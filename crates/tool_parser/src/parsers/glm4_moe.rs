@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::{
     errors::{ParserError, ParserResult},
+    factory::GrammarStart,
     parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -145,26 +146,48 @@ impl Glm4MoeParser {
         })
     }
 
-    /// What precedes a forced call on a thinking prompt: free text that
-    /// writes none of the call markers, so the first `<tool_call>` is the
-    /// forced tag's and the turn cannot end before it. The registry emits
-    /// `sequence[prefix, calls]`. The text is the model's thought and its
-    /// `</think>` where the engine applies the grammar from the first token,
-    /// and a newline or nothing where the engine runs a reasoning parser and
-    /// applies the grammar only after the model's own `</think>`. Nothing is
-    /// owed at its end: xgrammar's built-in `glm_4_7`
-    /// prefix (`reasoning=True`) closes the text with `</think>`, and an
-    /// engine that has already consumed the model's `</think>` then holds
-    /// the model to a second one, with a fabricated observation and answer
-    /// in between.
-    pub fn reasoning_prefix() -> Value {
-        serde_json::json!({
-            "type": "any_text",
-            "excludes": [
-                "<tool_call>", "</tool_call>",
-                "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>",
-            ],
-        })
+    /// What precedes a forced call on a thinking prompt, by where the engine
+    /// starts the grammar; the registry emits `sequence[prefix, calls]`.
+    ///
+    /// Where the engine applies the grammar only after its reasoning parser
+    /// has seen the model's own `</think>` (vLLM with a reasoning parser,
+    /// SGLang alike), nothing precedes the calls: the first constrained
+    /// token is the forced `<tool_call>`, as under the engine's own server.
+    /// Where it applies the grammar from the first token, the prefix is
+    /// xgrammar's built-in `glm_4_7` block (`reasoning=True`): the thought,
+    /// free of the think and call markers, closed by `</think>`, so the call
+    /// is not forced into the thought. Where the worker does not say, the
+    /// prefix is free text that writes none of the call markers, with
+    /// nothing owed at its end: the thought and its `</think>` on the one
+    /// kind of engine, a newline or nothing on the other. (A block closed by
+    /// `</think>` on an engine that has already consumed the model's
+    /// `</think>` holds the model to a second one, with a fabricated
+    /// observation and answer in between.)
+    pub fn reasoning_prefix(start: GrammarStart) -> Option<Value> {
+        const CALL_MARKERS: [&str; 6] = [
+            "<tool_call>",
+            "</tool_call>",
+            "<arg_key>",
+            "</arg_key>",
+            "<arg_value>",
+            "</arg_value>",
+        ];
+        match start {
+            GrammarStart::AfterReasoning => None,
+            GrammarStart::Unknown => Some(serde_json::json!({
+                "type": "any_text",
+                "excludes": CALL_MARKERS,
+            })),
+            GrammarStart::FirstToken => {
+                let excludes = [&["<think>", "</think>"][..], &CALL_MARKERS[..]].concat();
+                Some(serde_json::json!({
+                    "type": "tag",
+                    "begin": "",
+                    "content": { "type": "any_text", "excludes": excludes },
+                    "end": "</think>",
+                }))
+            }
+        }
     }
 
     /// Parse arguments, coercing each value by its declared schema type and
@@ -510,7 +533,7 @@ mod tests {
 
     #[test]
     fn reasoning_prefix_is_free_text_that_owes_nothing_at_its_end() {
-        let prefix = Glm4MoeParser::reasoning_prefix();
+        let prefix = Glm4MoeParser::reasoning_prefix(GrammarStart::Unknown).unwrap();
         assert_eq!(prefix["type"], "any_text");
         assert!(
             prefix.get("end").is_none(),
@@ -534,6 +557,31 @@ mod tests {
             !excludes.contains(&Value::String("</think>".to_string())),
             "the model closes its thought here when the engine applies the grammar from the first token"
         );
+    }
+
+    /// Where the worker says where its engine starts the grammar, the prefix
+    /// is the one shape that engine needs: none at all behind a reasoning
+    /// parser's gate, the `</think>`-closed thought block (xgrammar's
+    /// `glm_4_7` with `reasoning=True`) from the first token.
+    #[test]
+    fn reasoning_prefix_follows_where_the_engine_starts_the_grammar() {
+        assert_eq!(
+            Glm4MoeParser::reasoning_prefix(GrammarStart::AfterReasoning),
+            None,
+            "the grammar starts at the engine's gate: the call is forced right there"
+        );
+        let block = Glm4MoeParser::reasoning_prefix(GrammarStart::FirstToken).unwrap();
+        assert_eq!(block["type"], "tag");
+        assert_eq!(block["begin"], "");
+        assert_eq!(block["end"], "</think>");
+        assert_eq!(block["content"]["type"], "any_text");
+        let excludes = block["content"]["excludes"].as_array().unwrap();
+        for token in ["<think>", "</think>", "<tool_call>", "</arg_value>"] {
+            assert!(
+                excludes.contains(&Value::String(token.to_string())),
+                "{token} must not appear inside the thought block"
+            );
+        }
     }
 
     fn tool_with_props(props: Value) -> Vec<Tool> {

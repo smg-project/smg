@@ -1,6 +1,6 @@
 use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
 use serde_json::json;
-use tool_parser::{HyV4Parser, ParserFactory, ToolConstraint, ToolParser};
+use tool_parser::{GrammarStart, HyV4Parser, ParserFactory, ToolConstraint, ToolParser};
 
 const CONSTRAINED_CALLS: &str = concat!(
     "<tool_calls><tool_call>run",
@@ -497,7 +497,10 @@ fn hy4_constrains_only_forced_tool_choices() {
         let thinking = json!({
             "format": {
                 "type": "sequence",
-                "elements": [HyV4Parser::reasoning_prefix(), plain["format"]],
+                "elements": [
+                    HyV4Parser::reasoning_prefix(GrammarStart::Unknown).unwrap(),
+                    plain["format"]
+                ],
             },
         });
         for (reasoning, expected) in [(false, &plain), (true, &thinking)] {
@@ -586,4 +589,56 @@ fn hy4_forced_call_grammar_owes_nothing_before_the_calls_on_a_thinking_prompt() 
     assert_eq!(calls["type"], "triggered_tags", "{format}");
     assert_eq!(calls["triggers"], json!(["<tool_calls>"]));
     assert_eq!(calls["at_least_one"], true);
+}
+
+/// As for GLM: with the worker known, an engine that starts the grammar
+/// after its reasoning parser's gate gets the bare calls, one that starts
+/// at the first token the `</think>`-closed thought block in front of them.
+#[test]
+fn hy4_forced_call_grammar_follows_where_the_engine_starts_it() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("hy_v4");
+    let tools = constraint_tools();
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    let Some(ToolConstraint::StructuralTag(thinking)) = registry
+        .generate_tool_constraint(parser, &tools, &required, true)
+        .unwrap()
+    else {
+        panic!("expected a structural tag");
+    };
+    let calls = HyV4Parser::build_structural_tag(&tools, true);
+
+    let deferred = registry
+        .structural_tag_for_grammar_start(parser, &thinking, GrammarStart::AfterReasoning)
+        .unwrap()
+        .expect("re-shaped");
+    let deferred: serde_json::Value = serde_json::from_str(&deferred).unwrap();
+    assert_eq!(deferred, calls, "nothing precedes the calls");
+
+    let first_token = registry
+        .structural_tag_for_grammar_start(parser, &thinking, GrammarStart::FirstToken)
+        .unwrap()
+        .expect("re-shaped");
+    let first_token: serde_json::Value = serde_json::from_str(&first_token).unwrap();
+    assert_eq!(
+        first_token,
+        json!({
+            "format": {
+                "type": "sequence",
+                "elements": [
+                    HyV4Parser::reasoning_prefix(GrammarStart::FirstToken).unwrap(),
+                    calls["format"]
+                ],
+            },
+        })
+    );
+    assert_eq!(first_token["format"]["elements"][0]["end"], "</think>");
+    let excludes = first_token["format"]["elements"][0]["content"]["excludes"].clone();
+    for marker in ["<think", "</think", "<tool_call", "</tool_call"] {
+        assert!(
+            excludes.as_array().unwrap().contains(&json!(marker)),
+            "{marker} must not appear inside the thought block"
+        );
+    }
 }
