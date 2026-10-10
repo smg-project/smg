@@ -52,9 +52,14 @@ use pattern::Pattern;
 const BYTE_LEVEL_PATTERN: &str =
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 
-/// Pieces up to this many bytes are cached per thread; longer ones are rare
-/// and tokenized every time.
+/// Pieces up to this many bytes are cached per thread by their count (see
+/// `PIECE_CACHE_CAPACITY`); longer ones, up to `LONG_PIECE_MAX_BYTES`, by
+/// the bytes they take (see `LONG_PIECE_BYTES_CAPACITY`).
 const CACHED_PIECE_MAX_BYTES: usize = 64;
+/// Longest piece cached at all (a clause of some 80 characters in a script
+/// without word spaces, 256 of ASCII): a longer piece is rare and tokenized
+/// every time.
+const LONG_PIECE_MAX_BYTES: usize = 256;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
 /// at most; see `PIECE_CACHE_TOTAL_CAPACITY`.
 const PIECE_CACHE_CAPACITY: usize = 16_384;
@@ -64,9 +69,44 @@ const PIECE_CACHE_CAPACITY: usize = 16_384;
 /// tokenizer stay under about 40 MB however many runtime and blocking threads
 /// encode with it, and they are freed with the encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 262_144;
+/// Bytes of long pieces (each piece, its ids and their slot) a thread holds
+/// for one encoder before its long entries are cleared, at most; see
+/// `LONG_PIECE_BYTES_TOTAL`.
+const LONG_PIECE_BYTES_CAPACITY: usize = 2 << 20;
+/// Bytes of long pieces all threads together hold for one encoder, shared
+/// the way `PIECE_CACHE_TOTAL_CAPACITY` is. The long pieces of a prompt (its
+/// clauses, in a script without word spaces) are few in number and large,
+/// and each one that misses goes through the model's merges, so they are
+/// bounded by what they take rather than counted.
+const LONG_PIECE_BYTES_TOTAL: usize = 32 << 20;
+/// What an entry of the long tier takes beyond its piece and ids.
+const LONG_PIECE_ENTRY_BYTES: usize = size_of::<(Box<[u8]>, Box<[u32]>)>();
 
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
+
+/// One thread's cache of the pieces it tokenized with one encoder.
+#[derive(Default)]
+struct PieceCache {
+    /// Pieces of up to `CACHED_PIECE_MAX_BYTES`, bounded by their count.
+    short: PieceIds,
+    /// Longer pieces, up to `LONG_PIECE_MAX_BYTES`, bounded by their bytes.
+    long: PieceIds,
+    /// What `long` holds: each entry's piece, ids and slot.
+    long_bytes: usize,
+}
+
+impl PieceCache {
+    /// The ids cached for `piece`, if any.
+    fn get(&self, piece: &[u8]) -> Option<&[u32]> {
+        let tier = if piece.len() <= CACHED_PIECE_MAX_BYTES {
+            &self.short
+        } else {
+            &self.long
+        };
+        tier.get(piece).map(|ids| &**ids)
+    }
+}
 
 /// A literal split string as the regex that matches it, the way `Split`
 /// compiles a `String` pattern: every non-alphanumeric character escaped.
@@ -183,7 +223,7 @@ pub(crate) struct NativeEncoder {
     /// Each thread's cache from piece bytes to ids. The encoder owns them, so
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
-    piece_cache: ThreadLocal<RefCell<PieceIds>>,
+    piece_cache: ThreadLocal<RefCell<PieceCache>>,
     /// Threads that hold a piece cache of this encoder.
     threads: AtomicUsize,
 }
@@ -382,7 +422,7 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
     ) -> bool {
         let bytes = piece.as_bytes();
-        let cacheable = bytes.len() <= CACHED_PIECE_MAX_BYTES;
+        let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
         let cache = self.piece_cache.get_or(|| {
             self.threads.fetch_add(1, Ordering::Relaxed);
             RefCell::default()
@@ -400,12 +440,24 @@ impl NativeEncoder {
             Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
             Err(_) => return false,
         }
-        if cacheable {
+        if bytes.len() <= CACHED_PIECE_MAX_BYTES {
             let mut pieces = cache.borrow_mut();
-            if pieces.len() >= self.piece_cache_share() {
-                pieces.clear();
+            if pieces.short.len() >= self.piece_cache_share() {
+                pieces.short.clear();
             }
-            pieces.insert(bytes.into(), ids[start..].into());
+            pieces.short.insert(bytes.into(), ids[start..].into());
+        } else if cacheable {
+            let entry = LONG_PIECE_ENTRY_BYTES + bytes.len() + size_of_val(&ids[start..]);
+            let share = self.long_piece_bytes_share();
+            if entry <= share {
+                let mut pieces = cache.borrow_mut();
+                if pieces.long_bytes + entry > share {
+                    pieces.long.clear();
+                    pieces.long_bytes = 0;
+                }
+                pieces.long_bytes += entry;
+                pieces.long.insert(bytes.into(), ids[start..].into());
+            }
         }
         true
     }
@@ -416,6 +468,14 @@ impl NativeEncoder {
     fn piece_cache_share(&self) -> usize {
         (PIECE_CACHE_TOTAL_CAPACITY / self.threads.load(Ordering::Relaxed).max(1))
             .clamp(1, PIECE_CACHE_CAPACITY)
+    }
+
+    /// Bytes of long pieces one thread may hold: the total shared among the
+    /// threads that have encoded with this encoder, `LONG_PIECE_BYTES_CAPACITY`
+    /// at most.
+    fn long_piece_bytes_share(&self) -> usize {
+        (LONG_PIECE_BYTES_TOTAL / self.threads.load(Ordering::Relaxed).max(1))
+            .min(LONG_PIECE_BYTES_CAPACITY)
     }
 }
 
@@ -970,7 +1030,7 @@ mod tests {
         let caches: Vec<usize> = native
             .piece_cache
             .iter_mut()
-            .map(|cache| cache.get_mut().len())
+            .map(|cache| cache.get_mut().short.len())
             .collect();
         assert_eq!(caches.len(), threads, "{caches:?}");
         assert!(caches.iter().all(|&entries| entries > 0), "{caches:?}");
@@ -1016,10 +1076,12 @@ mod tests {
         assert_eq!(native.threads.load(Ordering::Relaxed), threads as usize);
         let share = native.piece_cache_share();
         assert!(share < PIECE_CACHE_CAPACITY, "{share}");
+        let long_share = native.long_piece_bytes_share();
+        assert!(long_share < LONG_PIECE_BYTES_CAPACITY, "{long_share}");
         let caches: Vec<usize> = native
             .piece_cache
             .iter_mut()
-            .map(|cache| cache.get_mut().len())
+            .map(|cache| cache.get_mut().short.len())
             .collect();
         assert_eq!(caches.len(), threads as usize, "{caches:?}");
         assert!(
@@ -1030,6 +1092,107 @@ mod tests {
             caches.iter().sum::<usize>() <= PIECE_CACHE_TOTAL_CAPACITY,
             "{caches:?}"
         );
+    }
+
+    /// `len` letters, distinct for distinct `i`: one piece of `len` bytes
+    /// under the byte-level split (letters only, no space). The padding is
+    /// a letter `word` never uses, so no two differ only in where it starts.
+    fn letters(len: usize, i: u32) -> String {
+        let mut text = word(i);
+        while text.len() < len {
+            text.push('X');
+        }
+        text
+    }
+
+    /// What the long tier accounts for one entry.
+    fn long_entry_bytes(piece: &[u8], ids: &[u32]) -> usize {
+        LONG_PIECE_ENTRY_BYTES + piece.len() + size_of_val(ids)
+    }
+
+    #[test]
+    fn long_pieces_are_cached_by_their_bytes() {
+        let mut state = 0x0BAD_F00D_1234_5678u64;
+        let shape = &shapes()[0];
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let model = tokenizer.get_model();
+        let short = letters(CACHED_PIECE_MAX_BYTES, 1);
+        let long = letters(CACHED_PIECE_MAX_BYTES + 1, 2);
+        let longest = letters(LONG_PIECE_MAX_BYTES, 3);
+        let beyond = letters(LONG_PIECE_MAX_BYTES + 1, 4);
+        // Newlines split the words without joining a space to them.
+        let text = format!("{short}\n{long}\n{longest}\n{beyond}");
+        let reference = tokenizer.encode(text.as_str(), false).expect("encode");
+        let first = native.encode(model, &text).expect("ids");
+        assert_eq!(first, reference.get_ids());
+        {
+            let cache = native
+                .piece_cache
+                .get()
+                .expect("this thread's cache")
+                .borrow();
+            assert!(cache.short.contains_key(short.as_bytes()));
+            assert!(!cache.long.contains_key(short.as_bytes()));
+            assert!(cache.long.contains_key(long.as_bytes()));
+            assert!(cache.long.contains_key(longest.as_bytes()));
+            assert!(!cache.long.contains_key(beyond.as_bytes()));
+            assert!(!cache.short.contains_key(beyond.as_bytes()));
+            assert_eq!(cache.long.len(), 2);
+            let accounted: usize = cache
+                .long
+                .iter()
+                .map(|(piece, ids)| long_entry_bytes(piece, ids))
+                .sum();
+            assert_eq!(cache.long_bytes, accounted);
+        }
+        // The second encode is answered from the cache: the same ids, and
+        // the cache as it was.
+        let second = native.encode(model, &text).expect("ids");
+        assert_eq!(second, first);
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        assert_eq!(cache.long.len(), 2);
+        assert_eq!(
+            cache.long_bytes,
+            long_entry_bytes(long.as_bytes(), &cache.long[long.as_bytes()])
+                + long_entry_bytes(longest.as_bytes(), &cache.long[longest.as_bytes()])
+        );
+    }
+
+    #[test]
+    fn long_pieces_stay_within_their_byte_share() {
+        let mut state = 0x7A7A_5B5B_3C3C_1D1Du64;
+        let shape = &shapes()[0];
+        let tokenizer = tokenizer_of(shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let model = tokenizer.get_model();
+        // Distinct long pieces worth more than one thread's share: each
+        // entry takes its 80 bytes, its ids (at least 27, the model merges
+        // pairs) and its slot, so 16,000 of them are over 3 MB.
+        let words = 16_000u32;
+        let text: String = (0..words)
+            .map(|i| format!("{}\n", letters(80, i)))
+            .collect();
+        native.encode(model, &text).expect("ids");
+        let share = native.long_piece_bytes_share();
+        let cache = native
+            .piece_cache
+            .get()
+            .expect("this thread's cache")
+            .borrow();
+        let accounted: usize = cache
+            .long
+            .iter()
+            .map(|(piece, ids)| long_entry_bytes(piece, ids))
+            .sum();
+        assert_eq!(cache.long_bytes, accounted);
+        assert!(cache.long_bytes <= share, "{} > {share}", cache.long_bytes);
+        assert!(cache.long.len() < words as usize, "{}", cache.long.len());
+        assert!(!cache.long.is_empty());
     }
 
     #[test]

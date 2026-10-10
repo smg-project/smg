@@ -366,10 +366,10 @@ impl HuggingFaceTokenizer {
 
     /// Words the model may cache per thread: none behind the direct encode
     /// path (`native`), whose own piece cache, owned by the encoder and freed
-    /// with it, answers in front of the model for the pieces of up to 64
-    /// bytes that make up nearly all of a prompt (a longer piece, a run of
-    /// 22-42 Han characters say, is merged on every encode: measured at the
-    /// same tokens per second with and without the model's cache), else
+    /// with it, answers in front of the model for every piece of up to 256
+    /// bytes (the short ones by count, the long ones, a clause in a script
+    /// without word spaces say, within a byte budget; a longer piece is rare
+    /// and merged on every encode), else
     /// [`Self::BPE_WORDS_CACHED_PER_THREAD`]. The
     /// model's cache outlives the model: it is a thread-local the crate
     /// never clears, so every thread that encoded with a tokenizer the

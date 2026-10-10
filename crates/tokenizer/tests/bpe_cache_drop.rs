@@ -73,7 +73,9 @@ static GLOBAL: Counting = Counting;
 const THREADS: usize = 4;
 /// Distinct words each thread encodes with one tokenizer: more than the
 /// model's per-thread word cache holds, so a thread that keeps that cache
-/// keeps it full.
+/// keeps it full. Every other word is long (above the 64 bytes the encoder
+/// caches by count), so the long pieces the encoder caches by their bytes
+/// go with it too.
 const WORDS: usize = 2_000;
 /// Tokenizers loaded, encoded with and dropped in turn while the threads
 /// live on: a reload each.
@@ -125,12 +127,17 @@ fn byte_level_bpe() -> Tokenizer {
     tokenizer
 }
 
-/// The `i`-th of the twelve-letter words, all distinct.
-fn word(mut i: usize) -> String {
+/// The `i`-th of the words, all distinct: twelve letters, or eight times
+/// that for every other `i`.
+fn word(i: usize) -> String {
     let mut word = String::with_capacity(12);
+    let mut rest = i;
     for _ in 0..12 {
-        word.push((b'a' + (i % 26) as u8) as char);
-        i /= 26;
+        word.push((b'a' + (rest % 26) as u8) as char);
+        rest /= 26;
+    }
+    if i % 2 == 1 {
+        word = word.repeat(8);
     }
     word
 }
@@ -147,7 +154,7 @@ fn a_dropped_tokenizer_leaves_nothing_on_the_threads_that_encoded_with_it() {
                     for i in 0..WORDS {
                         let text = word(thread * WORDS + i);
                         let encoding = tokenizer.encode(&text, false).expect("an encode");
-                        assert_eq!(encoding.token_ids().len(), 12, "one id per letter");
+                        assert_eq!(encoding.token_ids().len(), text.len(), "one id per letter");
                     }
                     drop(tokenizer);
                     done.send(()).expect("the test is waiting");
