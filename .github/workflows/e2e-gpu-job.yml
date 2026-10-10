@@ -230,8 +230,103 @@ jobs:
             --ignore=e2e_test/benchmarks \
             --ignore=e2e_test/bindings_go \
             ${{ inputs.test_filter }} \
-            --reruns 2 --reruns-delay 5 \
+            --reruns 0 --force-reruns 0 \
+            --junitxml=pd-completion-results.xml \
             -s -vv
+
+      - name: Require the original29PD cases to complete
+        if: always()
+        run: |
+          cat > pd-completion-expected.json <<'JSON'
+          {
+            "nodes": [
+              "e2e_test/router/test_context_length.py::TestPDContextLength::test_over_long_prompt_is_a_400_context_length_exceeded[1p1d]",
+              "e2e_test/router/test_context_length.py::TestPDContextLength::test_over_long_streaming_prompt_is_a_json_400[1p1d]",
+              "e2e_test/router/test_context_length.py::TestPDContextLength::test_prompt_within_the_window_is_served[1p1d]",
+              "e2e_test/router/test_context_length.py::TestPDContextLength::test_workers_still_healthy_after_rejection[1p1d]",
+              "e2e_test/router/test_pd_multimodal.py::TestPDMultimodalMropeLanguageModelOnlyDecode::test_mrope_request_is_rejected_clearly[setup_backend0]",
+              "e2e_test/router/test_pd_multimodal.py::TestPDMultimodalLanguageModelOnlyDecode::test_different_images_same_prefix_do_not_alias[setup_backend0]",
+              "e2e_test/router/test_pd_multimodal.py::TestPDMultimodalLanguageModelOnlyDecode::test_parallel_sampling_is_rejected_clearly[setup_backend0]",
+              "e2e_test/router/test_dp_routing.py::TestDpAwareRankPinning::test_requests_pinned_to_both_ranks[grpc]",
+              "e2e_test/router/test_pd_multimodal.py::TestPDMultimodalMrope::test_mrope_decode_answers_and_does_not_alias[pd_grpc]",
+              "e2e_test/router/test_pd_multimodal.py::TestPDMultimodalMrope::test_parallel_sampling_keeps_vision_on_decode[pd_grpc]",
+              "e2e_test/router/test_pd_multimodal.py::TestPDMultimodalMrope::test_worker_media_is_processed_once_on_the_prefill_leg[pd_grpc]",
+              "e2e_test/router/test_pd_messages.py::TestPDMessagesGrpc::test_non_streaming_message[pd_grpc]",
+              "e2e_test/router/test_pd_messages.py::TestPDMessagesGrpc::test_streaming_message[pd_grpc]",
+              "e2e_test/router/test_pd_mmlu.py::TestPDMMLUGrpc::test_pd_mmlu_basic[pd_grpc]",
+              "e2e_test/router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_minted_params_injected[pd_grpc]",
+              "e2e_test/router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_workers_transferred_kv[pd_grpc]",
+              "e2e_test/router/test_pd_nixl.py::TestPDNixlKvTransfer::test_decode_worker_performed_nixl_handshake[pd_grpc]",
+              "e2e_test/router/test_pd_nixl.py::TestPDNixlKvTransfer::test_kv_transfer_params_relayed[pd_grpc]",
+              "e2e_test/router/test_pd_responses.py::TestPDResponsesGrpc::test_basic_response_creation[openai-pd_grpc]",
+              "e2e_test/router/test_pd_responses.py::TestPDResponsesGrpc::test_basic_response_creation[smg-pd_grpc]",
+              "e2e_test/router/test_pd_responses.py::TestPDResponsesGrpc::test_previous_response_id_chaining[openai-pd_grpc]",
+              "e2e_test/router/test_pd_responses.py::TestPDResponsesGrpc::test_previous_response_id_chaining[smg-pd_grpc]",
+              "e2e_test/router/test_pd_responses.py::TestPDResponsesGrpc::test_store_false_not_retrievable[openai-pd_grpc]",
+              "e2e_test/router/test_pd_responses.py::TestPDResponsesGrpc::test_store_false_not_retrievable[smg-pd_grpc]",
+              "e2e_test/router/test_pd_responses.py::TestPDResponsesGrpc::test_streaming_response[openai-pd_grpc]",
+              "e2e_test/router/test_pd_responses.py::TestPDResponsesGrpc::test_streaming_response[smg-pd_grpc]",
+              "e2e_test/router/test_loads.py::TestDisaggregatedWorkerLoadReports::test_prefill_and_decode_workers_report_load[pd_grpc]",
+              "e2e_test/router/test_pd_multimodal.py::TestPDMultimodalKvIsolation::test_different_images_same_prefix_do_not_alias[pd_grpc]",
+              "e2e_test/router/test_pd_mmlu.py::TestPDMMLUHttp::test_pd_mmlu_basic[pd_http]"
+            ],
+            "existing_skips": [
+              "e2e_test/router/test_pd_multimodal.py::TestPDMultimodalMrope::test_worker_media_is_processed_once_on_the_prefill_leg[pd_grpc]",
+              "e2e_test/router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_minted_params_injected[pd_grpc]",
+              "e2e_test/router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_workers_transferred_kv[pd_grpc]"
+            ]
+          }
+          JSON
+          python3 - <<'PYTHON'
+          import json
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          expected = json.loads(Path("pd-completion-expected.json").read_text())
+          cases = ET.parse("pd-completion-results.xml").getroot().findall(".//testcase")
+
+
+          def node_id(case):
+              module, cls = case.attrib["classname"].rsplit(".", 1)
+              return f"{module.replace('.', '/')}.py::{cls}::{case.attrib['name']}"
+
+
+          ids = [node_id(case) for case in cases]
+          skipped = [node_id(case) for case in cases if case.find("skipped") is not None]
+          report = {
+              "case_ids": ids,
+              "skip_ids": skipped,
+              "expected": expected,
+              "tests": len(cases),
+              "skipped": len(skipped),
+              "failures": sum(case.find("failure") is not None for case in cases),
+              "errors": sum(case.find("error") is not None for case in cases),
+          }
+          Path("pd-completion-report.json").write_text(json.dumps(report, indent=2) + "\n")
+          assert len(cases) == 29 and set(ids) == set(expected["nodes"]), (
+              "Original29caseIDs changed or missing"
+          )
+          assert len(skipped) == 3 and set(skipped) == set(expected["existing_skips"]), (
+              "Existing skip boundary changed"
+          )
+          assert all(
+              child.tag in ("skipped", "system-out", "system-err", "properties")
+              for case in cases
+              for child in case
+          ), "A case failed, errored, or reran"
+          print("Original29cases completed:26passed,3existing skips; no reruns")
+          PYTHON
+
+      - name: Upload full PD completion evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pd-completion-${{ inputs.engine }}-${{ inputs.vllm_kv_backend }}
+          path: |
+            pd-completion-results.xml
+            pd-completion-report.json
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()
