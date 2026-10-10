@@ -61,7 +61,8 @@ pub enum MediaConnectorError {
     #[error("media decode task failed: {0}")]
     Blocking(#[from] tokio::task::JoinError),
     /// This process's own I/O after the bytes arrived: the scratch file a
-    /// decoder reads from, the decoder process it runs (see
+    /// decoder reads from, the decoder process it runs, or cannot run because
+    /// the decoder is not installed, not executable or not in this build (see
     /// [`MediaFault::Internal`]); never the request's or the media host's.
     #[error("I/O error while decoding media: {0}")]
     DecodeIo(#[source] std::io::Error),
@@ -107,7 +108,9 @@ pub enum MediaFault {
     Transient,
     /// This process's: a decode task that panicked or was cancelled, a
     /// scratch file or a decoder process that failed on this side (a
-    /// temporary directory that is full or not writable, a pipe that broke).
+    /// temporary directory that is full or not writable, a pipe that broke),
+    /// a decoder this side cannot start (not installed, not executable, a
+    /// backend this build does not have).
     Internal,
 }
 

@@ -875,12 +875,12 @@ async fn decode_video_frames(
             }
             #[cfg(not(feature = "opencv-video"))]
             {
-                Err(MediaConnectorError::VideoDecode(
+                Err(decoder_unavailable(
                     "SMG_VIDEO_DECODE_BACKEND=opencv requires the opencv-video feature".to_string(),
                 ))
             }
         }
-        Some(backend) => Err(MediaConnectorError::VideoDecode(format!(
+        Some(backend) => Err(decoder_unavailable(format!(
             "unsupported SMG_VIDEO_DECODE_BACKEND={backend}; expected auto, opencv, or ffmpeg"
         ))),
         None => {
@@ -951,6 +951,16 @@ fn fallback_failed(fallback: MediaConnectorError, message: String) -> MediaConne
     MediaConnectorError::DecodeIo(std::io::Error::new(kind, message))
 }
 
+/// The error of a decoder this process cannot run: not installed, not
+/// executable, or a backend this build does not have. This process's own
+/// ([`MediaConnectorError::DecodeIo`]), whatever clip the request sent.
+fn decoder_unavailable(message: String) -> MediaConnectorError {
+    MediaConnectorError::DecodeIo(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        message,
+    ))
+}
+
 async fn decode_video_bytes_with_ffmpeg(
     bytes: Bytes,
     cfg: VideoFetchConfig,
@@ -986,12 +996,12 @@ async fn decode_video_frames_from_path(
             }
             #[cfg(not(feature = "opencv-video"))]
             {
-                Err(MediaConnectorError::VideoDecode(
+                Err(decoder_unavailable(
                     "SMG_VIDEO_DECODE_BACKEND=opencv requires the opencv-video feature".to_string(),
                 ))
             }
         }
-        Some(backend) => Err(MediaConnectorError::VideoDecode(format!(
+        Some(backend) => Err(decoder_unavailable(format!(
             "unsupported SMG_VIDEO_DECODE_BACKEND={backend}; expected auto, opencv, or ffmpeg"
         ))),
         None => {
@@ -1871,9 +1881,10 @@ fn is_video_command_timeout(error: &MediaConnectorError) -> bool {
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
-/// missing executable is reported in the operator's terms; the command's own
-/// I/O (a spawn that fails otherwise, a pipe that breaks) is this process's
-/// ([`MediaConnectorError::DecodeIo`]).
+/// decoder this process cannot start (not installed, not executable) and the
+/// command's own I/O (a pipe that breaks) are this process's
+/// ([`MediaConnectorError::DecodeIo`]), reported in the operator's terms;
+/// only what the decoder says about the clip is the media's.
 async fn run_video_command_output(
     mut command: Command,
     program: &'static str,
@@ -1883,13 +1894,12 @@ async fn run_video_command_output(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let child = command.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            MediaConnectorError::VideoDecode(format!(
-                "{program} executable not found; install {program} to decode video_url inputs"
-            ))
+        let message = if e.kind() == std::io::ErrorKind::NotFound {
+            format!("{program} executable not found; install {program} to decode video_url inputs")
         } else {
-            MediaConnectorError::DecodeIo(e)
-        }
+            format!("{program} could not be started: {e}")
+        };
+        MediaConnectorError::DecodeIo(std::io::Error::new(e.kind(), message))
     })?;
 
     let timeout = video_process_timeout();
@@ -2911,12 +2921,12 @@ mod tests {
 
     use super::{
         checked_payload_length, collect_http_body_with_limit, decode_base64_with_limit,
-        effective_sample_fps, ensure_input_byte_limit, expected_sampled_frame_count,
-        fallback_failed, fps_filter_for_metadata, parse_ffmpeg_duration_seconds,
-        parse_ffprobe_video_info, parse_ppm_stream, read_file_with_limit, split_png_stream,
-        video_temp_suffix, write_temp_video_file, FrameSampling, MediaConnector,
-        MediaConnectorConfig, MediaConnectorError, MediaFault, MediaSource, VideoFetchConfig,
-        VideoMetadata,
+        decoder_unavailable, effective_sample_fps, ensure_input_byte_limit,
+        expected_sampled_frame_count, fallback_failed, fps_filter_for_metadata,
+        parse_ffmpeg_duration_seconds, parse_ffprobe_video_info, parse_ppm_stream,
+        read_file_with_limit, run_video_command_output, split_png_stream, video_temp_suffix,
+        write_temp_video_file, FrameSampling, MediaConnector, MediaConnectorConfig,
+        MediaConnectorError, MediaFault, MediaSource, VideoFetchConfig, VideoMetadata,
     };
 
     const TINY_PNG: &[u8] = &[
@@ -3050,6 +3060,53 @@ mod tests {
             matches!(theirs, MediaConnectorError::VideoDecode(_)),
             "{theirs}"
         );
+    }
+
+    /// A decoder this process cannot start is this process's fault, not the
+    /// media's, whatever clip the request sent: the executable is not there,
+    /// or is there but cannot be run; so is a backend this build does not
+    /// have. The operator's words stay on the error.
+    #[tokio::test]
+    async fn a_decoder_that_cannot_start_is_our_fault() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let missing = dir.path().join("ffprobe");
+        let error = run_video_command_output(tokio::process::Command::new(&missing), "ffprobe")
+            .await
+            .expect_err("a decoder that is not there");
+        assert!(
+            matches!(&error, MediaConnectorError::DecodeIo(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "{error}"
+        );
+        assert_eq!(error.fault(), MediaFault::Internal);
+        assert!(
+            error
+                .to_string()
+                .contains("ffprobe executable not found; install ffprobe"),
+            "{error}"
+        );
+
+        let not_executable = dir.path().join("ffmpeg");
+        std::fs::write(&not_executable, b"not a program").expect("a plain file");
+        let error =
+            run_video_command_output(tokio::process::Command::new(&not_executable), "ffmpeg")
+                .await
+                .expect_err("a decoder that cannot be run");
+        assert!(
+            matches!(&error, MediaConnectorError::DecodeIo(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        assert_eq!(error.fault(), MediaFault::Internal);
+        assert!(
+            error.to_string().contains("ffmpeg could not be started"),
+            "{error}"
+        );
+
+        let backend = decoder_unavailable(
+            "unsupported SMG_VIDEO_DECODE_BACKEND=gstreamer; expected auto, opencv, or ffmpeg"
+                .to_string(),
+        );
+        assert_eq!(backend.fault(), MediaFault::Internal);
+        assert!(backend.to_string().contains("gstreamer"), "{backend}");
     }
 
     #[test]
