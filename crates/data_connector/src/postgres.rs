@@ -983,6 +983,27 @@ impl PostgresResponseStorage {
     }
 }
 
+/// The query behind [`ResponseStorage::find_response_by_output_item`]:
+/// `raw_response` is a native `JSON` column, so each row is cast to `jsonb`
+/// and asked whether its `output` array contains an item with the id bound as
+/// `$1`. `None` when the schema skips the column (nothing to search).
+fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let order = if s.is_skipped("created_at") {
+        String::new()
+    } else {
+        format!(" ORDER BY {} DESC", s.col("created_at"))
+    };
+    Some(format!(
+        "{select_base} WHERE {col_raw}::jsonb @> jsonb_build_object('output', \
+         jsonb_build_array(jsonb_build_object('id', $1::text))){order} LIMIT 1"
+    ))
+}
+
 #[async_trait]
 impl ResponseStorage for PostgresResponseStorage {
     async fn store_response(
@@ -1089,6 +1110,30 @@ impl ResponseStorage for PostgresResponseStorage {
             return Ok(None);
         }
         Self::build_response_from_row(&rows[0], &self.store.schema).map(Some)
+    }
+
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> ResponseResult<Option<StoredResponse>> {
+        let Some(sql) = find_by_output_item_sql(&self.store.schema, &self.select_base) else {
+            return Ok(None);
+        };
+
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let rows = client
+            .query(&sql, &[&item_id])
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        match rows.first() {
+            Some(row) => Self::build_response_from_row(row, &self.store.schema).map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> ResponseResult<()> {

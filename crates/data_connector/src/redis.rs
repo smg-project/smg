@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use deadpool_redis::{Config, Pool, Runtime};
+use deadpool_redis::{Config, Connection, Pool, Runtime};
 use redis::AsyncCommands;
 use serde_json::Value;
 
@@ -706,6 +706,48 @@ impl RedisResponseStorage {
         }
     }
 
+    /// The key that points from an output item id at the response that
+    /// produced it: the lookup behind `item_reference` input items. Written
+    /// with the response (a hash cannot be searched by a field of its JSON
+    /// payload short of scanning every response) and removed with it.
+    fn output_item_key(&self, item_id: &str) -> String {
+        match &self.store.schema.owner {
+            Some(owner) => format!("{owner}:output_item:{item_id}"),
+            None => format!("output_item:{item_id}"),
+        }
+    }
+
+    /// The output-item keys pointing at the responses stored under `keys`,
+    /// read from each hash's `raw_response` (before the hashes go).
+    async fn output_item_keys_of_many(
+        &self,
+        conn: &mut Connection,
+        keys: &[String],
+    ) -> ResponseResult<Vec<String>> {
+        let sr = &self.store.schema.responses;
+        if sr.is_skipped("raw_response") || keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for key in keys {
+            pipe.hget(key, sr.col("raw_response"));
+        }
+        let raws: Vec<Option<String>> = pipe
+            .query_async(conn)
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let mut out = Vec::new();
+        for raw in raws {
+            let raw = parse_raw_response(raw).map_err(ResponseStorageError::StorageError)?;
+            out.extend(
+                output_item_ids(&raw)
+                    .into_iter()
+                    .map(|item_id| self.output_item_key(item_id)),
+            );
+        }
+        Ok(out)
+    }
+
     /// Build a `StoredResponse` from the Redis hash map returned by `HGETALL`.
     /// Fields listed in `skip_columns` use defaults since they were not stored.
     fn build_response_from_map(
@@ -851,6 +893,22 @@ impl ResponseStorage for RedisResponseStorage {
             }
         }
 
+        // One key per output item id -> this response, with the response's
+        // retention, for the lookup by output item id.
+        if !sr.is_skipped("raw_response") {
+            for item_id in output_item_ids(&response.raw_response) {
+                let item_key = self.output_item_key(item_id);
+                match self.store.retention_days {
+                    Some(days) => {
+                        pipe.set_ex(item_key, response_id_str, days * 24 * 60 * 60);
+                    }
+                    None => {
+                        pipe.set(item_key, response_id_str);
+                    }
+                }
+            }
+        }
+
         if let Some(days) = self.store.retention_days {
             pipe.expire(&key, (days * 24 * 60 * 60) as i64);
         }
@@ -898,6 +956,30 @@ impl ResponseStorage for RedisResponseStorage {
         self.build_response_from_map(map, id).map(Some)
     }
 
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> ResponseResult<Option<StoredResponse>> {
+        if self.store.schema.responses.is_skipped("raw_response") {
+            return Ok(None);
+        }
+        let mut conn = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+
+        let response_id: Option<String> = conn
+            .get(self.output_item_key(item_id))
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        match response_id {
+            Some(id) => self.get_response(&ResponseId(id)).await,
+            None => Ok(None),
+        }
+    }
+
     async fn delete_response(&self, response_id: &ResponseId) -> ResponseResult<()> {
         let sr = &self.store.schema.responses;
 
@@ -909,6 +991,10 @@ impl ResponseStorage for RedisResponseStorage {
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+
+        let output_item_keys = self
+            .output_item_keys_of_many(&mut conn, std::slice::from_ref(&key))
+            .await?;
 
         if sr.is_skipped("safety_identifier") {
             conn.del::<_, ()>(&key)
@@ -930,6 +1016,12 @@ impl ResponseStorage for RedisResponseStorage {
                     .await
                     .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
             }
+        }
+
+        if !output_item_keys.is_empty() {
+            conn.del::<_, ()>(output_item_keys)
+                .await
+                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
         }
 
         Ok(())
@@ -1013,9 +1105,20 @@ impl ResponseStorage for RedisResponseStorage {
             return Ok(0);
         }
 
+        let response_keys: Vec<String> = response_ids
+            .iter()
+            .map(|id| self.response_key(id))
+            .collect();
+        let output_item_keys = self
+            .output_item_keys_of_many(&mut conn, &response_keys)
+            .await?;
+
         let mut pipe = redis::pipe();
-        for id in response_ids {
-            pipe.del(self.response_key(&id));
+        for response_key in &response_keys {
+            pipe.del(response_key);
+        }
+        for item_key in &output_item_keys {
+            pipe.del(item_key);
         }
         pipe.del(&key);
 
@@ -1024,5 +1127,41 @@ impl ResponseStorage for RedisResponseStorage {
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
 
         Ok(count)
+    }
+}
+
+/// The ids of the output items of a stored response (`raw_response.output[].id`).
+fn output_item_ids(raw_response: &Value) -> Vec<&str> {
+    raw_response
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn output_item_ids_reads_the_output_array_only() {
+        let raw = json!({
+            "id": "resp_1",
+            "output": [
+                {"type": "reasoning", "id": "rs_1"},
+                {"type": "message", "id": "msg_1"},
+                {"type": "message"}
+            ]
+        });
+        assert_eq!(output_item_ids(&raw), vec!["rs_1", "msg_1"]);
+        assert!(output_item_ids(&json!({"id": "resp_2"})).is_empty());
+        assert!(output_item_ids(&Value::Null).is_empty());
     }
 }
