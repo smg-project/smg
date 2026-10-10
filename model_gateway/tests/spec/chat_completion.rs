@@ -72,9 +72,16 @@ fn test_max_completion_tokens_takes_precedence() {
         "max_completion_tokens should take precedence"
     );
     assert_eq!(req.output_token_cap(), Some(200));
+    // The cap reads the newer field; the public API nevertheless refuses the
+    // pair itself (invalid_parameter_combination), and so does validation.
+    let error = req
+        .validate()
+        .expect_err("both token limits at once are refused");
     assert!(
-        req.validate().is_ok(),
-        "Should be valid after normalization"
+        error
+            .to_string()
+            .contains("'max_tokens' and 'max_completion_tokens' cannot both be set"),
+        "{error}"
     );
 }
 

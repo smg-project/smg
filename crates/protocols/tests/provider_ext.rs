@@ -1000,9 +1000,10 @@ fn minimax_profile_rejects_a_second_answer_to_an_answered_call() {
 }
 
 #[test]
-fn kimi_and_openai_tolerate_loose_tool_history() {
-    // KVV requires invalid-JSON history arguments to be ACCEPTED for Kimi
-    for model in ["kimi-k3", "gpt-4o-mini"] {
+fn kimi_and_the_default_profile_tolerate_loose_tool_history() {
+    // KVV requires invalid-JSON history arguments to be ACCEPTED for Kimi;
+    // a self-hosted model (no vendor profile) leaves the history to the engine.
+    for model in ["kimi-k3", "qwen3-8b"] {
         assert!(
             tool_history_request(model, "call_1", "{invalid json}")
                 .validate()
@@ -1020,6 +1021,31 @@ fn kimi_and_openai_tolerate_loose_tool_history() {
             "{model} must tolerate unanswered tool calls"
         );
     }
+}
+
+#[test]
+fn openai_tolerates_loose_arguments_but_pairs_tool_messages() {
+    // The public API takes any string as historical arguments ...
+    assert!(
+        tool_history_request("gpt-4o-mini", "call_1", "{invalid json}")
+            .validate()
+            .is_ok(),
+        "gpt-4o-mini must tolerate loose arguments"
+    );
+    // ... and rejects a tool message that answers no issued call, and a
+    // tool_calls turn left unanswered (the recorded public-API behaviour).
+    let mismatch = tool_history_request("gpt-4o-mini", "call_999", "{}");
+    assert!(
+        has_code(&mismatch, "tool_call_id_not_found"),
+        "{:?}",
+        error_codes(&mismatch)
+    );
+    let unanswered = unanswered_request("gpt-4o-mini");
+    assert!(
+        has_code(&unanswered, "tool_calls_without_tool_messages"),
+        "{:?}",
+        error_codes(&unanswered)
+    );
 }
 
 #[test]
