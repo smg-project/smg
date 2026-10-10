@@ -13,7 +13,10 @@ use openai_protocol::{
     decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
-    messages::{CountMessageTokensRequest, CountMessageTokensResponse, CreateMessageRequest},
+    messages::{
+        CountMessageTokensRequest, CountMessageTokensResponse, CreateMessageRequest, Message,
+        MessageDelta, MessageDeltaUsage, MessageStreamEvent, StopReason, Tool, ToolChoice, Usage,
+    },
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
@@ -22,11 +25,12 @@ use tracing::debug;
 use super::{
     common::{
         responses::{
-            handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+            handlers::cancel_response_impl, streaming::build_sse_response_from_stream,
+            utils::validate_worker_availability, ResponsesContext,
         },
-        stages::{RateLimitCell, RateLimitOutcome},
+        stages::{helpers::resolve_request_id_stamp, RateLimitCell, RateLimitOutcome},
     },
-    context::SharedComponents,
+    context::{RequestType, SharedComponents},
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     mode::Mode,
     multimodal::{mm_settings, MultimodalComponents},
@@ -478,13 +482,22 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
+        let canonical_body = Arc::new(canonical_body);
+
+        // `max_tokens: 0` is answered as the public API answers it: an empty
+        // message that reports the prompt's token count; nothing is generated.
+        if canonical_body.max_tokens == 0 {
+            return self
+                .empty_message_response(tenant_meta, canonical_body, &model_id_cloned)
+                .await;
+        }
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
         let response = self
             .messages_pipeline
             .execute_messages(
-                Arc::new(canonical_body),
+                canonical_body,
                 headers.cloned(),
                 model_id_cloned,
                 self.shared_components.clone(),
@@ -508,53 +521,149 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         let model_id = self.resolve_canonical_model_id(model_id);
-        // A model nobody serves is the client's mistake (404), whatever a
-        // removed worker left in the tokenizer registry; a served model with
-        // no tokenizer is a gateway fault (500).
-        if !self.worker_registry.contains_model(&model_id) {
-            return error::model_not_found(&model_id);
-        }
-        let Some(tokenizer) = self.shared_components.tokenizer_registry.get(&model_id) else {
-            return error::internal_error(
-                "tokenizer_not_found",
-                format!("Tokenizer not found for model: {model_id}"),
-            );
-        };
-        let tools = message_utils::template_tools(body.tools.as_deref(), body.tool_choice.as_ref());
-        let media = match message_utils::resolve_messages_media(
-            &self.shared_components,
-            &model_id,
-            &*tokenizer,
-            &body.messages,
-        )
-        .await
-        {
-            Ok(media) => media,
-            Err(refused) => return refused,
-        };
-        match message_utils::count_input_tokens(
-            &body,
-            tokenizer,
-            &tools,
-            media.placeholders(),
-            media.media_order,
-        )
-        .await
+        match self
+            .count_prompt_tokens(
+                &model_id,
+                message_utils::MessagesPrompt::from(&body),
+                body.tools.as_deref(),
+                body.tool_choice.as_ref(),
+            )
+            .await
         {
             Ok(input_tokens) => (
                 StatusCode::OK,
                 Json(CountMessageTokensResponse { input_tokens }),
             )
                 .into_response(),
-            Err(message_utils::CountError::Render(e)) => {
-                debug!(model = %model_id, error = %e, "count_tokens: the request does not render");
+            Err(refused) => refused,
+        }
+    }
+
+    /// The prompt's token count, as `/v1/messages/count_tokens` reports it:
+    /// the registry's tokenizer for the model, the tools the template renders
+    /// and the request's media resolved as the preparation stage resolves
+    /// them; no worker takes part. The refusals are count_tokens': a model
+    /// nobody serves is the client's mistake (404), whatever a removed worker
+    /// left in the tokenizer registry; a served model with no tokenizer is a
+    /// gateway fault (500), as is a prompt that does not encode; a prompt
+    /// that does not render is a 400.
+    async fn count_prompt_tokens(
+        &self,
+        model_id: &str,
+        prompt: message_utils::MessagesPrompt<'_>,
+        tools: Option<&[Tool]>,
+        tool_choice: Option<&ToolChoice>,
+    ) -> Result<u32, Response> {
+        if !self.worker_registry.contains_model(model_id) {
+            return Err(error::model_not_found(model_id));
+        }
+        let Some(tokenizer) = self.shared_components.tokenizer_registry.get(model_id) else {
+            return Err(error::internal_error(
+                "tokenizer_not_found",
+                format!("Tokenizer not found for model: {model_id}"),
+            ));
+        };
+        let chat_tools = message_utils::template_tools(tools, tool_choice);
+        let media = message_utils::resolve_messages_media(
+            &self.shared_components,
+            model_id,
+            &*tokenizer,
+            prompt.messages,
+        )
+        .await?;
+        message_utils::count_input_tokens(
+            prompt,
+            tokenizer,
+            &chat_tools,
+            media.placeholders(),
+            media.media_order,
+        )
+        .await
+        .map_err(|e| match e {
+            message_utils::CountError::Render(e) => {
+                debug!(model = %model_id, error = %e, "the request does not render");
                 error::bad_request("process_messages_failed", e)
             }
-            Err(message_utils::CountError::Encode(e)) => {
-                tracing::error!(model = %model_id, error = %e, "count_tokens: tokenization failed");
+            message_utils::CountError::Encode(e) => {
+                tracing::error!(model = %model_id, error = %e, "tokenization failed");
                 error::internal_error("tokenization_failed", format!("Tokenization failed: {e}"))
             }
+        })
+    }
+
+    /// The answer to `max_tokens: 0`, as the public API answers it: a message
+    /// with no content, `stop_reason: max_tokens` and the prompt's token count
+    /// in `usage`, counted as `/v1/messages/count_tokens` counts it; no worker
+    /// takes part, and the message carries the id the pipeline would have
+    /// given it. A streaming request gets that message as `message_start`,
+    /// then `message_delta` with the stop reason and `message_stop`.
+    async fn empty_message_response(
+        &self,
+        tenant_meta: &TenantRequestMeta,
+        body: Arc<CreateMessageRequest>,
+        model_id: &str,
+    ) -> Response {
+        let input_tokens = match self
+            .count_prompt_tokens(
+                model_id,
+                message_utils::MessagesPrompt::from(&*body),
+                body.tools.as_deref(),
+                body.tool_choice.as_ref(),
+            )
+            .await
+        {
+            Ok(input_tokens) => input_tokens,
+            Err(refused) => return refused,
+        };
+        let stream = body.stream.unwrap_or(false);
+        let (id, _) = resolve_request_id_stamp(
+            &RequestType::Messages(body),
+            Some(tenant_meta),
+            "msg_",
+            self.mode != Mode::Regular,
+        );
+        let message = Message {
+            id,
+            message_type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: Vec::new(),
+            model: model_id.to_string(),
+            stop_reason: Some(StopReason::MaxTokens),
+            stop_sequence: None,
+            stop_details: None,
+            usage: Usage::from_counts(input_tokens, 0),
+            container: None,
+        };
+        if !stream {
+            return (StatusCode::OK, Json(message)).into_response();
         }
+
+        let events = [
+            MessageStreamEvent::MessageStart {
+                message: Message {
+                    stop_reason: None,
+                    ..message
+                },
+            },
+            MessageStreamEvent::MessageDelta {
+                delta: MessageDelta {
+                    stop_reason: Some(StopReason::MaxTokens),
+                    ..MessageDelta::default()
+                },
+                usage: MessageDeltaUsage {
+                    output_tokens: 0,
+                    input_tokens: Some(input_tokens),
+                    cache_creation_input_tokens: Some(0),
+                    cache_read_input_tokens: Some(0),
+                    server_tool_use: None,
+                    output_tokens_details: None,
+                },
+            },
+            MessageStreamEvent::MessageStop,
+        ];
+        let frames: Vec<Result<bytes::Bytes, std::io::Error>> =
+            events.iter().map(messages_sse_frame).map(Ok).collect();
+        build_sse_response_from_stream(futures::stream::iter(frames))
     }
 
     /// Main route_completion implementation
@@ -867,6 +976,17 @@ fn canonicalize_responses_request<'a>(
     )
 }
 
+/// One Messages SSE frame, `event: <type>\ndata: <json>\n\n`; the type is the
+/// event's own tag.
+fn messages_sse_frame(event: &MessageStreamEvent) -> bytes::Bytes {
+    let json = serde_json::to_value(event).unwrap_or_default();
+    let name = json
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("ping");
+    bytes::Bytes::from(format!("event: {name}\ndata: {json}\n\n"))
+}
+
 #[cfg(test)]
 mod pd_tests {
     use std::sync::{Arc, OnceLock};
@@ -1041,6 +1161,135 @@ mod pd_tests {
 
         let response = router
             .route_messages_count_tokens(None, &tenant_meta, count_request("gone"), "gone")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+    }
+
+    fn message_request(body: serde_json::Value) -> CreateMessageRequest {
+        serde_json::from_value(body).expect("message request")
+    }
+
+    fn sse_event(frame: &str, name: &str) -> serde_json::Value {
+        let prefix = format!("event: {name}\ndata: ");
+        let data = frame
+            .strip_prefix(prefix.as_str())
+            .unwrap_or_else(|| panic!("expected a {name} frame, got {frame:?}"));
+        serde_json::from_str(data).expect("event json")
+    }
+
+    /// `max_tokens: 0` is the router's own answer, as the public API's: a
+    /// message with no content, `stop_reason: max_tokens` and the prompt's
+    /// token count in `usage` (the renderer hands back three ids), under the
+    /// id the pipeline would have given it (the client's `rid` when it sends
+    /// one); streamed, that message as `message_start`, then `message_delta`
+    /// with the stop reason and `message_stop`. No worker takes part; a
+    /// model nobody serves is a 404.
+    #[tokio::test]
+    async fn max_tokens_zero_is_answered_with_an_empty_message() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("m", "m", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = json!({
+            "model": "m", "max_tokens": 0,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(body.clone()), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let message: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["content"], json!([]));
+        assert_eq!(message["stop_reason"], "max_tokens");
+        assert_eq!(message["usage"]["input_tokens"], 3);
+        assert_eq!(message["usage"]["output_tokens"], 0);
+        assert_eq!(message["usage"]["cache_read_input_tokens"], 0);
+        assert!(message["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")));
+
+        let mut with_rid = body.clone();
+        with_rid["rid"] = json!("req-7");
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(with_rid), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let message: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(message["id"], "req-7");
+
+        let mut streamed = body;
+        streamed["stream"] = json!(true);
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(streamed), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream; charset=utf-8")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        let frames: Vec<&str> = text.split("\n\n").filter(|f| !f.is_empty()).collect();
+        assert_eq!(frames.len(), 3, "{text}");
+        let start = sse_event(frames[0], "message_start");
+        assert_eq!(start["message"]["content"], json!([]));
+        assert_eq!(start["message"]["stop_reason"], serde_json::Value::Null);
+        assert_eq!(start["message"]["usage"]["input_tokens"], 3);
+        let delta = sse_event(frames[1], "message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(delta["usage"]["output_tokens"], 0);
+        assert_eq!(delta["usage"]["input_tokens"], 3);
+        assert_eq!(
+            sse_event(frames[2], "message_stop"),
+            json!({"type": "message_stop"})
+        );
+
+        let response = router
+            .route_messages(
+                None,
+                &tenant_meta,
+                message_request(json!({
+                    "model": "nope", "max_tokens": 0,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })),
+                "nope",
+            )
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(

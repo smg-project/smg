@@ -336,21 +336,22 @@ pub(crate) enum CountError {
     Encode(anyhow::Error),
 }
 
-/// The prompt tokens `/v1/messages` would send for `request`: the same tool
-/// set, media placeholders, template rendering and encoding as the
-/// preparation stage, without media processing (an image counts as the
-/// placeholder the template writes for it; the image itself is not fetched).
-/// A text or content-source document counts as its rendered text; a source
-/// with no text is refused, as `/v1/messages` refuses it.
+/// The prompt tokens `/v1/messages` would send for `prompt` (a message
+/// request's or a count_tokens request's): the same tool set, media
+/// placeholders, template rendering and encoding as the preparation stage,
+/// without media processing (an image counts as the placeholder the template
+/// writes for it; the image itself is not fetched). A text or content-source
+/// document counts as its rendered text; a source with no text is refused,
+/// as `/v1/messages` refuses it.
 pub(crate) async fn count_input_tokens(
-    request: &CountMessageTokensRequest,
+    prompt: MessagesPrompt<'_>,
     tokenizer: Arc<dyn Tokenizer>,
     tools: &[ChatTool],
     placeholders: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<u32, CountError> {
     let (processed, encoding) = process_messages_prompt(
-        MessagesPrompt::from(request),
+        prompt,
         &*tokenizer,
         (!tools.is_empty()).then_some(tools),
         placeholders,
@@ -1486,7 +1487,7 @@ mod tests {
         assert_eq!(tools.len(), 1, "a forced tool renders alone");
 
         let counted = count_input_tokens(
-            &request,
+            MessagesPrompt::from(&request),
             tokenizer,
             &tools,
             None,
@@ -1518,7 +1519,7 @@ mod tests {
         placeholders.insert(Modality::Image, "token".to_string());
 
         let without = count_input_tokens(
-            &request,
+            MessagesPrompt::from(&request),
             Arc::clone(&tokenizer),
             &[],
             None,
@@ -1527,7 +1528,7 @@ mod tests {
         .await
         .unwrap();
         let with = count_input_tokens(
-            &request,
+            MessagesPrompt::from(&request),
             tokenizer,
             &[],
             Some(&placeholders),
@@ -1592,7 +1593,7 @@ mod tests {
         .unwrap();
 
         let failure = count_input_tokens(
-            &request,
+            MessagesPrompt::from(&request),
             Arc::new(EncodeFails(llm_tokenizer::mock::MockTokenizer::new())),
             &[],
             None,

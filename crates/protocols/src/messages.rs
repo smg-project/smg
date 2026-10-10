@@ -34,8 +34,9 @@ pub struct CreateMessageRequest {
     #[validate(length(min = 1, message = "messages array is required and cannot be empty"))]
     pub messages: Vec<InputMessage>,
 
-    /// The maximum number of tokens to generate before stopping.
-    #[validate(range(min = 1, message = "max_tokens must be greater than 0"))]
+    /// The maximum number of tokens to generate before stopping. `0` is
+    /// accepted as the public API accepts it: the answer is an empty message
+    /// that reports the prompt's token count and generates nothing.
     pub max_tokens: u32,
 
     /// An object describing metadata about the request.
@@ -2675,6 +2676,17 @@ mod tests {
         assert_eq!(partition.cache_salt, Some("tenant-a"));
         assert!(partition.extra_key.is_none());
         assert!(partition.lora_path.is_none());
+    }
+
+    #[test]
+    fn max_tokens_zero_validates_as_the_public_api_accepts_it() {
+        let zero: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 0,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(zero.validate().is_ok());
     }
 
     #[test]
