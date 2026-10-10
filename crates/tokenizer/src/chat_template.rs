@@ -13,7 +13,7 @@ use chrono::{
 use minijinja::{
     context,
     machinery::{
-        ast::{Call, CallArg, Expr, ForLoop, Macro, Set, Stmt},
+        ast::{Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
@@ -590,33 +590,69 @@ impl ThinkDetector {
         false
     }
 
-    /// Whether the literal text a list of statements writes opens a `<think>`
-    /// block it does not close: the last `<think>` has no `</think>` after
-    /// it. A closed `<think>\n\n</think>` (a non-thinking template) does not
-    /// count; a branch of a nested `if` counts when its own text opens one.
-    fn body_opens_think_block(stmts: &[Stmt]) -> bool {
-        let mut text = String::new();
+    /// Whether the generation prompt an `if` writes leaves a `<think>` block
+    /// open: the true body when the condition reads `add_generation_prompt`
+    /// (alone or in a conjunction), the false body when it reads
+    /// `not add_generation_prompt`; `None` for any other condition.
+    fn generation_prompt_opens_think_block(ic: &IfCond) -> Option<bool> {
+        match &ic.expr {
+            Expr::UnaryOp(u) if matches!(u.op, UnaryOpKind::Not) => {
+                Self::expr_references_var(&u.expr, "add_generation_prompt")
+                    .then(|| Self::think_block_open_after(&ic.false_body, false))
+            }
+            expr => Self::expr_references_var_positively(expr, "add_generation_prompt")
+                .then(|| Self::think_block_open_after(&ic.true_body, false)),
+        }
+    }
+
+    /// `expr_references_var` with no negation above the reference.
+    fn expr_references_var_positively(expr: &Expr, name: &str) -> bool {
+        match expr {
+            Expr::Var(v) => v.id == name,
+            Expr::BinOp(b) => {
+                Self::expr_references_var_positively(&b.left, name)
+                    || Self::expr_references_var_positively(&b.right, name)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the literal text a list of statements writes leaves a
+    /// `<think>` block open at its end, starting from `open`: the text is
+    /// read in order, a `<think>` opens and a `</think>` closes; either
+    /// branch of a nested `if` may run, so the block is open after it when
+    /// either branch leaves it open, and text after the `if` still counts.
+    /// A closed `<think>\n\n</think>` (a non-thinking template) opens nothing.
+    fn think_block_open_after(stmts: &[Stmt], mut open: bool) -> bool {
         for stmt in stmts {
             match stmt {
-                Stmt::EmitRaw(raw) => text.push_str(raw.raw),
+                Stmt::EmitRaw(raw) => open = Self::think_block_open_after_text(raw.raw, open),
                 Stmt::EmitExpr(e) => {
                     if let Expr::Const(c) = &e.expr {
                         if let Some(s) = c.value.as_str() {
-                            text.push_str(s);
+                            open = Self::think_block_open_after_text(s, open);
                         }
                     }
                 }
-                Stmt::IfCond(ic)
-                    if Self::body_opens_think_block(&ic.true_body)
-                        || Self::body_opens_think_block(&ic.false_body) =>
-                {
-                    return true;
+                Stmt::IfCond(ic) => {
+                    open = Self::think_block_open_after(&ic.true_body, open)
+                        || Self::think_block_open_after(&ic.false_body, open);
                 }
                 _ => {}
             }
         }
-        text.rfind("<think>")
-            .is_some_and(|start| !text[start..].contains("</think>"))
+        open
+    }
+
+    /// `open` after `text`: the later of its last `<think>` and its last
+    /// `</think>` decides; a text with neither leaves it as it was.
+    fn think_block_open_after_text(text: &str, open: bool) -> bool {
+        match (text.rfind("<think>"), text.rfind("</think>")) {
+            (None, None) => open,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(start), Some(end)) => start > end,
+        }
     }
 
     fn walk_stmt(&mut self, stmt: &Stmt) {
@@ -638,10 +674,10 @@ impl ThinkDetector {
                 {
                     self.think_in_prefill = Self::body_has_think_tag(&ic.true_body);
                 }
-                if !self.prefill_opens_think_block
-                    && Self::expr_references_var(&ic.expr, "add_generation_prompt")
-                {
-                    self.prefill_opens_think_block = Self::body_opens_think_block(&ic.true_body);
+                if !self.prefill_opens_think_block {
+                    if let Some(opens) = Self::generation_prompt_opens_think_block(ic) {
+                        self.prefill_opens_think_block = opens;
+                    }
                 }
 
                 for b in &ic.true_body {
@@ -2037,6 +2073,25 @@ mod tests {
                         {%- if clear_thinking is defined and clear_thinking -%}<think></think>\
                         {%- else -%}<think>{%- endif -%}{%- endif -%}";
         let state = ChatTemplateState::new(Some(branched.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // Both branches open a block and the prompt closes it after them.
+        let closed_after_branches = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|>\
+                        {%- if clear_thinking is defined and clear_thinking -%}<think>\
+                        {%- else -%}<think>\n{%- endif -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(closed_after_branches.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+
+        // A block opened only when there is no generation prompt is not the
+        // prompt's; the else branch of that condition is.
+        let not_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not add_generation_prompt -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(not_prompt.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let else_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not add_generation_prompt -%}done{%- else -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(else_prompt.to_string())).unwrap();
         assert!(state.prefill_opens_think_block());
     }
 

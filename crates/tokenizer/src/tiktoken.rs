@@ -903,9 +903,9 @@ impl TokenizerTrait for TiktokenTokenizer {
 
     fn prefill_opens_think_block(&self) -> bool {
         match self.renderer {
-            // K3's generation-prompt tail opens `<think>` when thinking is on
-            // (the default), so completions start mid-reasoning.
-            Renderer::KimiK3Xtml => true,
+            // The native renderers all report a thinking switch, so this flag
+            // (read only for a switchless template) mirrors `think_in_prefill`.
+            Renderer::KimiK3Xtml => self.think_in_prefill(),
             _ => self.chat_template.prefill_opens_think_block(),
         }
     }

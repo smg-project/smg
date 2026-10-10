@@ -747,10 +747,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 
     fn prefill_opens_think_block(&self) -> bool {
         match self.renderer {
-            // All three native encoders emit `<｜Assistant｜><think>` at the end
-            // of the prompt when thinking mode is on; the completion therefore
-            // starts mid-reasoning and the parser must be told so.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => true,
+            // The native renderers all report a thinking switch, so this flag
+            // (read only for a switchless template) mirrors `think_in_prefill`.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => {
+                self.think_in_prefill()
+            }
             Renderer::Jinja => self.chat_template.prefill_opens_think_block(),
         }
     }
