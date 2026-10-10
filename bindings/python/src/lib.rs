@@ -593,6 +593,7 @@ struct Router {
     mesh_tls_ca_cert: Option<String>,
     mesh_tls_cert: Option<String>,
     mesh_tls_key: Option<String>,
+    power_of_two_load_metric: String,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -755,6 +756,15 @@ impl Router {
             }
         })?;
 
+        let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
+            &self.power_of_two_load_metric,
+        )
+        .ok_or_else(|| config::ConfigError::InvalidValue {
+            field: "power_of_two_load_metric".to_string(),
+            value: self.power_of_two_load_metric.clone(),
+            reason: "expected expected_wait, requests or least_requests".to_string(),
+        })?;
+
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
@@ -780,6 +790,7 @@ impl Router {
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,
+                    load_metric: power_of_two_load_metric,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
                     load_check_interval_secs: self.load_monitor_interval,
@@ -1331,6 +1342,7 @@ impl Router {
         mesh_tls_ca_cert = None,
         mesh_tls_cert = None,
         mesh_tls_key = None,
+        power_of_two_load_metric = String::from("expected_wait"),
         discovery = None,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -1521,6 +1533,7 @@ impl Router {
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
+        power_of_two_load_metric: String,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1740,6 +1753,7 @@ impl Router {
             mesh_tls_ca_cert,
             mesh_tls_cert,
             mesh_tls_key,
+            power_of_two_load_metric,
         })
     }
 

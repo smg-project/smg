@@ -1782,6 +1782,7 @@ class TestRouterArgsFieldOrder:
         "mesh_tls_ca_cert",
         "mesh_tls_cert",
         "mesh_tls_key",
+        "power_of_two_load_metric",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1841,6 +1842,7 @@ class TestRouterArgsFieldOrder:
             "priority_scheduler_tenant_metric_top_n",
             "tenant_rate_limit_enabled",
             "tenant_rate_limit_config",
+            "power_of_two_load_metric",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

@@ -30,9 +30,9 @@ use smg::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, ManualAssignmentMode,
-        MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
-        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig,
+        PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+        RoutingMode, SchemaConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
@@ -194,6 +194,13 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
 fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
     KvIndexKind::parse(value)
         .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
+}
+
+/// Parse the `--power-of-two-load-metric` value into a `PowerOfTwoLoadMetric`.
+fn parse_power_of_two_load_metric(value: &str) -> Result<PowerOfTwoLoadMetric, String> {
+    PowerOfTwoLoadMetric::parse(value).ok_or_else(|| {
+        format!("invalid value '{value}'; expected expected_wait, requests, or least_requests")
+    })
 }
 
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
@@ -473,6 +480,10 @@ struct CliArgs {
     /// this count; 0 disables. Set below the engine's max batch size
     #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
     least_load_max_waiting_requests: u32,
+
+    /// What power_of_two compares: expected_wait (default), requests or least_requests
+    #[arg(long, default_value = "expected_wait", value_parser = parse_power_of_two_load_metric, help_heading = "Routing Policy")]
+    power_of_two_load_metric: PowerOfTwoLoadMetric,
 
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
@@ -1758,6 +1769,7 @@ impl CliArgs {
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
+                load_metric: self.power_of_two_load_metric,
             },
             "least_load" => PolicyConfig::LeastLoad {
                 load_check_interval_secs: 5,

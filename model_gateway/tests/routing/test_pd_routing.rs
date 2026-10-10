@@ -146,6 +146,7 @@ mod pd_routing_unit_tests {
                 },
                 PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
+                    load_metric: Default::default(),
                 },
             ),
             (

@@ -6,7 +6,7 @@ use openai_protocol::worker::WorkerLoadResponse;
 use rand::RngExt;
 
 use super::{get_healthy_worker_indices, LeastLoadPolicy, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::Worker;
+use crate::{config::PowerOfTwoLoadMetric, worker::Worker};
 
 /// Power-of-two choices policy: sample two distinct healthy workers uniformly
 /// and route to the one with the lower expected wait, scored exactly like
@@ -19,14 +19,33 @@ pub struct PowerOfTwoPolicy {
     /// Expected-wait scorer shared with least-load: load cache, since-poll
     /// in-flight credit, and the scoring tunables.
     scorer: LeastLoadPolicy,
+    load_metric: PowerOfTwoLoadMetric,
 }
 
 impl PowerOfTwoPolicy {
     pub fn new() -> Self {
+        Self::with_load_metric(PowerOfTwoLoadMetric::default())
+    }
+
+    pub fn with_load_metric(load_metric: PowerOfTwoLoadMetric) -> Self {
         Self {
             scorer: LeastLoadPolicy::new(),
+            load_metric,
         }
     }
+}
+
+/// The candidates with the fewest router in-flight requests. Each count is read
+/// once, so concurrent dispatches cannot empty the result.
+fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<usize> {
+    let loads: Vec<usize> = candidates.iter().map(|&i| workers[i].load()).collect();
+    let fewest = loads.iter().copied().min().unwrap_or(0);
+    candidates
+        .iter()
+        .zip(loads)
+        .filter(|&(_, load)| load == fewest)
+        .map(|(&i, _)| i)
+        .collect()
 }
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
@@ -40,6 +59,13 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             return Some(healthy[0]);
         }
 
+        if self.load_metric == PowerOfTwoLoadMetric::LeastRequests {
+            let fewest = fewest_in_flight(workers, &healthy);
+            return self
+                .scorer
+                .select_min_expected_wait(workers, &fewest, info, self.name());
+        }
+
         // Select two distinct workers - use offset to guarantee different
         // selection in O(1).
         let mut rng = rand::rng();
@@ -47,6 +73,12 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         let idx2 = (idx1 + 1 + rng.random_range(0..healthy.len() - 1)) % healthy.len();
         let pair = [healthy[idx1], healthy[idx2]];
 
+        if self.load_metric == PowerOfTwoLoadMetric::Requests {
+            let fewest = fewest_in_flight(workers, &pair);
+            return self
+                .scorer
+                .select_min_expected_wait(workers, &fewest, info, self.name());
+        }
         self.scorer
             .select_min_expected_wait(workers, &pair, info, self.name())
     }
@@ -348,5 +380,52 @@ mod tests {
             seen.iter().all(|&s| s),
             "consecutive picks must spread across equal workers, saw {seen:?}"
         );
+    }
+
+    fn holding(in_flight: &[usize]) -> Vec<Arc<dyn Worker>> {
+        in_flight
+            .iter()
+            .enumerate()
+            .map(|(i, &requests)| {
+                let worker = mk(&format!("http://w{i}:8000"));
+                (0..requests).for_each(|_| worker.increment_load());
+                worker
+            })
+            .collect()
+    }
+
+    #[test]
+    fn requests_metric_prefers_fewer_in_flight_over_a_lighter_report() {
+        let workers = holding(&[5, 2]);
+        let mut loads = HashMap::new();
+        loads.insert("http://w0:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://w1:8000".to_string(), make_load(50_000, 0.1, 100.0));
+        let info = SelectWorkerInfo::default();
+
+        let expected_wait = PowerOfTwoPolicy::new();
+        expected_wait.update_loads(&loads);
+        assert_eq!(expected_wait.select_worker(&workers, &info), Some(0));
+
+        let requests = PowerOfTwoPolicy::with_load_metric(PowerOfTwoLoadMetric::Requests);
+        requests.update_loads(&loads);
+        for _ in 0..20 {
+            assert_eq!(requests.select_worker(&workers, &info), Some(1));
+        }
+    }
+
+    #[test]
+    fn least_requests_takes_the_fewest_in_flight_over_every_worker() {
+        let policy = PowerOfTwoPolicy::with_load_metric(PowerOfTwoLoadMetric::LeastRequests);
+        let workers = holding(&[4, 5, 1, 3]);
+        let mut loads = HashMap::new();
+        loads.insert("http://w0:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://w2:8000".to_string(), make_load(50_000, 0.1, 100.0));
+        policy.update_loads(&loads);
+        for _ in 0..20 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(2)
+            );
+        }
     }
 }
