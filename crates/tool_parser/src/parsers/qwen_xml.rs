@@ -914,6 +914,7 @@ mod tests {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         }]
     }

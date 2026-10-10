@@ -1187,6 +1187,7 @@ mod tests {
                         "properties": {"patch": {"type": "string"}},
                     }),
                     strict: None,
+                    extra: Default::default(),
                 },
             }]),
         )
