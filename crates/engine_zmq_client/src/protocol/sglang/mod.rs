@@ -56,6 +56,13 @@ impl EngineProtocol for SglangProtocol {
         SglangRequestType::Abort.to_frame()
     }
 
+    fn prompt_tokens(request: &Self::Request) -> u64 {
+        match request {
+            SglangRequest::Generate(request) => request.input_ids.len() as u64,
+            SglangRequest::Embed(request) => request.input_ids.len() as u64,
+        }
+    }
+
     fn request_id(request: &Self::Request) -> &str {
         request.rid()
     }

@@ -239,6 +239,8 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
         // A growing engine silence goes out once a second, so a subscriber's
         // wedge bound is met within a second of the engine crossing it.
         || last.engine_silence_ms.map(|ms| ms / 1000) != current.engine_silence_ms.map(|ms| ms / 1000)
+        || last.engine_reports_steps != current.engine_reports_steps
+        || last.prefill_pending_tokens != current.prefill_pending_tokens
 }
 
 /// Whether [`RELAY_START_ENV`] set to `value` keeps the start at boot.

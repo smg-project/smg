@@ -123,6 +123,9 @@ pub trait EngineProtocol: Send + Sync + 'static {
 
     /// The request's id (the registry routing key).
     fn request_id(request: &Self::Request) -> &str;
+    /// The prompt tokens of an add-request: what the engine has to prefill
+    /// before the request's first output.
+    fn prompt_tokens(request: &Self::Request) -> u64;
     /// SMG-pinned DP rank, if any (else the sole engine is used).
     fn data_parallel_rank(request: &Self::Request) -> Option<u32>;
     /// Reject fields this client cannot represent on the wire.

@@ -73,6 +73,13 @@ impl EngineProtocol for VllmProtocol {
         EngineCoreRequestType::Abort.to_frame()
     }
 
+    fn prompt_tokens(request: &Self::Request) -> u64 {
+        request
+            .prompt_token_ids
+            .as_ref()
+            .map_or(0, |ids| ids.len() as u64)
+    }
+
     fn request_id(request: &Self::Request) -> &str {
         &request.request_id
     }
