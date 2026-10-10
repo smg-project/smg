@@ -5540,7 +5540,14 @@ mod tests {
         update_expected_wait_loads(&policy, &workers, &[0, 0]);
         let held: Vec<u32> = (1..=4_400).collect();
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let indexer = setup_indexer_with_blocks("http://w1:8000", &[&held], 4);
+        // Stored as 1,100 blocks of four, as the index receives them, so the
+        // fleet's level is 1,100 and w2 is thin against it; as one block of
+        // 4,400 tokens the level would be one, below the warm-up blocks,
+        // nobody would be thin, and the slice would never run.
+        let indexer = Arc::new(KvIndex::positional(4));
+        let holder = indexer.intern_worker("http://w1:8000").unwrap();
+        indexer.intern_worker("http://w2:8000").unwrap();
+        store_blocks(&indexer, holder, &held, 4, 1);
         monitor.indexers.insert("unknown".to_string(), indexer);
         policy.set_kv_event_monitor(Some(monitor));
         // w1's first block (the shared head) followed by eleven novel blocks.
