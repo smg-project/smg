@@ -166,6 +166,44 @@ mod tests {
         }
     }
 
+    /// Which requests the engine reports every step, for the silence count:
+    /// a streaming request at an interval of one (the request's own, or the
+    /// server's default when unset); one that does not stream, or streams
+    /// every so many tokens, is reported at intervals. Every prompt counts
+    /// as pending prefill.
+    #[test]
+    fn a_streaming_request_at_interval_one_is_reported_every_step() {
+        use crate::protocol::tokenspeed::sampling::SamplingParams;
+        let request = |stream: bool, stream_interval: Option<u32>| TokenizedGenerateReqInput {
+            input_ids: vec![1, 2, 3],
+            stream,
+            sampling_params: SamplingParams {
+                stream_interval,
+                ..SamplingParams::default()
+            },
+            ..TokenizedGenerateReqInput::default()
+        };
+        assert!(TokenSpeedProtocol::reported_every_step(&request(
+            true, None
+        )));
+        assert!(TokenSpeedProtocol::reported_every_step(&request(
+            true,
+            Some(1)
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            true,
+            Some(8)
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            false, None
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            false,
+            Some(1)
+        )));
+        assert_eq!(TokenSpeedProtocol::prompt_tokens(&request(false, None)), 3);
+    }
+
     #[test]
     fn decode_batch_maps_outputs_and_finished_ids() {
         let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];

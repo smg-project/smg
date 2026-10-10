@@ -226,6 +226,51 @@ mod tests {
         }
     }
 
+    /// Which requests the engine reports every step, for the silence count:
+    /// a streaming generation at an interval of one (the request's own, or
+    /// the server's default when unset) and an embedding; a generation that
+    /// does not stream, or streams every so many tokens, is reported at
+    /// intervals. Every prompt counts as pending prefill.
+    #[test]
+    fn a_streaming_generation_at_interval_one_or_an_embedding_is_reported_every_step() {
+        use crate::protocol::sglang::{
+            request::{TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
+            sampling::SamplingParams,
+        };
+        let generate = |stream: bool, stream_interval: Option<u32>| {
+            SglangRequest::Generate(TokenizedGenerateReqInput {
+                input_ids: vec![1, 2, 3],
+                stream,
+                sampling_params: SamplingParams {
+                    stream_interval,
+                    ..SamplingParams::default()
+                },
+                ..TokenizedGenerateReqInput::default()
+            })
+        };
+        assert!(SglangProtocol::reported_every_step(&generate(true, None)));
+        assert!(SglangProtocol::reported_every_step(&generate(
+            true,
+            Some(1)
+        )));
+        assert!(!SglangProtocol::reported_every_step(&generate(
+            true,
+            Some(8)
+        )));
+        assert!(!SglangProtocol::reported_every_step(&generate(false, None)));
+        assert!(!SglangProtocol::reported_every_step(&generate(
+            false,
+            Some(1)
+        )));
+        let embed = SglangRequest::Embed(TokenizedEmbeddingReqInput {
+            input_ids: vec![1, 2],
+            ..TokenizedEmbeddingReqInput::default()
+        });
+        assert!(SglangProtocol::reported_every_step(&embed));
+        assert_eq!(SglangProtocol::prompt_tokens(&generate(false, None)), 3);
+        assert_eq!(SglangProtocol::prompt_tokens(&embed), 2);
+    }
+
     #[test]
     fn decode_batch_maps_outputs_finished_ids_and_load() {
         let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];

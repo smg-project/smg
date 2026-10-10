@@ -180,6 +180,20 @@ mod tests {
     use super::*;
     use crate::codec::decode_value;
 
+    /// The engine core reports every request it stepped on every step
+    /// (streaming is the frontend's affair and not on the request), so every
+    /// request counts toward the silence, and its prompt as pending prefill.
+    #[test]
+    fn every_request_is_reported_every_step() {
+        let request = EngineCoreRequest {
+            request_id: "r".to_string(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        assert!(VllmProtocol::reported_every_step(&request));
+        assert_eq!(VllmProtocol::prompt_tokens(&request), 3);
+    }
+
     #[test]
     fn start_wave_encodes_a_nil_excluded_rank() {
         let (frame, payload) = VllmProtocol::encode_start_wave(9).unwrap().unwrap();

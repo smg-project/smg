@@ -2552,6 +2552,166 @@ mod tests {
         assert_eq!(client.output_silence(), None);
     }
 
+    /// The same on the SGLang wire, embeddings included: a generation that
+    /// does not stream, or streams every so many tokens, counts no silence;
+    /// an embedding (one forward, one output) and a streaming generation at
+    /// an interval of one count from their own dispatch and take the silence
+    /// with them when they end.
+    #[tokio::test]
+    async fn an_sglang_request_reported_at_intervals_counts_no_silence() {
+        use crate::protocol::sglang::{
+            output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput},
+            request::{SglangRequest, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
+            sampling::SamplingParams,
+        };
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let _ns = ns;
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = SglangClient::new(transport.unwrap());
+        let mut engine = engine.unwrap();
+        let generate = |rid: &str, input_ids: Vec<u32>, stream: bool, stream_interval| {
+            SglangRequest::Generate(TokenizedGenerateReqInput {
+                rid: rid.to_string(),
+                input_ids,
+                sampling_params: SamplingParams {
+                    max_new_tokens: Some(4),
+                    stream_interval,
+                    ..SamplingParams::default()
+                },
+                stream,
+                ..TokenizedGenerateReqInput::default()
+            })
+        };
+        let done = |rid: &str, prompt_tokens: u32| BatchTokenIDSlimOutput {
+            rids: vec![rid.to_string()],
+            output_ids: vec![vec![11]],
+            finished_reasons: vec!["stop".into()],
+            finished_messages: vec![None],
+            finished_matched: vec![None],
+            prompt_tokens: vec![prompt_tokens],
+            completion_tokens: vec![1],
+            cached_tokens: vec![0],
+            output_token_logprobs_val: vec![vec![]],
+            output_token_logprobs_idx: vec![vec![]],
+            finished_status: vec![None],
+            ..Default::default()
+        };
+
+        // A generation that does not stream is reported at its end: no
+        // silence, however long it runs; its prompt is pending all the same.
+        let mut unstreamed = client
+            .submit(generate("sg-end", vec![1, 2, 3], false, None))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(client.output_silence(), None, "reported at its end only");
+        assert_eq!(client.prefill_pending_tokens(), 3);
+        // So is one streamed every eight tokens.
+        let mut spaced = client
+            .submit(generate("sg-spaced", vec![4, 5], true, Some(8)))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        assert_eq!(client.output_silence(), None, "streamed at an interval");
+        assert_eq!(client.prefill_pending_tokens(), 5);
+        // An embedding is owed its one output: it counts from its dispatch.
+        let mut embed = client
+            .submit(SglangRequest::Embed(TokenizedEmbeddingReqInput {
+                rid: "sg-embed".to_string(),
+                input_ids: vec![6, 7],
+                ..TokenizedEmbeddingReqInput::default()
+            }))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        let at_dispatch = client
+            .output_silence()
+            .expect("an embedding in flight is owed its output");
+        assert!(
+            at_dispatch < Duration::from_millis(150),
+            "counted from its own dispatch: {at_dispatch:?}"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 7);
+        // Its result ends it, and the silence with it.
+        let result = BatchEmbeddingSlimOutput {
+            rids: vec!["sg-embed".to_string()],
+            embeddings: vec![vec![0.5]],
+            prompt_tokens: vec![2],
+            cached_tokens: vec![0],
+            finished_reasons: vec!["stop".into()],
+            finished_messages: vec![None],
+            finished_status: vec![None],
+            ..Default::default()
+        };
+        engine
+            .send_output(vec![Bytes::from(encode_msgpack(&result).unwrap())])
+            .await
+            .unwrap();
+        assert!(embed.next().await.unwrap().unwrap().finished());
+        assert!(embed.next().await.is_none());
+        assert_eq!(
+            client.output_silence(),
+            None,
+            "the generations left are reported at intervals"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 5);
+        // A streaming generation at the default interval is reported every
+        // step: it counts from its own dispatch, not from the embedding's.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut streamed = client
+            .submit(generate("sg-step", vec![8], true, None))
+            .await
+            .unwrap();
+        engine.recv_request().await.unwrap();
+        let at_dispatch = client
+            .output_silence()
+            .expect("a streaming generation at an interval of one is owed every step");
+        assert!(
+            at_dispatch < Duration::from_millis(150),
+            "counted from its own dispatch: {at_dispatch:?}"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 6);
+        engine
+            .send_output(vec![Bytes::from(
+                encode_msgpack(&done("sg-step", 1)).unwrap(),
+            )])
+            .await
+            .unwrap();
+        assert!(streamed.next().await.unwrap().unwrap().finished());
+        assert!(streamed.next().await.is_none());
+        assert_eq!(client.output_silence(), None);
+        assert_eq!(client.prefill_pending_tokens(), 5);
+        // The quiet two end: nothing pending, nothing in flight.
+        for (rid, stream, prompt_tokens) in [
+            ("sg-end", &mut unstreamed, 3),
+            ("sg-spaced", &mut spaced, 2),
+        ] {
+            engine
+                .send_output(vec![Bytes::from(
+                    encode_msgpack(&done(rid, prompt_tokens)).unwrap(),
+                )])
+                .await
+                .unwrap();
+            assert!(stream.next().await.unwrap().unwrap().finished());
+            assert!(stream.next().await.is_none());
+        }
+        assert_eq!(client.prefill_pending_tokens(), 0);
+        assert_eq!(client.output_silence(), None);
+    }
+
     /// A lockstep group is paused when the client connects, so the first submit
     /// must wake every rank — including the one taking the request, so the
     /// whole group shares one wave number.
