@@ -38,7 +38,7 @@ use openai_protocol::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
     },
 };
-use rustls::crypto::ring;
+use rustls::crypto::{ring, CryptoProvider};
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
@@ -1222,7 +1222,30 @@ fn supervise_discovery(
     abort
 }
 
+/// The process-level crypto provider rustls uses, installed before anything
+/// in this process builds a TLS configuration.
+///
+/// The gateway links both rustls backends: `ring` directly and through its
+/// gRPC stack, `aws-lc-rs` through the HTTP client's default feature set.
+/// With two backends compiled in rustls cannot pick one on its own, and a
+/// `ServerConfig::builder()` call panics in whichever task builds the first
+/// TLS configuration without a provider installed: the mesh listener's task,
+/// when the mesh runs with mTLS, so the listener never bound while the
+/// gateway kept serving. The provider is `ring`, the one every explicit
+/// choice in this binary already makes. Installing is idempotent: a provider
+/// installed earlier, by an embedding process or a previous start in the
+/// same process, stays.
+fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // An error here means another thread installed one in between,
+        // which is the outcome wanted.
+        let _ = ring::default_provider().install_default();
+    }
+}
+
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    install_crypto_provider();
+
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
     // is public and `Deserialize`, so a Rust library caller can construct
@@ -1739,10 +1762,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &config.router_config.server_key,
     ) {
         info!("TLS enabled");
-        ring::default_provider()
-            .install_default()
-            .map_err(|e| format!("Failed to install rustls ring provider: {e:?}"))?;
-
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
             .await
             .map_err(|e| format!("Failed to create TLS config: {e}"))?;
