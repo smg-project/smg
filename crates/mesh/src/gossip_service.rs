@@ -152,17 +152,33 @@ impl GossipService {
         signal: F,
     ) -> Result<()> {
         let listen_addr = self.listen_addr;
+        let mut server = self.server_builder().await?;
         let service = GossipServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
             .send_compressed(tonic::codec::CompressionEncoding::Gzip);
 
-        Server::builder()
+        server
             .add_service(service)
             .serve_with_shutdown(listen_addr, signal)
             .await?;
         Ok(())
+    }
+
+    /// The listener's server: plain gRPC, or TLS with this node's
+    /// certificate (client certificates checked against the CA) when mTLS is
+    /// configured.
+    async fn server_builder(&self) -> Result<Server> {
+        let mut server = Server::builder();
+        if let Some(mtls_manager) = &self.mtls_manager {
+            server = server.tls_config(mtls_manager.server_tls_config().await?)?;
+            log::info!(
+                "Mesh listener {} serves TLS with the node certificate",
+                self.listen_addr
+            );
+        }
+        Ok(server)
     }
 
     pub async fn serve_ping_with_listener<F: std::future::Future<Output = ()>>(
@@ -171,12 +187,13 @@ impl GossipService {
         signal: F,
     ) -> Result<()> {
         let incoming = TcpIncoming::from(listener);
+        let mut server = self.server_builder().await?;
         let service = GossipServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
             .send_compressed(tonic::codec::CompressionEncoding::Gzip);
-        Server::builder()
+        server
             .add_service(service)
             .serve_with_incoming_shutdown(incoming, signal)
             .await?;

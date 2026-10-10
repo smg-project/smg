@@ -3,7 +3,7 @@
 //! Every case in `tests/fixtures/deepseek_v41/render_fixtures.json` is a
 //! request `scripts/generate_deepseek_v41_fixtures.py` fed the checkpoint's
 //! `encoding/encoding.py` (`deepseek-ai/DeepSeek-V4.1-Flash`) — or, for the
-//! shapes that encoder cannot render, vLLM's port of it — and the text it
+//! shapes that encoder cannot render, the serving engine's port of it — and the text it
 //! produced; each case names its oracle. Rendering it through
 //! `HuggingFaceTokenizer` must reproduce that text byte-for-byte, and the flat
 //! encode of the text must reproduce the ids in `render_ids_fixtures.json`,
@@ -38,7 +38,7 @@ enum ThinkingMode {
 }
 
 /// Which encoder recorded a case's text: the checkpoint's own `encoding.py`
-/// (`hf`) or vLLM's port (`vllm_python`), used for the shapes the reference
+/// (`hf`) or the serving engine's port (`vllm_python`), used for the shapes the reference
 /// cannot render, such as a developer message it keeps.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]

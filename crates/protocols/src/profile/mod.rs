@@ -19,6 +19,11 @@ mod kimi;
 mod minimax;
 mod zai;
 
+use std::{
+    collections::HashMap,
+    sync::{OnceLock, RwLock},
+};
+
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage},
     common::Tool,
@@ -42,7 +47,17 @@ pub enum ModelProfile {
 impl ModelProfile {
     /// Infer the same contract as the legacy name-based selection.
     pub fn for_model(model: &str) -> Self {
-        match ProviderProfile::for_model(model) {
+        Self::from_provider(ProviderProfile::for_model(model), model)
+    }
+
+    /// Infer from the name itself, before applying configured alias fallbacks.
+    pub fn for_model_name(model: &str) -> Self {
+        Self::from_provider(ProviderProfile::from_model_segments(model), model)
+    }
+
+    /// Refine a provider family into the version-specific contract it names.
+    fn from_provider(provider: ProviderProfile, model: &str) -> Self {
+        match provider {
             ProviderProfile::OpenAi => Self::OpenAi,
             ProviderProfile::Kimi if kimi::is_k3(model) => Self::KimiK3,
             ProviderProfile::Kimi => Self::Kimi,
@@ -57,6 +72,7 @@ impl ModelProfile {
         }
     }
 
+    /// The provider family whose message extensions this contract accepts.
     pub fn provider(self) -> ProviderProfile {
         match self {
             Self::OpenAi => ProviderProfile::OpenAi,
@@ -66,6 +82,16 @@ impl ModelProfile {
             Self::DeepSeekV4 | Self::DeepSeekV41 => ProviderProfile::DeepSeek,
         }
     }
+}
+
+/// Served model ids that take a vendor's profile from an alias they are served
+/// under, recorded once at startup from the configured model aliases. An alias
+/// is resolved into the request's model id before the response side reads it,
+/// so the served name has to select the profile its vendor-named alias does,
+/// or a request that entered under the vendor name loses the profile half-way.
+fn alias_profiles() -> &'static RwLock<HashMap<String, ProviderProfile>> {
+    static ALIAS_PROFILES: OnceLock<RwLock<HashMap<String, ProviderProfile>>> = OnceLock::new();
+    ALIAS_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Provider dialect for a request, selected from the model id.
@@ -116,14 +142,60 @@ impl ProviderProfile {
     /// Matches the way the tool and reasoning parser factories do: any
     /// `/`-separated segment that starts with a vendor marker selects the
     /// profile, so `kimi-k3`, `/models/Kimi-K3`, `moonshotai/kimi-k2` and
-    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. This is the
-    /// standalone protocol fallback. The gateway resolves registered aliases
-    /// and discovered model metadata before normalization and stores the result
-    /// on the request, independently of its wire model name.
+    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. A served model id
+    /// that names no vendor takes the profile of a vendor-named alias it was
+    /// registered with (see [`Self::register_model_aliases`]), so the profile
+    /// stays the same before and after an alias is resolved into the served
+    /// name. Without such an alias, an opaque served name keeps the OpenAI
+    /// baseline: any extension a request carried is dropped with a warning,
+    /// and a `root` message is rejected outright, so that role needs a
+    /// MiniMax model id.
     /// DeepSeek is narrower: only the calibrated V4 / V4.1 model segments
     /// and `deepseek-flash` alias select its profile; older versions and
     /// unrecognized suffixes keep the baseline.
     pub fn for_model(model: &str) -> Self {
+        let profile = Self::from_model_segments(model);
+        if profile != ProviderProfile::OpenAi {
+            return profile;
+        }
+        let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
+        aliased
+            .get(model)
+            .copied()
+            .unwrap_or(ProviderProfile::OpenAi)
+    }
+
+    /// Record the configured model aliases (`alias -> served model id`). A
+    /// served model id that has a vendor-named alias selects that vendor's
+    /// profile from now on, whichever of its names a request carries. Aliases
+    /// that select no vendor profile change nothing; when two aliases of one
+    /// served model name different vendors, the first registered wins and the
+    /// conflict is logged.
+    pub fn register_model_aliases<'a>(aliases: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        let mut map = alias_profiles().write().unwrap_or_else(|e| e.into_inner());
+        for (alias, canonical) in aliases {
+            let profile = Self::from_model_segments(alias);
+            if profile == ProviderProfile::OpenAi {
+                continue;
+            }
+            match map.get(canonical) {
+                Some(existing) if *existing != profile => tracing::warn!(
+                    canonical,
+                    alias,
+                    kept = ?existing,
+                    ignored = ?profile,
+                    "model alias names a different vendor than an earlier alias of the same served model"
+                ),
+                Some(_) => {}
+                None => {
+                    map.insert(canonical.to_string(), profile);
+                }
+            }
+        }
+    }
+
+    /// The vendor a model id names in one of its `/`-separated segments.
+    fn from_model_segments(model: &str) -> Self {
         for segment in model.split('/') {
             if deepseek::matches_model(segment) {
                 return ProviderProfile::DeepSeek;
@@ -234,6 +306,52 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
+/// Whether the model id names one of OpenAI's own hosted models: `gpt-*`
+/// (but not the open-weight `gpt-oss-*`), `chatgpt-*`, `codex-*`, the
+/// `o1`/`o3`/`o4` reasoning series, `computer-use-preview`, or a model behind
+/// an `openai` route segment such as `openai/gpt-4.1`.
+///
+/// The rules the public OpenAI API enforces on request *content* beyond the
+/// schema (a strict-mode schema must pin `additionalProperties: false` on
+/// every object node; a `json_object` format needs the word "json" in the
+/// prompt) hold for those models only. A self-hosted model passes such
+/// requests through to the engine, whose grammar compiler decides what it can
+/// constrain, so the gateway does not refuse ahead of it.
+pub fn is_openai_vendor_model(model: &str) -> bool {
+    const PREFIXES: [&str; 6] = [
+        "gpt-",
+        "chatgpt-",
+        "codex-",
+        "computer-use-preview",
+        "text-embedding-",
+        "omni-moderation",
+    ];
+    // The open-weight gpt-oss models are served locally whatever route
+    // segment precedes them: never the vendor's hosted contract.
+    if model
+        .split('/')
+        .any(|segment| starts_with_ignore_ascii_case(segment, "gpt-oss"))
+    {
+        return false;
+    }
+    model.split('/').any(|segment| {
+        segment.eq_ignore_ascii_case("openai")
+            || PREFIXES
+                .iter()
+                .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
+            || is_openai_reasoning_series(segment)
+    })
+}
+
+/// `o1`, `o3`, `o4-mini`, `o3-pro-2025-06-10`: an `o`, the series digit, then
+/// the end of the segment or a dash.
+fn is_openai_reasoning_series(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some('o' | 'O'))
+        && matches!(chars.next(), Some('1' | '3' | '4'))
+        && matches!(chars.next(), None | Some('-'))
+}
+
 /// The `root` role is a MiniMax-only extension; other dialects reject it the
 /// way their reference APIs do.
 fn reject_root(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
@@ -291,11 +409,85 @@ mod tests {
     }
 
     #[test]
+    fn a_vendor_named_alias_gives_the_served_model_its_vendor_profile() {
+        // Names unique to this test: the alias table is process-wide.
+        ProviderProfile::register_model_aliases([
+            ("kimi-k3-public-name", "served-model-alpha"),
+            ("gpt-4o-public-name", "served-model-beta"),
+            // A second, disagreeing alias of the same served model is ignored.
+            ("MiniMax-M3-public-name", "served-model-alpha"),
+        ]);
+        assert_eq!(
+            ProviderProfile::for_model("served-model-alpha"),
+            ProviderProfile::Kimi
+        );
+        assert_eq!(
+            ProviderProfile::for_model("served-model-beta"),
+            ProviderProfile::OpenAi
+        );
+        assert_eq!(
+            ProviderProfile::for_model("served-model-gamma"),
+            ProviderProfile::OpenAi
+        );
+
+        // A request that entered under the vendor name and had its model id
+        // rewritten to the served name keeps the profile's dynamic tools.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "served-model-alpha",
+            "messages": [
+                {"role": "system", "content": "", "tools": [
+                    {"type": "function", "function": {"name": "get_weather"}}
+                ]},
+                {"role": "user", "content": "hi"}
+            ],
+            "tool_choice": "required"
+        }))
+        .expect("request deserializes");
+        let names: Vec<&str> = request
+            .effective_tools()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["get_weather"]);
+        assert_eq!(request.callable_tools().len(), 1);
+    }
+
+    #[test]
     fn only_the_minimax_profile_parses_tool_calls_without_tools() {
         assert!(ProviderProfile::Minimax.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::Zai.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
+    }
+
+    #[test]
+    fn openai_vendor_models_are_told_apart_from_self_hosted_ones() {
+        for model in [
+            "gpt-4.1",
+            "gpt-5-nano",
+            "GPT-4o-mini",
+            "chatgpt-4o-latest",
+            "o1",
+            "o3-pro-2025-06-10",
+            "o4-mini",
+            "codex-mini-latest",
+            "computer-use-preview",
+            "openai/gpt-4.1",
+            "openrouter/openai/o3",
+        ] {
+            assert!(is_openai_vendor_model(model), "{model}");
+        }
+        for model in [
+            "Qwen/Qwen2.5-14B-Instruct",
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "openai/gpt-oss-120b",
+            "gpt-oss-20b",
+            "olmo-2",
+            "o5",
+            "m1",
+            "",
+        ] {
+            assert!(!is_openai_vendor_model(model), "{model}");
+        }
     }
 
     #[test]

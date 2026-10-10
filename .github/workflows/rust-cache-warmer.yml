@@ -1,0 +1,61 @@
+name: Rust Cache Warmer
+
+# The unit-tests job of PR Test (SMG) restores the Rust cache entry that main
+# saved under the key `unit-tests` and saves nothing itself: the setup-rust
+# action saves on main only, and only from a job that completed. Main's own
+# unit-tests job seldom completes, because the next push to main cancels the
+# run in progress and a flock of merges leaves none of them the time the test
+# build takes, so this workflow builds the workspace's test profile on main on
+# a schedule, with the same action inputs and the same environment the
+# unit-tests job has (the cache key hashes both), and saves the complete entry
+# the pull requests then restore. Its concurrency group is its own, so no merge
+# cancels it, and a run that fails saves nothing (smg-project/smg-lab#157).
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: rust-cache-warmer
+  cancel-in-progress: false
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  warm-unit-tests-cache:
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The same interpreter the unit-tests job builds the Python bindings
+      # against, so the artifacts it restores are the ones it would build.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: unit-tests
+
+      # The same two commands as the unit-tests job's "Build the Rust tests"
+      # step, so the target directory saved at the end of the job is the one
+      # that step would produce.
+      - name: Build the Rust tests
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test --no-run
+          cargo test -p data-connector --test postgres_integration --no-run
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats

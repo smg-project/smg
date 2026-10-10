@@ -1984,6 +1984,23 @@ fn test_custom_tool_grammar_format_round_trip() {
     }
 }
 
+/// A function tool keeps rejecting keys outside its schema (alone and inside
+/// a namespace), as before the function object learned to carry them for the
+/// chat API.
+#[test]
+fn test_function_tool_rejects_unknown_fields() {
+    let function =
+        json!({"type": "function", "name": "f", "parameters": {}, "response": {"type": "dict"}});
+    let namespace =
+        json!({"type": "namespace", "name": "ns", "description": "d", "tools": [function]});
+    for tool in [function, namespace] {
+        let error = serde_json::from_value::<ResponseTool>(tool)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `response`"), "{error}");
+    }
+}
+
 #[test]
 fn test_namespace_tool_with_function_round_trip() {
     // Spec (openai-responses-api-spec.md §tools L475):
@@ -4496,4 +4513,278 @@ fn test_mcp_list_tools_input_item_with_error_round_trip() {
     }
 
     assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
+}
+
+// ============================================================================
+// Request shapes the public API rejects with 400 (smg-lab #134)
+// ============================================================================
+
+fn plain_request(body: serde_json::Value) -> Result<ResponsesRequest, serde_json::Error> {
+    serde_json::from_value(body)
+}
+
+/// The validator's verdict in its debug form (codes and messages): the tests
+/// assert the expected code is in it, which an accepted request (`Ok(())`)
+/// never satisfies.
+fn validation_code(request: &ResponsesRequest) -> String {
+    format!("{:?}", request.validate())
+}
+
+#[test]
+fn unknown_top_level_parameter_is_rejected_at_the_body_parser() {
+    let err = plain_request(json!({"model": "m", "input": "hi", "frobnicate": true}))
+        .expect_err("an unknown top-level parameter must not deserialize");
+    assert!(err.to_string().contains("frobnicate"), "{err}");
+}
+
+#[test]
+fn background_and_the_sampling_extensions_stay_accepted() {
+    let request = plain_request(json!({
+        "model": "m", "input": "hi", "background": true, "stop": ["END"],
+        "top_k": 40, "min_p": 0.05, "repetition_penalty": 1.1,
+        "frequency_penalty": 0.5, "presence_penalty": 0.3
+    }))
+    .expect("declared parameters deserialize");
+    assert_eq!(request.background, Some(true));
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn unknown_input_message_role_is_rejected() {
+    let request = plain_request(json!({
+        "model": "m",
+        "input": [{"type": "message", "role": "robot", "content": "hi"}]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        code.contains("invalid_value") && code.contains("robot"),
+        "{code}"
+    );
+
+    for role in ["assistant", "system", "developer", "user"] {
+        let request = plain_request(json!({
+            "model": "m",
+            "input": [{"type": "message", "role": role, "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok(), "{role} is an input role");
+    }
+}
+
+#[test]
+fn max_output_tokens_below_sixteen_is_rejected() {
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 1})).unwrap();
+    assert!(validation_code(&request).contains("integer_below_min_value"));
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 16})).unwrap();
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn metadata_limits_are_enforced() {
+    let too_many: serde_json::Map<String, serde_json::Value> =
+        (0..17).map(|i| (format!("k{i}"), json!("v"))).collect();
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "metadata": too_many})).unwrap();
+    assert!(validation_code(&request).contains("object_above_max_properties"));
+
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "metadata": {"k": "v".repeat(600)}}))
+            .unwrap();
+    assert!(validation_code(&request).contains("string_above_max_length"));
+
+    let request =
+        plain_request(json!({"model": "m", "input": "hi", "metadata": {"k": "v".repeat(512)}}))
+            .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "512 characters is the maximum, not over it"
+    );
+}
+
+#[test]
+fn function_tool_parameters_must_be_an_object() {
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [{"type": "function", "name": "f", "parameters": "not-an-object"}]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        code.contains("invalid_type") && code.contains("tools[0].parameters"),
+        "{code}"
+    );
+}
+
+/// One of OpenAI's own models: the public API's structured-output rules apply.
+const OPENAI_MODEL: &str = "gpt-4.1";
+/// A self-hosted model: those rules are the engine's business, not the gateway's.
+const SELF_HOSTED_MODEL: &str = "Qwen/Qwen2.5-14B-Instruct";
+
+#[test]
+fn strict_function_schema_needs_additional_properties_false_for_openai_models() {
+    let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [{"type": "function", "name": "f", "strict": true, "parameters": loose}]
+    }))
+    .unwrap();
+    assert!(validation_code(&request).contains("invalid_function_parameters"));
+
+    let pinned = json!({
+        "type": "object",
+        "properties": {"x": {"type": "string"}, "inner": {"type": "object", "properties": {}, "additionalProperties": false}},
+        "additionalProperties": false
+    });
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [{"type": "function", "name": "f", "strict": true, "parameters": pinned}]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok());
+
+    // Not strict: the pin is not required.
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [{"type": "function", "name": "f", "parameters": {"type": "object", "properties": {}}}]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok());
+}
+
+#[test]
+fn strict_function_schema_passes_through_for_self_hosted_models() {
+    let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
+    let request = plain_request(json!({
+        "model": SELF_HOSTED_MODEL, "input": "hi",
+        "tools": [{"type": "function", "name": "f", "strict": true, "parameters": loose}]
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "the engine's grammar compiler decides a self-hosted model's strict schema"
+    );
+}
+
+#[test]
+fn strict_json_schema_text_format_needs_additional_properties_false_for_openai_models() {
+    let body = |model: &str| {
+        json!({
+            "model": model, "input": "Tokyo facts.",
+            "text": {"format": {"type": "json_schema", "name": "bad", "strict": true,
+                     "schema": {"type": "object", "properties": {"x": {"type": "string"}}}}}
+        })
+    };
+    let request = plain_request(body(OPENAI_MODEL)).unwrap();
+    assert!(validation_code(&request).contains("invalid_json_schema"));
+
+    let request = plain_request(body(SELF_HOSTED_MODEL)).unwrap();
+    assert!(request.validate().is_ok(), "passed through to the engine");
+}
+
+#[test]
+fn json_object_format_needs_the_word_json_in_the_prompt_for_openai_models() {
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "Tell me about Tokyo.",
+        "text": {"format": {"type": "json_object"}}
+    }))
+    .unwrap();
+    assert!(validation_code(&request).contains("json_object_requires_json_in_input"));
+
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "Tell me about Tokyo as JSON.",
+        "text": {"format": {"type": "json_object"}}
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok());
+
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "Tell me about Tokyo.", "instructions": "Answer in json.",
+        "text": {"format": {"type": "json_object"}}
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok(), "the instructions count too");
+
+    let request = plain_request(json!({
+        "model": SELF_HOSTED_MODEL, "input": "Tell me about Tokyo.",
+        "text": {"format": {"type": "json_object"}}
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "a self-hosted model's json_object request is passed through"
+    );
+}
+
+#[test]
+fn local_shell_tool_is_rejected() {
+    let request = plain_request(json!({
+        "model": "m", "input": "list files", "tools": [{"type": "local_shell"}]
+    }))
+    .unwrap();
+    assert!(validation_code(&request).contains("tool_not_supported"));
+}
+
+#[test]
+fn top_logprobs_without_include_is_accepted() {
+    let request = plain_request(json!({"model": "m", "input": "hi", "top_logprobs": 5})).unwrap();
+    assert!(request.validate().is_ok());
+}
+
+/// The Response object echoes `tool_choice` as the request sent it, as the
+/// public API does: the object forms stay objects (`{"type": "function",
+/// "name": ...}`, not a string containing that JSON), the bare strings stay
+/// bare strings (`"required"`, not `"\"required\""`), and a request without a
+/// `tool_choice` echoes `"auto"`.
+#[test]
+fn responses_response_echoes_tool_choice_as_sent() {
+    let echo = |request: serde_json::Value| {
+        let request: ResponsesRequest =
+            serde_json::from_value(request).expect("request should deserialize");
+        let wire = serde_json::to_value(
+            ResponsesResponse::builder("resp_tc", "m")
+                .copy_from_request(&request)
+                .build(),
+        )
+        .expect("serialize response");
+        wire["tool_choice"].clone()
+    };
+    let tools = json!([{
+        "type": "function",
+        "name": "get_weather",
+        "parameters": {"type": "object", "properties": {}}
+    }]);
+
+    for choice in [
+        json!({"type": "function", "name": "get_weather"}),
+        json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [{"type": "function", "name": "get_weather"}]
+        }),
+        json!({"type": "web_search"}),
+        json!("required"),
+        json!("none"),
+    ] {
+        let echoed = echo(json!({
+            "model": "m",
+            "input": "hi",
+            "tools": tools,
+            "tool_choice": choice
+        }));
+        assert_eq!(
+            echoed, choice,
+            "tool_choice {choice} must be echoed as sent"
+        );
+    }
+
+    // No tool_choice on the request: the public API's default, with and
+    // without tools (normalisation fills `"auto"` when tools are present).
+    assert_eq!(
+        echo(json!({"model": "m", "input": "hi", "tools": tools})),
+        json!("auto")
+    );
+    assert_eq!(echo(json!({"model": "m", "input": "hi"})), json!("auto"));
 }

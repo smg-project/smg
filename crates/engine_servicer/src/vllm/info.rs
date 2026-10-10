@@ -168,6 +168,10 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         attention_backend: model.attention_backend.clone(),
         pairing_protocol: model.pairing_protocol.clone(),
         block_size,
+        multimodal_encoder_dtype: match model_dtype.strip_prefix("torch.").unwrap_or(&model_dtype) {
+            dtype @ ("float32" | "float16" | "bfloat16") => dtype.to_string(),
+            _ => String::new(),
+        },
         model_dtype,
         shm_namespace_id: model.shm_namespace_id.clone(),
         mm_device_do_normalize: model.mm_device_do_normalize,

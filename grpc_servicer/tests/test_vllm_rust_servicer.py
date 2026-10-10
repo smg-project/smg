@@ -412,9 +412,12 @@ def _config(**overrides):
     )
 
 
-def test_smg_media_options_follow_the_engine_config(tmp_path):
+def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
+    from smg_grpc_servicer.vllm import mm_processor
     from smg_grpc_servicer.vllm.mm_processor import MmSettings
 
+    # The loader's default frame count is vLLM's to tell; none installed here.
+    monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: None)
     settings = MmSettings(processor="smg", max_inflight=3, max_items=2, max_item_bytes=10).resolve(
         env={}
     )
@@ -433,6 +436,8 @@ def test_smg_media_options_follow_the_engine_config(tmp_path):
         "max_items": 2,
         "engine_item_limits": None,
         "max_item_bytes": 10,
+        "video_frame_budget": None,
+        "video_loader_rule": None,
         "source": "flag",
     }
     # The engine's own per-prompt limits ride along for the pipeline to enforce.
@@ -444,6 +449,61 @@ def test_smg_media_options_follow_the_engine_config(tmp_path):
         "image": 8,
         "video": 2,
     }
+    # The engine's video frame budget rides along: its media kwargs when set
+    # (a non-positive count meaning every frame), else the loader's default,
+    # under the same SMG_VLLM_MM_MAX_VIDEO_FRAMES cap as the other processors.
+    monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: 32)
+    monkeypatch.setenv(mm_processor.ENV_MAX_VIDEO_FRAMES, "0")  # no cap
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 32
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"num_frames": 16}}
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 16
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"num_frames": -1}}
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 0
+    # The cap bounds a set count, the loader's default and an unbounded count alike.
+    monkeypatch.setenv(mm_processor.ENV_MAX_VIDEO_FRAMES, "8")
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"num_frames": 16}}
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"num_frames": 4}}
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 4
+    config.model_config.multimodal_config.media_io_kwargs = {}
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    # A loader of its own (video_backend in the kwargs or the environment) or a
+    # frame rate above zero, which thins by duration: rules the pipeline cannot
+    # follow go along by name, and the pipeline refuses them only for a family
+    # that samples the way the loader does. The budget rides along regardless.
+
+    def rule():
+        return rust.smg_media_options(config, settings, str(tmp_path))["video_loader_rule"]
+
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "x"}}
+    assert rule() == "--media-io-kwargs video.video_backend=x"
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "opencv"}}
+    assert rule() is None, "the default loader by name is no rule"
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": 1}}
+    assert rule() == "--media-io-kwargs video.fps=1"
+    for no_cap in (-1, 0, "0"):
+        config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": no_cap}}
+        assert rule() is None, f"fps={no_cap!r} thins nothing"
+    config.model_config.multimodal_config.media_io_kwargs = {}
+    monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv_dynamic")
+    assert rule() == "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic"
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"fps": 2}}
+    assert rule() == "VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic; --media-io-kwargs video.fps=2"
+    # vLLM takes the kwarg over the environment: a kwarg naming opencv silences
+    # a fleet-wide VLLM_VIDEO_LOADER_BACKEND, and a foreign kwarg is the rule
+    # whatever the environment says.
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "opencv"}}
+    assert rule() is None
+    monkeypatch.setenv("VLLM_VIDEO_LOADER_BACKEND", "opencv")
+    config.model_config.multimodal_config.media_io_kwargs = {"video": {"video_backend": "x"}}
+    assert rule() == "--media-io-kwargs video.video_backend=x"
+    config.model_config.multimodal_config.media_io_kwargs = {}
+    assert rule() is None
+    assert rust.smg_media_options(config, settings, str(tmp_path))["video_frame_budget"] == 8
+    monkeypatch.delenv("VLLM_VIDEO_LOADER_BACKEND", raising=False)
+    monkeypatch.delenv(mm_processor.ENV_MAX_VIDEO_FRAMES, raising=False)
     # A local model directory with its config is the pipeline's config source.
     (tmp_path / "config.json").write_text("{}")
     config.model_config.model = str(tmp_path)

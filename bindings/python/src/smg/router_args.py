@@ -166,7 +166,6 @@ class RouterArgs:
     # Tokenizer cache configuration
     tokenizer_cache_enable_l0: bool = False
     tokenizer_cache_l0_max_entries: int = 10000
-    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
     tokenizer_cache_enable_l1: bool = False
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     # Parser configuration
@@ -330,6 +329,16 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_enabled: bool = False
     tenant_rate_limit_config: str | None = None
+    # Heap profiles of the router process (a jemalloc-profiling build); appended
+    # last: positional callers bind the fields by position
+    jemalloc_prof_dir: str | None = None
+    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
+    mesh_tls_ca_cert: str | None = None
+    mesh_tls_cert: str | None = None
+    mesh_tls_key: str | None = None
+    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
+    # appended last for the same reason
+    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
 
     @staticmethod
     def add_cli_args(
@@ -366,6 +375,9 @@ class RouterArgs:
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
             "Prometheus Metrics", "Metrics export configuration"
+        )
+        profiling_group = parser.add_argument_group(
+            "Profiling", "Heap profiles of the router process"
         )
         request_group = parser.add_argument_group(
             "Request Handling", "Request timeout and ID configuration"
@@ -1377,7 +1389,9 @@ class RouterArgs:
             help=(
                 "Accept an extra client-facing model name for a served model."
                 " Format: <alias>=<canonical>. Repeat for multiple aliases."
-                " Matching is case-sensitive."
+                " Matching is case-sensitive. A vendor-named alias (kimi-*,"
+                " minimax-*, ...) also gives the served model that vendor's"
+                " contract profile under both names."
             ),
         )
         # Prometheus configuration
@@ -1406,6 +1420,17 @@ class RouterArgs:
             nargs="+",
             action="extend",
             help="Buckets for Prometheus duration metrics",
+        )
+        profiling_group.add_argument(
+            f"--{prefix}jemalloc-prof-dir",
+            type=str,
+            default=None,
+            help=(
+                "Directory where POST /heap_profile (an admin route) writes a jemalloc heap"
+                " profile of the router. Needs a build with the jemalloc-profiling feature,"
+                " started with _RJEM_MALLOC_CONF=prof:true,prof_active:true; unset, the route"
+                " answers 404"
+            ),
         )
 
         # Request handling configuration
@@ -1725,7 +1750,7 @@ class RouterArgs:
             default=RouterArgs.tokenizer_cache_l0_max_memory,
             help="Maximum memory for L0 tokenizer cache in bytes: texts, ids and per-entry overhead (default: 256MB)",
         )
-        parser.add_argument(
+        tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-l1-max-memory",
             type=int,
             default=RouterArgs.tokenizer_cache_l1_max_memory,
@@ -2071,6 +2096,28 @@ class RouterArgs:
             action="extend",
             default=[],
             help="Peer mesh server addresses to join (format: host:port)",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-ca-cert",
+            type=str,
+            default=None,
+            help=(
+                "CA certificate (PEM) the mesh peers' certificates chain to. With"
+                " --mesh-tls-cert and --mesh-tls-key the mesh listener serves TLS and requires"
+                " peer certificates, and every dial presents this node's."
+            ),
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-cert",
+            type=str,
+            default=None,
+            help="This mesh node's certificate (PEM), with the node's IP as a SAN",
+        )
+        mesh_group.add_argument(
+            f"--{prefix}mesh-tls-key",
+            type=str,
+            default=None,
+            help="This mesh node's private key (PKCS#8 PEM)",
         )
 
     @classmethod

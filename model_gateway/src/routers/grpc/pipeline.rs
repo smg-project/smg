@@ -10,7 +10,10 @@
 //! The plan is held until the retry window closes (first non-retryable
 //! response).
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::response::{IntoResponse, Response};
 use openai_protocol::{
@@ -117,6 +120,9 @@ pub(crate) struct PipelineDeps {
     /// `None` when tenant rate limiting is disabled; read only by the
     /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// `--queue-timeout-secs`: a request still ahead of worker selection this
+    /// long after the gateway accepted it is refused instead of dispatched.
+    queue_timeout: Duration,
 }
 
 impl PipelineDeps {
@@ -135,6 +141,7 @@ impl PipelineDeps {
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        queue_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
@@ -145,6 +152,7 @@ impl PipelineDeps {
             configured_tool_parser,
             configured_reasoning_parser,
             rate_limit_manager,
+            queue_timeout,
         }
     }
 
@@ -155,6 +163,7 @@ impl PipelineDeps {
         policy_registry: Arc<PolicyRegistry>,
         prefill_admission: Option<Arc<PrefillAdmission>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        queue_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
@@ -165,6 +174,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager,
+            queue_timeout,
         }
     }
 
@@ -230,6 +240,7 @@ impl PipelineDeps {
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager: None,
+            queue_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -289,7 +300,8 @@ impl RequestPipeline {
             deps.policy_registry.clone(),
             mode.worker_selection(),
             deps.prefill_admission.clone(),
-        );
+        )
+        .with_queue_timeout(deps.queue_timeout);
         let plan_kind = mode.plan_kind();
         let inject_pd_metadata = mode.inject_pd_metadata();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
@@ -600,12 +612,13 @@ impl RequestPipeline {
         metrics_endpoint: Option<&'static str>,
         retry_config: Option<&RetryConfig>,
     ) -> Result<RunOutcome, Response> {
-        if !cache_trace::enabled() {
+        let requested = cache_trace::requested(ctx.input.headers.as_ref());
+        if !cache_trace::enabled() && !requested {
             return self.run_inner(ctx, metrics_endpoint, retry_config).await;
         }
         let root_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref())
             .map(str::to_owned);
-        Box::pin(cache_trace::scope(async {
+        Box::pin(cache_trace::scope(requested, async {
             let result = self.run_inner(ctx, metrics_endpoint, retry_config).await;
             if let Err(response) = &result {
                 cache_trace::failure(root_id.as_deref(), response.status().as_u16());
@@ -730,6 +743,20 @@ impl RequestPipeline {
                     self.record_retries_exhausted(endpoint);
                 }
                 return Err(failure);
+            }
+
+            // The retry re-selects away from the engines this attempt used,
+            // while another available worker is left to take the request.
+            let engines: Vec<String> = dctx
+                .workers
+                .iter()
+                .flat_map(WorkerSelection::engines)
+                .map(str::to_string)
+                .collect();
+            for engine in engines {
+                if !dctx.tried.contains(&engine) {
+                    dctx.tried.push(engine);
+                }
             }
 
             let next_attempt = attempt + 1;
@@ -1589,7 +1616,13 @@ mod alias_pipeline_tests {
             .unwrap();
 
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None, None);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            policy_registry,
+            None,
+            None,
+            Duration::from_secs(60),
+        );
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
             tokenizer_registry,
@@ -2077,8 +2110,24 @@ mod request_release_tests {
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             prefill_admission,
             None,
+            Duration::from_secs(60),
         );
         RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
+    }
+
+    fn completion_pipeline_with_policy(
+        worker_registry: &Arc<WorkerRegistry>,
+        policy: PolicyConfig,
+    ) -> RequestPipeline {
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(policy)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline")
     }
 
     fn fast_retry_config(max_retries: u32) -> RetryConfig {
@@ -2089,6 +2138,70 @@ mod request_release_tests {
             backoff_multiplier: 1.0,
             jitter_factor: 0.0,
         }
+    }
+
+    /// A request pinned by a routing key whose engine cannot start it
+    /// (UNAVAILABLE) is retried on another engine, not replayed on the one
+    /// that just refused: one call there, one on the other engine, 200.
+    #[tokio::test]
+    async fn a_pinned_retry_moves_to_another_engine_after_an_unavailable_start() {
+        let seen_refusing = Arc::new(Mutex::new(Vec::new()));
+        let seen_serving = Arc::new(Mutex::new(Vec::new()));
+        let refusing_port = spawn_stub(GatedScheduler {
+            fail_always: true,
+            seen_request_ids: Arc::clone(&seen_refusing),
+            ..Default::default()
+        })
+        .await;
+        let serving_port = spawn_stub(GatedScheduler {
+            seen_request_ids: Arc::clone(&seen_serving),
+            ..Default::default()
+        })
+        .await;
+        let calls =
+            |seen: &Mutex<Vec<String>>| seen.lock().unwrap_or_else(PoisonError::into_inner).len();
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, refusing_port, WorkerType::Regular);
+        register_worker(&worker_registry, serving_port, WorkerType::Regular);
+        let pipeline =
+            completion_pipeline_with_policy(&worker_registry, PolicyConfig::ConsistentHashing);
+        let components = components(worker_registry).await;
+        let retry = fast_retry_config(3);
+
+        // Keys hash to either engine; the first one owned by the refusing
+        // engine is the case under test (the others succeed in one call).
+        for key in (0..64).map(|i| format!("session-{i}")) {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            let refused_before = calls(&seen_refusing);
+            let served_before = calls(&seen_serving);
+            let response = pipeline
+                .execute_completion(
+                    completion_request(false),
+                    Some(headers),
+                    MODEL.to_string(),
+                    Arc::clone(&components),
+                    None,
+                    None,
+                    Some(&retry),
+                )
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK, "key {key}");
+            let refused_now = calls(&seen_refusing) - refused_before;
+            let served_now = calls(&seen_serving) - served_before;
+            if refused_now == 0 {
+                assert_eq!(served_now, 1, "a key owned by the serving engine: one call");
+                continue;
+            }
+            assert_eq!(
+                refused_now, 1,
+                "the refusing engine sees the request once, not once per retry"
+            );
+            assert_eq!(served_now, 1, "the retry landed on the other engine");
+            return;
+        }
+        panic!("no key hashed to the refusing engine");
     }
 
     async fn run_and_drain(
@@ -2502,6 +2615,57 @@ mod request_release_tests {
             } else {
                 assert!(trace_header.is_none());
             }
+        }
+    }
+
+    /// `x-smg-cache-trace: 1` on a request returns that request's decision
+    /// record, with the chosen worker, whatever the process switches say.
+    #[tokio::test]
+    async fn a_request_header_opts_into_the_decision_record_with_its_worker() {
+        let port = spawn_stub(GatedScheduler::default()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-cache-trace", http::HeaderValue::from_static("1"));
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                Some(headers),
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let trace: serde_json::Value =
+            serde_json::from_str(response.headers()["x-smg-cache-trace"].to_str().unwrap())
+                .unwrap();
+        assert_eq!(trace["attempt"], 0);
+        assert_eq!(trace["selections"][0]["worker"], worker.url());
+        assert_eq!(trace["selections"][0]["origin"], "policy");
+        assert!(trace["selections"][0].get("candidates").is_none());
+        assert_eq!(response.headers()["x-smg-routed-worker-id"], worker.url());
+
+        // Without the request header the process switches decide, as before.
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        if !std::env::var("SMG_CACHE_TRACE_HEADER").is_ok_and(|v| v == "1") {
+            assert!(response.headers().get("x-smg-cache-trace").is_none());
         }
     }
 
@@ -3072,6 +3236,7 @@ mod request_release_tests {
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
             None,
             None,
+            Duration::from_secs(60),
         );
         let pipeline =
             RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");

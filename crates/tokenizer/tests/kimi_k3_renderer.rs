@@ -240,6 +240,30 @@ fn k3_tokenizer_reports_raw_tool_call_arguments() {
     assert!(!caps.native_assistant_continuation, "{caps:?}");
 }
 
+/// The K3 tokenizer hands the gateway the renderer's own thinking decision
+/// (a typed `disabled` beats an effort word; `none` switches it off), a
+/// Jinja-less mock has no rule of its own.
+#[test]
+fn k3_tokenizer_answers_the_renderer_s_thinking_mode() {
+    let (_dir, tok) = k3_tokenizer_without_chat_template();
+    let high = HashMap::from([("reasoning_effort".to_string(), json!("high"))]);
+    assert_eq!(
+        tok.native_thinking_mode(Some(&high), Some(false)),
+        Some(false)
+    );
+    assert_eq!(tok.native_thinking_mode(Some(&high), None), Some(true));
+    let none = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
+    assert_eq!(
+        tok.native_thinking_mode(Some(&none), Some(true)),
+        Some(false)
+    );
+    assert_eq!(tok.native_thinking_mode(None, None), Some(true));
+    assert_eq!(
+        llm_tokenizer::MockTokenizer::new().native_thinking_mode(Some(&high), Some(false)),
+        None
+    );
+}
+
 /// An image part is exactly one `<|media_pad|>` id at its authored position:
 /// the text ids on either side are untouched and no separator is added.
 #[test]
@@ -288,6 +312,46 @@ fn image_part_adds_exactly_one_anchor_token() {
         };
         assert_eq!(beside, neighbour);
     }
+}
+
+/// A `<|media_pad|>` spelling typed in user text is text, as the checkpoint's
+/// own encoder renders it (the ids below are its user segment for this
+/// message): the anchor id comes from an image part only.
+#[test]
+fn media_anchor_spelling_in_user_text_stays_text() {
+    let model_dir = common::ensure_kimi_k3_cached();
+    let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
+    let anchor = tok.token_to_id("<|media_pad|>").expect("anchor id");
+    let ids = |content: Value| {
+        let messages = vec![json!({"role": "user", "content": content})];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            thinking: Some(false),
+            ..Default::default()
+        };
+        let rendered = tok
+            .apply_chat_template_with_encoding(&messages, params, None)
+            .expect("render should succeed");
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("K3 must defer its encode");
+        };
+        job.run().expect("encode").token_ids().to_vec()
+    };
+
+    let typed = ids(json!("hello <|media_pad|> world"));
+    assert!(!typed.contains(&anchor), "{typed:?}");
+    let spelled = [22931, 22652, 13634, 49974, 91, 29, 2695];
+    assert!(
+        typed.windows(spelled.len()).any(|window| window == spelled),
+        "{typed:?}"
+    );
+
+    let with_image = ids(json!([
+        {"type": "text", "text": "hello <|media_pad|> world"},
+        {"type": "image"}
+    ]));
+    assert_eq!(with_image.iter().filter(|&&id| id == anchor).count(), 1);
+    assert_eq!(with_image.len(), typed.len() + 1, "{with_image:?}");
 }
 
 /// Token-id parity with the checkpoint's own `apply_chat_template(tokenize=True)`
@@ -368,4 +432,54 @@ fn segment_encoding_matches_vendor_token_ids() {
             "case {name}: flat encoding parity unexpected"
         );
     }
+}
+
+/// The checkpoint tokenizer encodes a text in 400,000-character windows, so
+/// a longer text's ids are not the whole text's: the merge across the seam
+/// does not happen (`" dog"` at the seam becomes `" "` + `"dog"`), on the
+/// plain encode and inside the rendered prompt alike. Counts and ids from
+/// the `tiktoken` library with the checkpoint's windows on the same text.
+#[test]
+fn long_text_encodes_in_the_checkpoint_windows() {
+    let model_dir = common::ensure_kimi_k3_cached();
+    let tok = TiktokenTokenizer::from_dir(&model_dir).expect("K3 tokenizer should load");
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(9_000);
+    assert_eq!(text.chars().count(), 405_000);
+
+    let ids = tok.encode(&text, false).expect("encode");
+    let ids = ids.token_ids();
+    assert_eq!(
+        ids.len(),
+        90_002,
+        "one encode of the whole text gives 90,001"
+    );
+    assert_eq!(&ids[88_888..88_894], &[220, 31039, 13, 646, 5072, 16331]);
+    let whole = text.chars().take(400_000).collect::<String>();
+    assert_eq!(
+        tok.encode(&whole, false).expect("encode").token_ids().len(),
+        88_889
+    );
+
+    let messages = vec![json!({"role": "user", "content": text})];
+    let rendered = tok
+        .apply_chat_template_with_encoding(
+            &messages,
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("render should succeed");
+    let PromptEncoding::Deferred(job) = rendered.encoding else {
+        panic!("K3 must defer its encode");
+    };
+    let prompt = job.run().expect("deferred encode should succeed");
+    let prompt = prompt.token_ids();
+    assert!(
+        prompt
+            .windows(ids.len())
+            .any(|window| window[0] == ids[0] && window == ids),
+        "the message's ids are not in the prompt as encoded on their own"
+    );
 }

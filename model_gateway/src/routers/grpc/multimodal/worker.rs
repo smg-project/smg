@@ -13,8 +13,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, registry::modality_limit_override, vision::PreProcessorConfig,
-    MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart, Modality,
-    ModelMetadata, ModelRegistry, MultiModalError, Parallelism, VisionProcessorRegistry,
+    FrameSampling, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
+    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, VisionProcessorRegistry,
     POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
@@ -82,6 +82,38 @@ pub struct WorkerMediaSettings {
     pub max_item_bytes: Option<usize>,
     pub allowed_domains: Option<Vec<String>>,
     pub fetch_timeout: Duration,
+    /// The engine's own video frame budget: its `--media-io-kwargs`
+    /// `video.num_frames` when set (`0` for every frame), else its loader's
+    /// default; `None` when unknown. A spec that samples the way the engine's
+    /// loader does takes it in place of its own constant.
+    pub video_frame_budget: Option<usize>,
+    /// A sampling rule of the engine's loader that the pipeline cannot
+    /// follow, as the launcher names it (`--media-io-kwargs video.fps=2`,
+    /// `VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic`); `None` when the loader
+    /// samples as the pipeline expects. Refused at construction for a spec
+    /// that samples the way the loader does (see `loader_rule_conflict`).
+    pub video_loader_rule: Option<String>,
+}
+
+/// Whether the engine's loader rule the launcher reported (`video.fps`, a
+/// loader other than the default) conflicts with the spec: a spec that samples
+/// the way the loader does would then sample a clip differently from the
+/// engine's own server, so it is refused with the rule named; the rate-based
+/// samplers never followed the loader and keep their rule, so the engine
+/// starts as before.
+fn loader_rule_conflict(
+    rule: Option<&str>,
+    spec_name: &str,
+    sampling: FrameSampling,
+) -> Option<String> {
+    let rule = rule?;
+    matches!(sampling, FrameSampling::UpTo { .. }).then(|| {
+        format!(
+            "{rule} changes how the engine's loader samples a video, and the {spec_name} \
+             pipeline samples the way the loader does; drop it or use --mm-processor \
+             inprocess or redis"
+        )
+    })
 }
 
 /// What set a modality's effective per-request item limit.
@@ -109,6 +141,18 @@ impl ItemLimitSource {
             Self::Spec => "the model spec".to_string(),
         }
     }
+}
+
+/// Whether this pipeline can be handed a video at all: the spec declares the
+/// modality (a text-and-image derivative does not) and the effective limit
+/// leaves room for one (`--limit-mm-per-prompt '{"video": 0}'`, image-only
+/// serving, does not). Such a pipeline never samples a clip, so its engine's
+/// loader rule cannot matter and a fleet-wide loader setting must not keep it
+/// from starting.
+fn serves_video(item_limits: &HashMap<Modality, ItemLimit>) -> bool {
+    item_limits
+        .get(&Modality::Video)
+        .is_some_and(|limit| limit.limit > 0)
 }
 
 /// A modality's effective per-request item limit and what set it.
@@ -322,7 +366,7 @@ impl WorkerMediaPipeline {
             None => loaded,
         };
         let model_registry = Arc::new(ModelRegistry::default());
-        let (spec_name, spec_limits) = {
+        let (spec_name, spec_limits, video_sampling) = {
             let adapter = RegistryTokenizer(tokenizer.as_ref());
             let metadata = ModelMetadata {
                 model_id: &settings.model_id,
@@ -339,7 +383,7 @@ impl WorkerMediaPipeline {
             let limits = spec.modality_limits(&metadata).map_err(|error| {
                 anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
             })?;
-            (spec.name(), limits)
+            (spec.name(), limits, spec.video_frame_sampling())
         };
         let item_limits = effective_item_limits(
             &spec_limits,
@@ -347,6 +391,15 @@ impl WorkerMediaPipeline {
             settings.max_items,
             modality_limit_override,
         );
+        if serves_video(&item_limits) {
+            if let Some(message) = loader_rule_conflict(
+                settings.video_loader_rule.as_deref(),
+                spec_name,
+                video_sampling,
+            ) {
+                anyhow::bail!(message);
+            }
+        }
         let vision_processor_registry = Arc::new(VisionProcessorRegistry::with_defaults());
         if settings.pixel_format == PixelFormat::RawU8 {
             let model_type = loaded.config.get("model_type").and_then(|v| v.as_str());
@@ -389,6 +442,7 @@ impl WorkerMediaPipeline {
                 .collect(),
             processing: MmProcessingMode::Worker,
             inflight: None,
+            video_frame_budget: settings.video_frame_budget,
         };
         Ok(Self {
             components,
@@ -434,6 +488,11 @@ impl WorkerMediaPipeline {
             .collect();
         limits.sort();
         limits.join(", ")
+    }
+
+    /// The engine's video frame budget the pipeline samples under, if known.
+    pub fn video_frame_budget(&self) -> Option<usize> {
+        self.components.video_frame_budget
     }
 
     /// Process one request's references against its prompt, which carries
@@ -753,6 +812,8 @@ mod tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -906,6 +967,8 @@ mod unsupported_model_tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -943,6 +1006,8 @@ mod unsupported_model_tests {
             max_item_bytes: None,
             allowed_domains: None,
             fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
         };
         let message = unsupported_model_message(
             &settings,
@@ -955,5 +1020,53 @@ mod unsupported_model_tests {
              supports: llava, qwen_vl; use --mm-processor inprocess or redis to process media \
              with the engine's own processors, or off (model path: /models/x)"
         );
+    }
+
+    /// A loader rule the pipeline cannot follow refuses only a spec that
+    /// samples the way the loader does; the rate-based samplers never did.
+    #[test]
+    fn a_loader_rule_refuses_only_a_spec_that_samples_like_the_loader() {
+        let loader = FrameSampling::UpTo { max_frames: 32 };
+        let message = loader_rule_conflict(Some("--media-io-kwargs video.fps=2"), "gemma4", loader)
+            .expect("the loader-style spec is refused");
+        assert!(
+            message.starts_with("--media-io-kwargs video.fps=2 changes"),
+            "{message}"
+        );
+        assert!(
+            message.contains("gemma4 pipeline samples the way the loader does"),
+            "{message}"
+        );
+        assert!(message.contains("--mm-processor inprocess"), "{message}");
+        for sampling in [FrameSampling::Even, FrameSampling::Interval] {
+            assert_eq!(
+                loader_rule_conflict(
+                    Some("VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic"),
+                    "qwen3_vl",
+                    sampling
+                ),
+                None,
+                "{sampling:?} never followed the loader"
+            );
+        }
+        assert_eq!(loader_rule_conflict(None, "gemma4", loader), None);
+    }
+
+    /// The loader rule matters only to a pipeline that can be handed a video:
+    /// a spec without the modality or an engine limit of 0 never samples one.
+    #[test]
+    fn the_loader_rule_is_moot_without_video() {
+        let at = |limit| {
+            HashMap::from([(
+                Modality::Video,
+                ItemLimit {
+                    limit,
+                    source: ItemLimitSource::Spec,
+                },
+            )])
+        };
+        assert!(!serves_video(&HashMap::new()), "no video in the spec");
+        assert!(!serves_video(&at(0)), "an engine limit of 0");
+        assert!(serves_video(&at(1)));
     }
 }

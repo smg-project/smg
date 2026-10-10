@@ -262,6 +262,11 @@ fn dispatch() -> context::DispatchMetadata {
 }
 
 fn chat_spec(with_tools: bool) -> ChatResponseSpec {
+    chat_spec_with(with_tools, None)
+}
+
+/// [`chat_spec`] with a `tool_choice` (`"required"`, a named function, ...).
+fn chat_spec_with(with_tools: bool, tool_choice: Option<Value>) -> ChatResponseSpec {
     let mut request = serde_json::json!({
         "model": "eof-test", "messages": [], "stream": true,
         "separate_reasoning": true, "n": 2
@@ -272,6 +277,9 @@ fn chat_spec(with_tools: bool) -> ChatResponseSpec {
                 "name": "lookup", "parameters": {"type": "object", "properties": {}}
             }
         }]);
+    }
+    if let Some(tool_choice) = tool_choice {
+        request["tool_choice"] = tool_choice;
     }
     ChatResponseSpec::from(
         &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
@@ -297,6 +305,15 @@ async fn chat_events(
     with_tools: bool,
     grpc_status: &'static str,
 ) -> (Result<(), String>, Vec<Value>) {
+    chat_events_with_spec(responses, with_tools, chat_spec(with_tools), grpc_status).await
+}
+
+async fn chat_events_with_spec(
+    responses: Vec<proto::GenerateResponse>,
+    with_tools: bool,
+    spec: ChatResponseSpec,
+    grpc_status: &'static str,
+) -> (Result<(), String>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, grpc_status).await;
     let (tx, rx) = sse_channel();
     let result = processor(with_tools)
@@ -305,7 +322,7 @@ async fn chat_events(
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             (None, None, false, false, false),
-            chat_spec(with_tools),
+            spec,
             &tx,
             None,
         )
@@ -373,7 +390,9 @@ async fn chat_role_chunk_goes_out_on_the_first_engine_output() {
     let data = text.trim().strip_prefix("data: ").expect("SSE data line");
     let event: Value = serde_json::from_str(data).expect("SSE JSON");
     assert_eq!(event["choices"][0]["delta"]["role"], "assistant");
-    assert!(event["choices"][0]["delta"]["content"].is_null());
+    // The role chunk carries an empty content, the shape the engines' own
+    // servers send (role once, content ""), not a null.
+    assert_eq!(event["choices"][0]["delta"]["content"], "");
     gate_tx.send(()).expect("open the gate");
     let events = collect_events(rx).await;
     task.await.expect("stream task").expect("stream processed");
@@ -422,6 +441,85 @@ async fn chat_eof_preserves_reasoning_and_normal_tails_per_choice() {
     }
 }
 
+/// A stream carries `role` once, in the first delta the OpenAI API opens a
+/// text stream with (`{"role": "assistant", "content": "", "refusal": null}`,
+/// whether the model then answers with text, reasoning or a tool call it
+/// chose itself); later deltas carry neither the role nor a
+/// `reasoning_content: null` placeholder.
+#[tokio::test]
+async fn chat_stream_sends_role_once_in_an_empty_first_content_delta() {
+    let text = vec![chunk(0, "Hi"), chunk(0, "!"), complete(0, "stop")];
+    let reasoning = vec![chunk(0, "<think>why</think>answer"), complete(0, "stop")];
+    let tool = vec![
+        chunk(0, r#"{"name": "lookup", "arguments": {}}"#),
+        complete(0, "stop"),
+    ];
+    for (frames, with_tools, content) in [
+        (text, false, "Hi!"),
+        (reasoning, false, "answer"),
+        (tool, true, ""),
+    ] {
+        let (result, events) = chat_events(frames, with_tools, "0").await;
+        assert!(result.is_ok(), "{result:?}");
+        let deltas: Vec<&Value> = events
+            .iter()
+            .filter(|event| event["choices"][0]["index"] == 0)
+            .map(|event| &event["choices"][0]["delta"])
+            .collect();
+        assert!(deltas.len() > 2, "{events:?}");
+        assert_eq!(
+            deltas[0],
+            &serde_json::json!({"role": "assistant", "content": "", "refusal": null}),
+            "{events:?}"
+        );
+        for delta in &deltas[1..] {
+            assert!(delta.get("role").is_none(), "role repeated: {events:?}");
+            assert!(
+                delta.get("refusal").is_none(),
+                "refusal repeated: {events:?}"
+            );
+            assert!(
+                delta.get("reasoning_content").is_none_or(Value::is_string),
+                "null reasoning placeholder: {events:?}"
+            );
+        }
+        assert_eq!(chat_text(&events, 0, "content"), content, "{events:?}");
+        assert_eq!(
+            deltas.iter().any(|delta| delta["tool_calls"].is_array()),
+            with_tools,
+            "{events:?}"
+        );
+    }
+}
+
+/// A request that forces a tool call (`tool_choice: "required"`, a named
+/// function) opens as the OpenAI API opens a tool-call stream:
+/// `{"role": "assistant", "content": null}`, no `refusal`; the opening chunk
+/// still goes out on the engine's first output.
+#[tokio::test]
+async fn chat_stream_opens_a_forced_tool_call_with_a_null_content() {
+    for tool_choice in [
+        serde_json::json!("required"),
+        serde_json::json!({"type": "function", "function": {"name": "lookup"}}),
+    ] {
+        let frames = vec![
+            chunk(0, r#"{"name": "lookup", "arguments": {}}"#),
+            complete(0, "stop"),
+        ];
+        let spec = chat_spec_with(true, Some(tool_choice.clone()));
+        let (result, events) = chat_events_with_spec(frames, true, spec, "0").await;
+        assert!(result.is_ok(), "{result:?}");
+        let first = &events[0]["choices"][0];
+        assert_eq!(first["index"], 0, "{events:?}");
+        assert_eq!(
+            first["delta"],
+            serde_json::json!({"role": "assistant", "content": null}),
+            "{tool_choice}: {events:?}"
+        );
+        assert!(first["logprobs"].is_null() && first["finish_reason"].is_null());
+    }
+}
+
 #[tokio::test]
 async fn chat_eof_tail_passes_through_buffered_tool_text_in_order() {
     let (result, events) = chat_events(
@@ -435,6 +533,105 @@ async fn chat_eof_tail_passes_through_buffered_tool_text_in_order() {
     assert!(events
         .iter()
         .all(|event| event["choices"][0]["delta"]["tool_calls"].is_null()));
+}
+
+/// The Kimi K3 parsers on an output `max_tokens` cuts inside the turn's closing
+/// structure: no marker reaches the content, streamed or whole.
+#[tokio::test]
+async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_content() {
+    // Thinking off: the prompt opened the response channel; the model answers and
+    // closes the turn, one marker a token. Cut after 8 of the 10 tokens the client
+    // used to receive `Pong.<|close|>message` (smg-lab #115); after 6, and at the
+    // natural end, `Pong.`.
+    let tokens = [
+        "P",
+        "ong",
+        ".",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+    ];
+    for (cut, finish) in [(6, "length"), (8, "length"), (9, "stop")] {
+        let text: String = tokens[..cut].concat();
+        let resolver = || {
+            utils::ParserResolver::new(
+                Arc::new(WorkerRegistry::new()),
+                Some("kimi_k3".to_string()),
+                Some("kimi_k3".to_string()),
+            )
+        };
+        // Streamed, a chunk per token.
+        let mut frames: Vec<_> = tokens[..cut].iter().map(|token| chunk(0, token)).collect();
+        frames.push(complete(0, finish));
+        let (stream, server) = scripted_stream(frames, "0").await;
+        let (tx, rx) = sse_channel();
+        let processor = StreamingProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            resolver(),
+            "vllm",
+        );
+        let result = processor
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                chat_spec(false),
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "Pong.",
+            "streamed, cut after {cut} tokens"
+        );
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), "");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["choices"][0]["finish_reason"] == finish),
+            "{events:?}"
+        );
+        // Whole, the non-streaming path.
+        let mut last = complete(0, finish);
+        if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+            complete.output_ids = text.chars().map(u32::from).collect();
+        }
+        let (stream, server) = scripted_stream(vec![chunk(0, &text), last], "0").await;
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+        let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+        let response = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            resolver(),
+        )
+        .process_non_streaming_chat_response(
+            context::ExecutionResult::Single { stream },
+            chat_spec(false),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+            false,
+        )
+        .await
+        .unwrap_or_else(|response| panic!("{}", response.status()));
+        server.abort();
+        let response = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            response["choices"][0]["message"]["content"], "Pong.",
+            "whole, cut after {cut} tokens"
+        );
+        assert_eq!(response["choices"][0]["finish_reason"], finish);
+    }
 }
 
 #[tokio::test]
@@ -561,6 +758,67 @@ async fn chat_usage_chunk_excludes_unbilled_prompt_tokens() {
             usage["total_tokens"],
             usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap()
         );
+    }
+}
+
+/// The engine on this path does not count reasoning tokens; the gateway's
+/// reasoning parser does, and reports them whenever it ran (zero included),
+/// as an engine with a reasoning parser does.
+#[tokio::test]
+async fn chat_usage_counts_the_tokens_the_reasoning_parser_split_off() {
+    for (texts, reasoning, expected) in [
+        (vec!["<think>", "ab", "</think>", "de"], "ab", 2),
+        // Both delimiters in the reasoning chunk, alone and with content:
+        // they are not reasoning tokens.
+        (vec!["<think>ab</think>", "de"], "ab", 2),
+        (vec!["<think>ab</think>de"], "ab", 2),
+        (vec!["hi"], "", 0),
+    ] {
+        let mut responses: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
+        responses.push(complete(0, "stop"));
+        let (stream, server) = scripted_stream(responses, "0").await;
+        let (tx, rx) = sse_channel();
+        let request = serde_json::json!({
+            "model": "eof-test", "messages": [], "stream": true,
+            "separate_reasoning": true,
+            "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+        });
+        let spec = ChatResponseSpec::from(
+            &serde_json::from_value::<ChatCompletionRequest>(request).expect("chat request"),
+        );
+        let result = processor(false)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "reasoning_content"), reasoning);
+        let usage = &events.last().expect("final usage event")["usage"];
+        assert_eq!(
+            usage["completion_tokens_details"]["reasoning_tokens"], expected,
+            "{usage}"
+        );
+        // The continuous usage never counts fewer reasoning tokens than the
+        // chunk before it: the content chunk after a crossed delimiter agrees
+        // with the reasoning chunk of its frame.
+        let mut last = 0;
+        for event in &events {
+            if let Some(count) =
+                event["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64()
+            {
+                assert!(count >= last, "reasoning count fell from {last}: {event}");
+                last = count;
+            }
+        }
     }
 }
 
@@ -794,7 +1052,12 @@ async fn deepseek_usage_rides_on_the_last_finish_chunk() {
                 last["usage"]["prompt_tokens_details"]["cached_tokens"],
                 8.min(10 - unbilled)
             );
-            assert!(last["usage"]["completion_tokens_details"]["reasoning_tokens"].is_null());
+            // The six tokens of `reason` per choice, split out of the one
+            // chunk by the gateway's reasoning parser.
+            assert_eq!(
+                last["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                6 * choices
+            );
             for event in &events[..events.len() - 1] {
                 if options["include_usage"] == true {
                     assert_eq!(event.get("usage"), Some(&Value::Null), "{event}");

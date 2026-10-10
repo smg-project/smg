@@ -146,7 +146,7 @@ MODEL_SPECS: dict[str, dict] = {
             '{"enable_in_reasoning": true}',
         ],
     },
-    # Vision-language model for multimodal benchmarks (MMMU)
+    # Vision-language model for the multimodal chat tests
     "Qwen/Qwen3-VL-8B-Instruct": {
         "model": _resolve_model_path("Qwen/Qwen3-VL-8B-Instruct"),
         "tp": 1,

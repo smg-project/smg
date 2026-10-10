@@ -9,7 +9,9 @@ smg --worker-urls grpc://engine:50051 \
   --reasoning-parser kimi_k3
 ```
 
-Detection uses the requested model card, including registered aliases, rather than another card on the same worker. Precise K3 metadata takes precedence over name inference. Without recognized metadata, existing canonical model-name rules apply; a single-model worker's discovered model path is also a fallback. Shared architectures such as `KimiLinearForCausalLM` do not imply K3. Replicas with inconsistent resolved contracts return HTTP 503 (`model_profile_conflict`) before dispatch.
+Detection uses the requested model card, including registered aliases, rather than another card on the same worker. Precise K3 metadata takes precedence over name inference. After precise metadata, detection checks the canonical model name, then a single-model worker's discovered model path, then the configured alias's provider family. Shared architectures such as `KimiLinearForCausalLM` do not imply K3. Replicas with inconsistent resolved contracts return HTTP 503 (`model_profile_conflict`) before dispatch.
+
+Compatibility: configured vendor-named aliases retain the provider-family fallback. An alias alone does not establish version-specific K3, GLM or DeepSeek rules; deployments with generic serving names must advertise the real model's architecture, type or path. A client-provided alias cannot override a recognized worker identity.
 
 The resolved contract remains internal through model-name rewrites and request clones. It controls validation, defaults, dynamic tools and response tool-call IDs: K3 uses `<name>_<ordinal>`, other Kimi models use `functions.<name>:<ordinal>`, and other profiles use OpenAI-style IDs. Client JSON cannot override the internal selection, and internal metadata is never serialized to the backend.
 

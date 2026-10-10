@@ -705,9 +705,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             GetServerInfoResponse protobuf
         """
         facts = server_facts(self.engine.vllm_config)
-        # The running window is the newest field; a proto package predating
-        # it takes the rest and leaves the Router's admission gate off.
+        # Older proto packages omit newer metadata fields; set them below
+        # only when their descriptors support them.
         max_num_seqs = facts.pop("max_num_seqs", 0)
+        encoder_dtype = facts.pop("multimodal_encoder_dtype", "")
         mm_processor = ""
         mm_media_ref_schemes = ""
         # A --language-model-only engine accepts no multimodal inputs, so it
@@ -734,6 +735,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # engine raw pixels; likewise absent from an older proto package.
         if "mm_device_do_normalize" in info.DESCRIPTOR.fields_by_name:
             info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
+        if "multimodal_encoder_dtype" in info.DESCRIPTOR.fields_by_name:
+            info.multimodal_encoder_dtype = encoder_dtype
         if max_num_seqs and "max_num_seqs" in info.DESCRIPTOR.fields_by_name:
             info.max_num_seqs = max_num_seqs
         # The engine's own per-prompt media limits, for the Router's media

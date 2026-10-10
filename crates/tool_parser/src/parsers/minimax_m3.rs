@@ -46,7 +46,7 @@ const MIXED_TEXT_FIELD: &str = "$text";
 /// - Parameters are expressed with parameter-name XML tags and may nest
 ///   recursively to form objects and arrays.
 ///
-/// Reference: vLLM `MinimaxM3ToolParser` (`tool_call_start_token =
+/// Reference: the serving engine's `MinimaxM3ToolParser` (`tool_call_start_token =
 /// "]<]minimax[>[<tool_call>"`).
 pub struct MinimaxM3Parser {
     // Streaming state

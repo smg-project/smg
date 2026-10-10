@@ -93,6 +93,7 @@ fn test_functions_normalizes_to_tools() {
             description: Some("Test function".to_string()),
             parameters: json!({}),
             strict: None,
+            extra: Default::default(),
         }]),
         tools: None,
         ..Default::default()
@@ -173,6 +174,7 @@ fn test_function_call_function_variant_normalizes() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         ..Default::default()
@@ -356,6 +358,7 @@ fn test_tool_choice_function_not_found() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::Function {
@@ -392,6 +395,7 @@ fn test_tool_choice_function_exists_valid() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::Function {
@@ -423,6 +427,7 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -460,6 +465,7 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -492,6 +498,7 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -524,6 +531,7 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -562,6 +570,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
                     description: Some("Get weather".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
             Tool {
@@ -571,6 +580,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
                     description: Some("Get time".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
         ]),
@@ -610,6 +620,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
                     description: Some("Get weather".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
             Tool {
@@ -619,6 +630,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
                     description: Some("Get time".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
         ]),

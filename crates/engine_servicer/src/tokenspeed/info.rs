@@ -77,6 +77,27 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
     let max_total_num_tokens = max_total_num_tokens(state);
     let mut scheduler_info = struct_from_json(&model.scheduler_info_json);
     if let Some(ready) = ready {
+        let epochs = state
+            .engine
+            .client
+            .get()
+            .map(ZmqEngineClient::cache_trace_epochs)
+            .unwrap_or_default();
+        scheduler_info.fields.insert(
+            "cache_trace_epochs".to_string(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::ListValue(
+                    prost_types::ListValue {
+                        values: epochs
+                            .into_iter()
+                            .map(|epoch| prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(epoch)),
+                            })
+                            .collect(),
+                    },
+                )),
+            },
+        );
         scheduler_info.fields.insert(
             "max_total_num_tokens".to_string(),
             number(max_total_num_tokens),

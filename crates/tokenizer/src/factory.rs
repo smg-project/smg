@@ -231,27 +231,35 @@ fn is_likely_sentencepiece(buffer: &[u8]) -> bool {
     false
 }
 
-/// Helper function to discover chat template files in a directory
+/// The chat template file beside a tokenizer, resolved as the engine's own
+/// tokenizer resolves it: `chat_template.jinja` outranks the `chat_template`
+/// field of `tokenizer_config.json`, which transformers' tokenizer reads next.
+/// `chat_template.json` is the processor's legacy template file, which that
+/// tokenizer never reads: a checkpoint may ship it beside a config template
+/// and the two can differ, so it serves only a config without one. Any other
+/// `.jinja` file comes last. `None` leaves the config's template, or none.
 pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
     use std::fs;
 
-    // Priority 1: Look for chat_template.json (contains Jinja in JSON format)
-    let json_template_path = dir.join("chat_template.json");
-    if json_template_path.exists() {
-        return json_template_path.to_str().map(|s| s.to_string());
-    }
-
-    // Priority 2: Look for chat_template.jinja (standard Jinja file)
     let jinja_path = dir.join("chat_template.jinja");
     if jinja_path.exists() {
         return jinja_path.to_str().map(|s| s.to_string());
     }
 
-    // Priority 3: Look for any .jinja file (for models with non-standard naming)
+    if config_has_chat_template(dir) {
+        return None;
+    }
+
+    let json_template_path = dir.join("chat_template.json");
+    if json_template_path.exists() {
+        return json_template_path.to_str().map(|s| s.to_string());
+    }
+
+    // Any .jinja file (for models with non-standard naming)
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".jinja") && name != "chat_template.jinja" {
+                if name.ends_with(".jinja") {
                     return entry.path().to_str().map(|s| s.to_string());
                 }
             }
@@ -259,6 +267,21 @@ pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
     }
 
     None
+}
+
+/// Whether `tokenizer_config.json` in `dir` carries a `chat_template` the
+/// loaders read: a string. A named-template list (the form some checkpoints
+/// ship) is not read by them, so it must not stand in the way of the file
+/// fallbacks.
+fn config_has_chat_template(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .is_some_and(|config| {
+            config
+                .get("chat_template")
+                .is_some_and(serde_json::Value::is_string)
+        })
 }
 
 /// Helper function to resolve and log chat template selection
@@ -742,5 +765,57 @@ mod tests {
         assert!(!is_likely_openai_model("adapter-v2"));
         assert!(!is_likely_openai_model("oracle-7b"));
         assert!(!is_likely_openai_model("open-llama"));
+    }
+
+    /// A checkpoint may ship the processor's legacy `chat_template.json`
+    /// beside a `tokenizer_config.json` template, and the two can differ: the
+    /// tokenizer's own template is what the engine's tokenizer renders with, a
+    /// `chat_template.jinja` outranks it, and the legacy file serves a config
+    /// without one.
+    #[test]
+    fn discovery_prefers_the_tokenizer_s_own_template_over_the_legacy_processor_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let discover = |path: &std::path::Path| super::discover_chat_template_in_dir(path);
+        std::fs::write(
+            path.join("chat_template.json"),
+            r#"{"chat_template": "processor"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"chat_template": "tokenizer"}"#,
+        )
+        .unwrap();
+        assert_eq!(discover(path), None);
+
+        std::fs::write(path.join("chat_template.jinja"), "file").unwrap();
+        assert_eq!(
+            discover(path).as_deref(),
+            path.join("chat_template.jinja").to_str()
+        );
+
+        std::fs::remove_file(path.join("chat_template.jinja")).unwrap();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"tokenizer_class": "PreTrainedTokenizerFast"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            discover(path).as_deref(),
+            path.join("chat_template.json").to_str()
+        );
+
+        // A named-template list in the config is not a template the loaders
+        // read, so the legacy file still serves such a checkpoint.
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"chat_template": [{"name": "default", "template": "a"}, {"name": "tool_use", "template": "b"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            discover(path).as_deref(),
+            path.join("chat_template.json").to_str()
+        );
     }
 }

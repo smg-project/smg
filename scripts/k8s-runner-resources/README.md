@@ -151,7 +151,7 @@ helm upgrade --install 4-gpu-h100 \
 `bellwether-record` runs bellwether's `record` workflow, one job per checkpoint group. It is registered to the
 `bellwether` repository alone, so no organization runner group is involved. Its pods have 8 CPU, 64 GiB and a
 40 GiB disk request, with no docker and no credentials, since the repository is public. They prefer CPU-only nodes
-and overflow onto GPU nodes.
+and overflow onto the tainted nodes the values file tolerates.
 
 ```bash
 helm upgrade --install bellwether-record \

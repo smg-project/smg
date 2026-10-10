@@ -63,6 +63,7 @@ fn request(model: &str, fields: Value) -> Request<Body> {
         .unwrap()
 }
 
+/// An opaque public endpoint must enforce the canonical model's sampling rules.
 #[tokio::test]
 async fn opaque_alias_enforces_canonical_kimi_k3_sampling() {
     let port = 19870;
@@ -91,6 +92,7 @@ fn k3_card(model: &str, alias: &str) -> ModelCard {
     card
 }
 
+/// Architecture-only and type-only discovery both identify a generically named K3.
 #[tokio::test]
 async fn worker_metadata_enforces_k3_sampling_for_generic_serving_names() {
     let port = 19871;
@@ -120,6 +122,7 @@ async fn worker_metadata_enforces_k3_sampling_for_generic_serving_names() {
     }
 }
 
+/// Precise discovery must win over an older Kimi name used for serving.
 #[tokio::test]
 async fn architecture_takes_precedence_over_serving_name() {
     let port = 19872;
@@ -139,6 +142,7 @@ async fn architecture_takes_precedence_over_serving_name() {
     ctx.shutdown().await;
 }
 
+/// Trusted discovery retains dynamic tools while ignoring client profile overrides.
 #[tokio::test]
 async fn discovered_profile_keeps_dynamic_tools_and_cannot_be_spoofed_by_client_json() {
     use crate::common::mock_worker::{set_request_recorder, RequestRecorder};
@@ -180,6 +184,7 @@ async fn discovered_profile_keeps_dynamic_tools_and_cannot_be_spoofed_by_client_
     ctx.shutdown().await;
 }
 
+/// Exceeding the retry buffer cap must not skip vendor validation.
 #[tokio::test]
 async fn large_http_request_cannot_bypass_a_discovered_contract() {
     let port = 19874;
@@ -205,6 +210,7 @@ async fn large_http_request_cannot_bypass_a_discovered_contract() {
     ctx.shutdown().await;
 }
 
+/// Shared or older Kimi architectures and a K3-looking alias do not prove K3.
 #[tokio::test]
 async fn other_kimi_architectures_do_not_select_the_k3_contract() {
     let port = 19875;
@@ -225,6 +231,7 @@ async fn other_kimi_architectures_do_not_select_the_k3_contract() {
     ctx.shutdown().await;
 }
 
+/// GLM defaults must remain the same through public aliases.
 #[tokio::test]
 async fn opaque_glm_alias_keeps_the_canonical_sampling_defaults() {
     use crate::common::mock_worker::{set_request_recorder, RequestRecorder};
@@ -275,6 +282,7 @@ async fn unknown_serving_name_cannot_bypass_a_discovered_contract() {
     ctx.shutdown().await;
 }
 
+/// One model's metadata and worker-level path must not leak to a sibling card.
 #[tokio::test]
 async fn multi_model_worker_uses_only_the_requested_card() {
     let port = 19878;
@@ -303,6 +311,7 @@ async fn multi_model_worker_uses_only_the_requested_card() {
     ctx.shutdown().await;
 }
 
+/// Disagreeing replicas must fail consistently before any upstream request.
 #[tokio::test]
 async fn conflicting_replica_contracts_are_rejected_before_dispatch() {
     use crate::common::mock_worker::{set_request_recorder, RequestRecorder};
@@ -351,6 +360,7 @@ async fn real_model_path_is_a_fallback_for_generic_single_model_workers() {
     ctx.shutdown().await;
 }
 
+/// Equivalent contracts tolerate replica-local paths and different discovery sources.
 #[tokio::test]
 async fn equivalent_k3_replicas_accept_different_metadata_sources_and_paths() {
     use crate::common::mock_worker::{set_request_recorder, RequestRecorder};
@@ -422,6 +432,7 @@ async fn cardless_vendor_worker_cannot_bypass_large_request_validation() {
     ctx.shutdown().await;
 }
 
+/// Lazy-discovered cards override the initial wildcard for both HTTP body paths.
 #[tokio::test]
 async fn effective_discovered_cards_select_the_contract() {
     let port = 19885;
@@ -458,6 +469,7 @@ async fn effective_discovered_cards_select_the_contract() {
     ctx.shutdown().await;
 }
 
+/// Replicas with different GLM defaults cannot share one captured contract.
 #[tokio::test]
 async fn conflicting_zai_defaults_are_rejected_before_dispatch() {
     let ports = [19886, 19887];
@@ -477,4 +489,111 @@ async fn conflicting_zai_defaults_are_rejected_before_dispatch() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     ctx.shutdown().await;
+}
+
+/// Typed vendor requests must advance round-robin once, including requests
+/// which would otherwise stream because retries are off or the body is large.
+#[tokio::test]
+async fn vendor_contract_round_robin_uses_every_worker() {
+    use smg::config::RetryConfig;
+
+    use crate::common::mock_worker::{set_request_recorder, RequestRecorder};
+
+    for max_retries in [1, 2] {
+        let ports = [19888, 19889];
+        let recorders: Vec<_> = ports
+            .iter()
+            .map(|&port| {
+                let recorder = RequestRecorder::new();
+                set_request_recorder(port, Arc::clone(&recorder));
+                recorder
+            })
+            .collect();
+        let mut config = TestRouterConfig::round_robin_with_retry(
+            3198,
+            RetryConfig {
+                max_retries,
+                ..Default::default()
+            },
+        );
+        config.max_buffered_request_bytes = 128;
+        let ctx = AppTestContext::new_with_config(
+            config,
+            ports
+                .iter()
+                .copied()
+                .map(TestWorkerConfig::healthy)
+                .collect(),
+        )
+        .await;
+        for port in ports {
+            register_cards(&ctx, port, vec![k3_card("vllm-model", "ocid1.rr")], None);
+        }
+        let app = ctx.create_app();
+        for _ in 0..6 {
+            let response = app
+                .clone()
+                .oneshot(request("ocid1.rr", json!({"padding":"x".repeat(2048)})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let served: Vec<_> = recorders.iter().map(|r| r.bodies().len()).collect();
+        assert_eq!(served, [3, 3], "max_retries {max_retries}");
+        ctx.shutdown().await;
+    }
+}
+
+/// Startup's vendor-family alias must not hide a precise worker model path.
+#[tokio::test]
+async fn worker_paths_take_precedence_over_configured_alias_family() {
+    use openai_protocol::profile::ProviderProfile;
+
+    use crate::common::mock_worker::{set_request_recorder, RequestRecorder};
+
+    for (port, model, alias, path, fields, expected) in [
+        (
+            19890,
+            "alias-path-k3-worker",
+            "kimi-k3-path-public",
+            "/models/Kimi-K3",
+            json!({"temperature":1.1}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            19891,
+            "alias-path-glm-worker",
+            "glm-4.7-path-public",
+            "/models/GLM-4.7",
+            json!({}),
+            StatusCode::OK,
+        ),
+    ] {
+        // Test contexts bypass AppContext::from_config; register exactly the
+        // same family fallback the production startup installs.
+        ProviderProfile::register_model_aliases([(alias, model)]);
+        let recorder = RequestRecorder::new();
+        set_request_recorder(port, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(port)]).await;
+        register_cards(
+            &ctx,
+            port,
+            vec![ModelCard::new(model).with_alias(alias)],
+            Some(path),
+        );
+        let response = ctx
+            .create_app()
+            .oneshot(request(alias, fields))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "model {model}");
+        if expected == StatusCode::OK {
+            let body = recorder.only_body();
+            assert_eq!(body["temperature"], 1.0);
+            assert!((body["top_p"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+        } else {
+            assert!(recorder.bodies().is_empty());
+        }
+        ctx.shutdown().await;
+    }
 }

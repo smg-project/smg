@@ -163,9 +163,10 @@ impl MockTokenizer {
         self
     }
 
-    /// Render `{"messages": [...], "add_generation_prompt": bool}` instead of
-    /// the `role: content` lines, so a test can assert on the exact message
-    /// list the template received.
+    /// Render `{"messages": [...], "add_generation_prompt": bool}`, plus
+    /// `"tools": [...]` when the call carries tools, instead of the
+    /// `role: content` lines, so a test can assert on the exact message list
+    /// and tool list the template received.
     pub fn with_json_chat_template(mut self) -> Self {
         self.json_chat_template = true;
         self
@@ -265,11 +266,14 @@ impl TokenizerTrait for MockTokenizer {
         params: ChatTemplateParams,
     ) -> Result<String> {
         if self.json_chat_template {
-            return Ok(serde_json::json!({
+            let mut rendered = serde_json::json!({
                 "messages": messages,
                 "add_generation_prompt": params.add_generation_prompt,
-            })
-            .to_string());
+            });
+            if let Some(tools) = params.tools {
+                rendered["tools"] = serde_json::Value::from(tools.to_vec());
+            }
+            return Ok(rendered.to_string());
         }
         let mut text = String::new();
         for message in messages {

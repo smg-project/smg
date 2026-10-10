@@ -1,11 +1,18 @@
 //! Tenant resolution and request-meta insertion for serving paths.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use axum::{
     body::Body,
     extract::{connect_info::ConnectInfo, Request, State},
-    http::{header::InvalidHeaderName, HeaderMap, HeaderName},
+    http::{header::InvalidHeaderName, Extensions, HeaderMap, HeaderName},
     middleware::Next,
     response::Response,
 };
@@ -15,6 +22,60 @@ use crate::{
     config::{RouterConfig, TenantResolutionConfig},
     tenant::{canonical_tenant_key, DataPlaneCaller, RouteRequestMeta, TenantIdentity, TenantKey},
 };
+
+/// When the gateway took the request in: stamped on the route request meta as
+/// it is built and stamped again when an admission permit is granted
+/// ([`restamp_accepted_at`]), so the bound on the wait ahead of worker
+/// selection measures the time after admission, not the admission queue's
+/// own, bounded wait. Read once: the first worker selection of a request
+/// takes the stamp ([`Self::take_for_selection`]); a later pipeline run of the
+/// same request (the Responses tool loops run the pipeline once per iteration
+/// with the same meta) finds it spent and is not bounded by it.
+#[derive(Clone, Debug)]
+pub struct AcceptedAt {
+    at: Instant,
+    spent: Arc<AtomicBool>,
+}
+
+impl AcceptedAt {
+    /// A stamp taken now.
+    pub fn now() -> Self {
+        Self::at(Instant::now())
+    }
+
+    /// A stamp taken at `at`.
+    pub fn at(at: Instant) -> Self {
+        Self {
+            at,
+            spent: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// When the request was accepted or admitted.
+    pub fn instant(&self) -> Instant {
+        self.at
+    }
+
+    /// The stamp, for the one selection that bounds the request's wait; `None`
+    /// once a selection has taken it, on this meta or any clone of it.
+    pub fn take_for_selection(&self) -> Option<Instant> {
+        (!self.spent.swap(true, Ordering::AcqRel)).then_some(self.at)
+    }
+}
+
+/// Stamp the request's route meta with a fresh [`AcceptedAt`]: called when an
+/// admission permit is granted, so the wait in the admission queue (bounded by
+/// its own timeout) does not count against the bound ahead of worker
+/// selection. `false` when the request carries no route meta.
+pub fn restamp_accepted_at(extensions: &mut Extensions) -> bool {
+    match extensions.get_mut::<RouteRequestMeta>() {
+        Some(meta) => {
+            meta.insert_extension(AcceptedAt::now());
+            true
+        }
+        None => false,
+    }
+}
 
 #[derive(Clone)]
 pub struct TenantResolutionState {
@@ -69,7 +130,8 @@ pub fn resolve_route_request_meta(
     state: &TenantResolutionState,
     request: &Request<Body>,
 ) -> RouteRequestMeta {
-    let meta = RouteRequestMeta::new(resolve_raw_tenant_key(state, request));
+    let meta = RouteRequestMeta::new(resolve_raw_tenant_key(state, request))
+        .with_extension(AcceptedAt::now());
     // Carry the middleware request id so backend request ids derive from it
     // (RequestIdLayer runs outside this middleware).
     match request.extensions().get::<RequestId>() {
@@ -189,6 +251,60 @@ mod tests {
                 .extension::<RequestId>()
                 .map(|request_id| request_id.0.as_str()),
             Some("chatcmpl-abc123")
+        );
+    }
+
+    #[tokio::test]
+    async fn request_meta_is_stamped_with_its_acceptance_time() {
+        let state = resolution_state();
+        let before = Instant::now();
+        let request = Request::builder().uri("/").body(Body::empty()).unwrap();
+
+        let request_meta = resolve_route_request_meta(&state, &request);
+        let accepted = request_meta
+            .extension::<AcceptedAt>()
+            .expect("the meta carries when the gateway accepted the request");
+        assert!(accepted.instant() >= before && accepted.instant() <= Instant::now());
+    }
+
+    /// The first selection takes the stamp; a later pipeline run of the same
+    /// request (a clone of the meta, as the tool loops pass it) finds it spent.
+    #[test]
+    fn the_acceptance_stamp_is_taken_once_across_clones() {
+        let accepted = AcceptedAt::now();
+        let shared = accepted.clone();
+        assert!(accepted.take_for_selection().is_some());
+        assert_eq!(shared.take_for_selection(), None, "spent on the clone too");
+        assert_eq!(accepted.take_for_selection(), None);
+    }
+
+    /// An admission grant replaces the stamp with a fresh, unspent one.
+    #[test]
+    fn an_admission_grant_restamps_the_meta() {
+        let earlier = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(5))
+            .expect("the clock has been running for five seconds");
+        let meta =
+            RouteRequestMeta::new(TenantKey::new("t")).with_extension(AcceptedAt::at(earlier));
+        meta.extension::<AcceptedAt>()
+            .unwrap()
+            .take_for_selection()
+            .expect("the first stamp is fresh");
+        let mut extensions = Extensions::new();
+        extensions.insert(meta);
+
+        assert!(restamp_accepted_at(&mut extensions));
+
+        let stamp = extensions
+            .get::<RouteRequestMeta>()
+            .unwrap()
+            .extension::<AcceptedAt>()
+            .unwrap();
+        assert!(stamp.instant() > earlier, "a fresh stamp");
+        assert!(stamp.take_for_selection().is_some(), "and an unspent one");
+        assert!(
+            !restamp_accepted_at(&mut Extensions::new()),
+            "no meta, nothing to stamp"
         );
     }
 

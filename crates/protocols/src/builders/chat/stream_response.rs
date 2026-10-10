@@ -96,7 +96,9 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
-    /// Add a choice delta that sets `role` and `content`
+    /// Add a choice delta that sets `role` and `content`: a stream's first
+    /// chunk only, since the role is sent once; the content chunks after it
+    /// go through `add_choice_content_with_logprobs`, which sets no role.
     pub fn add_choice_content(
         mut self,
         index: u32,
@@ -118,18 +120,18 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
-    /// Add a choice delta that sets `role`, `content`, and `logprobs`
+    /// Add a choice delta that sets `content` and `logprobs` without a `role`
+    /// (the role is sent once, in the first chunk of the stream)
     pub fn add_choice_content_with_logprobs(
         mut self,
         index: u32,
-        role: impl Into<String>,
         content: impl Into<String>,
         logprobs: Option<crate::common::ChatLogProbs>,
     ) -> Self {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
-                role: Some(role.into()),
+                role: None,
                 content: Some(content.into()),
                 tool_calls: None,
                 reasoning_content: None,
@@ -168,7 +170,7 @@ impl ChatCompletionStreamResponseBuilder {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
-                role: Some("assistant".to_string()),
+                role: None,
                 content: None,
                 tool_calls: Some(vec![ToolCallDelta {
                     index: 0,
@@ -193,7 +195,7 @@ impl ChatCompletionStreamResponseBuilder {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
-                role: Some("assistant".to_string()),
+                role: None,
                 content: None,
                 tool_calls: None,
                 reasoning_content: Some(reasoning.into()),
@@ -215,7 +217,7 @@ impl ChatCompletionStreamResponseBuilder {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
-                role: Some("assistant".to_string()),
+                role: None,
                 content: None,
                 tool_calls: Some(vec![ToolCallDelta {
                     index: 0,
@@ -245,7 +247,7 @@ impl ChatCompletionStreamResponseBuilder {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
-                role: Some("assistant".to_string()),
+                role: None,
                 content: None,
                 tool_calls: Some(vec![tool_call_delta]),
                 reasoning_content: None,

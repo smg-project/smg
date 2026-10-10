@@ -79,6 +79,7 @@ pub fn chat_function_tools(session: &McpToolSession<'_>) -> Vec<Tool> {
                 description: description.map(str::to_string),
                 parameters: schema_to_value(parameters),
                 strict: None,
+                extra: Default::default(),
             },
         })
         .collect()
@@ -95,6 +96,7 @@ pub fn response_tools(session: &McpToolSession<'_>) -> Vec<ResponseTool> {
                     description: description.map(str::to_string),
                     parameters: schema_to_value(parameters),
                     strict: None,
+                    extra: Default::default(),
                 },
             })
         })

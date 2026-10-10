@@ -154,6 +154,7 @@ mod tests {
                 description: None,
                 parameters: value!({"type": "object", "properties": {"patch": {"type": "string"}}}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }

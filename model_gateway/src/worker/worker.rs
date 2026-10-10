@@ -337,6 +337,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         0
     }
 
+    /// Epochs reported during metadata discovery, invalidated after a health
+    /// failure. These are observations, not proof against an undetected restart.
+    fn cache_trace_epochs(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Set the worker's lifecycle status.
     fn set_status(&self, status: WorkerStatus);
 
@@ -908,6 +914,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().spec.models.all().to_vec()
     }
 
+    /// Visit the effective model cards once. The default preserves custom
+    /// `models` implementations; BasicWorker borrows its discovery snapshot
+    /// without cloning. The slice is valid only during the callback.
+    fn with_models(&self, visitor: &mut dyn FnMut(&[ModelCard])) {
+        visitor(&self.models());
+    }
+
     /// Context window (in tokens) this worker advertises for `model_id`, from
     /// the matching model card (falling back to the primary card). `None`
     /// when the worker never advertised one; callers then leave the length
@@ -1356,6 +1369,7 @@ impl RoutingState {
 #[derive(Debug)]
 pub struct WorkerRuntime {
     status: AtomicU8,
+    cache_trace_epochs_valid: AtomicBool,
     consecutive_failures: AtomicUsize,
     consecutive_successes: AtomicUsize,
     total_pending_probes: AtomicUsize,
@@ -1434,6 +1448,10 @@ impl WorkerRuntime {
     pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
         Self {
             status: AtomicU8::new(initial_status as u8),
+            cache_trace_epochs_valid: AtomicBool::new(!matches!(
+                initial_status,
+                WorkerStatus::NotReady | WorkerStatus::Failed
+            )),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_successes: AtomicUsize::new(0),
             total_pending_probes: AtomicUsize::new(0),
@@ -1660,6 +1678,10 @@ impl WorkerRuntime {
     }
 
     pub fn set_status(&self, status: WorkerStatus) {
+        if matches!(status, WorkerStatus::NotReady | WorkerStatus::Failed) {
+            self.cache_trace_epochs_valid
+                .store(false, Ordering::Release);
+        }
         self.status.store(status as u8, Ordering::Release);
     }
 
@@ -2112,6 +2134,23 @@ impl Worker for BasicWorker {
         self.runtime.load().revision()
     }
 
+    fn cache_trace_epochs(&self) -> Vec<String> {
+        if !self
+            .runtime
+            .load()
+            .cache_trace_epochs_valid
+            .load(Ordering::Acquire)
+        {
+            return Vec::new();
+        }
+        self.metadata
+            .spec
+            .labels
+            .get("cache_trace_epochs")
+            .and_then(|epochs| serde_json::from_str(epochs).ok())
+            .unwrap_or_default()
+    }
+
     fn set_status(&self, status: WorkerStatus) {
         self.runtime.load().set_status(status);
         Metrics::set_worker_health(self.url(), status == WorkerStatus::Ready);
@@ -2435,13 +2474,19 @@ impl Worker for BasicWorker {
     }
 
     fn models(&self) -> Vec<ModelCard> {
+        let mut models = Vec::new();
+        self.with_models(&mut |cards| models = cards.to_vec());
+        models
+    }
+
+    fn with_models(&self, visitor: &mut dyn FnMut(&[ModelCard])) {
         let overridden = self.models_override.load();
         let source = if overridden.is_wildcard() {
             self.metadata.spec.models.all()
         } else {
             overridden.all()
         };
-        source.to_vec()
+        visitor(source);
     }
 
     fn context_length(&self, model_id: &str) -> Option<u32> {

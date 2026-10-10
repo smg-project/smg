@@ -80,26 +80,35 @@ async fn test_qwen_xml_streaming_braces_inside_string_do_not_close_object() {
 }
 
 #[tokio::test]
-async fn test_qwen_xml_eos_closes_only_complete_parameter_values() {
-    let input = "<tool_call><function=get_weather><parameter=city>Tokyo</parameter>";
-    for suffix in ["", "<parameter=units>cels"] {
-        assert_streamed_arguments(
-            &format!("{input}{suffix}"),
-            &[("get_weather", json!({"city": "Tokyo"}))],
-            false,
-        )
-        .await;
-    }
-}
-
-#[tokio::test]
-async fn test_qwen_xml_eos_does_not_invent_unfinished_parameter() {
+async fn test_qwen_xml_eos_closes_complete_parameter_values() {
     assert_streamed_arguments(
-        "<tool_call><function=get_weather><parameter=city>Tok",
-        &[("get_weather", json!({}))],
+        "<tool_call><function=get_weather><parameter=city>Tokyo</parameter>",
+        &[("get_weather", json!({"city": "Tokyo"}))],
         false,
     )
     .await;
+}
+
+// String values stream as they are generated, so one the stream ends in is
+// closed with what arrived; a parameter without any value is not invented.
+#[tokio::test]
+async fn test_qwen_xml_eos_closes_a_string_value_still_streaming() {
+    for (input, expected) in [
+        (
+            "<tool_call><function=get_weather><parameter=city>Tok",
+            json!({"city": "Tok"}),
+        ),
+        (
+            "<tool_call><function=get_weather><parameter=city>Tokyo</parameter><parameter=units>cels",
+            json!({"city": "Tokyo", "units": "cels"}),
+        ),
+        (
+            "<tool_call><function=get_weather><parameter=city>\n",
+            json!({}),
+        ),
+    ] {
+        assert_streamed_arguments(input, &[("get_weather", expected)], false).await;
+    }
 }
 
 #[tokio::test]

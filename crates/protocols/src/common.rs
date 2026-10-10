@@ -364,6 +364,57 @@ pub struct JsonSchemaFormat {
     pub strict: Option<bool>,
 }
 
+/// Strict structured outputs (`strict: true`) require every object node of the
+/// schema to pin `additionalProperties: false`, as the public API enforces.
+/// Walks `properties`, `items`, `prefixItems`, `anyOf`/`oneOf`/`allOf`,
+/// `$defs`/`definitions` and `not`; returns the JSON-pointer-like path of the
+/// first object node that lacks the pin.
+pub fn strict_schema_missing_additional_properties(schema: &Value) -> Option<String> {
+    fn walk(node: &Value, path: &str) -> Option<String> {
+        let obj = node.as_object()?;
+        let is_object_node = obj.get("type").and_then(Value::as_str) == Some("object")
+            || obj
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.iter().any(|t| t.as_str() == Some("object")))
+            || (obj.get("type").is_none() && obj.contains_key("properties"));
+        if is_object_node && obj.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return Some(if path.is_empty() {
+                "()".to_string()
+            } else {
+                path.to_string()
+            });
+        }
+        for key in ["properties", "$defs", "definitions"] {
+            if let Some(children) = obj.get(key).and_then(Value::as_object) {
+                for (name, child) in children {
+                    if let Some(found) = walk(child, &format!("{path}/{key}/{name}")) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+            if let Some(children) = obj.get(key).and_then(Value::as_array) {
+                for (index, child) in children.iter().enumerate() {
+                    if let Some(found) = walk(child, &format!("{path}/{key}/{index}")) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        for key in ["items", "not"] {
+            if let Some(child) = obj.get(key) {
+                if let Some(found) = walk(child, &format!("{path}/{key}")) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    walk(schema, "")
+}
+
 /// Shared shape rules for a json_schema format: name non-empty, schema a JSON object.
 pub fn validate_json_schema_shape(
     name: &str,
@@ -596,7 +647,7 @@ fn empty_parameters_schema() -> Value {
 }
 
 /// An explicit `"parameters": null` means the same as omitting the field
-/// (vLLM reads it as "no schema" too), and `null` is not a JSON Schema, so it
+/// (the serving engine reads it as "no schema" too), and `null` is not a JSON Schema, so it
 /// is normalised to the empty schema once here rather than in every consumer:
 /// the structural-tag builders, the JSON-schema constraint and the renderers.
 fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
@@ -620,6 +671,14 @@ pub struct Function {
     pub parameters: Value, // JSON Schema
     /// Whether to enable strict schema adherence (OpenAI structured outputs)
     pub strict: Option<bool>,
+    /// The fields of the function object beyond the ones above, as the request
+    /// carried them and in their order: a vendor's extension, such as the
+    /// `response` schema some tool corpora describe a tool's result with. The
+    /// chat template renders the tool object as given, so they must reach it
+    /// as they reach the engine's own template, and a forwarded request keeps
+    /// them.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -741,7 +800,10 @@ impl Usage {
         // Calling this builder means the backend supplied cache accounting.
         // Zero is therefore evidence of a cold miss, not absence of support,
         // and must remain distinguishable from `prompt_tokens_details: None`.
-        self.prompt_tokens_details = Some(PromptTokenUsageInfo { cached_tokens });
+        self.prompt_tokens_details = Some(PromptTokenUsageInfo {
+            cached_tokens,
+            audio_tokens: None,
+        });
         self
     }
 
@@ -774,12 +836,35 @@ impl Usage {
         }
         self
     }
+
+    /// Every detail counter present, zero where nothing was counted: the
+    /// shape the OpenAI API sends on every chat completion
+    /// (`prompt_tokens_details.{cached_tokens,audio_tokens}` and
+    /// `completion_tokens_details.{reasoning_tokens,audio_tokens,
+    /// accepted_prediction_tokens,rejected_prediction_tokens}`), which typed
+    /// clients read without a presence check. Counters already set are kept.
+    pub fn with_complete_details(mut self) -> Self {
+        let prompt = self
+            .prompt_tokens_details
+            .get_or_insert(PromptTokenUsageInfo {
+                cached_tokens: 0,
+                audio_tokens: None,
+            });
+        prompt.audio_tokens.get_or_insert(0);
+        let completion = self.completion_tokens_details.get_or_insert_default();
+        completion.reasoning_tokens.get_or_insert(0);
+        completion.audio_tokens.get_or_insert(0);
+        completion.accepted_prediction_tokens.get_or_insert(0);
+        completion.rejected_prediction_tokens.get_or_insert(0);
+        self
+    }
 }
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionTokensDetails {
     pub reasoning_tokens: Option<u32>,
+    pub audio_tokens: Option<u32>,
     pub accepted_prediction_tokens: Option<u32>,
     pub rejected_prediction_tokens: Option<u32>,
 }
@@ -795,9 +880,12 @@ pub struct UsageInfo {
     pub prompt_tokens_details: Option<PromptTokenUsageInfo>,
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct PromptTokenUsageInfo {
     pub cached_tokens: u32,
+    #[serde(default)]
+    pub audio_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -953,7 +1041,7 @@ impl<'de> Deserialize<'de> for InputIds {
     }
 }
 
-/// LoRA adapter path - can be single path or batch of paths (SGLang extension)
+/// LoRA adapter path - can be single path or batch of paths (an engine extension)
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum LoRAPath {
@@ -1131,6 +1219,31 @@ mod tests {
         assert_eq!(exact["model"], json!("glm-5.3-flash"));
     }
 
+    /// A tool definition may carry fields the OpenAI schema does not name
+    /// (the `response` schema of a BFCL tool); the typed view keeps them, in
+    /// their order, so the chat template and a forwarded request see the tool
+    /// as the client wrote it.
+    #[test]
+    fn a_function_keeps_the_fields_beyond_the_schema_in_their_order() {
+        let written = json!({
+            "type": "function",
+            "function": {
+                "name": "authenticate",
+                "description": "Authenticate a user.",
+                "parameters": {"type": "object", "properties": {"user": {"type": "string"}}},
+                "response": {"type": "dict", "properties": {"ok": {"type": "boolean"}}},
+                "x_vendor": ["kept", 1]
+            }
+        });
+        let tool: Tool = serde_json::from_value(written.clone()).unwrap();
+        assert_eq!(tool.function.name, "authenticate");
+        assert_eq!(tool.function.extra.len(), 2);
+        assert_eq!(
+            serde_json::to_string(&tool).unwrap(),
+            serde_json::to_string(&written).unwrap()
+        );
+    }
+
     #[derive(Deserialize)]
     struct NullableBoolTest {
         #[serde(default, deserialize_with = "deserialize_null_as_false")]
@@ -1191,7 +1304,10 @@ mod tests {
         let usage = Usage::from_counts(16, 1).with_cached_tokens(0);
         assert!(matches!(
             usage.prompt_tokens_details,
-            Some(PromptTokenUsageInfo { cached_tokens: 0 })
+            Some(PromptTokenUsageInfo {
+                cached_tokens: 0,
+                audio_tokens: None,
+            })
         ));
     }
 

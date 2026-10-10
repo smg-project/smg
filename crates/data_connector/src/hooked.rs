@@ -539,6 +539,46 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    /// The lookup by output item id is a read of the response it finds, so the
+    /// `GetResponse` hooks run on the found response's id, the policy of
+    /// [`get_response`](Self::get_response); no hook operation of its own, so a
+    /// hook that never heard of the lookup still sees it as the response read
+    /// it is. The id has to be found before a hook can judge it, so a read the
+    /// hook rejects is answered as a miss: the caller learns no more about an
+    /// item it may not read than about one that does not exist.
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> ResponseResult<Option<StoredResponse>> {
+        let Some(found) = self.inner.find_response_by_output_item(item_id).await? else {
+            return Ok(None);
+        };
+        let payload = serde_json::to_value(&found.id).unwrap_or_default();
+        let Ok(extra) = run_before(
+            &*self.hook,
+            StorageOperation::GetResponse,
+            &payload,
+            ResponseStorageError::StorageError,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+
+        let result = Some(found);
+        let result_json = serde_json::to_value(&result).unwrap_or_default();
+        run_after(
+            &*self.hook,
+            StorageOperation::GetResponse,
+            &payload,
+            &result_json,
+            &extra,
+        )
+        .await;
+
+        Ok(result)
+    }
+
     async fn list_identifier_responses(
         &self,
         identifier: &str,
@@ -790,6 +830,62 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(hook.before_calls(), 1);
         assert_eq!(hook.after_calls(), 1);
+    }
+
+    fn response_with_output_item(item_id: &str) -> StoredResponse {
+        let mut stored = StoredResponse::new(None);
+        stored.raw_response = json!({
+            "id": "resp_1",
+            "output": [{"type": "message", "id": item_id, "role": "assistant",
+                        "status": "completed", "content": []}]
+        });
+        stored
+    }
+
+    #[tokio::test]
+    async fn hooked_response_output_item_lookup_runs_the_response_read_hooks() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let id = inner
+            .store_response(response_with_output_item("msg_1"))
+            .await
+            .unwrap();
+
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let found = hooked.find_response_by_output_item("msg_1").await.unwrap();
+        assert_eq!(found.map(|r| r.id), Some(id));
+        assert_eq!(hook.before_calls(), 1);
+        assert_eq!(hook.after_calls(), 1);
+
+        // an unknown item reads no response: the hooks do not run
+        let missing = hooked
+            .find_response_by_output_item("msg_unknown")
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+        assert_eq!(hook.before_calls(), 1);
+        assert_eq!(hook.after_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn hooked_response_reject_prevents_output_item_lookup() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        inner
+            .store_response(response_with_output_item("msg_1"))
+            .await
+            .unwrap();
+
+        let hook = Arc::new(MockHook::new());
+        hook.set_reject("denied");
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        // A read the hook rejects is a miss, not an error: the caller cannot
+        // tell a response it may not read from one that does not exist.
+        let denied = hooked.find_response_by_output_item("msg_1").await.unwrap();
+        assert!(denied.is_none());
+        assert_eq!(hook.before_calls(), 1);
+        assert_eq!(hook.after_calls(), 0);
     }
 
     // ── Item tests ───────────────────────────────────────────────────────

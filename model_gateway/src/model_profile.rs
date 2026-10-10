@@ -22,25 +22,36 @@ fn profile_for_card(worker: &dyn Worker, card: &ModelCard, single_model: bool) -
     {
         return ModelProfile::KimiK3;
     }
-    let profile = ModelProfile::for_model(&card.id);
+    let profile = ModelProfile::for_model_name(&card.id);
+    if profile != ModelProfile::OpenAi {
+        return profile;
+    }
     // A worker-level path identifies only a single-model worker. Never apply
     // one model's identity to a sibling card on a multi-model worker.
-    if profile == ModelProfile::OpenAi && single_model {
+    if single_model {
         if let Some(path) = worker.metadata().spec.labels.get("model_path") {
-            return ModelProfile::for_model(path);
+            let profile = ModelProfile::for_model_name(path);
+            if profile != ModelProfile::OpenAi {
+                return profile;
+            }
         }
     }
-    profile
+    ModelProfile::for_model(&card.id)
 }
 
+/// Whether raw HTTP forwarding would bypass a registered model's contract.
 pub(crate) fn worker_requires_chat_profile(worker: &dyn Worker) -> bool {
-    let cards = worker.models();
-    if cards.is_empty() {
-        return ModelProfile::for_model(worker.model_id()) != ModelProfile::OpenAi;
-    }
-    cards
-        .iter()
-        .any(|card| profile_for_card(worker, card, cards.len() == 1) != ModelProfile::OpenAi)
+    let mut requires_profile = false;
+    worker.with_models(&mut |cards| {
+        requires_profile = if cards.is_empty() {
+            ModelProfile::for_model(worker.model_id()) != ModelProfile::OpenAi
+        } else {
+            cards.iter().any(|card| {
+                profile_for_card(worker, card, cards.len() == 1) != ModelProfile::OpenAi
+            })
+        };
+    });
+    requires_profile
 }
 
 /// Resolve only the requested card, including aliases. All registered replicas
@@ -50,12 +61,17 @@ fn resolve_model_profile(context: &AppContext, requested: &str) -> Result<ModelP
     let model = canonical.as_deref().unwrap_or(requested);
     let mut resolved = None;
     for worker in context.worker_registry.get_by_model(model).iter() {
-        let cards = worker.models();
-        let candidate = if let Some(card) = cards.iter().find(|card| card.matches(model)) {
-            profile_for_card(worker.as_ref(), card, cards.len() == 1)
-        } else if cards.is_empty() {
-            ModelProfile::for_model(worker.model_id())
-        } else {
+        let mut candidate = None;
+        worker.with_models(&mut |cards| {
+            candidate = if let Some(card) = cards.iter().find(|card| card.matches(model)) {
+                Some(profile_for_card(worker.as_ref(), card, cards.len() == 1))
+            } else if cards.is_empty() {
+                Some(ModelProfile::for_model(worker.model_id()))
+            } else {
+                None
+            };
+        });
+        let Some(candidate) = candidate else {
             continue;
         };
         if resolved.is_some_and(|current| current != candidate) {
@@ -69,6 +85,7 @@ fn resolve_model_profile(context: &AppContext, requested: &str) -> Result<ModelP
     Ok(resolved.unwrap_or_else(|| ModelProfile::for_model(model)))
 }
 
+/// Chat ingress that captures the trusted contract before request normalization.
 pub(crate) struct ProfiledChatJson(pub ChatCompletionRequest);
 
 impl FromRequest<Arc<AppState>> for ProfiledChatJson {

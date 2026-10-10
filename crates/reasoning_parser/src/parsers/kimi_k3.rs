@@ -5,6 +5,11 @@
 // delivers the remainder (with `response`/`message` wrapper tokens removed) as
 // `normal_text`. The `tools` channel is preserved verbatim for the tool parser.
 //
+// A tag the end of the output cut short (`<|close|>message` with no `<|sep|>`
+// after it, when `max_tokens` falls inside the turn's closing structure) is
+// dropped at the end of the output on both paths: the structural tokens are
+// atomic, so a tail that begins with a whole one is never the model's text.
+//
 // Ported from the Kimi-K3 reference reasoning parser (XTML `think` channel).
 
 use regex::Regex;
@@ -19,6 +24,45 @@ const RESPONSE_CLOSE: &str = "<|close|>response<|sep|>";
 const MESSAGE_OPEN: &str = "<|open|>message<|sep|>";
 const MESSAGE_CLOSE: &str = "<|close|>message<|sep|>";
 const TOOLS_OPEN: &str = "<|open|>tools<|sep|>";
+/// The structural tokens every XTML tag begins with. Each is one token of the
+/// model's vocabulary, so it reaches the parser whole or not at all.
+const STRUCTURAL_TOKENS: [&str; 2] = ["<|open|>", "<|close|>"];
+/// Every tag this parser reads, for the check at the end of an output.
+const TAGS: [&str; 7] = [
+    THINK_OPEN,
+    THINK_CLOSE,
+    RESPONSE_OPEN,
+    RESPONSE_CLOSE,
+    MESSAGE_OPEN,
+    MESSAGE_CLOSE,
+    TOOLS_OPEN,
+];
+
+/// `text` less a tag the end of the output cut short: a tail that begins with a
+/// whole structural token and is a proper prefix of one of [`TAGS`], such as the
+/// `<|close|>message` left when `max_tokens` falls inside the turn's closing
+/// structure. The tokens are atomic, so such a tail cannot be the model's text,
+/// and it would reach the client as content otherwise. A tail shorter than a
+/// token (`<|clo`) could be text, and stays, as every parser keeps a partial
+/// marker at the end of the stream.
+fn without_cut_tag(text: &str) -> &str {
+    let Some(at) = STRUCTURAL_TOKENS
+        .iter()
+        .filter_map(|token| text.rfind(token))
+        .max()
+    else {
+        return text;
+    };
+    let tail = &text[at..];
+    if TAGS
+        .iter()
+        .any(|tag| tag.len() > tail.len() && tag.starts_with(tail))
+    {
+        &text[..at]
+    } else {
+        text
+    }
+}
 
 /// Reasoning parser for the Kimi K3 (XTML) chat format.
 ///
@@ -92,12 +136,14 @@ impl KimiK3Parser {
     ///
     /// Unlike a structured extraction that pulls only the response body,
     /// this approach removes only the wrapper markers, preserving any
-    /// `<|open|>tools<|sep|>…` channel that follows for the tool parser.
+    /// `<|open|>tools<|sep|>…` channel that follows for the tool parser. A tag
+    /// the end of the output cut short goes too ([`without_cut_tag`]).
     fn strip_content_wrapper(&self, text: &str) -> String {
         let text = self.response_open_re.replace_all(text, "");
         let text = self.response_close_re.replace_all(&text, "");
         let text = self.message_open_re.replace_all(&text, "");
-        self.message_close_re.replace_all(&text, "").into_owned()
+        let text = self.message_close_re.replace_all(&text, "");
+        without_cut_tag(&text).to_owned()
     }
 
     /// Locate the end of the think channel in `text`, searching from `from`.
@@ -190,8 +236,8 @@ impl KimiK3Parser {
     /// Return the prefix of post-reasoning content that is safe to stream.
     ///
     /// Strips the response-open prefix, removes complete response-close and
-    /// message-close markers, then holds back any partial marker suffix.
-    ///
+    /// message-close markers, then holds back any partial marker suffix; on the
+    /// final chunk a tag the end of the output cut short is dropped instead.
     fn content_ready_to_emit(&self, text: &str, final_chunk: bool) -> String {
         // Strip the response-open marker as a prefix (first occurrence only).
         // In the K3 grammar the response channel opens exactly once and its
@@ -212,7 +258,7 @@ impl KimiK3Parser {
         let text = self.message_close_re.replace_all(&text, "");
 
         if final_chunk {
-            return text.into_owned();
+            return without_cut_tag(&text).to_owned();
         }
 
         // Hold a possible marker prefix until the next chunk or EOF.
@@ -277,9 +323,12 @@ impl ReasoningParser for KimiK3Parser {
             self.think_channel_end(text, reasoning_start, m_open.is_some())
         else {
             // Opened but never closed — e.g. output truncated mid-thought.
-            // Classify the remainder as reasoning rather than lose it.
+            // Classify the remainder as reasoning rather than lose it, less a
+            // tag the truncation cut short.
             self.in_reasoning = true;
-            return Ok(ParserResult::reasoning(text[reasoning_start..].to_owned()));
+            return Ok(ParserResult::reasoning(
+                without_cut_tag(&text[reasoning_start..]).to_owned(),
+            ));
         };
 
         let reasoning = text[reasoning_start..reasoning_end].to_owned();
@@ -408,7 +457,7 @@ impl ReasoningParser for KimiK3Parser {
             )
         } else if self.in_reasoning {
             let start = self.think_open_re.find(&self.buffer).map_or(0, |m| m.end());
-            let text = &self.buffer[start..];
+            let text = without_cut_tag(&self.buffer[start..]);
             ParserResult::reasoning(
                 text.strip_prefix(&self.emitted_reasoning)
                     .unwrap_or("")
@@ -906,5 +955,174 @@ mod tests {
         let r = p.detect_and_parse_reasoning("just content").unwrap();
         assert_eq!(r.normal_text, "just content");
         assert_eq!(r.reasoning_text, "");
+    }
+
+    // -------------------------------------------------------------------------
+    // A tag the end of the output cut short (smg-lab #115)
+    // -------------------------------------------------------------------------
+
+    /// The turn's closing structure after an answer, one marker a token.
+    const CLOSING: [&str; 6] = [
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+    ];
+
+    /// Every chunk streamed, then the flush: what a client assembles from the deltas.
+    fn streamed(chunks: &[&str], prefilled: bool) -> ParserResult {
+        let mut p = KimiK3Parser::new();
+        if prefilled {
+            p.mark_reasoning_started();
+        }
+        let mut got = ParserResult::default();
+        for chunk in chunks {
+            let r = p.parse_reasoning_streaming_incremental(chunk).unwrap();
+            got.normal_text.push_str(&r.normal_text);
+            got.reasoning_text.push_str(&r.reasoning_text);
+        }
+        let tail = p.flush().unwrap();
+        got.normal_text.push_str(&tail.normal_text);
+        got.reasoning_text.push_str(&tail.reasoning_text);
+        got
+    }
+
+    /// The whole text at once: the non-streaming path.
+    fn parsed(text: &str, prefilled: bool) -> ParserResult {
+        let mut p = KimiK3Parser::new();
+        if prefilled {
+            p.mark_reasoning_started();
+        }
+        p.detect_and_parse_reasoning(text).unwrap()
+    }
+
+    #[test]
+    fn a_cut_inside_the_closing_structure_leaks_no_marker_into_content() {
+        // Thinking off: the prompt opened the response channel, the model answers and closes
+        // the turn. Cut by `max_tokens` after 8 of its 10 tokens, the client received
+        // `Pong.<|close|>message` (smg-lab #115); after 6, or at the natural end, `Pong.`.
+        // Every cut reads `Pong.`, streamed and whole.
+        let mut tokens = vec!["P", "ong", "."];
+        tokens.extend(CLOSING);
+        let expected = ParserResult::normal("Pong.".to_owned());
+        for cut in 3..=tokens.len() {
+            assert_eq!(
+                streamed(&tokens[..cut], false),
+                expected,
+                "streamed, cut after {cut} tokens"
+            );
+            assert_eq!(
+                parsed(&tokens[..cut].concat(), false),
+                expected,
+                "whole, cut after {cut} tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn every_byte_cut_of_the_closing_structure_leaks_no_marker() {
+        // A cut at every byte of the closing structure, fed as one chunk, byte by byte, and as
+        // the whole text. From a structural token on, the tail is a tag cut short and goes;
+        // inside a structural token, which no stream splits (it is one token of the
+        // vocabulary), the bytes so far stay text, as every parser keeps a partial marker at
+        // the end of the stream, and never amount to a marker.
+        let closing: String = CLOSING.concat();
+        for cut in 1..=closing.len() {
+            let text = format!("Pong.{}", &closing[..cut]);
+            let bytes: Vec<&str> = (0..text.len()).map(|at| &text[at..=at]).collect();
+            for (how, got) in [
+                ("one chunk", streamed(&[&text], false)),
+                ("byte by byte", streamed(&bytes, false)),
+                ("non-streaming", parsed(&text, false)),
+            ] {
+                assert_eq!(got.reasoning_text, "", "{how}, cut at byte {cut}");
+                let rest = got
+                    .normal_text
+                    .strip_prefix("Pong.")
+                    .unwrap_or_else(|| panic!("{how}, cut at byte {cut}: {:?}", got.normal_text));
+                let inside_a_token = rest.len() < CLOSE.len() && CLOSE.starts_with(rest);
+                assert!(
+                    inside_a_token,
+                    "{how}, cut at byte {cut}: {rest:?} reached the client"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_cut_after_a_thought_leaks_into_neither_field() {
+        // Thinking on: the prompt opened the thought (the parser is told so), the model closes
+        // it, answers in the response channel and closes the turn; the cut falls after any
+        // token. The thought is the thought and the answer is the answer, nothing more.
+        let tokens = [
+            "Thought",
+            "<|close|>",
+            "think",
+            "<|sep|>",
+            "<|open|>",
+            "response",
+            "<|sep|>",
+            "P",
+            "ong",
+            ".",
+            "<|close|>",
+            "response",
+            "<|sep|>",
+            "<|close|>",
+            "message",
+            "<|sep|>",
+        ];
+        for cut in 1..=tokens.len() {
+            let content = if cut > 7 {
+                tokens[7..cut.min(10)].concat()
+            } else {
+                String::new()
+            };
+            let expected = ParserResult::new(content, "Thought".to_owned());
+            assert_eq!(
+                streamed(&tokens[..cut], true),
+                expected,
+                "streamed, cut after {cut} tokens"
+            );
+            assert_eq!(
+                parsed(&tokens[..cut].concat(), true),
+                expected,
+                "whole, cut after {cut} tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_tag_begun_by_a_whole_structural_token_is_cut() {
+        // What goes at the end of the output: a structural token with nothing, or part of a
+        // tag's word, after it. What stays: a tail shorter than a token, which may be text, and
+        // a token followed by text no tag begins with, which is the model's to explain.
+        for tail in [
+            "<|close|>",
+            "<|close|>message",
+            "<|close|>mes",
+            "<|close|>response",
+            "<|open|>",
+            "<|open|>respo",
+        ] {
+            let text = format!("Pong.{tail}");
+            let expected = ParserResult::normal("Pong.".to_owned());
+            assert_eq!(parsed(&text, false), expected, "{tail:?}");
+            assert_eq!(streamed(&[&text], false), expected, "{tail:?}");
+        }
+        // The `tools` opener cut short goes from a whole text too; streamed, the content phase
+        // hands the tools channel downstream as it arrives, so that opener is the tool parser's.
+        assert_eq!(
+            parsed("Pong.<|open|>tools", false),
+            ParserResult::normal("Pong.".to_owned())
+        );
+        for tail in ["<", "<|clo", "<|close|>x"] {
+            let text = format!("Pong.{tail}");
+            let expected = ParserResult::normal(text.clone());
+            assert_eq!(parsed(&text, false), expected, "{tail:?}");
+            assert_eq!(streamed(&[&text], false), expected, "{tail:?}");
+        }
     }
 }

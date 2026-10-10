@@ -371,7 +371,7 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// Where media for vLLM gRPC workers is fetched and preprocessed.
+    /// Where media for one engine's gRPC workers is fetched and preprocessed.
     pub fn mm_processing(mut self, mode: Option<MmProcessingMode>) -> Self {
         self.config.mm_processing = mode;
         self
@@ -831,6 +831,11 @@ impl RouterConfigBuilder {
 
     pub fn maybe_log_dir(mut self, dir: Option<impl Into<String>>) -> Self {
         self.config.log_dir = dir.map(|d| d.into());
+        self
+    }
+
+    pub fn maybe_jemalloc_prof_dir(mut self, dir: Option<impl Into<String>>) -> Self {
+        self.config.jemalloc_prof_dir = dir.map(|d| d.into());
         self
     }
 

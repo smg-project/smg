@@ -276,7 +276,7 @@ pub(super) fn drop_thinking_messages(
 
 /// Encode a single tool call's `arguments` value into `<DSML_TOKEN><parameter>`
 /// blocks, mirroring the reference `encode_arguments_to_dsml` (HF
-/// `encoding.py`, identical in vLLM's port).
+/// `encoding.py`, identical in the engine's port).
 ///
 /// `arguments` may arrive as a JSON *string* (raw OpenAI tool_calls) or as an
 /// already-parsed value — `model_gateway`'s `process_tool_call_arguments`
@@ -326,7 +326,7 @@ pub(super) fn encode_arguments_to_dsml(arguments: &Value, tags: &DsmlTags) -> St
 
 // Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
 // separators, raw UTF-8. Compact `serde_json::to_string` would change the
-// prompt bytes vLLM trained on. Each renderer module keeps its own copy of
+// prompt bytes the model was trained on. Each renderer module keeps its own copy of
 // this tiny wrapper (see `deepseek_v4::to_json`); this one is for
 // `encode_arguments_to_dsml`'s exclusive use.
 fn to_json(value: &Value) -> String {
