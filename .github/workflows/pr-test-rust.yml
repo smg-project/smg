@@ -23,11 +23,9 @@ jobs:
       SERIAL_SHA: 122b6e0d471be0fa358ef307f53bffb797b74788
       PARALLEL_SHA: 79c5342f5577b79c6c29c100eee3ac0136caf431
       GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4@sha256:9b503266049da17ae85abbc98ed5d57cf14f0af7643ee43a561c1a85d73a1b1f
-      E2E_ENGINE: sglang
       E2E_RUNTIME: sglang
       E2E_MODEL: meta-llama/Llama-3.1-8B-Instruct
       E2E_MODEL_TP_OVERRIDES: ''
-      E2E_GPU_TIER: '4'
       E2E_CONNECTION_MODE: ''
       ROUTER_LOCAL_MODEL_PATH: /models
       HF_HUB_OFFLINE: '1'
