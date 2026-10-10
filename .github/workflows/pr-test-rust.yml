@@ -1565,7 +1565,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1621,7 +1621,11 @@ jobs:
           # A run cancelled as a whole ends with this gate failed too: it did
           # not pass, and finish stays a verdict on every head.
           bad='^(failure|cancelled)$'
-          if [[ "${{ needs.pre-commit.result }}" =~ $bad || \
+          # detect-changes selects the lanes: when it fails or is cancelled, the
+          # unit tests and every e2e lane are skipped, and a skipped job passes
+          # this check, so its own result gates here (smg-project/smg-lab#172).
+          if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
+                "${{ needs.pre-commit.result }}" =~ $bad || \
                 "${{ needs.python-lint.result }}" =~ $bad || \
                 "${{ needs.grpc-proto-build-check.result }}" =~ $bad || \
                 "${{ needs.build-wheel.result }}" =~ $bad || \
