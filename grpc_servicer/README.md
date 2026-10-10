@@ -366,6 +366,17 @@ tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
 
+Both TokenSpeed servicers advertise, as `server_args` keys, the engine's
+reasoning parser (`engine_reasoning_parser`; `reasoning_parser` is the
+per-model parser override a router reads off a worker's labels) and where its
+grammar starts on a prompt that ends inside the model's thinking block
+(`structured_outputs_start`): always `first_token`, since this engine's grammar
+manager has no reasoning gate and starts every grammar at the first generated
+token (`--reasoning-parser` only has a JSON-schema constraint rewritten into a
+structural tag that lets the thought precede the JSON). A router shapes a
+forced tool call's grammar by it as the engine's own server would: the thought
+and then the calls, so the call is not forced into the thought.
+
 #### Multi-node engines: the worker pod's liveness
 
 An engine whose tensor-parallel ranks span pods is launched on every pod with

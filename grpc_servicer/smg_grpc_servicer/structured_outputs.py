@@ -61,6 +61,18 @@ def sglang_structured_outputs_start(server_args: Any) -> str:
     return STRUCTURED_OUTPUTS_FIRST_TOKEN
 
 
+def tokenspeed_structured_outputs_start() -> str:
+    """Where TokenSpeed starts a request's grammar on a thinking prompt: from
+    the first generated token, whatever the reasoning parser. Its grammar
+    manager takes no reasoning flag and its backends start every compiled
+    grammar at once (the token-gated reasoner wrapper of earlier versions is
+    gone); ``--reasoning-parser`` only has a JSON-schema constraint rewritten
+    into a structural tag that lets the thought precede the JSON, which is
+    still a grammar from the first token, and a structural tag from the Router
+    is taken as it is. So: ``first_token``."""
+    return STRUCTURED_OUTPUTS_FIRST_TOKEN
+
+
 def grammar_start_labels(server_args: Any, start: str) -> dict[str, str]:
     """The two labels as ``server_args`` entries, for the servicers that carry
     their labels there: the parser when the engine runs one, the start when the

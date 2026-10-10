@@ -43,6 +43,10 @@ from smg_grpc_servicer.rust_lifecycle import (
     resolve_tokenizer_dir,
     supervise,
 )
+from smg_grpc_servicer.structured_outputs import (
+    grammar_start_labels,
+    tokenspeed_structured_outputs_start,
+)
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
@@ -210,6 +214,9 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
+    # The engine's reasoning parser and where it starts a grammar on a thinking
+    # prompt, as the Python servicer adds them.
+    args_dict.update(grammar_start_labels(server_args, tokenspeed_structured_outputs_start()))
     kv_events = resolve_kv_events_config(server_args)
     try:
         from tokenspeed.version import __version__ as tokenspeed_version

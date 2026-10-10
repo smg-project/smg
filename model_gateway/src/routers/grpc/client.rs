@@ -951,6 +951,10 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     // The engine's own per-request media limits, flattened by the servicer as
     // for SGLang (`image=4`); TokenSpeed's engine has none to advertise today.
     "mm_item_limits",
+    // The engine's reasoning parser and where it starts a request's grammar
+    // on a thinking prompt, as for SGLang above; the servicer writes both.
+    "engine_reasoning_parser",
+    "structured_outputs_start",
     // RL control plane (crates/rl): where the engine's SGLang-compatible
     // control app listens and what it implements. The engine advertises
     // these; SMG's discovery turns them into the labels the RL crate reads.
@@ -1268,6 +1272,58 @@ mod tests {
         assert!(!labels.contains_key("status"));
         assert!(!labels.contains_key("active_requests"));
         assert!(!labels.contains_key("uptime_seconds"));
+    }
+
+    /// The TokenSpeed servicer's grammar-start facts ride with the server args
+    /// and become the `engine_reasoning_parser` and `structured_outputs_start`
+    /// labels, as for SGLang; the engine's own `reasoning_parser` argument is
+    /// not the router's parser override and stays out.
+    #[test]
+    fn server_info_to_labels_tokenspeed_carries_where_the_engine_starts_a_grammar() {
+        let info = ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([
+                    ("reasoning_parser".to_string(), string_value("kimi_k25")),
+                    (
+                        "engine_reasoning_parser".to_string(),
+                        string_value("kimi_k25"),
+                    ),
+                    (
+                        "structured_outputs_start".to_string(),
+                        string_value("first_token"),
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        }));
+
+        let labels = info.to_labels();
+
+        assert_eq!(
+            labels.get("engine_reasoning_parser").map(String::as_str),
+            Some("kimi_k25")
+        );
+        assert_eq!(
+            labels.get("structured_outputs_start").map(String::as_str),
+            Some("first_token")
+        );
+        assert!(!labels.contains_key("reasoning_parser"));
+
+        // A servicer that writes neither key: no label, the router keeps the
+        // grammar shape that fits either engine.
+        let silent = ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+            server_args: Some(prost_types::Struct {
+                fields: BTreeMap::from([(
+                    "reasoning_parser".to_string(),
+                    string_value("kimi_k25"),
+                )]),
+            }),
+            ..Default::default()
+        }))
+        .to_labels();
+        assert!(!silent.contains_key("engine_reasoning_parser"));
+        assert!(!silent.contains_key("structured_outputs_start"));
+        assert!(!silent.contains_key("reasoning_parser"));
     }
 
     #[test]

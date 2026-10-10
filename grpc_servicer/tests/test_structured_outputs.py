@@ -53,3 +53,20 @@ def test_grammar_start_labels_leave_out_what_is_empty():
     assert so.grammar_start_labels(SimpleNamespace(), "") == {}
     # The keys are the labels the Router reads, never its parser override.
     assert so.ENGINE_REASONING_PARSER_KEY != "reasoning_parser"
+
+
+def test_tokenspeed_starts_the_grammar_at_the_first_token_whatever_the_parser():
+    # This engine's grammar manager has no reasoning gate: a grammar runs from
+    # the first generated token; its --reasoning-parser only has a JSON schema
+    # rewritten into a structural tag, which is still a grammar from the first
+    # token. The parser still rides along under its own name.
+    assert so.tokenspeed_structured_outputs_start() == so.STRUCTURED_OUTPUTS_FIRST_TOKEN
+    assert so.grammar_start_labels(
+        SimpleNamespace(reasoning_parser="kimi_k25"), so.tokenspeed_structured_outputs_start()
+    ) == {
+        so.ENGINE_REASONING_PARSER_KEY: "kimi_k25",
+        so.STRUCTURED_OUTPUTS_START_KEY: "first_token",
+    }
+    assert so.grammar_start_labels(
+        SimpleNamespace(reasoning_parser=None), so.tokenspeed_structured_outputs_start()
+    ) == {so.STRUCTURED_OUTPUTS_START_KEY: "first_token"}

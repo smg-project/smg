@@ -325,6 +325,31 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert plain["kv_events_replay_endpoint"] == ""
 
 
+@dataclasses.dataclass
+class _ReasoningServerArgs(FakeServerArgs):
+    reasoning_parser: str | None = None
+
+
+def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
+    # The engine's reasoning parser and where it starts a request's grammar on
+    # a thinking prompt ride with the server args, as the Python servicer adds
+    # them: this engine starts every grammar at the first token, parser or not.
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    gated = json.loads(
+        rust.server_facts(_ReasoningServerArgs(reasoning_parser="kimi_k25"))["server_args_json"]
+    )
+    assert gated["engine_reasoning_parser"] == "kimi_k25"
+    assert gated["structured_outputs_start"] == "first_token"
+    # The engine's own argument stays under its own name; the Router's label
+    # readers never take it as the per-model parser override.
+    assert gated["reasoning_parser"] == "kimi_k25"
+
+    plain = json.loads(rust.server_facts(_ReasoningServerArgs())["server_args_json"])
+    assert plain["structured_outputs_start"] == "first_token"
+    assert "engine_reasoning_parser" not in plain
+
+
 def test_server_facts_never_carry_credentials(monkeypatch):
     """The Rust server reports the same server args as the Python one, so the
     in-engine RL control key and tokens must not leave the engine here either.

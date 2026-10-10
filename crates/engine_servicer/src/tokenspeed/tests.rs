@@ -52,7 +52,7 @@ fn model_info() -> TokenSpeedModelInfo {
         bos_token_id: 1,
         default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
         server_args_json:
-            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1"}"#
+            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","structured_outputs_start":"first_token"}"#
                 .to_string(),
         scheduler_info_json: r#"{"shm_namespace_id":"boot:1"}"#.to_string(),
         tokenspeed_version: "0.1.0.post20261003".to_string(),
@@ -747,6 +747,17 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!(
         server_args.fields["pairing_protocol"].kind,
         Some(Kind::StringValue("p1".to_string()))
+    );
+    // The launcher's grammar-start facts (the engine's reasoning parser and
+    // where its grammar starts on a thinking prompt) reach the Router's label
+    // source as the launcher wrote them.
+    assert_eq!(
+        server_args.fields["engine_reasoning_parser"].kind,
+        Some(Kind::StringValue("kimi_k25".to_string()))
+    );
+    assert_eq!(
+        server_args.fields["structured_outputs_start"].kind,
+        Some(Kind::StringValue("first_token".to_string()))
     );
     let scheduler_info = info.scheduler_info.expect("scheduler_info");
     assert_eq!(

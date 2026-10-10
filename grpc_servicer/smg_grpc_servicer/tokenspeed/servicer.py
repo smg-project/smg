@@ -55,6 +55,7 @@ from smg_grpc_servicer.tokenspeed.loads import (
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
 from ..pd_pairing import pairing_protocol_from_env
+from ..structured_outputs import grammar_start_labels, tokenspeed_structured_outputs_start
 
 if TYPE_CHECKING:
     # Type-only — keeps these out of the cold-path graph when the servicer is
@@ -609,6 +610,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         pairing_protocol = pairing_protocol_from_env()
         if pairing_protocol:
             server_args_dict["pairing_protocol"] = pairing_protocol
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt (the first token: this engine has no reasoning gate
+        # in front of a grammar), for the gateway to shape a forced tool
+        # call's grammar by.
+        server_args_dict.update(
+            grammar_start_labels(self.server_args, tokenspeed_structured_outputs_start())
+        )
 
         # Control endpoint and capabilities for a fronting gateway (SMG reads
         # the `rl.*` keys straight into worker labels). Older engines have no
