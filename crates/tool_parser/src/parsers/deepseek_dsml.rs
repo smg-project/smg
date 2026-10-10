@@ -52,8 +52,8 @@ impl DsmlDialect {
         }
     }
 
-    /// V4.1 parsing rules, from the reference parser (`encoding.py`), vLLM
-    /// Python and SGLang: exactly the `"\n\n"` separator before the block is
+    /// V4.1 parsing rules, from the reference parser (`encoding.py`) and the
+    /// serving engines' parsers: exactly the `"\n\n"` separator before the block is
     /// stripped from the content; `arguments` are serialised like Python's
     /// `json.dumps`; an invoke outside a block is accepted; text after the
     /// tool section is dropped; unknown tool names are forwarded unfiltered.
@@ -295,11 +295,11 @@ impl DeepSeekDsmlParser {
     fn parse_parameters_from_dsml(&self, invoke_content: &str, allow_partial: bool) -> String {
         let trimmed = invoke_content.trim();
 
-        // Direct JSON path (also the shape SGLang's grammar emits under a
+        // Direct JSON path (also the shape one engine's grammar emits under a
         // structural-tag constraint). The text is the arguments object and is
         // passed through as written — a compact body stays compact rather
         // than being re-spaced like DSML parameters — so streaming deltas stay
-        // consistent (SGLang does the same).
+        // consistent (that engine's parser does the same).
         if trimmed.starts_with('{') {
             if allow_partial {
                 // `strip_dsml_trailing` handles partial `</｜DSML｜invoke>` prefixes
@@ -335,7 +335,7 @@ impl DeepSeekDsmlParser {
         }
 
         // Partial parameter matching for streaming
-        // Following SGLang: strip DSML fragments from remaining content BEFORE
+        // Following the engine's parser: strip DSML fragments from remaining content BEFORE
         // running the partial regex, so the regex captures a clean value.
         if allow_partial {
             // Find where the last complete parameter match ended
@@ -633,13 +633,13 @@ impl DeepSeekDsmlParser {
     }
 
     /// The V4.1 tool-call grammar as an xgrammar structural tag, mirroring
-    /// vLLM's `deepseek_v41` builder for a forced tool choice
+    /// the serving engine's `deepseek_v41` builder for a forced tool choice
     /// (`tool_choice: required` or a named function): a blank line, the
     /// `<｜DSML｜ calls>` block, at least one invoke of a listed tool, and the
     /// block close. Each parameter constrains the DSML syntax only — a
     /// `string="true"` body is any text without a closing tag, a
     /// `string="false"` body is any JSON value; parameter names and schemas
-    /// are not lowered (vLLM leaves that as a TODO too). `at_least_one` is
+    /// are not lowered (the engine's builder leaves that as a TODO too). `at_least_one` is
     /// wired to `tool_choice` by the registry; like the Kimi builders,
     /// `stop_after_first` is left unset so a single listed tool may still be
     /// called more than once.

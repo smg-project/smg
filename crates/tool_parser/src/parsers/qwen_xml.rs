@@ -103,8 +103,8 @@ fn json_string_body(text: &str) -> String {
 /// and Qwen3.5: a tool argument whose value contains `&amp;`, `&lt;`, `&#39;`
 /// is returned with those entities intact. The Qwen XML tool format is not
 /// HTML-escaped on render either (the chat template emits values via
-/// `| tojson | safe` / `| string`), so parsing must not unescape it. vLLM's
-/// `Qwen3CoderToolParser`, SGLang's `qwen3_coder_detector`, and Qwen-Agent all
+/// `| tojson | safe` / `| string`), so parsing must not unescape it. The serving
+/// engines' `Qwen3CoderToolParser` and `qwen3_coder_detector`, and Qwen-Agent all
 /// agree, passing argument values through verbatim.
 ///
 /// 1. Try to parse as JSON (numbers, booleans, null, objects, arrays)

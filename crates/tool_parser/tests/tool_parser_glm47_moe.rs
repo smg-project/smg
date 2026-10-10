@@ -120,7 +120,7 @@ async fn test_glm5_routes_to_glm47_moe() {
 
 /// GLM-4.7 follows the same contract as every other native tool format:
 /// `auto` and `none` send no constraint (an engine launched without a grammar
-/// backend, TokenSpeed's default, keeps serving tool calls), and `required`
+/// backend, one engine's default, keeps serving tool calls), and `required`
 /// or a named function sends the structural tag with a forced call.
 #[test]
 fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {

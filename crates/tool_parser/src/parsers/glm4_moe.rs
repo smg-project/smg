@@ -92,7 +92,7 @@ impl Glm4MoeParser {
     }
 
     /// The xgrammar structural tag for the GLM-4.7 / GLM-5 tool-call format,
-    /// mirroring xgrammar's built-in `glm_4_7` tag (the one vLLM applies for
+    /// mirroring xgrammar's built-in `glm_4_7` tag (the one the serving engine applies for
     /// `required` and named tool choices). Each call is `<tool_call>{name}`,
     /// the arguments rendered from the tool's JSON schema in xgrammar's
     /// `glm_xml` style (`<arg_key>k</arg_key><arg_value>v</arg_value>`), then
@@ -103,7 +103,7 @@ impl Glm4MoeParser {
     /// Wire shape: `{"type": "json_schema", "json_schema": …, "style":
     /// "glm_xml"}` is xgrammar's `JSONSchemaFormat` (python/xgrammar/
     /// structural_tag.py), present since the 0.2 line that also ships the
-    /// built-in `glm_4_7` tag; TokenSpeed pins 0.2.3, where the tag emitted
+    /// built-in `glm_4_7` tag; one serving engine pins 0.2.3, where the tag emitted
     /// here compiles with `Grammar.from_structural_tag` and accepts the
     /// model's real call syntax. The schema is passed through as written,
     /// like the JSON-schema builders (mistral, kimik2, inkling): a tool with
