@@ -901,6 +901,7 @@ mod tests {
             },
             defer_loading: None,
             cache_control: None,
+            extra: Default::default(),
         };
 
         let chat_tool = custom_tool_to_chat_tool(&custom);

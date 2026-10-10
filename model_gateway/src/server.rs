@@ -347,6 +347,42 @@ async fn v1_embeddings(
         .await
 }
 
+/// The public Messages API requires `anthropic-version` on every request and
+/// knows only its dated versions: a request without the header, or with a
+/// value that is not a date of 2023 or later, is refused as the public API
+/// refuses it, before anything is routed.
+fn require_anthropic_version(headers: &HeaderMap) -> Result<(), Response> {
+    let Some(value) = headers.get("anthropic-version") else {
+        return Err(route_error::bad_request(
+            "missing_anthropic_version",
+            "anthropic-version: header is required",
+        ));
+    };
+    let version = value.to_str().unwrap_or_default();
+    if is_anthropic_version(version) {
+        Ok(())
+    } else {
+        Err(route_error::bad_request(
+            "invalid_anthropic_version",
+            format!("anthropic-version: \"{version}\" is not a valid version"),
+        ))
+    }
+}
+
+/// `YYYY-MM-DD`, 2023 (the first public version) or later.
+fn is_anthropic_version(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+        && &version[..4] >= "2023"
+}
+
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -354,6 +390,9 @@ async fn v1_messages(
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
+    if let Err(refused) = require_anthropic_version(&headers) {
+        return refused;
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -371,6 +410,9 @@ async fn v1_messages_count_tokens(
     cancel: middleware::scheduler::PreemptionGuard,
     Json(body): Json<CountMessageTokensRequest>,
 ) -> Response {
+    if let Err(refused) = require_anthropic_version(&headers) {
+        return refused;
+    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -1870,6 +1912,32 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// The public Messages API refuses a request without `anthropic-version`
+    /// and one whose version is not a dated version it knows.
+    #[test]
+    fn messages_requests_need_a_valid_anthropic_version() {
+        let with = |value: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("anthropic-version", http::HeaderValue::from_static(value));
+            headers
+        };
+        assert!(require_anthropic_version(&with("2023-06-01")).is_ok());
+        assert!(require_anthropic_version(&with("2023-01-01")).is_ok());
+        for (headers, code) in [
+            (HeaderMap::new(), "missing_anthropic_version"),
+            (with("1999-01-01"), "invalid_anthropic_version"),
+            (with("latest"), "invalid_anthropic_version"),
+            (with("2023-6-1"), "invalid_anthropic_version"),
+        ] {
+            let refused = require_anthropic_version(&headers).expect_err("refused");
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                route_error::extract_error_code_from_response(&refused),
+                code
+            );
+        }
+    }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
     /// gets a request id (and a log line and a metric) like a known one.

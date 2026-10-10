@@ -19,6 +19,7 @@ pub mod ext;
 pub mod generate;
 pub mod interactions;
 pub mod messages;
+mod messages_validation;
 pub mod model_card;
 pub mod model_type;
 pub mod models;
