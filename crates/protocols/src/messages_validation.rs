@@ -8,7 +8,9 @@
 //! role inside `messages` (kept in place for the clients that send one), the
 //! vendor's model-specific couplings of thinking with `temperature` or a
 //! forced `tool_choice` (a served model may take both), and the per-model
-//! output-token cap.
+//! output-token cap. The rule that `thinking.budget_tokens` stays under
+//! `max_tokens` reads the `anthropic-beta` header (the interleaved-thinking
+//! beta lifts it), so the gateway's handler applies it.
 
 use std::collections::HashSet;
 
@@ -71,12 +73,15 @@ fn role_name(role: &Role) -> &'static str {
 fn validate_message_contents(messages: &[InputMessage]) -> Result<(), ValidationError> {
     let last = messages.len().saturating_sub(1);
     for (index, message) in messages.iter().enumerate() {
+        if message.role == Role::System {
+            continue;
+        }
         let final_assistant = index == last && message.role == Role::Assistant;
         let empty = match &message.content {
             InputContent::String(text) => text.trim().is_empty(),
             InputContent::Blocks(blocks) => blocks.is_empty(),
         };
-        if empty && !final_assistant && message.role != Role::System {
+        if empty && !final_assistant {
             return Err(invalid(
                 "empty_content",
                 format!(
@@ -92,7 +97,7 @@ fn validate_message_contents(messages: &[InputMessage]) -> Result<(), Validation
             if empty_text {
                 return Err(invalid(
                     "empty_text_block",
-                    "messages: text content blocks must be non-empty".to_owned(),
+                    format!("messages.{index}: text content blocks must be non-empty"),
                 ));
             }
         }
@@ -116,24 +121,58 @@ fn validate_message_contents(messages: &[InputMessage]) -> Result<(), Validation
     Ok(())
 }
 
-fn tool_use_ids(message: &InputMessage) -> Vec<&str> {
-    match &message.content {
-        InputContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|block| match block {
-                InputContentBlock::ToolUse(tool_use) => Some(tool_use.id.as_str()),
-                _ => None,
-            })
-            .collect(),
-        InputContent::String(_) => Vec::new(),
+/// A conversation turn: consecutive messages of one role, which the public
+/// API combines into a single turn, with the index of the first.
+struct Turn<'a> {
+    role: Role,
+    at: usize,
+    messages: Vec<(usize, &'a InputMessage)>,
+}
+
+/// The user and assistant turns of `messages`, consecutive same-role
+/// messages combined; a `system` message of this gateway's extension is
+/// transparent.
+fn turns(messages: &[InputMessage]) -> Vec<Turn<'_>> {
+    let mut turns: Vec<Turn<'_>> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.role == Role::System {
+            continue;
+        }
+        match turns.last_mut() {
+            Some(turn) if turn.role == message.role => turn.messages.push((index, message)),
+            _ => turns.push(Turn {
+                role: message.role.clone(),
+                at: index,
+                messages: vec![(index, message)],
+            }),
+        }
     }
+    turns
+}
+
+fn tool_use_ids<'a>(turn: &Turn<'a>) -> Vec<&'a str> {
+    turn.messages
+        .iter()
+        .flat_map(|(_, message)| match &message.content {
+            InputContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    InputContentBlock::ToolUse(tool_use) => Some(tool_use.id.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            InputContent::String(_) => Vec::new(),
+        })
+        .collect()
 }
 
 /// A `tool_use` block is answered by a `tool_result` block in the very next
-/// message, one per id, and a `tool_result` answers a `tool_use` of the
-/// message right before it: the public API refuses a result nobody asked
-/// for and a call nobody answered, naming the message. A `system` message of
-/// this gateway's extension in between is skipped.
+/// user turn, one per id, and a `tool_result` answers a `tool_use` of the
+/// assistant turn right before it: the public API refuses a result nobody
+/// asked for, a call nobody answered, and a call answered twice, naming the
+/// message. Consecutive messages of one role form one turn, as the public
+/// API combines them (parallel results split over two user messages answer
+/// one assistant turn); a `system` message in between is skipped.
 fn validate_tool_pairing(messages: &[InputMessage]) -> Result<(), ValidationError> {
     let unanswered = |at: usize, ids: &[&str]| {
         invalid(
@@ -148,36 +187,47 @@ fn validate_tool_pairing(messages: &[InputMessage]) -> Result<(), ValidationErro
     };
     let mut pending: Vec<&str> = Vec::new();
     let mut pending_at = 0;
-    for (index, message) in messages.iter().enumerate() {
-        match message.role {
+    for turn in turns(messages) {
+        match turn.role {
             Role::System => continue,
             Role::Assistant => {
                 if !pending.is_empty() {
                     return Err(unanswered(pending_at, &pending));
                 }
-                pending = tool_use_ids(message);
-                pending_at = index;
+                pending = tool_use_ids(&turn);
+                pending_at = turn.at;
             }
             Role::User => {
                 let mut answered: HashSet<&str> = HashSet::new();
-                if let InputContent::Blocks(blocks) = &message.content {
+                for (index, message) in &turn.messages {
+                    let InputContent::Blocks(blocks) = &message.content else {
+                        continue;
+                    };
                     for (position, block) in blocks.iter().enumerate() {
                         let InputContentBlock::ToolResult(result) = block else {
                             continue;
                         };
-                        if !pending.contains(&result.tool_use_id.as_str()) {
+                        let id = result.tool_use_id.as_str();
+                        if !pending.contains(&id) {
                             return Err(invalid(
                                 "unexpected_tool_use_id",
                                 format!(
                                     "messages.{index}.content.{position}: unexpected `tool_use_id` \
-                                     found in `tool_result` blocks: {}. Each `tool_result` block \
+                                     found in `tool_result` blocks: {id}. Each `tool_result` block \
                                      must have a corresponding `tool_use` block in the previous \
-                                     message.",
-                                    result.tool_use_id
+                                     message."
                                 ),
                             ));
                         }
-                        answered.insert(result.tool_use_id.as_str());
+                        if !answered.insert(id) {
+                            return Err(invalid(
+                                "duplicate_tool_result",
+                                format!(
+                                    "messages.{index}.content.{position}: `tool_result` blocks must \
+                                     each answer a different `tool_use_id`: {id} is answered twice."
+                                ),
+                            ));
+                        }
                     }
                 }
                 let missing: Vec<&str> = pending
@@ -281,8 +331,9 @@ fn validate_tools(tools: Option<&[Tool]>) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// A thinking budget starts at 1024 tokens and leaves room for the answer
-/// under `max_tokens`.
+/// A thinking budget starts at 1024 tokens. (That it stays under
+/// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
+/// handler checks it.)
 fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
     if let Some(ThinkingConfig::Enabled { budget_tokens, .. }) = &req.thinking {
         if *budget_tokens < 1024 {
@@ -290,12 +341,6 @@ fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> 
                 "thinking_budget_too_small",
                 "thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"
                     .to_owned(),
-            ));
-        }
-        if *budget_tokens >= req.max_tokens {
-            return Err(invalid(
-                "thinking_budget_exceeds_max_tokens",
-                "`max_tokens` must be greater than `thinking.budget_tokens`".to_owned(),
             ));
         }
     }
@@ -360,7 +405,7 @@ mod tests {
         assert!(rejection(json!({"messages": [
             {"role": "user", "content": [{"type": "text", "text": ""}]}
         ]}))
-        .contains("messages: text content blocks must be non-empty"));
+        .contains("messages.0: text content blocks must be non-empty"));
         // The optional final assistant message may be empty, not end in whitespace.
         accepted(json!({"messages": [
             {"role": "user", "content": "hi"},
@@ -376,10 +421,12 @@ mod tests {
             {"role": "assistant", "content": [{"type": "text", "text": "The answer is\n"}]}
         ]}))
         .contains("final assistant content cannot end with trailing whitespace"));
-        // A system message in the array is this gateway's extension: untouched.
+        // A system message in the array is this gateway's extension: untouched,
+        // empty blocks and empty text alike.
         accepted(json!({"messages": [
             {"role": "user", "content": "hi"},
             {"role": "system", "content": []},
+            {"role": "system", "content": [{"type": "text", "text": ""}]},
             {"role": "user", "content": "again"}
         ]}));
     }
@@ -432,6 +479,44 @@ mod tests {
             trailing.contains("messages.1: `tool_use` ids were found without"),
             "{trailing}"
         );
+        let twice = rejection(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a")]},
+            {"role": "user", "content": [tool_result("toolu_a"), tool_result("toolu_a")]}
+        ]}));
+        assert!(
+            twice.contains("messages.2.content.1: `tool_result` blocks must each answer a different `tool_use_id`: toolu_a is answered twice."),
+            "{twice}"
+        );
+    }
+
+    /// Consecutive messages of one role are one turn, as the public API
+    /// combines them: parallel results split over two user messages answer
+    /// one assistant turn, and a tool_use followed by more assistant text is
+    /// answered after the whole assistant turn; a system message in between
+    /// changes nothing.
+    #[test]
+    fn consecutive_same_role_messages_pair_as_one_turn() {
+        accepted(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a"), tool_use("toolu_b")]},
+            {"role": "user", "content": [tool_result("toolu_a")]},
+            {"role": "user", "content": [tool_result("toolu_b")]}
+        ]}));
+        accepted(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a")]},
+            {"role": "assistant", "content": "Let me check that."},
+            {"role": "system", "content": "stay brief"},
+            {"role": "user", "content": [tool_result("toolu_a")]}
+        ]}));
+        let still_missing = rejection(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a"), tool_use("toolu_b")]},
+            {"role": "user", "content": [tool_result("toolu_a")]},
+            {"role": "user", "content": "and tomorrow?"}
+        ]}));
+        assert!(still_missing.contains("messages.1: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_b"), "{still_missing}");
     }
 
     #[test]
@@ -476,12 +561,13 @@ mod tests {
             json!({"max_tokens": 4096, "thinking": {"type": "enabled", "budget_tokens": 1023}})
         )
         .contains("thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"));
-        assert!(rejection(
-            json!({"max_tokens": 1024, "thinking": {"type": "enabled", "budget_tokens": 1024}})
-        )
-        .contains("`max_tokens` must be greater than `thinking.budget_tokens`"));
         accepted(
             json!({"max_tokens": 4096, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+        );
+        // Whether the budget stays under max_tokens depends on the beta
+        // header: the handler decides, not the body alone.
+        accepted(
+            json!({"max_tokens": 1024, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
         );
         // The vendor's couplings of thinking with sampling and tool_choice are
         // model-specific: a served model takes both.

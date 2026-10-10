@@ -157,10 +157,11 @@ async fn test_v1_messages_proxy_propagates_upstream_error() {
     ctx.shutdown().await;
 }
 
-/// The public Messages API refuses a request without the `anthropic-version`
-/// header before anything is routed; so does the gateway, on every backend.
+/// A request without `anthropic-version` is served (this gateway's own SDK
+/// clients send none); a malformed version is refused before anything is
+/// routed, on every backend that takes the buffered path.
 #[tokio::test]
-async fn test_v1_messages_requires_the_anthropic_version_header() {
+async fn test_v1_messages_takes_a_missing_anthropic_version_and_refuses_a_malformed_one() {
     let ctx = AppTestContext::new(vec![MockWorkerConfig {
         port: 18304,
         worker_type: WorkerType::Regular,
@@ -179,8 +180,9 @@ async fn test_v1_messages_requires_the_anthropic_version_header() {
     });
 
     for (version, expected) in [
-        (None, StatusCode::BAD_REQUEST),
+        (None, StatusCode::OK),
         (Some("1999-01-01"), StatusCode::BAD_REQUEST),
+        (Some("2023-02-30"), StatusCode::BAD_REQUEST),
         (Some("2023-06-01"), StatusCode::OK),
     ] {
         let mut req = Request::builder()
