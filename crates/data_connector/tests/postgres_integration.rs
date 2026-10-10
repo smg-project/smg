@@ -109,6 +109,46 @@ async fn store_and_get_response_round_trips_json_columns() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn storing_under_an_existing_id_replaces_the_row() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let resp = bundle.response_storage;
+
+    // A background response is stored as `queued` before its work starts and
+    // once more with its terminal object, under the one id its client polls.
+    let mut queued = StoredResponse::new(None);
+    queued.input = json!(["write a story"]);
+    queued.raw_response = json!({"id": queued.id.0, "status": "queued", "output": []});
+    let id = resp
+        .store_response(queued.clone())
+        .await
+        .expect("store the queued record");
+
+    let mut done = queued;
+    done.raw_response = json!({
+        "id": id.0,
+        "status": "completed",
+        "output": [{"type": "message", "id": "msg_1", "content": "once upon a time"}]
+    });
+    resp.store_response(done.clone())
+        .await
+        .expect("the second store must replace the row, not fail on the primary key");
+
+    let fetched = resp
+        .get_response(&id)
+        .await
+        .expect("get_response")
+        .expect("the record stays under its id");
+    assert_eq!(fetched.raw_response, done.raw_response);
+    assert_eq!(fetched.input, done.input);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
 async fn get_response_chain_walks_json_columns() {
     let Some(db_url) = test_db_url() else {
         return;

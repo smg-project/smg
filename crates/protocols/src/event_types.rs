@@ -4,6 +4,10 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResponseEvent {
     Created,
+    /// A background response has been accepted and waits for its turn; the
+    /// public API emits it right after `response.created` on a stream that
+    /// was created with `background: true`.
+    Queued,
     InProgress,
     Completed,
     Incomplete,
@@ -12,6 +16,7 @@ pub enum ResponseEvent {
 
 impl ResponseEvent {
     pub const CREATED: &'static str = "response.created";
+    pub const QUEUED: &'static str = "response.queued";
     pub const IN_PROGRESS: &'static str = "response.in_progress";
     pub const COMPLETED: &'static str = "response.completed";
     pub const INCOMPLETE: &'static str = "response.incomplete";
@@ -20,6 +25,7 @@ impl ResponseEvent {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Created => Self::CREATED,
+            Self::Queued => Self::QUEUED,
             Self::InProgress => Self::IN_PROGRESS,
             Self::Completed => Self::COMPLETED,
             Self::Incomplete => Self::INCOMPLETE,

@@ -17,4 +17,6 @@ mod non_streaming;
 mod streaming;
 
 // Public exports
-pub(crate) use handlers::route_responses;
+pub(crate) use handlers::{
+    route_responses, route_responses_background, route_responses_background_stream,
+};
