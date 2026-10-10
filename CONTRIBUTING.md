@@ -101,6 +101,12 @@ Signed-off-by: Your Name <your.email@example.com>
   Example: `Fixed in abc1234 — capped total_chunks at 1024 before allocation`.
   Silence or "Fixed!" makes reviewers re-hunt your work.
 
+For any change governed by the [API Stability Policy](governance/api-stability.md), identify
+every affected contract in the PR description and classify the change as additive,
+deprecated-compatible, or breaking. Record any version or deprecation action and
+migration note required by the policy. An intentional break must also follow the
+[label, release-note, and approval requirements](governance/api-stability.md#intentional-breaking-changes).
+
 ---
 
 ## Using code agents (Claude Code, Cursor, Copilot, etc.)
