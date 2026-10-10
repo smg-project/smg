@@ -237,3 +237,53 @@ async fn conversation_item_content_round_trips_json_column() {
         .expect("item should exist");
     assert_eq!(fetched.content, content);
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn find_response_by_output_item_queries_the_stored_output() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let resp = bundle.response_storage;
+
+    // The lookup behind `item_reference` input items: a stored response is
+    // found by the id of any of its output items, through the JSON column.
+    let mut stored = StoredResponse::new(None);
+    let msg_id = format!("msg_{}", stored.id.0);
+    let rs_id = format!("rs_{}", stored.id.0);
+    stored.input = json!([{"type": "message", "role": "user", "content": "hi"}]);
+    stored.raw_response = json!({
+        "id": stored.id.0,
+        "output": [
+            {"type": "reasoning", "id": rs_id, "summary": []},
+            {"type": "message", "id": msg_id, "role": "assistant", "status": "completed",
+             "content": [{"type": "output_text", "text": "hello", "annotations": []}]}
+        ]
+    });
+    let response_id = resp.store_response(stored).await.expect("store response");
+
+    for item_id in [&msg_id, &rs_id] {
+        let found = resp
+            .find_response_by_output_item(item_id)
+            .await
+            .expect("lookup by output item id");
+        assert_eq!(found.map(|r| r.id), Some(response_id.clone()), "{item_id}");
+    }
+    let unknown = resp
+        .find_response_by_output_item(&format!("msg_unknown_{}", response_id.0))
+        .await
+        .expect("lookup of an unknown id");
+    assert!(unknown.is_none());
+
+    resp.delete_response(&response_id)
+        .await
+        .expect("delete response");
+    let gone = resp
+        .find_response_by_output_item(&msg_id)
+        .await
+        .expect("lookup after delete");
+    assert!(gone.is_none());
+}
