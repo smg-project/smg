@@ -32,6 +32,8 @@ def _server_info_method(response_type):
         "server_facts": model_info.server_facts,
         "mm_device_do_normalize": model_info.mm_device_do_normalize,
         "mm_item_limits": model_info.mm_item_limits,
+        "engine_reasoning_parser": model_info.engine_reasoning_parser,
+        "structured_outputs_start": model_info.structured_outputs_start,
     }
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(_SERVICER), "exec"), namespace)
     return namespace["GetServerInfo"]
