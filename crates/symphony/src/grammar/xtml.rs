@@ -382,6 +382,170 @@ mod tests {
     }
 
     #[test]
+    fn a_propertys_own_definition_stands_before_the_roots() {
+        // The engine gets the property's schema with its own definitions kept and the root's
+        // filling in the rest, so the check reads the same: the property's `Inner` is whole and
+        // the root's `Inner`, which points at nothing, is not the one `Outer` reaches.
+        let call = first_call(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": {
+                    "Outer": {"type": "object", "properties": {"in": {"$ref": "#/$defs/Inner"}}},
+                    "Inner": {"$ref": "#/$defs/Gone"},
+                },
+                "properties": {
+                    "own": {
+                        "$ref": "#/$defs/Outer",
+                        "$defs": {"Inner": {"type": "integer"}},
+                    },
+                    "root": {"$ref": "#/$defs/Outer"},
+                },
+                "required": ["own", "root"],
+            }),
+        )]);
+        let slots = call["elements"][3]["elements"]
+            .as_array()
+            .expect("two slots");
+        assert_eq!(
+            slots[0]["elements"][0]["value"],
+            argument_open("own", "object")
+        );
+        assert_eq!(
+            slots[0]["elements"][1]["json_schema"]["$defs"]["Inner"],
+            value!({"type": "integer"}),
+            "the property's own definition goes to the engine"
+        );
+        assert_eq!(
+            slots[1]["elements"][0]["value"], "<|open|>argument key=\"root\" type=\"",
+            "through the root's Inner the pointer reaches nothing"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_definitions_is_followed_to_its_end_however_long_and_deep() {
+        // Every link is a different pointer, so the memo of pointers followed does not shorten a
+        // chain, and the walk keeps the schemas still to look at in a list of its own: a request's
+        // chain costs its length and no stack, however many links it has and however deep each
+        // link nests before its pointer. The property carries a type of its own: a whole chain
+        // pins it, and a chain whose last link points at nothing does not, so the pin shows the
+        // walk reached the end rather than stopping partway.
+        let chain = |links: usize, nesting: usize, whole: bool| {
+            let mut defs = serde_json::Map::new();
+            for i in 0..links {
+                let mut link = value!({"$ref": format!("#/$defs/D{}", i + 1)});
+                for _ in 0..nesting {
+                    link = value!({"properties": {"a": link}});
+                }
+                defs.insert(format!("D{i}"), link);
+            }
+            if whole {
+                defs.insert(format!("D{links}"), value!({"type": "integer"}));
+            }
+            tool(
+                "t",
+                value!({
+                    "type": "object",
+                    "$defs": defs,
+                    "properties": {"p": {"type": "object", "$ref": "#/$defs/D0"}},
+                    "required": ["p"],
+                }),
+            )
+        };
+        let opener = |links: usize, nesting: usize, whole: bool| {
+            first_call(&[chain(links, nesting, whole)])["elements"][3]["elements"][0]["elements"][0]
+                ["value"]
+                .clone()
+        };
+        let typeless = "<|open|>argument key=\"p\" type=\"";
+        assert_eq!(opener(10, 0, true), argument_open("p", "object"));
+        assert_eq!(
+            opener(5_000, 0, true),
+            argument_open("p", "object"),
+            "five thousand links"
+        );
+        // Sixty-four links, each wrapped a hundred and twenty times in `properties` before its
+        // pointer, two objects a wrap: a walk with a frame per object would need some fifteen
+        // thousand of them.
+        assert_eq!(
+            opener(64, 120, true),
+            argument_open("p", "object"),
+            "sixty-four links nested deep"
+        );
+        // The same chains with their last definition missing: only a walk that reaches the end
+        // finds the pointer at nothing.
+        assert_eq!(
+            opener(5_000, 0, false),
+            typeless,
+            "five thousand links to nothing"
+        );
+        assert_eq!(
+            opener(64, 120, false),
+            typeless,
+            "sixty-four deep links to nothing"
+        );
+    }
+
+    #[test]
+    fn a_wide_schema_keeps_its_pins_however_many_definitions_it_names() {
+        // A property whose fields each name a different leaf definition is looked at once per
+        // definition and keeps its type, with every definition attached.
+        let mut defs = serde_json::Map::new();
+        let mut fields = serde_json::Map::new();
+        for i in 0..70 {
+            defs.insert(format!("L{i}"), value!({"type": "integer"}));
+            fields.insert(format!("f{i}"), value!({"$ref": format!("#/$defs/L{i}")}));
+        }
+        let call = first_call(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": defs,
+                "properties": {"wide": {"type": "object", "properties": fields}},
+                "required": ["wide"],
+            }),
+        )]);
+        let slot = &call["elements"][3]["elements"][0];
+        assert_eq!(
+            slot["elements"][0]["value"],
+            argument_open("wide", "object")
+        );
+        assert_eq!(
+            slot["elements"][1]["json_schema"]["$defs"]["L69"],
+            value!({"type": "integer"})
+        );
+    }
+
+    #[test]
+    fn a_propertys_own_definitions_block_that_is_no_object_resolves_nothing() {
+        // `"$defs": null` (an SDK writing an empty map as null) stays as it is in the document the
+        // engine gets, with no entry at the pointer, so the property pins nothing rather than a
+        // schema the engine cannot compile.
+        let call = first_call(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": {"Count": {"type": "integer"}},
+                "properties": {
+                    "null_block": {"$ref": "#/$defs/Count", "$defs": null},
+                    "list_block": {"$ref": "#/$defs/Count", "$defs": []},
+                },
+                "required": ["null_block", "list_block"],
+            }),
+        )]);
+        let slots = call["elements"][3]["elements"]
+            .as_array()
+            .expect("two slots");
+        for (slot, key) in [(&slots[0], "null_block"), (&slots[1], "list_block")] {
+            assert_eq!(
+                slot["elements"][0]["value"],
+                format!("<|open|>argument key=\"{key}\" type=\""),
+                "{key} pins nothing"
+            );
+        }
+    }
+
+    #[test]
     fn attribute_values_are_escaped_as_the_template_writes_them() {
         let parameters = value!({
             "type": "object",
