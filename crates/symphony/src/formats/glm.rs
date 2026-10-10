@@ -57,6 +57,7 @@ mod tests {
                     "new_preferences": {"type": "object"},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }

@@ -1,7 +1,7 @@
 //! DeepSeek-V4 render parity with the engine's own server.
 //!
 //! Every case in `tests/fixtures/deepseek_v4/render_fixtures.json` is a chat
-//! request and the prompt vLLM's own server renders for it (its
+//! request and the prompt the engine's own server renders for it (its
 //! `tokenizers/deepseek_v4.py` over its port of the checkpoint's encoder):
 //! the request's `chat_template_kwargs`, top-level `reasoning_effort` and
 //! tools, the rendered text, and the text's ids under the checkpoint's

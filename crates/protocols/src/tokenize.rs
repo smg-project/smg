@@ -1,7 +1,7 @@
 //! Tokenize and Detokenize API protocol types
 //!
-//! These types mirror the SGLang Python implementation for compatibility.
-//! See: python/sglang/srt/entrypoints/openai/protocol.py
+//! These types mirror the serving engine's Python implementation for compatibility.
+//! See: its srt/entrypoints/openai/protocol.py
 
 use serde::{Deserialize, Serialize};
 

@@ -2,7 +2,8 @@
 # records its corpus sources and pushes the new sets to a branch with the job's own token. Registered to the bellwether
 # repository alone, so no organization runner group is involved. The repository is public, so the pods carry no
 # credential and run no docker. A recorder holds up to ~19 GB (tau2, 4 sets a call), hence 64 GiB for two at once; the
-# 40 GiB disk request keeps pods off the 35 GB CPU nodes. CPU-only nodes are preferred, GPU nodes take the overflow.
+# 40 GiB disk request keeps pods off the nodes with less ephemeral storage than that. CPU-only nodes are preferred;
+# the tainted nodes (tolerated below) take the overflow.
 githubConfigUrl: "https://github.com/smg-project/bellwether"
 githubConfigSecret: github-arc-secret
 controllerServiceAccount:

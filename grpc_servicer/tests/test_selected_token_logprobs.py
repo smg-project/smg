@@ -1,4 +1,4 @@
-"""Selected-token scores survive the Python SGLang transport without a GPU.
+"""Selected-token scores survive the Python SGLang transport without an engine.
 
 Only engine imports are replaced; request state, output handling, protobuf
 serialization, and the positional msgpack codec are the production code.
@@ -28,7 +28,7 @@ def _load(monkeypatch, name, filename):
 
 @pytest.fixture
 def manager_mod(monkeypatch):
-    # Importing SGLang itself loads GPU/runtime dependencies. These unused
+    # Importing SGLang itself loads the engine runtime's dependencies. These unused
     # imports are the only stand-ins; no request-manager behavior is mocked.
     symbols = {
         "sglang.srt.disaggregation.utils": "DisaggregationMode FAKE_BOOTSTRAP_HOST",

@@ -185,13 +185,18 @@ def server_facts(vllm_config: Any) -> dict[str, Any]:
         # pins per request.
         kv_connector, kv_engine_id = resolve_pd_connector(kv_config)
         kv_role = getattr(kv_config, "kv_role", None) or ""
+    pairing = pairing_fields(vllm_config)
+    encoder_dtype = pairing.get("model_dtype", "").removeprefix("torch.")
+    if encoder_dtype not in {"float32", "float16", "bfloat16"}:
+        encoder_dtype = ""
     return {
         "kv_connector": str(kv_connector or ""),
         "kv_role": str(kv_role),
         "kv_engine_id": str(kv_engine_id or ""),
         "data_parallel_size": int(vllm_config.parallel_config.data_parallel_size),
+        "multimodal_encoder_dtype": encoder_dtype,
         "max_num_seqs": running_window(vllm_config),
         "shm_namespace_id": mm_shm.shm_namespace_id(),
         "pairing_protocol": pairing_protocol_from_env(),
-        **pairing_fields(vllm_config),
+        **pairing,
     }

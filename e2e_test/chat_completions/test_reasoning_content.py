@@ -49,10 +49,11 @@ class TestReasoningContentAPI:
         reasoning_content = ""
         content = ""
         for chunk in response:
-            if chunk.choices[0].delta.content:
-                content += chunk.choices[0].delta.content
-            elif chunk.choices[0].delta.reasoning_content:
-                reasoning_content += chunk.choices[0].delta.reasoning_content
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content += delta.content
+            elif getattr(delta, "reasoning_content", None):
+                reasoning_content += delta.reasoning_content
 
         assert len(reasoning_content) == 0
         assert len(content) > 0
@@ -76,10 +77,11 @@ class TestReasoningContentAPI:
         reasoning_content = ""
         content = ""
         for chunk in response:
-            if chunk.choices[0].delta.content:
-                content += chunk.choices[0].delta.content
-            elif chunk.choices[0].delta.reasoning_content:
-                reasoning_content += chunk.choices[0].delta.reasoning_content
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content += delta.content
+            elif getattr(delta, "reasoning_content", None):
+                reasoning_content += delta.reasoning_content
 
         assert len(reasoning_content) > 0
         assert len(content) > 0
@@ -104,19 +106,18 @@ class TestReasoningContentAPI:
         content = ""
         first_chunk = False
         for chunk in response:
-            if chunk.choices[0].delta.reasoning_content:
-                reasoning_content = chunk.choices[0].delta.reasoning_content
+            delta = chunk.choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_content = reasoning
                 first_chunk = True
-            if chunk.choices[0].delta.content:
-                content += chunk.choices[0].delta.content
+            if delta.content:
+                content += delta.content
                 if not first_chunk:
-                    reasoning_content = chunk.choices[0].delta.reasoning_content
+                    reasoning_content = reasoning
                 first_chunk = True
             if not first_chunk:
-                assert (
-                    not chunk.choices[0].delta.reasoning_content
-                    or len(chunk.choices[0].delta.reasoning_content) == 0
-                )
+                assert not reasoning
 
         assert len(reasoning_content) > 0
         assert len(content) > 0
@@ -152,7 +153,7 @@ class TestReasoningContentAPI:
                 delta = chunk.choices[0].delta
                 if delta.content:
                     content += delta.content
-                if delta.reasoning_content:
+                if getattr(delta, "reasoning_content", None):
                     reasoning += delta.reasoning_content
             return reasoning, content
 

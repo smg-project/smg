@@ -1213,6 +1213,9 @@ async fn info_rpcs_report_config_and_handshake_facts() {
     assert_eq!(server.block_size, i32::try_from(ready.block_size).unwrap());
     // The launcher's dtype label wins (the spelling PD pairing compares).
     assert_eq!(server.model_dtype, "torch.bfloat16");
+    assert_eq!(server.multimodal_encoder_dtype, "bfloat16");
+    let labels = serde_json::to_value(&server).unwrap();
+    assert_eq!(labels["multimodal_encoder_dtype"], "bfloat16");
     assert_eq!(server.active_requests, 0);
     // PD identity and pairing facts, off the launcher's config.
     assert_eq!(server.kv_connector, "NixlConnector");
@@ -1254,6 +1257,46 @@ async fn info_rpcs_report_config_and_handshake_facts() {
         .unwrap_err();
     assert_eq!(status.code(), Code::Unimplemented);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Encoder metadata accepts only supported floats while PD pairing retains
+/// the selected model dtype, including the handshake fallback.
+#[tokio::test]
+async fn server_info_filters_encoder_dtype_without_changing_model_dtype() {
+    let handshake_dtype = default_ready_response().dtype.as_str().to_string();
+    for (dtype, expected) in [
+        ("torch.bfloat16", "bfloat16"),
+        ("torch.float16", "float16"),
+        ("torch.float32", "float32"),
+        ("bfloat16", "bfloat16"),
+        ("float16", "float16"),
+        ("float32", "float32"),
+        ("torch.float64", ""),
+        ("float64", ""),
+        ("torch.uint8", ""),
+        ("unknown", ""),
+        ("", handshake_dtype.as_str()),
+    ] {
+        let mut model = model_info();
+        model.model_dtype = dtype.to_string();
+        let mut h = harness(model, None).await;
+        let info = h
+            .client
+            .get_server_info(vllm::GetServerInfoRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.multimodal_encoder_dtype, expected, "dtype={dtype:?}");
+        assert_eq!(
+            info.model_dtype,
+            if dtype.is_empty() {
+                &handshake_dtype
+            } else {
+                dtype
+            }
+        );
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
 }
 
 /// The launcher's `--max-num-seqs` is the window `GetServerInfo` advertises

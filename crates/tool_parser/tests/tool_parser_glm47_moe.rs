@@ -120,7 +120,7 @@ async fn test_glm5_routes_to_glm47_moe() {
 
 /// GLM-4.7 follows the same contract as every other native tool format:
 /// `auto` and `none` send no constraint (an engine launched without a grammar
-/// backend, TokenSpeed's default, keeps serving tool calls), and `required`
+/// backend, one engine's default, keeps serving tool calls), and `required`
 /// or a named function sends the structural tag with a forced call.
 #[test]
 fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
@@ -220,10 +220,10 @@ fn test_glm47_constrains_only_forced_tool_choices_with_a_structural_tag() {
 }
 
 /// On a thinking prompt (GLM-4.7 with `enable_thinking` on, GLM-5 always) the
-/// forced call must follow the model's reasoning, as xgrammar's built-in
-/// `glm_4_7` tag lays it out with `reasoning=True`:
-/// `sequence[<free text></think>, <calls>]`. Without a forced choice there is
-/// still no constraint, thinking or not.
+/// forced call follows free text, `sequence[<free text>, <calls>]`: the
+/// thought and its close where the engine applies the grammar from the first
+/// token, nothing where it defers the grammar past the model's `</think>`.
+/// Without a forced choice there is still no constraint, thinking or not.
 #[test]
 fn test_glm47_forced_choice_on_a_thinking_prompt_reasons_first() {
     let factory = ParserFactory::new();
@@ -249,10 +249,8 @@ fn test_glm47_forced_choice_on_a_thinking_prompt_reasons_first() {
     assert_eq!(thinking["format"]["type"], "sequence");
     let elements = thinking["format"]["elements"].as_array().unwrap();
     assert_eq!(elements.len(), 2);
-    assert_eq!(elements[0]["type"], "tag");
-    assert_eq!(elements[0]["begin"], "");
-    assert_eq!(elements[0]["end"], "</think>");
-    assert_eq!(elements[0]["content"]["type"], "any_text");
+    assert_eq!(elements[0], Glm4MoeParser::reasoning_prefix());
+    assert_eq!(elements[0]["type"], "any_text");
     assert_eq!(
         elements[1], plain["format"],
         "the calls part is the non-thinking tag"
@@ -297,4 +295,57 @@ async fn test_glm47_nested_json_in_arg_values() {
     let args: serde_json::Value = serde_json::from_str(&tools[0].function.arguments).unwrap();
     assert!(args["data"].is_object());
     assert!(args["list"].is_array());
+}
+
+/// On a thinking prompt the forced call's grammar must not hold the model to
+/// anything it may already have written. An engine that runs a reasoning
+/// parser applies the grammar only once the model has closed
+/// its own `</think>`, so a reasoning block in front of the calls, closed by
+/// `</think>`, is owed a second time: the model can neither call nor end the
+/// turn until it has written another `</think>`, and fills the gap with a
+/// fabricated observation and answer. Whatever precedes the calls is free
+/// text with nothing owed at its end.
+#[test]
+fn test_glm47_forced_call_grammar_owes_nothing_before_the_calls_on_a_thinking_prompt() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("glm47_moe");
+    let tools = create_test_tools();
+    let named: ToolChoice = serde_json::from_value(serde_json::json!({
+        "type": "function",
+        "function": {"name": tools[0].function.name}
+    }))
+    .unwrap();
+    for (choice, selected) in [
+        (
+            ToolChoice::Value(ToolChoiceValue::Required),
+            tools.as_slice(),
+        ),
+        (named, &tools[..1]),
+    ] {
+        let Some(ToolConstraint::StructuralTag(tag)) = registry
+            .generate_tool_constraint(parser, selected, &choice, true)
+            .unwrap()
+        else {
+            panic!("expected a structural tag for {choice:?}");
+        };
+        let tag: serde_json::Value = serde_json::from_str(&tag).unwrap();
+        let format = &tag["format"];
+        let calls = if format["type"] == "sequence" {
+            let elements = format["elements"].as_array().unwrap();
+            assert_eq!(elements.len(), 2, "{choice:?}: {format}");
+            assert_eq!(
+                elements[0]["type"], "any_text",
+                "{choice:?}: free text before the calls, nothing the model owes: {format}"
+            );
+            assert!(elements[0].get("end").is_none(), "{choice:?}: {format}");
+            &elements[1]
+        } else {
+            format
+        };
+        assert_eq!(calls["type"], "triggered_tags", "{choice:?}: {format}");
+        assert_eq!(calls["triggers"], serde_json::json!(["<tool_call>"]));
+        assert_eq!(calls["at_least_one"], true);
+        assert_eq!(calls["tags"].as_array().unwrap().len(), selected.len());
+    }
 }

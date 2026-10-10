@@ -10,6 +10,10 @@ GPU resources are exclusive. Combined with the collection-ordering hook in
 ``fixtures/hooks.py`` (which clusters items by backend/model), this keeps
 the worker alive across every test class that uses the same backend.
 
+ZMQ reuse retains the gateway together with its workers: the engines dial
+that gateway's handshake sockets and cannot move to a new gateway. Only
+explicitly compatible functional classes opt into this paired lifetime.
+
 PD-disaggregation paths (prefill+decode) don't cache: they hold multiple
 workers concurrently and the caller manages teardown. But they still go
 through ``acquire()`` so the pool can evict any cached regular worker
@@ -28,6 +32,8 @@ import logging
 import threading
 
 from .constants import DEFAULT_STARTUP_TIMEOUT, ConnectionMode, WorkerType
+from .gateway import Gateway
+from .process_utils import wait_for_workers_ready
 from .worker import Worker, start_workers, stop_workers
 
 logger = logging.getLogger(__name__)
@@ -54,6 +60,8 @@ class WorkerPool:
         self._lock = threading.Lock()
         self._key: _PoolKey | None = None
         self._workers: list[Worker] = []
+        self._gateway: Gateway | None = None
+        self._gateway_key: tuple | None = None
         self._closed = False
 
     def acquire(
@@ -176,6 +184,109 @@ class WorkerPool:
             self._workers = new_workers
             return list(new_workers)
 
+    def acquire_zmq(
+        self,
+        *,
+        model_id: str,
+        model_path: str,
+        engine: str,
+        count: int,
+        gpus: int | None,
+        extra_engine_args: list[str] | None,
+        gateway_config: dict,
+        log_dir: str | None = None,
+    ) -> Gateway:
+        """Acquire one healthy ZMQ gateway/engine pair with identical config.
+
+        Lane environment and model specifications are fixed for a pytest
+        session. Class-varying engine and gateway options are matched exactly;
+        no default or CLI argument normalization expands compatibility.
+        """
+        key: _PoolKey = (
+            engine,
+            model_id,
+            ConnectionMode.ZMQ,
+            WorkerType.REGULAR,
+            count,
+            gpus,
+            tuple(extra_engine_args) if extra_engine_args else None,
+        )
+        gateway_key = (
+            model_path,
+            gateway_config["policy"],
+            gateway_config["timeout"],
+            tuple(gateway_config["extra_args"]) if gateway_config["extra_args"] else None,
+            gateway_config.get("log_level"),
+            gateway_config.get("log_dir"),
+            log_dir,
+        )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("WorkerPool has been closed")
+            if (
+                self._key == key
+                and self._gateway_key == gateway_key
+                and self._gateway is not None
+                and self._zmq_ready(count)
+            ):
+                logger.info("WorkerPool: reusing ZMQ gateway/worker pair for %s", key)
+                return self._gateway
+
+            self._evict_locked()
+            gateway = Gateway()
+            workers: list[Worker] = []
+            try:
+                workers = start_workers(
+                    model_id=model_id,
+                    engine=engine,
+                    mode=ConnectionMode.ZMQ,
+                    count=count,
+                    gpus=gpus,
+                    extra_engine_args=extra_engine_args,
+                    log_dir=log_dir,
+                )
+                gateway.start(
+                    worker_urls=[w.base_url for w in workers],
+                    model_path=model_path,
+                    backend=engine,
+                    policy=gateway_config["policy"],
+                    timeout=gateway_config["timeout"],
+                    extra_args=gateway_config["extra_args"],
+                    log_level=gateway_config.get("log_level"),
+                    log_dir=gateway_config.get("log_dir"),
+                )
+            except BaseException:
+                try:
+                    gateway.shutdown()
+                finally:
+                    stop_workers(workers)
+                raise
+            self._key, self._workers = key, workers
+            self._gateway, self._gateway_key = gateway, gateway_key
+            return gateway
+
+    def _zmq_ready(self, count: int) -> bool:
+        if (
+            self._gateway is None
+            or len(self._workers) != count
+            or not all(w.is_alive() for w in self._workers)
+            or not self._gateway.is_running
+        ):
+            return False
+        try:
+            # /health is only gateway liveness. Reuse the startup gate so a
+            # live launcher with an unavailable engine is not a cache hit.
+            wait_for_workers_ready(self._gateway.base_url, count, timeout=5)
+            return True
+        except TimeoutError:
+            return False
+
+    def discard_zmq(self, gateway: Gateway) -> None:
+        """Evict a pair whose class failed, without interrupting that class."""
+        with self._lock:
+            if self._gateway is gateway:
+                self._evict_locked()
+
     def cleanup(self) -> None:
         """Stop all cached workers. Idempotent; safe to call multiple times."""
         with self._lock:
@@ -183,10 +294,15 @@ class WorkerPool:
             self._closed = True
 
     def _evict_locked(self) -> None:
-        if self._workers:
+        try:
+            if self._gateway is not None:
+                self._gateway.shutdown()
+        finally:
             stop_workers(self._workers)
-        self._workers = []
-        self._key = None
+            self._workers = []
+            self._key = None
+            self._gateway = None
+            self._gateway_key = None
 
 
 _POOL: WorkerPool | None = None

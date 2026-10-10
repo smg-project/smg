@@ -4,7 +4,10 @@
 //! establishes its own peer connection to upstream, and bridges data-channel
 //! messages plus audio RTP packets between the two.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use axum::{
     body::Bytes,
@@ -24,16 +27,50 @@ use crate::{
     worker::ExternalWorker,
 };
 
-/// Resolve a STUN server hostname to an IPv4 `SocketAddr`.
-/// Filters for IPv4 since our UDP sockets bind to `0.0.0.0`.
+/// The WebRTC bind address when none is configured: the unspecified address
+/// of the serving host's family, so a gateway serving on an IPv6 address
+/// gathers IPv6 candidates. A `::` socket is dual-stack on Linux and still
+/// answers IPv4 peers through their mapped addresses.
+pub fn default_bind_addr(serving_host: &str) -> IpAddr {
+    let literal = serving_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if literal.parse::<Ipv6Addr>().is_ok() {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    }
+}
+
+/// The STUN server address a socket bound to `bind_addr` can talk to: the
+/// first answer of its family; for a `::` socket (dual-stack) an IPv4 answer
+/// through its mapped address when there is no IPv6 one.
+fn pick_stun_address(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    bind_addr: IpAddr,
+) -> Option<SocketAddr> {
+    let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
+    match bind_addr {
+        IpAddr::V4(_) => addrs.iter().find(|a| a.is_ipv4()).copied(),
+        IpAddr::V6(bind) => addrs.iter().find(|a| a.is_ipv6()).copied().or_else(|| {
+            if !bind.is_unspecified() {
+                return None;
+            }
+            addrs.iter().find_map(|a| match a.ip() {
+                IpAddr::V4(v4) => Some(SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), a.port())),
+                IpAddr::V6(_) => None,
+            })
+        }),
+    }
+}
+
+/// Resolve a STUN server hostname to a `SocketAddr` of the bind address's
+/// family (see [`pick_stun_address`]).
 /// Times out after 3 seconds to avoid blocking bridge setup on slow DNS.
-/// Returns `None` if disabled ("none") or resolution fails.
-///
-/// Limitation: IPv6 bind addresses are not currently supported. If `bind_addr`
-/// is IPv6 (e.g., `::`), STUN gathering will silently return `None` because
-/// only IPv4 addresses are selected from DNS results. Add bind-family-aware
-/// resolution when IPv6 deployments are required.
-async fn resolve_stun_server(server: Option<&str>) -> Option<SocketAddr> {
+/// Returns `None` if disabled ("none"), resolution fails or no answer fits
+/// the family.
+async fn resolve_stun_server(server: Option<&str>, bind_addr: IpAddr) -> Option<SocketAddr> {
     use std::time::Duration;
 
     let host = server?;
@@ -41,7 +78,17 @@ async fn resolve_stun_server(server: Option<&str>) -> Option<SocketAddr> {
         return None;
     }
     match tokio::time::timeout(Duration::from_secs(3), tokio::net::lookup_host(host)).await {
-        Ok(Ok(mut addrs)) => addrs.find(|a| a.is_ipv4()),
+        Ok(Ok(addrs)) => {
+            let picked = pick_stun_address(addrs, bind_addr);
+            if picked.is_none() {
+                tracing::warn!(
+                    stun_server = host,
+                    %bind_addr,
+                    "STUN server has no address of the bind address's family"
+                );
+            }
+            picked
+        }
         Ok(Err(e)) => {
             tracing::warn!(stun_server = host, error = %e, "Failed to resolve STUN server");
             None
@@ -272,7 +319,7 @@ pub async fn handle_realtime_webrtc(
     parsed: WebRtcParsedRequest,
     worker: Result<Arc<dyn ExternalWorker>, Response>,
     auth_header: Option<HeaderValue>,
-    bind_addr: std::net::IpAddr,
+    bind_addr: IpAddr,
     stun_server: Option<String>,
     realtime_registry: Arc<RealtimeRegistry>,
 ) -> Response {
@@ -378,7 +425,7 @@ async fn setup_and_spawn_bridge(
     session_config: Option<serde_json::Value>,
     auth_str: &str,
     worker: Arc<dyn ExternalWorker>,
-    bind_addr: std::net::IpAddr,
+    bind_addr: IpAddr,
     configured_stun_server: Option<String>,
     realtime_registry: Arc<RealtimeRegistry>,
     label: &str,
@@ -397,7 +444,7 @@ async fn setup_and_spawn_bridge(
     );
 
     let call_id = uuid::Uuid::now_v7().to_string();
-    let stun_server = resolve_stun_server(configured_stun_server.as_deref()).await;
+    let stun_server = resolve_stun_server(configured_stun_server.as_deref(), bind_addr).await;
 
     info!(
         call_id,
@@ -506,5 +553,75 @@ mod tests {
         // Empty/whitespace query model is rejected before SDP validation.
         let body = Bytes::from_static(b"v=0\r\n");
         assert!(parse_sdp(&body, "   ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    fn v4(last: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, last)), 3478)
+    }
+
+    fn v6(last: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last)),
+            3478,
+        )
+    }
+
+    #[test]
+    fn an_ipv4_bind_takes_the_first_ipv4_answer() {
+        assert_eq!(
+            pick_stun_address([v6(1), v4(1), v4(2)], IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Some(v4(1))
+        );
+        assert_eq!(
+            pick_stun_address([v6(1)], IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_ipv6_bind_takes_the_first_ipv6_answer() {
+        let bind = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7));
+        assert_eq!(pick_stun_address([v4(1), v6(1), v6(2)], bind), Some(v6(1)));
+        assert_eq!(
+            pick_stun_address([v4(1)], bind),
+            None,
+            "a socket bound to one IPv6 address cannot reach an IPv4 server"
+        );
+    }
+
+    #[test]
+    fn a_dual_stack_bind_falls_back_to_a_mapped_ipv4_answer() {
+        let bind = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        assert_eq!(pick_stun_address([v4(1), v6(1)], bind), Some(v6(1)));
+        assert_eq!(
+            pick_stun_address([v4(1)], bind),
+            Some(SocketAddr::new(
+                IpAddr::V6(Ipv4Addr::new(198, 51, 100, 1).to_ipv6_mapped()),
+                3478
+            ))
+        );
+    }
+
+    #[test]
+    fn the_default_bind_follows_the_serving_hosts_family() {
+        for host in ["0.0.0.0", "127.0.0.1", "10.0.0.7", "localhost", ""] {
+            assert_eq!(
+                default_bind_addr(host),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                "{host}"
+            );
+        }
+        for host in ["::", "[::]", "::1", "[fd00::7]", " :: "] {
+            assert_eq!(
+                default_bind_addr(host),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                "{host}"
+            );
+        }
     }
 }

@@ -125,8 +125,10 @@ fn test_detect_openai_format_with_length_check() {
 }
 
 #[test]
-fn test_detect_openai_format_with_index_access() {
-    // Template that accesses content by index
+fn test_index_access_without_a_content_loop_is_string_format() {
+    // An index on the content is not a loop over it: the engine's own
+    // detection keeps such a template in the string format, so the gateway
+    // does too and hands it string content as a string.
     let template = r"
         {%- for message in messages %}
         {%- if message.content[0] %}
@@ -137,7 +139,7 @@ fn test_detect_openai_format_with_index_access() {
 
     assert_eq!(
         detect_chat_template_content_format(template),
-        ChatTemplateContentFormat::OpenAI
+        ChatTemplateContentFormat::String
     );
 }
 
@@ -395,5 +397,221 @@ fn test_assignment_with_iteration_is_openai() {
     assert_eq!(
         detect_chat_template_content_format(template),
         ChatTemplateContentFormat::OpenAI
+    );
+}
+
+// The rule is the serving engine's own: a template is of the parts format
+// only when it loops over a message's content. The shapes below are those of
+// recorded templates whose renders depend on the verdict.
+
+#[test]
+fn a_length_test_on_the_content_without_a_loop_is_string_format() {
+    // ERNIE 4.5 (`content|length > 0`) and Qwen3-Coder
+    // (`message.content | trim | length > 0`) test the content's length and
+    // render it as a string; handing them a part list drops or breaks the
+    // text, so they are the string format, as on the engine.
+    let ernie = r"
+        {%- for message in messages %}
+        {%- if message.content is string %}{%- set content = message.content %}{%- else %}{%- set content = '' %}{%- endif %}
+        {%- if content|length > 0 %}{{ '<response>' + content + '</response>' }}{%- endif %}
+        {%- endfor %}
+        ";
+    let qwen3_coder = r"
+        {%- set loop_messages = messages %}
+        {%- for message in loop_messages %}
+        {%- if message.content is defined and message.content is string and message.content | trim | length > 0 %}
+        {{- message.content | trim }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+    for template in [ernie, qwen3_coder] {
+        assert_eq!(
+            detect_chat_template_content_format(template),
+            ChatTemplateContentFormat::String,
+            "{template}"
+        );
+    }
+}
+
+#[test]
+fn a_string_test_with_a_default_filter_without_a_loop_is_string_format() {
+    // Nemotron 3: `message.content | default('', true)` then `content is
+    // string`, and the string is printed; a part list would be printed as JSON.
+    let template = r"
+        {%- for message in messages %}
+        {%- set content = message.content | default('', true) %}
+        {%- if content is string and content | trim | length > 0 %}
+        {{- (content | trim) ~ '\n' }}
+        {%- else %}
+        {{- content | default('', true) | string | trim }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn a_loop_over_a_field_of_the_content_is_string_format() {
+    // Apertus: `message.content is mapping and 'parts' in message.content`,
+    // then a loop over `message.content.parts`, which is not a loop over the
+    // content itself; its string branch is the one the engine takes.
+    let template = r"
+        {%- for message in messages %}
+        {%- if message.content is string %}
+        {{ message.content }}
+        {%- elif message.content is mapping and 'parts' in message.content %}
+        {%- set parts = message.content.parts %}
+        {%- for part in parts %}{{ part.text }}{%- endfor %}
+        {%- else %}
+        {{- raise_exception('Invalid user message') }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn a_loop_over_the_content_of_a_messages_alias_is_openai_format() {
+    // `loop_messages` is assigned from `messages`, so `message` is a message
+    // and the loop over `message.content` makes the parts format, as on the
+    // engine, whatever the loop variable is called.
+    let template = r"
+        {%- set loop_messages = messages[1:] %}
+        {%- for msg in loop_messages %}
+        {%- for item in msg.content %}{{ item.text }}{%- endfor %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn a_filtered_loop_over_the_content_is_openai_format() {
+    // LLaVA: the loop runs over `message['content'] | selectattr(...)`; the
+    // filter does not hide the content.
+    let template = r"{% for message in messages %}{{ message['role'].upper() + ': ' }}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ content['text'] + ' ' }}{% endfor %}{% endfor %}";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn a_loop_over_the_content_in_a_nested_branch_is_openai_format() {
+    // K2-Horizon and Qwen3-Omni: the loop over `message.content` sits in the
+    // else branch of a string test, or runs under another name (`mcontent`).
+    let omni = r"
+        {%- for message in messages %}
+        {%- if message.content is string %}
+        {%- set content = message.content %}
+        {%- else %}
+        {%- set content = namespace(text='') %}
+        {%- for mcontent in message.content %}
+        {%- if mcontent.type == 'text' %}{%- set content.text = content.text + mcontent.text %}{%- endif %}
+        {%- endfor %}
+        {%- endif %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(omni),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn a_macro_parameter_fed_a_messages_content_is_openai_format() {
+    // Gemma 4 and Qwen3-VL fill a macro parameter with `message['content']`
+    // (by position or by keyword) and loop over it inside the macro.
+    let by_position = r"
+        {%- macro render(content) %}{%- for item in content %}{{ item.text }}{%- endfor %}{%- endmacro %}
+        {%- for message in messages %}{{ render(message['content']) }}{%- endfor %}
+        ";
+    let by_keyword = r"
+        {%- macro render(prefix, body) %}{%- for item in body %}{{ prefix ~ item.text }}{%- endfor %}{%- endmacro %}
+        {%- for message in messages %}{{ render('> ', body=message.content) }}{%- endfor %}
+        ";
+    for template in [by_position, by_keyword] {
+        assert_eq!(
+            detect_chat_template_content_format(template),
+            ChatTemplateContentFormat::OpenAI,
+            "{template}"
+        );
+    }
+}
+
+#[test]
+fn a_loop_inside_a_macro_not_fed_a_messages_content_is_string_format() {
+    // A macro that tests a type and loops over its parameter is not about the
+    // message content unless a call hands it one: here it renders tool
+    // parameters (Qwen3-Coder's `render_extra_keys`).
+    let template = r"
+        {%- macro render_extra_keys(json_dict, handled_keys) %}
+        {%- if json_dict is mapping %}
+        {%- for json_key in json_dict if json_key not in handled_keys %}{{ json_key }}{%- endfor %}
+        {%- endif %}
+        {%- endmacro %}
+        {%- for tool in tools %}{{ render_extra_keys(tool.parameters, ['type']) }}{%- endfor %}
+        {%- for message in messages %}{{ message.content }}{%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn a_loop_over_a_content_variable_inside_a_macro_is_string_format() {
+    // Outside a macro a loop over a variable named `content` is the parts
+    // format; inside one it is only when a call feeds the parameter a message's
+    // content, which this template never does.
+    let template = r"
+        {%- macro join(content) %}{%- for item in content %}{{ item }}{%- endfor %}{%- endmacro %}
+        {%- for message in messages %}{{ message.content }}{{ join(message.tool_calls) }}{%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn an_assignment_from_messages_to_a_namespace_falls_back_to_string_format() {
+    // The engine's walk stops at an assignment from `messages` whose target is
+    // not a plain name and falls back to its default, the string format; the
+    // gateway follows it there too.
+    let template = r"
+        {%- set ns = namespace(msgs=[]) %}
+        {%- set ns.msgs = messages %}
+        {%- for message in messages %}
+        {%- for item in message.content %}{{ item.text }}{%- endfor %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn a_loop_over_the_content_of_a_wrapped_message_is_string_format() {
+    // The base of `.content` must be the message name itself, as in the
+    // engine's `_is_attr_access`: a filter between them (`(message |
+    // default({})).content`) is not a loop over a message's content there.
+    let template = r"
+        {%- for message in messages %}
+        {%- for item in (message | default({})).content %}{{ item.text }}{%- endfor %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
     );
 }

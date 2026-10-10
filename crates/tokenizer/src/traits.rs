@@ -1,5 +1,5 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
 };
 
@@ -243,6 +243,22 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Renderer behaviours the gateway mirrors when it prepares a request.
     fn renderer_capabilities(&self) -> RendererCapabilities {
         RendererCapabilities::default()
+    }
+
+    /// The thinking mode this tokenizer's renderer renders for the template
+    /// kwargs and the request-level toggle it is handed
+    /// ([`ChatTemplateParams::template_kwargs`] and
+    /// [`ChatTemplateParams::thinking`]), for a renderer that resolves the
+    /// mode by its own rule rather than through the template's toggle key.
+    /// The gateway arms its reasoning parser from the same answer, so the
+    /// prompt and the parser never disagree. `None`: the renderer has no
+    /// rule of its own and the gateway's generic resolution applies.
+    fn native_thinking_mode(
+        &self,
+        _template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        _thinking: Option<bool>,
+    ) -> Option<bool> {
+        None
     }
 
     /// Set or override the chat template.

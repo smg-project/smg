@@ -1,0 +1,787 @@
+{
+ "description": "Prompts a Gemma 4 chat template renders for text-only requests, recorded from vLLM's own server: `ids` is the engine's POST /tokenize (messages, add_generation_prompt, the same chat_template_kwargs) and `text` the prompt those ids spell. Every layout with a string system or developer message ends its system turn in a space: vLLM hands the template the string as a one-item text part list and the template's parts branch appends a space after every part.",
+ "cases": [
+  {
+   "name": "user_only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_short",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\nYou are a helpful assistant. <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    496,
+    11045,
+    16326,
+    236761,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_long",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\nYou are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. You are a careful assistant. <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    1599,
+    659,
+    496,
+    15318,
+    16326,
+    236761,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_trailing_newline",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant.\n"
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\nYou are a helpful assistant. <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    496,
+    11045,
+    16326,
+    236761,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_leading_newline",
+   "messages": [
+    {
+     "role": "system",
+     "content": "\nYou are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\nYou are a helpful assistant. <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    496,
+    11045,
+    16326,
+    236761,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_two_paragraphs",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant.\n\nBe brief."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\nYou are a helpful assistant.\n\nBe brief. <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    496,
+    11045,
+    16326,
+    236761,
+    108,
+    3912,
+    8652,
+    236761,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_empty",
+   "messages": [
+    {
+     "role": "system",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\n <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "developer_short",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\nYou are a helpful assistant. <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    496,
+    11045,
+    16326,
+    236761,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_parts",
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "You are a helpful assistant."
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\nYou are a helpful assistant. <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    496,
+    11045,
+    16326,
+    236761,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "system_then_multiturn",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a helpful assistant."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!"
+    },
+    {
+     "role": "user",
+     "content": "How are you?"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>system\nYou are a helpful assistant. <turn|>\n<|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\nHow are you?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    9731,
+    107,
+    3048,
+    659,
+    496,
+    11045,
+    16326,
+    236761,
+    236743,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    9259,
+    236888,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    3910,
+    659,
+    611,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "multiturn_no_system",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!"
+    },
+    {
+     "role": "user",
+     "content": "How are you?"
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>user\nHi<turn|>\n<|turn>model\nHello!<turn|>\n<|turn>user\nHow are you?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    9259,
+    236888,
+    106,
+    107,
+    105,
+    2364,
+    107,
+    3910,
+    659,
+    611,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  },
+  {
+   "name": "user_parts",
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Hi"
+      }
+     ]
+    }
+   ],
+   "chat_template_kwargs": {
+    "enable_thinking": false
+   },
+   "text": "<bos><|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+   "ids": [
+    2,
+    105,
+    2364,
+    107,
+    10979,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+   ]
+  }
+ ]
+}

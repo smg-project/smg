@@ -337,6 +337,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         0
     }
 
+    /// Epochs reported during metadata discovery, invalidated after a health
+    /// failure. These are observations, not proof against an undetected restart.
+    fn cache_trace_epochs(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Set the worker's lifecycle status.
     fn set_status(&self, status: WorkerStatus);
 
@@ -1356,6 +1362,7 @@ impl RoutingState {
 #[derive(Debug)]
 pub struct WorkerRuntime {
     status: AtomicU8,
+    cache_trace_epochs_valid: AtomicBool,
     consecutive_failures: AtomicUsize,
     consecutive_successes: AtomicUsize,
     total_pending_probes: AtomicUsize,
@@ -1434,6 +1441,10 @@ impl WorkerRuntime {
     pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
         Self {
             status: AtomicU8::new(initial_status as u8),
+            cache_trace_epochs_valid: AtomicBool::new(!matches!(
+                initial_status,
+                WorkerStatus::NotReady | WorkerStatus::Failed
+            )),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_successes: AtomicUsize::new(0),
             total_pending_probes: AtomicUsize::new(0),
@@ -1660,6 +1671,10 @@ impl WorkerRuntime {
     }
 
     pub fn set_status(&self, status: WorkerStatus) {
+        if matches!(status, WorkerStatus::NotReady | WorkerStatus::Failed) {
+            self.cache_trace_epochs_valid
+                .store(false, Ordering::Release);
+        }
         self.status.store(status as u8, Ordering::Release);
     }
 
@@ -2110,6 +2125,23 @@ impl Worker for BasicWorker {
 
     fn revision(&self) -> u64 {
         self.runtime.load().revision()
+    }
+
+    fn cache_trace_epochs(&self) -> Vec<String> {
+        if !self
+            .runtime
+            .load()
+            .cache_trace_epochs_valid
+            .load(Ordering::Acquire)
+        {
+            return Vec::new();
+        }
+        self.metadata
+            .spec
+            .labels
+            .get("cache_trace_epochs")
+            .and_then(|epochs| serde_json::from_str(epochs).ok())
+            .unwrap_or_default()
     }
 
     fn set_status(&self, status: WorkerStatus) {

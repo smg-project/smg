@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Extension, Path, Query, Request, State},
+    extract::{Extension, Path, Query, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -54,6 +54,7 @@ use crate::{
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
+        heap_profile,
         inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -61,6 +62,7 @@ use crate::{
     },
     routers::{
         common::realtime::ws::RealtimeQueryParams,
+        error as route_error,
         gateway::Gateway,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
@@ -104,8 +106,34 @@ async fn parse_reasoning(
     parse::parse_reasoning(&state.context, &req).await
 }
 
-async fn sink_handler() -> Response {
-    StatusCode::NOT_FOUND.into_response()
+/// An unknown URL: a JSON envelope, never an empty body.
+async fn sink_handler(request: Request) -> Response {
+    unknown_route(StatusCode::NOT_FOUND, "unknown_url", request).await
+}
+
+/// A known URL with the wrong method (axum adds the `Allow` header).
+async fn method_not_allowed_handler(request: Request) -> Response {
+    unknown_route(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+        request,
+    )
+    .await
+}
+
+/// The envelope of the API the request speaks: the Messages API's on a
+/// Messages route or when the request carries `anthropic-version` (a model
+/// lookup by an Anthropic SDK), the OpenAI-shaped one otherwise.
+async fn unknown_route(status: StatusCode, code: &str, request: Request) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let response =
+        route_error::create_error(status, code, format!("Invalid URL ({method} {path})"));
+    if middleware::wants_messages_envelope(request.headers(), &path) {
+        middleware::into_messages_envelope(response, middleware::request_id_of(&request)).await
+    } else {
+        response
+    }
 }
 
 async fn liveness() -> Response {
@@ -478,12 +506,6 @@ async fn v1_conversations_list_items(
     .await
 }
 
-#[derive(Deserialize, Default)]
-struct GetItemQuery {
-    /// Additional fields to include in response (not yet implemented)
-    include: Option<Vec<String>>,
-}
-
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
@@ -501,14 +523,20 @@ async fn v1_conversations_create_items(
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(String, String)>,
-    Query(query): Query<GetItemQuery>,
+    RawQuery(query): RawQuery,
 ) -> Response {
+    // `include` arrives as repeated `include[]=` / `include=` pairs; each value
+    // must name an includable field, as the public API requires.
+    let include = match conversations::parse_item_include_query(query.as_deref()) {
+        Ok(include) => include,
+        Err(response) => return response,
+    };
     conversations::get_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
         &conversation_id,
         &item_id,
-        query.include,
+        include,
     )
     .await
 }
@@ -614,6 +642,15 @@ async fn stop_profile(
 ) -> Response {
     let body = body.map_or_else(StopProfileRequest::default, |Json(body)| body);
     WorkerManager::stop_profile_all(&state.context.worker_registry, body.url.as_deref())
+        .await
+        .into_response()
+}
+
+/// `POST /heap_profile`: a heap profile of this gateway process, written
+/// under `--jemalloc-prof-dir` by a `jemalloc-profiling` build (see
+/// [`heap_profile`]).
+async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
+    heap_profile::dump_blocking(state.context.router_config.jemalloc_prof_dir.clone())
         .await
         .into_response()
 }
@@ -957,6 +994,11 @@ pub fn build_app(
     .route_layer(axum::middleware::from_fn_with_state(
         app_state.clone(),
         middleware::wasm_middleware,
+    ))
+    // Outermost on these routes: a refusal by any layer inside (authentication,
+    // admission, the body timeout) leaves in the Messages envelope as well.
+    .route_layer(axum::middleware::from_fn(
+        middleware::messages_error_envelope_middleware,
     ));
 
     // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
@@ -1013,6 +1055,7 @@ pub fn build_app(
         .route("/flush_cache", post(flush_cache))
         .route("/start_profile", post(start_profile))
         .route("/stop_profile", post(stop_profile))
+        .route("/heap_profile", post(dump_heap_profile))
         // Deprecated alias of the public `/loads`.
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
@@ -1120,9 +1163,16 @@ where
     S: Clone + Send + Sync + 'static,
 {
     app.fallback(sink_handler)
+        .method_not_allowed_fallback(method_not_allowed_handler)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
+        ))
+        // The Messages envelope once more, outside the body-size limit: a
+        // declared over-limit length is refused by the limit layer before any
+        // route layer runs, and still leaves in the envelope.
+        .layer(axum::middleware::from_fn(
+            middleware::messages_error_envelope_middleware,
         ))
         .layer(axum::middleware::from_fn(
             middleware::trace_context_response,
@@ -1609,6 +1659,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &admin_auth_config,
         control_plane_auth_state.is_some(),
         config.prometheus_config.as_ref(),
+        config.mesh_server_config.as_ref(),
     );
 
     let app = build_app(
@@ -1853,6 +1904,92 @@ mod tests {
         }
     }
 
+    /// An unknown URL and a wrong method answer a JSON envelope in the shape
+    /// of the API the request speaks: the Messages envelope on a Messages
+    /// route or with the `anthropic-version` header, the OpenAI-shaped one
+    /// otherwise; never an empty body.
+    #[tokio::test]
+    async fn unknown_routes_answer_the_envelope_of_the_api_spoken() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = attach_edge_layers(
+            Router::new().route("/v1/chat/completions", post(|| async { StatusCode::OK })),
+            1024,
+            InFlightRequestTracker::new(),
+            vec![],
+            vec![],
+        );
+        for (method, path, version, status, messages_shape) in [
+            (
+                "GET",
+                "/v1/models/claude-x",
+                None,
+                StatusCode::NOT_FOUND,
+                false,
+            ),
+            (
+                "GET",
+                "/v1/models/claude-x",
+                Some("2023-06-01"),
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (
+                "GET",
+                "/v1/messages/batches",
+                None,
+                StatusCode::NOT_FOUND,
+                true,
+            ),
+            (
+                "GET",
+                "/v1/chat/completions",
+                None,
+                StatusCode::METHOD_NOT_ALLOWED,
+                false,
+            ),
+        ] {
+            let mut request = http::Request::builder().method(method).uri(path);
+            if let Some(version) = version {
+                request = request.header("anthropic-version", version);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{method} {path}");
+            let request_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| panic!("{method} {path}: not JSON: {body:?}"));
+            if messages_shape {
+                assert_eq!(json["type"], "error", "{json}");
+                let expected = if status == StatusCode::NOT_FOUND {
+                    "not_found_error"
+                } else {
+                    "invalid_request_error"
+                };
+                assert_eq!(json["error"]["type"], expected, "{json}");
+                assert_eq!(json["request_id"], request_id, "{json}");
+            } else {
+                assert!(json["error"].is_object(), "{json}");
+                assert!(
+                    json["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(path)),
+                    "{json}"
+                );
+            }
+        }
+    }
+
     /// An over-limit body answers 413 whatever its framing: a declared
     /// Content-Length over the limit is refused by the limit layer before the
     /// body, and a chunked upload is refused the moment it crosses the limit,
@@ -1871,14 +2008,23 @@ mod tests {
         use tower::ServiceExt;
 
         let app = attach_edge_layers(
-            Router::new().route(
-                "/v1/chat/completions",
-                post(
-                    |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
-                        StatusCode::OK
-                    },
+            Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
+                )
+                .route(
+                    "/v1/messages",
+                    post(
+                        |ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async {
+                            StatusCode::OK
+                        },
+                    ),
                 ),
-            ),
             1024,
             InFlightRequestTracker::new(),
             vec![],
@@ -1923,6 +2069,32 @@ mod tests {
             pulled <= 5 && pulled < total_frames,
             "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
         );
+
+        // Declared length on a Messages route: refused by the limit layer
+        // before the body, and still the Messages envelope.
+        let response = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_LENGTH, oversized.len())
+                    .body(Body::from(oversized.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let request_id = response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["type"], "error", "{json}");
+        assert_eq!(json["error"]["type"], "request_too_large", "{json}");
+        assert_eq!(json["request_id"], request_id, "{json}");
 
         // Declared length: refused by the limit layer before the body.
         let response = app

@@ -93,8 +93,8 @@ as of `tokenizer/src/*`.
 
 ## Chat Template Support (`chat_template.rs`)
 - Detects whether a template expects raw string content or the structured OpenAI-style `content`
-  list by walking the minijinja AST. This matches the Python-side detection logic used elsewhere in
-  SGLang.
+  list by walking the minijinja AST. This matches the Python-side detection logic of the serving
+  engines.
 - `ChatTemplateProcessor` (constructed per call) renders templates against JSON `messages` and
   `ChatTemplateParams` (system prompt, tools, EOS token handling, etc.). Errors surface as
   `anyhow::Error`, keeping parity with Hugging Face error messages.

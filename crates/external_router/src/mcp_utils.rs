@@ -578,6 +578,7 @@ mod tests {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })];
 
@@ -803,6 +804,7 @@ mod tests {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })];
 
@@ -825,6 +827,7 @@ mod tests {
                     description: None,
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             }),
             ResponseTool::WebSearchPreview(WebSearchPreviewTool::default()),

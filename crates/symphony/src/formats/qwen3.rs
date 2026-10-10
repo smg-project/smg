@@ -764,6 +764,7 @@ mod tests {
                     "days": {"type": "integer"},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }
@@ -1186,6 +1187,7 @@ mod tests {
                         "properties": {"patch": {"type": "string"}},
                     }),
                     strict: None,
+                    extra: Default::default(),
                 },
             }]),
         )

@@ -309,7 +309,7 @@ impl StopSequenceDecoder {
         self.matched_stop = None;
     }
 
-    /// Un-stop after a string match the caller does not count (vLLM checks
+    /// Un-stop after a string match the caller does not count (the serving engine checks
     /// stop strings only past `min_tokens`). Unlike [`reset`](Self::reset),
     /// the decode context stays, so the next token decodes with its leading
     /// space or byte context, and the tail of the matched text that could

@@ -6,7 +6,7 @@
 //! messages plus audio RTP packets, giving it full visibility into the traffic.
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -207,15 +207,15 @@ impl WebRtcBridge {
         // For local development the user may set `--webrtc-bind-addr 127.0.0.1`
         // so the browser (same machine) can reach the client-facing peer.
         // A loopback address can't reach external servers, so the upstream
-        // socket falls back to `0.0.0.0` in that case.
-        let upstream_bind = if bind_addr.is_loopback() {
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-        } else {
-            bind_addr
+        // socket falls back to the unspecified address of its family.
+        let upstream_bind = match bind_addr {
+            IpAddr::V4(ip) if ip.is_loopback() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(ip) if ip.is_loopback() => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            other => other,
         };
 
-        let client_candidate_ip = resolve_candidate_ip(bind_addr).await?;
-        let upstream_candidate_ip = resolve_candidate_ip(upstream_bind).await?;
+        let client_candidate_ip = resolve_candidate_ip(bind_addr, stun_server).await?;
+        let upstream_candidate_ip = resolve_candidate_ip(upstream_bind, stun_server).await?;
 
         let client_socket = UdpSocket::bind(SocketAddr::new(bind_addr, 0)).await?;
         let upstream_socket = UdpSocket::bind(SocketAddr::new(upstream_bind, 0)).await?;
@@ -928,17 +928,50 @@ fn earliest_timeout(a: Option<Instant>, b: Option<Instant>) -> Instant {
     }
 }
 
+/// The public addresses a route probe aims at when there is no STUN server
+/// of the socket's family: nothing is sent, the routing table only picks the
+/// outbound interface.
+const IPV4_ROUTE_PROBE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80);
+const IPV6_ROUTE_PROBE: SocketAddr = SocketAddr::new(
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+    80,
+);
+
 /// Resolve the effective IP for ICE candidates.
 ///
 /// When `addr` is unspecified (`0.0.0.0` / `::`), performs a non-sending UDP
-/// "connect" to a public address to let the OS routing table pick the default
-/// outbound interface.  No traffic is sent.
-async fn resolve_candidate_ip(addr: IpAddr) -> anyhow::Result<IpAddr> {
+/// "connect" of a socket of that family, to the STUN server when it is of the
+/// family and to a public address otherwise, to let the OS routing table pick
+/// the default outbound interface. A `::` socket is dual-stack on Linux, so a
+/// host without an IPv6 route still gets its IPv4 address. No traffic is sent.
+async fn resolve_candidate_ip(addr: IpAddr, probe: Option<SocketAddr>) -> anyhow::Result<IpAddr> {
     if !addr.is_unspecified() {
         return Ok(addr);
     }
-    let sock = UdpSocket::bind("0.0.0.0:0").await?;
-    sock.connect("8.8.8.8:80").await?;
+    let ipv4_probe = probe
+        .filter(SocketAddr::is_ipv4)
+        .unwrap_or(IPV4_ROUTE_PROBE);
+    match addr {
+        IpAddr::V4(_) => default_route_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ipv4_probe).await,
+        IpAddr::V6(_) => {
+            let ipv6_probe = probe
+                .filter(SocketAddr::is_ipv6)
+                .unwrap_or(IPV6_ROUTE_PROBE);
+            match default_route_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), ipv6_probe).await {
+                Ok(ip) => Ok(ip),
+                Err(ipv6_err) => default_route_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ipv4_probe)
+                    .await
+                    .map_err(|_| ipv6_err),
+            }
+        }
+    }
+}
+
+/// The source address the routing table picks for `probe` from a socket of
+/// `bind`'s family.
+async fn default_route_ip(bind: IpAddr, probe: SocketAddr) -> anyhow::Result<IpAddr> {
+    let sock = UdpSocket::bind(SocketAddr::new(bind, 0)).await?;
+    sock.connect(probe).await?;
     Ok(sock.local_addr()?.ip())
 }
 
@@ -1028,16 +1061,35 @@ fn parse_stun_xor_mapped_address(resp: &[u8], txn_id: &[u8]) -> Option<SocketAdd
 
         // XOR-MAPPED-ADDRESS = 0x0020 (RFC 5389 §15.2)
         // Port is XORed with top 16 bits of magic cookie (0x2112).
-        // IPv4 address is XORed with the full magic cookie (0x2112_A442).
-        if attr_type == 0x0020 && attr_len >= 8 && resp[off + 1] == 0x01 {
+        // IPv4 address is XORed with the full magic cookie (0x2112_A442);
+        // an IPv6 address with the cookie followed by the transaction id.
+        if attr_type == 0x0020 && attr_len >= 8 {
             let port = u16::from_be_bytes([resp[off + 2], resp[off + 3]]) ^ 0x2112;
-            let ip = std::net::Ipv4Addr::new(
-                resp[off + 4] ^ 0x21,
-                resp[off + 5] ^ 0x12,
-                resp[off + 6] ^ 0xA4,
-                resp[off + 7] ^ 0x42,
-            );
-            return Some(SocketAddr::new(IpAddr::V4(ip), port));
+            match resp[off + 1] {
+                0x01 => {
+                    let ip = Ipv4Addr::new(
+                        resp[off + 4] ^ 0x21,
+                        resp[off + 5] ^ 0x12,
+                        resp[off + 6] ^ 0xA4,
+                        resp[off + 7] ^ 0x42,
+                    );
+                    return Some(SocketAddr::new(IpAddr::V4(ip), port));
+                }
+                0x02 if attr_len >= 20 && txn_id.len() == 12 => {
+                    let key = [0x21, 0x12, 0xA4, 0x42]
+                        .into_iter()
+                        .chain(txn_id.iter().copied());
+                    let mut octets = [0u8; 16];
+                    for (octet, (byte, k)) in octets
+                        .iter_mut()
+                        .zip(resp[off + 4..off + 20].iter().zip(key))
+                    {
+                        *octet = byte ^ k;
+                    }
+                    return Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port));
+                }
+                _ => {}
+            }
         }
 
         // Attributes are padded to 4-byte boundaries
@@ -1048,7 +1100,97 @@ fn parse_stun_xor_mapped_address(resp: &[u8], txn_id: &[u8]) -> Option<SocketAdd
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
     use super::*;
+
+    const TXN: [u8; 12] = [
+        0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
+    ];
+
+    /// A STUN Binding Success Response carrying `addr` in XOR-MAPPED-ADDRESS,
+    /// encoded as RFC 5389 section 15.2 says.
+    fn binding_success(addr: SocketAddr) -> Vec<u8> {
+        let cookie = 0x2112_A442u32.to_be_bytes();
+        let mut attr = vec![0u8, if addr.is_ipv4() { 0x01 } else { 0x02 }];
+        attr.extend_from_slice(&(addr.port() ^ 0x2112).to_be_bytes());
+        match addr.ip() {
+            IpAddr::V4(ip) => {
+                attr.extend(ip.octets().iter().zip(cookie).map(|(o, k)| o ^ k));
+            }
+            IpAddr::V6(ip) => {
+                let key: Vec<u8> = cookie.iter().chain(TXN.iter()).copied().collect();
+                attr.extend(ip.octets().iter().zip(key).map(|(o, k)| o ^ k));
+            }
+        }
+        let mut resp = vec![0x01, 0x01];
+        resp.extend_from_slice(&((attr.len() + 4) as u16).to_be_bytes());
+        resp.extend_from_slice(&cookie);
+        resp.extend_from_slice(&TXN);
+        resp.extend_from_slice(&0x0020u16.to_be_bytes());
+        resp.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+        resp.extend(attr);
+        resp
+    }
+
+    #[test]
+    fn xor_mapped_address_decodes_an_ipv4_reflexive_address() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 50_000);
+        assert_eq!(
+            parse_stun_xor_mapped_address(&binding_success(addr), &TXN),
+            Some(addr)
+        );
+    }
+
+    #[test]
+    fn xor_mapped_address_decodes_an_ipv6_reflexive_address() {
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0xdead, 0xbeef)),
+            50_001,
+        );
+        assert_eq!(
+            parse_stun_xor_mapped_address(&binding_success(addr), &TXN),
+            Some(addr)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unspecified_ipv4_bind_takes_the_route_to_the_probe() {
+        let probe = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3478);
+        let ip = resolve_candidate_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), Some(probe))
+            .await
+            .unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn an_unspecified_ipv6_bind_takes_the_route_to_the_probe() {
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::UdpSocket::bind("[::1]:0").is_err() {
+            return;
+        }
+        let probe = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3478);
+        let ip = resolve_candidate_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), Some(probe))
+            .await
+            .unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn a_specific_bind_address_is_the_candidate() {
+        let ip = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7));
+        assert_eq!(resolve_candidate_ip(ip, None).await.unwrap(), ip);
+    }
+
+    #[test]
+    fn a_response_to_another_transaction_is_ignored() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 50_000);
+        let other = [0u8; 12];
+        assert_eq!(
+            parse_stun_xor_mapped_address(&binding_success(addr), &other),
+            None
+        );
+    }
 
     #[test]
     fn idle_beyond_max_triggers_timeout() {

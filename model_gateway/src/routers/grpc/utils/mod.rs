@@ -13,7 +13,7 @@ pub(crate) use chat_utils::{
     encode_blocking, encode_prompt_blocking, filter_chat_request_by_tool_choice,
     filter_tools_by_tool_choice, generate_tool_call_id, get_history_tool_calls_count,
     parse_finish_reason, parse_json_schema_response, process_chat_messages_with_placeholders,
-    resolve_tokenizer, send_error_sse, validate_chat_content_parts,
+    request_as_rendered, resolve_tokenizer, send_error_sse, validate_chat_content_parts,
 };
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
@@ -24,9 +24,8 @@ pub(crate) use metrics::{error_type_from_status, route_to_endpoint};
 // predicate instead of duplicating it.
 pub use parsers::chat_reasoning_starts_in_prefill;
 pub(crate) use parsers::{
-    check_reasoning_parser_availability, check_tool_parser_availability,
-    constraint_covers_reasoning, continues_final_assistant, create_reasoning_parser,
-    create_tool_parser, get_tool_parser, messages_reasoning_starts_in_prefill,
-    reasoning_parser_requires_special_tokens, reasoning_starts_in_prefill,
-    should_mark_reasoning_started, ParserResolver,
+    check_reasoning_parser_availability, check_tool_parser_availability, continues_final_assistant,
+    create_reasoning_parser, create_tool_parser, get_tool_parser,
+    messages_reasoning_starts_in_prefill, reasoning_parser_requires_special_tokens,
+    reasoning_starts_in_prefill, should_mark_reasoning_started, ParserResolver,
 };

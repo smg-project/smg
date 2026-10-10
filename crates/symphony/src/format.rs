@@ -99,6 +99,7 @@ pub struct Format {
     transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
     turn_opener: Option<String>,
+    structural_tokens: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +143,7 @@ impl Format {
             transitions: Vec::new(),
             calls: None,
             turn_opener: None,
+            structural_tokens: Vec::new(),
         }
     }
 
@@ -165,6 +167,19 @@ impl Format {
             text: text.to_string(),
             ignored: true,
         });
+        self
+    }
+
+    /// A token of the model's vocabulary that the format's tags begin with (`<|open|>`,
+    /// `<|close|>`). It reaches the engine whole or not at all, so a tail at the end of the output
+    /// that begins with one and is the beginning of a terminal the state has a row for is a tag
+    /// the end cut short, never the model's text: the engine drops it as it drops the whole tag,
+    /// instead of releasing it as content. A tail shorter than the token stays text, as every
+    /// parser keeps a partial marker at the end of the output; so does the beginning of a
+    /// terminal the state keeps as text when whole.
+    #[must_use]
+    pub fn structural_token(mut self, text: &str) -> Self {
+        self.structural_tokens.push(text.to_string());
         self
     }
 
@@ -233,6 +248,21 @@ impl Format {
     /// The terminals' texts, in the order the engine's scanner numbers them.
     pub(crate) fn terminal_texts(&self) -> impl Iterator<Item = &str> {
         self.terminals.iter().map(|terminal| terminal.text.as_str())
+    }
+
+    /// Whether `tail`, at the end of the output in `state`, is a tag the end cut short: it begins
+    /// with a whole structural token and is the beginning of a terminal that, whole, would move
+    /// the engine out of `state` or be dropped where it stands. The beginning of a terminal the
+    /// state has no row for is text, as the whole terminal would be.
+    pub(crate) fn is_cut_tag(&self, state: usize, tail: &str) -> bool {
+        self.structural_tokens
+            .iter()
+            .any(|token| tail.starts_with(token.as_str()))
+            && self.terminals.iter().enumerate().any(|(index, terminal)| {
+                terminal.text.len() > tail.len()
+                    && terminal.text.starts_with(tail)
+                    && (terminal.ignored || self.next(state, index).is_some())
+            })
     }
 
     /// The text of terminal `index`.

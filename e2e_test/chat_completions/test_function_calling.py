@@ -105,7 +105,9 @@ PYTHONIC_MESSAGES = [
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestOpenAIServerFunctionCalling:
@@ -721,7 +723,9 @@ class TestOpenAIServerFunctionCalling:
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "pythonic", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "pythonic", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestOpenAIPythonicFunctionCalling:
@@ -1671,7 +1675,9 @@ class _TestToolChoiceBase:
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceLlama(_TestToolChoiceBase):
@@ -1695,7 +1701,9 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceQwen(_TestToolChoiceBase):
@@ -1713,7 +1721,9 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 @pytest.mark.engine("sglang", "vllm", "trtllm")
 @pytest.mark.gpu(1)
 @pytest.mark.model("mistralai/Mistral-7B-Instruct-v0.3")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "mistral", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "mistral", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestToolChoiceMistral(_TestToolChoiceBase):
@@ -1767,7 +1777,9 @@ WEATHER_TOOL = {
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
 @pytest.mark.gpu(1)
 @pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
-@pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
+@pytest.mark.gateway(
+    reuse=True, extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"]
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestMultiTurnToolCall:

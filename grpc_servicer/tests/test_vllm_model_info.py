@@ -8,6 +8,7 @@ import json
 import logging
 from types import SimpleNamespace
 
+import pytest
 from smg_grpc_proto import vllm_engine_pb2
 from smg_grpc_servicer.vllm import model_info
 
@@ -180,3 +181,31 @@ def test_server_facts_carry_the_running_window():
     for window in (None, 0, -1, True, "64"):
         config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=window))
         assert model_info.running_window(config) == 0, window
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        ("torch.bfloat16", "bfloat16"),
+        ("torch.float16", "float16"),
+        ("float32", "float32"),
+        ("torch.float32", "float32"),
+        ("bfloat16", "bfloat16"),
+        ("float16", "float16"),
+        ("torch.float64", ""),
+        ("float64", ""),
+        ("torch.uint8", ""),
+        ("unknown", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_server_facts_report_encoder_dtype_without_changing_model_dtype(dtype, expected):
+    config = SimpleNamespace(
+        model_config=_model_config(dtype=dtype),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    response = vllm_engine_pb2.GetServerInfoResponse(**model_info.server_facts(config))
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(response.SerializeToString())
+    assert parsed.multimodal_encoder_dtype == expected
+    assert parsed.model_dtype == (dtype or "")

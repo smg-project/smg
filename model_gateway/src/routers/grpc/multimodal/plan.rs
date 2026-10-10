@@ -3,11 +3,12 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use llm_multimodal::{
     registry::modality_limit_override, MediaContentPart, MediaPartOrder, Modality, ModelMetadata,
 };
 use llm_tokenizer::TokenizerTrait;
+use openai_protocol::worker::MmProcessingMode;
 
 use super::{
     config::MultimodalComponents,
@@ -108,9 +109,27 @@ pub(crate) struct PlaceholderTokens {
     tokens: HashMap<Modality, String>,
     /// Modalities whose anchor a vLLM worker can expand itself.
     worker_expandable: HashMap<Modality, bool>,
+    /// The model matched no registry spec: the router knows no anchors and
+    /// no limits for it, so it writes and checks none; its media can only go
+    /// to a worker that processes media itself, whose engine owns the
+    /// placeholders, their expansion and the per-prompt limits, as on the
+    /// engine's own server.
+    worker_only: bool,
 }
 
 impl PlaceholderTokens {
+    /// For a model without a registry spec (see `worker_only`).
+    pub(crate) fn worker_only() -> Self {
+        Self {
+            worker_only: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn is_worker_only(&self) -> bool {
+        self.worker_only
+    }
+
     pub(crate) fn insert(&mut self, modality: Modality, token: String) {
         self.tokens.insert(modality, token);
     }
@@ -123,11 +142,16 @@ impl PlaceholderTokens {
         self.worker_expandable.insert(modality, expandable);
     }
 
+    /// Whether a vLLM worker can expand the rendered anchor for `modality`
+    /// itself: the spec's opt-in, or every modality of a model without a
+    /// spec, whose template renders the engine's own placeholders.
     pub(crate) fn worker_expandable(&self, modality: Modality) -> bool {
-        self.worker_expandable
-            .get(&modality)
-            .copied()
-            .unwrap_or(false)
+        self.worker_only
+            || self
+                .worker_expandable
+                .get(&modality)
+                .copied()
+                .unwrap_or(false)
     }
 }
 
@@ -138,6 +162,11 @@ impl PlaceholderTokens {
 /// advertise for their engine ([`super::engine_item_limits`]): the request is
 /// held to them here, before any fetch, as the engine's own front end would
 /// (it never sees the precomputed inputs the router sends).
+///
+/// A model without a spec is refused only where the router would process
+/// the media itself (`--mm-processing router`); otherwise its request is
+/// marked worker-only and goes on to a worker that processes media itself
+/// (see [`PlaceholderTokens::worker_only`]).
 pub(crate) async fn prepare_placeholder_tokens(
     plan: &MediaPlan,
     model_id: &str,
@@ -158,10 +187,15 @@ pub(crate) async fn prepare_placeholder_tokens(
         tokenizer: &registry_tokenizer,
         config: &model_config.config,
     };
-    let spec = components
-        .model_registry
-        .lookup(&metadata)
-        .with_context(|| format!("multimodal not supported for model: {model_id}"))?;
+    let Some(spec) = components.model_registry.lookup(&metadata) else {
+        anyhow::ensure!(
+            components.processing != MmProcessingMode::Router,
+            "multimodal not supported for model: {model_id} on the router (no media spec for \
+             its family); a vLLM worker with --mm-processor inprocess|redis processes its media \
+             itself under --mm-processing worker"
+        );
+        return Ok(PlaceholderTokens::worker_only());
+    };
     let spec_limits = spec.modality_limits(&metadata).map_err(|error| {
         anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
     })?;
@@ -249,6 +283,11 @@ pub(crate) fn validate_rendered_media_anchors(
     tokenizer: &dyn TokenizerTrait,
     token_ids: &[u32],
 ) -> Result<()> {
+    if placeholders.is_worker_only() {
+        // No spec, no anchors of the router's own: the worker's engine checks
+        // its placeholders against the media it fetches, as its own server does.
+        return Ok(());
+    }
     for &modality in plan.modalities() {
         let token = placeholders
             .get(modality)
@@ -429,5 +468,80 @@ mod tests {
             validate_rendered_media_anchors(&plan, &placeholders, &tokenizer, &[1001, 1001, 1002])
                 .unwrap_err();
         assert!(error.to_string().contains("image anchor count mismatch"));
+    }
+
+    fn components(mode: MmProcessingMode) -> MultimodalComponents {
+        use super::super::{config::MultimodalConfigRegistry, settings::MultimodalSettings};
+        let mut components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &MultimodalSettings::default(),
+        )
+        .expect("components");
+        components.processing = mode;
+        components
+    }
+
+    /// A model whose family has no registry spec: the router refuses it only
+    /// where it would process the media itself; under worker (or auto)
+    /// placement the request is marked worker-only, every modality counts as
+    /// expandable by the worker, and the router checks no anchors of its own.
+    #[tokio::test]
+    async fn a_model_without_a_spec_is_worker_only_unless_the_router_must_process() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "llama", "architectures": ["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        let source = dir.path().to_str().unwrap();
+        let tokenizer = MockTokenizer::default();
+        let plan = MediaPlan::new([MediaContentPart::ImageUrl {
+            url: "https://a/1.png".to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }]);
+
+        for mode in [MmProcessingMode::Worker, MmProcessingMode::Auto] {
+            let placeholders = prepare_placeholder_tokens(
+                &plan,
+                "m6",
+                &tokenizer,
+                &components(mode),
+                "tok",
+                source,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{mode:?} placement: {error:#}"));
+            assert!(placeholders.is_worker_only(), "{mode:?}");
+            assert!(placeholders.worker_expandable(Modality::Image), "{mode:?}");
+            assert!(placeholders.get(Modality::Image).is_none(), "{mode:?}");
+            // The template rendered the engine's own placeholders (or none the
+            // router knows of): nothing to check here, the engine checks.
+            validate_rendered_media_anchors(&plan, &placeholders, &tokenizer, &[1, 2, 3])
+                .expect("no anchors of the router's own to verify");
+        }
+
+        let error = prepare_placeholder_tokens(
+            &plan,
+            "m6",
+            &tokenizer,
+            &components(MmProcessingMode::Router),
+            "tok",
+            source,
+            &HashMap::new(),
+        )
+        .await
+        .expect_err("the router cannot process media it has no spec for");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("multimodal not supported for model: m6"),
+            "{message}"
+        );
+        assert!(message.contains("no media spec"), "{message}");
+        assert!(message.contains("--mm-processing worker"), "{message}");
     }
 }

@@ -43,6 +43,19 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
         .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
 }
 
+/// Account for the reasoning the gateway's own reasoning parser split off:
+/// `parsed` is the number of output tokens it routed to `reasoning_content`
+/// for the request, `None` when it did not run. Like an engine with a
+/// reasoning parser, the details are then always reported, zero included; an
+/// engine that counts reasoning itself is not overruled, whatever its count.
+pub(crate) fn with_parsed_reasoning_tokens(mut usage: Usage, parsed: Option<u32>) -> Usage {
+    if let Some(parsed) = parsed {
+        let details = usage.completion_tokens_details.get_or_insert_default();
+        details.reasoning_tokens.get_or_insert(parsed);
+    }
+    usage
+}
+
 /// The version to report on a generate response: what the engine stamped on
 /// this very response (the proto accessors already treat an empty string and
 /// the engine's `"default"` placeholder as unset) beats the dispatch-time
@@ -141,6 +154,43 @@ mod tests {
         assert_eq!(
             usage.completion_tokens, 10,
             "each choice generates its own completion -- must be summed"
+        );
+    }
+
+    #[test]
+    fn parsed_reasoning_tokens_are_reported_once_the_parser_ran() {
+        let reasoning_tokens = |usage: Usage| {
+            usage
+                .completion_tokens_details
+                .and_then(|d| d.reasoning_tokens)
+        };
+        let usage = build_usage(&[complete(10, 8, 4)]);
+        assert_eq!(reasoning_tokens(usage.clone()), None);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage.clone(), None)),
+            None,
+            "no reasoning parser: nothing to report"
+        );
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage.clone(), Some(0))),
+            Some(0),
+            "the parser ran and found no reasoning: zero, not absent"
+        );
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage, Some(7))),
+            Some(7)
+        );
+        let engine_counted = Usage::from_counts(10, 4).with_reasoning_tokens(5);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted, Some(3))),
+            Some(5),
+            "an engine that counts reasoning itself is not overruled"
+        );
+        let engine_counted_fewer = Usage::from_counts(10, 4).with_reasoning_tokens(3);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted_fewer, Some(5))),
+            Some(3),
+            "nor when its count is lower than the parser's"
         );
     }
 

@@ -59,6 +59,7 @@ mod tests {
                     "days": {"type": "integer"},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }

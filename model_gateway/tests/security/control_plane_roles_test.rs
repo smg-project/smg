@@ -36,6 +36,7 @@ const WRITE_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/workers/no-such-worker"),
     ("POST", "/v1/tokenizers"),
     ("POST", "/stop_profile"),
+    ("POST", "/heap_profile"),
 ];
 
 fn control_plane_auth() -> ControlPlaneAuthState {
