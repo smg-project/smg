@@ -684,7 +684,7 @@ const CONTENT_OR_CALLS: &[&str] = &[
 enum Allowance {
     /// The reference's argument is a boolean, a number or null for a parameter the tool declares
     /// `string`, so the template writes it as it writes the string, and the parser gives the
-    /// string back, as vLLM does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
+    /// string back, as the engine's parser does (BFCL declares `smoking_allowed` an enum of `"True"`, `"False"`
     /// and `"dontcare"` and answers `false`). Bellwether #56 refuses such a case.
     DeclaredTypeConflict,
     /// The template writes no thought, so the reasoning the reference carries is not in the output
