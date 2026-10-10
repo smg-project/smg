@@ -1157,6 +1157,43 @@ mod tests {
     }
 
     #[test]
+    fn the_floor_excludes_hidden_backlogs_without_tilting_the_healthy_fleet() {
+        // Two of eight workers hold 16 requests each that their fresh reports
+        // do not show (admission throttled: the requests wait in front of the
+        // engine); the six healthy ones hold 2 each, reported as running.
+        // Over 60 picks, each dispatched (the load counter moves as the
+        // router's would) with no report in between, the two take nothing
+        // and the six water-fill evenly: the floor steers off the hidden
+        // backlogs, not onto a favourite.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let workers: Vec<Arc<dyn Worker>> =
+            (0..8).map(|i| mk(&format!("http://w{i}:8000"))).collect();
+        let mut loads = HashMap::new();
+        for (i, worker) in workers.iter().enumerate() {
+            let hidden = i < 2;
+            for _ in 0..if hidden { 16 } else { 2 } {
+                worker.increment_load();
+            }
+            let mut load = make_load(0, 0.0, 2000.0);
+            load.loads[0].num_running_reqs = if hidden { 0 } else { 2 };
+            loads.insert(worker.url().to_string(), load);
+        }
+        policy.update_loads(&loads);
+        let mut picks = [0usize; 8];
+        for _ in 0..60 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap();
+            workers[idx].increment_load();
+            picks[idx] += 1;
+        }
+        assert_eq!(&picks[..2], &[0, 0], "{picks:?}");
+        let healthy = &picks[2..];
+        let spread = healthy.iter().max().unwrap() - healthy.iter().min().unwrap();
+        assert!(spread <= 1, "{picks:?}");
+    }
+
+    #[test]
     fn a_report_releases_the_dispatches_made_up_to_its_sample_and_keeps_the_rest() {
         let policy = LeastLoadPolicy::new();
         let workers = vec![mk("http://a:8000")];

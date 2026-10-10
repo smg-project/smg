@@ -3584,6 +3584,45 @@ mod tests {
         policy.update_loads(&loads);
     }
 
+    /// Like [`update_expected_wait_loads`], with each report counting the
+    /// requests the router holds on its worker (`worker.load()`) as waiting
+    /// requests: the engine has every request the router dispatched to it.
+    /// The expected-wait scorer charges a worker for requests the router
+    /// holds beyond what its report and since-poll credit account for (work
+    /// in transit the engine has not seen), so a fixture that holds requests
+    /// either reports them, as here, or models that in-transit backlog.
+    fn update_expected_wait_loads_counting_held(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        queued_tokens: &[i32],
+    ) {
+        let loads = workers
+            .iter()
+            .zip(queued_tokens)
+            .map(|(worker, &queued)| {
+                let mut load = expected_wait_load(queued, 0.1, 100.0);
+                load.loads[0].num_waiting_reqs = i32::try_from(worker.load()).unwrap_or(i32::MAX);
+                (worker.url().to_string(), load)
+            })
+            .collect();
+        policy.update_loads(&loads);
+    }
+
+    /// One selection for `text` through the string path.
+    fn route_text(
+        policy: &CacheAwarePolicy,
+        workers: &[Arc<dyn Worker>],
+        text: &str,
+    ) -> Option<usize> {
+        policy.select_worker(
+            workers,
+            &SelectWorkerInfo {
+                request_text: Some(text),
+                ..Default::default()
+            },
+        )
+    }
+
     fn assert_only_final_worker_credited(
         policy: &CacheAwarePolicy,
         workers: &[Arc<dyn Worker>],
@@ -3742,8 +3781,13 @@ mod tests {
         let policy = CacheAwarePolicy::with_config(test_config());
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
+        // `w2` holds one request the router dispatched, and its report counts
+        // it: one waiting request of 500 uncached tokens. The live count and
+        // the expected-wait score disagree (`w2` is the busier worker by
+        // count, the cheaper by wait) while the report hides nothing, so the
+        // charge for requests a report does not show stays out of this test.
         workers[1].increment_load();
-        update_expected_wait_loads(&policy, &workers, &[0, 500]);
+        update_expected_wait_loads_counting_held(&policy, &workers, &[0, 500]);
 
         let route_miss = |text| {
             policy.select_worker(
@@ -3769,7 +3813,7 @@ mod tests {
             (true, 1024, 1)
         );
 
-        update_expected_wait_loads(&policy, &workers, &[0, 500]);
+        update_expected_wait_loads_counting_held(&policy, &workers, &[0, 500]);
         for worker in &workers {
             assert_eq!(
                 policy.load_scorer.load_state_for_test(worker.url()),
@@ -3781,6 +3825,97 @@ mod tests {
             route_miss("omega miss"),
             Some(0),
             "fresh backend load must reset since-poll dispatch credit"
+        );
+    }
+
+    #[test]
+    fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
+        // `w2` holds five requests the router dispatched while its fresh
+        // report shows an idle engine: dispatches still in transit, the
+        // backlog that herded a fleet onto its emptiest-looking workers. `w1`
+        // reports one queued request of 10 tokens. Read from the reports
+        // alone, `w2` is the emptier worker and takes the miss; charged five
+        // mean prefills (51.2 s at 100 tokens/s) for the requests its report
+        // hides, it loses every miss to `w1` until `w1`'s own credit has
+        // grown to as much.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        for _ in 0..5 {
+            workers[1].increment_load();
+        }
+        let mut one_queued = expected_wait_load(10, 0.1, 100.0);
+        one_queued.loads[0].num_waiting_reqs = 1;
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), one_queued),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(0, 0.1, 100.0),
+            ),
+        ]));
+        for text in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            assert_eq!(
+                route_text(&policy, &workers, text),
+                Some(0),
+                "{text}: the miss went to the worker whose report hides its load"
+            );
+        }
+        let (_, credited_tokens, credited_requests) =
+            policy.load_scorer.load_state_for_test(workers[0].url());
+        assert_eq!((credited_tokens, credited_requests), (5 * 1024, 5));
+    }
+
+    #[test]
+    fn a_request_the_report_already_counts_is_not_priced_again() {
+        // `w1` holds three requests and its report counts them as running:
+        // three mean prefills at 100 tokens/s = 30.72 s, nothing more. `w2`
+        // holds nothing and reports 3,100 queued tokens = 31 s. Charged a
+        // second time for the three, `w1` would read as 61.44 s and lose.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        for _ in 0..3 {
+            workers[0].increment_load();
+        }
+        let mut running = expected_wait_load(0, 0.1, 100.0);
+        running.loads[0].num_running_reqs = 3;
+        policy.update_loads(&HashMap::from([
+            (workers[0].url().to_string(), running),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(3_100, 0.1, 100.0),
+            ),
+        ]));
+        assert_eq!(route_text(&policy, &workers, "alpha"), Some(0));
+
+        // The same three requests dispatched after `w1`'s report: the
+        // since-poll credit carries them (3 × 1024 tokens = 30.72 s), and
+        // nothing is charged on top of the credit either.
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        policy.init_workers(&workers);
+        policy.update_loads(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                expected_wait_load(0, 0.1, 100.0),
+            ),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(3_100, 0.1, 100.0),
+            ),
+        ]));
+        for text in ["bravo", "charlie", "delta"] {
+            assert_eq!(route_text(&policy, &workers, text), Some(0));
+            workers[0].increment_load();
+        }
+        assert_eq!(
+            policy.load_scorer.load_state_for_test(workers[0].url()),
+            (true, 3 * 1024, 3)
+        );
+        assert_eq!(
+            route_text(&policy, &workers, "echo"),
+            Some(0),
+            "requests the credit carries were charged again"
         );
     }
 
@@ -4135,7 +4270,11 @@ mod tests {
         for _ in 0..10 {
             workers[2].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
+        // Every report counts the requests its worker holds (100 queued on
+        // `w1`, 10 on `w3`); `w3`'s ten queue 1,000 uncached tokens against
+        // `w2`'s 10,000, so the expected wait prefers `w3` although its live
+        // count is the higher: the spill must follow the wait, not the count.
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
         let selected = policy
             .select_worker(
@@ -4254,7 +4393,11 @@ mod tests {
         for _ in 0..10 {
             workers[2].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
+        // Every report counts the requests its worker holds (100 queued on
+        // `w1`, 10 on `w3`); `w3`'s ten queue 1,000 uncached tokens against
+        // `w2`'s 10,000, so the expected wait prefers `w3` although its live
+        // count is the higher: the spill must follow the wait, not the count.
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
         let selected = policy
             .select_worker(
@@ -5969,7 +6112,11 @@ mod tests {
         for _ in 0..10 {
             workers[2].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
+        // Every report counts the requests its worker holds (100 queued on
+        // `w1`, 10 on `w3`); `w3`'s ten queue 1,000 uncached tokens against
+        // `w2`'s 10,000, so the expected wait prefers `w3` although its live
+        // count is the higher: the spill must follow the wait, not the count.
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
         let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
@@ -6562,7 +6709,11 @@ mod tests {
         for _ in 0..10 {
             workers[2].increment_load();
         }
-        update_expected_wait_loads(&policy, &workers, &[20_000, 10_000, 0]);
+        // Every report counts the requests its worker holds (100 queued on
+        // `w1`, 10 on `w3`); `w3`'s ten queue 1,000 uncached tokens against
+        // `w2`'s 10,000, so the expected wait prefers `w3` although its live
+        // count is the higher: the spill must follow the wait, not the count.
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
         let selected = route_tokens(&policy, &workers, &tokens);
         assert_eq!(selected, 2, "spill must use expected wait over the fleet");
