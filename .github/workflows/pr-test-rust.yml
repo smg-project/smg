@@ -1610,32 +1610,37 @@ jobs:
 
       - name: Check CI result
         run: |
-          if [[ "${{ needs.pre-commit.result }}" == "failure" || \
-                "${{ needs.python-lint.result }}" == "failure" || \
-                "${{ needs.grpc-proto-build-check.result }}" == "failure" || \
-                "${{ needs.build-wheel.result }}" == "failure" || \
-                "${{ needs.python-unit-tests.result }}" == "failure" || \
-                "${{ needs.unit-tests.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat-mm-worker.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
-                "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-completions.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-embeddings.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-realtime.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-gateway.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-responses.result }}" == "failure" || \
-                "${{ needs.e2e-2gpu-pd.result }}" == "failure" || \
-                "${{ needs.e2e-2gpu-pd-mm-worker.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-chat.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-gateway.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-epd.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-pd.result }}" == "failure" || \
-                "${{ needs.e2e-vendor.result }}" == "failure" || \
-                "${{ needs.go-unit-tests.result }}" == "failure" || \
-                "${{ needs.go-bindings-e2e.result }}" == "failure" ]]; then
-            echo "One or more jobs failed"
+          # A job that runs into its timeout-minutes ends "cancelled", not
+          # "failure", and fails this gate the same way (smg-project/smg-lab#171).
+          # A run cancelled as a whole ends with this gate failed too: it did
+          # not pass, and finish stays a verdict on every head.
+          bad='^(failure|cancelled)$'
+          if [[ "${{ needs.pre-commit.result }}" =~ $bad || \
+                "${{ needs.python-lint.result }}" =~ $bad || \
+                "${{ needs.grpc-proto-build-check.result }}" =~ $bad || \
+                "${{ needs.build-wheel.result }}" =~ $bad || \
+                "${{ needs.python-unit-tests.result }}" =~ $bad || \
+                "${{ needs.unit-tests.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-completions.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-embeddings.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-realtime.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-gateway.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-responses.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd-mm-worker.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-chat.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-gateway.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-epd.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-pd.result }}" =~ $bad || \
+                "${{ needs.e2e-vendor.result }}" =~ $bad || \
+                "${{ needs.go-unit-tests.result }}" =~ $bad || \
+                "${{ needs.go-bindings-e2e.result }}" =~ $bad ]]; then
+            echo "One or more jobs failed or were cancelled"
             exit 1
           else
             echo "All jobs completed successfully"
