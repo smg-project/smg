@@ -526,14 +526,14 @@ struct TokenizerConfigResult {
 
 impl Encoder for HuggingFaceTokenizer {
     fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-        if !add_special_tokens {
-            if let Some(ids) = self
-                .native
-                .as_ref()
-                .and_then(|native| native.encode(self.tokenizer.get_model(), input))
-            {
-                return Ok(Encoding::Plain(ids));
-            }
+        // The direct path accepts no post-processor that adds tokens, so a
+        // request for special tokens gets the same ids and is served too.
+        if let Some(ids) = self
+            .native
+            .as_ref()
+            .and_then(|native| native.encode(self.tokenizer.get_model(), input))
+        {
+            return Ok(Encoding::Plain(ids));
         }
         self.tokenizer
             .encode(input, add_special_tokens)

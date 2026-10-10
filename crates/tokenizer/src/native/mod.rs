@@ -26,7 +26,9 @@
 //! (another normalizer, a pre-tokenizer or regex construct outside the
 //! supported subset, a post-processor that adds tokens, truncation or
 //! padding, added tokens with `single_word`/`lstrip`/`rstrip`) simply has no
-//! native path. `add_special_tokens = true` also stays with `tokenizers`.
+//! native path. Since no post-processor the path accepts adds tokens, a
+//! request for special tokens gets the same ids and is served by the path
+//! as well.
 
 use std::{
     cell::RefCell,
@@ -310,7 +312,8 @@ impl NativeEncoder {
         Some(stages)
     }
 
-    /// The ids of `text` without special tokens added, or `None` when this
+    /// The ids of `text` (the same whether special tokens were requested or
+    /// not: no post-processor the path accepts adds any), or `None` when this
     /// text must take the `tokenizers` path: not in NFC under an NFC
     /// normalizer, or a piece the model would not tokenize (so that the
     /// error surfaces from there).
