@@ -309,11 +309,11 @@ impl std::str::FromStr for RuntimeType {
 ///
 /// Different providers have different API formats and requirements.
 /// `None` (when used as `Option<ProviderType>`) means native/passthrough —
-/// no transformation needed (local SGLang backends).
+/// no transformation needed (local engine backends).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
-    /// OpenAI API — strip SGLang-specific fields.
+    /// OpenAI API — strip the engine-specific fields.
     #[serde(alias = "openai")]
     OpenAI,
     /// xAI/Grok — special handling for input items.
@@ -677,13 +677,13 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_role: Option<String>,
 
-    /// KV transfer engine id (vLLM `kv_transfer_config.engine_id`; Mooncake PD).
+    /// KV transfer engine id (the engine's `kv_transfer_config.engine_id`; Mooncake PD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_engine_id: Option<String>,
 
     /// KV cache block size (tokens per block) for event-driven routing.
     /// When set, overrides the router-level default for this worker's model.
-    /// Typically matches the backend engine's page size (e.g. 16 for SGLang).
+    /// Typically matches the backend engine's page size (e.g. 16 for one of the engines).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block_size: Option<usize>,
     /// Explicit PD pairing protocol. A prefill and a decode with this set
@@ -841,7 +841,7 @@ impl std::str::FromStr for TransportMode {
     }
 }
 
-/// Where media is fetched and preprocessed for vLLM gRPC workers.
+/// Where media is fetched and preprocessed for one engine's gRPC workers.
 ///
 /// - `Auto`: forward media references when every worker serving the model
 ///   advertises worker-side processing; otherwise preprocess on the router.
@@ -1342,7 +1342,7 @@ pub struct StopProfileRequest {
 
 /// Per-DP-rank load snapshot from a backend.
 ///
-/// Contains core metrics from the sglang `/v1/loads` endpoint or `GetLoads` gRPC RPC.
+/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
 /// Each snapshot represents one data-parallel rank's scheduler state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1379,7 +1379,7 @@ pub struct SchedulerLoadSnapshot {
     pub queues: Option<EngineQueueMetricsSnapshot>,
     /// PD disaggregation signals, populated only when the backend reports a
     /// `disagg` section. `None` for HTTP or older engines. Canonical schema
-    /// other engines map into; SGLang derives the queue depths from its
+    /// other engines map into; one engine derives the queue depths from its
     /// per-stage DisaggregationMetrics counters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_transfer_latency_ms: Option<f64>,

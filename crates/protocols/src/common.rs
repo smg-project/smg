@@ -589,7 +589,7 @@ fn empty_parameters_schema() -> Value {
 }
 
 /// An explicit `"parameters": null` means the same as omitting the field
-/// (vLLM reads it as "no schema" too), and `null` is not a JSON Schema, so it
+/// (the serving engine reads it as "no schema" too), and `null` is not a JSON Schema, so it
 /// is normalised to the empty schema once here rather than in every consumer:
 /// the structural-tag builders, the JSON-schema constraint and the renderers.
 fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
@@ -954,7 +954,7 @@ impl<'de> Deserialize<'de> for InputIds {
     }
 }
 
-/// LoRA adapter path - can be single path or batch of paths (SGLang extension)
+/// LoRA adapter path - can be single path or batch of paths (an engine extension)
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum LoRAPath {

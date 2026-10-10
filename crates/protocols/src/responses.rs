@@ -3213,17 +3213,17 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagementEntry>>,
 
-    /// Top-k sampling parameter (SGLang extension)
+    /// Top-k sampling parameter (an engine extension)
     #[serde(default = "default_top_k")]
     #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: i32,
 
-    /// Min-p sampling parameter (SGLang extension)
+    /// Min-p sampling parameter (an engine extension)
     #[serde(default)]
     #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: f32,
 
-    /// Repetition penalty (SGLang extension)
+    /// Repetition penalty (an engine extension)
     #[serde(default = "default_repetition_penalty")]
     #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: f32,

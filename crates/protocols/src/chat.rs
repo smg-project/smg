@@ -51,8 +51,8 @@ pub enum ChatMessage {
         content: Option<MessageContent>,
         name: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
-        /// Reasoning content for O1-style models (SGLang extension); vLLM's
-        /// `reasoning` spelling is accepted on input.
+        /// Reasoning content for O1-style models (an engine extension); another
+        /// engine's `reasoning` spelling is accepted on input.
         #[serde(alias = "reasoning")]
         reasoning_content: Option<String>,
         #[serde(flatten)]
@@ -386,7 +386,7 @@ pub struct ChatCompletionRequest {
     /// Random seed for sampling for deterministic outputs
     pub sampling_seed: Option<u64>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
@@ -785,7 +785,7 @@ impl GenerationRequest for ChatCompletionRequest {
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
             // Engine extensions carried in the passthrough map, not typed
-            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            // fields: the engines' `cache_salt`, one engine's `extra_key`.
             cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
             extra_key: self.other.get("extra_key").and_then(Value::as_str),
             lora_path: self.lora_path.as_deref(),
@@ -906,7 +906,7 @@ pub struct ChatChoice {
     /// Information about which stop condition was matched
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>, // Can be string or integer
-    /// Hidden states from the model (SGLang extension)
+    /// Hidden states from the model (an engine extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
 }

@@ -77,7 +77,7 @@ pub struct CreateMessageRequest {
     /// MCP servers to be utilized in this request (beta).
     pub mcp_servers: Option<Vec<McpServerConfig>>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields not explicitly defined above (e.g. beta features like

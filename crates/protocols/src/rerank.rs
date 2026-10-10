@@ -44,7 +44,7 @@ pub struct RerankRequest {
     #[serde(default = "default_true")]
     pub return_documents: bool,
 
-    // SGLang specific extensions
+    // Engine-specific extensions
     /// Request ID for tracking
     pub rid: Option<StringOrArray>,
 
