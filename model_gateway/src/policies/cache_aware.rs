@@ -1825,7 +1825,12 @@ impl CacheAwarePolicy {
     /// workers inside the warm-up window unless every worker is (a young
     /// fleet slices nothing, a miss getting a load-balanced pick anyway); a
     /// settled fleet pays nothing here. Each candidate is checked live before
-    /// the pick, and the pick is credited through the expected-wait selector
+    /// the pick: still eligible, still warming, and under the count-pressure
+    /// gate an affinity pick obeys (`balance_rel_threshold` times the mean
+    /// in-flight and `balance_abs_threshold` above it), so a thin worker that
+    /// cannot admit what it is sent (an in-transit backlog, a throttled
+    /// admission) is not fed one miss in `1 / share` while the rest of the
+    /// pool idles. The pick is credited through the expected-wait selector
     /// like any other.
     fn warmup_slice(
         &self,
@@ -1833,6 +1838,7 @@ impl CacheAwarePolicy {
         table: &PoolTable,
         indexer: &KvIndex,
         info: &SelectWorkerInfo,
+        avg_load: f64,
     ) -> Option<usize> {
         if table.warming.is_empty() {
             return None;
@@ -1861,6 +1867,9 @@ impl CacheAwarePolicy {
                 indexed.unwrap_or(0),
                 table.fleet_level,
             ) {
+                continue;
+            }
+            if self.candidate_requires_spill(workers, idx, avg_load) {
                 continue;
             }
             match pick {
@@ -2382,7 +2391,7 @@ impl CacheAwarePolicy {
         let thin_overlap = best_overlap / request_blocks <= f64::from(self.config.cache_threshold)
             || (best_overlap <= WARMUP_MISS_BLOCKS && best_overlap * 2.0 < request_blocks);
         if thin_overlap {
-            if let Some(idx) = self.warmup_slice(workers, &table, indexer, info) {
+            if let Some(idx) = self.warmup_slice(workers, &table, indexer, info, avg_load) {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
                 debug!(
                     worker = workers[idx].url(),
@@ -5707,6 +5716,47 @@ mod tests {
             "the emptied worker got its slice of the thin-overlap requests: {picks:?}"
         );
         assert!(picks.contains(&0), "the holder kept the rest: {picks:?}");
+    }
+
+    #[test]
+    fn a_thin_worker_that_holds_more_than_the_gate_allows_gets_no_slice() {
+        // Seven holders of 1,100 blocks each and an eighth worker with nothing
+        // indexed: thin against the fleet's level, the slice's only candidate.
+        // The router holds 100 requests on it that its report does not show
+        // (dispatches queued in front of an engine that admits slowly), far
+        // over the count-pressure gate (the mean in-flight is 12.5), so the
+        // slice skips it and every thin-overlap request (one block of a
+        // holder's head, eleven of its own) stays with its holder. Without
+        // the gate the slice would feed it one such miss in four.
+        let HolderFleet {
+            policy,
+            workers,
+            heads,
+            ..
+        } = fleet_with_holders(7);
+        for _ in 0..100 {
+            workers[7].increment_load();
+        }
+        let mut request: Vec<u32> = heads[0][..4].to_vec();
+        request.extend(90_000..90_044);
+        let picks: Vec<usize> = (0..8)
+            .map(|_| {
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: Some(&request),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            picks,
+            vec![0; 8],
+            "the slice fed the thin worker that holds more than the gate allows"
+        );
     }
 
     /// Store `tokens` for `worker` as blocks of `block` tokens, with sequence
