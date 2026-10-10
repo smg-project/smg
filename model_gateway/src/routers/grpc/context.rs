@@ -1220,15 +1220,19 @@ impl WorkerSelection {
     pub fn record_prefill_decode_outcomes(
         &self,
         ledger: &AttemptLedger,
-        prefill_status: u16,
-        decode_status: u16,
+        prefill_status: Option<u16>,
+        decode_status: Option<u16>,
     ) {
         if let Self::Disaggregated {
             prefill, decode, ..
         } = self
         {
-            ledger.record_outcome(prefill.as_ref(), prefill_status);
-            ledger.record_outcome(decode.as_ref(), decode_status);
+            if let Some(status) = prefill_status {
+                ledger.record_outcome(prefill.as_ref(), status);
+            }
+            if let Some(status) = decode_status {
+                ledger.record_outcome(decode.as_ref(), status);
+            }
         }
     }
 

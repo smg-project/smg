@@ -17,7 +17,9 @@ pub use encoder_inputs::{
     f32_to_bf16_bits, f32_to_f16_bits, EncoderDtype, EncoderInput, EncoderInputView,
     ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,
 };
-pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, TransformError};
+pub use error::{
+    MediaConnectorError, MediaFault, MultiModalError, MultiModalResult, TransformError,
+};
 pub use media::{
     init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
     MediaConnectorConfig, MediaSource, VideoFetchConfig,

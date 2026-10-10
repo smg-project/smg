@@ -48,8 +48,10 @@ pub enum MediaConnectorError {
     DisallowedLocalPath(String),
     #[error("HTTP error while fetching media: {0}")]
     Http(#[from] reqwest::Error),
+    /// The local file the request names could not be read: the request's
+    /// own (see [`MediaFault::Client`]).
     #[error("I/O error while reading media: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
     #[error("base64 decode error: {0}")]
     Base64Decode(#[from] base64::DecodeError),
     #[error("data URL parse error: {0}")]
@@ -58,6 +60,11 @@ pub enum MediaConnectorError {
     PayloadTooLarge { media: &'static str, limit: usize },
     #[error("media decode task failed: {0}")]
     Blocking(#[from] tokio::task::JoinError),
+    /// This process's own I/O after the bytes arrived: the scratch file a
+    /// decoder reads from, the decoder process it runs (see
+    /// [`MediaFault::Internal`]); never the request's or the media host's.
+    #[error("I/O error while decoding media: {0}")]
+    DecodeIo(#[source] std::io::Error),
     #[error("image decode error: {0}")]
     Image(#[from] image::ImageError),
     #[error("audio decode error: {0}")]
@@ -78,4 +85,152 @@ pub enum MultiModalError {
     Join(#[from] tokio::task::JoinError),
     #[error("tracker validation error: {0}")]
     Validation(String),
+}
+
+/// Whose fault a [`MediaConnectorError`] is: it decides how the request is
+/// answered and whether the process that fetched is at fault at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaFault {
+    /// The request's own: a URL that cannot be parsed or is not allowed, a
+    /// host that cannot be resolved or refuses the connection, a host that
+    /// answers 4xx, a local file the request names that cannot be read, a
+    /// payload that is not the media it claims to be or is too large, a
+    /// media parameter out of range. The host's reachability is judged from
+    /// this side: a resolver, proxy or trust store that is broken here makes
+    /// every fetch look like the request's fault, so such a worker stays in
+    /// rotation and each refusal is logged with its fault and the connector's
+    /// words; charging it to the worker would let any client's URL open the
+    /// worker's breaker.
+    Client,
+    /// The media host's, for now: a fetch that ran out of its budget, a 5xx
+    /// answer, a transfer that broke while the body arrived.
+    Transient,
+    /// This process's: a decode task that panicked or was cancelled, a
+    /// scratch file or a decoder process that failed on this side (a
+    /// temporary directory that is full or not writable, a pipe that broke).
+    Internal,
+}
+
+impl MediaConnectorError {
+    /// Whose fault this error is; see [`MediaFault`]. An I/O error is judged
+    /// by where it happened, never by its kind: on the local file the request
+    /// names it is the request's ([`Self::Io`]), on this process's scratch
+    /// file or decoder process it is this process's ([`Self::DecodeIo`]).
+    pub fn fault(&self) -> MediaFault {
+        match self {
+            Self::Http(http) => http_fault(http),
+            Self::Timeout { .. } => MediaFault::Transient,
+            Self::Blocking(_) | Self::DecodeIo(_) => MediaFault::Internal,
+            Self::InvalidMaxLongSidePixel { .. }
+            | Self::InvalidSampleFps { .. }
+            | Self::InvalidVideoLongSideCap { .. }
+            | Self::UnsupportedScheme(_)
+            | Self::InvalidUrl(_)
+            | Self::DisallowedDomain(_)
+            | Self::DisallowedLocalPath(_)
+            | Self::Io(_)
+            | Self::Base64Decode(_)
+            | Self::DataUrl(_)
+            | Self::PayloadTooLarge { .. }
+            | Self::Image(_)
+            | Self::AudioDecode(_)
+            | Self::VideoDecode(_) => MediaFault::Client,
+        }
+    }
+}
+
+/// Whose fault an HTTP fetch error is. A host that answered is judged by its
+/// status; one that did not answer in time is the host's for now; one that
+/// cannot be resolved or refuses the connection, and a redirect that leads
+/// nowhere, are the request's; a transfer that broke before the last byte is
+/// the host's.
+fn http_fault(error: &reqwest::Error) -> MediaFault {
+    if let Some(status) = error.status() {
+        return if status.is_server_error() {
+            MediaFault::Transient
+        } else {
+            MediaFault::Client
+        };
+    }
+    if error.is_timeout() {
+        MediaFault::Transient
+    } else if error.is_connect() || error.is_redirect() || error.is_builder() {
+        MediaFault::Client
+    } else if error.is_body() || error.is_decode() {
+        MediaFault::Transient
+    } else {
+        MediaFault::Client
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reference the request got wrong, media that is not what it claims
+    /// to be, a payload over the cap: the request's own fault.
+    #[test]
+    fn a_fault_of_the_request_is_the_clients() {
+        for error in [
+            MediaConnectorError::UnsupportedScheme("ftp".to_string()),
+            MediaConnectorError::InvalidUrl("not a url".to_string()),
+            MediaConnectorError::DisallowedDomain("media.example".to_string()),
+            MediaConnectorError::DataUrl("missing comma in data url".to_string()),
+            MediaConnectorError::PayloadTooLarge {
+                media: "image",
+                limit: 1,
+            },
+            MediaConnectorError::Image(image::ImageError::Decoding(
+                image::error::DecodingError::new(
+                    image::error::ImageFormatHint::Unknown,
+                    "not an image",
+                ),
+            )),
+            MediaConnectorError::VideoDecode("not a video".to_string()),
+            MediaConnectorError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        ] {
+            assert_eq!(error.fault(), MediaFault::Client, "{error}");
+        }
+    }
+
+    /// A decode task that never answers is this process's fault.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test task, aborted at once for its join error"
+    )]
+    async fn a_decode_task_that_dies_is_ours() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let join = task.await.expect_err("aborted");
+        assert_eq!(
+            MediaConnectorError::Blocking(join).fault(),
+            MediaFault::Internal
+        );
+    }
+
+    /// An I/O error is judged by where it happened, not by its kind: on this
+    /// process's scratch file or decoder process it is this process's fault,
+    /// on the local file the request names it is the request's, whatever the
+    /// kind.
+    #[test]
+    fn io_is_classified_by_where_it_failed_not_by_its_kind() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::Other,
+        ] {
+            assert_eq!(
+                MediaConnectorError::DecodeIo(std::io::Error::from(kind)).fault(),
+                MediaFault::Internal,
+                "{kind:?}"
+            );
+            assert_eq!(
+                MediaConnectorError::Io(std::io::Error::from(kind)).fault(),
+                MediaFault::Client,
+                "{kind:?}"
+            );
+        }
+    }
 }

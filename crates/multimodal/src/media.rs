@@ -49,7 +49,7 @@ const HIGH_CONCURRENCY_CPU_BUDGET_NUMERATOR: usize = 6;
 const HIGH_CONCURRENCY_CPU_BUDGET_DENOMINATOR: usize = 7;
 
 use super::{
-    error::MediaConnectorError,
+    error::{MediaConnectorError, MediaFault},
     types::{
         AudioClip, AudioSource, DecodedRgbFrame, DecodedRgbVideo, ImageDetail, ImageFrame,
         ImageSource, VideoClip, VideoSamplingInfo, VideoSource,
@@ -239,7 +239,7 @@ impl MediaConnector {
         });
 
         let allowed_local_media_path = if let Some(path) = config.allowed_local_media_path {
-            Some(std::fs::canonicalize(path)?)
+            Some(std::fs::canonicalize(path).map_err(MediaConnectorError::Io)?)
         } else {
             None
         };
@@ -427,7 +427,9 @@ impl MediaConnector {
             .as_ref()
             .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
 
-        let canonical = fs::canonicalize(path).await?;
+        let canonical = fs::canonicalize(path)
+            .await
+            .map_err(MediaConnectorError::Io)?;
         if !canonical.starts_with(allowed_root) {
             return Err(MediaConnectorError::DisallowedLocalPath(
                 path.display().to_string(),
@@ -539,7 +541,9 @@ impl MediaConnector {
             .as_ref()
             .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
 
-        let canonical = fs::canonicalize(path).await?;
+        let canonical = fs::canonicalize(path)
+            .await
+            .map_err(MediaConnectorError::Io)?;
         if !canonical.starts_with(allowed_root) {
             return Err(MediaConnectorError::DisallowedLocalPath(
                 path.display().to_string(),
@@ -557,7 +561,9 @@ impl MediaConnector {
             .as_ref()
             .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
 
-        let canonical = fs::canonicalize(path).await?;
+        let canonical = fs::canonicalize(path)
+            .await
+            .map_err(MediaConnectorError::Io)?;
         if !canonical.starts_with(allowed_root) {
             return Err(MediaConnectorError::DisallowedLocalPath(
                 path.display().to_string(),
@@ -685,14 +691,23 @@ impl MediaConnector {
     }
 }
 
+/// The local file the request names, up to `limit` bytes. Its I/O is the
+/// request's own ([`MediaConnectorError::Io`]).
 async fn read_file_with_limit(
     path: &Path,
     limit: usize,
     media: &'static str,
 ) -> Result<Bytes, MediaConnectorError> {
-    let file = fs::File::open(path).await?;
+    let file = fs::File::open(path)
+        .await
+        .map_err(MediaConnectorError::Io)?;
     let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
-    if file.metadata().await?.len() > limit_u64 {
+    let len = file
+        .metadata()
+        .await
+        .map_err(MediaConnectorError::Io)?
+        .len();
+    if len > limit_u64 {
         return Err(MediaConnectorError::PayloadTooLarge { media, limit });
     }
 
@@ -700,7 +715,10 @@ async fn read_file_with_limit(
     // covers a file growing after the metadata check.
     let mut reader = file.take(limit_u64.saturating_add(1));
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
+    reader
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(MediaConnectorError::Io)?;
     ensure_input_byte_limit(bytes.len(), limit, media)?;
     Ok(Bytes::from(bytes))
 }
@@ -847,9 +865,10 @@ async fn decode_video_frames(
                         decode_video_bytes_with_tempfile(bytes, cfg)
                             .await
                             .map_err(|fallback_error| {
-                                MediaConnectorError::VideoDecode(format!(
+                                let message = format!(
                                     "buffered OpenCV decode failed: {error}; tempfile OpenCV fallback failed: {fallback_error}"
-                                ))
+                                );
+                                fallback_failed(fallback_error, message)
                             })
                     }
                 }
@@ -885,9 +904,10 @@ async fn decode_video_frames(
                         decode_video_bytes_with_tempfile(bytes, cfg)
                             .await
                             .map_err(|fallback_error| {
-                                MediaConnectorError::VideoDecode(format!(
+                                let message = format!(
                                     "buffered OpenCV decode failed: {opencv_error}; tempfile fallback failed: {fallback_error}"
-                                ))
+                                );
+                                fallback_failed(fallback_error, message)
                             })
                     }
                 }
@@ -908,11 +928,27 @@ async fn decode_video_bytes_with_tempfile(
     let input_bytes = bytes.len();
     let input_file = {
         let bytes = bytes.clone();
-        task::spawn_blocking(move || write_temp_video_file(&bytes))
+        task::spawn_blocking(move || write_temp_video_file(&std::env::temp_dir(), &bytes))
             .await
             .map_err(MediaConnectorError::Blocking)??
     };
     decode_video_frames_from_path(input_file.path(), input_bytes, cfg).await
+}
+
+/// The error of a decode whose fallback failed too, with both decoders'
+/// words in `message`. The fallback's fault decides whose it is: a fallback
+/// that failed on this process's own I/O or task keeps the error this
+/// process's (see [`MediaConnectorError::fault`]); otherwise it is the
+/// media's.
+fn fallback_failed(fallback: MediaConnectorError, message: String) -> MediaConnectorError {
+    if fallback.fault() != MediaFault::Internal {
+        return MediaConnectorError::VideoDecode(message);
+    }
+    let kind = match &fallback {
+        MediaConnectorError::DecodeIo(io) => io.kind(),
+        _ => std::io::ErrorKind::Other,
+    };
+    MediaConnectorError::DecodeIo(std::io::Error::new(kind, message))
 }
 
 async fn decode_video_bytes_with_ffmpeg(
@@ -922,7 +958,7 @@ async fn decode_video_bytes_with_ffmpeg(
     let input_bytes = bytes.len();
     let input_file = {
         let bytes = bytes.clone();
-        task::spawn_blocking(move || write_temp_video_file(&bytes))
+        task::spawn_blocking(move || write_temp_video_file(&std::env::temp_dir(), &bytes))
             .await
             .map_err(MediaConnectorError::Blocking)??
     };
@@ -981,9 +1017,12 @@ async fn decode_video_frames_from_path(
 
                         match decode_video_with_ffmpeg(input_path, input_bytes, cfg).await {
                             Ok(frames) => Ok(frames),
-                            Err(ffmpeg_error) => Err(MediaConnectorError::VideoDecode(format!(
-                                "OpenCV decode failed: {opencv_error}; ffmpeg fallback failed: {ffmpeg_error}"
-                            ))),
+                            Err(ffmpeg_error) => {
+                                let message = format!(
+                                    "OpenCV decode failed: {opencv_error}; ffmpeg fallback failed: {ffmpeg_error}"
+                                );
+                                Err(fallback_failed(ffmpeg_error, message))
+                            }
                         }
                     }
                 }
@@ -1649,9 +1688,10 @@ async fn decode_video_with_ffmpeg(
     decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, metadata, None)
         .await
         .map_err(|fallback_error| {
-            MediaConnectorError::VideoDecode(format!(
+            let message = format!(
                 "ffmpeg frame selection failed: {selected_error}; fps resampling fallback failed: {fallback_error}"
-            ))
+            );
+            fallback_failed(fallback_error, message)
         })
 }
 
@@ -1732,14 +1772,24 @@ async fn decode_video_with_ffmpeg_runners(
     }
 }
 
-fn write_temp_video_file(bytes: &[u8]) -> Result<tempfile::NamedTempFile, MediaConnectorError> {
+/// The scratch file a decoder reads `bytes` from, in `dir`. Its I/O is this
+/// process's own ([`MediaConnectorError::DecodeIo`]): the bytes have arrived
+/// by now, and a directory that is full or not writable is not the media's
+/// fault.
+fn write_temp_video_file(
+    dir: &Path,
+    bytes: &[u8],
+) -> Result<tempfile::NamedTempFile, MediaConnectorError> {
     let started = Instant::now();
     let mut input_file = tempfile::Builder::new()
         .prefix("smg-video-")
         .suffix(video_temp_suffix(bytes))
-        .tempfile()?;
-    input_file.write_all(bytes)?;
-    input_file.flush()?;
+        .tempfile_in(dir)
+        .map_err(MediaConnectorError::DecodeIo)?;
+    input_file
+        .write_all(bytes)
+        .map_err(MediaConnectorError::DecodeIo)?;
+    input_file.flush().map_err(MediaConnectorError::DecodeIo)?;
     if log_video_decode_timing_enabled() {
         info!(
             nbytes = bytes.len(),
@@ -1820,6 +1870,10 @@ fn is_video_command_timeout(error: &MediaConnectorError) -> bool {
     matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_COMMAND_TIMED_OUT))
 }
 
+/// Runs a decoder command to completion under the video process timeout. A
+/// missing executable is reported in the operator's terms; the command's own
+/// I/O (a spawn that fails otherwise, a pipe that breaks) is this process's
+/// ([`MediaConnectorError::DecodeIo`]).
 async fn run_video_command_output(
     mut command: Command,
     program: &'static str,
@@ -1834,14 +1888,14 @@ async fn run_video_command_output(
                 "{program} executable not found; install {program} to decode video_url inputs"
             ))
         } else {
-            MediaConnectorError::Io(e)
+            MediaConnectorError::DecodeIo(e)
         }
     })?;
 
     let timeout = video_process_timeout();
     match time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(MediaConnectorError::Io(error)),
+        Ok(Err(error)) => Err(MediaConnectorError::DecodeIo(error)),
         Err(_) => Err(MediaConnectorError::VideoDecode(format!(
             "{program} {VIDEO_COMMAND_TIMED_OUT} {:.3} seconds",
             timeout.as_secs_f64()
@@ -2858,9 +2912,10 @@ mod tests {
     use super::{
         checked_payload_length, collect_http_body_with_limit, decode_base64_with_limit,
         effective_sample_fps, ensure_input_byte_limit, expected_sampled_frame_count,
-        fps_filter_for_metadata, parse_ffmpeg_duration_seconds, parse_ffprobe_video_info,
-        parse_ppm_stream, read_file_with_limit, split_png_stream, video_temp_suffix, FrameSampling,
-        MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaSource, VideoFetchConfig,
+        fallback_failed, fps_filter_for_metadata, parse_ffmpeg_duration_seconds,
+        parse_ffprobe_video_info, parse_ppm_stream, read_file_with_limit, split_png_stream,
+        video_temp_suffix, write_temp_video_file, FrameSampling, MediaConnector,
+        MediaConnectorConfig, MediaConnectorError, MediaFault, MediaSource, VideoFetchConfig,
         VideoMetadata,
     };
 
@@ -2953,6 +3008,48 @@ mod tests {
         assert_eq!(video_temp_suffix(b"OggS"), ".ogv");
         assert_eq!(video_temp_suffix(&[0x00, 0x00, 0x01, 0xba]), ".mpg");
         assert_eq!(video_temp_suffix(b"unknown"), ".video");
+    }
+
+    /// The scratch file a decoder reads from is this process's own: in a
+    /// directory that is not there (or not writable) the error is this
+    /// process's fault, whatever bytes the request sent; the same bytes in a
+    /// writable directory are written as they are.
+    #[test]
+    fn a_scratch_file_that_cannot_be_written_is_our_fault() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let bytes = b"not a video, never decoded";
+        let written = write_temp_video_file(dir.path(), bytes).expect("a writable dir");
+        assert_eq!(
+            std::fs::read(written.path()).expect("the scratch file"),
+            bytes
+        );
+        let missing = dir.path().join("missing");
+        let error = write_temp_video_file(&missing, bytes).expect_err("a dir that is not there");
+        assert!(matches!(error, MediaConnectorError::DecodeIo(_)), "{error}");
+        assert_eq!(error.fault(), MediaFault::Internal);
+    }
+
+    /// A decode whose fallback failed too is judged by the fallback: on this
+    /// process's own I/O it stays this process's fault, with both decoders'
+    /// words kept; on the media it is the media's.
+    #[test]
+    fn a_failed_fallback_keeps_an_internal_origin() {
+        let message = "first decoder failed: bad frame; fallback failed: no space left on device";
+        let ours = fallback_failed(
+            MediaConnectorError::DecodeIo(std::io::Error::other("no space left on device")),
+            message.to_string(),
+        );
+        assert_eq!(ours.fault(), MediaFault::Internal);
+        assert!(ours.to_string().contains(message), "{ours}");
+        let theirs = fallback_failed(
+            MediaConnectorError::VideoDecode("no video stream".to_string()),
+            message.to_string(),
+        );
+        assert_eq!(theirs.fault(), MediaFault::Client);
+        assert!(
+            matches!(theirs, MediaConnectorError::VideoDecode(_)),
+            "{theirs}"
+        );
     }
 
     #[test]
@@ -3050,7 +3147,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_files_at_limit_and_rejects_limit_plus_one() -> Result<(), MediaConnectorError> {
+    async fn reads_files_at_limit_and_rejects_limit_plus_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut file = tempfile::NamedTempFile::new()?;
         file.write_all(b"12345")?;
         file.flush()?;
@@ -4174,7 +4272,8 @@ pub(crate) fn decode_image_bytes(
     let image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
         Some(image) => image,
         None => image::ImageReader::new(std::io::Cursor::new(bytes))
-            .with_guessed_format()?
+            .with_guessed_format()
+            .map_err(MediaConnectorError::Io)?
             .decode()?,
     };
     Ok(apply_max_long_side_pixel(image, max_long_side_pixel))
@@ -4186,7 +4285,8 @@ pub(crate) fn encoded_image_size(
     max_long_side_pixel: Option<u32>,
 ) -> Result<crate::types::ImageSize, MediaConnectorError> {
     let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()?
+        .with_guessed_format()
+        .map_err(MediaConnectorError::Io)?
         .into_dimensions()?;
     let (width, height) = max_long_side_pixel
         .and_then(|cap| capped_dimensions(width, height, cap))
