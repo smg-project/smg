@@ -375,6 +375,20 @@ jobs:
           $sudo apt-get update
           $sudo apt-get install -y --no-install-recommends ffmpeg
 
+      # The test targets are built in a step of their own: when the Rust cache
+      # has nothing to restore (the usual case on this runner pool, see
+      # smg-project/smg-lab#157), the whole workspace compiles in the test
+      # profile here, 11 minutes on a quiet runner and 28 on a busy one, and a
+      # single step would spend the test budget below on compiling. The
+      # second step finds everything fresh and only runs the tests, so its
+      # timeout bounds the tests, which is what a timeout here is for.
+      - name: Build the Rust tests
+        timeout-minutes: 45
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test --no-run
+          cargo test -p data-connector --test postgres_integration --no-run
+
       - name: Run Rust tests
         timeout-minutes: 30
         run: |
