@@ -5,6 +5,9 @@
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
 #![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
+use std::{fmt::Display, sync::Arc};
+
+use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
@@ -13,18 +16,57 @@ use llm_tokenizer::{
 use openai_protocol::{
     common::{self, StringOrArray, Tool as ChatTool, ToolChoice as ChatToolChoice},
     messages::{
-        self, CreateMessageRequest, InputContent, InputContentBlock, InputMessage, SystemContent,
-        ThinkingConfig, ToolResultContent,
+        self, CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
+        InputMessage, SystemContent, ThinkingConfig, ToolResultContent,
     },
 };
 use serde_json::{json, Value};
+use tracing::error;
 
 use super::chat_utils;
-use crate::routers::grpc::{multimodal::PlaceholderTokens, ProcessedMessages};
+use crate::routers::{
+    error,
+    grpc::{
+        context::SharedComponents,
+        multimodal::{self, MediaPlan, MultimodalComponents, PlaceholderTokens},
+        ProcessedMessages,
+    },
+};
 
 // ============================================================================
 // Top-level processing function
 // ============================================================================
+
+/// The parts of a Messages request its prompt is rendered from, so that
+/// `/v1/messages` and `/v1/messages/count_tokens` render through one path.
+pub(crate) struct MessagesPrompt<'a> {
+    pub messages: &'a [InputMessage],
+    pub system: Option<&'a SystemContent>,
+    pub thinking: Option<&'a ThinkingConfig>,
+    pub stop_sequences: Option<&'a [String]>,
+}
+
+impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
+    fn from(request: &'a CreateMessageRequest) -> Self {
+        Self {
+            messages: &request.messages,
+            system: request.system.as_ref(),
+            thinking: request.thinking.as_ref(),
+            stop_sequences: request.stop_sequences.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
+    fn from(request: &'a CountMessageTokensRequest) -> Self {
+        Self {
+            messages: &request.messages,
+            system: request.system.as_ref(),
+            thinking: request.thinking.as_ref(),
+            stop_sequences: None,
+        }
+    }
+}
 
 /// Process messages from a CreateMessageRequest and apply the chat template.
 ///
@@ -39,18 +81,35 @@ pub fn process_messages(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    process_messages_prompt(
+        MessagesPrompt::from(request),
+        tokenizer,
+        chat_tools,
+        placeholder_tokens,
+        media_order,
+    )
+}
+
+/// [`process_messages`] over the prompt parts alone.
+pub(crate) fn process_messages_prompt(
+    request: MessagesPrompt<'_>,
+    tokenizer: &dyn Tokenizer,
+    chat_tools: Option<&[ChatTool]>,
+    placeholder_tokens: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let content_format = tokenizer.chat_template_content_format();
 
     // Step 1: Convert InputMessages to chat template JSON values
     let mut transformed_messages = process_message_content_format(
-        &request.messages,
+        request.messages,
         content_format,
         placeholder_tokens,
         media_order,
     )?;
 
     // Step 2: Prepend system message if present
-    if let Some(system) = &request.system {
+    if let Some(system) = request.system {
         let system_text = match system {
             SystemContent::String(s) => s.clone(),
             SystemContent::Blocks(blocks) => blocks
@@ -86,7 +145,7 @@ pub fn process_messages(
     // preference. Adaptive is treated as "thinking on"; the model decides
     // whether to actually emit it. The tokenizer applies this under the model's
     // own toggle key (`enable_thinking`/`thinking`) in `apply`.
-    let thinking = match &request.thinking {
+    let thinking = match request.thinking {
         Some(ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. }) => Some(true),
         Some(ThinkingConfig::Disabled) => Some(false),
         None => None, // Let template use its default behavior
@@ -107,8 +166,7 @@ pub fn process_messages(
     // Step 7: Build ProcessedMessages
     let stop_sequences = request
         .stop_sequences
-        .as_ref()
-        .map(|seqs| StringOrArray::Array(seqs.clone()));
+        .map(|seqs| StringOrArray::Array(seqs.to_vec()));
 
     Ok((
         ProcessedMessages {
@@ -118,6 +176,193 @@ pub fn process_messages(
         },
         rendered.encoding,
     ))
+}
+
+/// The tools the template renders for a request: the custom tools as chat
+/// tools, narrowed by `tool_choice` the way the chat path narrows them (a
+/// forced tool renders alone). Shared by the preparation stage and
+/// count_tokens so both render the same prompt.
+pub(crate) fn template_tools(
+    tools: Option<&[messages::Tool]>,
+    tool_choice: Option<&messages::ToolChoice>,
+) -> Vec<ChatTool> {
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    let chat_tools = extract_chat_tools(tools);
+    match tool_choice.map(convert_message_tool_choice) {
+        Some(tc) => {
+            chat_utils::filter_tools_by_tool_choice(&chat_tools, Some(&tc)).unwrap_or(chat_tools)
+        }
+        None => chat_tools,
+    }
+}
+
+/// The media context of a Messages request, resolved from the registries
+/// before the template renders, as the preparation stage resolves it:
+/// nothing is fetched or preprocessed here.
+pub(crate) struct MessagesMedia {
+    /// Where the model's template wants media parts relative to text.
+    pub(crate) media_order: MediaPartOrder,
+    /// The request's media and the placeholders the template writes for it,
+    /// when the request carries media.
+    pub(crate) media: Option<MediaContext>,
+}
+
+impl MessagesMedia {
+    pub(crate) fn placeholders(&self) -> Option<&PlaceholderTokens> {
+        self.media.as_ref().map(|media| &media.placeholders)
+    }
+}
+
+/// A request's media as the preparation stage processes it after rendering.
+pub(crate) struct MediaContext {
+    pub(crate) plan: MediaPlan,
+    pub(crate) placeholders: PlaceholderTokens,
+    pub(crate) components: Arc<MultimodalComponents>,
+    pub(crate) tokenizer_id: String,
+    pub(crate) tokenizer_source: String,
+}
+
+/// The 400 for media the request carries that cannot be prepared.
+pub(crate) fn invalid_multimodal_request(error: impl Display) -> Response {
+    error::bad_request(
+        "invalid_multimodal_request",
+        format!("Invalid multimodal request: {error}"),
+    )
+}
+
+/// Resolve what a Messages request's media needs before the template renders:
+/// the model's media-part order and, for a request with media, the plan and
+/// the placeholder tokens (the engine's own limits applied). The refusals are
+/// the preparation stage's, so count_tokens answers a request the way
+/// `/v1/messages` would.
+pub(crate) async fn resolve_messages_media(
+    components: &SharedComponents,
+    model_id: &str,
+    tokenizer: &dyn Tokenizer,
+    messages: &[InputMessage],
+) -> Result<MessagesMedia, Response> {
+    let tokenizer_entry = components
+        .tokenizer_registry
+        .get_by_name(model_id)
+        .or_else(|| components.tokenizer_registry.get_by_id(model_id));
+    // The media-part order comes from the model registry so /v1/messages
+    // renders each model consistently with /v1/chat/completions.
+    let media_order = match (components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
+        (Some(mm_components), Some(entry)) => {
+            multimodal::resolve_media_part_order(
+                model_id,
+                tokenizer,
+                mm_components,
+                &entry.id,
+                &entry.source,
+            )
+            .await
+        }
+        _ => MediaPartOrder::MediaFirst,
+    };
+
+    let plan = multimodal::media_plan_messages(messages);
+    if plan.is_empty() {
+        return Ok(MessagesMedia {
+            media_order,
+            media: None,
+        });
+    }
+    let Some(mm_components) = components.multimodal.as_ref() else {
+        error!(
+            function = "resolve_messages_media",
+            "Multimodal content detected but multimodal components not initialized"
+        );
+        return Err(error::bad_request(
+            "multimodal_not_supported",
+            "Multimodal content detected but multimodal processing is not available",
+        ));
+    };
+    let Some(entry) = tokenizer_entry else {
+        error!(
+            function = "resolve_messages_media",
+            model = %model_id,
+            "Tokenizer entry not found for multimodal processing"
+        );
+        return Err(error::bad_request(
+            "multimodal_config_missing",
+            format!("Tokenizer not found for model: {model_id}"),
+        ));
+    };
+
+    // The per-request media limits the model's workers advertise for their
+    // engine, which the plan is held to before any fetch.
+    let engine_limits = multimodal::engine_item_limits(&components.worker_registry, model_id);
+    let placeholders = multimodal::prepare_placeholder_tokens(
+        &plan,
+        model_id,
+        tokenizer,
+        mm_components,
+        &entry.id,
+        &entry.source,
+        &engine_limits,
+    )
+    .await
+    .map_err(|e| {
+        error!(
+            function = "resolve_messages_media",
+            model = %model_id,
+            error = %e,
+            "Failed to resolve multimodal placeholder token"
+        );
+        invalid_multimodal_request(e)
+    })?;
+
+    Ok(MessagesMedia {
+        media_order,
+        media: Some(MediaContext {
+            plan,
+            placeholders,
+            components: Arc::clone(mm_components),
+            tokenizer_id: entry.id,
+            tokenizer_source: entry.source,
+        }),
+    })
+}
+
+/// Why a count could not be produced: the request does not render (the
+/// client's mistake, a 400 on `/v1/messages`) or the rendered prompt does
+/// not encode (a gateway fault, a 500 there).
+#[derive(Debug)]
+pub(crate) enum CountError {
+    Render(String),
+    Encode(anyhow::Error),
+}
+
+/// The prompt tokens `/v1/messages` would send for `request`: the same tool
+/// set, media placeholders, template rendering and encoding as the
+/// preparation stage, without media processing (an image counts as the
+/// placeholder the template writes for it; the image itself is not fetched).
+/// A text or content-source document counts as its rendered text; a source
+/// with no text is refused, as `/v1/messages` refuses it.
+pub(crate) async fn count_input_tokens(
+    request: &CountMessageTokensRequest,
+    tokenizer: Arc<dyn Tokenizer>,
+    tools: &[ChatTool],
+    placeholders: Option<&PlaceholderTokens>,
+    media_order: MediaPartOrder,
+) -> Result<u32, CountError> {
+    let (processed, encoding) = process_messages_prompt(
+        MessagesPrompt::from(request),
+        &*tokenizer,
+        (!tools.is_empty()).then_some(tools),
+        placeholders,
+        media_order,
+    )
+    .map_err(CountError::Render)?;
+    let encoded = chat_utils::encode_prompt_blocking(tokenizer, &processed.text, encoding)
+        .await
+        .map_err(CountError::Encode)?;
+    u32::try_from(encoded.token_ids().len()).map_err(|_| {
+        CountError::Render("the prompt has more tokens than a count can report".to_owned())
+    })
 }
 
 // ============================================================================
@@ -1213,5 +1458,147 @@ mod tests {
             .unwrap_err();
             assert!(err.starts_with(needle), "{err}");
         }
+    }
+
+    /// count_tokens renders and encodes through the same path as a message
+    /// request: with a renderer that encodes itself, the count is the length
+    /// of the ids it hands back, not of a re-tokenization of its text.
+    #[tokio::test]
+    async fn count_input_tokens_reports_the_rendered_prompt_length() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![7, 8, 9, 10, 11]),
+        );
+        let request: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "system": "You are terse.",
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "tools": [{
+                "name": "get_weather",
+                "description": "Weather for a city",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }],
+            "tool_choice": {"type": "tool", "name": "get_weather"},
+            "messages": [{"role": "user", "content": "Weather in Paris?"}]
+        }))
+        .unwrap();
+        let tools = template_tools(request.tools.as_deref(), request.tool_choice.as_ref());
+        assert_eq!(tools.len(), 1, "a forced tool renders alone");
+
+        let counted = count_input_tokens(
+            &request,
+            tokenizer,
+            &tools,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .await
+        .unwrap();
+        assert_eq!(counted, 5);
+    }
+
+    /// With a string-format template an image is the placeholder the model's
+    /// registry names; the count carries it, as the prompt `/v1/messages`
+    /// sends carries it. (The mock vocabulary knows "token", "Hello", "world".)
+    #[tokio::test]
+    async fn count_input_tokens_counts_the_image_placeholder_the_template_writes() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new()
+                .with_content_format(ChatTemplateContentFormat::String),
+        );
+        let request: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Hello world"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]}]
+        }))
+        .unwrap();
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, "token".to_string());
+
+        let without = count_input_tokens(
+            &request,
+            Arc::clone(&tokenizer),
+            &[],
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .await
+        .unwrap();
+        let with = count_input_tokens(
+            &request,
+            tokenizer,
+            &[],
+            Some(&placeholders),
+            MediaPartOrder::MediaFirst,
+        )
+        .await
+        .unwrap();
+        assert_eq!(without, 2, "the text alone: Hello, world");
+        assert_eq!(with, 3, "the placeholder counts once");
+    }
+
+    /// A tokenizer whose encode fails is a gateway fault, told apart from a
+    /// request that does not render, so the router can answer 500 and 400 as
+    /// `/v1/messages` does.
+    #[tokio::test]
+    async fn count_input_tokens_tells_an_encode_failure_from_a_render_failure() {
+        struct EncodeFails(llm_tokenizer::mock::MockTokenizer);
+        impl llm_tokenizer::traits::Encoder for EncodeFails {
+            fn encode(&self, _: &str, _: bool) -> anyhow::Result<llm_tokenizer::traits::Encoding> {
+                Err(anyhow::anyhow!("the tokenizer files are unreadable"))
+            }
+            fn encode_batch(
+                &self,
+                _: &[&str],
+                _: bool,
+            ) -> anyhow::Result<Vec<llm_tokenizer::traits::Encoding>> {
+                Err(anyhow::anyhow!("the tokenizer files are unreadable"))
+            }
+        }
+        impl llm_tokenizer::traits::Decoder for EncodeFails {
+            fn decode(&self, ids: &[u32], s: bool) -> anyhow::Result<String> {
+                self.0.decode(ids, s)
+            }
+        }
+        impl Tokenizer for EncodeFails {
+            fn vocab_size(&self) -> usize {
+                self.0.vocab_size()
+            }
+            fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+                self.0.get_special_tokens()
+            }
+            fn token_to_id(&self, t: &str) -> Option<u32> {
+                self.0.token_to_id(t)
+            }
+            fn id_to_token(&self, id: u32) -> Option<String> {
+                self.0.id_to_token(id)
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn apply_chat_template(
+                &self,
+                messages: &[Value],
+                params: ChatTemplateParams,
+            ) -> anyhow::Result<String> {
+                self.0.apply_chat_template(messages, params)
+            }
+        }
+        let request: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "Hello world"}]
+        }))
+        .unwrap();
+
+        let failure = count_input_tokens(
+            &request,
+            Arc::new(EncodeFails(llm_tokenizer::mock::MockTokenizer::new())),
+            &[],
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure, CountError::Encode(_)), "{failure:?}");
     }
 }
