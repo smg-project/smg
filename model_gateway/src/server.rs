@@ -1055,7 +1055,9 @@ pub fn build_app(
         .route("/engine_metrics", get(engine_metrics))
         .route("/loads", get(get_loads))
         .route("/v1/models", get(v1_models))
-        .route("/v1/models/{id}", get(v1_model))
+        // The rest of the path: a self-hosted id usually carries a slash
+        // (an organisation and a name), raw or percent-encoded.
+        .route("/v1/models/{*id}", get(v1_model))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 

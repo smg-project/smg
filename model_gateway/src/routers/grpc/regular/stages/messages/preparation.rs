@@ -1,7 +1,5 @@
 //! Message API preparation stage: Convert tools, process messages, tokenize, build constraints
 
-use std::fmt::Display;
-
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
@@ -27,13 +25,6 @@ use crate::routers::{
 /// tokenizes, and builds tool constraints.
 pub(crate) struct MessagePreparationStage;
 
-fn invalid_multimodal_request(error: impl Display) -> Response {
-    error::bad_request(
-        "invalid_multimodal_request",
-        format!("Invalid multimodal request: {error}"),
-    )
-}
-
 #[async_trait]
 impl PipelineStage for MessagePreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
@@ -57,126 +48,38 @@ impl MessagePreparationStage {
         let tokenizer = utils::resolve_tokenizer(ctx, "MessagePreparationStage::prepare_messages")
             .map_err(|e| *e)?;
 
-        // Step 1: Convert Messages API tools to chat tools and filter by tool_choice
-        let chat_tools = request
-            .tools
-            .as_deref()
-            .map(message_utils::extract_chat_tools);
-
+        // Step 1: The tools the template renders (narrowed by tool_choice),
+        // shared with count_tokens so both render the same prompt.
+        let filtered_tools =
+            message_utils::template_tools(request.tools.as_deref(), request.tool_choice.as_ref());
         let chat_tool_choice = request
             .tool_choice
             .as_ref()
             .map(message_utils::convert_message_tool_choice);
-
-        // Filter tools by tool_choice (reuse chat utility)
-        let filtered_tools = match (&chat_tools, &chat_tool_choice) {
-            (Some(tools), Some(tc)) => {
-                utils::filter_tools_by_tool_choice(tools, Some(tc)).unwrap_or_else(|| tools.clone())
-            }
-            (Some(tools), None) => tools.clone(),
-            _ => Vec::new(),
-        };
-
         let tools_for_template = if filtered_tools.is_empty() {
             None
         } else {
             Some(filtered_tools.as_slice())
         };
 
-        // Resolve media-part ordering from the model registry so /v1/messages
-        // renders each model consistently with /v1/chat/completions.
+        // The media-part order and, for a request with media, the plan and the
+        // placeholder tokens: resolved once, shared with count_tokens.
         let model_id = ctx.input.model_id.as_str();
-        let tokenizer_entry = ctx
-            .components
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
-        let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
-            (Some(mm_components), Some(entry)) => {
-                multimodal::resolve_media_part_order(
-                    model_id,
-                    &*tokenizer,
-                    mm_components,
-                    &entry.id,
-                    &entry.source,
-                )
-                .await
-            }
-            _ => llm_multimodal::MediaPartOrder::MediaFirst,
-        };
-
-        // Resolve multimodal context once (see chat/preparation.rs for details).
-        let media_plan = multimodal::media_plan_messages(&request.messages);
-        let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
-            (None, None)
-        } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
-            let model_id = ctx.input.model_id.as_str();
-            let (tokenizer_id, tokenizer_source) = match tokenizer_entry {
-                Some(e) => (e.id, e.source),
-                None => {
-                    error!(
-                        function = "MessagePreparationStage::execute",
-                        model = %model_id,
-                        "Tokenizer entry not found for multimodal processing"
-                    );
-                    return Err(error::bad_request(
-                        "multimodal_config_missing",
-                        format!("Tokenizer not found for model: {model_id}"),
-                    ));
-                }
-            };
-
-            // The per-request media limits the model's workers advertise for
-            // their engine, which the plan is held to before any fetch.
-            let engine_limits =
-                multimodal::engine_item_limits(&ctx.components.worker_registry, model_id);
-            let placeholders = multimodal::prepare_placeholder_tokens(
-                &media_plan,
-                model_id,
-                &*tokenizer,
-                mm_components,
-                &tokenizer_id,
-                &tokenizer_source,
-                &engine_limits,
-            )
-            .await
-            .map_err(|e| {
-                error!(
-                    function = "MessagePreparationStage::execute",
-                    model = %model_id,
-                    error = %e,
-                    "Failed to resolve multimodal placeholder token"
-                );
-                invalid_multimodal_request(e)
-            })?;
-
-            (
-                Some(placeholders),
-                Some((
-                    mm_components,
-                    model_id,
-                    tokenizer_id,
-                    tokenizer_source,
-                    media_plan,
-                )),
-            )
-        } else {
-            error!(
-                function = "MessagePreparationStage::execute",
-                "Multimodal content detected but multimodal components not initialized"
-            );
-            return Err(error::bad_request(
-                "multimodal_not_supported",
-                "Multimodal content detected but multimodal processing is not available",
-            ));
-        };
+        let media = message_utils::resolve_messages_media(
+            &ctx.components,
+            model_id,
+            &*tokenizer,
+            &request.messages,
+        )
+        .await?;
+        let media_order = media.media_order;
 
         // Step 2: Process messages and apply chat template
         let (processed_messages, prompt_encoding) = match message_utils::process_messages(
             request,
             &*tokenizer,
             tools_for_template,
-            placeholder_tokens.as_ref(),
+            media.placeholders(),
             media_order,
         ) {
             Ok(msgs) => msgs,
@@ -206,12 +109,10 @@ impl MessagePreparationStage {
 
         let mut token_ids = encoding.token_ids().to_vec();
 
-        if let (Some(placeholders), Some((_, _, _, _, media_plan))) =
-            (placeholder_tokens.as_ref(), mm_context.as_ref())
-        {
+        if let Some(media) = media.media.as_ref() {
             multimodal::validate_rendered_media_anchors(
-                media_plan,
-                placeholders,
+                &media.plan,
+                &media.placeholders,
                 &*tokenizer,
                 &token_ids,
             )
@@ -229,17 +130,20 @@ impl MessagePreparationStage {
         // or keep the media references for a worker that processes them itself.
         let mut multimodal_intermediate = None;
         let mut multimodal_refs = None;
-        if let (
-            Some(placeholders),
-            Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)),
-        ) = (placeholder_tokens.as_ref(), mm_context)
+        if let Some(message_utils::MediaContext {
+            plan: media_plan,
+            placeholders,
+            components: mm_components,
+            tokenizer_id,
+            tokenizer_source,
+        }) = media.media
         {
             let processing = multimodal::resolve_mm_processing(
-                mm_components,
+                &mm_components,
                 &ctx.components.worker_registry,
                 model_id,
                 &media_plan,
-                placeholders,
+                &placeholders,
             )
             .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
             if processing == multimodal::MmProcessing::Worker {
@@ -255,7 +159,7 @@ impl MessagePreparationStage {
                     model_id,
                     &*tokenizer,
                     token_ids,
-                    mm_components,
+                    &mm_components,
                     &tokenizer_id,
                     &tokenizer_source,
                 )
@@ -382,7 +286,7 @@ impl MessagePreparationStage {
 mod tests {
     use axum::http::StatusCode;
 
-    use super::invalid_multimodal_request;
+    use crate::routers::grpc::utils::message_utils::invalid_multimodal_request;
 
     #[test]
     fn invalid_multimodal_input_maps_to_bad_request() {

@@ -107,14 +107,17 @@ pub(crate) async fn list_models_with(
     registry_models_response(registry, shape)
 }
 
-/// Answer `GET /v1/models/{id}` from the self-hosted inventory: the card
-/// whose id or alias is `model_id`, in the caller's API shape, or the same
-/// 404 an unknown model gets on every other route.
+/// Answer `GET /v1/models/{id}` from the self-hosted inventory: the card of
+/// the model `model_id` names (its id, or an alias the registry resolves),
+/// in the caller's API shape, or the same 404 an unknown model gets on every
+/// other route.
 pub fn retrieve_model(context: &AppContext, headers: &HeaderMap, model_id: &str) -> Response {
     retrieve_model_with(&context.worker_registry, headers, model_id)
 }
 
-/// [`retrieve_model`] over an explicit registry.
+/// [`retrieve_model`] over an explicit registry. The lookup is by the
+/// resolved canonical id alone: a canonical id that is also another card's
+/// alias names its own card, as it does on every other route.
 pub(crate) fn retrieve_model_with(
     registry: &WorkerRegistry,
     headers: &HeaderMap,
@@ -124,7 +127,7 @@ pub(crate) fn retrieve_model_with(
     let wanted = canonical.as_deref().unwrap_or(model_id);
     let card = self_hosted_cards(registry)
         .into_iter()
-        .find(|card| card.id == wanted || card.aliases.iter().any(|alias| alias == model_id));
+        .find(|card| card.id == wanted);
     match card {
         Some(card) => ModelShape::from_headers(headers).single(card),
         None => error::model_not_found(model_id),
@@ -443,5 +446,19 @@ mod tests {
 
         let unknown = retrieve_model_with(&registry, &headers, "nope");
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A canonical id that is also another card's alias names its own card:
+    /// the lookup goes by the resolved canonical id, never by a raw alias.
+    #[tokio::test]
+    async fn a_canonical_id_that_is_another_cards_alias_answers_its_own_card() {
+        let mut aliased = ModelCard::new("org/first");
+        aliased.aliases = vec!["org/second".to_owned()];
+        let registry = registry_with(vec![aliased, ModelCard::new("org/second")]);
+
+        let response = retrieve_model_with(&registry, &HeaderMap::new(), "org/second");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["id"], "org/second");
     }
 }

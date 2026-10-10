@@ -508,27 +508,51 @@ impl GrpcRouter {
         model_id: &str,
     ) -> Response {
         let model_id = self.resolve_canonical_model_id(model_id);
+        // A model nobody serves is the client's mistake (404), whatever a
+        // removed worker left in the tokenizer registry; a served model with
+        // no tokenizer is a gateway fault (500).
+        if !self.worker_registry.contains_model(&model_id) {
+            return error::model_not_found(&model_id);
+        }
         let Some(tokenizer) = self.shared_components.tokenizer_registry.get(&model_id) else {
-            // A model nobody serves is the client's mistake (404); a served
-            // model with no tokenizer is a gateway fault (500).
-            return if self.worker_registry.contains_model(&model_id) {
-                error::internal_error(
-                    "tokenizer_not_found",
-                    format!("Tokenizer not found for model: {model_id}"),
-                )
-            } else {
-                error::model_not_found(&model_id)
-            };
+            return error::internal_error(
+                "tokenizer_not_found",
+                format!("Tokenizer not found for model: {model_id}"),
+            );
         };
-        match message_utils::count_input_tokens(&body, tokenizer).await {
+        let tools = message_utils::template_tools(body.tools.as_deref(), body.tool_choice.as_ref());
+        let media = match message_utils::resolve_messages_media(
+            &self.shared_components,
+            &model_id,
+            &*tokenizer,
+            &body.messages,
+        )
+        .await
+        {
+            Ok(media) => media,
+            Err(refused) => return refused,
+        };
+        match message_utils::count_input_tokens(
+            &body,
+            tokenizer,
+            &tools,
+            media.placeholders(),
+            media.media_order,
+        )
+        .await
+        {
             Ok(input_tokens) => (
                 StatusCode::OK,
                 Json(CountMessageTokensResponse { input_tokens }),
             )
                 .into_response(),
-            Err(e) => {
+            Err(message_utils::CountError::Render(e)) => {
                 debug!(model = %model_id, error = %e, "count_tokens: the request does not render");
                 error::bad_request("process_messages_failed", e)
+            }
+            Err(message_utils::CountError::Encode(e)) => {
+                tracing::error!(model = %model_id, error = %e, "count_tokens: tokenization failed");
+                error::internal_error("tokenization_failed", format!("Tokenization failed: {e}"))
             }
         }
     }
@@ -991,6 +1015,32 @@ mod pd_tests {
 
         let response = router
             .route_messages_count_tokens(None, &tenant_meta, count_request("nope"), "nope")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+    }
+
+    /// A tokenizer a removed worker left in the registry does not make its
+    /// model served: the count is refused as an unknown model, like every
+    /// other route refuses it.
+    #[tokio::test]
+    async fn count_tokens_refuses_a_model_no_worker_serves_whatever_the_tokenizer_registry_holds() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("gone", "gone", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("gone"), "gone")
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
