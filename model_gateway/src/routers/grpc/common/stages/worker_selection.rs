@@ -150,15 +150,6 @@ impl WorkerSelectionStage {
         Some(Self::queue_timeout_refusal(ctx, waited, timeout))
     }
 
-    /// What is left of the bound for a request accepted at `accepted`: the
-    /// prefill admission wait of a PD or EPD request is held to it, so an
-    /// expired request leaves the prefill queue at the bound instead of
-    /// holding its place until a slot opens.
-    fn remaining_budget(&self, accepted: Option<Instant>) -> Option<Duration> {
-        let timeout = self.queue_timeout?;
-        Some(timeout.saturating_sub(accepted?.elapsed()))
-    }
-
     /// The 503 of a request that waited `waited`, past the queue timeout.
     fn queue_timeout_refusal(
         ctx: &RequestContext,
@@ -201,22 +192,17 @@ impl WorkerSelectionStage {
     where
         F: std::future::Future<Output = Result<T, Response>>,
     {
-        match (
-            self.remaining_budget(accepted),
-            self.queue_timeout,
-            accepted,
-        ) {
-            (Some(budget), Some(timeout), Some(accepted)) => {
-                match tokio::time::timeout(budget, admission).await {
-                    Ok(result) => result,
-                    Err(_) => Err(Self::queue_timeout_refusal(
-                        ctx,
-                        accepted.elapsed(),
-                        timeout,
-                    )),
-                }
-            }
-            _ => admission.await,
+        let (Some(timeout), Some(accepted)) = (self.queue_timeout, accepted) else {
+            return admission.await;
+        };
+        let budget = timeout.saturating_sub(accepted.elapsed());
+        match tokio::time::timeout(budget, admission).await {
+            Ok(result) => result,
+            Err(_) => Err(Self::queue_timeout_refusal(
+                ctx,
+                accepted.elapsed(),
+                timeout,
+            )),
         }
     }
 }
@@ -3055,7 +3041,7 @@ mod tests {
     /// admission is held to the remaining budget: it leaves the prefill queue
     /// at the bound, refused, before a slot opens, and holds no claim.
     #[tokio::test]
-    async fn the_bound_is_checked_again_after_the_prefill_admission_wait() {
+    async fn the_prefill_admission_wait_is_held_to_the_remaining_budget() {
         let registry = Arc::new(WorkerRegistry::new());
         let prefill = worker("grpc://prefill-bound:30000", WorkerType::Prefill);
         let decode = worker("grpc://decode-bound:30000", WorkerType::Decode);
