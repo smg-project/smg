@@ -80,6 +80,12 @@ impl EngineProtocol for VllmProtocol {
             .map_or(0, |ids| ids.len() as u64)
     }
 
+    fn reported_every_step(_request: &Self::Request) -> bool {
+        // The engine core reports every request it stepped on every step;
+        // streaming is the frontend's affair and not on the request.
+        true
+    }
+
     fn request_id(request: &Self::Request) -> &str {
         &request.request_id
     }

@@ -28,7 +28,10 @@
 //!   answering health looks exactly like this. The servicer's pushed load
 //!   record carries the engine's own silence as well
 //!   (`EngineLoad.engine_silence_ms`: how long the engine has produced
-//!   nothing while the servicer holds requests on it); past the bound that
+//!   nothing while the servicer holds requests on it that the engine
+//!   reports every step; a generation the engine reports at intervals, one
+//!   that does not stream or one streamed every so many tokens, is quiet
+//!   while healthy and counts none); past the bound that
 //!   is the same veto without a pile, so a frozen engine with one request on
 //!   it, or with requests from another gateway, leaves routing within the
 //!   bound instead of once a pile forms. Which bound depends on the wire:

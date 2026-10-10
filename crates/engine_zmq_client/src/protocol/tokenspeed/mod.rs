@@ -55,6 +55,19 @@ impl EngineProtocol for TokenSpeedProtocol {
         request.input_ids.len() as u64
     }
 
+    fn reported_every_step(request: &Self::Request) -> bool {
+        // A request that does not stream is reported at its end (and at the
+        // scheduler's forced interval), a streaming one every
+        // `stream_interval` tokens (its own, else the server's, 1 unless
+        // raised); only a streaming request at an interval of one is
+        // reported every step.
+        request.stream
+            && request
+                .sampling_params
+                .stream_interval
+                .is_none_or(|interval| interval <= 1)
+    }
+
     fn request_id(request: &Self::Request) -> &str {
         &request.rid
     }

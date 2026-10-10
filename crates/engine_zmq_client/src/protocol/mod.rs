@@ -126,6 +126,14 @@ pub trait EngineProtocol: Send + Sync + 'static {
     /// The prompt tokens of an add-request: what the engine has to prefill
     /// before the request's first output.
     fn prompt_tokens(request: &Self::Request) -> u64;
+    /// Whether the engine reports this request on every scheduler step that
+    /// decodes it, so an engine silent with such a request in flight is a
+    /// scheduler that is not stepping: the connector counts the silence it
+    /// reports over these requests only. A request the engine reports at
+    /// intervals (one that does not stream, whose output comes at its end or
+    /// every forced interval; one streamed every so many tokens) is quiet
+    /// while healthy, and is left out of that count.
+    fn reported_every_step(request: &Self::Request) -> bool;
     /// SMG-pinned DP rank, if any (else the sole engine is used).
     fn data_parallel_rank(request: &Self::Request) -> Option<u32>;
     /// Reject fields this client cannot represent on the wire.

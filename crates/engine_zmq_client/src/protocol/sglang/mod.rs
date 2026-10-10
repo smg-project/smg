@@ -63,6 +63,26 @@ impl EngineProtocol for SglangProtocol {
         }
     }
 
+    fn reported_every_step(request: &Self::Request) -> bool {
+        match request {
+            // The scheduler's `stream_output_generation` sends a request
+            // that does not stream every `DEFAULT_FORCE_STREAM_INTERVAL`
+            // (50) decoded tokens and at its end, and a streaming one every
+            // `stream_interval` tokens: the request's own, else the server's
+            // `--stream-interval` (1 unless raised). Only a streaming request
+            // at an interval of one is reported every step.
+            SglangRequest::Generate(request) => {
+                request.stream
+                    && request
+                        .sampling_params
+                        .stream_interval
+                        .is_none_or(|interval| interval <= 1)
+            }
+            // One forward, one output: nothing to report in between.
+            SglangRequest::Embed(_) => true,
+        }
+    }
+
     fn request_id(request: &Self::Request) -> &str {
         request.rid()
     }
