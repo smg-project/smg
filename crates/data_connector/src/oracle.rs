@@ -1314,7 +1314,11 @@ impl OracleResponseStorage {
 /// above 4,000 bytes (the JSON of `input` or `raw_response`) is accepted
 /// for a CLOB column as it is in an INSERT, while the same bind in a
 /// subquery's select list fails with ORA-01461. Named binds, so the id's
-/// two occurrences are bound once.
+/// two occurrences are bound once. The MERGE needs no unique index on the
+/// id: its one-row source matches the target rows through the ON clause
+/// (every row under the id is updated, a row is inserted when none
+/// matches), so a configured table that pre-exists without the primary key
+/// the store would create works too.
 fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
     let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
     let id_col = columns.first().copied().unwrap_or("id");

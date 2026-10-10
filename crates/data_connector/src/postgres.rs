@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde_json::Value;
-use tokio_postgres::{NoTls, Row};
+use tokio_postgres::{IsolationLevel, NoTls, Row};
 
 use crate::{
     common::{build_response_select_base, extra_column_defs, resolve_extra_column_values},
@@ -1004,32 +1004,48 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     ))
 }
 
-/// The statement that stores a response: an insert that becomes an update of
-/// every other column when a row with the same id exists (the first column
-/// is the id, the table's primary key), so a record written as `queued`
-/// is replaced by its terminal object under the one id.
-fn store_response_sql(table: &str, col_names: &[&str]) -> String {
+/// The statements that store a response under its id (the first column), in
+/// the order they run inside one transaction: an UPDATE of every column of
+/// the rows under the id, then, when no row moved, the INSERT. A record
+/// written as `queued` is replaced by its terminal object under the one id
+/// this way on any table. `INSERT ... ON CONFLICT (id)` would need a unique
+/// index on the mapped id column, which only the table the store creates
+/// itself is known to have; a configured table that pre-exists without one
+/// would fail every store. The id is assigned to itself so the SET list is
+/// never empty and both statements take the same parameters.
+fn store_response_sql(table: &str, col_names: &[&str]) -> (String, String) {
     let placeholders: String = (1..=col_names.len())
         .map(|i| format!("${i}"))
         .collect::<Vec<_>>()
         .join(", ");
     let id_col = col_names.first().copied().unwrap_or("id");
-    let updates: Vec<String> = col_names
+    let assignments: Vec<String> = col_names
         .iter()
-        .skip(1)
-        .map(|col| format!("{col} = EXCLUDED.{col}"))
+        .enumerate()
+        .map(|(i, col)| format!("{col} = ${}", i + 1))
         .collect();
-    if updates.is_empty() {
-        return format!(
-            "INSERT INTO {table} ({}) VALUES ({placeholders}) ON CONFLICT ({id_col}) DO NOTHING",
-            col_names.join(", ")
-        );
-    }
-    format!(
-        "INSERT INTO {table} ({}) VALUES ({placeholders}) ON CONFLICT ({id_col}) DO UPDATE SET {}",
-        col_names.join(", "),
-        updates.join(", ")
-    )
+    let update = format!(
+        "UPDATE {table} SET {} WHERE {id_col} = $1",
+        assignments.join(", ")
+    );
+    let insert = format!(
+        "INSERT INTO {table} ({}) VALUES ({placeholders})",
+        col_names.join(", ")
+    );
+    (update, insert)
+}
+
+/// The key of the transaction-scoped advisory lock a store of `id` holds
+/// (FNV-1a over the id's bytes): stores of one id serialize across every
+/// gateway sharing the database, so two first stores of an id cannot both
+/// insert, with or without a unique index on the id column.
+fn store_lock_key(id: &str) -> i64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let hash = id.bytes().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    });
+    hash as i64
 }
 
 #[async_trait]
@@ -1094,19 +1110,47 @@ impl ResponseStorage for PostgresResponseStorage {
             params.push(val);
         }
 
-        let sql = store_response_sql(&table, &col_names);
+        let (update, insert) = store_response_sql(&table, &col_names);
+        let lock_key = store_lock_key(&response_id.0);
 
-        let client = self
+        let mut client = self
             .store
             .pool
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        let insert_count = client
-            .execute(&sql, &params)
+        // One READ COMMITTED transaction: the UPDATE takes its snapshot once
+        // the lock is held, so it sees the row of every store of this id
+        // that finished before it, and the INSERT runs only when there is
+        // no such row.
+        let tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        tracing::debug!(rows_affected = insert_count, "Response stored in Postgres");
+        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&lock_key])
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let updated = tx
+            .execute(&update, &params)
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let inserted = if updated == 0 {
+            tx.execute(&insert, &params)
+                .await
+                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?
+        } else {
+            0
+        };
+        tx.commit()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        tracing::debug!(
+            rows_updated = updated,
+            rows_inserted = inserted,
+            "Response stored in Postgres"
+        );
         Ok(response_id)
     }
 
@@ -1293,17 +1337,35 @@ mod tests {
         assert!(PostgresConversationStorage::parse_metadata(Some(json!("not an object"))).is_err());
     }
     #[test]
-    fn store_response_sql_replaces_an_existing_row_by_id() {
-        let sql = store_response_sql("responses", &["id", "input", "raw_response"]);
+    fn store_response_sql_updates_the_rows_under_the_id_and_inserts_when_none_moved() {
+        let (update, insert) = store_response_sql("responses", &["id", "input", "raw_response"]);
         assert_eq!(
-            sql,
-            "INSERT INTO responses (id, input, raw_response) VALUES ($1, $2, $3) \
-             ON CONFLICT (id) DO UPDATE SET input = EXCLUDED.input, raw_response = EXCLUDED.raw_response"
+            update,
+            "UPDATE responses SET id = $1, input = $2, raw_response = $3 WHERE id = $1"
         );
-        let sql = store_response_sql("r", &["id"]);
         assert_eq!(
-            sql,
-            "INSERT INTO r (id) VALUES ($1) ON CONFLICT (id) DO NOTHING"
+            insert,
+            "INSERT INTO responses (id, input, raw_response) VALUES ($1, $2, $3)"
         );
+        // Neither statement needs a unique index on the id column (a
+        // configured table that pre-exists may have none).
+        assert!(!update.contains("ON CONFLICT") && !insert.contains("ON CONFLICT"));
+        // The mapped id is the first column; the SET list is never empty.
+        let (update, insert) = store_response_sql("r", &["response_key"]);
+        assert_eq!(
+            update,
+            "UPDATE r SET response_key = $1 WHERE response_key = $1"
+        );
+        assert_eq!(insert, "INSERT INTO r (response_key) VALUES ($1)");
+    }
+
+    #[test]
+    fn store_lock_key_is_stable_and_tells_ids_apart() {
+        assert_eq!(store_lock_key("resp_1"), store_lock_key("resp_1"));
+        assert_ne!(store_lock_key("resp_1"), store_lock_key("resp_2"));
+        // Pinned FNV-1a 64 values: gateways of different builds share one
+        // database, so the key of an id must never change.
+        assert_eq!(store_lock_key(""), 0xcbf2_9ce4_8422_2325_u64 as i64);
+        assert_eq!(store_lock_key("a"), 0xaf63_dc4c_8601_ec8c_u64 as i64);
     }
 }

@@ -650,6 +650,7 @@ pub fn is_response_event(event_type: &str) -> bool {
     matches!(
         event_type,
         ResponseEvent::CREATED
+            | ResponseEvent::QUEUED
             | ResponseEvent::IN_PROGRESS
             | ResponseEvent::COMPLETED
             | ResponseEvent::INCOMPLETE
@@ -677,6 +678,7 @@ mod tests {
     fn every_lifecycle_variant_round_trips_through_the_predicate() {
         for event in [
             ResponseEvent::Created,
+            ResponseEvent::Queued,
             ResponseEvent::InProgress,
             ResponseEvent::Completed,
             ResponseEvent::Incomplete,
