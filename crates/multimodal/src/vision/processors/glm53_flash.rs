@@ -23,7 +23,12 @@ const MERGE_SIZE: usize = 2;
 const TEMPORAL_PATCH_SIZE: usize = 2;
 const MIN_IMAGE_TOKENS: usize = 16;
 const MAX_IMAGE_TOKENS: usize = 8000;
+/// The checkpoint's own video budget, in tokens.
 const MAX_VIDEO_TOKENS: usize = 240_000;
+/// The serving engine caps a clip at this many vision tokens (the
+/// checkpoint's own budget would starve its KV cache at startup profiling);
+/// images keep the checkpoint's budget.
+const VIDEO_TOKEN_CAP: usize = 30_000;
 
 #[derive(Clone, Copy)]
 struct Params {
@@ -140,11 +145,17 @@ impl Params {
                 Ok,
             )
         };
-        // Video budgets read video-named token keys only: an image-scale
-        // `max_image_tokens` must not silently become a clip's volume cap
-        // when the gateway falls back to the image config for video.
+        // Video budgets read video-named token keys first; without them a
+        // video processor config is budgeted the way the engine's own server
+        // budgets it, and an image config (the gateway's fallback for a video
+        // when there is none) keeps the checkpoint default: its image-scale
+        // `max_image_tokens` must not silently become a clip's volume cap.
         let (min_key, max_key, max_fallback) = if video {
-            ("min_video_tokens", "max_video_tokens", MAX_VIDEO_TOKENS)
+            (
+                "min_video_tokens",
+                "max_video_tokens",
+                video_token_budget(config)?,
+            )
         } else {
             ("min_image_tokens", "max_image_tokens", MAX_IMAGE_TOKENS)
         };
@@ -245,6 +256,21 @@ impl Params {
             ),
         })
     }
+}
+
+/// The clip budget the serving engine's own server applies to a video
+/// processor config (one naming its `video_processor_type`): the config's
+/// `max_image_tokens` under the serving cap, the checkpoint default when the
+/// key is absent. Any other config is not a video processor's and keeps the
+/// checkpoint default.
+fn video_token_budget(config: &PreProcessorConfig) -> Result<usize, TransformError> {
+    if !config.extra.contains_key("video_processor_type") {
+        return Ok(MAX_VIDEO_TOKENS);
+    }
+    if !config.extra.contains_key("max_image_tokens") {
+        return Ok(MAX_VIDEO_TOKENS);
+    }
+    Ok(extra_usize(config, "max_image_tokens", MAX_VIDEO_TOKENS)?.min(VIDEO_TOKEN_CAP))
 }
 
 fn pixel_lut(
@@ -606,6 +632,44 @@ mod tests {
             ModelSpecificValue::IntTensor { data, .. } => data.clone(),
             value => panic!("unexpected grid value: {value:?}"),
         }
+    }
+
+    /// The video processor config this family's checkpoint ships, the keys
+    /// the engine's own processor reads.
+    fn video_config() -> PreProcessorConfig {
+        PreProcessorConfig::from_json(
+            r#"{"do_rescale":true,"video_processor_type":"Glm5NextVideoProcessor",
+            "patch_expand_factor":1,"merge_size":2,"image_mean":[0.48145466,0.4578275,0.40821073],
+            "image_std":[0.26862954,0.26130258,0.27577711],"temporal_patch_size":2,"patch_size":14,
+            "min_image_tokens":16,"max_image_tokens":240000,"fps":2}"#,
+        )
+        .unwrap()
+    }
+
+    /// A clip is budgeted the way the engine's own server budgets it: the
+    /// checkpoint's 240,000-token video budget under the 30,000-token serving
+    /// cap, which fits 32 frames of 3416x2060 on a 952x1540 canvas (68x110
+    /// patches, 16 x 34 x 55 = 29,920 tokens), the engine's own numbers for
+    /// such a clip. An image config in the video's place keeps the checkpoint
+    /// default rather than its image-scale budget, and an explicit
+    /// `max_video_tokens` stands.
+    #[test]
+    fn video_budget_follows_the_engines_serving_cap() {
+        let ppt = 2 * 28 * 28;
+        let params = Params::from_config(&video_config(), true).unwrap();
+        assert_eq!(params.max_pixels, VIDEO_TOKEN_CAP * ppt);
+        assert_eq!(params.min_pixels, 16 * ppt);
+        assert_eq!(params.geometry(32, 2060, 3416).unwrap().target, (952, 1540));
+
+        let image_fallback = Params::from_config(&config(MAX_IMAGE_TOKENS), true).unwrap();
+        assert_eq!(image_fallback.max_pixels, MAX_VIDEO_TOKENS * ppt);
+
+        let mut explicit = video_config();
+        explicit
+            .extra
+            .insert("max_video_tokens".into(), serde_json::json!(50_000));
+        let explicit = Params::from_config(&explicit, true).unwrap();
+        assert_eq!(explicit.max_pixels, 50_000 * ppt);
     }
 
     #[test]

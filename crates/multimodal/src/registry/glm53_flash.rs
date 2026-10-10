@@ -4,16 +4,29 @@ use serde_json::{json, Value};
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
+    media::FrameSampling,
     registry::{
-        MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+        MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
+        RegistryResult,
     },
-    types::{FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId},
+    types::{
+        FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId, VideoSamplingInfo,
+    },
+    vision::PreProcessorConfig,
 };
 
 const IMAGE: &str = "<|image|>";
 const VIDEO: &str = "<|video|>";
 const BEGIN: &str = "<|begin_of_image|>";
 const END: &str = "<|end_of_image|>";
+/// The serving engine's default video loader keeps at most this many frames
+/// of a clip, spread from the first to the last, and its processor takes
+/// them as they come; a clip costs on this path what it costs on the
+/// engine's own server only when the frames are the same.
+const LOADER_FRAMES: usize = 32;
+/// Frames per temporal group: the engine's timestamps take every second
+/// sampled frame, whatever the configured temporal patch size.
+const FRAMES_PER_GROUP: usize = 2;
 
 pub(super) struct Glm53FlashSpec;
 
@@ -35,6 +48,100 @@ impl Glm53FlashSpec {
             }
         })?;
         Ok(ids.into_iter().map(|id| id as TokenId).collect())
+    }
+
+    /// The timestamp the engine's own server writes before each temporal
+    /// group of a clip its loader sampled: the whole second of the group's
+    /// first frame, the groups being consecutive pairs of the distinct
+    /// sampled frames with an odd last frame repeated. `None` when the
+    /// decoder reported no usable sampling.
+    fn group_seconds(sampling: &VideoSamplingInfo) -> Option<Vec<f64>> {
+        if !(sampling.source_fps.is_finite() && sampling.source_fps > 0.0) {
+            return None;
+        }
+        let mut distinct: Vec<usize> = Vec::with_capacity(sampling.frame_indices.len());
+        for &index in &sampling.frame_indices {
+            if !distinct.contains(&index) {
+                distinct.push(index);
+            }
+        }
+        let last = *distinct.last()?;
+        if !distinct.len().is_multiple_of(FRAMES_PER_GROUP) {
+            distinct.push(last);
+        }
+        Some(
+            distinct
+                .iter()
+                .step_by(FRAMES_PER_GROUP)
+                .map(|&index| (index as f64 / sampling.source_fps).floor())
+                .collect(),
+        )
+    }
+
+    /// One replacement per clip: `<|begin_of_image|>`, the group's image
+    /// tokens, `<|end_of_image|>` and its timestamp, for every temporal
+    /// group. A group's timestamp comes from `seconds` (the sampled frames'
+    /// own seconds) when the clip has them, else from the clip's seconds per
+    /// grid, as a clip sampled at the processor's own rate is stamped.
+    fn video_replacements(
+        metadata: &ModelMetadata,
+        input: &PreprocessedEncoderInputs,
+        seconds: &[Option<Vec<f64>>],
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        let grids = Self::video_grid_t(input)?;
+        if grids.len() != input.feature_token_counts.len() {
+            return Err(ModelRegistryError::InvalidPreprocessedField {
+                field: "video_grid_thw item count".to_string(),
+            });
+        }
+        let image_id = Self::image_id(metadata)?;
+        let begin = metadata.token_id(BEGIN)?;
+        let end = metadata.token_id(END)?;
+        // The paired vision processor always emits this; a missing or
+        // wrongly-typed value means the pipeline is broken, and defaulting
+        // would silently caption every frame with wrong timestamps while
+        // the grid field next to it fails loudly.
+        let per_grid_seconds = match input.model_specific.get("video_second_per_grid") {
+            Some(ModelSpecificValue::Tensor { data, .. }) if !data.is_empty() => data[0],
+            _ => {
+                return Err(ModelRegistryError::InvalidPreprocessedField {
+                    field: "video_second_per_grid".to_string(),
+                })
+            }
+        };
+
+        input
+            .feature_token_counts
+            .iter()
+            .zip(grids)
+            .enumerate()
+            .map(|(item, (&count, grid_t))| {
+                if grid_t == 0 || !count.is_multiple_of(grid_t) {
+                    return Err(ModelRegistryError::InvalidPreprocessedField {
+                        field: "video_grid_thw temporal token layout".to_string(),
+                    });
+                }
+                let per_grid = count / grid_t;
+                let sampled = seconds.get(item).and_then(|seconds| seconds.as_deref());
+                let mut tokens = Vec::new();
+                let mut ranges = Vec::with_capacity(grid_t);
+                for index in 0..grid_t {
+                    tokens.push(begin);
+                    ranges.push(PlaceholderRange {
+                        offset: tokens.len(),
+                        length: per_grid,
+                    });
+                    tokens.extend(std::iter::repeat_n(image_id, per_grid));
+                    tokens.push(end);
+                    let second = sampled
+                        .and_then(|seconds| seconds.get(index).copied())
+                        .unwrap_or_else(|| f64::from(index as f32 * per_grid_seconds));
+                    tokens.extend(Self::encode(metadata, &format!("{second:.1} seconds"))?);
+                }
+                Ok(PromptReplacement::sequence(Modality::Video, VIDEO, tokens)
+                    .with_feature_ranges(ranges))
+            })
+            .collect()
     }
 
     fn video_grid_t(input: &PreprocessedEncoderInputs) -> RegistryResult<Vec<usize>> {
@@ -173,59 +280,34 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         if modality != Modality::Video {
             return Err(Self::unsupported(modality));
         }
+        Self::video_replacements(metadata, input, &[])
+    }
 
-        let grids = Self::video_grid_t(input)?;
-        if grids.len() != input.feature_token_counts.len() {
-            return Err(ModelRegistryError::InvalidPreprocessedField {
-                field: "video_grid_thw item count".to_string(),
-            });
+    fn prompt_replacements_with_media(
+        &self,
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+        modality: Modality,
+        media: &[MediaItemInfo],
+        _preprocessor_config: &PreProcessorConfig,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        if modality != Modality::Video {
+            return self.prompt_replacements_for(metadata, preprocessed, modality);
         }
-        let image_id = Self::image_id(metadata)?;
-        let begin = metadata.token_id(BEGIN)?;
-        let end = metadata.token_id(END)?;
-        // The paired vision processor always emits this; a missing or
-        // wrongly-typed value means the pipeline is broken, and defaulting
-        // would silently caption every frame with wrong timestamps while
-        // the grid field next to it fails loudly.
-        let seconds = match input.model_specific.get("video_second_per_grid") {
-            Some(ModelSpecificValue::Tensor { data, .. }) if !data.is_empty() => data[0],
-            _ => {
-                return Err(ModelRegistryError::InvalidPreprocessedField {
-                    field: "video_second_per_grid".to_string(),
-                })
-            }
-        };
-
-        input
-            .feature_token_counts
+        let seconds: Vec<Option<Vec<f64>>> = media
             .iter()
-            .zip(grids)
-            .map(|(&count, grid_t)| {
-                if grid_t == 0 || !count.is_multiple_of(grid_t) {
-                    return Err(ModelRegistryError::InvalidPreprocessedField {
-                        field: "video_grid_thw temporal token layout".to_string(),
-                    });
-                }
-                let per_grid = count / grid_t;
-                let mut tokens = Vec::new();
-                let mut ranges = Vec::with_capacity(grid_t);
-                for index in 0..grid_t {
-                    tokens.push(begin);
-                    ranges.push(PlaceholderRange {
-                        offset: tokens.len(),
-                        length: per_grid,
-                    });
-                    tokens.extend(std::iter::repeat_n(image_id, per_grid));
-                    tokens.push(end);
-                    tokens.extend(Self::encode(
-                        metadata,
-                        &format!("{:.1} seconds", index as f32 * seconds),
-                    )?);
-                }
-                Ok(PromptReplacement::sequence(Modality::Video, VIDEO, tokens)
-                    .with_feature_ranges(ranges))
-            })
-            .collect()
+            .map(|item| item.video_sampling.as_ref().and_then(Self::group_seconds))
+            .collect();
+        Self::video_replacements(metadata, preprocessed, &seconds)
+    }
+
+    /// The engine's own server takes a clip from its default video loader,
+    /// which keeps at most `LOADER_FRAMES` frames spread from the first to
+    /// the last; the processor's own rate-based sampling never runs there.
+    fn video_frame_sampling(&self) -> FrameSampling {
+        FrameSampling::UpTo {
+            max_frames: LOADER_FRAMES,
+        }
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -260,6 +342,90 @@ mod tests {
     fn tokenizer() -> TestTokenizer {
         TestTokenizer::new(&[(IMAGE, IMAGE_ID), (BEGIN, BEGIN_ID), (END, END_ID)])
             .with_byte_encoder(1000)
+    }
+
+    /// A clip is sampled the way the engine's own loader samples it, and each
+    /// temporal group is stamped with the whole second of its first sampled
+    /// frame, as the engine's own server stamps a loader-sampled clip; a clip
+    /// whose decoder reported no sampling keeps the per-grid stamps.
+    #[test]
+    fn video_sampling_and_timestamps_follow_the_engines_loader() {
+        let tokenizer = tokenizer();
+        let config = json!({"model_type":"glm53_flash", "image_token_id":IMAGE_ID});
+        let metadata = ModelMetadata {
+            model_id: "zai-org/GLM-5.3-Flash",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).unwrap();
+        assert_eq!(
+            spec.video_frame_sampling(),
+            FrameSampling::UpTo {
+                max_frames: LOADER_FRAMES
+            }
+        );
+
+        // Four temporal groups of two tokens each, from eight frames the
+        // loader picked at 30 fps: the groups start at frames 0, 17, 35, 53.
+        let mut input = test_preprocessed_with_tokens(&[], &[8]);
+        input.model_specific.insert(
+            "video_grid_thw".into(),
+            ModelSpecificValue::int_2d(vec![4, 2, 4], 1, 3),
+        );
+        input.model_specific.insert(
+            "video_second_per_grid".into(),
+            ModelSpecificValue::Tensor {
+                data: vec![1.0],
+                shape: vec![1],
+            },
+        );
+        let media = [MediaItemInfo {
+            video_sampling: Some(VideoSamplingInfo {
+                source_fps: 30.0,
+                frame_indices: vec![0, 8, 17, 26, 35, 44, 53, 62],
+            }),
+        }];
+        let group = |second: &str| -> Vec<TokenId> {
+            [BEGIN_ID, IMAGE_ID, IMAGE_ID, END_ID]
+                .into_iter()
+                .map(|id| id as TokenId)
+                .chain(Glm53FlashSpec::encode(&metadata, &format!("{second} seconds")).unwrap())
+                .collect()
+        };
+        let stamped = spec
+            .prompt_replacements_with_media(
+                &metadata,
+                &input,
+                Modality::Video,
+                &media,
+                &PreProcessorConfig::default(),
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let expected: Vec<TokenId> = ["0.0", "0.0", "1.0", "1.0"]
+            .iter()
+            .flat_map(|second| group(second))
+            .collect();
+        assert_eq!(stamped.tokens, expected);
+
+        let unsampled = spec
+            .prompt_replacements_with_media(
+                &metadata,
+                &input,
+                Modality::Video,
+                &[MediaItemInfo::default()],
+                &PreProcessorConfig::default(),
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let expected: Vec<TokenId> = ["0.0", "1.0", "2.0", "3.0"]
+            .iter()
+            .flat_map(|second| group(second))
+            .collect();
+        assert_eq!(unsampled.tokens, expected);
     }
 
     #[test]
