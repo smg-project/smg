@@ -21,6 +21,7 @@ runs the recorder, and `vendor_probe/**` feeds the `agentic` change family in
 vendor_probe/
   probes/openai_responses.py     # curated tier: ~225 probes, plain data
   probes/anthropic_messages.py   # curated tier: ~163 probes, plain data
+  probes/openai_chat_completions.py  # curated tier: ~134 probes (Chat Completions)
   genmatrix.py                   # generated tier: ~6.5K OpenAI / ~5.1K Anthropic
   runner.py                      # async httpx runner + provider adapters
   compat_diff.py                 # structural differ (+ --baseline gate mode)
@@ -106,12 +107,32 @@ The PR-triggered workflow run stays on the curated tier; `workflow_dispatch`
 defaults to `tier=all` at concurrency 24 (`tier`, `concurrency`, `budget`
 inputs).
 
+## Chat Completions tier
+
+`probes/openai_chat_completions.py` covers the Chat Completions surface with
+the same conventions (provider `openai-chat`, replay target `smg-openai-chat`,
+no generated tier yet): plain / system / developer / multi-turn / content
+parts, streaming with and without `stream_options.include_usage` (n, stop,
+max-token cuts, tools, logprobs, json_schema), the classic sampling parameters
+(temperature, top_p, seed, n, stop, penalties, logit_bias, logprobs), tools
+(auto / required / named / none, parallel on and off, strict, `$defs`,
+scripted tool-result round trips that do not depend on the model calling a
+tool, the legacy `functions` surface), structured outputs, images by data URL
+and URL, and 55 error probes (bad JSON, unknown fields, every numeric bound,
+tool/tool_choice/tool-message pairing mistakes, response_format mistakes,
+auth). Chat Completions streams carry no `event:` line, so the fingerprint
+names each chunk by what it carries (`delta.role`, `delta.content`,
+`delta.tool_calls`, `...finish:<reason>`, `usage`, `[DONE]`); the differ
+treats the content-bound kinds and the stop/length finish classes as
+mock-limited, like the other families.
+
 ## Dual-target replay (SMG diff)
 
 ```bash
 export SMG_BASE_URL=http://localhost:8080 SMG_API_KEY=...
 python -m vendor_probe.runner --provider smg-openai    --out results/smg-openai
 python -m vendor_probe.runner --provider smg-anthropic --out results/smg-anthropic
+python -m vendor_probe.runner --provider smg-openai-chat --out results/smg-openai-chat
 ```
 
 The `smg-*` adapters reuse the same probe matrices with SMG's base_url/auth
@@ -222,11 +243,12 @@ python -m vendor_probe.baseline \
 
 ### The 2026-10-09 baselines
 
-Recorded by the `pull_request` run of the Vendor Probe workflow on the PR that
-revived this harness (curated tier only: 225 + 163 probes, run 38001344395;
-`gpt-5-nano-2025-08-07` / `gpt-4.1-nano-2025-04-14` and
-`claude-haiku-4-5-20251001`). Two properties of that recording to keep in mind
-when reading a diff against it:
+Recorded by the `pull_request` runs of the Vendor Probe workflow on the PRs
+that revived this harness: first run 38001344395 (Responses + Messages), then
+run 38004101229, which this directory holds (curated tiers only: 225 Responses
++ 163 Messages + 134 Chat Completions probes; `gpt-5-nano-2025-08-07` /
+`gpt-4.1-nano-2025-04-14` and `claude-haiku-4-5-20251001`; ~0.06 USD). Two
+properties of that recording to keep in mind when reading a diff against it:
 
 - The OpenAI organisation behind the CI key has Zero Data Retention: every
   probe that stores a response or reads one back (`previous_response_id`,
@@ -235,13 +257,16 @@ when reading a diff against it:
   behaviour. A gateway that stores (`--history-backend memory`) answers 200
   there; those clusters are annotated in `known_divergences.jsonl`, not
   divergences.
-- Both vendors refused the probes' image inputs (the 1x1 PNG, the wikimedia
-  URL), so the image probes carry the vendors' `400` rather than a 200.
+- Both vendors fail to fetch the probes' image URL, so the image-URL probes
+  carry the vendors' `400`; the base64 image probes are 200 since the 1x1 PNG
+  fixture became a valid PNG (the first run still had the truncated one).
 
 `known_divergences.jsonl` for this date was regenerated with
-`--write-allowlist` from a replay against a gateway in front of a real engine
-(gRPC worker path); each entry's `note` names the tracking issue or the
-recording artefact it comes from. Compared with the 2026-08-21 baselines the
+`--write-allowlist` from a replay of all three families against a gateway in
+front of a real, text-only engine (gRPC worker path); each entry's `note`
+names the tracking issue, the recording artefact or the model-dependent
+behaviour it comes from (clusters whose verdict rests on one chat template's
+refusal are marked as such). Compared with the 2026-08-21 baselines the
 vendors changed field inventories only (OpenAI added `access_programs` and
 `billing`; Anthropic added `container`, `diagnostics`, `stop_details`,
 `usage.cache_creation`, `usage.inference_geo`, `usage.service_tier` and richer

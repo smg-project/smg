@@ -44,7 +44,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vendor_probe import compat_diff, genmatrix, runner  # noqa: E402
-from vendor_probe.probes import anthropic_messages, openai_responses  # noqa: E402
+from vendor_probe.probes import (  # noqa: E402
+    anthropic_messages,
+    openai_chat_completions,
+    openai_responses,
+)
 
 BASELINES_ROOT = REPO_ROOT / "vendor_probe" / "baselines"
 ALLOWLIST_NAME = "known_divergences.jsonl"
@@ -101,10 +105,19 @@ def is_full_run() -> bool:
     return os.environ.get(FULL_ENV, "").lower() in ("1", "true", "yes")
 
 
+_CURATED = {
+    "openai": openai_responses.PROBES,
+    "anthropic": anthropic_messages.PROBES,
+    "openai-chat": openai_chat_completions.PROBES,
+}
+
+
 @functools.cache
 def full_matrix(provider: str) -> tuple:
-    curated = openai_responses.PROBES if provider == "openai" else anthropic_messages.PROBES
-    return tuple(list(curated) + genmatrix.generate(provider, budget=0))
+    curated = list(_CURATED[provider])
+    if provider in ("openai", "anthropic"):  # the generated tier covers these two families
+        curated += genmatrix.generate(provider, budget=0)
+    return tuple(curated)
 
 
 def representatives(member_ids, limit: int = REPRESENTATIVES_PER_CLUSTER) -> list:

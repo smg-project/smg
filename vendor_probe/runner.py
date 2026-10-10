@@ -10,6 +10,7 @@ later diff tool can audit SMG's compatibility.
 Usage:
   python -m vendor_probe.runner --provider openai   --out results/openai
   python -m vendor_probe.runner --provider anthropic --out results/anthropic
+  python -m vendor_probe.runner --provider openai-chat --out results/openai-chat
   python -m vendor_probe.runner --provider openai --dry-run    # no network
 
 Env (defaults are cheap):
@@ -20,7 +21,8 @@ Env (defaults are cheap):
   ANTHROPIC_API_KEY, ANTHROPIC_MODEL=claude-haiku-4-5,
   ANTHROPIC_VERSION=2023-06-01, ANTH_PROBE_EXPENSIVE=1 (opt-in cost),
   ANTHROPIC_BASE_URL=https://api.anthropic.com
-  SMG_BASE_URL, SMG_API_KEY (for smg-openai / smg-anthropic replay targets)
+  SMG_BASE_URL, SMG_API_KEY (for smg-openai / smg-anthropic / smg-openai-chat
+  replay targets)
 """
 
 from __future__ import annotations
@@ -45,10 +47,10 @@ except ImportError:  # pragma: no cover - dry-run works without httpx
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from vendor_probe import genmatrix
-    from vendor_probe.probes import anthropic_messages, openai_responses
+    from vendor_probe.probes import anthropic_messages, openai_chat_completions, openai_responses
 else:
     from . import genmatrix
-    from .probes import anthropic_messages, openai_responses
+    from .probes import anthropic_messages, openai_chat_completions, openai_responses
 
 # --- response header allowlist ----------------------------------------------
 _HEADER_EXACT = {
@@ -91,6 +93,9 @@ class Adapter:
     optional: dict  # sentinel -> value or None (None => skip probe)
     probes: list
     extra_version_header: dict = field(default_factory=dict)
+    # protocol family: "openai" (Responses), "anthropic" (Messages), "openai-chat"
+    # (Chat Completions); drives SSE naming and the generated tier
+    family: str = "openai"
 
     def all_sentinels(self):
         d = dict(self.sentinels)
@@ -98,9 +103,10 @@ class Adapter:
         return d
 
 
-def _openai_adapter(base_env, key, model, model_classic):
+def _openai_adapter(base_env, key, model, model_classic, probes=None, family="openai"):
     return Adapter(
         name="openai",
+        family=family,
         base_url=os.environ.get(base_env, "https://api.openai.com").rstrip("/"),
         auth_headers={"Authorization": f"Bearer {key}"} if key else {},
         sentinels={
@@ -110,7 +116,7 @@ def _openai_adapter(base_env, key, model, model_classic):
             "@MODEL_SHELL": os.environ.get("OPENAI_MODEL_SHELL", "codex-mini-latest"),
         },
         optional={"@VECTOR_STORE_ID": os.environ.get("OPENAI_VECTOR_STORE_ID")},
-        probes=openai_responses.PROBES,
+        probes=openai_responses.PROBES if probes is None else probes,
     )
 
 
@@ -121,6 +127,7 @@ def _anthropic_adapter(base_env, key, model):
         hdr["x-api-key"] = key
     return Adapter(
         name="anthropic",
+        family="anthropic",
         base_url=os.environ.get(base_env, "https://api.anthropic.com").rstrip("/"),
         auth_headers=hdr,
         sentinels={"@MODEL": model},
@@ -150,7 +157,24 @@ def build_adapter(provider: str) -> Adapter:
         a = _anthropic_adapter("SMG_BASE_URL", os.environ.get("SMG_API_KEY"), a_model)
         a.name = "smg-anthropic"
         return a
+    if provider in ("openai-chat", "smg-openai-chat"):
+        # Chat Completions: the OpenAI host, key and model sentinels, the chat matrix.
+        base_env = "OPENAI_BASE_URL" if provider == "openai-chat" else "SMG_BASE_URL"
+        key_env = "OPENAI_API_KEY" if provider == "openai-chat" else "SMG_API_KEY"
+        a = _openai_adapter(
+            base_env,
+            os.environ.get(key_env),
+            o_model,
+            o_classic,
+            probes=openai_chat_completions.PROBES,
+            family="openai-chat",
+        )
+        a.name = provider
+        return a
     raise ValueError(f"unknown provider {provider!r}")
+
+
+PROVIDERS = ["openai", "anthropic", "openai-chat", "smg-openai", "smg-anthropic", "smg-openai-chat"]
 
 
 # =============================================================================
@@ -255,12 +279,52 @@ def field_paths(obj, prefix=""):
     return out
 
 
+def chat_chunk_name(ev):
+    """Name a Chat Completions SSE chunk by what it carries (chunks have no
+    ``event:`` line): ``delta.role``, ``delta.content``, ``delta.tool_calls``,
+    ``delta.reasoning``, ``delta.refusal`` joined with ``+``, a
+    ``.finish:<reason>`` suffix, ``+usage`` when usage rides along, ``usage``
+    for the trailing usage-only chunk, ``[DONE]`` for the sentinel, ``error``
+    for an error object."""
+    if (ev.get("data") or "").strip() == "[DONE]":
+        return "[DONE]"
+    parsed = ev.get("parsed")
+    if not isinstance(parsed, dict):
+        return "?"
+    if "error" in parsed:
+        return "error"
+    choices = parsed.get("choices") or []
+    if not choices:
+        return "usage" if parsed.get("usage") else "chunk.empty"
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    delta = choice.get("delta") or {}
+    parts = []
+    if "role" in delta:
+        parts.append("role")
+    if delta.get("content"):
+        parts.append("content")
+    if delta.get("tool_calls") or delta.get("function_call"):
+        parts.append("tool_calls")
+    if delta.get("reasoning_content") or delta.get("reasoning"):
+        parts.append("reasoning")
+    if delta.get("refusal"):
+        parts.append("refusal")
+    name = "delta." + "+".join(parts) if parts else "delta.empty"
+    if choice.get("finish_reason"):
+        name += f".finish:{choice['finish_reason']}"
+    if parsed.get("usage"):
+        name += "+usage"
+    return name
+
+
 def stream_event_names(sse_events, provider):
     names = []
     for ev in sse_events:
         if provider.endswith("anthropic"):
             parsed = ev.get("parsed") or {}
             names.append(parsed.get("type") or ev.get("event") or "?")
+        elif provider.endswith("openai-chat"):
+            names.append(chat_chunk_name(ev))
         else:
             names.append(ev.get("event") or "?")
     return ">".join(names)
@@ -741,9 +805,7 @@ def write_outputs(out_dir: Path, adapter, records):
 # =============================================================================
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Vendor ground-truth probe runner")
-    ap.add_argument(
-        "--provider", required=True, choices=["openai", "anthropic", "smg-openai", "smg-anthropic"]
-    )
+    ap.add_argument("--provider", required=True, choices=PROVIDERS)
     ap.add_argument("--out", default=None, help="output dir (default results/<provider>)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--filter", default=None, help="regex over probe ids")
@@ -774,12 +836,12 @@ def main(argv=None):
         os.environ["OPENAI_MODEL_CLASSIC"] = args.model_classic
 
     adapter = build_adapter(args.provider)
-    family = "openai" if adapter.name.endswith("openai") else "anthropic"
     probes = []
     if args.tier in ("curated", "all"):
         probes.extend(adapter.probes)
-    if args.tier in ("generated", "all"):
-        probes.extend(genmatrix.generate(family, budget=args.budget))
+    if args.tier in ("generated", "all") and adapter.family in ("openai", "anthropic"):
+        # the generated tier exists for the Responses and Messages families only
+        probes.extend(genmatrix.generate(adapter.family, budget=args.budget))
     ids = [p["id"] for p in probes]
     if len(set(ids)) != len(ids):
         seen, dups = set(), set()

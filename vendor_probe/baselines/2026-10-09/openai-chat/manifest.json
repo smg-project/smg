@@ -1,11 +1,10 @@
 {
-  "baseline_bytes": 198719,
-  "clusters": 46,
+  "baseline_bytes": 29239,
+  "clusters": 23,
   "date": "2026-10-09",
   "exemplar_kinds": {
-    "body": 34,
-    "skeleton": 4,
-    "sse": 8
+    "body": 11,
+    "sse": 12
   },
   "max_exemplar_bytes": 8192,
   "models": {
@@ -15,25 +14,24 @@
     ],
     "requested": [
       "",
-      "computer-use-preview",
       "gpt-4.1-nano",
       "gpt-5-nano",
       "gpt-nope"
     ]
   },
   "probe_set_git_sha": "0829a0bf",
-  "probes_distilled": 209,
-  "probes_total": 225,
-  "provider": "openai",
+  "probes_distilled": 134,
+  "probes_total": 134,
+  "provider": "openai-chat",
   "recording": {
-    "estimated_cost_usd": 0.0112,
+    "estimated_cost_usd": 0.0009,
     "expected_error_recorded": 59,
-    "fingerprint_clusters_total": 46,
-    "recorded": 209,
-    "skipped": 16,
+    "fingerprint_clusters_total": 25,
+    "recorded": 134,
+    "skipped": 0,
     "tokens": {
-      "input": 110667,
-      "output": 14274
+      "input": 2120,
+      "output": 1712
     },
     "transport_failures": 0
   },
