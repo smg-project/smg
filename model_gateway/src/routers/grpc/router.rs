@@ -122,6 +122,7 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
             ),
             multimodal,
+            token_dump: ctx.token_dump.clone(),
         });
 
         // Deps for the parser-consuming endpoints (chat/messages/harmony).

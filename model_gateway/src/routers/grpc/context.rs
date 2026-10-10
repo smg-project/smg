@@ -42,7 +42,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    observability::cache_trace,
+    observability::{cache_trace, token_dump::TokenDump},
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
@@ -185,6 +185,8 @@ pub(crate) struct SharedComponents {
     pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
+    /// The token dump, when `--token-dump-dir` enables it.
+    pub token_dump: Option<Arc<TokenDump>>,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
@@ -318,6 +320,8 @@ pub(crate) struct DispatchContext {
     /// reselection refills it.
     pub pd_prefill_guard: Option<PrefillLoadGuard>,
     pub response: ResponseState,
+    /// The token dump, when `--token-dump-dir` enables it.
+    pub token_dump: Option<Arc<TokenDump>>,
 }
 
 impl DispatchContext {
@@ -892,6 +896,7 @@ impl RequestContext {
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
+        let token_dump = components.token_dump.clone();
         drop(components);
         let routing = state.routing_snapshot.ok_or_else(|| {
             error!(
@@ -918,7 +923,9 @@ impl RequestContext {
                 )
             })?;
         Ok(DispatchContext {
-            root_request_id: if cache_trace::enabled() {
+            // The client's request id, for the routing trace and the token
+            // dump's `request` lines.
+            root_request_id: if cache_trace::enabled() || token_dump.is_some() {
                 super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
                     .map(str::to_owned)
             } else {
@@ -945,6 +952,7 @@ impl RequestContext {
             load_guards: None,
             pd_prefill_guard: state.pd_prefill_guard,
             response: state.response,
+            token_dump,
         })
     }
 
