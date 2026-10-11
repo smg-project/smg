@@ -2719,6 +2719,29 @@ pub struct TrackedStream {
     replay: Option<Option<Result<ProtoGenerateResponse, tonic::Status>>>,
 }
 
+/// What [`ProtoStream::first_response_within`] found as the stream's first
+/// item, held for the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstItem {
+    /// A response: the leg answered.
+    Response,
+    /// A failure (the engine's own report, or the transport's): the reader
+    /// meets it next and accounts for it.
+    Failure,
+    /// The end: the stream closed with nothing on it.
+    End,
+}
+
+impl FirstItem {
+    fn of(item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) -> Self {
+        match item {
+            Some(Ok(_)) => Self::Response,
+            Some(Err(_)) => Self::Failure,
+            None => Self::End,
+        }
+    }
+}
+
 /// The request's place in its worker's tracked pile (see
 /// [`Worker::tracked_load`]), held for the stream's life.
 struct ProgressTicket {
@@ -2770,7 +2793,7 @@ impl Drop for PrefillTicket {
 mod tracked_tests {
     use std::sync::Arc;
 
-    use super::{sglang, vllm, FanoutStream, ProtoGenerateResponse, ProtoStream};
+    use super::{sglang, vllm, FanoutStream, FirstItem, ProtoGenerateResponse, ProtoStream};
     use crate::worker::{BasicWorkerBuilder, Worker};
 
     #[test]
@@ -2905,9 +2928,14 @@ mod tracked_tests {
         let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
             .tracked_prefill_leg(Arc::clone(&worker), 16);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        assert!(stream.first_response_within(deadline).await.is_ok());
-        assert!(
-            stream.first_response_within(deadline).await.is_ok(),
+        assert_eq!(
+            stream.first_response_within(deadline).await.ok(),
+            Some(FirstItem::End),
+            "what was pulled ahead is named: the end, not a response"
+        );
+        assert_eq!(
+            stream.first_response_within(deadline).await.ok(),
+            Some(FirstItem::End),
             "a second wait does not pull past the held item"
         );
         assert!(stream.next().await.is_none(), "the held end is replayed");
@@ -3002,26 +3030,27 @@ impl ProtoStream {
         }))
     }
 
-    /// Wait for the stream's first response, or its end, until `deadline`.
-    /// Within the deadline the stream is left for its reader as if nothing
-    /// had been read: the response (or the end) is replayed by the next
-    /// [`Self::next`], its bookkeeping already done. Past the deadline the
-    /// stream has produced nothing, and the caller decides its fate. Only a
-    /// tracked stream can hold a response back, so any other returns at once
-    /// as if the response had come (the dispatch paths wrap a leg before they
-    /// bound it).
-    pub async fn first_response_within(&mut self, deadline: Instant) -> Result<(), Elapsed> {
+    /// Wait for the stream's first item, a response or its end, until
+    /// `deadline`, and say which it was. Within the deadline the stream is
+    /// left for its reader as if nothing had been read: the item is replayed
+    /// by the next [`Self::next`], its bookkeeping already done. Past the
+    /// deadline the stream has produced nothing, and the caller decides its
+    /// fate. Only a tracked stream can hold an item back, so any other
+    /// returns at once as if a response had come (the dispatch paths wrap a
+    /// leg before they bound it).
+    pub async fn first_response_within(&mut self, deadline: Instant) -> Result<FirstItem, Elapsed> {
         let Self::Tracked(tracked) = self else {
-            return Ok(());
+            return Ok(FirstItem::Response);
         };
-        if tracked.replay.is_some() {
-            return Ok(());
+        if let Some(held) = &tracked.replay {
+            return Ok(FirstItem::of(held.as_ref()));
         }
         let item = tokio::time::timeout_at(deadline.into(), self.next()).await?;
+        let first = FirstItem::of(item.as_ref());
         if let Self::Tracked(tracked) = self {
             tracked.replay = Some(item);
         }
-        Ok(())
+        Ok(first)
     }
 
     /// Get next item from stream

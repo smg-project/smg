@@ -768,6 +768,15 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         Duration::ZERO
     }
 
+    /// How long ago a prompt dispatched to the worker was last answered with
+    /// its first token (or, for a non-streaming generation, its one answer):
+    /// the worker's latest first response, the evidence that it answers at
+    /// all. `None` for a worker that has answered none since the gateway
+    /// started, or does not track it.
+    fn prefill_answered_ago(&self) -> Option<Duration> {
+        None
+    }
+
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
     /// reads status, load, processed and the overload veto together so the hot
     /// path takes one `ArcSwap` guard per backing cell per worker instead of one
@@ -1570,6 +1579,9 @@ struct PrefillBook {
     window_busy_ms: u64,
     /// First tokens' prompt tokens in the open window.
     window_tokens: u64,
+    /// Gateway clock of the latest first response (or one answer) to a
+    /// prompt dispatched here; zero until one.
+    last_answer_ms: u64,
 }
 
 impl PrefillBook {
@@ -1589,6 +1601,9 @@ impl PrefillBook {
 
     fn ended(&mut self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
         self.pending = self.pending.saturating_sub(tokens);
+        if cached.is_some() {
+            self.last_answer_ms = now_ms;
+        }
         if !timed {
             return;
         }
@@ -1658,6 +1673,13 @@ impl PrefillBook {
             rate => rate,
         };
         Duration::from_millis(pending.saturating_mul(1000) / rate)
+    }
+
+    /// How long before `now_ms` the latest prompt was answered; `None`
+    /// until one has been.
+    fn answered_ago(&self, now_ms: u64) -> Option<Duration> {
+        (self.last_answer_ms > 0)
+            .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_answer_ms)))
     }
 }
 
@@ -1905,6 +1927,15 @@ impl WorkerRuntime {
 
     pub fn prefill_eta(&self, tokens: u64) -> Duration {
         self.prefill.lock().eta(tokens)
+    }
+
+    pub fn prefill_answered_ago(&self) -> Option<Duration> {
+        self.prefill_answered_ago_at(super::liveness::now_ms().max(1))
+    }
+
+    /// [`Self::prefill_answered_ago`] as of `now_ms` on the gateway clock.
+    pub fn prefill_answered_ago_at(&self, now_ms: u64) -> Option<Duration> {
+        self.prefill.lock().answered_ago(now_ms)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -2754,6 +2785,10 @@ impl Worker for BasicWorker {
 
     fn prefill_eta(&self, tokens: u64) -> Duration {
         self.runtime.load().prefill_eta(tokens)
+    }
+
+    fn prefill_answered_ago(&self) -> Option<Duration> {
+        self.runtime.load().prefill_answered_ago()
     }
 
     fn note_tracked_started(&self) {
@@ -4845,11 +4880,45 @@ mod tests {
         runtime.note_prefill_started_at(20_000, true, 1_000);
         assert_eq!(runtime.prefill_eta(30_000), Duration::from_secs(5));
         assert_eq!(runtime.prefill_eta(0), runtime.prefill_backlog());
-        // A measured rate of 98k tokens/s (as above) replaces the prior.
+        // A measured rate (20k tokens over 1.5 s of busy time: 13,333
+        // tokens/s) replaces the prior.
         runtime.note_prefill_ended_at(10_000, true, Some(0), 1_600);
         runtime.note_prefill_ended_at(10_000, true, Some(0), 2_500);
         assert_eq!(runtime.prefill_rate_tps(), 13_333);
         assert_eq!(runtime.prefill_eta(40_000), Duration::from_millis(3_000));
+    }
+
+    #[test]
+    fn the_latest_first_response_is_stamped_on_the_worker() {
+        // A prefill leg past its own bound asks whether its worker answers
+        // anything at all: the stamp is the latest first response to any
+        // prompt dispatched there, never the drop of a stream that got none.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(5_000),
+            None,
+            "never answered"
+        );
+        runtime.note_prefill_started_at(256, true, 1_000);
+        runtime.note_prefill_started_at(256, true, 1_000);
+        runtime.note_prefill_ended_at(256, true, None, 1_500);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(5_000),
+            None,
+            "a dropped stream is no answer"
+        );
+        runtime.note_prefill_ended_at(256, true, Some(0), 2_000);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(5_000),
+            Some(Duration::from_secs(3))
+        );
+        runtime.note_prefill_started_at(64, false, 6_000);
+        runtime.note_prefill_ended_at(64, false, Some(0), 6_500);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(7_000),
+            Some(Duration::from_millis(500)),
+            "a non-streaming generation's one answer counts too"
+        );
     }
 
     #[test]
