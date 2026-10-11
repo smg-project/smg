@@ -835,6 +835,16 @@ impl ConfigValidator {
             });
         }
 
+        // The async runtime builder panics on zero worker threads; refuse it
+        // here like every other count that must be positive.
+        if config.runtime_worker_threads == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "runtime_worker_threads".to_string(),
+                value: "0".to_string(),
+                reason: "Must be >= 1".to_string(),
+            });
+        }
+
         // A zero-capacity job channel panics at construction and a
         // zero-permit dispatcher never dequeues; reject both here so a
         // config-file value fails as early as the CLI parsers do.
@@ -1581,6 +1591,24 @@ mod tests {
 
         let config = RouterConfig {
             mm_per_request_image_limit: Some(128),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn zero_runtime_worker_threads_is_rejected() {
+        let config = RouterConfig {
+            runtime_worker_threads: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "runtime_worker_threads"
+        ));
+
+        let config = RouterConfig {
+            runtime_worker_threads: Some(4),
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
