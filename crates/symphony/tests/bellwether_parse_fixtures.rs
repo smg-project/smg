@@ -142,6 +142,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    (
+        "qwen3-30b-a3b",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     // The 2507 line, Qwen3-Next and Qwen3-VL split into instruct, with no thought, and thinking,
     // whose template always opens the thought in the prompt.
     (
@@ -161,6 +166,11 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     ),
     (
         "qwen3-4b-thinking-2507",
+        Family::Qwen3,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "qwen3-30b-a3b-thinking-2507",
         Family::Qwen3,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
@@ -277,7 +287,7 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen2_5,
         GenerationPrompt::Plain,
     ),
-    ("qwen2.5-omni-3b", Family::Qwen2_5, GenerationPrompt::Plain),
+    ("qwen2.5-omni-7b", Family::Qwen2_5, GenerationPrompt::Plain),
     // Qwen 3.5 and later write calls as tags and open the thought in the prompt; Qwen3-Coder
     // writes tags and has no thought.
     // Qwen3.5-0.8B's template has no thought.
@@ -780,7 +790,7 @@ const CONTENT_OR_CALLS: &[&str] = &[
     "qwen2.5-vl-3b-instruct",
     "qwen2.5-vl-7b-instruct",
     "qwen2.5-vl-32b-instruct",
-    "qwen2.5-omni-3b",
+    "qwen2.5-omni-7b",
 ];
 
 /// A class of difference the recorded sets have, allowed for what the fixture shows rather than
