@@ -7,6 +7,8 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    future::{pending, Future},
+    pin::pin,
     sync::Arc,
     time::Duration,
 };
@@ -23,16 +25,29 @@ use engine_zmq_client::{
     },
     EngineId,
 };
-use tokio::{sync::mpsc, task::AbortHandle};
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     config::Config,
+    drain::InFlight,
     engine::{Engine, GenEvent, LoadSnapshot, NewRequest},
 };
 
 /// Run one mock ZMQ EngineCore rank: connect to `handshake_address`, then serve
 /// requests until the frontend disconnects.
 pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u32) {
+    serve_until(cfg, handshake_address, engine_index, pending()).await;
+}
+
+/// [`serve`] until `shutdown` resolves as well: from then on the rank admits
+/// no request and returns once the ones in flight have finished (the drain
+/// of a termination signal), as an engine process does under SIGTERM.
+pub async fn serve_until(
+    cfg: Arc<Config>,
+    handshake_address: String,
+    engine_index: u32,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let mut ready = default_ready_response();
     ready.data_parallel_rank = engine_index;
     ready.instance_id = format!("mock-zmq-{engine_index}");
@@ -89,9 +104,19 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
         }
     });
 
-    let mut inflight: HashMap<String, AbortHandle> = HashMap::new();
+    let mut shutdown = pin!(shutdown);
+    let mut stopped = false;
+    let mut inflight: HashMap<String, JoinHandle<()>> = HashMap::new();
     loop {
-        match input.recv().await {
+        let inbound = tokio::select! {
+            inbound = input.recv() => inbound,
+            () = &mut shutdown => {
+                tracing::info!("zmq engine {engine_index}: stopping, admitting no more requests");
+                stopped = true;
+                break;
+            }
+        };
+        match inbound {
             Ok(EngineInbound::Add(request)) => {
                 let request_id = request.request_id.clone();
                 let prompt = request.prompt_token_ids.clone().unwrap_or_default();
@@ -103,6 +128,7 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                     .filter(|&max| max > 0)
                     .unwrap_or(cfg.output_tokens);
 
+                let in_flight = InFlight::enter();
                 let (gen_tx, gen_rx) = mpsc::unbounded_channel::<GenEvent>();
                 match &engine {
                     Some(engine) => engine.submit(NewRequest {
@@ -131,8 +157,9 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
                     gen_rx,
                     out_tx.clone(),
                     engine.clone(),
+                    in_flight,
                 ));
-                inflight.insert(request_id, forwarder.abort_handle());
+                inflight.insert(request_id, forwarder);
             }
             Ok(EngineInbound::Abort(request_ids)) => {
                 for request_id in request_ids {
@@ -175,6 +202,13 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
             }
         }
     }
+    // A stop lets the requests admitted before it finish (the frontend is
+    // still there to read their outputs); the deadline is the caller's.
+    if stopped {
+        for forwarder in inflight.into_values() {
+            let _ = forwarder.await;
+        }
+    }
 }
 
 /// Forward one request's generation events to the output funnel as
@@ -185,6 +219,9 @@ async fn forward_request(
     mut gen_rx: mpsc::UnboundedReceiver<GenEvent>,
     out_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     engine: Option<Engine>,
+    // Held until the forwarder is done or aborted: the request's share of
+    // the in-flight count.
+    _in_flight: InFlight,
 ) {
     while let Some(event) = gen_rx.recv().await {
         let load = engine
