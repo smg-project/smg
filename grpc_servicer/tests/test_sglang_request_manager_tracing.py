@@ -35,16 +35,17 @@ def _calls(node: ast.AST) -> list[str]:
 
 
 def _guarded_by_enable_trace(node: ast.AST, call_name: str) -> bool:
-    """Whether every `call_name` call sits under an `if self.enable_trace`."""
-    found = False
+    """Whether every `call_name` call in `node` sits under an `if self.enable_trace`
+    (and there is at least one): a call added outside the switch fails this."""
+    total = _calls(node).count(call_name)
+    guarded = 0
     for branch in ast.walk(node):
         if not isinstance(branch, ast.If):
             continue
         test = branch.test
         if isinstance(test, ast.Attribute) and test.attr == "enable_trace":
-            if call_name in _calls(ast.Module(body=branch.body, type_ignores=[])):
-                found = True
-    return found
+            guarded += _calls(ast.Module(body=branch.body, type_ignores=[])).count(call_name)
+    return total > 0 and guarded == total
 
 
 def test_the_request_state_starts_the_trace_from_the_calls_metadata():
