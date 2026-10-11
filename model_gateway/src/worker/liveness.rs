@@ -31,8 +31,9 @@
 //!   HTTP worker, a PD leg or a non-streaming generation gives no signal
 //!   between dispatch and completion, so it never forms a pile and is never
 //!   judged by one; a non-streaming generation's one answer is progress all
-//!   the same, and its prompt counts in the prefill backlog. The clock
-//!   starts at the first dispatch of a run of
+//!   the same, and its prompt counts in the prefill backlog (but times no
+//!   prefill: the gateway never sees its first token). The clock starts at
+//!   the first dispatch of a run of
 //!   tracked requests, never at registration, and the bound is the
 //!   configured threshold or, if longer, the time the engine may still need
 //!   to prefill what is in flight ([`Worker::prefill_backlog`]): a batch that
@@ -582,7 +583,7 @@ mod tests {
         for _ in 0..128 {
             w.increment_load();
         }
-        w.note_prefill_started(128 * 1_152);
+        w.note_prefill_started(128 * 1_152, true);
         let bound = wedge_bound(&w, DEFAULT_WEDGE);
         assert_eq!(
             bound,
@@ -598,10 +599,10 @@ mod tests {
         );
         // The first tokens arrive: the backlog is gone and the bound is the
         // configured threshold again.
-        w.note_prefill_ended(128 * 1_152, true);
+        w.note_prefill_ended(128 * 1_152, true, true);
         assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
         // The bound is capped against leaking books.
-        w.note_prefill_started(100_000_000);
+        w.note_prefill_started(100_000_000, true);
         assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), WEDGE_BOUND_CAP);
         assert_eq!(
             wedge_bound(&w, Duration::from_secs(600)),
@@ -618,7 +619,7 @@ mod tests {
         for _ in 0..8 {
             w.increment_load();
         }
-        w.note_prefill_started(8 * 150);
+        w.note_prefill_started(8 * 150, true);
         let bound = wedge_bound(&w, DEFAULT_WEDGE);
         assert_eq!(
             bound, DEFAULT_WEDGE,

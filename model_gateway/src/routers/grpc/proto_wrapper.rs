@@ -2629,6 +2629,10 @@ impl Drop for ProgressTicket {
 struct PrefillTicket {
     worker: Arc<dyn Worker>,
     tokens: u64,
+    /// The first response is the request's first token (a streaming
+    /// generation), so the prompt's prefill is timed for the worker's rate;
+    /// a non-streaming generation's one response is its whole answer.
+    timed: bool,
     released: bool,
 }
 
@@ -2636,7 +2640,8 @@ impl PrefillTicket {
     fn first_response(&mut self) {
         if !self.released {
             self.released = true;
-            self.worker.note_prefill_ended(self.tokens, true);
+            self.worker
+                .note_prefill_ended(self.tokens, self.timed, true);
         }
     }
 }
@@ -2644,7 +2649,8 @@ impl PrefillTicket {
 impl Drop for PrefillTicket {
     fn drop(&mut self) {
         if !self.released {
-            self.worker.note_prefill_ended(self.tokens, false);
+            self.worker
+                .note_prefill_ended(self.tokens, self.timed, false);
         }
     }
 }
@@ -2693,8 +2699,8 @@ mod tracked_tests {
             ProtoStream::Tracked(tracked) => {
                 assert!(tracked.progress.is_none(), "no pile slot");
                 assert!(
-                    tracked.prefill.is_some(),
-                    "its prompt is pending prefill there like any other"
+                    tracked.prefill.as_ref().is_some_and(|ticket| !ticket.timed),
+                    "pending prefill like any other, untimed: its first response is its whole answer"
                 );
                 // Its one answer goes through the same `Tracked` arm of
                 // `next` as a token, which is where progress is recorded.
@@ -2726,9 +2732,12 @@ impl ProtoStream {
     /// answer of a non-streaming one), its `prompt_tokens` as pending prefill
     /// there until the first response, and, when the engine streams the
     /// generation (`streaming`), the request as one of the worker's tracked
-    /// pile while the stream lives. A non-streaming generation shows nothing
-    /// between dispatch and completion, so it joins no pile: the pile rule
-    /// never judges a worker by requests it cannot see progress on.
+    /// pile while the stream lives, with its prefill timed by its first
+    /// token. A non-streaming generation shows nothing between dispatch and
+    /// completion, so it joins no pile and times no prefill (its one answer
+    /// comes after its decode): the pile rule never judges a worker by
+    /// requests it cannot see progress on, and the prefill rate is learned
+    /// from first tokens only.
     #[must_use]
     pub fn tracked(self, worker: Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
         let progress = streaming.then(|| {
@@ -2738,10 +2747,11 @@ impl ProtoStream {
             }
         });
         let prefill = (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens);
+            worker.note_prefill_started(prompt_tokens, streaming);
             PrefillTicket {
                 worker: Arc::clone(&worker),
                 tokens: prompt_tokens,
+                timed: streaming,
                 released: false,
             }
         });
