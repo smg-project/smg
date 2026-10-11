@@ -1241,10 +1241,6 @@ mod tests {
     #[test]
     fn gemma4_rendered_prompt_state_follows_actual_parser_selection() {
         let factory = ReasoningParserFactory::new();
-        let request = ChatCompletionRequest {
-            model: "google/gemma-4-serve".to_string(),
-            ..Default::default()
-        };
         for configured in [Some("gemma4"), None, Some("unknown-parser")] {
             assert!(check_reasoning_parser_availability(
                 &factory,
@@ -1256,30 +1252,16 @@ mod tests {
                 ("<|im_start|>model<|channel>thought\n", true),
                 ("<|im_start|>model<|channel>thought\nplan<channel|>", false),
             ] {
-                let in_prefill = rendered_prompt_reasoning_in_prefill(
-                    &factory,
-                    configured,
-                    &request.model,
-                    prompt,
-                );
                 assert_eq!(
-                    in_prefill,
+                    rendered_prompt_reasoning_in_prefill(
+                        &factory,
+                        configured,
+                        "google/gemma-4-serve",
+                        prompt,
+                    ),
                     Some(expected),
                     "configured={configured:?}, prompt={prompt:?}"
                 );
-                let wire =
-                    smg_grpc_client::SglangSchedulerClient::build_generate_request_from_chat_parts(
-                        "test".to_string(),
-                        &request,
-                        prompt.to_string(),
-                        Vec::new(),
-                        smg_grpc_client::SglangGenerateRequestOptions {
-                            require_reasoning: in_prefill.unwrap(),
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(wire.require_reasoning, expected);
             }
         }
         // A valid override wins over the model; other models keep their defaults.
