@@ -900,7 +900,7 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
             drop(tx);
             let events = collect_events(rx).await;
             server.abort();
-            assert_eq!(result.is_ok(), status == "0", "{result:?}");
+            assert_eq!(result.is_ok(), status == "0", "{:?}", result.as_ref().err());
             let text: String = events
                 .iter()
                 .filter_map(|event| event["choices"][0]["text"].as_str())
