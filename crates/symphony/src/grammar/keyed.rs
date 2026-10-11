@@ -319,6 +319,71 @@ mod tests {
     }
 
     #[test]
+    fn k2_horizon_writes_its_block_with_a_newline_before_each_call_and_before_the_close() {
+        // K2-Horizon's template writes `<ifm|tool_calls>`, then each call after a newline, then a
+        // newline and `</ifm|tool_calls>`; every one of the recorded sets' 1,935 block openings,
+        // 1,250 call-to-call joins and 1,935 block closings reads so. The block holds one call or
+        // more, each GLM 4.6's pair spelling under the `ifm|` tags, and a zero-argument call is its
+        // name and a newline.
+        let payload = formats::k2_horizon()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let block = &payload["format"]["tags"][0];
+        assert_eq!(block["begin"], "<ifm|tool_calls>");
+        assert_eq!(block["end"], "</ifm|tool_calls>");
+        let inside = block["content"]["elements"]
+            .as_array()
+            .expect("calls, then the newline");
+        assert_eq!(inside[1], value!({"type": "const_string", "value": "\n"}));
+        assert_eq!(inside[0]["type"], "plus");
+        let each = inside[0]["content"]["elements"]
+            .as_array()
+            .expect("the newline, then one of the calls");
+        assert_eq!(each[0], value!({"type": "const_string", "value": "\n"}));
+        let calls = each[1]["elements"].as_array().expect("two tools");
+        let weather = calls[0]["elements"].as_array().expect("a call's parts");
+        assert_eq!(weather[0]["value"], "<ifm|tool_call>get_weather\n");
+        assert_eq!(weather[2]["value"], "</ifm|tool_call>");
+        let city = weather[1]["elements"][0]["elements"]
+            .as_array()
+            .expect("the first pair's parts");
+        assert_eq!(city[2]["value"], "</ifm|arg_key>\n<ifm|arg_value>");
+        assert_eq!(city[4]["value"], "</ifm|arg_value>\n");
+        let ping = calls[1]["elements"]
+            .as_array()
+            .expect("the zero-argument call's parts");
+        assert_eq!(ping[0]["value"], "<ifm|tool_call>ping\n");
+        assert_eq!(ping[1]["type"], "star");
+        assert_eq!(ping[2]["value"], "</ifm|tool_call>");
+        // With the thought open, the same block follows a prefix that excludes the call tags.
+        let with_prefix = formats::k2_horizon()
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .payload();
+        let parts = with_prefix["format"]["elements"]
+            .as_array()
+            .expect("prefix, then the block");
+        let excludes = parts[0]["excludes"].as_array().expect("the excluded tags");
+        for tag in [
+            "<ifm|tool_calls>",
+            "</ifm|tool_calls>",
+            "<ifm|tool_call>",
+            "</ifm|tool_call>",
+            "<ifm|arg_key>",
+            "</ifm|arg_key>",
+            "<ifm|arg_value>",
+            "</ifm|arg_value>",
+        ] {
+            assert!(
+                excludes.contains(&value!(tag)),
+                "{tag} is excluded from the prefix"
+            );
+        }
+        assert_eq!(parts[1]["tags"][0]["begin"], "<ifm|tool_calls>");
+    }
+
+    #[test]
     fn hy4_with_the_reasoning_open_takes_the_prefix_and_its_one_way_in() {
         // Hy4's prompt opens the thought, so this is the path it takes most: the prefix is free
         // text that can write none of the four call terminals nor the four suffixed tags, the

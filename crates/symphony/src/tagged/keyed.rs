@@ -99,7 +99,9 @@ pub struct Newlines {
     pub after_value: &'static str,
     /// Before the call's close, whether or not a pair came.
     pub before_close: &'static str,
-    /// Inside a block of calls, before each call's opener.
+    /// Inside a block of calls, before each call's opener. The block's two places are the
+    /// grammar's alone: the table owns the block's markers, and the assembler never sees the
+    /// bytes between them.
     pub block_before_call: &'static str,
     /// Inside a block of calls, before the block's close.
     pub block_before_close: &'static str,
