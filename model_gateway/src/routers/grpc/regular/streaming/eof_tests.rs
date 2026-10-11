@@ -30,6 +30,7 @@ use crate::{
 #[derive(Default)]
 pub(super) struct CharacterTokenizer {
     special_tokens: SpecialTokens,
+    eager_steps: std::sync::atomic::AtomicUsize,
 }
 
 impl llm_tokenizer::traits::Encoder for CharacterTokenizer {
@@ -50,6 +51,19 @@ impl llm_tokenizer::traits::Encoder for CharacterTokenizer {
 }
 
 impl llm_tokenizer::traits::Decoder for CharacterTokenizer {
+    fn decode_step_eager(
+        &self,
+        token_id: u32,
+        ids: &mut Vec<u32>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> anyhow::Result<Option<String>> {
+        self.eager_steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
     fn decode(&self, ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
         ids.iter()
             .map(|id| char::from_u32(*id).ok_or_else(|| anyhow::anyhow!("invalid character token")))
@@ -796,7 +810,10 @@ async fn byte_fallback_messages_complete_counts_held_thinking_tokens() {
 
 #[tokio::test]
 async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
-    let tokenizer = byte_fallback_reasoning_tokenizer();
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(llm_tokenizer::CachedTokenizer::new(
+        byte_fallback_reasoning_tokenizer(),
+        llm_tokenizer::CacheConfig::default(),
+    ));
     let processor = ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
@@ -859,6 +876,57 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
             2
         );
     }
+}
+
+#[tokio::test]
+async fn non_byte_fallback_held_stop_keeps_original_reasoning_accounting() {
+    let native = Arc::new(CharacterTokenizer::default());
+    let tokenizer: Arc<dyn Tokenizer> = native.clone();
+    let ids: Vec<_> = "<think>abST".chars().map(u32::from).collect();
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer.clone(),
+        llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("STOP"),
+        false,
+    );
+    let outputs = decoder.process_tokens(&ids).unwrap();
+    assert!(outputs
+        .iter()
+        .any(|output| matches!(output, SequenceDecoderOutput::Held)));
+    assert!(!tokenizer.uses_byte_fallback());
+    let complete = ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
+        output_ids: ids,
+        finish_reason: "length".into(),
+        ..Default::default()
+    }));
+    let processor = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    );
+    let (choice, reasoning_tokens) = processor
+        .process_single_choice(
+            &complete,
+            0,
+            &chat_spec(false),
+            "eof-test",
+            &tokenizer,
+            &mut decoder,
+            0,
+            true,
+            false,
+            Some("qwen3"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(choice.message.reasoning_content.as_deref(), Some("abST"));
+    assert_eq!(reasoning_tokens, 4);
+    assert_eq!(
+        native
+            .eager_steps
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
 }
 
 #[tokio::test]

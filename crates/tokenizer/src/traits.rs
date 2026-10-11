@@ -100,6 +100,11 @@ pub trait IncrementalDecoder: Send + Sync {
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
 
+    /// Whether the configured decoder contains ByteFallback byte-run buffering.
+    fn uses_byte_fallback(&self) -> bool {
+        false
+    }
+
     /// Release text buffered by incremental decoding at end of input.
     fn finish_decode(
         &self,

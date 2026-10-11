@@ -26,6 +26,21 @@ fn byte_fallback_tokenizer() -> Arc<dyn crate::TokenizerTrait> {
 }
 
 #[test]
+fn byte_fallback_capability_distinguishes_byte_level_and_survives_cache() {
+    let mut byte_level =
+        tokenizers::Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+    byte_level.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+    let byte_level: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(byte_level));
+    for (tokenizer, expected) in [(byte_fallback_tokenizer(), true), (byte_level, false)] {
+        assert_eq!(tokenizer.uses_byte_fallback(), expected);
+        let cached = crate::CachedTokenizer::new(tokenizer, crate::CacheConfig::default());
+        assert_eq!(cached.uses_byte_fallback(), expected);
+    }
+    assert!(!mock::MockTokenizer::new().uses_byte_fallback());
+}
+
+#[test]
 fn byte_fallback_streaming_preserves_exact_text() {
     use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 

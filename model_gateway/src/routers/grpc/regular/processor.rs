@@ -116,7 +116,11 @@ impl ResponseProcessor {
                 *last = final_text.len();
             }
         }
-        if held && original_request.separate_reasoning && reasoning_parser_available {
+        if held
+            && tokenizer.uses_byte_fallback()
+            && original_request.separate_reasoning
+            && reasoning_parser_available
+        {
             if let Some(ends) = eager_token_ends(
                 tokenizer,
                 &complete.output_ids()[..token_ends.len()],
@@ -699,7 +703,7 @@ impl ResponseProcessor {
                 *last = final_text.len();
             }
         }
-        if held && reasoning_parser_available {
+        if held && tokenizer.uses_byte_fallback() && reasoning_parser_available {
             if let Some(ends) = eager_token_ends(
                 &tokenizer,
                 &complete.output_ids()[..token_ends.len()],

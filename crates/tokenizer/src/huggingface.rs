@@ -606,6 +606,10 @@ impl Encoder for HuggingFaceTokenizer {
 }
 
 impl Decoder for HuggingFaceTokenizer {
+    fn uses_byte_fallback(&self) -> bool {
+        self.has_byte_fallback
+    }
+
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         self.tokenizer
             .decode(token_ids, skip_special_tokens)
