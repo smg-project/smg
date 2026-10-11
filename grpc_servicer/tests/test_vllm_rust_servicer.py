@@ -578,6 +578,15 @@ def test_model_info_carries_where_the_engine_starts_a_grammar():
     assert info["structured_outputs_start"] == "first_token"
 
 
+def test_model_info_carries_the_stats_flag():
+    # The servicer is told whether the engine cores run with their scheduler
+    # statistics on (the wire then reports every step); unsaid, it classifies
+    # the wire by what it shows.
+    assert rust.model_info_from_config(_config())["log_stats"] is None
+    assert rust.model_info_from_config(_config(), log_stats=True)["log_stats"] is True
+    assert rust.model_info_from_config(_config(), log_stats=False)["log_stats"] is False
+
+
 def test_model_info_carries_the_running_window():
     # The Rust servicer advertises the launcher's `--max-num-seqs` as the
     # Python servicer does; a config without one leaves the handshake's.
@@ -1385,7 +1394,10 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
         @staticmethod
         def from_cli_args(args):
             recorded["engine_args_from"] = args
-            return SimpleNamespace(create_engine_config=lambda usage_context: _config())
+            return SimpleNamespace(
+                create_engine_config=lambda usage_context: _config(),
+                disable_log_stats=False,
+            )
 
     _stub_frontend_args(monkeypatch)
     _stub_engine_exceptions(monkeypatch)
@@ -1450,6 +1462,8 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""
+    # The engine cores run with their statistics on: the servicer is told.
+    assert kwargs["log_stats"] is True
 
     (ns,) = launched
     assert ns.model == "org/m" and ns.model_tag is None and ns.grpc is False

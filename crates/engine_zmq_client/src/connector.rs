@@ -1046,14 +1046,26 @@ impl<P: EngineProtocol> Client<P> {
         Some(self.inner.output_clock.elapsed().saturating_sub(since))
     }
 
-    /// Whether the engine's wire has shown a scheduler step without any
-    /// token (a stats-only step report, which vLLM sends every step while
-    /// its stats logging is on): from then on [`Self::output_silence`] is
-    /// the scheduler's silence. A wire that carries token batches only
-    /// (SGLang, TokenSpeed) never sets it, and its silence may be a prefill
-    /// in progress, which the gateway allows for.
+    /// Whether the engine's wire reports every scheduler step: it has shown
+    /// a scheduler step without any token (a stats-only step report, which
+    /// vLLM sends every step while its stats logging is on), or the launcher
+    /// that started the engine said so ([`Self::note_reports_steps`]). From
+    /// then on [`Self::output_silence`] is the scheduler's silence. A wire
+    /// that carries token batches only (SGLang, TokenSpeed) never sets it,
+    /// and its silence may be a prefill in progress, which the gateway
+    /// allows for.
     pub fn reports_steps(&self) -> bool {
         self.inner.steps_reported.load(Ordering::Relaxed)
+    }
+
+    /// The engine's wire reports every scheduler step, as the launcher that
+    /// started the engine knows (its scheduler statistics are on): hold
+    /// [`Self::reports_steps`] from now rather than from the first stats-only
+    /// step batch, so an engine that freezes before its first batch after
+    /// the servicer connected is judged on the step-reporting path too. A
+    /// client told nothing is classified by what its wire shows.
+    pub fn note_reports_steps(&self) {
+        self.inner.steps_reported.store(true, Ordering::Relaxed);
     }
 
     /// Prompt tokens of the in-flight requests that have produced no output
@@ -2422,6 +2434,33 @@ mod tests {
         assert!(second.finished());
         // Terminal output ends the stream.
         assert!(stream.next().await.is_none());
+    }
+
+    /// A launcher that knows the engine's scheduler statistics are on tells
+    /// the client so: the wire counts as step-reporting from the start, before
+    /// any batch, and the first request's silence counts from its dispatch;
+    /// a client told nothing waits for a stats-only step batch to say so.
+    #[tokio::test]
+    async fn a_client_told_its_engine_reports_steps_is_step_reporting_before_any_batch() {
+        let (client, mut engine, _ns) = connect().await;
+        assert!(
+            !client.reports_steps(),
+            "told nothing and shown nothing: a token-batch wire until shown otherwise"
+        );
+        client.note_reports_steps();
+        assert!(
+            client.reports_steps(),
+            "the launcher's word holds before any batch"
+        );
+        let _stream = client.submit(request_for("req-1", 0)).await.unwrap();
+        engine.recv_request().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let silence = client.output_silence().expect("a request is in flight");
+        assert!(
+            silence >= Duration::from_millis(70) && client.reports_steps(),
+            "the first request's silence is the scheduler's own from its dispatch: {silence:?}"
+        );
+        assert_eq!(client.prefill_pending_tokens(), 3);
     }
 
     /// The silence the servicer reports is counted over the requests the

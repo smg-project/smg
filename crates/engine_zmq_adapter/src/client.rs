@@ -915,6 +915,18 @@ impl ZmqEngineClient {
         }
     }
 
+    /// The engine's wire reports every scheduler step, as the launcher that
+    /// started the engine knows: `reports_steps` holds from now rather than
+    /// from the first stats-only step batch (see the client's own
+    /// `note_reports_steps`).
+    pub fn note_reports_steps(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.note_reports_steps(),
+            ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
+            ZmqBackend::Sglang(client) => client.note_reports_steps(),
+        }
+    }
+
     /// Prompt tokens of the in-flight requests without a first output yet
     /// (the ZMQ client's `prefill_pending_tokens`).
     pub fn prefill_pending_tokens(&self) -> u64 {

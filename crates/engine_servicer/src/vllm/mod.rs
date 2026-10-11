@@ -146,6 +146,15 @@ pub struct VllmModelInfo {
     /// parser to see the thought's end, `first_token` when the grammar runs
     /// from the first generated token; empty when the config does not say.
     pub structured_outputs_start: String,
+    /// Whether the engine's scheduler statistics are on (vLLM's
+    /// `--disable-log-stats` not given), as the launcher started it: such an
+    /// engine's wire reports every scheduler step, and the pushed load record
+    /// says so (`engine_reports_steps`) from the first record rather than
+    /// from the first stats-only step batch, so an engine that freezes before
+    /// its first batch is judged on the step-reporting path too. `None` when
+    /// the launcher did not say (an older one): the wire is then classified
+    /// by what it shows.
+    pub log_stats: Option<bool>,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.

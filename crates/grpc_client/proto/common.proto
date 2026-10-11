@@ -89,8 +89,10 @@ message EngineLoad {
   // request does: a subscriber that finds it past its wedge bound vetoes the
   // worker without needing a pile of its own requests on it.
   optional uint32 engine_silence_ms = 19;
-  // Whether the engine's wire has shown a scheduler step without any token
-  // (a stats-only step report), so `engine_silence_ms` is the scheduler's own
+  // Whether the engine's wire reports every scheduler step: it has shown a
+  // scheduler step without any token (a stats-only step report), or the
+  // launcher that started the engine told the servicer its scheduler
+  // statistics are on, so `engine_silence_ms` is the scheduler's own
   // silence; unset or false on a wire that carries token batches only, where
   // the silence may be a prefill in progress and the subscriber allows for
   // the prefill it knows to be pending.

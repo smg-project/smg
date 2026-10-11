@@ -92,11 +92,15 @@ IMPLS = ("python", "rust")
 HOOK_SYMBOL = "resolve_servicer_impl"
 
 
-def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
+def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -> dict[str, Any]:
     """`VllmGrpcServer` keyword arguments from vLLM's own config: the facts
     both servicers advertise (`model_facts`, `server_facts`), plus the inputs
     only the Rust servicer needs up front because no Python runs on its
-    request path."""
+    request path. ``log_stats`` is whether the engine cores are started with
+    their scheduler statistics on (``--disable-log-stats`` not given): such
+    an engine's wire reports every scheduler step, which the servicer's
+    pushed load records say from the first record; ``None`` leaves the
+    servicer to classify the wire by what it shows."""
     model_config = vllm_config.model_config
     facts = {**model_facts(model_config), **server_facts(vllm_config)}
     # `server_facts` carries the multimodal encoder dtype for the Python
@@ -146,6 +150,7 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         "mm_item_limits": mm_item_limits(vllm_config),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
         "structured_outputs_start": structured_outputs_start(vllm_config),
+        "log_stats": log_stats,
     }
 
 
@@ -495,7 +500,13 @@ async def serve_rust(args: argparse.Namespace) -> int:
         )
     engine_args = AsyncEngineArgs.from_cli_args(args)
     vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
-    info = model_info_from_config(vllm_config)
+    # The engine cores are started with `log_stats=not disable_log_stats`
+    # below (`launch_engine_cores`); the servicer is told the same.
+    disable_log_stats = getattr(engine_args, "disable_log_stats", None)
+    info = model_info_from_config(
+        vllm_config,
+        log_stats=None if disable_log_stats is None else not disable_log_stats,
+    )
     if info["kv_events_endpoint"]:
         logger.info("SubscribeKvEvents relays vLLM's KV events from %s", info["kv_events_endpoint"])
     else:

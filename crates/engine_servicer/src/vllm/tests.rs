@@ -1300,6 +1300,34 @@ async fn server_info_filters_encoder_dtype_without_changing_model_dtype() {
     }
 }
 
+/// A launcher that says the engine's scheduler statistics are on makes the
+/// wire step-reporting from the first record (`engine_reports_steps`), before
+/// any batch: an engine that freezes on its first request is judged on the
+/// step-reporting path. Without the launcher's word the wire waits for its
+/// first stats-only step batch.
+#[tokio::test]
+async fn the_launchers_stats_flag_classifies_the_wire_before_its_first_batch() {
+    let mut model = model_info();
+    model.log_stats = Some(true);
+    let h = harness(model, None).await;
+    assert_eq!(
+        h.server.state.engine.reports_steps(),
+        Some(true),
+        "step-reporting from the start, no batch seen"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let untold = harness(model_info(), None).await;
+    assert_eq!(
+        untold.server.state.engine.reports_steps(),
+        Some(false),
+        "told nothing: classified by the first stats-only step batch"
+    );
+    untold
+        .server
+        .stop(Duration::from_secs(5))
+        .expect("clean stop");
+}
+
 /// The launcher's `--max-num-seqs` is the window `GetServerInfo` advertises
 /// and `GetLoads` reports, over the handshake's figure.
 #[tokio::test]

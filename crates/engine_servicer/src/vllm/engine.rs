@@ -81,6 +81,11 @@ pub(super) async fn connect_engine(
             client.set_structured_outputs_backend(structured_outputs_backend_from_config(
                 &state.model.structured_outputs_backend,
             ));
+            // Known at start: the wire reports every scheduler step while the
+            // engine's statistics are on, before its first batch shows it.
+            if state.model.log_stats == Some(true) {
+                client.note_reports_steps();
+            }
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,

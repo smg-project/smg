@@ -35,9 +35,10 @@
 //!   is the same veto without a pile, so a frozen engine with one request on
 //!   it, or with requests from another gateway, leaves routing within the
 //!   bound instead of once a pile forms. Which bound depends on the wire:
-//!   an engine whose wire has shown a scheduler step without any token
-//!   (`engine_reports_steps`: vLLM's stats-only step batches, sent every
-//!   step with stats logging on) is silent only when its scheduler is, so
+//!   an engine whose wire reports every scheduler step
+//!   (`engine_reports_steps`: it has shown a stats-only step batch, which
+//!   vLLM sends every step with stats logging on, or its launcher told the
+//!   servicer that logging is on) is silent only when its scheduler is, so
 //!   the bare threshold applies; a wire that carries token batches only
 //!   (SGLang, TokenSpeed, vLLM with stats logging off) is silent through a
 //!   long prefill as well, so its silence is judged against the prefill its
@@ -1269,6 +1270,40 @@ mod tests {
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "no flap");
         on_token_progress(&w);
         assert!(w.stall_reason().is_none(), "progress clears it");
+    }
+
+    /// A worker that has shown no prefill rate yet (its engine's first
+    /// request after the servicer connected) is judged at the bare threshold
+    /// when its wire reports every step, and gets no verdict on a token-batch
+    /// wire, whose allowance needs a rate.
+    #[test]
+    fn a_cold_worker_on_a_step_reporting_wire_is_vetoed_at_the_bare_threshold() {
+        let w = worker();
+        tracked_pile(&w, 1);
+        assert_eq!(w.prefill_rate_tps(), 0, "no rate shown yet");
+        on_load_report_with(
+            &w,
+            0,
+            Some(Duration::from_secs(3)),
+            true,
+            Some(2_048),
+            DEFAULT_WEDGE,
+        );
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        let batch_only = worker();
+        tracked_pile(&batch_only, 1);
+        on_load_report_with(
+            &batch_only,
+            0,
+            Some(Duration::from_secs(3)),
+            false,
+            Some(2_048),
+            DEFAULT_WEDGE,
+        );
+        assert!(
+            batch_only.stall_reason().is_none(),
+            "a token-batch wire without a rate gets no verdict"
+        );
     }
 
     #[test]
