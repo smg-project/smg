@@ -28,7 +28,7 @@ use bytes::Bytes;
 use futures::Stream;
 use parking_lot::Mutex;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
     time::Instant,
 };
@@ -89,6 +89,10 @@ struct RequestRegistry<O> {
     /// [`Client::set_silence_death_timeout`] changed it): the dispatcher's
     /// deadline, and the idle spell after which the count starts over.
     silence_window: Duration,
+    /// Signalled when `requests` goes from empty to non-empty: the dispatcher
+    /// re-arms the silence watchdog for the remainder of the window the
+    /// engine's unanswered work has left, not a whole one.
+    busy_started: Arc<Notify>,
 }
 
 /// Completes one utility call with its value, or the error that ended it.
@@ -104,6 +108,7 @@ impl<O> Default for RequestRegistry<O> {
             idle_since: None,
             unanswered_before: Duration::ZERO,
             silence_window: ENGINE_SILENCE_DEATH_TIMEOUT,
+            busy_started: Arc::new(Notify::new()),
         }
     }
 }
@@ -132,6 +137,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 self.unanswered_before = Duration::ZERO;
             }
             self.in_flight_since = Some(now);
+            self.busy_started.notify_one();
         }
         self.requests.insert(request_id, sender);
         Ok(receiver)
@@ -1163,10 +1169,27 @@ async fn run_dispatcher<P: EngineProtocol>(
     // aborts this loop also handles are the client's own events and say
     // nothing about the engine; a steady trickle of them (a gateway retrying
     // into a stalled engine) must not keep a silent engine alive.
-    let watchdog = tokio::time::sleep_until(Instant::now() + inner.registry.lock().silence_window);
+    let (window, busy_started) = {
+        let registry = inner.registry.lock();
+        (registry.silence_window, registry.busy_started.clone())
+    };
+    let watchdog = tokio::time::sleep_until(Instant::now() + window);
     tokio::pin!(watchdog);
     loop {
         tokio::select! {
+            () = busy_started.notified() => {
+                // A busy period began. The engine has what is left of a window
+                // of unanswered work to answer in, not a whole one: a tick that
+                // landed in the gap before this period waited a whole window,
+                // and the sum of the periods before it must not be waited out
+                // again.
+                let now = Instant::now();
+                let (unanswered, window) = {
+                    let registry = inner.registry.lock();
+                    (registry.unanswered_for(now), registry.silence_window)
+                };
+                watchdog.as_mut().reset(now + window.saturating_sub(unanswered));
+            }
             output = out_rx.recv() => {
                 if output.is_some() {
                     let now = Instant::now();
@@ -1244,8 +1267,11 @@ async fn run_dispatcher<P: EngineProtocol>(
                 let now = Instant::now();
                 let mut registry = inner.registry.lock();
                 let window = registry.silence_window;
-                if registry.requests.is_empty() {
-                    // Idle with nothing in flight: silence is expected, keep waiting.
+                if registry.requests.is_empty() && registry.unanswered_before < window {
+                    // Idle, the busy periods since the last output short of a
+                    // window: silence is expected, keep waiting. The next busy
+                    // period re-arms this tick for what is left of the window
+                    // (`busy_started`), so a whole one here defers nothing.
                     drop(registry);
                     watchdog.as_mut().reset(now + window);
                     continue;
@@ -1254,7 +1280,8 @@ async fn run_dispatcher<P: EngineProtocol>(
                 // last output, over the busy periods since. Short of a window
                 // it is a request still in its first step (one registered just
                 // before this tick, say); a whole window of it is a dead
-                // engine, however many requests it was spread over.
+                // engine, however many requests it was spread over and whether
+                // or not one is in flight at this tick.
                 let unanswered = registry.unanswered_for(now);
                 if unanswered < window {
                     drop(registry);
@@ -3163,5 +3190,77 @@ mod tests {
             "{text}"
         );
         assert!(client.is_alive());
+    }
+
+    /// The watchdog's tick landing in a gap between two abandoned requests
+    /// does not push the give-up back a whole window: the engine is given up
+    /// on during the request in which its unanswered work reaches the window,
+    /// not at a later tick that happens to land while one is in flight.
+    #[tokio::test]
+    async fn a_tick_in_a_gap_between_requests_does_not_push_the_give_up_back() {
+        let (client, mut engine, _ns) = connect().await;
+        let window = Duration::from_millis(600);
+        client.set_silence_death_timeout(window);
+        // One answered request arms the watchdog with that window.
+        let mut warm = client.submit(request_for("req-warm", 0)).await.unwrap();
+        engine.recv().await.unwrap();
+        engine
+            .send_output(finished_output("req-warm"))
+            .await
+            .unwrap();
+        assert!(warm.next().await.unwrap().unwrap().finished());
+        // Requests of 250 ms with 150 ms gaps: the first tick (600 ms) lands
+        // in the second request and re-arms for the 150 ms left (750 ms),
+        // which is the gap before the third; the work reaches the window
+        // 100 ms into the third request.
+        let (busy, gap) = (Duration::from_millis(250), Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        let mut given_up = None;
+        let mut submitted = 0;
+        for n in 0..12 {
+            let request_id = format!("req-{n}");
+            let mut stream = match client.submit(request_for(&request_id, 0)).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    given_up = Some(error);
+                    break;
+                }
+            };
+            submitted += 1;
+            match engine.recv().await.unwrap() {
+                EngineInbound::Add(request) => assert_eq!(request.request_id, request_id),
+                other => panic!("expected the Add, got {other:?}"),
+            }
+            match tokio::time::timeout(busy, stream.next()).await {
+                Err(_abandoned) => drop(stream),
+                Ok(Some(Err(error))) => {
+                    given_up = Some(error);
+                    break;
+                }
+                Ok(other) => panic!("the engine answers nothing: {other:?}"),
+            }
+            match engine.recv().await.unwrap() {
+                EngineInbound::Abort(ids) => assert_eq!(ids, [request_id]),
+                other => panic!("expected the Abort, got {other:?}"),
+            }
+            tokio::time::sleep(gap).await;
+        }
+        let elapsed = started.elapsed();
+        let error = given_up.expect("the engine is given up on within a few abandoned requests");
+        assert!(
+            matches!(&error, Error::Shared(shared) if matches!(**shared, Error::EngineCoreDead))
+                || matches!(error, Error::ClientClosed { .. }),
+            "{error:?}"
+        );
+        assert!(!client.is_alive());
+        assert!(
+            elapsed >= window,
+            "given up on no sooner than a window of unanswered work"
+        );
+        assert_eq!(
+            submitted, 3,
+            "given up on during the request in which the work reached the window \
+             (after {elapsed:?}), not at a tick a whole window after the gap"
+        );
     }
 }
