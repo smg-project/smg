@@ -43,8 +43,9 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
 }
 
 /// [`serve`] until `shutdown` resolves as well: from then on the rank admits
-/// no request and returns once the ones in flight have finished (the drain
-/// of a termination signal), as an engine process does under SIGTERM.
+/// no request and returns once the ones in flight have finished and their
+/// last outputs are on the socket (the drain of a termination signal), as an
+/// engine process does under SIGTERM.
 pub async fn serve_until(
     cfg: Arc<Config>,
     handshake_address: String,
@@ -95,9 +96,9 @@ pub async fn serve_until(
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<EngineCoreOutputs>();
     #[expect(
         clippy::disallowed_methods,
-        reason = "writer self-terminates when the output channel closes"
+        reason = "the writer ends with the output channel; a drain awaits it"
     )]
-    let _writer = tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         let mut output = output;
         while let Some(outputs) = out_rx.recv().await {
             if let Err(error) = output.send_outputs(&outputs).await {
@@ -114,7 +115,9 @@ pub async fn serve_until(
     // (an Abort still lands) until the last forwarder is done.
     let mut forwarders = JoinSet::new();
     let mut inflight: HashMap<String, AbortHandle> = HashMap::new();
-    loop {
+    // Whether the loop ended with the last forwarder of a stop (drained) or
+    // with the frontend gone.
+    let drained = loop {
         let inbound = tokio::select! {
             inbound = input.recv() => inbound,
             () = &mut shutdown, if !stopped => {
@@ -131,11 +134,14 @@ pub async fn serve_until(
             joined = forwarders.join_next(), if stopped || !forwarders.is_empty() => {
                 match joined {
                     Some(Ok(())) => continue,
-                    Some(Err(e)) => {
+                    Some(Err(e)) if e.is_panic() => {
                         tracing::error!("zmq engine {engine_index} forwarder panicked: {e}");
                         continue;
                     }
-                    None => break,
+                    // Aborted through its handle (the frontend's Abort below):
+                    // the normal end of a cancelled request, not a fault.
+                    Some(Err(_)) => continue,
+                    None => break true,
                 }
             }
         };
@@ -227,9 +233,21 @@ pub async fn serve_until(
             }
             Err(error) => {
                 tracing::info!("zmq engine {engine_index} input closed: {error}");
-                break;
+                break false;
             }
         }
+    };
+    if drained {
+        // The last forwarder's terminal batch is only in the funnel so far.
+        // Closing the funnel lets the writer end once everything queued is on
+        // the socket, and the rank returns after that, not before: the
+        // process exits right behind its last rank, and a batch still in the
+        // funnel would go with it.
+        drop(out_tx);
+        if let Err(e) = writer.await {
+            tracing::error!("zmq engine {engine_index} output writer panicked: {e}");
+        }
+        return;
     }
     // The input closed with forwarders still running: they finish on their
     // own, as before (their outputs go nowhere once the writer fails).

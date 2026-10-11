@@ -13,6 +13,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use engine_zmq_client::{
+    connect_handshake,
+    protocol::vllm::{
+        output::EngineCoreFinishReason, request::EngineCoreRequest,
+        sampling::EngineCoreSamplingParams,
+    },
+    EngineCoreClient,
+};
 use futures::StreamExt;
 use serde_json::json;
 use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
@@ -437,5 +445,114 @@ async fn a_second_signal_during_the_drain_exits_at_once() {
     assert!(
         log.contains("SIGTERM during the drain: exiting now with 1 request(s) in flight"),
         "log:\n{log}"
+    );
+}
+
+/// A request to a ZMQ rank for `max_tokens` tokens.
+fn zmq_request(request_id: &str, max_tokens: u32) -> EngineCoreRequest {
+    EngineCoreRequest {
+        request_id: request_id.to_string(),
+        prompt_token_ids: Some(vec![1, 2, 3, 4]),
+        sampling_params: Some(EngineCoreSamplingParams {
+            max_tokens,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
+    // Two requests in flight on a ZMQ rank: one the frontend gives up on
+    // during the drain (an Abort; the forwarder it cancels is no fault to
+    // log), one read to its end. A rank's output writer is what puts a batch
+    // on the socket, and the process exits the moment its last rank returns,
+    // so the terminal batch of the drained request has to be on the wire by
+    // then.
+    let dir = tempfile::tempdir().expect("a directory for the ipc endpoints");
+    let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+    let (handshake, input, output) = (
+        endpoint("hs.sock"),
+        endpoint("in.sock"),
+        endpoint("out.sock"),
+    );
+    let mock = Mock::start(&[
+        "--engine",
+        "realistic",
+        "--decode-base-ms",
+        DECODE_MS,
+        "--zmq-handshake",
+        &handshake,
+        "--zmq-count",
+        "1",
+    ]);
+    // The rank dials the frontend: binding the frontend's sockets here lets
+    // it register.
+    let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(20))
+        .await
+        .expect("the ZMQ rank registers with the frontend");
+    let client = EngineCoreClient::new(transport);
+
+    let mut drained = client
+        .submit(zmq_request("drained", 40))
+        .await
+        .expect("submit the request to drain");
+    let mut abandoned = client
+        .submit(zmq_request("abandoned", 400))
+        .await
+        .expect("submit the request to abandon");
+    let mut tokens = drained
+        .next()
+        .await
+        .expect("a first batch")
+        .expect("ok")
+        .new_token_ids
+        .len();
+    abandoned.next().await.expect("a first batch").expect("ok");
+
+    let sent = mock.signal("TERM");
+    // The frontend gives the long request up during the drain: its Abort
+    // reaches the rank, whose forwarder for it is cancelled.
+    drop(abandoned);
+
+    // The other request runs to its end, terminal batch included.
+    let finish = tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(item) = drained.next().await {
+            let output = item.expect("an output of the drained request");
+            tokens += output.new_token_ids.len();
+            if output.finished() {
+                return output.finish_reason;
+            }
+        }
+        None
+    })
+    .await
+    .expect("the drained request ends within 8 s");
+    assert_eq!(
+        finish,
+        Some(EngineCoreFinishReason::Length),
+        "the terminal batch of the drained request arrived"
+    );
+    assert_eq!(tokens, 40, "every token of the drained request arrived");
+
+    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
+    assert!(
+        exited - sent < Duration::from_secs(4),
+        "the rank returns with its last batch sent, before the deadline: {:?}",
+        exited - sent
+    );
+    assert!(
+        log.contains("SIGTERM: draining 2 in-flight request(s)"),
+        "both requests were counted; log:\n{log}"
+    );
+    assert!(log.contains("drained; exiting"), "log:\n{log}");
+    assert!(
+        !log.contains("forwarder panicked"),
+        "a forwarder cancelled by an Abort is not a panic; log:\n{log}"
+    );
+    assert!(
+        !log.contains("ERROR"),
+        "nothing is an error here; log:\n{log}"
     );
 }
