@@ -110,6 +110,7 @@ class Gateway:
         # The router's captured output (None while it goes to the terminal).
         self.log_path: str | None = None
         self._log_file: IO[Any] | None = None
+        self._log_is_temporary = False
         # The leg workers a PD/EPD gateway was started with (tests kill and restart them).
         self.encode_workers: list[Worker] = []
         self.prefill_workers: list[Worker] = []
@@ -305,16 +306,25 @@ class Gateway:
     def _open_log_file(self) -> IO[Any]:
         """The file the router's output goes to when it is not shown.
 
-        Under the log dir it is uploaded with the worker logs when a lane
-        fails; without one it goes to the temp dir.
+        It goes under the log dir given to ``start``, else under
+        ``E2E_LOG_DIR`` (the directory a failed lane's logs are uploaded
+        from, as for the workers). Without either it is a private, uniquely
+        named file in the temp dir, removed at shutdown unless the launch
+        failed (the error names it then).
         """
-        name = f"router-{self.port}.log"
-        if self.log_dir:
-            os.makedirs(self.log_dir, exist_ok=True)
-            path = os.path.join(self.log_dir, name)
+        log_dir = self.log_dir or os.environ.get("E2E_LOG_DIR")
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, f"router-{self.port}.log")
+            self._log_file = open(path, "w", encoding="utf-8")
+            self._log_is_temporary = False
         else:
-            path = os.path.join(tempfile.gettempdir(), f"smg-{name}")
-        self._log_file = open(path, "w", encoding="utf-8")
+            # Created exclusively with a random suffix and mode 0600: a shared
+            # temp dir may hold another user's file or a symlink at a
+            # predictable name.
+            fd, path = tempfile.mkstemp(prefix=f"smg-router-{self.port}-", suffix=".log")
+            self._log_file = os.fdopen(fd, "w", encoding="utf-8")
+            self._log_is_temporary = True
         self.log_path = path
         return self._log_file
 
@@ -361,7 +371,11 @@ class Gateway:
         stdout_target: int | IO[Any] | None = None
         stderr_target: int | IO[Any] | None = None
         if not show_output:
-            stdout_target = self._open_log_file()
+            try:
+                stdout_target = self._open_log_file()
+            except OSError:
+                self.shutdown()
+                raise
             stderr_target = subprocess.STDOUT
 
         try:
@@ -415,6 +429,13 @@ class Gateway:
                 kill_process_tree(self.process.pid)
             self.process = None
         self._close_log_file()
+        if self._log_is_temporary and self._started and self.log_path is not None:
+            # A launch that succeeded leaves no file behind in the temp dir.
+            try:
+                os.unlink(self.log_path)
+            except OSError:
+                pass
+            self.log_path = None
 
         if self._port_auto_allocated:
             release_port(self.port)

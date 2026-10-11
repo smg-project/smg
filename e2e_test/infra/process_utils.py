@@ -400,7 +400,9 @@ def wait_for_workers_ready(
         process: The router's process, when the caller launched it; its exit
             ends the wait at once with :class:`ProcessExitedError`.
         expected_urls: The worker URLs the router was started with; the ones
-            still missing at the deadline are named in the error.
+            still missing at the deadline are named in the error (a
+            data-parallel worker counts as registered once any of its ranks
+            is).
     """
     start = time.perf_counter()
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -417,8 +419,12 @@ def wait_for_workers_ready(
                     data = resp.json()
                     workers = data.get("workers", [])
                     connected_workers = data.get("total", len(workers))
+                    # A data-parallel worker registers each rank as
+                    # "<base>@<rank>" with the base URL in dp_base_url.
                     registered_urls = [
-                        w["url"] for w in workers if isinstance(w, dict) and "url" in w
+                        w.get("dp_base_url") or w["url"]
+                        for w in workers
+                        if isinstance(w, dict) and "url" in w
                     ]
                     if connected_workers >= expected_workers:
                         readiness_resp = session.get(

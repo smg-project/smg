@@ -8,8 +8,10 @@ last worker, so the three findings a readiness wait must report can be staged.
 from __future__ import annotations
 
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -34,6 +36,7 @@ FAKE_ROUTER = textwrap.dedent(
     parser.add_argument("--prometheus-port", type=int, required=True)
     parser.add_argument("--worker-urls", nargs="*", default=[])
     parser.add_argument("--fake", default="serve", choices=["serve", "exit", "hold-last"])
+    parser.add_argument("--fake-dp", action="store_true", help="register rank-suffixed URLs")
     args, _ = parser.parse_known_args()
 
     if args.fake == "exit":
@@ -58,7 +61,11 @@ FAKE_ROUTER = textwrap.dedent(
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/workers":
-                body = {"total": len(urls), "workers": [{"url": u} for u in urls]}
+                workers = [
+                    {"url": f"{u}@0", "dp_base_url": u} if args.fake_dp else {"url": u}
+                    for u in urls
+                ]
+                body = {"total": len(urls), "workers": workers}
             elif self.path == "/readiness":
                 body = {"status": "ready", "healthy_workers": len(urls)}
             elif self.path == "/health":
@@ -176,6 +183,74 @@ def test_the_timeout_names_the_workers_still_missing(fake_router):
     assert "workers: 1/2" in message
     assert f"missing: {WORKERS[1]}" in message
     assert "readiness: waiting for workers" in message
+
+
+def test_the_timeout_names_a_data_parallel_worker_by_its_base_url(fake_router):
+    gateway = Gateway()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            gateway.start(
+                worker_urls=WORKERS,
+                model_path="m",
+                timeout=4,
+                extra_args=["--fake", "hold-last", "--fake-dp"],
+            )
+    finally:
+        gateway.shutdown()
+    # The first worker's rank registered as "<url>@0": only the second is missing.
+    assert f"missing: {WORKERS[1]}, readiness" in str(excinfo.value)
+
+
+def test_the_log_goes_under_e2e_log_dir_when_start_gets_no_log_dir(
+    fake_router, tmp_path, monkeypatch
+):
+    log_dir = tmp_path / "e2e-logs"
+    monkeypatch.setenv("E2E_LOG_DIR", str(log_dir))
+    gateway = Gateway()
+    try:
+        with pytest.raises(ProcessExitedError):
+            gateway.start(
+                worker_urls=WORKERS, model_path="m", timeout=30, extra_args=["--fake", "exit"]
+            )
+    finally:
+        gateway.shutdown()
+    log = log_dir / f"router-{gateway.port}.log"
+    assert gateway.log_path == str(log)
+    assert "told to exit" in log.read_text(encoding="utf-8")
+
+
+def test_without_a_log_dir_the_log_is_a_private_temp_file(fake_router, monkeypatch):
+    monkeypatch.delenv("E2E_LOG_DIR", raising=False)
+    # A failed launch keeps the file: the error names it.
+    gateway = Gateway()
+    try:
+        with pytest.raises(ProcessExitedError) as excinfo:
+            gateway.start(
+                worker_urls=WORKERS, model_path="m", timeout=30, extra_args=["--fake", "exit"]
+            )
+    finally:
+        gateway.shutdown()
+    kept = Path(gateway.log_path)
+    try:
+        assert str(kept) in str(excinfo.value)
+        assert kept.parent == Path(tempfile.gettempdir())
+        assert kept.name.startswith(f"smg-router-{gateway.port}-")
+        assert kept.name.endswith(".log")
+        assert stat.S_IMODE(kept.stat().st_mode) == 0o600
+        assert "told to exit" in kept.read_text(encoding="utf-8")
+    finally:
+        kept.unlink(missing_ok=True)
+    # A launch that succeeded leaves nothing behind.
+    gateway = Gateway()
+    try:
+        gateway.start(worker_urls=WORKERS, model_path="m", timeout=15)
+        running = Path(gateway.log_path)
+        assert running.exists()
+        assert running.name.startswith(f"smg-router-{gateway.port}-")
+    finally:
+        gateway.shutdown()
+    assert not running.exists()
+    assert gateway.log_path is None
 
 
 def test_readiness_waits_stop_when_the_process_exits():
