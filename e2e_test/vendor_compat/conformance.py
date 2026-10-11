@@ -22,7 +22,8 @@ replays every member instead (nightly / dispatch use).
 Verdict → outcome:
 - ``exact`` / ``benign`` / ``mock-limited`` (content-bound)  -> pass
 - divergent + allowlisted in ``known_divergences.jsonl``     -> xfail
-- divergent + NOT allowlisted (or worse than allowlisted)    -> FAIL, with a
+- divergent + NOT allowlisted (or worse than allowlisted: a higher
+  severity, or an S1 kind the entry does not list)            -> FAIL, with a
   ready-to-paste ``TO-TRIAGE`` allowlist line in the failure message
 - no comparable replay (gated/skipped/stale probes)          -> skip
 """
@@ -212,6 +213,23 @@ def replay_health(records: dict) -> dict:
     }
 
 
+def replay_health_problem(health: dict, min_responded_fraction: float) -> str | None:
+    """Why a replay cannot be judged, or ``None`` when it can.
+
+    A replay in which nothing was attempted (every selected probe skipped:
+    cascading dependency skips, gated sentinels, a matrix change) would
+    otherwise turn every cluster into ``no-coverage`` and the suite green.
+    """
+    if not health["attempted"]:
+        return "no probe was attempted (every selected probe was skipped), so nothing was compared"
+    if health["responded_fraction"] < min_responded_fraction:
+        return (
+            f"only {health['responded']}/{health['attempted']} attempted probes got an "
+            "HTTP response"
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Per-cluster judgment
 # ---------------------------------------------------------------------------
@@ -244,10 +262,13 @@ def judge_cluster(provider: str, cluster: dict, member_ids, records: dict) -> di
         verdict = "exact"
 
     allowed = allowlist(provider).get(cluster.get("sig_hash"))
+    s1_kinds = sorted({e.get("s1_kind") for e in comparable if e.get("s1_kind")})
     if verdict in _DIVERGENT:
         if allowed is None:
             disposition = "new-divergence"
         elif compat_diff._SEV_RANK[verdict] < compat_diff._SEV_RANK.get(allowed.get("verdict"), 99):
+            disposition = "severity-escalation"
+        elif unlisted_s1_kinds(s1_kinds, allowed):
             disposition = "severity-escalation"
         else:
             disposition = "expected-divergence"
@@ -256,7 +277,6 @@ def judge_cluster(provider: str, cluster: dict, member_ids, records: dict) -> di
     else:
         disposition = "conformant"
 
-    s1_kinds = sorted({e.get("s1_kind") for e in comparable if e.get("s1_kind")})
     return {
         "disposition": disposition,
         "verdict": verdict,
@@ -264,6 +284,19 @@ def judge_cluster(provider: str, cluster: dict, member_ids, records: dict) -> di
         "entries": entries,
         "allowlisted": allowed,
     }
+
+
+def unlisted_s1_kinds(s1_kinds, allowed: dict) -> list:
+    """S1 kinds of the replay that the allowlist entry does not list.
+
+    An entry with ``s1_kinds`` grandfathers S1 of those kinds only: one written
+    for a ``server-error`` does not also cover a later ``accepts-invalid`` on
+    the same cluster. An entry without the field keeps the rank-only ceiling.
+    """
+    listed = allowed.get("s1_kinds") or []
+    if not listed:
+        return []
+    return sorted(set(s1_kinds) - set(listed))
 
 
 def triage_allowlist_line(provider: str, cluster: dict, outcome: dict) -> str:
@@ -302,10 +335,18 @@ def failure_message(provider: str, cluster: dict, outcome: dict) -> str:
         + (f" {outcome['s1_kinds']}" if outcome["s1_kinds"] else "")
     ]
     if outcome["disposition"] == "severity-escalation" and outcome["allowlisted"]:
-        lines.append(
-            f"allowlisted as {outcome['allowlisted'].get('verdict')} but now "
-            f"{outcome['verdict']} — the divergence got worse"
-        )
+        allowed = outcome["allowlisted"]
+        new_kinds = unlisted_s1_kinds(outcome["s1_kinds"], allowed)
+        if allowed.get("verdict") == outcome["verdict"] and new_kinds:
+            lines.append(
+                f"allowlisted as {outcome['verdict']} {allowed.get('s1_kinds')} but now "
+                f"also {new_kinds} — a new kind of status-class mismatch"
+            )
+        else:
+            lines.append(
+                f"allowlisted as {allowed.get('verdict')} but now "
+                f"{outcome['verdict']} — the divergence got worse"
+            )
     for e in divergent[:3]:
         notes = "; ".join(compat_diff.scrub(n) for n in e["notes"][:3])
         lines.append(

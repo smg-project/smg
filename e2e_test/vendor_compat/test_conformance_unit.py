@@ -205,6 +205,40 @@ def test_judge_severity_escalation(monkeypatch):
     assert out["disposition"] == "severity-escalation"
 
 
+def _s1_server_error_allowlist(cluster):
+    return {cluster["sig_hash"]: {"verdict": "S1", "s1_kinds": ["server-error"], "note": ""}}
+
+
+def test_judge_s1_kind_outside_the_allowlisted_kinds_escalates(monkeypatch):
+    # grandfathered: the gateway answered 5xx where the vendor gave 404 ...
+    cluster = _mini_cluster(status=404)
+    monkeypatch.setattr(
+        conformance, "allowlist", lambda provider: _s1_server_error_allowlist(cluster)
+    )
+    # ... but now it accepts what the vendor rejects: S1 of another kind
+    records = {m["id"]: _smg_record(m["id"], body=_matching_body()) for m in cluster["members"]}
+    out = conformance.judge_cluster("openai", cluster, ["t.probe.a", "t.probe.b"], records)
+    assert out["verdict"] == "S1"
+    assert out["s1_kinds"] == ["accepts-invalid"]
+    assert out["disposition"] == "severity-escalation"
+    message = conformance.failure_message("openai", cluster, out)
+    assert "['server-error'] but now also ['accepts-invalid']" in message
+
+
+def test_judge_s1_kind_within_the_allowlisted_kinds_is_expected(monkeypatch):
+    cluster = _mini_cluster(status=404)
+    monkeypatch.setattr(
+        conformance, "allowlist", lambda provider: _s1_server_error_allowlist(cluster)
+    )
+    records = {
+        m["id"]: _smg_record(m["id"], status=500, body={"error": "boom"})
+        for m in cluster["members"]
+    }
+    out = conformance.judge_cluster("openai", cluster, ["t.probe.a", "t.probe.b"], records)
+    assert out["s1_kinds"] == ["server-error"]
+    assert out["disposition"] == "expected-divergence"
+
+
 def test_judge_no_coverage_when_replay_missing(monkeypatch):
     _no_allowlist(monkeypatch)
     cluster = _mini_cluster()
@@ -221,6 +255,21 @@ def test_field_drift_is_s2_not_s1(monkeypatch):
     out = conformance.judge_cluster("openai", cluster, ["t.probe.a", "t.probe.b"], records)
     assert out["disposition"] == "new-divergence"
     assert out["verdict"] == "S2"
+
+
+def test_replay_health_problem_flags_an_empty_replay():
+    health = conformance.replay_health({"p": {"probe_id": "p", "skipped": True}})
+    assert health["attempted"] == 0
+    assert "nothing was compared" in conformance.replay_health_problem(health, 0.5)
+
+
+def test_replay_health_problem_flags_a_dead_gateway_and_passes_a_live_one():
+    live = _smg_record("a", body={})
+    dead = {"probe_id": "b", "recorded": False, "error": "connect"}
+    unhealthy = conformance.replay_health({"a": live, "b": dead, "c": dict(dead, probe_id="c")})
+    assert "1/3" in conformance.replay_health_problem(unhealthy, 0.5)
+    healthy = conformance.replay_health({"a": live, "b": dict(live, probe_id="b")})
+    assert conformance.replay_health_problem(healthy, 0.5) is None
 
 
 def test_triage_line_is_valid_allowlist_json(monkeypatch):

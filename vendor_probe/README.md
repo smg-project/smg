@@ -209,7 +209,8 @@ as `compat_diff` normalizes (ids/timestamps/model names/token counts →
 placeholders, volatile integers → 0); error bodies are kept verbatim (the S4
 envelope comparison needs their values), large 2xx bodies keep only the
 field-path skeleton. Output is fully deterministic (sorted clusters, members,
-keys), ~1.6 MB (OpenAI, 138 clusters) + ~0.7 MB (Anthropic, 26 clusters);
+keys): ~1.6 MB (OpenAI, 138 clusters) + ~0.7 MB (Anthropic, 26 clusters) for
+the all-tier 2026-08-21 set, 44 + 23 clusters for the curated 2026-10-09 set;
 `manifest.json` pins provenance (probe-set git sha, recording run id, models,
 counts, cost).
 
@@ -238,6 +239,13 @@ when reading a diff against it:
 - Both vendors refused the probes' image inputs (the 1x1 PNG, the wikimedia
   URL), so the image probes carry the vendors' `400` rather than a 200.
 
+This set is curated-tier only, and it is the one the conformance suite judges
+against: `conformance.baseline_date()` takes the newest dated directory, so
+the generated tier (the 6,549 + 5,118 members of 2026-08-21) is not replayed
+by the e2e suite until a `tier=all` dispatch (step 1 of "Refreshing the
+baselines") is distilled into a newer date. 2026-08-21 stays in the tree as
+the last all-tier recording, for `compat_diff --baseline` drift comparisons.
+
 `known_divergences.jsonl` for this date was regenerated with
 `--write-allowlist` from a replay against a gateway in front of a real engine
 (gRPC worker path); each entry's `note` names the tracking issue or the
@@ -254,9 +262,11 @@ raw vendor recordings — same severity ranking, same report format, plus stable
 cluster ids (`Bnnn`) and a regression gate: with `--allowlist`, any divergent
 cluster whose `sig_hash` is not in `known_divergences.jsonl` — or whose
 severity got worse than allowlisted — exits 1 (plus a replay-coverage floor so
-a dead gateway can't fake green). The checked-in allowlist grandfathers the
-150 divergent clusters present when the baseline was cut (133 OpenAI + 17
-Anthropic); the gate catches *regressions beyond that state*, and
+a dead gateway can't fake green). Each dated allowlist grandfathers the
+divergent clusters present when its baseline was cut (2026-08-21: 150 = 133
+OpenAI + 17 Anthropic, replayed against a canned mock; 2026-10-09: 50 = 33
+OpenAI + 17 Anthropic, replayed against a gateway in front of a real engine);
+the gate catches *regressions beyond that state*, and
 `--write-allowlist` regenerates a provider's lines after divergences are
 deliberately fixed or accepted.
 
@@ -283,7 +293,8 @@ python -m vendor_probe.compat_diff \
 
 The ongoing gate is an e2e suite that replays cluster representatives (up to 3
 member probes per cluster — first/middle/last of the sorted ids — plus
-dependency closure; ~380 requests total) against the PR lane's real gateway +
+dependency closure; ~130 requests with the 2026-10-09 clusters, ~380 with an
+all-tier set such as 2026-08-21) against the PR lane's real gateway +
 engine, and asserts every baseline cluster still holds structurally. One test
 per (surface, cluster); grandfathered divergences xfail; a new divergent
 cluster or a known one getting *worse* fails with a ready-to-paste
