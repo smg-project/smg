@@ -49,7 +49,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 # The launcher imports this module before it defines serve_grpc: the moment
 # the servicer switch has to be in place (see launcher_switch).
 from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
-from smg_grpc_servicer.vllm.loads import LoadTracker, scheduler_load_fields
+from smg_grpc_servicer.vllm.loads import LoadTracker, load_record, scheduler_load_fields
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
@@ -67,11 +67,13 @@ from smg_grpc_servicer.vllm.mm_salt import (
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
+    engine_reasoning_parser,
     mm_device_do_normalize,
     mm_item_limits,
     model_facts,
     running_window,
     server_facts,
+    structured_outputs_start,
 )
 from smg_grpc_servicer.vllm.trace_context import trace_headers
 
@@ -118,6 +120,23 @@ def _max_running_requests(engine) -> int:
     return running_window(getattr(engine, "vllm_config", None))
 
 
+def _first_rank(engine) -> int:
+    """The lowest data-parallel rank this servicer serves: the first of the
+    engine client's managed ranks (a slice of all the ranks under external or
+    hybrid load balancing, from ``data_parallel_rank`` on), else that start
+    rank from the config, else 0. ``GetLoads`` reports this rank, and its
+    pushed record is the one that carries the servicer's estimate, as the
+    first entry of the Rust servicer's ``GetLoads`` does."""
+    managed = getattr(getattr(engine, "engine_core", None), "engine_ranks_managed", None)
+    if isinstance(managed, (list, tuple, range)):
+        ranks = [rank for rank in managed if isinstance(rank, int)]
+        if ranks:
+            return min(ranks)
+    parallel = getattr(getattr(engine, "vllm_config", None), "parallel_config", None)
+    start = getattr(parallel, "data_parallel_rank", 0)
+    return start if isinstance(start, int) and start > 0 else 0
+
+
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
     """Best-effort read of the most recent ``SchedulerStats`` snapshot.
 
@@ -126,7 +145,8 @@ def _latest_scheduler_stats(engine, engine_idx: int = 0):
     reaches into ``engine.logger_manager.stat_loggers`` and returns the freshest
     snapshot, handling the logger-shape variants:
 
-    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats``
+    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats`` (its own
+      engine's, ``engine_index``; another index reads nothing from it)
     - ``AggregatedLoggingStatLogger`` (DP)   -> ``.last_scheduler_stats_dict[idx]``
     - ``PerEngineStatLoggerAdapter``         -> ``.per_engine_stat_loggers[idx]``
     - ``PrometheusStatLogger``               -> skipped (no cached snapshot)
@@ -142,7 +162,7 @@ def _latest_scheduler_stats(engine, engine_idx: int = 0):
         if isinstance(per, dict) and engine_idx in per:
             return per[engine_idx]
         stats = getattr(sl, "last_scheduler_stats", None)
-        if stats is not None:
+        if stats is not None and getattr(sl, "engine_index", 0) == engine_idx:
             return stats
         per_engine = getattr(sl, "per_engine_stat_loggers", None)
         if isinstance(per_engine, dict) and engine_idx in per_engine:
@@ -743,6 +763,12 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # pipeline to hold requests to; likewise absent from an older package.
         if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
             info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt, for the Router to shape a forced tool call's
+        # grammar by; likewise absent from an older package.
+        if "structured_outputs_start" in info.DESCRIPTOR.fields_by_name:
+            info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
+            info.structured_outputs_start = structured_outputs_start(self.engine.vllm_config)
         return info
 
     async def GetLoads(
@@ -767,9 +793,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         dropping the poll.
 
         Note: ``request.dp_rank`` and ``request.include`` are accepted but not yet
-        applied — vLLM reports a single DP rank (``dp_rank_count=1``) with only
-        core metrics, so there is nothing to filter. They are reserved for future
-        multi-DP / sectioned-metrics support.
+        applied — vLLM reports a single DP rank (the servicer's first, see
+        ``_first_rank``; ``dp_rank_count=1``) with only core metrics, so there is
+        nothing to filter. They are reserved for future multi-DP /
+        sectioned-metrics support.
 
         Args:
             request: The GetLoadsRequest protobuf
@@ -778,22 +805,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetLoadsResponse protobuf
         """
-        stats = _latest_scheduler_stats(self.engine)
-        if stats is not None:
-            num_running = int(getattr(stats, "num_running_reqs", 0) or 0)
-            num_waiting = int(getattr(stats, "num_waiting_reqs", 0) or 0)
-            kv_usage = float(getattr(stats, "kv_cache_usage", 0.0) or 0.0)
-        else:
-            num_running = 0
-            num_waiting = 0
-            kv_usage = 0.0
-
+        first_rank = _first_rank(self.engine)
+        num_running, num_waiting, kv_usage = self._scheduler_counts(first_rank) or (0, 0, 0.0)
         load = vllm_engine_pb2.SchedulerLoad(
             **scheduler_load_fields(
                 num_running,
                 num_waiting,
                 kv_usage,
                 self._loads.estimate(num_waiting),
+                dp_rank=first_rank,
                 max_total_num_tokens=_kv_capacity_tokens(self.engine),
                 max_running_requests=_max_running_requests(self.engine),
             )
@@ -805,6 +825,51 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             dp_rank_count=1,
             loads=[load],
         )
+
+    def _scheduler_counts(self, engine_idx: int = 0) -> tuple[int, int, float] | None:
+        """Running, waiting and KV usage from the latest ``SchedulerStats``
+        snapshot of the engine at ``engine_idx`` (the data-parallel rank),
+        what ``GetLoads`` and the pushed load record both report; ``None``
+        when there is none to read (no engine step yet, stats logging off,
+        or a rank the stat loggers do not keep apart)."""
+        stats = _latest_scheduler_stats(self.engine, engine_idx)
+        if stats is None:
+            return None
+        return (
+            int(getattr(stats, "num_running_reqs", 0) or 0),
+            int(getattr(stats, "num_waiting_reqs", 0) or 0),
+            float(getattr(stats, "kv_cache_usage", 0.0) or 0.0),
+        )
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries for the batch's rank
+        (the servicer's first rank when it names none, see ``_first_rank``):
+        that rank's own scheduler counts, with this servicer's queued-work
+        estimate on the first rank only, as the Rust servicer stamps its
+        batches. A rank whose snapshot the servicer cannot read gets no
+        record rather than another rank's figures; the first rank reports
+        zeros before its first snapshot, as ``GetLoads`` does."""
+        try:
+            first_rank = _first_rank(self.engine)
+            rank = first_rank if dp_rank is None else dp_rank
+            counts = self._scheduler_counts(rank)
+            if counts is None:
+                if rank != first_rank:
+                    return None
+                counts = (0, 0, 0.0)
+            num_running, num_waiting, kv_usage = counts
+            return load_record(
+                num_running,
+                num_waiting,
+                kv_usage,
+                self._loads.estimate(num_waiting) if rank == first_rank else None,
+                dp_rank=rank,
+                max_total_num_tokens=_kv_capacity_tokens(self.engine),
+                max_running_requests=_max_running_requests(self.engine),
+            )
+        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
+            logger.debug("load record unavailable", exc_info=True)
+            return None
 
     async def GetTokenizer(
         self,
@@ -1353,5 +1418,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             context,
             topic=str(getattr(config, "topic", "") or ""),
             hwm=getattr(config, "hwm", None),
+            load_source=self._load_record,
         ):
             yield proto_batch

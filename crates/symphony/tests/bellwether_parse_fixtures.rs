@@ -47,13 +47,20 @@
 //! engine finish the reference implies. A second test replays the fixtures' token-level chunk
 //! plans, each delta carrying its tokens' pieces as bellwether records them in `output_pieces`, and
 //! checks that every token is counted once, in the event that carries its first byte.
+//!
+//! What a replay prints, per model: the cases that differ from the reference and nothing allows
+//! (`DIFFERS`, up to [`SHOWN`] of them) and the summary line of its sets. The per-case report, one
+//! verdict line per case with the reason of a listed one, followed by the failures, goes to a file
+//! per test under `BELLWETHER_REPORT_DIR`, or under the build's `target/tmp` when the variable is
+//! not set, and the run says where. `BELLWETHER_VERBOSE=1` prints the per-case report on stdout
+//! too, as the run did before it went to a file.
 
 mod common;
 
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, BufWriter, Write},
     num::NonZeroUsize,
     path::PathBuf,
     sync::{
@@ -83,6 +90,13 @@ const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 /// thousand cases in minutes, and a nightly run, which leaves it unset, replays them all. The
 /// hand-written [`COMMON_SET`] is replayed whole whatever the step. The run says so.
 const SAMPLE_ENV: &str = "SYMPHONY_SAMPLE_EVERY";
+/// Set to anything but empty or `0`, the per-case report is printed on stdout as well.
+const VERBOSE_ENV: &str = "BELLWETHER_VERBOSE";
+/// The directory the per-case reports are written to; the build's `target/tmp` when it is not set.
+const REPORT_DIR_ENV: &str = "BELLWETHER_REPORT_DIR";
+/// How many differing cases of a model stdout shows, and how many failures the run's message
+/// lists; the rest are in the per-case report.
+const SHOWN: usize = 20;
 /// The hand-written set in every slug's directory: the probes (bellwether #16) and the parallel
 /// calls, a few cases that a sample must not thin.
 const COMMON_SET: &str = "common";
@@ -962,7 +976,11 @@ fn qwen3_parse_fixtures_match_the_reference() {
         "no parse fixtures under {}",
         root.display()
     );
-    let Parity { report, failures } = parity(
+    let Parity {
+        report,
+        summary,
+        failures,
+    } = parity(
         &fixtures,
         &ids,
         &|fixture| Family::Qwen3.engine(SLUG, fixture),
@@ -971,8 +989,95 @@ fn qwen3_parse_fixtures_match_the_reference() {
         &[],
         Family::Qwen3.think_markers(),
     );
-    print!("{report}");
-    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    let verbose = verbose();
+    let mut file = ReportFile::create("bellwether_parse_fixtures-qwen3-8b.txt")
+        .unwrap_or_else(|e| panic!("{e}"));
+    file.write(&report);
+    print!("{}", if verbose { &report } else { &summary });
+    let path = file.finish(&failures).unwrap_or_else(|e| panic!("{e}"));
+    println!("per-case report: {}", path.display());
+    assert!(
+        failures.is_empty(),
+        "\n{}",
+        message(&failures, verbose, &path)
+    );
+}
+
+/// Whether [`VERBOSE_ENV`] asks for the per-case report on stdout: set to anything but empty or
+/// `0`.
+fn verbose() -> bool {
+    std::env::var(VERBOSE_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
+/// A per-case report being written: `name` under [`REPORT_DIR_ENV`] or the build's `target/tmp`.
+/// A write that fails is kept and reported when the file is finished, so that the replay's
+/// closures need not handle it.
+struct ReportFile {
+    path: PathBuf,
+    file: BufWriter<fs::File>,
+    error: Option<std::io::Error>,
+}
+
+impl ReportFile {
+    /// Create the file, and its directory.
+    fn create(name: &str) -> Result<Self, String> {
+        let dir = std::env::var_os(REPORT_DIR_ENV)
+            .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let path = dir.join(name);
+        let file = fs::File::create(&path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        Ok(Self {
+            path,
+            file: BufWriter::new(file),
+            error: None,
+        })
+    }
+
+    /// Append `text`.
+    fn write(&mut self, text: &str) {
+        if let Err(e) = self.file.write_all(text.as_bytes()) {
+            self.error.get_or_insert(e);
+        }
+    }
+
+    /// Append the failures and close the file; its path, or the first error met.
+    fn finish(mut self, failures: &[String]) -> Result<PathBuf, String> {
+        for failure in failures {
+            self.write(failure);
+            self.write("\n");
+        }
+        if let Err(e) = self.file.flush() {
+            self.error.get_or_insert(e);
+        }
+        match self.error {
+            Some(e) => Err(format!("cannot write {}: {e}", self.path.display())),
+            None => Ok(self.path),
+        }
+    }
+}
+
+/// The run's failure message: every failure when the run is verbose, else [`capped`].
+fn message(failures: &[String], verbose: bool, report: &std::path::Path) -> String {
+    if verbose {
+        failures.join("\n")
+    } else {
+        capped(failures, report)
+    }
+}
+
+/// The first [`SHOWN`] of `failures`; the rest are counted, and the reader sent to the per-case
+/// report at `report`.
+fn capped(failures: &[String], report: &std::path::Path) -> String {
+    if failures.len() <= SHOWN {
+        return failures.join("\n");
+    }
+    format!(
+        "{}\n... and {} more, every one in {}",
+        failures[..SHOWN].join("\n"),
+        failures.len() - SHOWN,
+        report.display()
+    )
 }
 
 #[test]
@@ -991,6 +1096,9 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
     };
     let mut failures = Vec::new();
     let mut recorded = 0;
+    let verbose = verbose();
+    let mut file = ReportFile::create("bellwether_parse_fixtures-models.txt")
+        .unwrap_or_else(|e| panic!("{e}"));
     in_order(
         MODELS,
         |&(slug, family, prompt)| replay_model(&root, slug, family, prompt),
@@ -998,9 +1106,11 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
             Replayed::Skipped(notice) => eprintln!("{notice}"),
             Replayed::Compared {
                 report,
+                summary,
                 failures: of_model,
             } => {
-                print!("{report}");
+                file.write(&report);
+                print!("{}", if verbose { &report } else { &summary });
                 failures.extend(of_model);
                 recorded += 1;
             }
@@ -1012,15 +1122,23 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
             root.display()
         );
     }
-    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    let path = file.finish(&failures).unwrap_or_else(|e| panic!("{e}"));
+    println!("per-case report: {}", path.display());
+    assert!(
+        failures.is_empty(),
+        "\n{}",
+        message(&failures, verbose, &path)
+    );
 }
 
 /// What replaying one of [`MODELS`] gave: the notice for a slug the run leaves out, or the
-/// report a serial run would have printed for the model and the differences nothing allows.
+/// report a serial run would have printed for the model, what stdout shows of it, and the
+/// differences nothing allows.
 enum Replayed {
     Skipped(String),
     Compared {
         report: String,
+        summary: String,
         failures: Vec<String>,
     },
 }
@@ -1047,7 +1165,11 @@ fn replay_model(
         return Replayed::Skipped(format!("skipping {slug}: {reason}"));
     }
     let Cases { fixtures, ids } = read_fixtures(&dir).unwrap_or_else(|e| panic!("{e}"));
-    let Parity { report, failures } = parity(
+    let Parity {
+        report,
+        summary,
+        failures,
+    } = parity(
         &fixtures,
         &ids,
         &|fixture| family.engine(slug, fixture),
@@ -1058,6 +1180,7 @@ fn replay_model(
     );
     Replayed::Compared {
         report: format!("{slug} ({family:?}, {prompt:?}):\n{report}"),
+        summary: format!("{slug} ({family:?}, {prompt:?}):\n{summary}"),
         failures,
     }
 }
@@ -1072,23 +1195,24 @@ fn in_order<I: Sync, T: Send>(items: &[I], each: impl Fn(&I) -> T + Sync, then: 
         .map_or(1, NonZeroUsize::get)
         .min(items.len())
         .max(1);
-    in_order_on(threads, items, each, then);
+    in_order_on(threads, &AtomicBool::new(false), items, each, then);
 }
 
-/// [`in_order`] on `threads` threads.
+/// [`in_order`] on `threads` threads, with `stop` as the flag the thread that panics raises as it
+/// unwinds; no thread takes an item once it is up.
 fn in_order_on<I: Sync, T: Send>(
     threads: usize,
+    stop: &AtomicBool,
     items: &[I],
     each: impl Fn(&I) -> T + Sync,
     mut then: impl FnMut(T),
 ) {
     let next = AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
     let (tx, rx) = mpsc::channel();
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let tx = tx.clone();
-            let (next, stop, each) = (&next, &stop, &each);
+            let (next, each) = (&next, &each);
             scope.spawn(move || {
                 let _raised_on_panic = StopOnPanic(stop);
                 while !stop.load(Ordering::Relaxed) {
@@ -1128,10 +1252,40 @@ impl Drop for StopOnPanic<'_> {
 }
 
 /// What [`parity`] gave for a set: the report, one line per case and the set's summary, as a
-/// serial run would have printed it, and every difference that nothing allows.
+/// serial run would have printed it; what stdout shows of it, the first differing cases that
+/// nothing allows and the set's summary; and every difference that nothing allows.
 struct Parity {
     report: String,
+    summary: String,
     failures: Vec<String>,
+}
+
+/// The first differing cases of a set, as stdout shows them.
+#[derive(Default)]
+struct Shown {
+    lines: String,
+    differing: usize,
+}
+
+impl Shown {
+    /// Count one differing case, and keep its line while fewer than [`SHOWN`] are kept.
+    fn differs(&mut self, line: &str) {
+        self.differing += 1;
+        if self.differing <= SHOWN {
+            self.lines.push_str(line);
+        }
+    }
+
+    /// The lines kept, and how many more the per-case report has.
+    fn text(mut self) -> String {
+        if self.differing > SHOWN {
+            self.lines.push_str(&format!(
+                "  ... and {} more differing cases, every one in the per-case report\n",
+                self.differing - SHOWN
+            ));
+        }
+        self.lines
+    }
 }
 
 /// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
@@ -1159,6 +1313,7 @@ fn parity(
     };
     let mut failures = Vec::new();
     let mut out = String::new();
+    let mut shown = Shown::default();
     let (mut bitwise, mut separators_only, mut listed, mut allowed_count) = (0, 0, 0, 0);
     let (mut token_plans_run, mut without_pieces) = (0, 0);
     for fixture in fixtures {
@@ -1288,7 +1443,11 @@ fn parity(
                 fixture.id
             ));
         }
-        out.push_str(&format!("  {verdict:34} {}\n", fixture.id));
+        let line = format!("  {verdict:34} {}\n", fixture.id);
+        if verdict == "DIFFERS" {
+            shown.differs(&line);
+        }
+        out.push_str(&line);
         if let Some(listed_case) = known(&fixture.id) {
             out.push_str(&format!("  {:34} {}\n", "", listed_case.reason));
         }
@@ -1304,14 +1463,16 @@ fn parity(
         }
     }
     let sample = sample_note(sample_every());
-    out.push_str(&format!(
+    let totals = format!(
         "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, \
          {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} token plans \
          replayed, {without_pieces} cases without output_pieces\n",
         fixtures.len()
-    ));
+    );
+    out.push_str(&totals);
     Parity {
         report: out,
+        summary: shown.text() + &totals,
         failures,
     }
 }
@@ -1916,6 +2077,51 @@ fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
         .all(|known| known.id != REASONING_PROBE.id));
 }
 
+/// Spins until `ready` holds, for at most ten seconds, so that a test waiting on another thread's
+/// progress fails with `never` rather than hangs.
+fn wait_until(ready: impl Fn() -> bool, never: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(Instant::now() < deadline, "{never}");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn stdout_shows_the_first_differing_cases_and_counts_the_rest() {
+    let mut shown = Shown::default();
+    for i in 0..SHOWN + 3 {
+        shown.differs(&format!("  DIFFERS  m/parse/common-{i}\n"));
+    }
+    let text = shown.text();
+    assert_eq!(text.lines().count(), SHOWN + 1, "{text}");
+    assert!(
+        text.starts_with("  DIFFERS  m/parse/common-0\n")
+            && text
+                .ends_with("  ... and 3 more differing cases, every one in the per-case report\n"),
+        "{text}"
+    );
+    let mut few = Shown::default();
+    few.differs("  DIFFERS  m/parse/common-0\n");
+    assert_eq!(few.text(), "  DIFFERS  m/parse/common-0\n");
+    // The run's message lists the first failures the same way.
+    let failures: Vec<String> = (0..SHOWN + 2)
+        .map(|i| format!("m/parse/common-{i}: differs from the reference"))
+        .collect();
+    let report = std::path::Path::new("reports/parse.txt");
+    let listed = capped(&failures, report);
+    assert_eq!(listed.lines().count(), SHOWN + 1, "{listed}");
+    assert!(
+        listed.starts_with(&failures[0])
+            && listed.ends_with("\n... and 2 more, every one in reports/parse.txt"),
+        "{listed}"
+    );
+    assert_eq!(capped(&failures[..2], report), failures[..2].join("\n"));
+    // A verbose run's message is whole.
+    assert_eq!(message(&failures, true, report), failures.join("\n"));
+    assert_eq!(message(&failures, false, report), listed);
+}
+
 #[test]
 fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
     // Item 0 waits until item 1 is done, so on two threads item 1 finishes first and items 2
@@ -1925,14 +2131,14 @@ fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
     let mut handed = Vec::new();
     in_order_on(
         2,
+        &AtomicBool::new(false),
         &items,
         |&item| {
             if item == 0 {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !item_1_done.load(Ordering::Relaxed) {
-                    assert!(Instant::now() < deadline, "item 1 never finished");
-                    std::thread::yield_now();
-                }
+                wait_until(
+                    || item_1_done.load(Ordering::Relaxed),
+                    "item 1 never finished",
+                );
             }
             if item == 1 {
                 item_1_done.store(true, Ordering::Relaxed);
@@ -1946,38 +2152,43 @@ fn the_fan_out_hands_the_items_over_in_their_order_however_they_finish() {
 
 #[test]
 fn a_panic_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_more() {
-    // Item 0 panics at once; every other item waits for that panic and then a while longer, so
-    // the flag is up before any other thread looks for its next item: on two threads, the
-    // other thread finishes the one item it had and takes none of the six left.
-    let item_0_panicked = AtomicBool::new(false);
+    // On two threads, item 0 panics once the other thread has an item in flight, and that item
+    // ends once the panic has raised the flag: the other thread finishes the one item it had,
+    // finds the flag up when it looks for the next, and takes none of the six left. Nothing
+    // here waits a length of time; the item in flight waits for the flag itself, however long
+    // the unwind takes on a loaded host.
+    let stop = AtomicBool::new(false);
     let started = AtomicUsize::new(0);
     let items: Vec<usize> = (0..8).collect();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         in_order_on(
             2,
+            &stop,
             &items,
             |&item| {
                 if item == 0 {
-                    item_0_panicked.store(true, Ordering::Relaxed);
+                    wait_until(
+                        || started.load(Ordering::Relaxed) >= 1,
+                        "the other thread never started an item",
+                    );
                     panic!("item 0");
                 }
                 started.fetch_add(1, Ordering::Relaxed);
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !item_0_panicked.load(Ordering::Relaxed) {
-                    assert!(Instant::now() < deadline, "item 0 never panicked");
-                    std::thread::yield_now();
-                }
-                std::thread::sleep(Duration::from_millis(200));
+                wait_until(
+                    || stop.load(Ordering::Relaxed),
+                    "item 0's panic never raised the flag",
+                );
                 item
             },
             |_| {},
         );
     }));
     assert!(outcome.is_err(), "the panic reaches the caller");
-    let started = started.load(Ordering::Relaxed);
-    assert!(
-        started <= 1,
-        "{started} items started beside the one that panicked; the other thread had one in flight"
+    assert!(stop.load(Ordering::Relaxed), "the panic raised the flag");
+    assert_eq!(
+        started.load(Ordering::Relaxed),
+        1,
+        "the other thread finishes the item it had in flight and takes no more"
     );
 }
 

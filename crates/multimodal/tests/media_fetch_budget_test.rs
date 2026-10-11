@@ -16,8 +16,9 @@ use std::{
 use llm_multimodal::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
-use reqwest::Client;
 use tokio::process::Command;
+
+mod common;
 
 /// One HTTP/1.1 response for the first connection: the headers after
 /// `header_delay`, then `first` bytes of the body, then the rest after
@@ -67,7 +68,10 @@ fn serve_once(
 }
 
 fn connector(config: MediaConnectorConfig) -> MediaConnector {
-    let client = Client::builder().no_proxy().build().expect("client");
+    let client = common::http_client_builder()
+        .no_proxy()
+        .build()
+        .expect("client");
     MediaConnector::new(client, config).expect("media connector")
 }
 

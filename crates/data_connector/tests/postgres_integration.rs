@@ -25,11 +25,22 @@
 //! effect. Postgres doesn't serialize concurrent first-time DDL on the same
 //! table name, so running these in parallel against a fresh database races.
 
+use std::{
+    io::{Read, Write},
+    net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    thread,
+};
+
 use data_connector::{
     create_storage, HistoryBackend, NewConversation, NewConversationItem, PostgresConfig,
-    SchemaConfig, StorageBundle, StorageFactoryConfig, StoredResponse,
+    SchemaConfig, StorageBundle, StorageFactoryConfig, StoredResponse, TableConfig,
 };
 use serde_json::json;
+use tokio::task::JoinSet;
 
 fn test_db_url() -> Option<String> {
     std::env::var("DATA_CONNECTOR_TEST_POSTGRES_URL").ok()
@@ -105,6 +116,46 @@ async fn store_and_get_response_round_trips_json_columns() {
     assert_eq!(fetched_second.previous_response_id, Some(first_id));
     assert_eq!(fetched_second.input, second.input);
     assert_eq!(fetched_second.raw_response, second.raw_response);
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn storing_under_an_existing_id_replaces_the_row() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let resp = bundle.response_storage;
+
+    // A background response is stored as `queued` before its work starts and
+    // once more with its terminal object, under the one id its client polls.
+    let mut queued = StoredResponse::new(None);
+    queued.input = json!(["write a story"]);
+    queued.raw_response = json!({"id": queued.id.0, "status": "queued", "output": []});
+    let id = resp
+        .store_response(queued.clone())
+        .await
+        .expect("store the queued record");
+
+    let mut done = queued;
+    done.raw_response = json!({
+        "id": id.0,
+        "status": "completed",
+        "output": [{"type": "message", "id": "msg_1", "content": "once upon a time"}]
+    });
+    resp.store_response(done.clone())
+        .await
+        .expect("the second store must replace the row, not fail on the primary key");
+
+    let fetched = resp
+        .get_response(&id)
+        .await
+        .expect("get_response")
+        .expect("the record stays under its id");
+    assert_eq!(fetched.raw_response, done.raw_response);
+    assert_eq!(fetched.input, done.input);
 }
 
 #[tokio::test]
@@ -286,4 +337,358 @@ async fn find_response_by_output_item_queries_the_stored_output() {
         .await
         .expect("lookup after delete");
     assert!(gone.is_none());
+}
+
+/// A responses table a deployment brings itself, with its own column names:
+/// the store's `CREATE TABLE IF NOT EXISTS` leaves it as it is, so it has
+/// only what its owner gave it. `unique_id` decides whether the mapped id
+/// column carries a unique index. Returns the connection and the task that
+/// drives it (the connection ends with the set).
+async fn create_configured_responses_table(
+    db_url: &str,
+    table: &str,
+    unique_id: bool,
+) -> Result<(tokio_postgres::Client, JoinSet<()>), String> {
+    let (client, connection) = tokio_postgres::connect(db_url, tokio_postgres::NoTls)
+        .await
+        .map_err(|e| format!("connect to the test database: {e}"))?;
+    let mut driver = JoinSet::new();
+    driver.spawn(async move {
+        let _ = connection.await;
+    });
+    let id_def = if unique_id {
+        "response_key VARCHAR(64) PRIMARY KEY"
+    } else {
+        "response_key VARCHAR(64)"
+    };
+    client
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table}; \
+             CREATE TABLE {table} ({id_def}, conversation_id VARCHAR(64), \
+             previous_response_id VARCHAR(64), input JSON, created_at TIMESTAMPTZ, \
+             safety_identifier VARCHAR(128), model VARCHAR(128), payload JSON)"
+        ))
+        .await
+        .map_err(|e| format!("create the configured responses table: {e}"))?;
+    Ok((client, driver))
+}
+
+/// Storage over the configured table, with `id` mapped to `response_key`
+/// and `raw_response` to `payload`.
+async fn configured_table_bundle(db_url: &str, table: &str) -> Result<StorageBundle, String> {
+    let mut responses = TableConfig {
+        table: table.to_string(),
+        ..Default::default()
+    };
+    responses
+        .columns
+        .insert("id".to_string(), "response_key".to_string());
+    responses
+        .columns
+        .insert("raw_response".to_string(), "payload".to_string());
+    let postgres_cfg = PostgresConfig {
+        db_url: db_url.to_string(),
+        pool_max: 4,
+        schema: Some(SchemaConfig {
+            auto_migrate: true,
+            responses,
+            ..Default::default()
+        }),
+    };
+    create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&postgres_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await
+}
+
+/// A background response is stored as `queued` and once more with its
+/// terminal object under the one id, on a table the store did not create:
+/// the second store replaces the row whether or not the id column has a
+/// unique index, and concurrent first stores of one id leave one row.
+async fn a_configured_table_replaces_the_row_under_its_id(unique_id: bool) -> Result<(), String> {
+    let Some(db_url) = test_db_url() else {
+        return Ok(());
+    };
+    let table = if unique_id {
+        "configured_responses_unique"
+    } else {
+        "configured_responses_plain"
+    };
+    let (admin, _driver) = create_configured_responses_table(&db_url, table, unique_id).await?;
+    let resp = configured_table_bundle(&db_url, table)
+        .await?
+        .response_storage;
+
+    let mut queued = StoredResponse::new(None);
+    queued.input = json!(["write a story"]);
+    queued.raw_response = json!({"id": queued.id.0, "status": "queued", "output": []});
+    let id = resp
+        .store_response(queued.clone())
+        .await
+        .map_err(|e| format!("store the queued record: {e}"))?;
+
+    let mut done = queued;
+    done.raw_response = json!({
+        "id": id.0,
+        "status": "completed",
+        "output": [{"type": "message", "id": "msg_1", "content": "once upon a time"}]
+    });
+    resp.store_response(done.clone()).await.map_err(|e| {
+        format!(
+            "the second store must replace the row, with or without a unique index on the id: {e}"
+        )
+    })?;
+
+    let fetched = resp
+        .get_response(&id)
+        .await
+        .map_err(|e| format!("get_response: {e}"))?
+        .ok_or_else(|| "the record stays under its id".to_string())?;
+    assert_eq!(fetched.raw_response, done.raw_response);
+    assert_eq!(fetched.input, done.input);
+    let count_sql = format!("SELECT count(*) FROM {table} WHERE response_key = $1");
+    let rows: i64 = admin
+        .query_one(&count_sql, &[&id.0])
+        .await
+        .map_err(|e| format!("count the rows under the id: {e}"))?
+        .get(0);
+    assert_eq!(rows, 1, "one row under the id after two stores");
+
+    // Eight first stores of one fresh id at once.
+    let fresh = StoredResponse::new(None);
+    let mut writers = JoinSet::new();
+    for writer in 0..8 {
+        let resp = resp.clone();
+        let mut record = fresh.clone();
+        record.raw_response = json!({"id": fresh.id.0, "status": "queued", "writer": writer});
+        writers.spawn(async move { resp.store_response(record).await });
+    }
+    while let Some(stored) = writers.join_next().await {
+        stored
+            .map_err(|e| format!("the store task: {e}"))?
+            .map_err(|e| format!("a concurrent first store: {e}"))?;
+    }
+    let rows: i64 = admin
+        .query_one(&count_sql, &[&fresh.id.0])
+        .await
+        .map_err(|e| format!("count the rows under the fresh id: {e}"))?
+        .get(0);
+    assert_eq!(rows, 1, "one row under an id eight writers stored at once");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_configured_table_without_a_unique_id_replaces_the_row_under_its_id() {
+    a_configured_table_replaces_the_row_under_its_id(false)
+        .await
+        .expect("a configured table without a unique index on the id");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_configured_table_with_a_unique_id_replaces_the_row_under_its_id() {
+    a_configured_table_replaces_the_row_under_its_id(true)
+        .await
+        .expect("a configured table with a unique index on the id");
+}
+
+/// What a relay in front of the database counted: the server's ReadyForQuery
+/// messages (one per round trip the client waited for) and the client's
+/// statement Close messages (a statement prepared for one use is closed
+/// afterwards; a cached one is not).
+struct RoundTripMeter {
+    ready_for_query: Arc<AtomicUsize>,
+    closes: Arc<AtomicUsize>,
+}
+
+/// Copies one direction of a relayed connection and counts the messages of
+/// kind `wanted`, before the bytes go on, so a count is in place when the
+/// receiver acts on them. The client's first message (the startup) has no
+/// type byte; every later message of either side is a type byte and a
+/// length. (The store connects without TLS, so no SSL negotiation precedes
+/// the startup message.)
+fn pump(
+    mut from: TcpStream,
+    mut to: TcpStream,
+    startup_first: bool,
+    wanted: u8,
+    counter: Arc<AtomicUsize>,
+) {
+    let mut chunk = [0u8; 65536];
+    let mut buf: Vec<u8> = Vec::new();
+    let mut startup_pending = startup_first;
+    loop {
+        let n = match from.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        let mut at = 0;
+        loop {
+            if startup_pending {
+                if buf.len() < at + 4 {
+                    break;
+                }
+                let len =
+                    u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize;
+                if buf.len() < at + len {
+                    break;
+                }
+                at += len;
+                startup_pending = false;
+                continue;
+            }
+            if buf.len() < at + 5 {
+                break;
+            }
+            let len =
+                u32::from_be_bytes([buf[at + 1], buf[at + 2], buf[at + 3], buf[at + 4]]) as usize;
+            if buf.len() < at + 1 + len {
+                break;
+            }
+            if buf[at] == wanted {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            at += 1 + len;
+        }
+        buf.drain(..at);
+        if to.write_all(&chunk[..n]).is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown(Shutdown::Write);
+}
+
+/// Starts a relay on a free local port in front of the database `db_url`
+/// names and returns the url that goes through it, with its meter. The url
+/// shape is `scheme://[user:password@]host[:port][/...]`.
+fn relayed_database(db_url: &str) -> Result<(String, RoundTripMeter), String> {
+    let scheme_end = db_url
+        .find("://")
+        .ok_or_else(|| format!("no scheme in the database url {db_url}"))?
+        + 3;
+    let rest = &db_url[scheme_end..];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let (userinfo, host_port) = match authority.rfind('@') {
+        Some(i) => (&authority[..=i], &authority[i + 1..]),
+        None => ("", authority),
+    };
+    let upstream = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:5432")
+    };
+    let upstream_addr = upstream
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {upstream}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{upstream} resolves to nothing"))?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind the relay: {e}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| format!("the relay's address: {e}"))?;
+    let ready_for_query = Arc::new(AtomicUsize::new(0));
+    let closes = Arc::new(AtomicUsize::new(0));
+    let (ready, closed) = (ready_for_query.clone(), closes.clone());
+    thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { break };
+            let Ok(server) = TcpStream::connect(upstream_addr) else {
+                break;
+            };
+            let (Ok(client_rx), Ok(server_rx)) = (client.try_clone(), server.try_clone()) else {
+                break;
+            };
+            let closed = closed.clone();
+            thread::spawn(move || pump(client_rx, server, true, b'C', closed));
+            let ready = ready.clone();
+            thread::spawn(move || pump(server_rx, client, false, b'Z', ready));
+        }
+    });
+    let url = format!(
+        "{}{userinfo}{local}{}",
+        &db_url[..scheme_end],
+        &rest[authority_end..]
+    );
+    Ok((
+        url,
+        RoundTripMeter {
+            ready_for_query,
+            closes,
+        },
+    ))
+}
+
+/// A store costs the round trips of its path and nothing more, measured on
+/// the wire: `expected` per store, after the first store on the connection
+/// prepared the statement, and no statement closed between stores.
+async fn a_store_costs_the_round_trips_of_its_path(
+    unique_id: bool,
+    expected: usize,
+) -> Result<(), String> {
+    let Some(db_url) = test_db_url() else {
+        return Ok(());
+    };
+    let table = if unique_id {
+        "configured_responses_unique_relayed"
+    } else {
+        "configured_responses_plain_relayed"
+    };
+    let (_admin, _driver) = create_configured_responses_table(&db_url, table, unique_id).await?;
+    let (relayed_url, meter) = relayed_database(&db_url)?;
+    let resp = configured_table_bundle(&relayed_url, table)
+        .await?
+        .response_storage;
+
+    let mut first = StoredResponse::new(None);
+    first.raw_response = json!({"id": first.id.0, "status": "queued"});
+    resp.store_response(first.clone())
+        .await
+        .map_err(|e| format!("the first store: {e}"))?;
+    let ready_before = meter.ready_for_query.load(Ordering::SeqCst);
+    let closes_before = meter.closes.load(Ordering::SeqCst);
+
+    // A fresh id, then the first one replaced: both cost the same.
+    let mut second = StoredResponse::new(None);
+    second.raw_response = json!({"id": second.id.0, "status": "queued"});
+    resp.store_response(second)
+        .await
+        .map_err(|e| format!("the store of a fresh id: {e}"))?;
+    first.raw_response = json!({"id": first.id.0, "status": "completed"});
+    resp.store_response(first)
+        .await
+        .map_err(|e| format!("the store that replaces the first record: {e}"))?;
+
+    let round_trips = meter.ready_for_query.load(Ordering::SeqCst) - ready_before;
+    let closes = meter.closes.load(Ordering::SeqCst) - closes_before;
+    if round_trips != 2 * expected || closes != 0 {
+        return Err(format!(
+            "two stores took {round_trips} round trips and closed {closes} statements; \
+             expected {} and none",
+            2 * expected
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_store_is_one_round_trip_with_a_unique_index_on_the_id() {
+    a_store_costs_the_round_trips_of_its_path(true, 1)
+        .await
+        .expect("one round trip per store on a table with a unique index on the id");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_store_is_four_round_trips_without_a_unique_index_on_the_id() {
+    a_store_costs_the_round_trips_of_its_path(false, 4)
+        .await
+        .expect("four round trips per store on a table without a unique index on the id");
 }

@@ -812,7 +812,7 @@ def _bind_consecutive(ctx, kind, count, attempts=20):
 
 
 @pytest_asyncio.fixture
-async def bridge():
+async def bridge(request):
     ctx = zmq.asyncio.Context()
     base, pubs = _bind_consecutive(ctx, zmq.XPUB, 2)
     replay_base, routers = _bind_consecutive(ctx, zmq.ROUTER, 2)
@@ -822,6 +822,8 @@ async def bridge():
         topic="kv",
     )
     options = {"replay_timeout": 0.3, "recv_timeout": 0.1}
+    # Indirect parametrization adds relay options (a load source, its intervals).
+    options.update(getattr(request, "param", None) or {})
 
     async def handler(request, context):
         sources = kv_relay.rank_sources(config, range(len(pubs)))
@@ -1263,3 +1265,100 @@ def test_hash_check_is_off_unless_asked(caplog):
     normalizer = kv_relay.Normalizer()
     normalizer.normalize_batch(kv_relay.decode_batch(_batch([_store([1], [1, 2, 3, 4])])), 1)
     assert _checked(normalizer) == (0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Streaming: the load record on the stream
+# ---------------------------------------------------------------------------
+
+
+class _Loads:
+    """A load source the tests move: the record for any rank."""
+
+    def __init__(self):
+        self.record = common_pb2.EngineLoad(
+            running_requests=1, token_usage=0.25, cache_hit_rate=0.5, max_total_num_tokens=400
+        )
+
+    def __call__(self, rank):
+        copy = common_pb2.EngineLoad()
+        copy.CopyFrom(self.record)
+        return copy
+
+
+_LOADS = _Loads()
+_WITH_LOADS = {
+    "load_source": _LOADS,
+    "load_tick": 0.02,
+    "heartbeat_interval": 0.2,
+    "heartbeat_backoff": 1.0,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge", [_WITH_LOADS], indirect=True)
+async def test_every_relayed_batch_carries_the_servicers_load_record(bridge):
+    _LOADS.record.running_requests = 1
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(0, 0)
+    await bridge.publish(1, 0)
+    seen = [await read(call) for _ in range(2)]
+    assert [batch.sequence_number for batch in seen] == [1, 2]
+    assert [batch.load.sample for batch in seen] == [1, 2]
+    assert all(not batch.load.load_only for batch in seen)
+    assert all(batch.load.running_requests == 1 for batch in seen)
+    # The telemetry rides the first record only; the core rides every batch.
+    assert seen[0].load.cache_hit_rate == 0.5 and seen[0].load.max_total_num_tokens == 400
+    assert not seen[1].load.HasField("cache_hit_rate")
+    assert seen[1].load.token_usage == 0.25
+    call.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge", [_WITH_LOADS], indirect=True)
+async def test_an_idle_stream_heartbeats_a_load_only_batch_on_the_last_sequence(bridge):
+    _LOADS.record.running_requests = 1
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(1, 0)
+    first = await read(call)
+    assert (first.sequence_number, first.dp_rank) == (1, 1)
+    started = asyncio.get_running_loop().time()
+    beat = await read(call)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert beat.load.load_only and beat.sequence_number == 1 and beat.dp_rank == 1
+    assert beat.events == [] and beat.load.sample == 2
+    assert 0.1 < elapsed < 1.0, elapsed  # the heartbeat interval, not the backoff
+    assert beat.load.cache_hit_rate == 0.5  # the telemetry rides the heartbeat
+    call.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge", [_WITH_LOADS], indirect=True)
+async def test_a_changed_record_is_pushed_within_the_tick_without_an_event(bridge):
+    _LOADS.record.running_requests = 1
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(0, 0)
+    assert (await read(call)).sequence_number == 1
+    _LOADS.record.running_requests = 5
+    started = asyncio.get_running_loop().time()
+    pushed = await read(call)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert pushed.load.load_only and pushed.load.running_requests == 5
+    assert pushed.sequence_number == 1
+    assert elapsed < 0.15, elapsed  # the tick, not the heartbeat interval
+    call.cancel()
+
+
+@pytest.mark.asyncio
+async def test_without_a_load_source_the_stream_carries_cache_events_only(bridge):
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(0, 0)
+    batch = await read(call)
+    assert not batch.HasField("load")
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(call.read(), 0.5)  # no heartbeat either
+    call.cancel()

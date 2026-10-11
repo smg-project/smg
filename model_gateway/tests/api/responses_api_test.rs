@@ -5,8 +5,8 @@ use openai_protocol::{
     common::{GenerationRequest, UsageInfo},
     responses::{
         CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, RequireApprovalMode,
-        ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest, ResponsesToolChoice,
-        ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
+        ResponseContentPart, ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest,
+        ResponsesToolChoice, ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
     },
 };
 use smg::{
@@ -1023,6 +1023,228 @@ async fn test_conversations_crud_basic() {
     // Get again -> 404
     let not_found = conversations::get_conversation(&ctx.conversation_storage, conv_id).await;
     assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+}
+
+/// The router configuration of the conversation tests: OpenAI mode, no
+/// upstream calls, the memory storage backends.
+fn conversation_router_config() -> RouterConfig {
+    RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked()
+}
+
+/// The JSON body of a response that must be a 200.
+async fn ok_json(
+    response: axum::response::Response,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The public API answers a conversation created without metadata with
+/// `"metadata": {}` on creation and on retrieval; the field is never omitted.
+#[tokio::test]
+async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+    )
+    .await?;
+    assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
+
+    let conv_id = created["id"].as_str().expect("id missing");
+    let fetched =
+        ok_json(conversations::get_conversation(&ctx.conversation_storage, conv_id).await).await?;
+    assert_eq!(fetched["metadata"], serde_json::json!({}), "{fetched}");
+    Ok(())
+}
+
+/// A message added with a plain string content is stored, answered and
+/// listed with the typed `input_text` part the public API makes of it, the
+/// same shape a message added with typed parts has; the list carries the item
+/// objects alone, without a gateway-only `created_at` on them.
+#[tokio::test]
+async fn items_added_with_string_content_are_listed_as_typed_parts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+    )
+    .await?;
+    let conv_id = created["id"].as_str().expect("id missing");
+    let typed_first = serde_json::json!([{"type": "input_text", "text": "first"}]);
+    let typed_second = serde_json::json!([{"type": "input_text", "text": "second"}]);
+
+    let added = ok_json(
+        conversations::create_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            serde_json::json!({"items": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "user", "content": typed_second},
+            ]}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(added["data"][0]["content"], typed_first, "{added}");
+    assert_eq!(added["data"][1]["content"], typed_second, "{added}");
+
+    let first_id = added["data"][0]["id"].as_str().expect("item id missing");
+    let second_id = added["data"][1]["id"].as_str().expect("item id missing");
+
+    let listed = ok_json(
+        conversations::list_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            None,
+            Some("asc"),
+            None,
+        )
+        .await,
+    )
+    .await?;
+    let listed_items = listed["data"].as_array().expect("data");
+    assert_eq!(listed_items.len(), 2, "{listed}");
+    // The two items of one add call share their `added_at`, and the stores
+    // order such ties by the item id, so the list may answer them in either
+    // order: each item is looked up by its id.
+    let listed_content = |id: &str| {
+        listed_items
+            .iter()
+            .find(|item| item["id"] == id)
+            .map(|item| item["content"].clone())
+    };
+    assert_eq!(
+        listed_content(first_id).as_ref(),
+        Some(&typed_first),
+        "{listed}"
+    );
+    assert_eq!(
+        listed_content(second_id).as_ref(),
+        Some(&typed_second),
+        "{listed}"
+    );
+    for item in listed_items {
+        assert!(
+            item.get("created_at").is_none(),
+            "a listed item carries a field the public API's items do not: {item}"
+        );
+        assert_eq!(item["status"], "completed", "{item}");
+    }
+
+    let fetched = ok_json(
+        conversations::get_conversation_item(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            first_id,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(fetched["content"], typed_first, "{fetched}");
+    Ok(())
+}
+
+/// An assistant message added with a plain string content becomes the one
+/// `output_text` part (empty `annotations`) the public API makes of it, not
+/// an `input_text` part, which the public API refuses on an assistant message
+/// when the conversation's history is replayed; the add, the item GET and the
+/// list answer that part, and it deserializes as the typed content parts the
+/// history loaders replay upstream.
+#[tokio::test]
+async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+    )
+    .await?;
+    let conv_id = created["id"].as_str().expect("id missing");
+    let output_part =
+        serde_json::json!([{"type": "output_text", "text": "Hi there!", "annotations": []}]);
+
+    let added = ok_json(
+        conversations::create_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            serde_json::json!({"items": [
+                {"type": "message", "role": "assistant", "content": "Hi there!"},
+            ]}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(added["data"][0]["role"], "assistant", "{added}");
+    assert_eq!(added["data"][0]["content"], output_part, "{added}");
+    let item_id = added["data"][0]["id"].as_str().expect("item id missing");
+
+    let fetched = ok_json(
+        conversations::get_conversation_item(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            item_id,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(fetched["content"], output_part, "{fetched}");
+
+    let listed = ok_json(
+        conversations::list_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            conv_id,
+            None,
+            Some("asc"),
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(1), "{listed}");
+    assert_eq!(listed["data"][0]["content"], output_part, "{listed}");
+
+    // The parse both history loaders apply to a stored message before they
+    // replay it upstream: the typed parts, an `output_text` one here.
+    let parts: Vec<ResponseContentPart> = serde_json::from_value(fetched["content"].clone())?;
+    assert!(
+        matches!(
+            parts.as_slice(),
+            [ResponseContentPart::OutputText { text, annotations, .. }]
+                if text == "Hi there!" && annotations.is_empty()
+        ),
+        "{parts:?}"
+    );
+    Ok(())
 }
 
 #[test]

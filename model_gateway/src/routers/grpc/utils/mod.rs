@@ -5,6 +5,7 @@ mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
+mod stream_failure;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
@@ -27,5 +28,7 @@ pub(crate) use parsers::{
     check_reasoning_parser_availability, check_tool_parser_availability, continues_final_assistant,
     create_reasoning_parser, create_tool_parser, get_tool_parser,
     messages_reasoning_starts_in_prefill, reasoning_parser_requires_special_tokens,
-    reasoning_starts_in_prefill, should_mark_reasoning_started, ParserResolver,
+    reasoning_starts_in_prefill, should_mark_reasoning_started, tool_constraints_for_worker,
+    ParserResolver,
 };
+pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};

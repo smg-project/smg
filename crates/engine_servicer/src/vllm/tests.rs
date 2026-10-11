@@ -35,6 +35,7 @@ use smg_grpc_client::{
     tokenizer_bundle::{validate_bundle_sha256, with_extracted_bundle, StreamBundle},
     vllm_proto as vllm,
     vllm_proto::vllm_engine_client::VllmEngineClient,
+    WorkerMediaFault,
 };
 use tonic::{transport::Channel, Code};
 use tonic_health::pb::{
@@ -2545,20 +2546,45 @@ async fn malformed_media_refs_are_refused_before_processing() {
 
 /// A processor's verdict becomes the Python servicer's status: a caller
 /// error INVALID_ARGUMENT, a retryable one UNAVAILABLE (the Router re-selects
-/// a worker), a failure INTERNAL; a refused PD decode leg still notifies the
-/// engine.
+/// a worker), a failure INTERNAL; a failure of the request's media keeps the
+/// code its fault would have had and carries the fault as a trailer; a
+/// refused PD decode leg still notifies the engine.
 #[tokio::test]
 async fn media_processor_errors_map_to_statuses() {
-    for (outcome, code) in [
+    for (outcome, code, fault) in [
         (
             MediaError::Invalid("media_refs[0]: unsupported image".to_string()),
             Code::InvalidArgument,
+            None,
         ),
         (
             MediaError::Unavailable("sidecar_timeout: no result".to_string()),
             Code::Unavailable,
+            None,
         ),
-        (MediaError::Internal("boom".to_string()), Code::Internal),
+        (
+            MediaError::Internal("boom".to_string()),
+            Code::Internal,
+            None,
+        ),
+        (
+            MediaError::Media {
+                fault: WorkerMediaFault::Client,
+                message: "HTTP error while fetching media: HTTP status client error (404 Not \
+                          Found) for url (https://media.example/missing.png)"
+                    .to_string(),
+            },
+            Code::InvalidArgument,
+            Some(WorkerMediaFault::Client),
+        ),
+        (
+            MediaError::Media {
+                fault: WorkerMediaFault::Transient,
+                message: "media fetch timed out after 10s".to_string(),
+            },
+            Code::Unavailable,
+            Some(WorkerMediaFault::Transient),
+        ),
     ] {
         let processor = MockMediaProcessor::answering(Err(outcome.clone()));
         let mut h = harness_with(model_info(), None, Some(processor)).await;
@@ -2568,6 +2594,7 @@ async fn media_processor_errors_map_to_statuses() {
             Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
         let status = h.client.generate(request).await.expect_err("refused");
         assert_eq!(status.code(), code, "{outcome:?}");
+        assert_eq!(WorkerMediaFault::from_status(&status), fault, "{outcome:?}");
         let notice = recv_add(&mut h.engine_in).await;
         assert_eq!(notice.request_id, "mr6");
         assert!(notice.abort_immediately);
@@ -2707,6 +2734,38 @@ async fn server_info_advertises_the_engines_item_limits() {
         .unwrap()
         .into_inner();
     assert_eq!(info.mm_item_limits, "");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Where the engine starts a request's grammar on a thinking prompt is a fact
+/// of its config the launcher read: advertised with the reasoning parser's
+/// name so the Router shapes a forced tool call's grammar as the engine's own
+/// server would; a launcher that reported neither advertises neither.
+#[tokio::test]
+async fn server_info_advertises_where_the_engine_starts_a_grammar() {
+    let mut model = model_info();
+    model.engine_reasoning_parser = "glm45".to_string();
+    model.structured_outputs_start = "after_reasoning".to_string();
+    let mut h = harness_with(model, None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.engine_reasoning_parser, "glm45");
+    assert_eq!(info.structured_outputs_start, "after_reasoning");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let mut h = harness_with(model_info(), None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.engine_reasoning_parser, "");
+    assert_eq!(info.structured_outputs_start, "");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

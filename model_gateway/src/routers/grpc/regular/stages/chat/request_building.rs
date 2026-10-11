@@ -123,6 +123,28 @@ pub(crate) async fn build_chat_backed_plan(
         utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
     });
 
+    // Now that the worker is known, a forced call's grammar takes the shape
+    // its engine needs: the bare calls behind a reasoning parser's gate, the
+    // thought and then the calls from the first token (the worker's
+    // `structured_outputs_start` label; see `utils::tool_constraints_for_worker`).
+    // The unshaped constraint stays on the attempt stamp: a retry gives the
+    // worker it selects the same shaping (`helpers::ToolConstraintStamp`).
+    let tool_parser = ctx
+        .components
+        .parser_resolver
+        .tool_parser(&chat_request.model);
+    let unshaped_tool_constraints = tool_constraints.clone();
+    let tool_constraints = utils::tool_constraints_for_worker(
+        &ctx.components.tool_parser_factory,
+        tool_parser.as_deref(),
+        tool_constraints,
+        ctx.state.workers.as_ref(),
+    )
+    .map_err(|e| {
+        error!(function = "build_chat_backed_plan", error = %e, "Failed to shape the tool constraint for the worker");
+        error::internal_error("invalid_tool_constraint", format!("Invalid tool constraint: {e}"))
+    })?;
+
     // The ids are the prompt; the text rides along only when the request
     // carries media (see `helpers::wire_prompt_text`).
     let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
@@ -193,6 +215,11 @@ pub(crate) async fn build_chat_backed_plan(
         ctx.state.media_refs_forwarded = true;
     }
 
+    let tool_constraint = helpers::ToolConstraintStamp::capture(
+        unshaped_tool_constraints,
+        tool_parser.as_deref(),
+        &proto_request,
+    );
     Ok((
         ExecutionPlan::generate(plan_kind, proto_request),
         AttemptStamp {
@@ -200,6 +227,7 @@ pub(crate) async fn build_chat_backed_plan(
             sampling_mask,
             sampling_baseline,
             inject_pd_metadata,
+            tool_constraint,
         },
     ))
 }

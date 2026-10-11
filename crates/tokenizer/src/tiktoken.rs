@@ -901,6 +901,15 @@ impl TokenizerTrait for TiktokenTokenizer {
         }
     }
 
+    fn prefill_opens_think_block(&self) -> bool {
+        match self.renderer {
+            // The native renderers all report a thinking switch, so this flag
+            // (read only for a switchless template) mirrors `think_in_prefill`.
+            Renderer::KimiK3Xtml => self.think_in_prefill(),
+            _ => self.chat_template.prefill_opens_think_block(),
+        }
+    }
+
     fn renderer_capabilities(&self) -> RendererCapabilities {
         match self.renderer {
             // The K3 encoder parses `arguments` itself; the gateway forwards them as written.

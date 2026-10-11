@@ -10,6 +10,7 @@
 
 use std::{
     convert::Infallible,
+    future::{pending, Future},
     io,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -35,6 +36,7 @@ use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
     config::Config,
+    drain::InFlight,
     engine::{self, Engine, NewRequest},
 };
 
@@ -58,6 +60,17 @@ fn router(state: Arc<AppState>) -> Router {
 
 /// Serve the mock HTTP worker contract on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
+    serve_until(cfg, host, port, pending()).await;
+}
+
+/// Serve on `port` until `shutdown` resolves, then stop accepting connections
+/// and let the requests in flight finish (the drain of a termination signal).
+pub async fn serve_until(
+    cfg: Arc<Config>,
+    host: String,
+    port: u16,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let listener = match TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -79,7 +92,10 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
             tracing::warn!("http worker {port}: set_nodelay failed: {e}");
         }
     });
-    if let Err(e) = axum::serve(listener, router(state)).await {
+    if let Err(e) = axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         tracing::error!("http worker {port} stopped: {e}");
     }
 }
@@ -160,6 +176,9 @@ async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
 }
 
 async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
+    // In flight from here until the response is complete or its stream is
+    // done, so a shutdown knows what it waits for.
+    let in_flight = InFlight::enter();
     let parsed: Option<Value> = serde_json::from_slice(&body).ok();
     let stream_requested = parsed
         .as_ref()
@@ -199,7 +218,7 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         });
         let model = state.cfg.model_id.clone();
         return if stream_requested {
-            realistic_sse(rx, model, endpoint, cut).into_response()
+            realistic_sse(rx, model, endpoint, cut, in_flight).into_response()
         } else {
             realistic_completion(rx, model, prompt_tokens, endpoint, cut).await
         };
@@ -211,7 +230,7 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         tokio::time::sleep(state.cfg.gen_delay).await;
     }
     if stream_requested {
-        stream_chat(&state.cfg).into_response()
+        stream_chat(&state.cfg, in_flight).into_response()
     } else {
         Json(completion(&state.cfg)).into_response()
     }
@@ -238,7 +257,10 @@ fn completion(cfg: &Config) -> Value {
     })
 }
 
-fn stream_chat(cfg: &Config) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+fn stream_chat(
+    cfg: &Config,
+    in_flight: InFlight,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut events: Vec<Result<Event, Infallible>> = Vec::new();
     for _ in 0..cfg.output_tokens {
         let frame = json!({
@@ -255,7 +277,7 @@ fn stream_chat(cfg: &Config) -> Sse<impl Stream<Item = Result<Event, Infallible>
     });
     events.push(Ok(Event::default().data(final_frame.to_string())));
     events.push(Ok(Event::default().data("[DONE]")));
-    Sse::new(stream::iter(events))
+    Sse::new(in_flight.until_done(stream::iter(events)))
 }
 
 // ── Realistic responses ─────────────────────────────────────────────────────
@@ -353,8 +375,9 @@ fn realistic_sse(
     model: String,
     endpoint: Endpoint,
     cut: Option<(u32, u16, Arc<AtomicU64>)>,
+    in_flight: InFlight,
 ) -> Sse<impl Stream<Item = Result<Event, io::Error>>> {
-    Sse::new(realistic_frames(rx, model, endpoint, cut))
+    Sse::new(in_flight.until_done(realistic_frames(rx, model, endpoint, cut)))
 }
 
 /// The frames of [`realistic_sse`].

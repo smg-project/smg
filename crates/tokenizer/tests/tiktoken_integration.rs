@@ -21,6 +21,8 @@ use llm_tokenizer::{
     traits::{Decoder, Encoder, Tokenizer as TokenizerTrait},
 };
 
+mod common;
+
 // -- Download configuration --
 
 const KIMI_K2_MODEL_ID: &str = "moonshotai/Kimi-K2-Instruct";
@@ -58,7 +60,7 @@ fn ensure_kimi_k2_cached() -> PathBuf {
         fs::create_dir_all(&cache_dir).expect("Failed to create Kimi K2 cache directory");
     }
 
-    let client = reqwest::blocking::Client::builder()
+    let client = common::http_client_builder()
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .expect("Failed to build reqwest client");

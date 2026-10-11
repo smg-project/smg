@@ -35,6 +35,7 @@ from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     default_socket_dir,
@@ -42,6 +43,10 @@ from smg_grpc_servicer.rust_lifecycle import (
     free_port,
     resolve_tokenizer_dir,
     supervise,
+)
+from smg_grpc_servicer.structured_outputs import (
+    grammar_start_labels,
+    tokenspeed_structured_outputs_start,
 )
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
@@ -53,6 +58,7 @@ SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS"
+STARTUP_CEILING_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
@@ -210,6 +216,9 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
+    # The engine's reasoning parser and where it starts a grammar on a thinking
+    # prompt, as the Python servicer adds them.
+    args_dict.update(grammar_start_labels(server_args, tokenspeed_structured_outputs_start()))
     kv_events = resolve_kv_events_config(server_args)
     try:
         from tokenspeed.version import __version__ as tokenspeed_version
@@ -344,21 +353,30 @@ async def serve_rust(server_args: Any) -> int:
             "No local tokenizer directory for %s; string stops will be refused",
             getattr(server_args, "model", ""),
         )
+    startup_timeout_secs = env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
+    startup_ceiling_secs = env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
     server = TokenSpeedGrpcServer(
         bind_address=host_port(host, port),
         ipc_base_url=f"ipc://{socket_dir}/tokenspeed-servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=engine_count,
         tokenizer_dir=tokenizer_dir,
-        engine_startup_timeout_secs=env_float(
-            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
-        ),
+        engine_startup_timeout_secs=startup_timeout_secs,
+        engine_startup_ceiling_secs=startup_ceiling_secs,
         **facts,
     )
     logger.info(
         "Rust TokenSpeed servicer listening on %s; headless scheduler(s) dial handshake port %d",
         server.address,
         handshake_port,
+    )
+    logger.info(
+        "Scheduler startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+        "the handshake waits while the scheduler process is alive",
+        startup_timeout_secs,
+        STARTUP_TIMEOUT_SECS_ENV,
+        f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
+        STARTUP_CEILING_SECS_ENV,
     )
     engine = launch_headless_scheduler(
         headless_server_args(server_args, handshake_port=handshake_port)

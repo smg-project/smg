@@ -91,7 +91,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::core::config::McpTransport;
+    use crate::core::{config::McpTransport, orchestrator::http_client_builder};
 
     #[test]
     fn test_resolve_proxy_no_config() {
@@ -202,7 +202,7 @@ mod tests {
             password: None,
         };
 
-        let builder = reqwest::Client::builder();
+        let builder = http_client_builder();
         let result = apply_proxy_to_builder(builder, &proxy);
         assert!(result.is_ok(), "Should apply proxy to builder");
         assert!(result.unwrap().build().is_ok(), "Should build client");
@@ -218,7 +218,7 @@ mod tests {
             password: Some("pass".to_string()),
         };
 
-        let builder = reqwest::Client::builder();
+        let builder = http_client_builder();
         let result = apply_proxy_to_builder(builder, &proxy);
         assert!(
             result.is_ok(),
@@ -237,7 +237,7 @@ mod tests {
             password: None,
         };
 
-        let builder = reqwest::Client::builder();
+        let builder = http_client_builder();
         let result = apply_proxy_to_builder(builder, &proxy);
         assert!(result.is_err(), "Should fail with invalid proxy URL");
     }

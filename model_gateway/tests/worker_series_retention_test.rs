@@ -26,7 +26,9 @@ use smg::{
 const URL: &str = "grpc://[fd00::1]:50051";
 
 async fn scrape(addr: SocketAddr) -> String {
-    reqwest::get(format!("http://{addr}/metrics"))
+    smg::http_client::client()
+        .get(format!("http://{addr}/metrics"))
+        .send()
         .await
         .expect("metrics endpoint reachable")
         .text()

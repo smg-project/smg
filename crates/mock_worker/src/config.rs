@@ -41,6 +41,10 @@ pub struct Config {
     /// Port of the process-wide admin API (fleet, request records, cache
     /// dumps, resets); off when `None`.
     pub admin_port: Option<u16>,
+    /// How long a termination signal (SIGTERM or SIGINT) lets the requests
+    /// in flight finish before the process exits regardless; no worker
+    /// accepts new work from the signal on.
+    pub drain_timeout: Duration,
     /// Context length advertised to the gateway (`max_context_length`,
     /// `max_req_input_len`, `max_model_len`).
     pub context_length: u32,
@@ -157,6 +161,7 @@ impl Default for Config {
             realistic: false,
             engine: EngineParams::default(),
             admin_port: None,
+            drain_timeout: Duration::from_secs(5),
             context_length: 32768,
             grpc_max_message_bytes: usize::MAX,
             kv_events_zmq_base_port: None,
@@ -271,6 +276,11 @@ impl Config {
                     block_size_given = true;
                 }
                 "--admin-port" => cfg.admin_port = Some(parse(value(&mut args, &flag)?, &flag)?),
+                "--drain-timeout-secs" => {
+                    let secs: f64 = parse(value(&mut args, &flag)?, &flag)?;
+                    cfg.drain_timeout =
+                        Duration::try_from_secs_f64(secs).map_err(|e| format!("{flag}: {e}"))?;
+                }
                 "--prefix-cache" => {
                     cfg.engine.prefix_cache = parse(value(&mut args, &flag)?, &flag)?
                 }
@@ -413,7 +423,9 @@ fn usage() -> String {
        --loads-like <mock|vllm>  load report: everything the simulator knows, or only what the\n\
                                 vLLM servicer reports (running, waiting, token_usage, maxima)\n\
        --admin-port <port>      process-wide admin API: fleet, request records with the\n\
-                                arrival-time oracle, cache dumps, resets (default off)"
+                                arrival-time oracle, cache dumps, resets (default off)\n\
+       --drain-timeout-secs <s> on SIGTERM or SIGINT, how long the requests in flight may\n\
+                                finish before the process exits regardless (default 5)"
         .to_string()
 }
 
@@ -444,6 +456,26 @@ mod tests {
             Config::default().kv_zmq_for(0, 0).is_none(),
             "no publisher for a canned worker"
         );
+    }
+
+    #[test]
+    fn drain_timeout_flag_is_seconds_and_must_be_a_duration() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let cfg = parse(&grpc).expect("gRPC flags parse");
+        assert_eq!(
+            cfg.drain_timeout,
+            Duration::from_secs(5),
+            "the default drain"
+        );
+
+        let cfg = parse(&[&grpc[..], &["--drain-timeout-secs", "0.5"]].concat())
+            .expect("fractional seconds parse");
+        assert_eq!(cfg.drain_timeout, Duration::from_millis(500));
+        assert!(
+            parse(&[&grpc[..], &["--drain-timeout-secs", "-1"]].concat()).is_err(),
+            "a negative drain is refused"
+        );
+        assert!(parse(&[&grpc[..], &["--drain-timeout-secs", "soon"]].concat()).is_err());
     }
 
     #[test]

@@ -373,7 +373,6 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 #[cfg(test)]
 mod tests {
     use axum::{routing::get, Json, Router};
-    use reqwest::Client;
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -412,7 +411,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &Client::new(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
             .await
             .unwrap();
         server.abort();
@@ -428,7 +427,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &Client::new(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
             .await
             .unwrap();
         server.abort();
@@ -449,7 +448,7 @@ mod tests {
         );
         let (url, server) = serve_router(router).await;
 
-        let runtime = detect_http_backend(&url, 5, &Client::new(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
             .await
             .unwrap();
         server.abort();
@@ -465,9 +464,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let err = detect_http_backend(&format!("http://{addr}"), 1, &Client::new(), None)
-            .await
-            .unwrap_err();
+        let err = detect_http_backend(
+            &format!("http://{addr}"),
+            1,
+            &crate::http_client::client(),
+            None,
+        )
+        .await
+        .unwrap_err();
 
         assert!(err.contains("Could not detect HTTP backend"), "got: {err}");
     }
@@ -478,7 +482,7 @@ mod tests {
         // retries instead of registering a backend with nothing to serve.
         let (url, server) = serve_router(models_route(json!({"object": "list", "data": []}))).await;
 
-        let result = detect_http_backend(&url, 5, &Client::new(), None).await;
+        let result = detect_http_backend(&url, 5, &crate::http_client::client(), None).await;
         server.abort();
 
         result.unwrap_err();
@@ -492,7 +496,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &Client::new(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
             .await
             .unwrap();
         server.abort();

@@ -656,7 +656,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_sglang_http_metadata() {
-        let labels = fetch_sglang_http_metadata(&Client::new(), "http://0.0.0.0:30000", None).await;
+        let labels =
+            fetch_sglang_http_metadata(&crate::http_client::client(), "http://0.0.0.0:30000", None)
+                .await;
         dump_labels("SGLang HTTP combined", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("tokenizer_path"));
@@ -665,7 +667,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_vllm_http_metadata() {
-        let labels = fetch_vllm_http_metadata(&Client::new(), "http://0.0.0.0:20000", None).await;
+        let labels =
+            fetch_vllm_http_metadata(&crate::http_client::client(), "http://0.0.0.0:20000", None)
+                .await;
         dump_labels("vLLM HTTP", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("version"));
@@ -758,8 +762,12 @@ mod tests {
                 .unwrap();
         });
 
-        let labels =
-            fetch_sglang_http_metadata(&Client::new(), &format!("http://{addr}"), None).await;
+        let labels = fetch_sglang_http_metadata(
+            &crate::http_client::client(),
+            &format!("http://{addr}"),
+            None,
+        )
+        .await;
         server.abort();
 
         assert_eq!(

@@ -23,6 +23,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::{pending, Future},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -73,6 +74,18 @@ fn router(state: Arc<AdminState>) -> Router {
 
 /// Serve the admin API on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
+    serve_until(cfg, host, port, pending()).await;
+}
+
+/// Serve the admin API on `port` until `shutdown` resolves (the drain of a
+/// termination signal): the requests in flight are answered, no new one is
+/// accepted.
+pub async fn serve_until(
+    cfg: Arc<Config>,
+    host: String,
+    port: u16,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let listener = match TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -81,7 +94,10 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
         }
     };
     let state = Arc::new(AdminState { cfg });
-    if let Err(e) = axum::serve(listener, router(state)).await {
+    if let Err(e) = axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         tracing::error!("admin server stopped: {e}");
     }
 }

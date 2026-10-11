@@ -78,24 +78,33 @@ pub(crate) fn effective_weight_version<'a>(
 ///
 /// Handles the two chunk conventions (`ChunkSemantics`):
 /// - delta streams send per-chunk token counts (must accumulate)
-/// - cumulative streams send the count in the Complete message
+/// - cumulative streams send the count in the Complete message, and the
+///   running count in every chunk before it
 pub(crate) struct CompletionTokenTracker {
     tokens: HashMap<u32, u32>,
+    /// The running count a cumulative stream reported in its latest chunk:
+    /// how far it had come, for a stream that ends before its Complete.
+    reported: HashMap<u32, u32>,
 }
 
 impl CompletionTokenTracker {
     pub fn new() -> Self {
         Self {
             tokens: HashMap::new(),
+            reported: HashMap::new(),
         }
     }
 
     /// Record tokens from a streaming chunk.
     /// Delta streams accumulate the chunk's token count; cumulative streams
-    /// report it in Complete instead, so this is a no-op for them.
+    /// report it in Complete instead, so a chunk of theirs only notes the
+    /// running count it carries.
     pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
         if chunk.chunk_semantics().is_delta() {
             *self.tokens.entry(chunk.index()).or_insert(0) += chunk.token_ids().len() as u32;
+        } else {
+            self.reported
+                .insert(chunk.index(), chunk.completion_tokens());
         }
     }
 
@@ -115,6 +124,19 @@ impl CompletionTokenTracker {
     /// Get total completion tokens across all indices
     pub fn total(&self) -> u32 {
         self.tokens.values().sum()
+    }
+
+    /// Completion tokens delivered so far across all indices: the count
+    /// [`total`](Self::total) knows, else the running count a cumulative
+    /// stream last reported. How far a stream that ends before its Complete
+    /// had come.
+    pub fn delivered(&self) -> u32 {
+        let mut per_index = self.reported.clone();
+        for (index, tokens) in &self.tokens {
+            let known = per_index.entry(*index).or_insert(0);
+            *known = (*known).max(*tokens);
+        }
+        per_index.values().sum()
     }
 }
 
@@ -245,6 +267,36 @@ mod tests {
             7,
             "cumulative stream reports it in Complete"
         );
+    }
+
+    #[test]
+    fn delivered_tokens_follow_a_stream_that_ends_before_complete() {
+        // Cumulative stream: a chunk carries the running count; the total is
+        // unknown until Complete, the delivered count is not.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(tracker.total(), 0, "no authoritative count before Complete");
+        assert_eq!(
+            tracker.delivered(),
+            41,
+            "the running count the engine reported"
+        );
+        tracker.record_complete(&complete(0, 0, 42));
+        assert_eq!((tracker.total(), tracker.delivered()), (42, 42));
+
+        // Delta stream: the accumulated chunks are both.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+            token_ids: vec![1, 2, 3],
+            ..Default::default()
+        }));
+        assert_eq!((tracker.total(), tracker.delivered()), (3, 3));
     }
 
     #[test]

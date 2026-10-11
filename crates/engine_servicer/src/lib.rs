@@ -57,16 +57,18 @@ pub(crate) type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Se
 /// How long a servicer waits for a sign of life from its engine during the
 /// ZMQ handshake before it reports the link failed. An engine's start includes
 /// model load, kernel JIT and graph capture, and nothing crosses the wire
-/// between its first handshake message and its last; for the vLLM servicer the
-/// lifecycle owner reports the engine process alive while it polls it
-/// ([`VllmServicerServer::note_engine_alive`]), so a healthy start that
+/// between its first handshake message and its last; the lifecycle owner
+/// reports the engine process alive while it polls it
+/// ([`VllmServicerServer::note_engine_alive`],
+/// [`SglangServicerServer::note_engine_alive`],
+/// [`TokenSpeedServicerServer::note_engine_alive`]), so a healthy start that
 /// outlasts this bound still completes, under
 /// [`DEFAULT_ENGINE_STARTUP_CEILING`]. A dead engine never waits this long:
 /// the lifecycle owner stops the servicer when the process exits.
 pub const DEFAULT_ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// The most a vLLM servicer's engine start may take however alive the engine
-/// is: a bound on an engine that stays alive without ever completing its
+/// The most a servicer's engine start may take however alive the engine is: a
+/// bound on an engine that stays alive without ever completing its
 /// handshake. Large checkpoints have taken over half an hour to load on a
 /// cold start; four hours leaves room for the storage path, with the knob
 /// above it for anything slower.

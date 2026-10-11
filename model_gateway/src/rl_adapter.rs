@@ -96,7 +96,7 @@ mod tests {
     /// worker (HTTP version, TLS identity, pool tuning), not a second one.
     #[test]
     fn view_hands_out_the_worker_negotiated_http_client() {
-        let client = Arc::new(reqwest::Client::new());
+        let client = Arc::new(crate::http_client::client());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://engine:30000")
                 .connection_mode(ConnectionMode::Http)

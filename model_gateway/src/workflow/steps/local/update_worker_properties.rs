@@ -231,7 +231,7 @@ mod tests {
 
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: reqwest::Client::new(),
+            client: crate::http_client::client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
@@ -571,7 +571,7 @@ mod tests {
     /// entry the old worker was keeping alive.
     #[tokio::test]
     async fn http_update_adopts_the_materialized_shared_client() {
-        let client = Arc::new(reqwest::Client::new());
+        let client = Arc::new(crate::http_client::client());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w:8080")
                 .http_client(Arc::clone(&client))
@@ -597,7 +597,7 @@ mod tests {
     async fn http_update_preserves_http2() {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w:8080")
-                .http_client(Arc::new(reqwest::Client::new()))
+                .http_client(Arc::new(crate::http_client::client()))
                 .http2(true)
                 .status(WorkerStatus::Ready)
                 .build(),

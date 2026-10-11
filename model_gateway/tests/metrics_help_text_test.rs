@@ -56,7 +56,9 @@ async fn every_smg_family_has_help_text() {
     Metrics::record_worker_cb_transition(worker, "closed", "open");
     Metrics::record_kv_event_lag(worker, 0.004);
 
-    let body = reqwest::get(format!("http://{addr}/metrics"))
+    let body = smg::http_client::client()
+        .get(format!("http://{addr}/metrics"))
+        .send()
         .await
         .expect("metrics endpoint reachable")
         .text()

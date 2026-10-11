@@ -267,7 +267,7 @@ jobs:
           pytest -q grpc_servicer/tests -rs
 
       - name: Run CI tooling unit tests
-        run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py scripts/tests/test_ci_gpu_runner_image.py
+        run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py scripts/tests/test_ci_tokenspeed_scheduler_pin.py scripts/tests/test_ci_gpu_runner_image.py
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
@@ -721,8 +721,12 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
     secrets: inherit
 
-  # The SGLang chat and admin-op cases against the Rust gRPC servicer
-  # (SMG_SGLANG_SERVICER_IMPL=rust): the same workers, the Rust request path.
+  # The chat cases against the Rust gRPC servicer (SMG_SGLANG_SERVICER_IMPL=rust,
+  # SMG_VLLM_SERVICER_IMPL=rust): the same workers, the Rust request path. A
+  # row for SGLang and one for vLLM (the TokenSpeed Rust servicer has no
+  # PR-time row yet, so this lane says nothing about it): every other lane of
+  # those engines runs the Python servicer, so a launcher or binding change
+  # that breaks the Rust servicer's start fails here and nowhere else.
   e2e-1gpu-chat-rust-servicer:
     name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -748,6 +752,22 @@ jobs:
             # the wire's control calls.
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
             min_selected: 204 # floor ≈ 95% of the chat lane's measured effective (215 of 223 ran on the Rust servicer; audit 2026-10-04)
+          # The vLLM chat suite on the Rust servicer: the suite, floor and
+          # budgets of e2e-1gpu-chat's vllm row (the harness deselects nothing
+          # for this servicer), so the two rows differ by the servicer only.
+          - engine: vllm
+            timeout: 32
+            test_timeout: 24
+            min_selected: 202 # the vllm chat row's floor: the same selection
+          # The TokenSpeed chat suite on the Rust servicer: the suite, floor
+          # and budgets of e2e-1gpu-chat's tokenspeed row (its prebuilt engine
+          # image, or the source build on a cold path, hence the budget), so
+          # the two rows differ by the servicer only. The admin-op and loads
+          # cases of that row stay on the Python servicer's row.
+          - engine: tokenspeed
+            timeout: 56
+            test_timeout: 26
+            min_selected: 114 # the tokenspeed chat row's floor: the same selection
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1565,7 +1585,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1621,7 +1641,12 @@ jobs:
           # A run cancelled as a whole ends with this gate failed too: it did
           # not pass, and finish stays a verdict on every head.
           bad='^(failure|cancelled)$'
-          if [[ "${{ needs.pre-commit.result }}" =~ $bad || \
+          # detect-changes selects the lanes: when it fails or is cancelled, the
+          # Rust unit tests, the benchmarks and the EPD lane skip on every event
+          # (and, on a pull request, every e2e lane); a skipped job passes this
+          # check, so its own result gates here (smg-project/smg-lab#172).
+          if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
+                "${{ needs.pre-commit.result }}" =~ $bad || \
                 "${{ needs.python-lint.result }}" =~ $bad || \
                 "${{ needs.grpc-proto-build-check.result }}" =~ $bad || \
                 "${{ needs.build-wheel.result }}" =~ $bad || \

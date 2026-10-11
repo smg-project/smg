@@ -6,6 +6,7 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     errors::{ParserError, ParserResult},
+    factory::GrammarStart,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
@@ -209,20 +210,38 @@ impl HyV4Parser {
         })
     }
 
-    /// What precedes a forced call on a thinking prompt: free text without
-    /// the call markers (their checkpoint-suffixed spellings included) and
-    /// nothing owed at its end, as `Glm4MoeParser::reasoning_prefix`: an
-    /// engine that runs a reasoning parser applies the grammar only after the
-    /// model's own `</think>`, and a prefix closed by `</think>` would be owed
-    /// a second time.
-    pub fn reasoning_prefix() -> Value {
-        json!({
-            "type": "any_text",
-            "excludes": [
-                "<tool_call", "</tool_call",
-                "<arg_key", "</arg_key", "<arg_value", "</arg_value",
-            ],
-        })
+    /// What precedes a forced call on a thinking prompt, by where the engine
+    /// starts the grammar, as `Glm4MoeParser::reasoning_prefix`: nothing
+    /// behind a reasoning parser's gate, the thought block closed by
+    /// `</think>` where the grammar runs from the first token, and free text
+    /// with nothing owed at its end where the worker does not say. The
+    /// excluded markers are spelled without their closing bracket so the
+    /// checkpoint-suffixed spellings are excluded with them.
+    pub fn reasoning_prefix(start: GrammarStart) -> Option<Value> {
+        const CALL_MARKERS: [&str; 6] = [
+            "<tool_call",
+            "</tool_call",
+            "<arg_key",
+            "</arg_key",
+            "<arg_value",
+            "</arg_value",
+        ];
+        match start {
+            GrammarStart::AfterReasoning => None,
+            GrammarStart::Unknown => Some(json!({
+                "type": "any_text",
+                "excludes": CALL_MARKERS,
+            })),
+            GrammarStart::FirstToken => {
+                let excludes = [&["<think", "</think"][..], &CALL_MARKERS[..]].concat();
+                Some(json!({
+                    "type": "tag",
+                    "begin": "",
+                    "content": { "type": "any_text", "excludes": excludes },
+                    "end": "</think>",
+                }))
+            }
+        }
     }
 }
 

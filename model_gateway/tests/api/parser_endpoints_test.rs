@@ -81,7 +81,7 @@ impl ParserTestContext {
             _ => {} // PrefillDecode mode has its own setup
         }
 
-        let client = Client::builder()
+        let client = smg::http_client::client_builder()
             .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
             .build()
             .unwrap();

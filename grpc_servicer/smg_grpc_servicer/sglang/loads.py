@@ -6,9 +6,13 @@ SGLang installed (see grpc_servicer/tests/test_sglang_get_loads.py).
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from smg_grpc_proto import sglang_scheduler_pb2
+from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.load_record import engine_load_from
 
 if TYPE_CHECKING:
     from sglang.srt.managers.load_snapshot import LoadSnapshot
@@ -100,3 +104,25 @@ def convert_loads_to_protobuf(result: LoadSnapshot) -> sglang_scheduler_pb2.Sche
         )
 
     return scheduler_load
+
+
+def load_record(
+    snapshots: Iterable[LoadSnapshot], dp_rank: int | None
+) -> common_pb2.EngineLoad | None:
+    """The load record the KV-event stream carries for ``dp_rank`` (the
+    first published rank when the batch names none), from the schedulers'
+    published snapshots as ``GetLoads`` reports them (every section, the
+    scheduler's queued token-work); ``None`` while no snapshot is published,
+    and for a named rank that has not published one: its batches go without
+    a record rather than with another rank's figures.
+    """
+    snapshots = list(snapshots)
+    if not snapshots:
+        return None
+    if dp_rank is None:
+        chosen = min(snapshots, key=lambda s: s.dp_rank)
+    else:
+        chosen = next((s for s in snapshots if s.dp_rank == dp_rank), None)
+        if chosen is None:
+            return None
+    return engine_load_from(convert_loads_to_protobuf(chosen), queued_token_work=True)

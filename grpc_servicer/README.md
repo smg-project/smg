@@ -260,6 +260,17 @@ grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
 explicitly when that matters; the engine keeps the backend of its first
 structured request either way, as it does behind vLLM's own frontend.
 
+Both vLLM servicers also advertise the engine's reasoning parser
+(`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
+a router reads off a worker's labels) and where its grammar starts on a prompt
+that ends inside the model's thinking block (`structured_outputs_start`): `after_reasoning` when
+a reasoning parser is set and `enable_in_reasoning` is off, since vLLM then
+holds a request's grammar back until the parser has seen the thought's end,
+`first_token` otherwise. A router shapes a forced tool call's grammar by it as
+the engine's own server would: the bare calls behind the parser's gate, so the
+call is forced right there; the thought and then the calls from the first
+token.
+
 #### Multi-node engines: the worker pod's liveness
 
 An engine whose tensor-parallel ranks span pods runs its EngineCore and the
@@ -347,13 +358,27 @@ the launcher is given no `--kv-events-config` (an explicit one is kept as
 given; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
-`SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800, as for vLLM
-above), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
+`SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
+`SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
+bounds as for vLLM above: the launcher reports the scheduler process alive each
+time it polls it, so a slow but living start completes, under the ceiling, and
+0 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`
 (default 1, for the one runtime `server.rs` builds for the vLLM, SGLang and
 TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
+
+Both TokenSpeed servicers advertise, as `server_args` keys, the engine's
+reasoning parser (`engine_reasoning_parser`; `reasoning_parser` is the
+per-model parser override a router reads off a worker's labels) and where its
+grammar starts on a prompt that ends inside the model's thinking block
+(`structured_outputs_start`): always `first_token`, since this engine's grammar
+manager has no reasoning gate and starts every grammar at the first generated
+token (`--reasoning-parser` only has a JSON-schema constraint rewritten into a
+structural tag that lets the thought precede the JSON). A router shapes a
+forced tool call's grammar by it as the engine's own server would: the thought
+and then the calls, so the call is not forced into the thought.
 
 #### Multi-node engines: the worker pod's liveness
 
@@ -401,6 +426,18 @@ the flat `mm_item_limits` label (`image=1,video=1`) in `GetServerInfo`'s
 the engine's limits: the precomputed inputs it sends bypass the tokenizer
 manager's own check. Without the flag the engine has no such limit and the
 label is absent.
+
+They also advertise, as `server_args` keys, the engine's reasoning parser
+(`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
+a router reads off a worker's labels) and where its grammar starts on a prompt
+that ends inside the model's thinking block (`structured_outputs_start`):
+`after_reasoning` with `--reasoning-parser`, since the scheduler then wraps its
+grammar backend in a reasoner that holds a request's grammar back until the
+parser's thought-end sequence has been generated (for a request that asks for
+reasoning, which a router does on a thinking prompt), `first_token` without
+one. A router shapes a forced tool call's grammar by it as the engine's own
+server would: the bare calls behind the parser's gate, so the call is forced
+right there; the thought and then the calls from the first token.
 
 #### KV-event recovery
 
@@ -475,7 +512,13 @@ and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
 turns on by itself when the launcher is given no `--kv-events-config` (an
 explicit one is kept as given; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the
 publisher off). SGLang's HTTP sidecar (metrics and profiling endpoints) is not
-started on this path.
+started on this path. Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
+free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
+`SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
+`SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
+bounds as for vLLM above: the launcher reports the scheduler process alive each
+time it polls it, so a slow but living start completes, under the ceiling, and
+0 lifts the ceiling), `SMG_ZMQ_SOCKET_DIR`, `SMG_SERVICER_WORKER_THREADS`.
 
 #### Headless over ZMQ (no SGLang change)
 

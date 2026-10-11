@@ -5,6 +5,7 @@
 //!
 //! - [`kubernetes`] owns the Kubernetes client, reflector lifecycle, and the
 //!   Pod-to-desired-worker conversion.
+//! - [`file`] rereads a JSON manifest of workers on a fixed interval.
 //! - [`provider`] defines the contract every provider produces: a
 //!   [`provider::DiscoveredWorker`] per worker, plus the provider's kind.
 //! - [`reconciler`] owns ownership, the registry diff and the `JobQueue`
@@ -17,6 +18,7 @@
 //! SMG mesh-router peer discovery is a different concern — it discovers router
 //! peers, not inference workers — and lives in [`crate::mesh_discovery`].
 
+mod file;
 mod kubernetes;
 mod provider;
 mod reconciler;
@@ -24,6 +26,7 @@ mod runtime;
 #[cfg(test)]
 mod testing;
 
+pub use file::FileProviderConfig;
 #[cfg(feature = "test-util")]
 pub use kubernetes::start_service_discovery_with_client;
 pub use kubernetes::{

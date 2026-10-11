@@ -52,19 +52,26 @@ def _subscribe_method(namespace):
 async def test_servicer_hands_config_server_args_and_cursor_to_the_relay():
     calls = []
 
-    async def fake_subscribe(config, server_args, start, context):
-        calls.append((config, server_args, start, context))
+    async def fake_subscribe(config, server_args, start, context, *, load_source=None):
+        calls.append((config, server_args, start, context, load_source))
         yield common_pb2.KvEventBatch(sequence_number=1)
 
     method = _subscribe_method({"subscribe_kv_events": fake_subscribe})
     config = SimpleNamespace(endpoint="tcp://*:5557", topic="kv")
     server_args = SimpleNamespace(dp_size=2)
-    servicer = SimpleNamespace(_kv_events_config=config, server_args=server_args)
+
+    def load_record(dp_rank):
+        return None
+
+    servicer = SimpleNamespace(
+        _kv_events_config=config, server_args=server_args, _load_record=load_record
+    )
     context = SimpleNamespace()
     request = common_pb2.SubscribeKvEventsRequest(start_sequence_number=7)
     batches = [batch async for batch in method(servicer, request, context)]
     assert [b.sequence_number for b in batches] == [1]
-    assert calls == [(config, server_args, 7, context)]
+    # The servicer's load record rides the stream: its source goes to the relay.
+    assert calls == [(config, server_args, 7, context, load_record)]
 
 
 @pytest.mark.asyncio

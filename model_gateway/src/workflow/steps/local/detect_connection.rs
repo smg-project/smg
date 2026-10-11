@@ -233,7 +233,7 @@ mod tests {
         };
         Arc::new(
             AppContext::builder()
-                .client(reqwest::Client::new())
+                .client(crate::http_client::client())
                 .rate_limiter(None)
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)

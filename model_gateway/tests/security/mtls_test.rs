@@ -63,7 +63,7 @@ fn create_mtls_client(
         .with_client_auth_cert(client_certs, client_key.into())
         .map_err(|e| format!("Failed to build client config: {e}"))?;
 
-    let client = reqwest::Client::builder()
+    let client = smg::http_client::client_builder()
         .use_preconfigured_tls(client_config)
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -92,7 +92,7 @@ fn create_tls_client(
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    let client = reqwest::Client::builder()
+    let client = smg::http_client::client_builder()
         .use_preconfigured_tls(client_config)
         .timeout(Duration::from_secs(10))
         .build()?;
@@ -110,7 +110,7 @@ fn create_client_without_ca() -> Result<reqwest::Client, Box<dyn std::error::Err
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    let client = reqwest::Client::builder()
+    let client = smg::http_client::client_builder()
         .use_preconfigured_tls(client_config)
         .timeout(Duration::from_secs(10))
         .build()?;

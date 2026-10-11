@@ -270,7 +270,7 @@ impl MultimodalComponents {
         settings: &MultimodalSettings,
     ) -> Result<Self> {
         let client = build_client(
-            || reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
+            || crate::http_client::client_builder().timeout(std::time::Duration::from_secs(30)),
             false,
             "media HTTP client",
         )

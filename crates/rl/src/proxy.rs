@@ -462,7 +462,7 @@ mod tests {
     async fn control_timeout_is_applied_per_request_on_the_worker_client() {
         let slow_engine = FakeEngine::start(StatusCode::OK, json!({}), 1500).await;
         let mut w = worker("slow", &slow_engine.url, RuntimeType::Sglang);
-        w.http_client = Some(Arc::new(reqwest::Client::new()));
+        w.http_client = Some(crate::testing::test_client());
         let app = crate::router::<()>(state(vec![w], 1));
 
         let r = app

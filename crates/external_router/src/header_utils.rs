@@ -411,6 +411,8 @@ pub fn should_forward_request_header(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rustls::crypto::ring;
+
     use super::*;
 
     #[test]
@@ -426,9 +428,20 @@ mod tests {
         assert!(is_smg_owned_error_code_header("X-SMG-Error-Code"));
     }
 
+    /// The tests' HTTP client, the process-level TLS crypto provider
+    /// installed first; the request builders under test come from it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+    )]
+    fn client() -> reqwest::Client {
+        let _ = ring::default_provider().install_default();
+        reqwest::Client::new()
+    }
+
     #[test]
     fn apply_forwarded_request_headers_user_auth_wins_without_duplicate() {
-        let client = reqwest::Client::new();
+        let client = client();
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::AUTHORIZATION,
@@ -462,7 +475,7 @@ mod tests {
 
     #[test]
     fn apply_forwarded_request_headers_falls_back_to_worker_key() {
-        let client = reqwest::Client::new();
+        let client = client();
         let headers = HeaderMap::new(); // caller sent no Authorization
         let worker_key = "worker-key".to_string();
 

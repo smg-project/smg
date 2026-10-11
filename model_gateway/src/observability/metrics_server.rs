@@ -106,7 +106,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
-            let resp = reqwest::get(format!("http://{addr}/metrics"))
+            let resp = crate::http_client::client()
+                .get(format!("http://{addr}/metrics"))
+                .send()
                 .await
                 .unwrap();
             assert!(resp.status().is_success(), "host {host}");
@@ -149,7 +151,9 @@ mod tests {
             .unwrap();
         assert_ne!(addr.port(), 0);
 
-        let resp = reqwest::get(format!("http://{addr}/metrics"))
+        let resp = crate::http_client::client()
+            .get(format!("http://{addr}/metrics"))
+            .send()
             .await
             .unwrap();
         assert!(resp.status().is_success());

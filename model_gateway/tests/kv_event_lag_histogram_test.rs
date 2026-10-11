@@ -25,7 +25,9 @@ async fn kv_event_lag_renders_histogram_buckets() {
     Metrics::record_kv_event_lag("grpc://worker-a:50051", 0.004);
     Metrics::record_kv_event_lag("grpc://worker-b:50051", 2.0);
 
-    let body = reqwest::get(format!("http://{addr}/metrics"))
+    let body = smg::http_client::client()
+        .get(format!("http://{addr}/metrics"))
+        .send()
         .await
         .expect("metrics endpoint reachable")
         .text()

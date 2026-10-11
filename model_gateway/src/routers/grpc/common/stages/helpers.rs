@@ -11,6 +11,7 @@ use smg_grpc_client::{
     sglang_proto::{self, DisaggregatedParams},
     tokenspeed_proto, vllm_proto,
 };
+use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error, warn};
 
 use super::pd_protocol::{DpPlacement, PdProtocol, PdRendezvous};
@@ -22,6 +23,7 @@ use crate::{
         grpc::{
             context::{AttemptStamp, ExecutionPlan, LoadGuards, RequestType, WorkerSelection},
             proto_wrapper::ProtoGenerateRequest,
+            utils,
         },
     },
     worker::{
@@ -388,22 +390,92 @@ impl SamplingBaseline {
     }
 }
 
+/// A forced tool call's constraint as preparation built it, with the name of
+/// the tool parser that shapes it. Request building gives the first attempt's
+/// worker the shape its engine needs (`utils::tool_constraints_for_worker`);
+/// a retry gives the worker it selects the same treatment from this unshaped
+/// form, since a tag already shaped for one engine cannot be shaped for
+/// another.
+#[derive(Clone, Debug)]
+pub(crate) struct ToolConstraintStamp {
+    /// The `(kind, value)` pair preparation produced, before any worker shaped it.
+    constraint: (String, String),
+    /// The configured tool parser the shaping reads its reasoning prefix from.
+    parser: Option<String>,
+}
+
+impl ToolConstraintStamp {
+    /// Capture the stamp for a built request that carries the forced call's
+    /// structural tag. Nothing is captured for a JSON-schema constraint (no
+    /// shape to follow) or when the backend's builder let the request's
+    /// `response_format` outrank the tool constraint (the request then
+    /// carries a schema, grammar or regex, never a structural tag).
+    pub(crate) fn capture(
+        unshaped: Option<(String, String)>,
+        parser: Option<&str>,
+        request: &ProtoGenerateRequest,
+    ) -> Option<Self> {
+        let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
+        request.structural_tag()?;
+        Some(Self {
+            constraint,
+            parser: parser.map(str::to_string),
+        })
+    }
+
+    /// Write the constraint, shaped for `workers`, over the request's
+    /// structural tag.
+    fn restamp(
+        &self,
+        request: &mut ProtoGenerateRequest,
+        workers: &WorkerSelection,
+        tool_parser_factory: &ToolParserFactory,
+    ) -> Result<(), Response> {
+        let shaped = utils::tool_constraints_for_worker(
+            tool_parser_factory,
+            self.parser.as_deref(),
+            Some(self.constraint.clone()),
+            Some(workers),
+        )
+        .map_err(|e| {
+            error!(
+                function = "restamp_plan_for_attempt",
+                error = %e,
+                "Failed to shape the tool constraint for the retry's worker"
+            );
+            error::internal_error(
+                "invalid_tool_constraint",
+                format!("Invalid tool constraint: {e}"),
+            )
+        })?;
+        if let Some((_, tag)) = shaped {
+            request.set_structural_tag(tag);
+        }
+        Ok(())
+    }
+}
+
 /// Re-stamp the retained plan for a retry attempt's newly selected workers:
 /// fresh engine ids per [`IdStamp`], the new worker's sampling defaults
-/// (re-applied over the build-time baseline), and fresh PD
-/// bootstrap/rendezvous rooms. EPD encode bootstrap info is deliberately
-/// untouched — those rooms are the rendezvous with encode jobs the first
-/// dispatch already launched.
+/// (re-applied over the build-time baseline), a forced tool call's
+/// constraint in the shape the new worker's engine needs
+/// ([`ToolConstraintStamp`]), and fresh PD bootstrap/rendezvous rooms. EPD
+/// encode bootstrap info is deliberately untouched — those rooms are the
+/// rendezvous with encode jobs the first dispatch already launched.
 pub(crate) fn restamp_plan_for_attempt(
     plan: &mut ExecutionPlan,
     stamp: &AttemptStamp,
     workers: &WorkerSelection,
+    tool_parser_factory: &ToolParserFactory,
 ) -> Result<(), Response> {
     stamp.id.restamp(plan)?;
     for request in plan.generate_requests_mut() {
         if let (Some(mask), Some(baseline)) = (stamp.sampling_mask, &stamp.sampling_baseline) {
             baseline.restore_masked(request, mask)?;
             apply_sampling_defaults_with_mask(request, mask, Some(workers));
+        }
+        if let Some(tool_constraint) = &stamp.tool_constraint {
+            tool_constraint.restamp(request, workers, tool_parser_factory)?;
         }
         if stamp.inject_pd_metadata {
             maybe_inject_pd_metadata(request, workers);
@@ -1358,6 +1430,7 @@ mod sampling_restamp_tests {
             sampling_mask: Some(mask),
             sampling_baseline: baseline,
             inject_pd_metadata: false,
+            tool_constraint: None,
         };
         let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
         {
@@ -1369,7 +1442,7 @@ mod sampling_restamp_tests {
         // Worker B omits temperature: it must return to the baseline (1.0),
         // not keep worker A's 0.5.
         let worker_b = worker_with_defaults("grpc://worker-b:30000", Some(r#"{"top_k":9}"#));
-        restamp_plan_for_attempt(&mut plan, &stamp, &worker_b).unwrap();
+        restamp_plan_for_attempt(&mut plan, &stamp, &worker_b, &ToolParserFactory::new()).unwrap();
         {
             let params = sglang_params(&plan);
             assert_eq!(params.temperature, 1.0, "baseline restored, not worker A's");
@@ -1379,12 +1452,247 @@ mod sampling_restamp_tests {
         // Worker C has no defaults label at all: everything returns to the
         // baseline.
         let worker_c = worker_with_defaults("grpc://worker-c:30000", None);
-        restamp_plan_for_attempt(&mut plan, &stamp, &worker_c).unwrap();
+        restamp_plan_for_attempt(&mut plan, &stamp, &worker_c, &ToolParserFactory::new()).unwrap();
         {
             let params = sglang_params(&plan);
             assert_eq!(params.temperature, 1.0);
             assert_eq!(params.top_k, 3);
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_constraint_restamp_tests {
+    use std::sync::Arc;
+
+    use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
+    use serde_json::Value;
+    use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
+    use tool_parser::ToolConstraint;
+
+    use super::*;
+    use crate::{
+        routers::grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
+        worker::{BasicWorkerBuilder, WorkerType},
+    };
+
+    /// A parser that registers a reasoning prefix, so a forced call on a
+    /// thinking prompt takes the shape the worker's engine needs.
+    const PARSER: &str = "glm47_moe";
+    const BARE_CALLS: &str = "the bare calls (grammar after the reasoning)";
+    const THOUGHT_THEN_CALLS: &str =
+        "the thought block then the calls (grammar from the first token)";
+    const PREFIX_THEN_CALLS: &str = "the free-text prefix then the calls (either engine)";
+
+    fn worker(labels: &[(&str, &str)]) -> WorkerSelection {
+        let mut builder =
+            BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        WorkerSelection::Single {
+            worker: Arc::new(builder.build()),
+        }
+    }
+
+    fn forced_call_on_a_thinking_prompt(factory: &ToolParserFactory) -> (String, String) {
+        let tools: Vec<Tool> = serde_json::from_value(serde_json::json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
+        }]))
+        .unwrap();
+        let required = ToolChoice::Value(ToolChoiceValue::Required);
+        match factory
+            .registry()
+            .generate_tool_constraint(Some(PARSER), &tools, &required, true)
+            .unwrap()
+        {
+            Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
+            other => panic!("expected a structural tag, got {other:?}"),
+        }
+    }
+
+    /// Each backend's built request carrying `tag` where its builder places a
+    /// forced call's structural tag.
+    fn requests_with_tag(tag: &str) -> Vec<(&'static str, ProtoGenerateRequest)> {
+        vec![
+            (
+                "sglang",
+                ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+                    sampling_params: Some(sglang_proto::SamplingParams {
+                        constraint: Some(sglang_proto::sampling_params::Constraint::StructuralTag(
+                            tag.to_string(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            ),
+            (
+                "vllm",
+                ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
+                    sampling_params: Some(vllm_proto::SamplingParams {
+                        constraint: Some(vllm_proto::sampling_params::Constraint::StructuralTag(
+                            tag.to_string(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            ),
+            (
+                "tokenspeed",
+                ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                    sampling_params: Some(tokenspeed_proto::SamplingParams {
+                        constraint: Some(
+                            tokenspeed_proto::sampling_params::Constraint::StructuralTag(
+                                tag.to_string(),
+                            ),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            ),
+            (
+                "trtllm",
+                ProtoGenerateRequest::Trtllm(Box::new(trtllm_proto::GenerateRequest {
+                    guided_decoding: Some(trtllm_proto::GuidedDecodingParams {
+                        guide_type: trtllm_proto::guided_decoding_params::GuideType::StructuralTag
+                            as i32,
+                        guide: tag.to_string(),
+                    }),
+                    ..Default::default()
+                })),
+            ),
+        ]
+    }
+
+    /// Which engine a forced call's tag is shaped for.
+    fn shape_of(tag: &str) -> &'static str {
+        let tag: Value = serde_json::from_str(tag).unwrap();
+        let format = &tag["format"];
+        if format["type"] == "triggered_tags" {
+            BARE_CALLS
+        } else if format["elements"][0]["end"] == "</think>" {
+            THOUGHT_THEN_CALLS
+        } else {
+            PREFIX_THEN_CALLS
+        }
+    }
+
+    fn plan_tag(plan: &ExecutionPlan) -> String {
+        match plan {
+            ExecutionPlan::Single(ProtoRequest::Generate(request)) => request
+                .structural_tag()
+                .expect("the plan keeps a structural tag")
+                .to_string(),
+            _ => panic!("expected a single generate plan"),
+        }
+    }
+
+    /// A forced call built for an engine that starts the grammar after its
+    /// reasoning parser's gate (the bare calls) reaches a retry's engine that
+    /// starts it at the first token as the thought block then the calls, and
+    /// the reverse; a retry's worker that does not say gets the prefix shape
+    /// that fits either. On every backend that carries a structural tag.
+    #[test]
+    fn retry_reshapes_the_forced_call_for_its_own_workers_engine() {
+        let factory = ToolParserFactory::new();
+        let unshaped = forced_call_on_a_thinking_prompt(&factory);
+        assert_eq!(shape_of(&unshaped.1), PREFIX_THEN_CALLS);
+        let after_reasoning = worker(&[("structured_outputs_start", "after_reasoning")]);
+        let first_token = worker(&[("structured_outputs_start", "first_token")]);
+        let silent = worker(&[]);
+
+        let (_, built_tag) = utils::tool_constraints_for_worker(
+            &factory,
+            Some(PARSER),
+            Some(unshaped.clone()),
+            Some(&after_reasoning),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(shape_of(&built_tag), BARE_CALLS);
+
+        for (backend, request) in requests_with_tag(&built_tag) {
+            let stamp = AttemptStamp {
+                id: IdStamp::Exact,
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: false,
+                tool_constraint: ToolConstraintStamp::capture(
+                    Some(unshaped.clone()),
+                    Some(PARSER),
+                    &request,
+                ),
+            };
+            assert!(
+                stamp.tool_constraint.is_some(),
+                "{backend}: the built request carries the forced call's tag"
+            );
+            let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &first_token, &factory).unwrap();
+            assert_eq!(
+                shape_of(&plan_tag(&plan)),
+                THOUGHT_THEN_CALLS,
+                "{backend}: a retry on an engine that starts the grammar at the first token"
+            );
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &after_reasoning, &factory).unwrap();
+            assert_eq!(
+                shape_of(&plan_tag(&plan)),
+                BARE_CALLS,
+                "{backend}: a retry back on an engine that starts it after the reasoning"
+            );
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &silent, &factory).unwrap();
+            assert_eq!(
+                plan_tag(&plan),
+                unshaped.1,
+                "{backend}: a worker that does not say gets the shape that fits either"
+            );
+        }
+    }
+
+    /// Nothing is stamped, and nothing rewritten, when the request's
+    /// constraint is not the forced call's structural tag: a JSON-schema tool
+    /// constraint (no shape to follow), or a backend that let the request's
+    /// `response_format` outrank the tool constraint.
+    #[test]
+    fn a_request_without_the_forced_calls_tag_is_left_as_built() {
+        let factory = ToolParserFactory::new();
+        let schema = r#"{"type":"object"}"#.to_string();
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+            sampling_params: Some(sglang_proto::SamplingParams {
+                constraint: Some(sglang_proto::sampling_params::Constraint::JsonSchema(
+                    schema.clone(),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let schema_constraint = ("json_schema".to_string(), schema.clone());
+        assert!(
+            ToolConstraintStamp::capture(Some(schema_constraint), Some(PARSER), &request).is_none()
+        );
+        // The forced call's tag that the backend dropped for the request's
+        // response_format: the request carries the schema, not the tag.
+        let unshaped = forced_call_on_a_thinking_prompt(&factory);
+        assert!(ToolConstraintStamp::capture(Some(unshaped), Some(PARSER), &request).is_none());
+
+        request.set_structural_tag("{}".to_string());
+        assert_eq!(request.structural_tag(), None);
+        let ProtoGenerateRequest::Sglang(req) = &request else {
+            panic!("the request was built for SGLang");
+        };
+        assert_eq!(
+            req.sampling_params.as_ref().unwrap().constraint,
+            Some(sglang_proto::sampling_params::Constraint::JsonSchema(
+                schema
+            ))
+        );
     }
 }
 
@@ -1458,9 +1766,11 @@ mod epd_restamp_tests {
             sampling_mask: None,
             sampling_baseline: None,
             inject_pd_metadata: false,
+            tool_constraint: None,
         };
         let retry_pair = tokenspeed_pd_pair("grpc://retry-prefill:30000", "grpc://decode:30000");
-        restamp_plan_for_attempt(&mut plan, &stamp, &retry_pair).unwrap();
+        restamp_plan_for_attempt(&mut plan, &stamp, &retry_pair, &ToolParserFactory::new())
+            .unwrap();
 
         let (encode, kv) = tokenspeed_rendezvous(&plan);
         assert_eq!(

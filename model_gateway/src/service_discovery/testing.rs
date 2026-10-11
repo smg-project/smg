@@ -29,7 +29,7 @@ pub(super) fn create_test_app_context() -> Arc<AppContext> {
     // Jobs submitted during tests will queue but not be processed
     Arc::new(AppContext {
         gateway_auth: AuthConfig::new(None),
-        client: reqwest::Client::new(),
+        client: crate::http_client::client(),
         router_config: router_config.clone(),
         rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
         rate_limit_manager: None,

@@ -432,7 +432,12 @@ pub type ResponseResult<T> = Result<T, ResponseStorageError>;
 /// Trait for response storage
 #[async_trait]
 pub trait ResponseStorage: Send + Sync {
-    /// Store a new response
+    /// Store a response under its id.
+    ///
+    /// A record already stored under the same id is replaced: a background
+    /// response is written as `queued` before its work starts and again with
+    /// its terminal object when the work ends, under the one id its client
+    /// polls.
     async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId>;
 
     /// Get a response by ID

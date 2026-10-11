@@ -17,7 +17,9 @@ pub use encoder_inputs::{
     f32_to_bf16_bits, f32_to_f16_bits, EncoderDtype, EncoderInput, EncoderInputView,
     ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,
 };
-pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, TransformError};
+pub use error::{
+    MediaConnectorError, MediaFault, MultiModalError, MultiModalResult, TransformError,
+};
 pub use media::{
     init_log_video_decode_timing, FrameSampling, ImageFetchConfig, MediaConnector,
     MediaConnectorConfig, MediaSource, VideoFetchConfig,
@@ -39,3 +41,22 @@ pub use vision::{
     DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
     VisionPreProcessor, VisionProcessorRegistry,
 };
+
+/// Support for this crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use rustls::crypto::ring;
+
+    /// A plain HTTP client for the tests' media connectors. The library
+    /// takes its client from the caller; the tests build it here, with the
+    /// process-level TLS crypto provider installed first (reqwest's
+    /// `rustls-no-provider` client panics at build time without one).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+    )]
+    pub(crate) fn http_client() -> reqwest::Client {
+        let _ = ring::default_provider().install_default();
+        reqwest::Client::new()
+    }
+}

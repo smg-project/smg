@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import dataclasses
 import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -31,8 +32,21 @@ def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
     parent, _, child = name.rpartition(".")
     if parent:
         parent_module = sys.modules.get(parent) or _install(monkeypatch, parent)
-        setattr(parent_module, child, module)
+        # Undone with the test: the parent is the real package where an engine is installed.
+        monkeypatch.setattr(parent_module, child, module, raising=False)
     return module
+
+
+def _install_fake_servicer(monkeypatch, server, init_servicer_tracing=None):
+    """A fake ``smg.servicer`` binding under a fake ``smg`` package: the
+    installed package, where there is one, keeps its own ``servicer`` module."""
+    _install(monkeypatch, "smg")
+    return _install(
+        monkeypatch,
+        "smg.servicer",
+        TokenSpeedGrpcServer=server,
+        init_servicer_tracing=init_servicer_tracing or (lambda level=None: None),
+    )
 
 
 def _stub_servicer_module(monkeypatch, modalities=(1,)):
@@ -325,6 +339,31 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert plain["kv_events_replay_endpoint"] == ""
 
 
+@dataclasses.dataclass
+class _ReasoningServerArgs(FakeServerArgs):
+    reasoning_parser: str | None = None
+
+
+def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
+    # The engine's reasoning parser and where it starts a request's grammar on
+    # a thinking prompt ride with the server args, as the Python servicer adds
+    # them: this engine starts every grammar at the first token, parser or not.
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    gated = json.loads(
+        rust.server_facts(_ReasoningServerArgs(reasoning_parser="kimi_k25"))["server_args_json"]
+    )
+    assert gated["engine_reasoning_parser"] == "kimi_k25"
+    assert gated["structured_outputs_start"] == "first_token"
+    # The engine's own argument stays under its own name; the Router's label
+    # readers never take it as the per-model parser override.
+    assert gated["reasoning_parser"] == "kimi_k25"
+
+    plain = json.loads(rust.server_facts(_ReasoningServerArgs())["server_args_json"])
+    assert plain["structured_outputs_start"] == "first_token"
+    assert "engine_reasoning_parser" not in plain
+
+
 def test_server_facts_never_carry_credentials(monkeypatch):
     """The Rust server reports the same server args as the Python one, so the
     in-engine RL control key and tokens must not leave the engine here either.
@@ -402,12 +441,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
             )
             self.address = bind_address
 
-    _install(
-        monkeypatch,
-        "smg.servicer",
-        TokenSpeedGrpcServer=FakeServer,
-        init_servicer_tracing=lambda level=None: None,
-    )
+    _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model})
     monkeypatch.setattr(
         rust,
@@ -431,6 +465,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_DRAIN_SECS", "1.5")
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS", "42")
+    monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS", "0")
 
     assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
 
@@ -441,6 +476,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert server["engine_count"] == 2
     assert server["tokenizer_dir"] == str(tmp_path)
     assert server["engine_startup_timeout_secs"] == 42.0
+    assert server["engine_startup_ceiling_secs"] == 0.0  # 0 lifts the ceiling
     assert server["model_path"] == "org/m"
     headless = recorded["headless"]
     assert headless.zmq_msgpack is True and headless.skip_tokenizer_init is True
@@ -451,3 +487,92 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert isinstance(supervised_server, FakeServer)
     assert engine == "engine-handle"
     assert drain_secs == 1.5
+
+
+def _run_serve_rust(monkeypatch, tmp_path) -> dict:
+    """``serve_rust`` against a recording fake server with the launcher's own
+    fact producers (over a fake model config and the stub servicer module), the
+    scheduler launch and the supervisor stubbed; the keywords the server was
+    constructed with."""
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.address = kwargs["bind_address"]
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    _stub_servicer_module(monkeypatch)
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            eos_token_id=2, model_type="qwen3", architectures=["Qwen3ForCausalLM"]
+        ),
+        context_len=8192,
+        vocab_size=151936,
+        dtype="torch.bfloat16",
+        is_multimodal=False,
+    )
+    monkeypatch.setattr(rust, "_model_config", lambda args: model_config)
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
+    monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.setattr(rust, "launch_headless_scheduler", lambda headless: "engine-handle")
+
+    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
+    assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
+    return created
+
+
+def test_serve_rust_defaults_both_startup_bounds(monkeypatch, tmp_path):
+    """Without the environment variables the server gets the lifecycle's
+    defaults for the silence bound and the ceiling."""
+    monkeypatch.delenv(rust.STARTUP_TIMEOUT_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.STARTUP_CEILING_SECS_ENV, raising=False)
+    created = _run_serve_rust(monkeypatch, tmp_path)
+    assert created["engine_startup_timeout_secs"] == rust.DEFAULT_STARTUP_TIMEOUT_SECS
+    assert created["engine_startup_ceiling_secs"] == rust.DEFAULT_STARTUP_CEILING_SECS
+
+
+def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):
+    """The keyword set `serve_rust` hands the Rust server is bound against the
+    compiled binding's constructor: a fact or a knob the launcher gains without
+    a parameter on the binding fails here, not at the scheduler's start.
+    Skipped where the `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    signature = inspect.signature(servicer.TokenSpeedGrpcServer)
+    created = _run_serve_rust(monkeypatch, tmp_path)
+    unexpected = sorted(set(created) - set(signature.parameters))
+    assert not unexpected, f"keywords the binding's constructor does not take: {unexpected}"
+    # The required parameters are all given too; pyo3 refuses the call otherwise.
+    signature.bind(**created)
+
+
+def test_serve_rust_fakes_leave_the_installed_package_untouched(tmp_path):
+    """The fakes `_run_serve_rust` installs go under a fake ``smg`` package, so
+    the installed one keeps its own ``servicer`` module once the test is over.
+    Skipped where the `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    package = sys.modules["smg"]
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _run_serve_rust(monkeypatch, tmp_path)
+    assert sys.modules["smg"] is package
+    assert package.servicer is servicer
+
+
+def test_install_undoes_a_fake_under_a_real_package():
+    """A fake installed under a real package is undone with the test, the
+    attribute on the package like the ``sys.modules`` entry, so a later
+    ``from smg_grpc_servicer.tokenspeed import servicer`` gets the real module.
+    ``_stub_servicer_module`` and the launcher test's fake ``server`` take this path."""
+    from smg_grpc_servicer import tokenspeed as package
+
+    name = "smg_grpc_servicer.tokenspeed.servicer"
+    before = (vars(package).get("servicer"), sys.modules.get(name))
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        fake = _install(monkeypatch, name)
+        assert package.servicer is fake and sys.modules[name] is fake
+    assert (vars(package).get("servicer"), sys.modules.get(name)) == before

@@ -83,3 +83,32 @@ class TestDisaggregationMetrics:
         load = loads_mod.convert_loads_to_protobuf(_snapshot(None))
 
         assert not load.HasField("disaggregation")
+
+
+class TestLoadRecord:
+    """The record the KV-event stream carries: the published snapshot of the
+    batch's rank, converted as GetLoads converts it."""
+
+    def _snapshots(self):
+        first, second = _snapshot(None), _snapshot(_disaggregation(prefill_bootstrap_queue_reqs=4))
+        second.dp_rank = 1
+        second.num_running_reqs = 9
+        return [first, second]
+
+    def test_the_batch_rank_selects_its_snapshot(self, loads_mod):
+        record = loads_mod.load_record(self._snapshots(), 1)
+        assert record.running_requests == 9
+        assert record.disaggregation.prefill_prealloc_queue_reqs == 4
+        assert record.waiting_uncached_tokens == 3  # the scheduler's queued token-work
+        assert record.cache_hit_rate == 0.25 and record.max_total_num_tokens == 100
+
+    def test_a_batch_without_a_rank_reads_the_first_rank(self, loads_mod):
+        snapshots = list(reversed(self._snapshots()))
+        assert loads_mod.load_record(snapshots, None).running_requests == 2
+
+    def test_a_batch_naming_an_unpublished_rank_gets_no_record(self, loads_mod):
+        # Rank 7 has published nothing: no record, not the first rank's figures.
+        assert loads_mod.load_record(self._snapshots(), 7) is None
+
+    def test_no_published_snapshot_means_no_record(self, loads_mod):
+        assert loads_mod.load_record([], 0) is None

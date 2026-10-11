@@ -450,7 +450,19 @@ impl MockSearchResponseMCPServer {
 
 #[cfg(test)]
 mod tests {
+    use rmcp::transport::{
+        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+    };
+
     use super::{MockFailingMCPServer, MockMCPServer};
+
+    /// A client transport to `url` over the test binary's HTTP client.
+    fn client_transport(url: &str) -> StreamableHttpClientTransport<reqwest::Client> {
+        StreamableHttpClientTransport::with_client(
+            smg::http_client::client(),
+            StreamableHttpClientTransportConfig::with_uri(url),
+        )
+    }
 
     #[tokio::test]
     async fn test_mock_server_startup() {
@@ -464,9 +476,9 @@ mod tests {
     async fn test_mock_server_with_rmcp_client() {
         let mut server = MockMCPServer::start().await.unwrap();
 
-        use rmcp::{transport::StreamableHttpClientTransport, ServiceExt};
+        use rmcp::ServiceExt;
 
-        let transport = StreamableHttpClientTransport::from_uri(server.url().as_str());
+        let transport = client_transport(server.url().as_str());
         let client = ().serve(transport).await;
 
         assert!(client.is_ok(), "Should be able to connect to mock server");
@@ -490,15 +502,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_failing_server_startup() {
-        use rmcp::{
-            model::CallToolRequestParams, transport::StreamableHttpClientTransport, ServiceExt,
-        };
+        use rmcp::{model::CallToolRequestParams, ServiceExt};
 
         let mut server = MockFailingMCPServer::start("marker").await.unwrap();
         assert!(server.port() > 0);
         assert!(server.url().contains(&server.port().to_string()));
 
-        let transport = StreamableHttpClientTransport::from_uri(server.url().as_str());
+        let transport = client_transport(server.url().as_str());
         let client = ().serve(transport).await.expect("connect failing mock server");
 
         let err = client

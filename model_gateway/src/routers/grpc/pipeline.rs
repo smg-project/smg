@@ -270,6 +270,8 @@ pub(crate) struct RequestPipeline {
     mode: Mode,
     /// The registry, read at dispatch for `--worker-overload-shed`.
     worker_registry: Arc<WorkerRegistry>,
+    /// Shapes a forced tool call's constraint for each attempt's worker.
+    tool_parser_factory: ToolParserFactory,
 }
 
 /// Outcome of one full pipeline run.
@@ -448,6 +450,7 @@ impl RequestPipeline {
             backend_type: backend,
             mode,
             worker_registry: deps.worker_registry.clone(),
+            tool_parser_factory: deps.tool_parser_factory.clone(),
         })
     }
 
@@ -530,9 +533,9 @@ impl RequestPipeline {
         dctx.attempt = attempt;
         if attempt > 0 {
             // Fresh worker selection per attempt; the retained plan is
-            // re-stamped (engine ids, sampling defaults, PD rooms) for the
-            // new workers. Buffered decode state from the failed attempt is
-            // reset.
+            // re-stamped (engine ids, sampling defaults, the forced tool
+            // call's shape, PD rooms) for the new workers. Buffered decode
+            // state from the failed attempt is reset.
             self.stages.worker_selection.reselect(dctx).await?;
             let workers = dctx.workers.as_ref().ok_or_else(|| {
                 error!(
@@ -556,7 +559,7 @@ impl RequestPipeline {
                 error!(function = "run_attempt", "Execution plan already consumed");
                 error::internal_error("execution_plan_consumed", "Execution plan already consumed")
             })?;
-            helpers::restamp_plan_for_attempt(retained, stamp, workers)?;
+            helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }
@@ -636,14 +639,7 @@ impl RequestPipeline {
     ) -> Result<RunOutcome, Response> {
         let mut attempt_start = Instant::now();
         if let Some(endpoint) = metrics_endpoint {
-            Metrics::record_router_request(
-                metrics_labels::ROUTER_GRPC,
-                self.backend_type,
-                metrics_labels::CONNECTION_GRPC,
-                &ctx.input.model_id,
-                endpoint,
-                bool_to_static_str(ctx.is_streaming()),
-            );
+            self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
         }
 
         let build = match self.run_ingress(&mut ctx).await {
@@ -675,14 +671,7 @@ impl RequestPipeline {
             if attempt > 0 {
                 attempt_start = Instant::now();
                 if let Some(endpoint) = metrics_endpoint {
-                    Metrics::record_router_request(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &dctx.model_id,
-                        endpoint,
-                        bool_to_static_str(dctx.streaming),
-                    );
+                    self.record_request(endpoint, &dctx.model_id, dctx.streaming);
                 }
             }
 
@@ -802,7 +791,28 @@ impl RequestPipeline {
         response
     }
 
-    fn record_error(&self, endpoint: Option<&'static str>, model: &str, response: &Response) {
+    /// One router request under this pipeline's labels, the count the
+    /// dashboards read: recorded per attempt here, and by the router for an
+    /// answer it gives without the pipeline, so that traffic stays visible.
+    pub(crate) fn record_request(&self, endpoint: &'static str, model: &str, streaming: bool) {
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            endpoint,
+            bool_to_static_str(streaming),
+        );
+    }
+
+    /// A refused request under this pipeline's labels, by the response's
+    /// status class.
+    pub(crate) fn record_error(
+        &self,
+        endpoint: Option<&'static str>,
+        model: &str,
+        response: &Response,
+    ) {
         if let Some(endpoint) = endpoint {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_GRPC,

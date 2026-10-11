@@ -180,12 +180,18 @@ jobs:
       # runs on 1 case in 200 of each benchmark set (its SYMPHONY_SAMPLE_EVERY
       # switch, the hand-written sets whole), as the whole replay of every
       # recorded model takes hours. Each target's output is its own group in
-      # the log, written as the target ends, and a target that failed fails
-      # the step once the others have ended.
+      # the log, written as the target ends: one line per model with its
+      # counts, the first unlisted differences of a model, and the totals.
+      # The per-case reports (each set read, every difference with its
+      # reason, the failures) go to BELLWETHER_REPORT_DIR and are kept as the
+      # job's artifact by the step after this one; BELLWETHER_VERBOSE=1 would
+      # print them in the log as well. A target that failed fails the step
+      # once the others have ended.
       - name: Run the tests that read bellwether
         timeout-minutes: 120
         env:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
+          BELLWETHER_REPORT_DIR: ${{ runner.temp }}/bellwether-reports
           SYMPHONY_SAMPLE_EVERY: "200"
           # Two of the recorded templates (Apertus, Muse Glimmer) write the day
           # of the render into the prompt with strftime_now, so their references
@@ -222,6 +228,18 @@ jobs:
             echo "::error::tests that read bellwether failed: ${failed[*]}"
             exit 1
           fi
+
+      # The per-case reports, one file per harness: what the log summarizes
+      # per model, case by case. Kept whether the tests passed or not; when
+      # the step ended before the tests ran there is nothing to keep.
+      - name: Keep the per-case reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bellwether-reports
+          path: ${{ runner.temp }}/bellwether-reports/
+          if-no-files-found: ignore
+          retention-days: 30
 
       # The stats are for reading, not a verdict. When the job ends before the
       # Rust setup put sccache on PATH (the unpack failed, say), the step says

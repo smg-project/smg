@@ -182,7 +182,6 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
 #[cfg(test)]
 mod tests {
     use axum::{routing::get, Json, Router};
-    use reqwest::Client;
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -213,9 +212,14 @@ mod tests {
                 .unwrap();
         });
 
-        let owned_by = probe_models_owned_by(&format!("http://{addr}"), 5, &Client::new(), None)
-            .await
-            .unwrap();
+        let owned_by = probe_models_owned_by(
+            &format!("http://{addr}"),
+            5,
+            &crate::http_client::client(),
+            None,
+        )
+        .await
+        .unwrap();
         server.abort();
 
         assert_eq!(owned_by, "nvidia");

@@ -323,17 +323,31 @@ pub(crate) fn init_metrics() {
 
     // Layer 2: PD disaggregation metrics (signals only SMG can measure — it is the
     // only component that observes both the prefill and decode legs of a request).
+    //
+    // The PD time to first token is split into phases the gateway bounds itself.
+    // Under sequential dispatch (the gRPC router relays the legs) the three
+    // phase families add up to `smg_pd_ttft_seconds` exactly:
+    //   prefill  smg_pd_prefill_duration_seconds    prefill dispatch -> prefill response drained
+    //   relay    smg_pd_kv_transfer_duration_seconds prefill drained -> decode dispatch (gateway work only)
+    //   decode   smg_pd_decode_ttft_seconds          decode dispatch -> first decode token
+    // The engines' own KV transfer runs inside the decode phase. Parallel
+    // dispatch sends both legs together: the decode phase is the whole TTFT and
+    // there is no relay phase.
     describe_histogram!(
         "smg_pd_prefill_duration_seconds",
-        "Prefill-leg RPC duration by backend_type, model, runtime"
+        "PD prefill phase: prefill dispatch to the end of the prefill response, the prefill engine's queueing and compute included, by backend_type, model, runtime"
     );
     describe_histogram!(
         "smg_pd_kv_transfer_duration_seconds",
-        "KV-transfer window (prefill drain to decode send) by backend_type, model, runtime (vLLM sequential PD)"
+        "PD relay phase (sequential dispatch): end of the prefill response to the decode dispatch, gateway work only; not the engines' KV transfer, which runs inside smg_pd_decode_ttft_seconds; by backend_type, model, runtime"
+    );
+    describe_histogram!(
+        "smg_pd_decode_ttft_seconds",
+        "PD decode phase: decode dispatch to the first decode token, the engines' KV transfer and the decode scheduling included (the whole TTFT under parallel dispatch), by backend_type, model, runtime"
     );
     describe_histogram!(
         "smg_pd_ttft_seconds",
-        "Honest end-to-end TTFT (prefill start to first decode token) by backend_type, model, runtime"
+        "PD time to first token: prefill dispatch to the first decode token (the decode response head on the HTTP router); under sequential dispatch the prefill, relay and decode phases add up to it; by backend_type, model, runtime"
     );
     describe_counter!(
         "smg_pd_kv_connector_mode_total",
@@ -720,6 +734,10 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_discovery_workers_discovered",
         "Workers known via discovery by source"
+    );
+    describe_counter!(
+        "smg_discovery_snapshot_errors_total",
+        "Discovery source observations rejected, by source and reason"
     );
 
     // Layer 5: MCP metrics
@@ -1574,7 +1592,8 @@ impl Metrics {
     // (never per retry attempt).
     // ========================================================================
 
-    /// Record prefill-leg RPC duration.
+    /// Record the PD prefill phase: prefill dispatch to the end of the prefill
+    /// response.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_prefill_duration(
         backend_type: &'static str,
@@ -1592,8 +1611,11 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record the KV-transfer window (prefill drain to decode send) for vLLM
-    /// sequential PD. Uses string interning for model_id; runtime is a static label.
+    /// Record the PD relay phase of sequential dispatch: the gateway's own gap
+    /// between the drained prefill response and the decode dispatch. The family
+    /// name predates the phase model and stays for compatibility; this is not
+    /// the engines' KV transfer, which runs inside the decode phase.
+    /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_kv_transfer_duration(
         backend_type: &'static str,
         model_id: &str,
@@ -1610,12 +1632,36 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record honest end-to-end TTFT: prefill start to first decode token.
+    /// Record the PD decode phase: decode dispatch to the first decode token.
+    /// Under sequential dispatch this is where the engines' KV transfer and the
+    /// decode scheduling show up; under parallel dispatch both legs go out
+    /// together and the value is the end-to-end TTFT.
+    /// Uses string interning for model_id; runtime is a static label.
+    pub fn record_pd_decode_ttft(
+        backend_type: &'static str,
+        model_id: &str,
+        runtime: &'static str,
+        duration: Duration,
+    ) {
+        let model = intern_model_label(model_id);
+        histogram!(
+            "smg_pd_decode_ttft_seconds",
+            "backend_type" => backend_type,
+            "model" => model,
+            "runtime" => runtime
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record the PD time to first token: prefill dispatch to the first decode
+    /// token.
     ///
-    /// INVARIANT: this is the user-facing complement to
-    /// `smg_router_ttft_seconds{backend_type="pd"}`, which measures only the
-    /// decode leg (first decode token minus decode-send). For sequential PD the
-    /// two differ by the prefill + KV-transfer time; both are kept on purpose.
+    /// `smg_router_ttft_seconds{backend_type="pd"}` shares the prefill-dispatch
+    /// anchor on the gRPC streaming paths (their stream base is the prefill
+    /// dispatch). This family adds the runtime label and is the total that the
+    /// phase families (`record_pd_prefill_duration`,
+    /// `record_pd_kv_transfer_duration`, `record_pd_decode_ttft`) add up to
+    /// under sequential dispatch.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_ttft(
         backend_type: &'static str,
@@ -2328,6 +2374,17 @@ impl Metrics {
             "source" => source
         )
         .set(count as f64);
+    }
+
+    /// Record a discovery source observation that was rejected; the provider
+    /// keeps reconciling its last good snapshot meanwhile
+    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_snapshot_errors_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================
@@ -3251,6 +3308,71 @@ mod tests {
             rendered.contains("smg_pd_ttft_seconds_count")
                 && rendered.contains(r#"runtime="sglang""#),
             "pd ttft histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_decode_ttft_emits_histogram() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_decode_ttft(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                Duration::from_millis(321),
+            );
+        });
+        assert!(
+            rendered.contains("smg_pd_decode_ttft_seconds_count")
+                && rendered.contains(r#"runtime="vllm""#),
+            "pd decode ttft histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    /// The PD phase families say on `/metrics` what they bound: the relay
+    /// family is the gateway's own gap and not the engines' KV transfer, and
+    /// the prefill phase, the decode phase and the total name their anchors.
+    #[test]
+    fn pd_phase_families_describe_what_they_measure() {
+        let (rendered, ()) = with_test_recorder(|| {
+            init_metrics();
+            let sample = Duration::from_millis(5);
+            Metrics::record_pd_prefill_duration(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+            Metrics::record_pd_kv_transfer_duration(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                sample,
+            );
+            Metrics::record_pd_decode_ttft(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+            Metrics::record_pd_ttft(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+        });
+        let help = |family: &str| -> String {
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("# HELP {family} ")))
+                .unwrap_or_else(|| panic!("no # HELP for {family}; rendered:\n{rendered}"))
+                .to_owned()
+        };
+        let prefill = help("smg_pd_prefill_duration_seconds");
+        assert!(
+            prefill.contains("prefill dispatch to the end of the prefill response"),
+            "{prefill}"
+        );
+        let relay = help("smg_pd_kv_transfer_duration_seconds");
+        assert!(
+            relay.contains("relay phase") && relay.contains("not the engines' KV transfer"),
+            "{relay}"
+        );
+        let decode = help("smg_pd_decode_ttft_seconds");
+        assert!(
+            decode.contains("decode dispatch to the first decode token"),
+            "{decode}"
+        );
+        let total = help("smg_pd_ttft_seconds");
+        assert!(
+            total.contains("prefill dispatch to the first decode token")
+                && total.contains("add up to it"),
+            "{total}"
         );
     }
 

@@ -94,3 +94,54 @@ class TestLoadConversion:
 
         assert load.token_usage == 0.0
         assert load.max_running_requests == 0
+
+
+class TestLoadRecord:
+    """The record the KV-event stream carries: the fresh snapshot of the
+    batch's rank from the engine's replica, converted as GetLoads converts it."""
+
+    def _snapshots(self):
+        return [
+            SimpleNamespace(
+                dp_rank=1,
+                num_running_reqs=2,
+                num_waiting_reqs=1,
+                num_active_pages=2,
+                num_used_pages=4,
+                max_total_pages=16,
+            ),
+            SimpleNamespace(
+                dp_rank=0,
+                num_running_reqs=1,
+                num_waiting_reqs=0,
+                num_active_pages=4,
+                num_used_pages=8,
+                max_total_pages=16,
+            ),
+        ]
+
+    def test_the_batch_rank_selects_its_snapshot_and_keeps_the_active_usage(self, loads_mod):
+        record = loads_mod.load_record(
+            self._snapshots(), 0, max_total_num_tokens=16384, max_running_requests=16
+        )
+        assert (record.running_requests, record.waiting_requests) == (1, 0)
+        assert record.token_usage == 0.5 and record.active_token_usage == 0.25
+        assert record.num_used_tokens == 8192 and record.max_running_requests == 16
+        # The scheduler reports no queued token-work on this wire: absent, not 0.
+        assert not record.HasField("waiting_uncached_tokens")
+
+    def test_a_batch_without_a_rank_reads_the_lowest_fresh_rank(self, loads_mod):
+        record = loads_mod.load_record(
+            self._snapshots(), None, max_total_num_tokens=16384, max_running_requests=16
+        )
+        assert record.running_requests == 1
+
+    def test_a_batch_naming_a_rank_without_a_fresh_snapshot_gets_no_record(self, loads_mod):
+        # Rank 7's scheduler stopped publishing (or never did): no record, not rank 0's figures.
+        record = loads_mod.load_record(
+            self._snapshots(), 7, max_total_num_tokens=16384, max_running_requests=16
+        )
+        assert record is None
+
+    def test_no_fresh_snapshot_means_no_record(self, loads_mod):
+        assert loads_mod.load_record([], 0, max_total_num_tokens=1, max_running_requests=1) is None

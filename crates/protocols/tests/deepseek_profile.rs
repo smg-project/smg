@@ -28,7 +28,7 @@ fn deepseek_profile_is_limited_to_the_verified_v4_family() {
     ] {
         assert_ne!(
             ProviderProfile::for_model(model),
-            ProviderProfile::OpenAi,
+            ProviderProfile::Generic,
             "{model}"
         );
     }
@@ -46,7 +46,7 @@ fn deepseek_profile_is_limited_to_the_verified_v4_family() {
     ] {
         assert_eq!(
             ProviderProfile::for_model(model),
-            ProviderProfile::OpenAi,
+            ProviderProfile::Generic,
             "{model}"
         );
     }

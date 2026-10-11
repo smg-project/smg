@@ -903,26 +903,39 @@ mod tests {
         let addr = start_probe_listener("127.0.0.1", 0, state.clone()).unwrap();
         let base = format!("http://{addr}");
 
-        let resp = reqwest::get(format!("{base}/liveness")).await.unwrap();
+        let client = crate::http_client::client();
+        let resp = client.get(format!("{base}/liveness")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "OK");
 
-        let resp = reqwest::get(format!("{base}/readiness")).await.unwrap();
+        let resp = client
+            .get(format!("{base}/readiness"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         registry
             .register(http_worker("http://w1:8080", WorkerStatus::Ready))
             .unwrap();
         recompute(&state, &registry, &router_config);
-        let resp = reqwest::get(format!("{base}/readiness")).await.unwrap();
+        let resp = client
+            .get(format!("{base}/readiness"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Drain flips readiness on the dedicated listener; liveness stays OK.
         inflight_tracker.begin_drain();
-        let resp = reqwest::get(format!("{base}/readiness")).await.unwrap();
+        let resp = client
+            .get(format!("{base}/readiness"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.text().await.unwrap().contains("draining"));
-        let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+        let resp = client.get(format!("{base}/health")).send().await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

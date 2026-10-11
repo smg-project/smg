@@ -505,6 +505,7 @@ mod video_param_tests {
 
 #[cfg(test)]
 mod repeat_tests {
+
     use super::*;
     use crate::media::MediaConnectorConfig;
 
@@ -553,9 +554,11 @@ mod repeat_tests {
     }
 
     fn tracker() -> AsyncMultiModalTracker {
-        let connector =
-            MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
-                .expect("default connector");
+        let connector = MediaConnector::new(
+            crate::test_support::http_client(),
+            MediaConnectorConfig::default(),
+        )
+        .expect("default connector");
         AsyncMultiModalTracker::new(Arc::new(connector))
     }
 

@@ -274,7 +274,7 @@ mod tests {
         let router_config = RouterConfig::default();
         let context = Arc::new(
             AppContext::builder()
-                .client(reqwest::Client::new())
+                .client(crate::http_client::client())
                 .rate_limiter(Some(bucket))
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)

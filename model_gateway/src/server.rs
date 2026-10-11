@@ -38,7 +38,6 @@ use openai_protocol::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerSpec, WorkerUpdateRequest,
     },
 };
-use rustls::crypto::{ring, CryptoProvider};
 use serde::Deserialize;
 use serde_json::Value;
 use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
@@ -169,6 +168,15 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
     models::list_models(&state.context, req.headers()).await
+}
+
+async fn v1_model(
+    State(state): State<Arc<AppState>>,
+    Path(model_id): Path<String>,
+    req: Request,
+) -> Response {
+    let request_id = middleware::request_id_of(&req);
+    models::retrieve_model(&state.context, req.headers(), &model_id, request_id).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -450,7 +458,7 @@ async fn v1_messages_count_tokens(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<CountMessageTokensRequest>,
+    ValidatedJson(body): ValidatedJson<CountMessageTokensRequest>,
 ) -> Response {
     if let Err(refused) = check_anthropic_version(&headers) {
         return refused;
@@ -1131,6 +1139,9 @@ pub fn build_app(
         .route("/engine_metrics", get(engine_metrics))
         .route("/loads", get(get_loads))
         .route("/v1/models", get(v1_models))
+        // The rest of the path: a self-hosted id usually carries a slash
+        // (an organisation and a name), raw or percent-encoded.
+        .route("/v1/models/{*id}", get(v1_model))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 
@@ -1306,29 +1317,8 @@ fn supervise_discovery(
     abort
 }
 
-/// The process-level crypto provider rustls uses, installed before anything
-/// in this process builds a TLS configuration.
-///
-/// The gateway links both rustls backends: `ring` directly and through its
-/// gRPC stack, `aws-lc-rs` through the HTTP client's default feature set.
-/// With two backends compiled in rustls cannot pick one on its own, and a
-/// `ServerConfig::builder()` call panics in whichever task builds the first
-/// TLS configuration without a provider installed: the mesh listener's task,
-/// when the mesh runs with mTLS, so the listener never bound while the
-/// gateway kept serving. The provider is `ring`, the one every explicit
-/// choice in this binary already makes. Installing is idempotent: a provider
-/// installed earlier, by an embedding process or a previous start in the
-/// same process, stays.
-fn install_crypto_provider() {
-    if CryptoProvider::get_default().is_none() {
-        // An error here means another thread installed one in between,
-        // which is the outcome wanted.
-        let _ = ring::default_provider().install_default();
-    }
-}
-
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    install_crypto_provider();
+    crate::tls::install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
@@ -2449,7 +2439,10 @@ mod tests {
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
-                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let client = crate::http_client::client_builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap();
                 for (path, content_type, expected) in [
                     ("plain", "application/json", "{\"ok\":true}"),
                     (

@@ -4,7 +4,7 @@
 //! request building is its last reader and [`RequestContext::into_dispatch`]
 //! yields the request-free [`DispatchContext`] the dispatch phase runs on.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::http::HeaderMap;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
@@ -28,7 +28,7 @@ use super::{
     backend_client::BackendClient,
     common::stages::{
         encode::EncodeDispatchPlan,
-        helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
+        helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
         RateLimitCell,
     },
     multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
@@ -42,7 +42,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    observability::cache_trace,
+    observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
@@ -344,6 +344,10 @@ pub(crate) struct AttemptStamp {
     /// Pre-default values of the masked fields, so re-application never
     /// carries a previous attempt's worker defaults forward.
     pub sampling_baseline: Option<SamplingBaseline>,
+    /// A forced tool call's constraint before any worker shaped it, with
+    /// the tool parser that shapes it; retry attempts re-shape it for the
+    /// newly selected worker's engine, as the build did for the first.
+    pub tool_constraint: Option<ToolConstraintStamp>,
     /// Mode::PrefillDecode only (mirrors the build stage's flag).
     pub inject_pd_metadata: bool,
 }
@@ -1220,15 +1224,19 @@ impl WorkerSelection {
     pub fn record_prefill_decode_outcomes(
         &self,
         ledger: &AttemptLedger,
-        prefill_status: u16,
-        decode_status: u16,
+        prefill_status: Option<u16>,
+        decode_status: Option<u16>,
     ) {
         if let Self::Disaggregated {
             prefill, decode, ..
         } = self
         {
-            ledger.record_outcome(prefill.as_ref(), prefill_status);
-            ledger.record_outcome(decode.as_ref(), decode_status);
+            if let Some(status) = prefill_status {
+                ledger.record_outcome(prefill.as_ref(), status);
+            }
+            if let Some(status) = decode_status {
+                ledger.record_outcome(decode.as_ref(), status);
+            }
         }
     }
 
@@ -1384,13 +1392,41 @@ pub(crate) enum ExecutionResult {
 }
 
 /// Timing context threaded from PD execution into the streaming layer so the
-/// first decode token can be measured against prefill start.
+/// first decode token can be measured against the prefill and decode dispatch
+/// instants.
 #[derive(Clone)]
 pub(crate) struct PdTiming {
     /// Monotonic instant the prefill RPC was dispatched.
-    pub prefill_start: std::time::Instant,
+    pub prefill_start: Instant,
+    /// Monotonic instant the decode RPC was dispatched. Sequential dispatch
+    /// sends decode once prefill is drained and relayed; parallel dispatch
+    /// sends both legs together, so this is the prefill instant.
+    pub decode_sent: Instant,
     /// Backend runtime label (e.g. "sglang", "vllm") for the PD metric set.
     pub runtime: &'static str,
+}
+
+impl PdTiming {
+    /// Record the PD time-to-first-token pair at the first decode token: the
+    /// end-to-end value from the prefill dispatch (`smg_pd_ttft_seconds`) and
+    /// the decode phase from the decode dispatch (`smg_pd_decode_ttft_seconds`),
+    /// off one clock reading so that the prefill, relay and decode phases add
+    /// up to the end-to-end value exactly.
+    pub(crate) fn record_first_decode_token(&self, backend_type: &'static str, model: &str) {
+        let now = Instant::now();
+        Metrics::record_pd_ttft(
+            backend_type,
+            model,
+            self.runtime,
+            now.duration_since(self.prefill_start),
+        );
+        Metrics::record_pd_decode_ttft(
+            backend_type,
+            model,
+            self.runtime,
+            now.duration_since(self.decode_sent),
+        );
+    }
 }
 
 /// Final processed response

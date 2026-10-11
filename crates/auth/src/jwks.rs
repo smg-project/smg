@@ -18,6 +18,7 @@ use std::{
 
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use parking_lot::{Mutex, RwLock};
+use rustls::crypto::{ring, CryptoProvider};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -228,6 +229,33 @@ pub(crate) struct JwksProvider {
     last_fetch_attempt: Mutex<Option<Instant>>,
 }
 
+/// Installs `ring` as the process-level TLS crypto provider unless one is
+/// installed already. The HTTP client takes the process provider (reqwest's
+/// `rustls-no-provider` feature) and panics at build time when there is
+/// none, so the client factory installs it before building the client; a
+/// provider the embedding process installed earlier stays.
+fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // An error here means another thread installed one in between,
+        // which is the outcome wanted.
+        let _ = ring::default_provider().install_default();
+    }
+}
+
+/// The provider's HTTP client: a 10 s timeout and no redirects (SSRF).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
+)]
+fn http_client() -> Result<reqwest::Client, JwksError> {
+    install_crypto_provider();
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF via redirects
+        .build()
+        .map_err(|e| JwksError::HttpClientError(e.to_string()))
+}
+
 impl JwksProvider {
     /// Create a new JWKS provider with explicit JWKS URI.
     /// The URL is validated for SSRF protection.
@@ -237,11 +265,7 @@ impl JwksProvider {
         // Validate URL for SSRF protection
         validate_url(&jwks_uri)?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF via redirects
-            .build()
-            .map_err(|e| JwksError::HttpClientError(e.to_string()))?;
+        let client = http_client()?;
 
         Ok(Self {
             client,
@@ -262,11 +286,7 @@ impl JwksProvider {
         // Validate discovery URL for SSRF protection
         validate_url(&discovery_url)?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| JwksError::HttpClientError(e.to_string()))?;
+        let client = http_client()?;
 
         info!("Fetching OIDC discovery from: {}", discovery_url);
 

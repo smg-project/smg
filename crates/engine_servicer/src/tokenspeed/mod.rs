@@ -106,9 +106,14 @@ pub struct TokenSpeedServicerConfig {
     /// requests carrying string stops are refused.
     pub tokenizer_dir: Option<String>,
     pub model: TokenSpeedModelInfo,
-    /// Bound on the scheduler's startup handshake; see
-    /// [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
+    /// Bound on silence during the scheduler's startup handshake: a handshake
+    /// message or a [`TokenSpeedServicerServer::note_engine_alive`] report resets
+    /// it; see [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
     pub engine_startup_timeout: Duration,
+    /// Bound on the whole startup handshake however alive the scheduler is;
+    /// `None` leaves that to the silence bound and the lifecycle owner. See
+    /// [`crate::DEFAULT_ENGINE_STARTUP_CEILING`].
+    pub engine_startup_ceiling: Option<Duration>,
 }
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
@@ -231,6 +236,12 @@ impl TokenSpeedServicerServer {
         if config.engine_startup_timeout.is_zero() {
             return Err(invalid("engine_startup_timeout must be positive"));
         }
+        if config
+            .engine_startup_ceiling
+            .is_some_and(|ceiling| ceiling.is_zero())
+        {
+            return Err(invalid("engine_startup_ceiling must be positive when set"));
+        }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
@@ -273,6 +284,7 @@ impl TokenSpeedServicerServer {
             engine_count,
             tokenizer_dir,
             engine_startup_timeout,
+            engine_startup_ceiling,
             ..
         } = config;
         let thread = ServerThread::start(
@@ -295,6 +307,7 @@ impl TokenSpeedServicerServer {
                     handshake_address,
                     engine_count,
                     engine_startup_timeout,
+                    engine_startup_ceiling,
                     tokenizer_dir,
                     last_error,
                 ));
@@ -352,6 +365,18 @@ impl TokenSpeedServicerServer {
     /// Whether the engine handshake completed.
     pub fn engine_ready(&self) -> bool {
         self.state.engine.client.get().is_some()
+    }
+
+    /// Report a sign of life from the scheduler process while the handshake
+    /// runs: the lifecycle owner that launched it calls this each time it
+    /// polls the process and finds it alive. Each report resets the
+    /// handshake's silence bound (`engine_startup_timeout`); the ceiling
+    /// (`engine_startup_ceiling`) still holds. A no-op once the scheduler is
+    /// connected.
+    pub fn note_engine_alive(&self) {
+        if !self.engine_ready() {
+            self.state.engine.liveness.touch();
+        }
     }
 
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {

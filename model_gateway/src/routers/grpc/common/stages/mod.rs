@@ -66,7 +66,8 @@ mod worker_selection;
 // Export stage implementations
 pub(crate) use client_acquisition::acquire_clients;
 pub(crate) use context_length::{
-    enforce_context_length, enforce_decisions_context_length, enforce_output_budget,
+    context_length_exceeded, enforce_context_length, enforce_decisions_context_length,
+    enforce_output_budget, smallest_context_length,
 };
 pub(crate) use dispatch_metadata::prepare_dispatch_metadata;
 pub(crate) use encode::EncodeStage;

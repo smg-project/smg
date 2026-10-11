@@ -24,6 +24,7 @@ from smg_grpc_servicer.kv_relay import (
     rank_sources,
     relay,
 )
+from smg_grpc_servicer.load_record import LoadSource
 
 __all__ = ["dp_rank_count", "endpoint_for_rank", "sources", "subscribe_kv_events"]
 
@@ -46,8 +47,11 @@ async def subscribe_kv_events(
     server_args: object,
     start_sequence_number: int,
     context: grpc.aio.ServicerContext,
+    *,
+    load_source: LoadSource | None = None,
 ) -> AsyncIterator[common_pb2.KvEventBatch]:
-    """Relay every rank's events; see :func:`smg_grpc_servicer.kv_relay.relay`."""
+    """Relay every rank's events, with the servicer's load record on each
+    when ``load_source`` is given; see :func:`smg_grpc_servicer.kv_relay.relay`."""
     async for batch in relay(
         sources(config, server_args),
         Engine.SGLANG,
@@ -55,5 +59,6 @@ async def subscribe_kv_events(
         context,
         topic=str(getattr(config, "topic", "") or ""),
         hwm=getattr(config, "hwm", None),
+        load_source=load_source,
     ):
         yield batch

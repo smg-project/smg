@@ -43,6 +43,7 @@ use rmcp::{
     service::{RunningService, ServiceError},
     RoleClient,
 };
+use rustls::crypto::{ring, CryptoProvider};
 use serde_json::Value;
 use tokio::{
     sync::mpsc,
@@ -100,13 +101,37 @@ fn build_request_headers(
     Ok(headers)
 }
 
+/// Installs `ring` as the process-level TLS crypto provider unless one is
+/// installed already. The HTTP client takes the process provider (reqwest's
+/// `rustls-no-provider` feature) and panics at build time when there is
+/// none, so the factory installs it before building a client; a provider
+/// the embedding process installed earlier stays.
+fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // An error here means another thread installed one in between,
+        // which is the outcome wanted.
+        let _ = ring::default_provider().install_default();
+    }
+}
+
+/// A client builder with the process-level TLS crypto provider installed:
+/// every HTTP client of this crate comes from here.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
+)]
+pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
+    install_crypto_provider();
+    reqwest::Client::builder()
+}
+
 /// Build HTTP client with default headers.
 fn build_http_client(
     proxy_config: Option<&McpProxyConfig>,
     token: Option<&str>,
     custom_headers: &HashMap<String, String>,
 ) -> McpResult<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(10));
+    let mut builder = http_client_builder().connect_timeout(Duration::from_secs(10));
 
     if let Some(proxy_cfg) = proxy_config {
         builder = super::proxy::apply_proxy_to_builder(builder, proxy_cfg)?;

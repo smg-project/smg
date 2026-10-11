@@ -25,7 +25,7 @@ COMMON_POLICY_CHOICES = [
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
-DISCOVERY_PROVIDER_CHOICES = ["kubernetes"]
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file"]
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -339,6 +339,14 @@ class RouterArgs:
     # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
     # appended last for the same reason
     tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
+    # File discovery (discovery_provider="file"): the JSON manifest, and how
+    # often to reread it (None = 30s).
+    discovery_file: str | None = None
+    discovery_check_interval_secs: int | None = None
+    # Most Responses API requests with background: true in flight at once;
+    # one beyond answers 429. 0 = background mode off (such requests run in
+    # the foreground); appended last for the same reason
+    max_background_responses: int = 1024
 
     @staticmethod
     def add_cli_args(
@@ -371,6 +379,9 @@ class RouterArgs:
         )
         k8s_group = parser.add_argument_group(
             "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
+        )
+        file_discovery_group = parser.add_argument_group(
+            "Service Discovery (File)", "Workers listed in a JSON manifest"
         )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
@@ -1295,6 +1306,21 @@ class RouterArgs:
             default=None,
             help="Worker discovery provider. Give this or --service-discovery, not both",
         )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-file",
+            type=str,
+            default=None,
+            help=(
+                "JSON manifest listing the workers, for --discovery-provider file."
+                " It may be created after startup"
+            ),
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-check-interval-secs",
+            type=int,
+            default=None,
+            help="Seconds between rereads of the --discovery-file manifest (default: 30)",
+        )
         k8s_group.add_argument(
             f"--{prefix}selector",
             type=str,
@@ -1523,6 +1549,16 @@ class RouterArgs:
                 "Sustained admission rate in requests per second, bursting up"
                 " to --max-concurrent-requests, which keeps bounding standing"
                 " concurrency. Unset or 0 = no rate limit."
+            ),
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-background-responses",
+            type=int,
+            default=RouterArgs.max_background_responses,
+            help=(
+                "Most Responses API requests with background: true in flight"
+                " at once; one beyond answers 429. 0 switches background mode"
+                " off: such requests then run in the foreground."
             ),
         )
 

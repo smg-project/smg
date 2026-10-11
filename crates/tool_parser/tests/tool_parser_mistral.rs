@@ -3,8 +3,68 @@
 //! Tests for the Mistral parser which handles [TOOL_CALLS] format
 mod common;
 
+use openai_protocol::common::ToolChoice;
 use serde_json::json;
-use tool_parser::{MistralParser, ToolParser};
+use tool_parser::{MistralParser, ParserFactory, ToolConstraint, ToolParser};
+
+#[test]
+fn test_mistral_structural_tag_call_cardinality() {
+    let tools = common::create_test_tools();
+    for at_least_one in [true, false] {
+        let tag = MistralParser::build_structural_tag(&tools[..2], at_least_one);
+        let format = &tag["format"];
+        let calls = &format["tags"][0]["content"];
+        assert_eq!(format["at_least_one"], at_least_one);
+        assert_eq!(calls["type"], "tags_with_separator");
+        assert_eq!(calls["at_least_one"], at_least_one);
+        assert!(!calls["stop_after_first"].as_bool().unwrap_or(false));
+    }
+}
+
+#[test]
+fn test_mistral_tool_choice_constraints() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let tools = common::create_test_tools();
+    let tools = &tools[1..3];
+
+    for (choice, selected) in [
+        (json!("required"), tools),
+        (
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            &tools[..1],
+        ),
+        (
+            json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "get_weather"}]}),
+            &tools[..1],
+        ),
+    ] {
+        // The gateway filters named/allowed tools before asking the registry.
+        let choice: ToolChoice = serde_json::from_value(choice).unwrap();
+        let Some(ToolConstraint::StructuralTag(tag)) = registry
+            .generate_tool_constraint(Some("mistral"), selected, &choice, false)
+            .unwrap()
+        else {
+            panic!("expected a structural tag for {choice:?}");
+        };
+        let tag: serde_json::Value = serde_json::from_str(&tag).unwrap();
+        let calls = &tag["format"]["tags"][0]["content"];
+        assert_eq!(calls["at_least_one"], true, "{choice:?}");
+        assert_eq!(calls["tags"].as_array().unwrap().len(), selected.len());
+    }
+
+    for choice in [
+        json!("auto"),
+        json!("none"),
+        json!({"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "get_weather"}]}),
+    ] {
+        let choice: ToolChoice = serde_json::from_value(choice).unwrap();
+        assert!(registry
+            .generate_tool_constraint(Some("mistral"), tools, &choice, false)
+            .unwrap()
+            .is_none());
+    }
+}
 
 #[tokio::test]
 async fn test_mistral_single_tool() {

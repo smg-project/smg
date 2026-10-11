@@ -14,6 +14,14 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 
 from smg_grpc_proto.generated import common_pb2
 
+from smg_grpc_servicer.load_record import (
+    HEARTBEAT_BACKOFF,
+    HEARTBEAT_INTERVAL,
+    LOAD_TICK,
+    LoadRecorder,
+    LoadSource,
+)
+
 logger = logging.getLogger(__name__)
 
 _U64_MASK = 0xFFFFFFFFFFFFFFFF
@@ -135,6 +143,10 @@ async def stream_kv_events(
     is_cancelled: Callable[[], bool],
     *,
     recv_timeout: float = 1.0,
+    load_source: LoadSource | None = None,
+    load_tick: float = LOAD_TICK,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL,
+    heartbeat_backoff: float = HEARTBEAT_BACKOFF,
 ) -> AsyncIterator[common_pb2.KvEventBatch]:
     """Core ZMQ→proto streaming loop, decoupled from any engine and gRPC types.
 
@@ -147,15 +159,35 @@ async def stream_kv_events(
             gRPC client's ``subscribe_kv_events().await`` resolves promptly.
         is_cancelled: returns True when the RPC is cancelled; loop then exits.
         recv_timeout: poll timeout so cancellation is observed even when idle.
+        load_source: the servicer's ``GetLoads`` figures as a record (see
+            :mod:`smg_grpc_servicer.load_record`); with it every batch carries
+            the engine's load and ``load_only`` batches go out while no batch
+            flows, at the intervals given. Without it the stream carries cache
+            events only and the gateway keeps polling the worker.
 
     Yields proto KvEventBatch using the ZMQ publisher's native sequence numbers.
     """
+    recorder = (
+        LoadRecorder(
+            load_source,
+            load_tick=load_tick,
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_backoff=heartbeat_backoff,
+        )
+        if load_source is not None
+        else None
+    )
+    poll_timeout = recorder.poll_timeout(recv_timeout) if recorder is not None else recv_timeout
     await send_initial_metadata()
     event_id = 0
     while not is_cancelled():
         # poll() before recv: cancelling a zmq.asyncio recv future does not
         # cancel the in-flight ZMQ recv and can drop an already-dequeued message.
-        if not await sub_socket.poll(timeout=int(recv_timeout * 1000)):
+        if not await sub_socket.poll(timeout=int(poll_timeout * 1000)):
+            if recorder is not None:
+                heartbeat = recorder.heartbeat()
+                if heartbeat is not None:
+                    yield heartbeat
             continue
         frames = await sub_socket.recv_multipart()
 
@@ -170,4 +202,4 @@ async def stream_kv_events(
             continue
 
         proto_batch, event_id = convert_batch(raw_batch, zmq_seq, event_id)
-        yield proto_batch
+        yield recorder.stamp(proto_batch) if recorder is not None else proto_batch

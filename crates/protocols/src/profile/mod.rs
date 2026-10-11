@@ -17,6 +17,7 @@
 mod deepseek;
 mod kimi;
 mod minimax;
+mod openai;
 mod zai;
 
 use std::{
@@ -43,7 +44,15 @@ fn alias_profiles() -> &'static RwLock<HashMap<String, ProviderProfile>> {
 /// Provider dialect for a request, selected from the model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProfile {
-    /// OpenAI baseline: no extra rules beyond core validation.
+    /// The default: a model whose id selects no vendor contract, which is
+    /// every self-hosted deployment. Only the structural rules of core
+    /// validation apply; strict schemas, `json_object` prompts and tool-message
+    /// pairing go through to the engine, whose grammar compiler validates
+    /// what it needs.
+    Generic,
+    /// OpenAI's own hosted models ([`is_openai_vendor_model`]): the public
+    /// API's structured-output and tool-message rules on top of core
+    /// validation.
     OpenAi,
     /// Kimi/Moonshot contract (Kimi-Vendor-Verifier).
     Kimi,
@@ -69,7 +78,8 @@ impl ProviderProfile {
             ProviderProfile::DeepSeek
             | ProviderProfile::Minimax
             | ProviderProfile::Zai
-            | ProviderProfile::OpenAi => Box::new(std::iter::empty()),
+            | ProviderProfile::OpenAi
+            | ProviderProfile::Generic => Box::new(std::iter::empty()),
         }
     }
 
@@ -83,48 +93,59 @@ impl ProviderProfile {
         matches!(self, ProviderProfile::Minimax)
     }
 
-    /// Select the profile from a model id.
+    /// Select the profile for a model id.
     ///
-    /// Matches the way the tool and reasoning parser factories do: any
+    /// A registered alias or served model id takes the profile recorded for
+    /// it at startup ([`Self::register_model_aliases`]): an alias resolves to
+    /// its served model's profile, so the profile is the same before and
+    /// after the alias is resolved into the served name. Otherwise the name
+    /// decides, the way the tool and reasoning parser factories match: any
     /// `/`-separated segment that starts with a vendor marker selects the
     /// profile, so `kimi-k3`, `/models/Kimi-K3`, `moonshotai/kimi-k2` and
-    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. A served model id
-    /// that names no vendor takes the profile of a vendor-named alias it was
-    /// registered with (see [`Self::register_model_aliases`]), so the profile
-    /// stays the same before and after an alias is resolved into the served
-    /// name. Without such an alias, an opaque served name keeps the OpenAI
-    /// baseline: any extension a request carried is dropped with a warning,
-    /// and a `root` message is rejected outright, so that role needs a
-    /// MiniMax model id.
-    /// DeepSeek is narrower: only the calibrated V4 / V4.1 model segments
-    /// and `deepseek-flash` alias select its profile; older versions and
-    /// unrecognized suffixes keep the baseline.
+    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi; OpenAI's own
+    /// model ids ([`is_openai_vendor_model`]: `gpt-4o`, `openai/gpt-4.1`,
+    /// `chatgpt-4o-latest`, `o3-mini`) resolve to OpenAI. Any other id is the
+    /// default profile: a self-hosted model, whose extensions from another
+    /// vendor are dropped with a warning and whose `root` message is rejected
+    /// outright (that role needs a MiniMax model id or alias). DeepSeek is
+    /// narrower: only the calibrated V4 / V4.1 model segments and the
+    /// `deepseek-flash` alias select its profile; older versions and
+    /// unrecognized suffixes keep the default.
     pub fn for_model(model: &str) -> Self {
-        let profile = Self::from_model_segments(model);
-        if profile != ProviderProfile::OpenAi {
-            return profile;
-        }
-        let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
-        aliased
+        let registered = alias_profiles()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(model)
-            .copied()
-            .unwrap_or(ProviderProfile::OpenAi)
+            .copied();
+        registered.unwrap_or_else(|| Self::from_model_segments(model))
     }
 
-    /// Record the configured model aliases (`alias -> served model id`). A
-    /// served model id that has a vendor-named alias selects that vendor's
-    /// profile from now on, whichever of its names a request carries. Aliases
-    /// that select no vendor profile change nothing; when two aliases of one
-    /// served model name different vendors, the first registered wins and the
-    /// conflict is logged.
+    /// Record the configured model aliases (`alias -> served model id`).
+    ///
+    /// A served model id whose own name selects no vendor contract takes the
+    /// contract of a vendor-named alias (Kimi, MiniMax, z.ai, DeepSeek) it is
+    /// served under, whichever of its names a request carries; when two
+    /// aliases of one served model name different vendors, the first wins and
+    /// the conflict is logged. An OpenAI-looking alias (`gpt-4o=local-model`)
+    /// is compatibility naming for OpenAI clients, not a contract: it binds
+    /// nothing, and because every alias resolves to its served model's
+    /// profile, a request naming such an alias is judged as the self-hosted
+    /// model it reaches, not under the public API's rules.
     pub fn register_model_aliases<'a>(aliases: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        let aliases: Vec<(&str, &str)> = aliases.into_iter().collect();
         let mut map = alias_profiles().write().unwrap_or_else(|e| e.into_inner());
-        for (alias, canonical) in aliases {
-            let profile = Self::from_model_segments(alias);
-            if profile == ProviderProfile::OpenAi {
+        // First the served models' contracts, from their own names or their
+        // vendor-named aliases ...
+        for (alias, canonical) in &aliases {
+            let own = Self::from_model_segments(canonical);
+            if own.is_vendor_contract() {
                 continue;
             }
-            match map.get(canonical) {
+            let profile = Self::from_model_segments(alias);
+            if !profile.is_vendor_contract() {
+                continue;
+            }
+            match map.get(*canonical) {
                 Some(existing) if *existing != profile => tracing::warn!(
                     canonical,
                     alias,
@@ -134,10 +155,32 @@ impl ProviderProfile {
                 ),
                 Some(_) => {}
                 None => {
-                    map.insert(canonical.to_string(), profile);
+                    map.insert((*canonical).to_string(), profile);
                 }
             }
         }
+        // ... then every alias resolves to its served model's profile.
+        for (alias, canonical) in &aliases {
+            let profile = map
+                .get(*canonical)
+                .copied()
+                .unwrap_or_else(|| Self::from_model_segments(canonical));
+            map.insert((*alias).to_string(), profile);
+        }
+    }
+
+    /// Whether this is a vendor's contract (Kimi, MiniMax, z.ai, DeepSeek)
+    /// that an alias may bind to a served model; the default profile and
+    /// OpenAI's are not: the former is the absence of a contract, the latter
+    /// follows OpenAI's own model names only.
+    fn is_vendor_contract(self) -> bool {
+        matches!(
+            self,
+            ProviderProfile::Kimi
+                | ProviderProfile::Minimax
+                | ProviderProfile::Zai
+                | ProviderProfile::DeepSeek
+        )
     }
 
     /// The vendor a model id names in one of its `/`-separated segments.
@@ -163,7 +206,10 @@ impl ProviderProfile {
                 return ProviderProfile::Zai;
             }
         }
-        ProviderProfile::OpenAi
+        if is_openai_vendor_model(model) {
+            return ProviderProfile::OpenAi;
+        }
+        ProviderProfile::Generic
     }
 
     /// Shape the request for dispatch under this profile: the provider's own
@@ -183,7 +229,8 @@ impl ProviderProfile {
             ProviderProfile::DeepSeek
             | ProviderProfile::Kimi
             | ProviderProfile::Zai
-            | ProviderProfile::OpenAi => {}
+            | ProviderProfile::OpenAi
+            | ProviderProfile::Generic => {}
         }
         let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
@@ -218,7 +265,7 @@ impl ProviderProfile {
             ProviderProfile::DeepSeek => deepseek::normalize_chat(req),
             ProviderProfile::Kimi => kimi::normalize_chat(req),
             ProviderProfile::Zai => zai::normalize_chat(req),
-            ProviderProfile::OpenAi | ProviderProfile::Minimax => {}
+            ProviderProfile::OpenAi | ProviderProfile::Generic | ProviderProfile::Minimax => {}
         }
     }
 
@@ -241,7 +288,11 @@ impl ProviderProfile {
                 reject_root(req)?;
                 deepseek::validate_chat(req)
             }
-            ProviderProfile::OpenAi => reject_root(req),
+            ProviderProfile::OpenAi => {
+                reject_root(req)?;
+                openai::validate_chat(req)
+            }
+            ProviderProfile::Generic => reject_root(req),
         }
     }
 }
@@ -367,13 +418,24 @@ mod tests {
             ProviderProfile::for_model("served-model-alpha"),
             ProviderProfile::Kimi
         );
+        // An OpenAI-looking alias is compatibility naming, not a contract:
+        // the served model stays on the default profile, and a request
+        // naming the alias is judged as that model, not under OpenAI's rules.
         assert_eq!(
             ProviderProfile::for_model("served-model-beta"),
-            ProviderProfile::OpenAi
+            ProviderProfile::Generic
+        );
+        assert_eq!(
+            ProviderProfile::for_model("gpt-4o-public-name"),
+            ProviderProfile::Generic
+        );
+        assert_eq!(
+            ProviderProfile::for_model("kimi-k3-public-name"),
+            ProviderProfile::Kimi
         );
         assert_eq!(
             ProviderProfile::for_model("served-model-gamma"),
-            ProviderProfile::OpenAi
+            ProviderProfile::Generic
         );
 
         // A request that entered under the vendor name and had its model id
@@ -403,6 +465,7 @@ mod tests {
         assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::Zai.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::Generic.parses_tool_calls_without_tools());
     }
 
     #[test]
@@ -479,17 +542,37 @@ mod tests {
         }
         for model in [
             "gpt-4o-mini",
+            "GPT-5-nano",
+            "openai/gpt-4o",
+            "openrouter/openai/o3-mini",
+            "chatgpt-4o-latest",
+            "codex-mini-latest",
+            "o1",
+            "o4-mini-2025-04-16",
+        ] {
+            assert_eq!(
+                ProviderProfile::for_model(model),
+                ProviderProfile::OpenAi,
+                "{model}"
+            );
+        }
+        for model in [
             "",
             "/models/llama-3",
+            "qwen3-8b",
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "olmo-3-7b-instruct",
+            "o1js-chat",
             "my-kimi-alias",
-            "openai/gpt-4o",
             "my-glm-alias",
             // ChatGLM predates the z.ai chat contract.
             "THUDM/chatglm3-6b",
         ] {
             assert_eq!(
                 ProviderProfile::for_model(model),
-                ProviderProfile::OpenAi,
+                ProviderProfile::Generic,
                 "{model}"
             );
         }
