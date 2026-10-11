@@ -278,32 +278,40 @@ impl Format {
         if named.is_empty() {
             return None;
         }
-        let markers = self.call_markers()?;
+        // The markers are the syntaxes' with a region of calls; xLAM's list has none.
+        let markers = self.call_markers();
+        let markers = markers.as_ref();
         let calls = match self.call_syntax()? {
-            CallSyntax::Json => Self::json_calls(&markers, &named, at_least_one),
+            // The list stands alone in the turn, no marker before or after it, and its table has
+            // no thought: the list is the same either way.
+            CallSyntax::JsonList => return Some(Self::json_list_calls(&named, at_least_one)),
+            CallSyntax::Json => Self::json_calls(markers?, &named, at_least_one),
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
-                Self::keyed_calls(&markers, &named, at_least_one)
+                Self::keyed_calls(markers?, &named, at_least_one)
             }
-            CallSyntax::Dsml => Self::dsml_calls(&markers, &named, at_least_one)?,
+            CallSyntax::Dsml => Self::dsml_calls(markers?, &named, at_least_one)?,
             CallSyntax::Attributed(tags) => {
-                attributed::calls(&markers, tags, &named, at_least_one)?
+                attributed::calls(markers?, tags, &named, at_least_one)?
             }
             CallSyntax::Keyed(tags) => {
-                let ways_in = self.ways_into_block(&markers);
-                keyed::calls(&markers, &ways_in, tags, &named, at_least_one)
+                let markers = markers?;
+                let ways_in = self.ways_into_block(markers);
+                keyed::calls(markers, &ways_in, tags, &named, at_least_one)
             }
             CallSyntax::Xtml => {
+                let markers = markers?;
                 let ways_in = self.ways_into(markers.block.as_ref()?.state);
-                return xtml::calls(&markers, &ways_in, &named, at_least_one);
+                return xtml::calls(markers, &ways_in, &named, at_least_one);
             }
             CallSyntax::Tagged(spelling, _) => {
-                let ways_in = self.ways_into_block(&markers);
-                tagged::calls(&markers, &ways_in, *spelling, &named, at_least_one)
+                let markers = markers?;
+                let ways_in = self.ways_into_block(markers);
+                tagged::calls(markers, &ways_in, *spelling, &named, at_least_one)
             }
             CallSyntax::Pythonic(framing) => {
-                pythonic::calls(&markers, *framing, &named, at_least_one)
+                pythonic::calls(markers?, *framing, &named, at_least_one)
             }
-            CallSyntax::JsonList | CallSyntax::Xml => return None,
+            CallSyntax::Xml => return None,
         };
         if !reasoning_open {
             return Some(calls);
@@ -360,6 +368,51 @@ impl Format {
             triggers: vec![markers.call_open.to_string()],
             tags,
             at_least_one,
+        }
+    }
+
+    /// xLAM's list: the whole output is `[`, the calls joined by `, `, `]`, each call a JSON object
+    /// whose `name` is the tool's and whose `arguments` the tool's schema accepts, spelled as the
+    /// template spells it (`{"name": "NAME", "arguments": {...}}`, a space after each colon and
+    /// comma); with `at_least_one`, the list alone, and otherwise the list or prose, since the
+    /// model answers in prose instead and the assembler reads an output that does not start with
+    /// `[` as content. The prose may hold no `[`: the one place the grammar is narrower than the
+    /// assembler, which reads a `[` that opens no object as prose too.
+    fn json_list_calls(tools: &[&Tool], at_least_one: bool) -> Grammar {
+        let one_call = Grammar::Or(
+            tools
+                .iter()
+                .map(|tool| {
+                    let name = Value::String(tool.function.name.clone());
+                    Grammar::Sequence(vec![
+                        Grammar::ConstString(format!("{{\"name\": {name}, \"arguments\": ")),
+                        Grammar::JsonSchema {
+                            schema: tool.function.parameters.clone(),
+                            style: None,
+                        },
+                        Grammar::ConstString("}".to_string()),
+                    ])
+                })
+                .collect(),
+        );
+        let list = Grammar::Sequence(vec![
+            Grammar::ConstString("[".to_string()),
+            one_call.clone(),
+            Grammar::Star(Box::new(Grammar::Sequence(vec![
+                Grammar::ConstString(", ".to_string()),
+                one_call,
+            ]))),
+            Grammar::ConstString("]".to_string()),
+        ]);
+        if at_least_one {
+            list
+        } else {
+            Grammar::Or(vec![
+                Grammar::AnyText {
+                    excludes: vec!["[".to_string()],
+                },
+                list,
+            ])
         }
     }
 
@@ -1087,13 +1140,79 @@ mod tests {
     }
 
     #[test]
+    fn xlam_writes_the_list_alone_each_call_named_and_its_arguments_by_the_schema() {
+        // The recorded outputs: `[` first, `{"name": "NAME", "arguments": {...}}` with a space
+        // after each colon and comma, `, ` between calls, `]` last and nothing after it. The table
+        // has no thought, so the thought's state changes nothing.
+        let tools = weather_tools();
+        let payload = formats::xlam()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let call = |name: &str, parameters: Value| {
+            value!({"type": "sequence", "elements": [
+                {
+                    "type": "const_string",
+                    "value": format!("{{\"name\": \"{name}\", \"arguments\": "),
+                },
+                {"type": "json_schema", "json_schema": parameters},
+                {"type": "const_string", "value": "}"},
+            ]})
+        };
+        let one_call = value!({"type": "or", "elements": tools
+            .iter()
+            .filter(|tool| !tool.function.name.is_empty())
+            .map(|tool| call(&tool.function.name, tool.function.parameters.clone()))
+            .collect::<Vec<_>>()});
+        assert_eq!(
+            payload,
+            value!({"format": {"type": "sequence", "elements": [
+                {"type": "const_string", "value": "["},
+                one_call,
+                {"type": "star", "content": {"type": "sequence", "elements": [
+                    {"type": "const_string", "value": ", "},
+                    one_call,
+                ]}},
+                {"type": "const_string", "value": "]"},
+            ]}})
+        );
+        assert_eq!(
+            formats::xlam()
+                .grammar(&tools, true, true)
+                .expect("a grammar")
+                .payload(),
+            payload
+        );
+    }
+
+    #[test]
+    fn xlam_without_a_required_call_writes_the_list_or_prose_without_a_bracket() {
+        let tools = weather_tools();
+        let list = formats::xlam()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .to_json();
+        let either = formats::xlam()
+            .grammar(&tools, false, false)
+            .expect("a grammar")
+            .to_json();
+        assert_eq!(
+            either,
+            value!({"type": "or", "elements": [
+                {"type": "any_text", "excludes": ["["]},
+                list,
+            ]})
+        );
+    }
+
+    #[test]
     fn no_named_tool_and_no_derivation_yet_give_none() {
         let tools = weather_tools();
         assert!(formats::glm().grammar(&[], true, false).is_none());
         assert!(formats::glm()
             .grammar(&[tool("", None, value!({}))], true, false)
             .is_none());
-        for format in [formats::minimax_m3(), formats::xlam(), formats::plain()] {
+        for format in [formats::minimax_m3(), formats::plain()] {
             assert!(
                 format.grammar(&tools, true, false).is_none(),
                 "{}",
