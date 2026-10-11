@@ -129,7 +129,7 @@ impl<'a> Definitions<'a> {
 
     /// The schema the property's own `$ref` names, one hop: its keywords stand beside the
     /// property's, and a cycle of definitions is the engine's to expand, not this function's.
-    fn target_of(self, schema: &'a Value) -> Option<&'a Value> {
+    pub(super) fn target_of(self, schema: &'a Value) -> Option<&'a Value> {
         self.resolve(schema.get("$ref")?.as_str()?)
     }
 

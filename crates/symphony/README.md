@@ -53,7 +53,7 @@ and a client that wants the raw text back can have it.
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
 | `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
-| `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a call syntax not derived yet: `to_json()` as the engine reads it, `payload()` as a request carries it. |
+| `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
 | `Ledger` | Token accounting: which tokens wrote which bytes, so every text event can say what it cost. |
 
@@ -71,9 +71,9 @@ and a client that wants the raw text back can have it.
   XML tree, Kimi K3's XTML; and the value reader that turns a value's text into the JSON the
   request's tools declare.
 - `pythonic`: calls written as Python, `name(key=value)`.
-- `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`, and
-  `tagged` with #2884), with the argument shapes a JSON schema pins (`schema`). The syntaxes not
-  derived yet (MiniMax's XML, pythonic, xLAM's list) give `None`.
+- `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
+  `tagged`, `pythonic`, and `xml` for MiniMax's; the JSON, compact keyed, DSML and xLAM list
+  spellings in the module itself), with the argument shapes a JSON schema pins (`schema`).
 - `adapt`: the three API adapters, every response policy in one place.
 - `event`, `input`, `parser`: the contract above.
 

@@ -60,6 +60,7 @@ mod keyed;
 mod pythonic;
 mod schema;
 mod tagged;
+mod xml;
 mod xtml;
 
 /// A structural-tag grammar, as the engines take it.
@@ -255,16 +256,17 @@ struct Region<'a> {
 
 impl Format {
     /// The structural tag for a forced or required call to one of `tools`, or `None` when the
-    /// table's call syntax has no derivation yet, the table has no calls, or no tool has a name.
-    /// `at_least_one` asks for at least one call (`tool_choice` `required`, a named function, or
-    /// an allowed-tools list in `required` mode). With `reasoning_open`, the prompt left the model
-    /// inside its thought, and the tag follows a prefix of free text without the call markers,
-    /// nothing owed at its end (the thought and its close, or nothing, by where the engine starts
-    /// the grammar); a table without a thought has no prefix, and the tag comes back as it is; a
-    /// table whose thought does not close back to where it opened has no prefix yet, and gives
-    /// `None`. Kimi
-    /// K3's tag has a way in per state its block is entered from, the state's close first when it
-    /// has one, so it is the same either way.
+    /// table has no calls or no tool has a name. `at_least_one` asks for at least one call
+    /// (`tool_choice` `required`, a named function, or an allowed-tools list in `required` mode).
+    /// With `reasoning_open`, the prompt left the model inside its thought, and the tag follows a
+    /// prefix of free text without the call markers, nothing owed at its end (the thought and its
+    /// close, or nothing, by where the engine starts the grammar); a table without a thought has
+    /// no prefix, and the tag comes back as it is; a table whose thought does not close back to
+    /// where it opened has no prefix yet, and gives `None`. Kimi K3's tag has a way in per state
+    /// its block is entered from, the state's close first when it has one, so it is the same
+    /// either way; so is MiniMax M3's, whose block is entered the same way from every state and
+    /// whose thought closes in the free text before the trigger; so is xLAM's list, whose table
+    /// has no thought.
     pub fn grammar(
         &self,
         tools: &[Tool],
@@ -311,7 +313,9 @@ impl Format {
             CallSyntax::Pythonic(framing) => {
                 pythonic::calls(markers?, *framing, &named, at_least_one)
             }
-            CallSyntax::Xml => return None,
+            CallSyntax::Xml => {
+                return xml::calls(markers?, self.separator(), &named, at_least_one);
+            }
         };
         if !reasoning_open {
             return Some(calls);
@@ -500,6 +504,14 @@ impl Format {
             },
             Grammar::ConstString(block_close.to_string()),
         ]))
+    }
+
+    /// The text the table drops wherever it stands, which the template writes before every tag
+    /// (MiniMax M3's separator), or nothing for a table without one.
+    fn separator(&self) -> &str {
+        (0..self.terminal_texts().count())
+            .find(|&index| self.ignored(index))
+            .map_or("", |index| self.terminal_text(index))
     }
 
     /// The call markers the rows give: the region of the arguments state, and of the wrapper state
@@ -1206,19 +1218,13 @@ mod tests {
     }
 
     #[test]
-    fn no_named_tool_and_no_derivation_yet_give_none() {
+    fn no_named_tool_and_no_calls_give_none() {
         let tools = weather_tools();
         assert!(formats::glm().grammar(&[], true, false).is_none());
         assert!(formats::glm()
             .grammar(&[tool("", None, value!({}))], true, false)
             .is_none());
-        for format in [formats::minimax_m3(), formats::plain()] {
-            assert!(
-                format.grammar(&tools, true, false).is_none(),
-                "{}",
-                format.name()
-            );
-        }
+        assert!(formats::plain().grammar(&tools, true, false).is_none());
     }
 
     #[test]
