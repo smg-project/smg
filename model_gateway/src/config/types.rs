@@ -314,6 +314,13 @@ pub struct RouterConfig {
     /// requests then run in the foreground, as every other request does.
     #[serde(default = "default_max_background_responses")]
     pub max_background_responses: usize,
+    /// How long the lease a gateway holds on a background response it runs
+    /// stays valid without a renewal, in seconds. A record whose lease has
+    /// expired (its gateway stopped) is closed as `failed` by any gateway
+    /// sharing the response store, within one and a half times this value.
+    /// 0 writes no lease and runs no reaper.
+    #[serde(default = "default_background_lease_ttl_secs")]
+    pub background_lease_ttl_secs: u64,
     /// Enable the priority-aware admission scheduler. When false (default),
     /// the legacy concurrency-limit middleware stays wired — zero behavior
     /// change for existing deployments.
@@ -539,6 +546,10 @@ const fn default_disabled_limit() -> i32 {
 
 const fn default_max_background_responses() -> usize {
     1024
+}
+
+const fn default_background_lease_ttl_secs() -> u64 {
+    30
 }
 
 pub const DEFAULT_PREFILL_QUEUE_SIZE: usize = 100;
@@ -1554,6 +1565,7 @@ impl Default for RouterConfig {
             prefill_queue_timeout_secs: None,
             rate_limit_tokens_per_second: None,
             max_background_responses: default_max_background_responses(),
+            background_lease_ttl_secs: default_background_lease_ttl_secs(),
             priority_scheduler_enabled: false,
             priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
             priority_scheduler_config: None,

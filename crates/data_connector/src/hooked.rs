@@ -579,6 +579,16 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    /// The gateway's own maintenance read (the records whose running gateway
+    /// may be gone), not a client operation: no hook runs for it. The close
+    /// that follows is a store and runs the hooks as every store does.
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        self.inner.list_open_background_responses(limit).await
+    }
+
     async fn list_identifier_responses(
         &self,
         identifier: &str,
@@ -1393,6 +1403,27 @@ mod tests {
         // list_identifier_responses triggers its own before/after hook
         assert_eq!(hook.before_calls(), 3);
         assert_eq!(hook.after_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn hooked_response_lists_open_background_responses_without_a_hook_round() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let mut open = StoredResponse::new(None);
+        open.raw_response = json!({"background": true, "status": "in_progress"});
+        let open_id = hooked.store_response(open).await.unwrap();
+        let mut closed = StoredResponse::new(None);
+        closed.raw_response = json!({"background": true, "status": "completed"});
+        hooked.store_response(closed).await.unwrap();
+        assert_eq!(hook.before_calls(), 2);
+
+        let listed = hooked.list_open_background_responses(10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, open_id);
+        assert_eq!(hook.before_calls(), 2, "a maintenance read runs no hook");
+        assert_eq!(hook.after_calls(), 2);
     }
 
     #[tokio::test]

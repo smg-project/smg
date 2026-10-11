@@ -479,6 +479,7 @@ struct Router {
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
     max_background_responses: usize,
+    background_lease_ttl_secs: u64,
     connection_mode: worker::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -1082,6 +1083,7 @@ impl Router {
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
             .max_background_responses(self.max_background_responses)
+            .background_lease_ttl_secs(self.background_lease_ttl_secs)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1329,6 +1331,7 @@ impl Router {
         jemalloc_prof_dir = None,
         tokenizer_cache_l0_max_memory = 268435456,
         max_background_responses = 1024,
+        background_lease_ttl_secs = 30,
         // Keyword-only, so it never takes a positional slot.
         *,
         mesh_tls_ca_cert = None,
@@ -1522,6 +1525,7 @@ impl Router {
         jemalloc_prof_dir: Option<String>,
         tokenizer_cache_l0_max_memory: usize,
         max_background_responses: usize,
+        background_lease_ttl_secs: u64,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
@@ -1643,6 +1647,7 @@ impl Router {
             queue_timeout_secs,
             rate_limit_tokens_per_second,
             max_background_responses,
+            background_lease_ttl_secs,
             connection_mode,
             model_path,
             tokenizer_path,

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use smg_data_connector::{ResponseId, ResponseStorage};
 use tracing::{info, warn};
 
-use crate::routers::error;
+use crate::routers::{error, grpc::common::responses::background};
 
 pub async fn get_response(
     response_storage: &Arc<dyn ResponseStorage>,
@@ -18,7 +18,13 @@ pub async fn get_response(
 ) -> Response {
     let id = ResponseId::from(response_id);
     match response_storage.get_response(&id).await {
-        Ok(Some(stored)) => (StatusCode::OK, Json(stored.raw_response)).into_response(),
+        // A background record in flight carries the running gateway's lease,
+        // which is the gateway's own and not part of the object served.
+        Ok(Some(stored)) => (
+            StatusCode::OK,
+            Json(background::public_object(stored.raw_response)),
+        )
+            .into_response(),
         Ok(None) => error::not_found(
             "not_found",
             format!("No response found with id '{response_id}'"),

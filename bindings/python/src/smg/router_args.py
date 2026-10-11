@@ -347,6 +347,11 @@ class RouterArgs:
     # one beyond answers 429. 0 = background mode off (such requests run in
     # the foreground); appended last for the same reason
     max_background_responses: int = 1024
+    # How long the lease a gateway holds on a background response it runs
+    # stays valid without a renewal, in seconds; a response whose gateway
+    # stopped is closed as failed by any gateway sharing the response store.
+    # 0 = no lease, no reaper; appended last for the same reason
+    background_lease_ttl_secs: int = 30
 
     @staticmethod
     def add_cli_args(
@@ -1559,6 +1564,18 @@ class RouterArgs:
                 "Most Responses API requests with background: true in flight"
                 " at once; one beyond answers 429. 0 switches background mode"
                 " off: such requests then run in the foreground."
+            ),
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}background-lease-ttl-secs",
+            type=int,
+            default=RouterArgs.background_lease_ttl_secs,
+            help=(
+                "How long the lease this gateway holds on a background"
+                " response it runs stays valid without a renewal, in seconds;"
+                " a response whose gateway stopped is closed as failed by any"
+                " gateway sharing the response store within one and a half"
+                " times this value. 0 writes no lease and runs no reaper."
             ),
         )
 

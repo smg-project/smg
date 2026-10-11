@@ -1010,6 +1010,27 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     ))
 }
 
+/// The query behind [`ResponseStorage::list_open_background_responses`]:
+/// the rows whose `raw_response` (cast to `jsonb`) carries `background: true`
+/// and a status the response still leaves, oldest first, `$1` the most rows.
+/// `None` when the schema skips the column (nothing to list).
+fn open_background_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let order = if s.is_skipped("created_at") {
+        String::new()
+    } else {
+        format!(" ORDER BY {} ASC", s.col("created_at"))
+    };
+    Some(format!(
+        "{select_base} WHERE {col_raw}::jsonb @> '{{\"background\": true}}'::jsonb \
+         AND {col_raw}::jsonb->>'status' IN ('queued', 'in_progress'){order} LIMIT $1"
+    ))
+}
+
 /// How a response is stored under its id, decided once at start-up from the
 /// catalog (`store_path_for`). The table the store creates has a primary key
 /// on the id, so it takes the one-statement path; a configured table that
@@ -1314,6 +1335,32 @@ impl ResponseStorage for PostgresResponseStorage {
         }
     }
 
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        let Some(sql) = open_background_sql(&self.store.schema, &self.select_base) else {
+            return Ok(Vec::new());
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let rows = client
+            .query(&sql, &[&limit])
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let schema = &self.store.schema;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(Self::build_response_from_row(&row, schema)?);
+        }
+        Ok(out)
+    }
+
     async fn delete_response(&self, response_id: &ResponseId) -> ResponseResult<()> {
         let s = &self.store.schema.responses;
         let table = s.qualified_table(self.store.schema.owner.as_deref());
@@ -1449,6 +1496,25 @@ mod tests {
     fn parse_metadata_non_object_is_error() {
         assert!(PostgresConversationStorage::parse_metadata(Some(json!("not an object"))).is_err());
     }
+    #[test]
+    fn open_background_sql_filters_on_the_stored_status_and_flag_oldest_first() {
+        let schema = SchemaConfig::default();
+        let sql = open_background_sql(&schema, "SELECT id, raw_response FROM responses").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT id, raw_response FROM responses WHERE raw_response::jsonb @> \
+             '{\"background\": true}'::jsonb AND raw_response::jsonb->>'status' \
+             IN ('queued', 'in_progress') ORDER BY created_at ASC LIMIT $1"
+        );
+
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_sql(&skipped, "SELECT id FROM responses").is_none());
+    }
+
     #[test]
     fn upsert_sql_replaces_the_row_under_its_id_in_one_statement() {
         let sql = upsert_sql("responses", &["id", "input", "raw_response"]);

@@ -411,6 +411,22 @@ impl StoredResponse {
     }
 }
 
+/// The statuses a background response still leaves.
+pub(crate) const OPEN_RESPONSE_STATUSES: [&str; 2] = ["queued", "in_progress"];
+
+impl StoredResponse {
+    /// Whether this is a background record still in flight (`background:
+    /// true` with a status it still leaves): the gateway running it holds a
+    /// lease on it, and any gateway sharing the store closes it once that
+    /// lease has expired.
+    pub fn is_open_background(&self) -> bool {
+        self.raw_response["background"].as_bool() == Some(true)
+            && self.raw_response["status"]
+                .as_str()
+                .is_some_and(|status| OPEN_RESPONSE_STATUSES.contains(&status))
+    }
+}
+
 /// Response chain - a sequence of related responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseChain {
@@ -538,6 +554,20 @@ pub trait ResponseStorage: Send + Sync {
     ) -> ResponseResult<Option<StoredResponse>> {
         let _ = item_id;
         Ok(None)
+    }
+
+    /// The background responses still in flight (`background: true` with a
+    /// status they still leave), oldest first, at most `limit` of them: the
+    /// records a gateway reads to close those whose running gateway is gone.
+    ///
+    /// The default answers an empty list: a backend without a way to find
+    /// them leaves such records to a client's cancel.
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        let _ = limit;
+        Ok(Vec::new())
     }
 
     /// List recent responses for a safety identifier

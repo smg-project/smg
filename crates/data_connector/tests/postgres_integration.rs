@@ -862,3 +862,75 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
         .expect("is linked"));
     assert!(list(SortOrder::Asc).await.is_empty());
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn open_background_responses_are_listed_until_they_close() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    // Three records of this run: a background response in flight (with the
+    // lease its gateway wrote), one that closed, and a foreground one.
+    let record = |status: &str, background: bool| {
+        let mut stored = StoredResponse::new(None);
+        let mut raw = json!({"id": stored.id.0, "status": status, "output": []});
+        if background {
+            raw["background"] = json!(true);
+            raw["_lease"] = json!({"owner": "gw_test", "expires_at": 1_700_000_000});
+        }
+        stored.raw_response = raw;
+        stored
+    };
+    let open = record("in_progress", true);
+    let closed = record("completed", true);
+    let foreground = record("in_progress", false);
+    for stored in [&open, &closed, &foreground] {
+        storage.store_response(stored.clone()).await.expect("store");
+    }
+
+    let listed_ids =
+        |responses: Vec<StoredResponse>| responses.into_iter().map(|r| r.id.0).collect::<Vec<_>>();
+    let ids = listed_ids(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list"),
+    );
+    assert!(
+        ids.contains(&open.id.0),
+        "the open background record is listed: {ids:?}"
+    );
+    assert!(!ids.contains(&closed.id.0), "a closed record is not");
+    assert!(
+        !ids.contains(&foreground.id.0),
+        "a foreground record is not"
+    );
+    let listed = storage
+        .list_open_background_responses(10_000)
+        .await
+        .expect("list");
+    let found = listed
+        .iter()
+        .find(|r| r.id == open.id)
+        .expect("the open record");
+    assert_eq!(found.raw_response["_lease"]["owner"], "gw_test");
+
+    // Its terminal store takes it out of the list.
+    let mut done = open.clone();
+    done.raw_response["status"] = json!("failed");
+    storage.store_response(done).await.expect("store");
+    let ids = listed_ids(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list"),
+    );
+    assert!(!ids.contains(&open.id.0), "{ids:?}");
+
+    for stored in [&open, &closed, &foreground] {
+        storage.delete_response(&stored.id).await.expect("delete");
+    }
+}

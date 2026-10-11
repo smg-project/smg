@@ -1804,6 +1804,7 @@ class TestRouterArgsFieldOrder:
         "discovery_file",
         "discovery_check_interval_secs",
         "max_background_responses",
+        "background_lease_ttl_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1865,6 +1866,7 @@ class TestRouterArgsFieldOrder:
             "tenant_rate_limit_config",
             "tokenizer_cache_l0_max_memory",
             "max_background_responses",
+            "background_lease_ttl_secs",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
