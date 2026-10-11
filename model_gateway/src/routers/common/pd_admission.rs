@@ -251,10 +251,11 @@ pub(crate) async fn admit_decode(
 
     let wait = admission_wait();
     // The place is taken before the first try, so a request that arrives
-    // while others wait joins behind them even when a room happens to be
-    // free, and one that finds nobody waiting is next at once and claims
-    // without a wait, as before. The guard gives the place back on every
-    // way out of the wait, the dispatch dropped mid-wait included.
+    // while others of its size (or narrower) wait joins behind them even
+    // when a room happens to be free, and one that finds nobody it must
+    // yield to claims without a wait, as before. The guard gives the place
+    // back on every way out of the wait, the dispatch dropped mid-wait
+    // included.
     let place = Place::take(decode.as_ref(), rooms);
     let wake = place.wake();
     let claim = claim_within(wait, wake.as_deref(), || {
