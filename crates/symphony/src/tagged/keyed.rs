@@ -13,7 +13,8 @@
 //!
 //! each with its own spellings of the four tags ([`Tags`]) and its own newlines around them (Ling
 //! writes one after the name, after each `</arg_key>` and before the close, GLM 4.5 and 4.6 one
-//! after the name, after each `</arg_key>` and after each `</arg_value>`, Hy4 and IQuest none;
+//! after the name, after each `</arg_key>` and after each `</arg_value>`, K2-Horizon the same under
+//! `ifm|`-prefixed tags with the block's own around its calls, Hy4 and IQuest none;
 //! [`Newlines`]). The engine's table
 //! owns the call markers: it enters this assembler after the opening marker and leaves it at the
 //! closing one, which it hands over as the call's end. Between the two the assembler reads the
@@ -98,6 +99,10 @@ pub struct Newlines {
     pub after_value: &'static str,
     /// Before the call's close, whether or not a pair came.
     pub before_close: &'static str,
+    /// Inside a block of calls, before each call's opener.
+    pub block_before_call: &'static str,
+    /// Inside a block of calls, before the block's close.
+    pub block_before_close: &'static str,
 }
 
 impl Newlines {
@@ -107,6 +112,8 @@ impl Newlines {
         after_key: "",
         after_value: "",
         before_close: "",
+        block_before_call: "",
+        block_before_close: "",
     };
 
     /// Ling's: after the name, after each `</arg_key>` and before the close, nothing between
@@ -118,6 +125,8 @@ impl Newlines {
         after_key: "\n",
         after_value: "",
         before_close: "\n",
+        block_before_call: "",
+        block_before_close: "",
     };
 
     /// GLM 4.5 and 4.6's: after the name, after each `</arg_key>` and after each `</arg_value>`,
@@ -130,6 +139,19 @@ impl Newlines {
         after_key: "\n",
         after_value: "\n",
         before_close: "",
+        block_before_call: "",
+        block_before_close: "",
+    };
+
+    /// K2-Horizon's: GLM 4.5 and 4.6's places, and the block's own newline before each call and
+    /// before the block's close, so a turn's calls read
+    /// `<ifm|tool_calls>\n<ifm|tool_call>NAME\n…</ifm|tool_call>\n</ifm|tool_calls>` (in
+    /// k2-horizon-36b's recorded shapes set: 4 of 4 zero-argument calls `NAME\n</ifm|tool_call>`,
+    /// 2,667 pairs followed by `\n<ifm|arg_key>`, 1,588 last pairs by `\n</ifm|tool_call>`).
+    pub const K2_HORIZON: Self = Self {
+        block_before_call: "\n",
+        block_before_close: "\n",
+        ..Self::GLM4
     };
 }
 
@@ -153,6 +175,15 @@ impl Tags {
     pub const GLM4: Self = Self {
         newlines: Newlines::GLM4,
         ..Self::PLAIN
+    };
+
+    /// K2-Horizon's spelling, every tag prefixed `ifm|`, with its newlines.
+    pub const K2_HORIZON: Self = Self {
+        key_open: "<ifm|arg_key>",
+        key_close: "</ifm|arg_key>",
+        value_open: "<ifm|arg_value>",
+        value_close: "</ifm|arg_value>",
+        newlines: Newlines::K2_HORIZON,
     };
 
     /// Hy4's spelling, every tag suffixed `:opensource`, nothing between them.

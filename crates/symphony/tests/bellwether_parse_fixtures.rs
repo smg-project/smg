@@ -76,8 +76,8 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, glm, glm4, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain,
-        qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v4_1, glm, glm4, hy4, iquest, k2_horizon, kimi_k3, lfm2_5, ling, minimax_m3,
+        olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -446,6 +446,16 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Glm4,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    // K2-Horizon writes GLM 4.6's keyed spelling under `ifm|`-prefixed tags in a block, and its
+    // prompt opens the thought whatever the request says (the template has no thinking switch;
+    // `reasoning_effort` picks the tag, `<ifm|think>` by default). The template raises on an
+    // assistant turn without a thinking field, so bellwether records five of its sixteen common
+    // cases, the reasoning ones and the thinking-on call.
+    (
+        "k2-horizon-36b",
+        Family::K2Horizon,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
     (
         "iquest-q1",
         Family::IQuest,
@@ -515,13 +525,14 @@ enum Family {
     DeepSeekV4_1,
     /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
     SeedOss,
-    /// [`hy4`], [`ling`], [`iquest`], [`glm`], [`glm4`]: keyed arguments, typed by the request
-    /// tools.
+    /// [`hy4`], [`ling`], [`iquest`], [`glm`], [`glm4`], [`k2_horizon`]: keyed arguments, typed
+    /// by the request tools.
     Hy4,
     Ling,
     IQuest,
     Glm,
     Glm4,
+    K2Horizon,
     /// [`olmo3`], [`lfm2_5`]: Python calls.
     Olmo3,
     Lfm2_5,
@@ -544,6 +555,7 @@ impl Family {
             Self::Hy4 => ("<think:opensource>", "</think:opensource>"),
             Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
             Self::KimiK3 => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+            Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
             _ => ("<think>", "</think>"),
         }
     }
@@ -570,6 +582,7 @@ impl Family {
             Self::Ling => ling(),
             Self::Glm => glm(),
             Self::Glm4 => glm4(),
+            Self::K2Horizon => k2_horizon(),
             Self::IQuest => iquest(),
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
@@ -587,12 +600,16 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::MiMo => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3 and the plain table read neither of the probes'
-            // Qwen markers: `</think>` stays reasoning text and the fenced `<tool_call>` block
-            // stays content, as the reference says.
-            Self::SeedOss | Self::Hy4 | Self::Olmo3 | Self::Xlam | Self::KimiK3 | Self::Plain => {
-                &[]
-            }
+            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3, K2-Horizon and the plain table read neither of
+            // the probes' Qwen markers: `</think>` stays reasoning text and the fenced
+            // `<tool_call>` block stays content, as the reference says.
+            Self::SeedOss
+            | Self::Hy4
+            | Self::Olmo3
+            | Self::Xlam
+            | Self::KimiK3
+            | Self::K2Horizon
+            | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
             // but not `<tool_call>`.

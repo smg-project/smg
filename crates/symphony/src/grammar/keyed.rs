@@ -1,9 +1,10 @@
 //! Keyed arguments written from the table's own tags, for the spellings the engines' `glm_xml`
 //! style does not write: Ling's, with the template's newline after the call's name, after each
 //! `</arg_key>` and before `</tool_call>`; GLM 4.5 and 4.6's, with it after the name, after each
-//! `</arg_key>` and after each `</arg_value>`; and Hy4's, every tag suffixed `:opensource` and the
-//! calls in a block. GLM 4.7's and IQuest's compact spelling keeps the `glm_xml` style, the shape
-//! the gateway writes for it today.
+//! `</arg_key>` and after each `</arg_value>`; K2-Horizon's, the same under `ifm|`-prefixed tags
+//! with the block's newline before each call and before its close; and Hy4's, every tag suffixed
+//! `:opensource` and the calls in a block. GLM 4.7's and IQuest's compact spelling keeps the
+//! `glm_xml` style, the shape the gateway writes for it today.
 //!
 //! A call is the call's opener and the tool's name, then one `<arg_key>` and `<arg_value>` pair per
 //! property of the tool's schema, in the schema's order, each optional unless the schema requires
@@ -58,12 +59,21 @@ pub(super) fn calls(
                     })
                     .collect(),
             );
-            block_of(
-                ways_in,
-                Grammar::Plus(Box::new(one_call)),
-                block.close,
-                at_least_one,
-            )
+            // The block's own newlines, where the template writes them: before each call and
+            // before the block's close (K2-Horizon); Hy4's block writes none.
+            let newlines = &tags.newlines;
+            let each = match newlines.block_before_call {
+                "" => one_call,
+                before => {
+                    Grammar::Sequence(vec![Grammar::ConstString(before.to_string()), one_call])
+                }
+            };
+            let all = Grammar::Plus(Box::new(each));
+            let inside = match newlines.block_before_close {
+                "" => all,
+                before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
+            };
+            block_of(ways_in, inside, block.close, at_least_one)
         }
         None => Grammar::TriggeredTags {
             triggers: vec![markers.call_open.to_string()],

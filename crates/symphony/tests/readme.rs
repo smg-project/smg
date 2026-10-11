@@ -8,8 +8,8 @@ use std::{fmt::Write as _, fs, path::PathBuf};
 
 use symphony::{
     formats::{
-        deepseek_v4_1, glm, glm4, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain,
-        qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v4_1, glm, glm4, hy4, iquest, k2_horizon, kimi_k3, lfm2_5, ling, minimax_m3,
+        olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Format,
@@ -67,6 +67,7 @@ enum Table {
     KimiK3,
     Glm,
     Glm4,
+    K2Horizon,
     Plain,
 }
 
@@ -90,6 +91,7 @@ impl Table {
             Self::KimiK3 => kimi_k3(),
             Self::Glm => glm(),
             Self::Glm4 => glm4(),
+            Self::K2Horizon => k2_horizon(),
             Self::Plain => plain(),
         }
     }
@@ -332,9 +334,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-09-01",
         smg: (None, None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::K2Horizon),
+        set: Some(12_817),
+        status: Status::Replaying,
     },
     Group {
         slug: "kimi-k3",
