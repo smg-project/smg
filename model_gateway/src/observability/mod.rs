@@ -5,6 +5,7 @@ pub mod events;
 pub mod gauge_histogram;
 pub mod heap_profile;
 pub mod inflight_tracker;
+pub mod log_throttle;
 pub mod logging;
 pub mod metrics;
 pub mod metrics_server;

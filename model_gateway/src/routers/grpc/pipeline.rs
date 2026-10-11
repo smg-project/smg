@@ -28,7 +28,7 @@ use openai_protocol::{
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::error;
+use tracing::{debug, error};
 
 use super::{
     common::{
@@ -71,7 +71,7 @@ use super::{
 };
 use crate::{
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -459,7 +459,17 @@ impl RequestPipeline {
         macro_rules! step {
             ($stage:expr, $result:expr) => {
                 $result.inspect_err(|response: &Response| {
-                    error!("Stage {} failed with status {}", $stage, response.status());
+                    if response.extensions().get::<ReportedRefusal>().is_some() {
+                        // The stage wrote the one line this refusal gets
+                        // (rate-limited, with the pool's state).
+                        debug!(
+                            "Stage {} refused the request with status {}",
+                            $stage,
+                            response.status()
+                        );
+                    } else {
+                        error!("Stage {} failed with status {}", $stage, response.status());
+                    }
                 })
             };
         }

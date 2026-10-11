@@ -41,6 +41,16 @@ use crate::observability::{
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeResponse;
 
+/// Response-extension marker for a refusal whose producing stage wrote the
+/// log line for it already (one WARN per refusal, rate-limited under a
+/// sustained condition, with the request id, the model and the pool's
+/// state). [`ResponseLogger`] logs a marked response at DEBUG instead of a
+/// second line at ERROR: a client retrying at once against a model whose
+/// workers are all down turned every refusal into three ERROR lines, and
+/// the log into a storm.
+#[derive(Clone, Copy, Debug)]
+pub struct ReportedRefusal;
+
 /// The probe routes on the main listener. Request-start logging for these is
 /// demoted alongside [`ProbeResponse`] — the paths are the request-side view
 /// of the same contract.
@@ -181,6 +191,13 @@ impl<B> OnResponse<B> for ResponseLogger {
             debug!(
                 target: "smg::response",
                 "finished probe request"
+            );
+        } else if response.extensions().get::<ReportedRefusal>().is_some() {
+            // The refusing stage wrote this refusal's line; a second one per
+            // request here, at ERROR, is what made a retry loop a log storm.
+            debug!(
+                target: "smg::response",
+                "request refused; reported by the refusing stage"
             );
         } else if status.is_server_error() {
             error!(
@@ -331,7 +348,12 @@ mod tests {
         Arc,
     };
 
-    use axum::{body::Bytes, http::Request, routing::get, Router};
+    use axum::{
+        body::Bytes,
+        http::{Request, StatusCode},
+        routing::get,
+        Router,
+    };
     use http_body_util::BodyExt;
     use tower::ServiceExt;
     use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
@@ -392,5 +414,64 @@ mod tests {
             during_body < frames,
             "the request span was entered {during_body} times while {frames} frames streamed"
         );
+    }
+
+    /// Counts the events of one level on this thread's subscriber.
+    struct LevelCounter(tracing::Level, Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for LevelCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == self.0 {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A 503 the refusing stage reported itself is not logged again at ERROR
+    /// by the access log; an unmarked 503 still is.
+    #[tokio::test]
+    async fn a_reported_refusal_is_not_logged_again_at_error() {
+        let errors = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(LevelCounter(tracing::Level::ERROR, errors.clone())),
+        );
+        let refused = || async {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            response.extensions_mut().insert(ReportedRefusal);
+            response
+        };
+        let failed = || async {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            response
+        };
+        let app = Router::new()
+            .route("/refused", get(refused))
+            .route("/failed", get(failed))
+            .layer(create_logging_layer());
+        for (path, expected_errors) in [("/refused", 0), ("/failed", 1)] {
+            errors.store(0, Ordering::Relaxed);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                errors.load(Ordering::Relaxed),
+                expected_errors,
+                "ERROR lines written for {path}"
+            );
+        }
     }
 }

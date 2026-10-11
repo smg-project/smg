@@ -380,6 +380,10 @@ pub(crate) fn failure_from(
 /// the health interval are far longer, and the fleet may be back sooner.
 pub(crate) const NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS: u32 = 1;
 
+/// The client-visible code of [`no_available_workers`], which the loggers
+/// downstream recognise the refusal by.
+pub(crate) const NO_AVAILABLE_WORKERS_CODE: &str = "no_available_workers";
+
 /// The 503 for a pool whose every worker is unavailable (unhealthy or its
 /// circuit breaker open). Terminal for the retry layer: the verdict clears at
 /// the health interval or the breaker timeout, never inside a backoff window,
@@ -389,7 +393,7 @@ pub(crate) const NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS: u32 = 1;
 /// overload shed, tenant limits): a client that honours the header does not
 /// hammer a fleet that is down and gets the same bounded hint on every path.
 pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
-    let mut response = error::service_unavailable("no_available_workers", message);
+    let mut response = error::service_unavailable(NO_AVAILABLE_WORKERS_CODE, message);
     mark_non_retryable(&mut response);
     response.headers_mut().insert(
         RETRY_AFTER,
