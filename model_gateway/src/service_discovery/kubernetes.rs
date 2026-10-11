@@ -105,7 +105,7 @@ pub struct ServiceDiscoveryConfig {
     /// Annotation listing the pod's worker data ports (comma-separated).
     /// Absent = single worker at `port`.
     pub worker_ports_annotation: String,
-    /// KV metadata is captured at worker registration; replace a Pod after changing it.
+    /// Editing the KV annotations on a live Pod updates its worker in place.
     pub kv_connector_annotation: String,
     pub kv_engine_id_annotation: String,
     /// Per-worker model_id override source from pod metadata.
