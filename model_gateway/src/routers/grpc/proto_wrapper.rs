@@ -2684,7 +2684,8 @@ impl PrefillTicket {
 impl Drop for PrefillTicket {
     fn drop(&mut self) {
         if !self.released {
-            self.worker.note_prefill_ended(self.tokens, self.timed, None);
+            self.worker
+                .note_prefill_ended(self.tokens, self.timed, None);
         }
     }
 }

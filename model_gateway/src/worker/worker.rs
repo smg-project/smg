@@ -1745,7 +1745,13 @@ impl WorkerRuntime {
     }
 
     /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock.
-    pub fn note_prefill_ended_at(&self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
+    pub fn note_prefill_ended_at(
+        &self,
+        tokens: u64,
+        timed: bool,
+        cached: Option<u64>,
+        now_ms: u64,
+    ) {
         self.prefill.lock().ended(tokens, timed, cached, now_ms);
     }
 
@@ -2484,7 +2490,9 @@ impl Worker for BasicWorker {
     }
 
     fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
-        self.runtime.load().note_prefill_ended(tokens, timed, cached);
+        self.runtime
+            .load()
+            .note_prefill_ended(tokens, timed, cached);
     }
 
     fn prefill_backlog(&self) -> Duration {
@@ -4682,7 +4690,11 @@ mod tests {
             runtime.note_prefill_started_at(2_000, true, now);
             runtime.note_prefill_ended_at(2_000, true, Some(2_000), now + 10);
         }
-        assert_eq!(runtime.prefill_rate_tps(), 0, "nothing computed, nothing learned");
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            0,
+            "nothing computed, nothing learned"
+        );
         runtime.note_prefill_started_at(4 * 16_000, true, 60_000);
         assert_eq!(
             runtime.prefill_backlog(),
