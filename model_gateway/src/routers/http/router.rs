@@ -63,7 +63,7 @@ use crate::{
             },
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
-            placement::{self, CandidateFilter, PlacementFailure, PlacementInputs},
+            placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
@@ -358,6 +358,32 @@ impl Router {
         }
     }
 
+    /// The line and marker of a refusal this router answers on its own (a
+    /// `no_available_workers` 503, a `model_not_found` 404): one WARN per
+    /// refusal, rate-limited, with the regular pool's state, through
+    /// [`placement::report_refusal`]; the access log then keeps quiet about
+    /// it. Every other response passes through unchanged.
+    fn report_refusal(
+        &self,
+        function: &'static str,
+        model_id: &str,
+        refusal: Response,
+    ) -> Response {
+        placement::report_refusal(
+            &self.worker_registry,
+            RefusalSite {
+                function,
+                mode: "Regular",
+                legs: &[("regular", RoutingPool::HttpRegular)],
+            },
+            // The line is written inside the request's span, which carries
+            // the id.
+            None,
+            model_id,
+            refusal,
+        )
+    }
+
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -566,7 +592,7 @@ impl Router {
                 // from, wildcard model included: that is what makes the shed
                 // fire for a model-less `/generate` and for a model that is
                 // also served over gRPC.
-                return match placement::single_failure(
+                let refusal = match placement::single_failure(
                     &self.worker_registry,
                     model_id,
                     RoutingPool::HttpRegular,
@@ -581,6 +607,7 @@ impl Router {
                         "All workers are unavailable (circuit breaker open or unhealthy)",
                     ),
                 };
+                return self.report_refusal("Router::route_typed_request", model_id, refusal);
             }
         };
 
@@ -938,7 +965,11 @@ impl Router {
             .worker_registry
             .get_routing_pool(model_id, RoutingPool::HttpRegular);
         if all_workers.is_empty() {
-            let resp = error::model_not_found(model_id);
+            let resp = self.report_refusal(
+                "Router::route_multipart_transcription",
+                model_id,
+                error::model_not_found(model_id),
+            );
             record_pre_send_error(&resp);
             return resp;
         }
@@ -994,6 +1025,7 @@ impl Router {
                     placement::no_available_workers(message)
                 }
             };
+            let resp = self.report_refusal("Router::route_multipart_transcription", model_id, resp);
             record_pre_send_error(&resp);
             return resp;
         };
@@ -2486,6 +2518,7 @@ mod tests {
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
+        middleware::ReportedRefusal,
         policies::CacheAwarePolicy,
         routers::common::{
             body_policy::{
@@ -4678,6 +4711,95 @@ mod tests {
         );
         let worker = &router.worker_registry.get_all()[0];
         assert!(worker.circuit_breaker_can_execute());
+    }
+
+    /// Counts, on this thread's subscriber, the ERROR events and the refusal
+    /// lines (the events carrying a `suppressed` field).
+    struct RefusalLineCounter {
+        errors: Arc<AtomicUsize>,
+        refusal_lines: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                self.errors.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            if event.metadata().fields().field("suppressed").is_some() {
+                self.refusal_lines.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    /// A refusal this router answers on its own is marked as reported for
+    /// the access log and written at WARN within the per-second allowance,
+    /// never at ERROR: the `no_available_workers` 503 of a drained pool and
+    /// the `model_not_found` 404 of a model nobody serves, each under a
+    /// client retrying at once.
+    #[tokio::test]
+    async fn a_refusal_is_marked_and_written_at_warn_within_the_allowance() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::Registry::default().with(RefusalLineCounter {
+                errors: Arc::clone(&errors),
+                refusal_lines: Arc::clone(&refusal_lines),
+            }),
+        );
+        let router = create_test_regular_router();
+        for worker in router.worker_registry.get_all() {
+            worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+        let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();
+        let refusals = 5 * allowance;
+
+        for (model, status, code) in [
+            (
+                crate::worker::UNKNOWN_MODEL_ID,
+                StatusCode::SERVICE_UNAVAILABLE,
+                placement::NO_AVAILABLE_WORKERS_CODE,
+            ),
+            (
+                "nobody-serves-this",
+                StatusCode::NOT_FOUND,
+                placement::MODEL_NOT_FOUND_CODE,
+            ),
+        ] {
+            for _ in 0..refusals {
+                let response = router
+                    .route_typed_request(
+                        None,
+                        DropProbeRequest {
+                            text: "refused".to_string(),
+                            _probe: Arc::new(()),
+                        },
+                        "/generate",
+                        model,
+                    )
+                    .await;
+                assert_eq!(response.status(), status, "{code}");
+                assert_eq!(extract_error_code_from_response(&response), code);
+                assert!(
+                    response.extensions().get::<ReportedRefusal>().is_some(),
+                    "the {code} refusal is marked as reported, so the access log keeps quiet"
+                );
+            }
+        }
+        assert_eq!(
+            errors.load(AtomicOrdering::Relaxed),
+            0,
+            "a refusal is not an error of the gateway"
+        );
+        assert!(
+            refusal_lines.load(AtomicOrdering::Relaxed) <= 2 * allowance,
+            "{refusals} refusals of each kind inside one second write at most {allowance} lines each"
+        );
     }
 }
 

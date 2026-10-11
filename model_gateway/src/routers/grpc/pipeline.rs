@@ -458,9 +458,19 @@ impl RequestPipeline {
     async fn run_ingress(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         macro_rules! step {
             ($stage:expr, $result:expr) => {
-                $result.inspect_err(|response: &Response| {
+                $result.map_err(|response: Response| {
+                    // A refusal the failing stage did not report itself (the
+                    // preparation stage's 404 for a model nobody serves)
+                    // gets its one rate-limited line here; a reported one,
+                    // and every other failure, passes through.
+                    let response = self.stages.worker_selection.report_refusal(
+                        "RequestPipeline::run_ingress",
+                        helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref()),
+                        &ctx.input.model_id,
+                        response,
+                    );
                     if response.extensions().get::<ReportedRefusal>().is_some() {
-                        // The stage wrote the one line this refusal gets
+                        // The one line this refusal gets was written
                         // (rate-limited, with the pool's state).
                         debug!(
                             "Stage {} refused the request with status {}",
@@ -470,6 +480,7 @@ impl RequestPipeline {
                     } else {
                         error!("Stage {} failed with status {}", $stage, response.status());
                     }
+                    response
                 })
             };
         }

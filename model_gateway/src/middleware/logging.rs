@@ -44,7 +44,7 @@ use crate::observability::{
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeResponse;
 
-/// Response-extension marker for a refusal whose producing stage wrote the
+/// Response-extension marker for a refusal whose refusing router wrote the
 /// log line for it already (one WARN per refusal, rate-limited under a
 /// sustained condition, with the request id, the model and the pool's
 /// state). [`ResponseLogger`] logs a marked response at DEBUG instead of a
@@ -206,11 +206,12 @@ impl<B> OnResponse<B> for ResponseLogger {
                 "finished probe request"
             );
         } else if response.extensions().get::<ReportedRefusal>().is_some() {
-            // The refusing stage wrote this refusal's line; a second one per
-            // request here, at ERROR, is what made a retry loop a log storm.
+            // The refusing router wrote this refusal's line; a second one per
+            // request here, at ERROR or WARN, is what made a retry loop a log
+            // storm.
             debug!(
                 target: "smg::response",
-                "request refused; reported by the refusing stage"
+                "request refused; reported by the refusing router"
             );
         } else if status.is_server_error() {
             error!(

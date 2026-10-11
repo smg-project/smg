@@ -62,7 +62,7 @@ use crate::{
                 NIXL_PREFILL_KV_PARAMS,
             },
             overload,
-            placement::{self, PairFailure, PlacementFailure, PlacementInputs},
+            placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{is_retryable_response, RetryExecutor},
             serialize_json_sized,
@@ -300,14 +300,38 @@ impl PDRouter {
             PdSelectionFailure::QueueFull => prefill_queue_full(),
             PdSelectionFailure::QueueTimeout => prefill_queue_timeout(),
             PdSelectionFailure::Unavailable(error) => {
-                error!("Failed to select PD pair error={}", error);
                 // Same code the regular HTTP router and the gRPC routers use
                 // for a leg that is merely down, so a client can key its
                 // retry on one code whatever the transport; the message
-                // still names the leg.
+                // still names the leg. Its log line is written by
+                // [`Self::report_refusal`], once and rate-limited, not here.
                 placement::no_available_workers(format!("No available servers: {error}"))
             }
         }
+    }
+
+    /// The line and marker of a refusal this router answers on its own (the
+    /// `no_available_workers` 503 of a leg that is down): one WARN per
+    /// refusal, rate-limited, with both legs' state, through
+    /// [`placement::report_refusal`]; the access log then keeps quiet about
+    /// it. Every other response passes through unchanged.
+    fn report_refusal(&self, model_id: &str, refusal: Response) -> Response {
+        placement::report_refusal(
+            &self.worker_registry,
+            RefusalSite {
+                function: "PDRouter::execute_dual_dispatch_attempt",
+                mode: "PrefillDecode",
+                legs: &[
+                    ("prefill", RoutingPool::HttpPrefill),
+                    ("decode", RoutingPool::HttpDecode),
+                ],
+            },
+            // The line is written inside the request's span, which carries
+            // the id.
+            None,
+            model_id,
+            refusal,
+        )
     }
 
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
@@ -562,7 +586,8 @@ impl PDRouter {
         let ((prefill, decode), guards) = match selected {
             Ok(admitted) => admitted,
             Err(e) => {
-                return Self::handle_server_selection_error(*e);
+                return self
+                    .report_refusal(context.model_id, Self::handle_server_selection_error(*e));
             }
         };
 
@@ -2984,6 +3009,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{types::PdPairingMode, PolicyConfig},
+        middleware::ReportedRefusal,
         tenant::TenantKey,
         worker::{BasicWorkerBuilder, WorkerType},
     };
@@ -6315,5 +6341,78 @@ mod tests {
         );
         assert!(decode.circuit_breaker_can_execute());
         assert!(prefill.circuit_breaker_can_execute());
+    }
+
+    /// Counts, on this thread's subscriber, the ERROR events and the refusal
+    /// lines (the events carrying a `suppressed` field).
+    struct RefusalLineCounter {
+        errors: Arc<AtomicUsize>,
+        refusal_lines: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if event.metadata().fields().field("suppressed").is_some() {
+                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A request with no prefill/decode pair to take it is refused with the
+    /// `no_available_workers` 503, marked as reported for the access log,
+    /// and written at WARN within the per-second allowance, never at ERROR:
+    /// two ERROR lines per refusal made a client's retry loop a log storm.
+    #[tokio::test]
+    async fn a_refusal_for_a_leg_that_is_down_is_marked_and_written_at_warn_within_the_allowance() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::Registry::default().with(RefusalLineCounter {
+                errors: Arc::clone(&errors),
+                refusal_lines: Arc::clone(&refusal_lines),
+            }),
+        );
+        let router = create_test_pd_router();
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();
+
+        let refusals = 5 * allowance;
+        for _ in 0..refusals {
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .expect("valid chat request");
+            let response = router
+                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                placement::NO_AVAILABLE_WORKERS_CODE
+            );
+            assert!(
+                response.extensions().get::<ReportedRefusal>().is_some(),
+                "the refusal is marked as reported, so the access log keeps quiet"
+            );
+        }
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "a refusal is not an error of the gateway"
+        );
+        assert!(
+            refusal_lines.load(Ordering::Relaxed) <= allowance,
+            "{refusals} refusals inside one second write at most {allowance} lines"
+        );
     }
 }

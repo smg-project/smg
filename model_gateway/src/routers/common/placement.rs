@@ -12,7 +12,7 @@
 //! refresh-on-miss that the provider and realtime paths use; this is the
 //! policy-registry path over the self-hosted routing pools.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc, time::Duration};
 
 use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
@@ -22,7 +22,11 @@ use rand::RngExt;
 use tracing::{debug, warn};
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    middleware::ReportedRefusal,
+    observability::{
+        log_throttle::KeyedLogThrottle,
+        metrics::{metrics_labels, Metrics},
+    },
     policies::{
         policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
         SelectWorkerInfo, WorkerLeg,
@@ -447,6 +451,207 @@ fn admitted_leg(
     .unwrap_or(on_wire)
 }
 
+/// The client-visible code of [`error::model_not_found`], which the refusal
+/// line recognises the 404 by.
+pub(crate) const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
+
+/// Lines per second the gateway writes for each refusal it answers on its
+/// own: a model whose workers are all unavailable (`no_available_workers`)
+/// and a model nobody serves (`model_not_found`). One line per refusal, with
+/// the request id, the model and the pool's state, shows the condition and
+/// whom it hits; past this rate the lines are counted and the next one
+/// carries the count, while `smg_router_request_errors_total` keeps the
+/// volume. A client retrying at once drew four thousand refusals a second,
+/// up to three ERROR lines each, before. The allowance is per model, so one
+/// storming model never silences another's first line.
+pub(crate) const REFUSAL_LINES_PER_SECOND: u32 = 10;
+
+/// Models a refusal throttle tracks at once; past this the model seen least
+/// recently is forgotten (a model that is down keeps refusing, so it stays).
+pub(crate) const REFUSAL_LOG_MODELS: usize = 64;
+
+static NO_AVAILABLE_WORKERS_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
+static MODEL_NOT_FOUND_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
+/// The router answering a refusal, as its line names it.
+#[derive(Clone, Copy)]
+pub(crate) struct RefusalSite<'a> {
+    /// The refusing function, e.g. `WorkerSelectionStage::execute`.
+    pub function: &'static str,
+    /// The router's mode: `Regular`, `PrefillDecode` or `EncodePrefillDecode`.
+    pub mode: &'static str,
+    /// The pools the router draws from for the model, named per leg.
+    pub legs: &'a [(&'static str, RoutingPool)],
+}
+
+/// A refusal the gateway answers on its own, with the line it gets and the
+/// cap the line is under.
+#[derive(Clone, Copy)]
+enum Refusal {
+    NoAvailableWorkers,
+    ModelNotFound,
+}
+
+impl Refusal {
+    fn of(response: &Response) -> Option<Self> {
+        match error::extract_error_code_from_response(response) {
+            NO_AVAILABLE_WORKERS_CODE => Some(Self::NoAvailableWorkers),
+            MODEL_NOT_FOUND_CODE => Some(Self::ModelNotFound),
+            _ => None,
+        }
+    }
+
+    fn throttle(self) -> &'static KeyedLogThrottle {
+        match self {
+            Self::NoAvailableWorkers => &NO_AVAILABLE_WORKERS_LOG,
+            Self::ModelNotFound => &MODEL_NOT_FOUND_LOG,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::NoAvailableWorkers => "No available workers for model",
+            Self::ModelNotFound => "No worker serves model",
+        }
+    }
+}
+
+/// The log line of a refusal the gateway answers on its own, and its marker.
+///
+/// A `no_available_workers` 503 or a `model_not_found` 404 gets one WARN
+/// with the request id, the model and the state of the pools `site` draws
+/// from, capped at [`REFUSAL_LINES_PER_SECOND`] per kind and per model; a
+/// line past the cap is counted and the next admitted line of that model
+/// carries the count as `suppressed`. The response is marked [`ReportedRefusal`], so the
+/// pipeline's stage line and the access log's response line drop to DEBUG
+/// for it: a refusal is the gateway's normal answer to "no worker for this
+/// request", not a fault of its own, and up to three ERROR lines per refusal
+/// made a client's retry loop a log storm. The error counter
+/// (`smg_router_request_errors_total`) keeps the volume. A refusal already
+/// marked, and every other response, passes through unchanged.
+pub(crate) fn report_refusal(
+    registry: &WorkerRegistry,
+    site: RefusalSite<'_>,
+    request_id: Option<&str>,
+    model_id: &str,
+    refusal: Response,
+) -> Response {
+    match Refusal::of(&refusal) {
+        Some(kind) if refusal.extensions().get::<ReportedRefusal>().is_none() => {
+            report_refusal_under(
+                kind.throttle(),
+                registry,
+                site,
+                request_id,
+                model_id,
+                refusal,
+            )
+        }
+        _ => refusal,
+    }
+}
+
+/// [`report_refusal`] under an explicit throttle (a test's own, or the
+/// static of the refusal's kind), keyed by the model.
+pub(crate) fn report_refusal_under(
+    throttle: &KeyedLogThrottle,
+    registry: &WorkerRegistry,
+    site: RefusalSite<'_>,
+    request_id: Option<&str>,
+    model_id: &str,
+    mut refusal: Response,
+) -> Response {
+    let Some(kind) = Refusal::of(&refusal) else {
+        return refusal;
+    };
+    let message = kind.message();
+    refusal.extensions_mut().insert(ReportedRefusal);
+    if let Some(admitted) = throttle.admit(model_id) {
+        let pool = PoolState::of(registry, model_id, site.legs);
+        // The request's span carries the id too; the field is for a line
+        // written outside it (a retry's re-selection) and is omitted when
+        // the router has no id of its own to give.
+        warn!(
+            function = site.function,
+            request_id = request_id,
+            mode = %site.mode,
+            model_id = %model_id,
+            workers = pool.workers(),
+            available = pool.available(),
+            pool = %pool,
+            suppressed = admitted.suppressed,
+            "{message}"
+        );
+    }
+    refusal
+}
+
+/// What a refusal line says about the pools it drew from: per leg, the
+/// workers registered for the model, those healthy, and those routable
+/// (healthy, circuit closed, not vetoed by load or liveness).
+struct PoolState {
+    legs: Vec<LegState>,
+}
+
+struct LegState {
+    leg: &'static str,
+    workers: usize,
+    healthy: usize,
+    available: usize,
+}
+
+impl PoolState {
+    fn of(registry: &WorkerRegistry, model_id: &str, legs: &[(&'static str, RoutingPool)]) -> Self {
+        PoolState {
+            legs: legs
+                .iter()
+                .map(|(leg, pool)| {
+                    let workers = registry.get_routing_pool(model_id, *pool);
+                    LegState {
+                        leg,
+                        workers: workers.len(),
+                        healthy: workers.iter().filter(|w| w.is_healthy()).count(),
+                        available: workers.iter().filter(|w| w.is_available()).count(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn workers(&self) -> usize {
+        self.legs.iter().map(|leg| leg.workers).sum()
+    }
+
+    fn available(&self) -> usize {
+        self.legs.iter().map(|leg| leg.available).sum()
+    }
+}
+
+impl fmt::Display for PoolState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, leg) in self.legs.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(
+                f,
+                "{} {}/{} available ({} healthy)",
+                leg.leg, leg.available, leg.workers, leg.healthy
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// The steering default for a disaggregated placement whose failed leg is
 /// vetoed on every worker the request may use (`failed_leg`, see
 /// [`admitted_leg`]), by the overload thresholds or by the liveness
@@ -802,10 +1007,15 @@ pub(crate) fn select_pair(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
 
     use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     use super::*;
     use crate::{
@@ -1804,5 +2014,172 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1")
         );
+    }
+
+    // ---- the refusal line -------------------------------------------------------------------
+
+    /// Collects, on this thread's subscriber, the events of one level as
+    /// `field=value` renderings (the message among them).
+    struct EventLines(tracing::Level, Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for EventLines {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != self.0 {
+                return;
+            }
+            struct Render(String);
+            impl tracing::field::Visit for Render {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    use fmt::Write;
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            let mut rendered = Render(String::new());
+            event.record(&mut rendered);
+            self.1.lock().unwrap().push(rendered.0);
+        }
+    }
+
+    /// A refusal the gateway answers on its own is marked for the loggers
+    /// downstream and written once, at WARN, with the refusing router, the
+    /// request id, the model and the pool's state; past the cap the lines
+    /// are counted onto the model's next admitted one; another model's line
+    /// is its own; a refusal already reported and any other answer pass
+    /// through silently.
+    #[test]
+    fn a_refusal_is_marked_and_written_once_at_warn_with_the_pools_state() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(EventLines(tracing::Level::WARN, Arc::clone(&lines))),
+        );
+        let registry = WorkerRegistry::new();
+        let down = BasicWorkerBuilder::new("http://worker-down:8080")
+            .model(ModelCard::new("m1"))
+            .worker_type(WorkerType::Regular)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        down.set_status(WorkerStatus::NotReady);
+        registry.register(Arc::new(down)).unwrap();
+        let site = RefusalSite {
+            function: "Router::route_typed_request",
+            mode: "Regular",
+            legs: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let window = Duration::from_millis(100);
+        let throttle = KeyedLogThrottle::new(2, window, REFUSAL_LOG_MODELS);
+        let opened = Instant::now();
+
+        for _ in 0..5 {
+            let refused = report_refusal_under(
+                &throttle,
+                &registry,
+                site,
+                Some("req-1"),
+                "m1",
+                no_available_workers("every worker is down"),
+            );
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                refused.extensions().get::<ReportedRefusal>().is_some(),
+                "the refusal is marked as reported"
+            );
+        }
+        let written = lines.lock().unwrap().clone();
+        assert_eq!(
+            written.len(),
+            2,
+            "two lines per window, not five: {written:?}"
+        );
+        for expected in [
+            "message=No available workers for model",
+            "function=\"Router::route_typed_request\"",
+            "request_id=\"req-1\"",
+            "mode=Regular",
+            "model_id=m1",
+            "workers=1",
+            "available=0",
+            "pool=regular 0/1 available (0 healthy)",
+            "suppressed=0",
+        ] {
+            assert!(
+                written[0].contains(expected),
+                "{expected} missing from {:?}",
+                written[0]
+            );
+        }
+
+        // The three lines past the cap ride on the model's next line, here
+        // its 404 after the pool went away entirely.
+        std::thread::sleep(window.saturating_sub(opened.elapsed()) + Duration::from_millis(10));
+        let gone = report_refusal_under(
+            &throttle,
+            &registry,
+            site,
+            None,
+            "m1",
+            error::model_not_found("m1"),
+        );
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        assert!(gone.extensions().get::<ReportedRefusal>().is_some());
+        let written = lines.lock().unwrap().clone();
+        assert_eq!(written.len(), 3, "{written:?}");
+        assert!(
+            written[2].contains("message=No worker serves model"),
+            "{:?}",
+            written[2]
+        );
+        assert!(written[2].contains("suppressed=3"), "{:?}", written[2]);
+        assert!(
+            !written[2].contains("request_id="),
+            "no id of its own, no field: {:?}",
+            written[2]
+        );
+
+        // Another model's refusal is its own line, with nothing of m1's.
+        let other = report_refusal_under(
+            &throttle,
+            &registry,
+            site,
+            None,
+            "m2",
+            error::model_not_found("m2"),
+        );
+        assert!(other.extensions().get::<ReportedRefusal>().is_some());
+        let written = lines.lock().unwrap().clone();
+        assert_eq!(written.len(), 4, "{written:?}");
+        assert!(written[3].contains("model_id=m2"), "{:?}", written[3]);
+        assert!(written[3].contains("suppressed=0"), "{:?}", written[3]);
+        assert!(
+            written[3].contains("pool=regular 0/0 available (0 healthy)"),
+            "{:?}",
+            written[3]
+        );
+
+        // Already reported: no second line, whatever the throttle says.
+        let again = report_refusal(&registry, site, None, "m1", gone);
+        assert!(again.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(
+            lines.lock().unwrap().len(),
+            4,
+            "a reported refusal is not reported again"
+        );
+
+        // Another answer is neither marked nor written.
+        let unrelated = report_refusal(
+            &registry,
+            site,
+            None,
+            "m1",
+            error::service_unavailable("no_compatible_pd_pair", "no pair"),
+        );
+        assert!(unrelated.extensions().get::<ReportedRefusal>().is_none());
+        assert_eq!(lines.lock().unwrap().len(), 4);
     }
 }
