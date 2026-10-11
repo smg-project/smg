@@ -31,7 +31,7 @@ pub fn glm4() -> Format {
         .transition("content", "call_open", "call")
         .transition("call", "call_close", "content")
         .transition("call", "call_open", "call")
-        .calls(CallSyntax::Keyed(keyed::Tags::LING))
+        .calls(CallSyntax::Keyed(keyed::Tags::GLM4))
         .opens_turn("<|assistant|>")
 }
 

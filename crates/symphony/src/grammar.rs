@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(payload["format"]["tags"][0]["end"], "</iquest_tool_call>");
         // Ling writes the template's newlines between the tags, which the compact style does not,
         // so its table says so and its tag is written from its own tags (the `keyed` module).
-        assert_eq!(KeyedTags::LING.between, "\n");
+        assert_eq!(KeyedTags::LING.newlines.after_name, "\n");
     }
 
     #[test]

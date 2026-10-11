@@ -1,8 +1,9 @@
 //! Keyed arguments written from the table's own tags, for the spellings the engines' `glm_xml`
 //! style does not write: Ling's, with the template's newline after the call's name, after each
-//! `</arg_key>` and before `</tool_call>`, and Hy4's, every tag suffixed `:opensource` and the
-//! calls in a block. GLM's and IQuest's compact spelling keeps the `glm_xml` style, the shape the
-//! gateway writes for it today.
+//! `</arg_key>` and before `</tool_call>`; GLM 4.5 and 4.6's, with it after the name, after each
+//! `</arg_key>` and after each `</arg_value>`; and Hy4's, every tag suffixed `:opensource` and the
+//! calls in a block. GLM 4.7's and IQuest's compact spelling keeps the `glm_xml` style, the shape
+//! the gateway writes for it today.
 //!
 //! A call is the call's opener and the tool's name, then one `<arg_key>` and `<arg_value>` pair per
 //! property of the tool's schema, in the schema's order, each optional unless the schema requires
@@ -92,8 +93,8 @@ impl Ends<'_> {
     }
 }
 
-/// One call as its three parts: the opener with the name and the spelling's newline, the
-/// arguments, and the newline with the close.
+/// One call as its three parts: the opener with the name and the newline the spelling writes after
+/// it, the arguments, and the newline the spelling writes before the close with the close.
 fn call(
     markers: &CallMarkers<'_>,
     tags: &Tags,
@@ -102,9 +103,9 @@ fn call(
     parameters: &Value,
 ) -> (String, Grammar, String) {
     (
-        format!("{}{name}{}", markers.call_open, tags.between),
+        format!("{}{name}{}", markers.call_open, tags.newlines.after_name),
         arguments(tags, ends, parameters),
-        format!("{}{}", tags.between, markers.call_close),
+        format!("{}{}", tags.newlines.before_close, markers.call_close),
     )
 }
 
@@ -121,17 +122,19 @@ fn arguments(tags: &Tags, ends: &Ends<'_>, parameters: &Value) -> Grammar {
     })
 }
 
-/// One pair: the key between its tags, the spelling's newline, the value between its tags.
+/// One pair: the key between its tags, the newline the spelling writes after the key, the value
+/// between its tags, and the newline the spelling writes after the value.
 fn argument(tags: &Tags, key: Grammar, value: Grammar) -> Grammar {
+    let newlines = &tags.newlines;
     Grammar::Sequence(vec![
         Grammar::ConstString(tags.key_open.to_string()),
         key,
         Grammar::ConstString(format!(
             "{}{}{}",
-            tags.key_close, tags.between, tags.value_open
+            tags.key_close, newlines.after_key, tags.value_open
         )),
         value,
-        Grammar::ConstString(tags.value_close.to_string()),
+        Grammar::ConstString(format!("{}{}", tags.value_close, newlines.after_value)),
     ])
 }
 
@@ -257,8 +260,9 @@ mod tests {
     #[test]
     fn a_ling_call_without_arguments_writes_both_newlines() {
         // The template writes the newline after the name and the one before `</tool_call>`
-        // whether or not an argument comes between: every one of the 259 zero-argument calls in
-        // ling-3.0-flash's recorded parse sets reads `<tool_call>NAME\n\n</tool_call>`.
+        // whether or not an argument comes between, and nothing between two pairs: every one of
+        // the 259 zero-argument calls in ling-3.0-flash's recorded parse sets reads
+        // `<tool_call>NAME\n\n</tool_call>`, and its pairs read `</arg_value><arg_key>`.
         let payload = formats::ling()
             .grammar(&[tool("ping", value!({"type": "object"}))], true, false)
             .expect("a grammar")
@@ -270,6 +274,38 @@ mod tests {
             tag["end"].as_str().expect("end")
         );
         assert_eq!(written, "<tool_call>ping\n\n</tool_call>");
+    }
+
+    #[test]
+    fn glm4_ends_each_pair_with_its_newline_and_closes_right_after() {
+        // GLM 4.6's template writes the newline after each `</arg_value>` and none of its own
+        // before `</tool_call>`: in glm-4.6's recorded parse sets, 280 of 280 zero-argument calls
+        // read `<tool_call>NAME\n</tool_call>`, 23,167 of 23,167 pairs are followed by
+        // `\n<arg_key>`, and 19,254 of 19,254 last pairs by `\n</tool_call>`.
+        let payload = formats::glm4()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let tags = payload["format"]["tags"].as_array().expect("two tags");
+        assert_eq!(tags[0]["begin"], "<tool_call>get_weather\n");
+        assert_eq!(tags[0]["end"], "</tool_call>");
+        let pairs = tags[0]["content"]["elements"]
+            .as_array()
+            .expect("three pairs");
+        let city = pairs[0]["elements"].as_array().expect("a pair's parts");
+        assert_eq!(city[2]["value"], "</arg_key>\n<arg_value>");
+        assert_eq!(city[4]["value"], "</arg_value>\n");
+        let units = pairs[2]["content"]["elements"]
+            .as_array()
+            .expect("the optional pair's parts");
+        assert_eq!(units[4]["value"], "</arg_value>\n");
+        // A call without arguments: the name's newline, then the close.
+        let written = format!(
+            "{}{}",
+            tags[1]["begin"].as_str().expect("begin"),
+            tags[1]["end"].as_str().expect("end")
+        );
+        assert_eq!(written, "<tool_call>ping\n</tool_call>");
     }
 
     #[test]

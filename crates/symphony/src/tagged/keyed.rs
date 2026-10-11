@@ -11,8 +11,10 @@
 //! </tool_call>
 //! ```
 //!
-//! each with its own spellings of the four tags ([`Tags`]) and its own newlines between them (Ling
-//! writes one after the name and one after `</arg_key>`, Hy4 and IQuest none). The engine's table
+//! each with its own spellings of the four tags ([`Tags`]) and its own newlines around them (Ling
+//! writes one after the name, after each `</arg_key>` and before the close, GLM 4.5 and 4.6 one
+//! after the name, after each `</arg_key>` and after each `</arg_value>`, Hy4 and IQuest none;
+//! [`Newlines`]). The engine's table
 //! owns the call markers: it enters this assembler after the opening marker and leaves it at the
 //! closing one, which it hands over as the call's end. Between the two the assembler reads the
 //! name and the tags itself.
@@ -71,18 +73,64 @@ fn is_name(text: &str) -> bool {
         .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '{' | '}' | '<' | '>'))
 }
 
-/// The four tags a family spells its keyed arguments with, and `between`: the template's newline,
-/// written after the call's name, after each key's closing tag and before the call's close (Ling,
-/// GLM 4.5 and 4.6), or nothing anywhere (GLM 4.7 and later, IQuest, Hy4). The field tells the two
-/// spellings apart; the places are the spelling's. The assembler reads a call either way; the
-/// grammar derived from a table spells the one its template writes.
+/// The four tags a family spells its keyed arguments with, and where its template writes a newline
+/// around them ([`Newlines`]). The assembler reads a call whatever the newlines, as the template's
+/// whitespace between tags; the grammar derived from a table spells the ones its template writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tags {
     pub key_open: &'static str,
     pub key_close: &'static str,
     pub value_open: &'static str,
     pub value_close: &'static str,
-    pub between: &'static str,
+    pub newlines: Newlines,
+}
+
+/// Where a template writes a newline around a call's keyed arguments: each field is the text it
+/// writes at that place, a newline or nothing. What the recorded calls show, place by place, is
+/// in the constants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Newlines {
+    /// After the call's name.
+    pub after_name: &'static str,
+    /// Between `</arg_key>` and `<arg_value>`.
+    pub after_key: &'static str,
+    /// After `</arg_value>`, whether or not a pair follows.
+    pub after_value: &'static str,
+    /// Before the call's close, whether or not a pair came.
+    pub before_close: &'static str,
+}
+
+impl Newlines {
+    /// Nothing anywhere: GLM 4.7 and later, IQuest, Hy4.
+    pub const NONE: Self = Self {
+        after_name: "",
+        after_key: "",
+        after_value: "",
+        before_close: "",
+    };
+
+    /// Ling's: after the name, after each `</arg_key>` and before the close, nothing between
+    /// pairs, so a call without arguments reads `<tool_call>NAME\n\n</tool_call>` (every one of
+    /// the 259 in ling-3.0-flash's recorded parse sets) and two pairs read
+    /// `</arg_value><arg_key>`.
+    pub const LING: Self = Self {
+        after_name: "\n",
+        after_key: "\n",
+        after_value: "",
+        before_close: "\n",
+    };
+
+    /// GLM 4.5 and 4.6's: after the name, after each `</arg_key>` and after each `</arg_value>`,
+    /// nothing of its own before the close, so a call without arguments reads
+    /// `<tool_call>NAME\n</tool_call>` (280 of 280 in glm-4.6's recorded parse sets), two pairs
+    /// read `</arg_value>\n<arg_key>` (23,167 of 23,167) and the close follows the last pair's
+    /// newline (19,254 of 19,254).
+    pub const GLM4: Self = Self {
+        after_name: "\n",
+        after_key: "\n",
+        after_value: "\n",
+        before_close: "",
+    };
 }
 
 impl Tags {
@@ -92,13 +140,18 @@ impl Tags {
         key_close: "</arg_key>",
         value_open: "<arg_value>",
         value_close: "</arg_value>",
-        between: "",
+        newlines: Newlines::NONE,
     };
 
-    /// The plain tags with the template's newline after the call's name, after each `</arg_key>`
-    /// and before `</tool_call>`: Ling, GLM 4.5 and 4.6.
+    /// The plain tags with Ling's newlines.
     pub const LING: Self = Self {
-        between: "\n",
+        newlines: Newlines::LING,
+        ..Self::PLAIN
+    };
+
+    /// The plain tags with GLM 4.5 and 4.6's newlines.
+    pub const GLM4: Self = Self {
+        newlines: Newlines::GLM4,
         ..Self::PLAIN
     };
 
@@ -108,7 +161,7 @@ impl Tags {
         key_close: "</arg_key:opensource>",
         value_open: "<arg_value:opensource>",
         value_close: "</arg_value:opensource>",
-        between: "",
+        newlines: Newlines::NONE,
     };
 
     fn text(&self, tag: usize) -> &'static str {
