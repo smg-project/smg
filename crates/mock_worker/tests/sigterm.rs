@@ -471,6 +471,14 @@ async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
     // on the socket, and the process exits the moment its last rank returns,
     // so the terminal batch of the drained request has to be on the wire by
     // then.
+    //
+    // The rank's engine runs one request at a time, and the request to drain
+    // is queued behind the one to abandon: the rank counts it from its
+    // arrival, but it cannot produce a token, let alone finish, until the
+    // abandoned request is gone, which is after the signal. So the count at
+    // the signal is two however late the signal lands. (A request that has
+    // produced output proves nothing about that count: it may have finished
+    // by the time the signal arrives.)
     let dir = tempfile::tempdir().expect("a directory for the ipc endpoints");
     let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
     let (handshake, input, output) = (
@@ -483,6 +491,8 @@ async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
         "realistic",
         "--decode-base-ms",
         DECODE_MS,
+        "--max-running",
+        "1",
         "--zmq-handshake",
         &handshake,
         "--zmq-count",
@@ -495,29 +505,46 @@ async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
         .expect("the ZMQ rank registers with the frontend");
     let client = EngineCoreClient::new(transport);
 
-    let mut drained = client
-        .submit(zmq_request("drained", 40))
-        .await
-        .expect("submit the request to drain");
     let mut abandoned = client
         .submit(zmq_request("abandoned", 400))
         .await
         .expect("submit the request to abandon");
-    let mut tokens = drained
-        .next()
+    let mut drained = client
+        .submit(zmq_request("drained", 40))
         .await
-        .expect("a first batch")
-        .expect("ok")
-        .new_token_ids
-        .len();
-    abandoned.next().await.expect("a first batch").expect("ok");
+        .expect("submit the request to drain");
+    // Both are registered at the rank once its load, which rides on every
+    // output batch, reports the abandoned request running and the drained
+    // one waiting behind it.
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            abandoned
+                .next()
+                .await
+                .expect("a batch of the running request")
+                .expect("ok");
+            let load = client
+                .engine_load(0)
+                .expect("the rank's load rides on its batches");
+            if load.num_running == 1 && load.num_waiting == 1 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the rank reports one request running and one waiting within 8 s");
 
     let sent = mock.signal("TERM");
+    // The stop is in effect once a port refuses connections: the drain's
+    // count is logged before anything else of this test reaches the rank.
+    assert_refuses_connections(mock.grpc_port);
     // The frontend gives the long request up during the drain: its Abort
-    // reaches the rank, whose forwarder for it is cancelled.
+    // reaches the rank, whose forwarder for it is cancelled, and the queued
+    // request takes its place in the engine.
     drop(abandoned);
 
-    // The other request runs to its end, terminal batch included.
+    // The queued request runs to its end, terminal batch included.
+    let mut tokens = 0;
     let finish = tokio::time::timeout(Duration::from_secs(8), async {
         while let Some(item) = drained.next().await {
             let output = item.expect("an output of the drained request");
