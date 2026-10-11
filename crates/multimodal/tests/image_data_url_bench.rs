@@ -12,7 +12,8 @@ use llm_multimodal::{
     AsyncMultiModalTracker, MediaConnector, MediaConnectorConfig, MediaContentPart, Modality,
     TrackedMedia,
 };
-use rustls::crypto::ring;
+
+mod common;
 
 fn fixtures() -> Vec<String> {
     (0..70)
@@ -37,9 +38,8 @@ fn fixtures() -> Vec<String> {
 #[ignore = "performance benchmark; run explicitly on base and candidate"]
 async fn image_data_url_tracker() {
     let urls = fixtures();
-    let _ = ring::default_provider().install_default();
     let connector = Arc::new(
-        MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
+        MediaConnector::new(common::http_client(), MediaConnectorConfig::default())
             .expect("connector"),
     );
     for (count, unique) in [(1, 1), (8, 8), (32, 32), (70, 70), (70, 1)] {

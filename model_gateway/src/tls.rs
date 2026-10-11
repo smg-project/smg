@@ -11,10 +11,10 @@ use rustls::crypto::{ring, CryptoProvider};
 /// `rustls-no-provider` feature and uses whatever provider the process
 /// installed, panicking when there is none. Installing is idempotent: a
 /// provider installed earlier, by an embedding process or a previous start in
-/// the same process, stays. [`crate::server::startup`] calls it first, and
-/// so does every place this crate builds an HTTP client (the worker's lazy
-/// client, `build_client`, the external discovery step's static client);
-/// test code that builds a reqwest client directly calls it itself.
+/// the same process, stays. [`crate::server::startup`] calls it first thing,
+/// and so do the functions of [`crate::http_client`], through which this
+/// crate, its bindings and its tests build every HTTP client; nothing else
+/// needs to.
 pub fn install_crypto_provider() {
     if CryptoProvider::get_default().is_none() {
         // An error here means another thread installed one in between,

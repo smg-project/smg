@@ -75,9 +75,10 @@ use std::{
 };
 
 use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer, Sequence};
-use rustls::crypto::ring;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
+
+mod common;
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 const CACHE_DIR: &str = ".tokenizer_cache/bellwether";
@@ -1191,10 +1192,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     }
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    // The client takes the process-level TLS crypto provider and panics
-    // without one: `ring` is installed before the first client is built.
-    let _ = ring::default_provider().install_default();
-    let client = reqwest::blocking::Client::new();
+    let client = common::http_client();
     download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
         .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
     download(&client, model, revision, &dir, "config.json", 2)?;

@@ -8,4 +8,5 @@ pub mod grpc;
 pub mod http;
 pub mod kv_zmq;
 pub mod replay;
+pub mod tls;
 pub mod zmq;

@@ -56,7 +56,12 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
 }
 
 /// One plain client shared by every fake worker, standing in for the
-/// gateway's per-worker negotiated client.
+/// gateway's per-worker negotiated client; the process-level TLS crypto
+/// provider is installed before it is built.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+)]
 pub fn test_client() -> Arc<reqwest::Client> {
     static CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
     Arc::clone(CLIENT.get_or_init(|| {

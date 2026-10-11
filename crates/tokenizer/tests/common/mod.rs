@@ -22,9 +22,24 @@ static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 /// process-level TLS crypto provider (reqwest's `rustls-no-provider`
 /// feature) and panics at build time when there is none, so `ring` is
 /// installed first; a provider installed earlier in the process stays.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+)]
 pub fn http_client() -> reqwest::blocking::Client {
     let _ = ring::default_provider().install_default();
     reqwest::blocking::Client::new()
+}
+
+/// A builder for a download client with settings of its own, the provider
+/// installed the same way.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+)]
+pub fn http_client_builder() -> reqwest::blocking::ClientBuilder {
+    let _ = ring::default_provider().install_default();
+    reqwest::blocking::Client::builder()
 }
 
 /// Downloads the TinyLlama tokenizer from HuggingFace if not already cached.

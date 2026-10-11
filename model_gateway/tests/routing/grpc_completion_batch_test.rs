@@ -57,7 +57,6 @@ fn grpc_modes() -> Vec<RoutingMode> {
     reason = "test setup helper; failures should panic"
 )]
 async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
-    smg::tls::install_crypto_provider();
     let config = RouterConfig::builder()
         .mode(mode)
         .grpc_connection()
@@ -98,7 +97,7 @@ async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
     Arc::new(
         AppContext::builder()
             .router_config(config.clone())
-            .client(reqwest::Client::new())
+            .client(smg::http_client::client())
             .tokenizer_registry(tokenizer_registry)
             .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
             .tool_parser_factory(Some(ToolParserFactory::new()))

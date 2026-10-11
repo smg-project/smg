@@ -12,8 +12,7 @@ use smg::{
 #[tokio::test]
 async fn test_policy_registry_with_gateway() {
     // Create HTTP client
-    smg::tls::install_crypto_provider();
-    let _client = reqwest::Client::new();
+    let _client = smg::http_client::client();
 
     // Create shared registries
     let worker_registry = Arc::new(WorkerRegistry::new());

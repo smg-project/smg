@@ -470,9 +470,8 @@ mod tests {
 
     #[test]
     fn provided_http_client_is_used_as_is() {
-        crate::tls::install_crypto_provider();
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(reqwest::Client::new()))
+            .http_client(Arc::new(crate::http_client::client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }

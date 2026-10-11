@@ -86,10 +86,8 @@ impl LazyHttpClient {
     }
 
     fn init(&self) -> &Arc<reqwest::Client> {
-        self.cell.get_or_init(|| {
-            crate::tls::install_crypto_provider();
-            Arc::new(reqwest::Client::new())
-        })
+        self.cell
+            .get_or_init(|| Arc::new(crate::http_client::client()))
     }
 }
 

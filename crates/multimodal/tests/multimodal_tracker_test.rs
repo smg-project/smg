@@ -5,9 +5,9 @@ use llm_multimodal::{
     AsyncMultiModalTracker, AudioSource, ImageFetchConfig, ImageSource, MediaConnector,
     MediaConnectorConfig, MediaContentPart, MediaSource, Modality,
 };
-use reqwest::Client;
-use rustls::crypto::ring;
 use tempfile::tempdir;
+
+mod common;
 
 const TINY_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
@@ -48,8 +48,7 @@ fn wav_i16_mono(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
     reason = "test helper: panic on failure is intentional"
 )]
 fn test_connector(allowed_path: Option<PathBuf>) -> MediaConnector {
-    let _ = ring::default_provider().install_default();
-    let client = Client::builder()
+    let client = common::http_client_builder()
         .timeout(Duration::from_secs(5))
         .no_proxy()
         .build()

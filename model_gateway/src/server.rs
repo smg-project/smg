@@ -2438,8 +2438,10 @@ mod tests {
                 .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
-                crate::tls::install_crypto_provider();
-                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let client = crate::http_client::client_builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap();
                 for (path, content_type, expected) in [
                     ("plain", "application/json", "{\"ok\":true}"),
                     (

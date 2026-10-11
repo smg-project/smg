@@ -229,8 +229,7 @@ mod pd_routing_unit_tests {
                     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
                 };
 
-                smg::tls::install_crypto_provider();
-                let client = reqwest::Client::new();
+                let client = smg::http_client::client();
 
                 // Initialize rate limiter
                 let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));

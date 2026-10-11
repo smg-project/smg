@@ -325,8 +325,7 @@ mod tests {
         );
         registry.register(internal_worker);
 
-        crate::tls::install_crypto_provider();
-        let client = reqwest::Client::new();
+        let client = crate::http_client::client();
         let gateway_auth = AuthConfig::with_tenant_keys(
             Some("shared-secret".to_string()),
             &[TenantApiKeyEntry {
@@ -394,8 +393,7 @@ mod tests {
         let mut card = ModelCard::new("m1");
         card.display_name = Some("Model One".to_owned());
         let registry = registry_with(vec![card]);
-        crate::tls::install_crypto_provider();
-        let client = reqwest::Client::new();
+        let client = crate::http_client::client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
         let openai =

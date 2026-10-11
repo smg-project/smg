@@ -793,10 +793,9 @@ mod tests {
         let registry = Arc::new(WorkerRegistry::new());
         let job_queue = Arc::new(std::sync::OnceLock::new());
 
-        crate::tls::install_crypto_provider();
         Arc::new(crate::app_context::AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: reqwest::Client::new(),
+            client: crate::http_client::client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
@@ -867,8 +866,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        crate::tls::install_crypto_provider();
-        data.http_client_handle = Some(Arc::new(reqwest::Client::new()));
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         assert_eq!(

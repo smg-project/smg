@@ -425,7 +425,7 @@ impl WorkerMediaPipeline {
             );
         }
         let client = build_client(
-            || reqwest::Client::builder().timeout(Duration::from_secs(30)),
+            || crate::http_client::client_builder().timeout(Duration::from_secs(30)),
             false,
             "media HTTP client",
         )

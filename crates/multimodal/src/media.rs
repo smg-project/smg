@@ -2871,8 +2871,6 @@ fn skip_ppm_whitespace_and_comments(bytes: &[u8], pos: &mut usize) {
 mod tests {
     use std::io::Write as _;
 
-    use rustls::crypto::ring;
-
     /// The engine's frame budget replaces only the loader-style budget: the
     /// rate-based samplers keep their rule, `0` means every frame, `None`
     /// changes nothing.
@@ -3340,10 +3338,11 @@ mod tests {
     /// spends a decode on the clip, exactly as the image decoder does.
     #[tokio::test]
     async fn decode_video_rejects_an_invalid_long_side_cap() {
-        let _ = ring::default_provider().install_default();
-        let connector =
-            MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
-                .expect("default connector");
+        let connector = MediaConnector::new(
+            crate::test_support::http_client(),
+            MediaConnectorConfig::default(),
+        )
+        .expect("default connector");
         for value in [0, 505] {
             let cfg = VideoFetchConfig {
                 max_long_side_pixel: Some(value),

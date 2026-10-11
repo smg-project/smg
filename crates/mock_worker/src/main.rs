@@ -12,6 +12,9 @@ use mock_worker::{admin, config::Config, grpc, http, replay::Capture, zmq};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The process-level TLS crypto provider, before anything builds a TLS
+    // configuration or an HTTP client.
+    mock_worker::tls::install_crypto_provider();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();

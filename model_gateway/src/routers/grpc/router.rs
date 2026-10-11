@@ -1044,7 +1044,6 @@ mod pd_tests {
     /// Minimal `AppContext` for constructing a disaggregated gRPC router. PD
     /// serves /v1/responses, so the MCP orchestrator must be initialized.
     async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
-        crate::tls::install_crypto_provider();
         let config = RouterConfig::builder()
             .mode(mode)
             .grpc_connection()
@@ -1071,7 +1070,7 @@ mod pd_tests {
         Arc::new(
             AppContext::builder()
                 .router_config(config.clone())
-                .client(reqwest::Client::new())
+                .client(crate::http_client::client())
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
                 .tool_parser_factory(Some(ToolParserFactory::new()))

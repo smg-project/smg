@@ -150,7 +150,7 @@ impl WorkerHttpClientCache {
             .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
 
         let make_builder = || {
-            let mut builder = reqwest::Client::builder()
+            let mut builder = crate::http_client::client_builder()
                 .pool_max_idle_per_host(key.pool_max_idle_per_host)
                 .pool_idle_timeout(pool_idle_timeout)
                 .timeout(Duration::from_secs(key.timeout_secs))
@@ -197,7 +197,6 @@ pub(crate) fn build_client(
     tls_configured: bool,
     purpose: &str,
 ) -> Result<reqwest::Client, String> {
-    crate::tls::install_crypto_provider();
     let error = match make_builder().build() {
         Ok(client) => return Ok(client),
         Err(error) => error,
