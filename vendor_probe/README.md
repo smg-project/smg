@@ -123,8 +123,9 @@ tool/tool_choice/tool-message pairing mistakes, response_format mistakes,
 auth). Chat Completions streams carry no `event:` line, so the fingerprint
 names each chunk by what it carries (`delta.role`, `delta.content`,
 `delta.tool_calls`, `...finish:<reason>`, `usage`, `[DONE]`); the differ
-treats the content-bound kinds and the stop/length finish classes as
-mock-limited, like the other families.
+treats the content-bound delta parts (which kinds a chunk carries, and whether
+the first rides along with `role`) and the stop/length/tool_calls finish
+classes as mock-limited, like the other families.
 
 ## Dual-target replay (SMG diff)
 
@@ -231,7 +232,7 @@ placeholders, volatile integers → 0); error bodies are kept verbatim (the S4
 envelope comparison needs their values), large 2xx bodies keep only the
 field-path skeleton. Output is fully deterministic (sorted clusters, members,
 keys): ~1.6 MB (OpenAI, 138 clusters) + ~0.7 MB (Anthropic, 26 clusters) for
-the all-tier 2026-08-21 set, 44 + 23 clusters for the curated 2026-10-09 set;
+the all-tier 2026-08-21 set, 46 + 22 + 23 clusters for the curated 2026-10-09 set;
 `manifest.json` pins provenance (probe-set git sha, recording run id, models,
 counts, cost).
 
@@ -291,8 +292,9 @@ severity got worse than allowlisted, or whose S1 is of a kind the entry's
 gateway can't fake green); the conformance suite applies the same ceiling to
 the same file. Each dated allowlist grandfathers the
 divergent clusters present when its baseline was cut (2026-08-21: 150 = 133
-OpenAI + 17 Anthropic, replayed against a canned mock; 2026-10-09: 50 = 33
-OpenAI + 17 Anthropic, replayed against a gateway in front of a real engine);
+OpenAI + 17 Anthropic, replayed against a canned mock; 2026-10-09: 73 = 36
+OpenAI Responses + 17 Messages + 20 Chat Completions, replayed against a gateway
+in front of a real engine);
 the gate catches *regressions beyond that state*, and
 `--write-allowlist` regenerates a provider's lines after divergences are
 deliberately fixed or accepted.
