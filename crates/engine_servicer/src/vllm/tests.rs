@@ -1805,6 +1805,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
         h.client
             .subscribe_kv_events(common::SubscribeKvEventsRequest {
                 start_sequence_number: 0,
+                load_records_before_first_batch: false,
             }),
     )
     .await

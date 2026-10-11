@@ -199,6 +199,10 @@ macro_rules! impl_subscribe_kv_events {
         ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
             let request = tonic::Request::new($crate::common_proto::SubscribeKvEventsRequest {
                 start_sequence_number,
+                // This client admits a `load_only` batch to no cursor, so the
+                // servicer may send its records before the publisher's first
+                // batch (the field's note in the proto).
+                load_records_before_first_batch: true,
             });
             let mut client = self
                 .client

@@ -401,13 +401,14 @@ impl TokenSpeedScheduler for MockScheduler {
             // Realistic mode with prefix caching: stream the engine's KV events,
             // each carrying the load record a servicer attaches.
             Some(engine) if engine.kv_enabled() => {
-                let start = request.into_inner().start_sequence_number;
+                let request = request.into_inner();
                 let events = with_load_records(
                     engine.clone(),
                     self.cfg.loads_like,
                     self.cfg.step_reports,
                     Arc::clone(&self.prefill_pending),
-                    engine.subscribe_kv(start),
+                    request.load_records_before_first_batch,
+                    engine.subscribe_kv(request.start_sequence_number),
                 );
                 // A subscription ends with the worker's stop, as a serving
                 // engine's ends with its process; nothing else ends it, and
@@ -708,7 +709,13 @@ struct LoadRecords {
     step_reports: bool,
     /// The worker's prompt tokens handed to the engine with no token yet.
     prefill_pending: Arc<AtomicU64>,
-    last_seq: u64,
+    /// The subscriber takes `load_only` batches before the stream's first
+    /// batch, numbered 0 (`SubscribeKvEventsRequest.
+    /// load_records_before_first_batch`); unset, it waits for that batch.
+    records_before_first_batch: bool,
+    /// The last sequence sent, which a `load_only` batch repeats; `None`
+    /// before the stream's first batch.
+    last_seq: Option<u64>,
     last_rank: Option<i32>,
     last_record: Option<common::EngineLoad>,
     last_sent_at: Instant,
@@ -745,8 +752,16 @@ impl LoadRecords {
     /// A `load_only` batch when the record moved since the last one sent, or
     /// after the heartbeat interval of silence (the backoff interval after two
     /// unchanged heartbeats); it repeats the last sequence sent, as the
-    /// gateway expects.
+    /// gateway expects. Before the stream's first batch there is none to
+    /// repeat: as the Rust relay, the mock sends one numbered 0 only to a
+    /// subscriber that asked for records before the first batch, and keeps
+    /// an older subscriber waiting for that batch.
     fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
+        let sequence_number = match self.last_seq {
+            Some(sequence) => sequence,
+            None if self.records_before_first_batch => 0,
+            None => return None,
+        };
         let mut current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
         current.engine_silence_ms = silence_ms(&self.engine);
         current.engine_reports_steps = Some(self.step_reports);
@@ -771,7 +786,7 @@ impl LoadRecords {
             self.idle_heartbeats.saturating_add(1)
         };
         Some(common::KvEventBatch {
-            sequence_number: self.last_seq,
+            sequence_number,
             timestamp: engine::unix_seconds(),
             events: Vec::new(),
             dp_rank: self.last_rank,
@@ -783,12 +798,15 @@ impl LoadRecords {
 
 /// `stream` with the engine's load record on every batch and `load_only`
 /// batches while the engine is quiet, as the Rust servicer's relay sends
-/// them (`crates/engine_servicer/src/kv_events.rs`).
+/// them (`crates/engine_servicer/src/kv_events.rs`): from the subscription
+/// on for a subscriber that takes records before the first batch
+/// (`records_before_first_batch`), from the stream's first batch otherwise.
 fn with_load_records(
     engine: engine::Engine,
     like: LoadsLike,
     step_reports: bool,
     prefill_pending: Arc<AtomicU64>,
+    records_before_first_batch: bool,
     stream: KvEventStream,
 ) -> KvEventStream {
     let records = LoadRecords {
@@ -797,7 +815,8 @@ fn with_load_records(
         like,
         step_reports,
         prefill_pending,
-        last_seq: 0,
+        records_before_first_batch,
+        last_seq: None,
         last_rank: Some(0),
         last_record: None,
         last_sent_at: Instant::now(),
@@ -814,7 +833,7 @@ fn with_load_records(
                 Waited::Item(None) => return None,
                 Waited::Item(Some(Err(status))) => return Some((Err(status), records)),
                 Waited::Item(Some(Ok(mut batch))) => {
-                    records.last_seq = batch.sequence_number;
+                    records.last_seq = Some(batch.sequence_number);
                     records.last_rank = batch.dp_rank;
                     records.last_sent_at = Instant::now();
                     records.idle_heartbeats = 0;
@@ -897,6 +916,71 @@ mod tests {
             Some(GenResp::Chunk(chunk)) => chunk.token_ids,
             other => panic!("not a chunk: {other:?}"),
         }
+    }
+
+    /// As the Rust relay: a subscriber that asks for records before the
+    /// stream's first batch gets a `load_only` one numbered 0 within a tick;
+    /// one that does not waits for the first batch, whose sequence the
+    /// heartbeats repeat from there.
+    #[tokio::test]
+    async fn load_records_before_the_first_batch_go_to_the_subscriber_that_asked() {
+        let engine = Engine::spawn(engine::EngineParams::default());
+        let records = |asked: bool, kv: KvEventStream| {
+            with_load_records(
+                engine.clone(),
+                LoadsLike::Mock,
+                false,
+                Arc::new(AtomicU64::new(0)),
+                asked,
+                kv,
+            )
+        };
+        let quiet = || Box::pin(stream::pending()) as KvEventStream;
+        let load_only =
+            |batch: &common::KvEventBatch| batch.load.as_ref().is_some_and(|load| load.load_only);
+
+        let mut asked = records(true, quiet());
+        let first = tokio::time::timeout(Duration::from_millis(500), asked.next())
+            .await
+            .expect("a record before the stream's first batch")
+            .expect("an item")
+            .expect("a batch");
+        assert!(load_only(&first), "{first:?}");
+        assert_eq!((first.sequence_number, first.events.len()), (0, 0));
+
+        let mut waiting = records(false, quiet());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), waiting.next())
+                .await
+                .is_err(),
+            "no batch may precede the stream's first for a subscriber that did not ask"
+        );
+
+        let seventh = common::KvEventBatch {
+            sequence_number: 7,
+            ..Default::default()
+        };
+        let mut after = records(
+            false,
+            Box::pin(stream::iter([Ok::<_, Status>(seventh)]).chain(stream::pending())),
+        );
+        let live = after
+            .next()
+            .await
+            .expect("the first batch")
+            .expect("a batch");
+        assert_eq!(live.sequence_number, 7);
+        assert!(!load_only(&live));
+        let beat = tokio::time::timeout(
+            HEARTBEAT_INTERVAL + Duration::from_millis(500),
+            after.next(),
+        )
+        .await
+        .expect("a heartbeat after the interval")
+        .expect("an item")
+        .expect("a batch");
+        assert!(load_only(&beat));
+        assert_eq!(beat.sequence_number, 7, "repeats the last sequence sent");
     }
 
     #[tokio::test]

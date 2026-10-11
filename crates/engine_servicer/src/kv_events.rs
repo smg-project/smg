@@ -82,7 +82,15 @@
 //! sections) rides the heartbeats and the stream's first record. The
 //! gateway feeds the record where its `GetLoads` poll goes, admits nothing
 //! from a `load_only` batch, and does not poll a worker while its records
-//! arrive: `GetLoads` is the fallback.
+//! arrive: `GetLoads` is the fallback. Before the publisher's first batch
+//! there is no sequence a `load_only` batch could repeat: one goes out
+//! numbered 0, from the subscription on, only to a subscriber that asked for
+//! records before the first batch (`SubscribeKvEventsRequest.
+//! load_records_before_first_batch`, set by every gateway that knows
+//! `load_only`), so the engine's silence on the first request it ever
+//! receives reaches the gateway like any later one; an older subscriber,
+//! which would take the publisher's first batch for a duplicate of such a
+//! heartbeat, gets its first record with that batch.
 //!
 //! `SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor` turns on the relay's
 //! engine-hash verification ([`crate::engine_hash`]); mismatches are counted,
@@ -588,6 +596,7 @@ impl KvEventRelay {
         // the two is missed; the subscriber skips what it already replayed.
         let rx = self.live.subscribe();
         let cursor = request.start_sequence_number;
+        let records_before_first_batch = request.load_records_before_first_batch;
         let serve = {
             let mut shared = lock(&self.shared);
             if let Some(error) = &shared.failed {
@@ -727,6 +736,7 @@ impl KvEventRelay {
             endpoint: self.config.endpoint.clone(),
             done: false,
             source: self.load_source.get().cloned(),
+            records_before_first_batch,
             load_tick: self.config.load_tick,
             heartbeat_interval: self.config.heartbeat_interval,
             heartbeat_backoff: self.config.heartbeat_backoff,
@@ -791,6 +801,10 @@ struct Subscriber {
     /// The servicer's load for the record on every batch; `None` sends
     /// batches without one and no `load_only` batches.
     source: Option<Arc<dyn LoadSource>>,
+    /// The subscriber takes `load_only` batches before the publisher's
+    /// first batch, numbered 0 (`SubscribeKvEventsRequest.
+    /// load_records_before_first_batch`); unset, it waits for that batch.
+    records_before_first_batch: bool,
     load_tick: Duration,
     heartbeat_interval: Duration,
     heartbeat_backoff: Duration,
@@ -841,10 +855,17 @@ impl Subscriber {
     /// or when the stream has been silent for the heartbeat interval (the
     /// backoff interval after two unchanged heartbeats); `None` otherwise.
     fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
-        // Nothing sent yet, nothing to repeat: a heartbeat numbered 0 before
-        // the publisher's first batch would make a gateway that predates
-        // the field take that batch for a duplicate.
-        let sequence_number = self.last_sent?;
+        // Nothing sent yet, nothing to repeat: a subscriber that takes
+        // records before the publisher's first batch gets them numbered 0
+        // (it admits a `load_only` batch to no cursor), so the engine's
+        // silence on its first request reaches it in time; a gateway that
+        // predates the field would take the publisher's first batch for a
+        // duplicate of such a heartbeat, and waits for that batch.
+        let sequence_number = match self.last_sent {
+            Some(sequence) => sequence,
+            None if self.records_before_first_batch => 0,
+            None => return None,
+        };
         let current = self.source.as_ref()?.load(self.last_rank)?;
         let changed = self
             .last_record
@@ -2082,6 +2103,19 @@ mod tests {
         fn subscribe(&self, cursor: u64) -> Result<BoxStream<common::KvEventBatch>, Status> {
             self.relay.subscribe(common::SubscribeKvEventsRequest {
                 start_sequence_number: cursor,
+                load_records_before_first_batch: false,
+            })
+        }
+
+        /// [`Self::subscribe`] as a gateway that knows `load_only` does: it
+        /// asks for the records before the publisher's first batch.
+        fn subscribe_from_the_start(
+            &self,
+            cursor: u64,
+        ) -> Result<BoxStream<common::KvEventBatch>, Status> {
+            self.relay.subscribe(common::SubscribeKvEventsRequest {
+                start_sequence_number: cursor,
+                load_records_before_first_batch: true,
             })
         }
 
@@ -3112,6 +3146,7 @@ mod tests {
             let started = Instant::now();
             let stream = relay.subscribe(common::SubscribeKvEventsRequest {
                 start_sequence_number: 0,
+                load_records_before_first_batch: false,
             });
             (stream, started.elapsed())
         });
@@ -3221,10 +3256,11 @@ mod tests {
     }
 
     /// Before the stream has sent a batch there is no sequence a heartbeat
-    /// could repeat, so a quiet publisher at the start gets none: a gateway
-    /// that predates the load field would take the publisher's first batch
-    /// for a duplicate of a heartbeat numbered 0. The first real batch
-    /// opens the heartbeats.
+    /// could repeat, so a quiet publisher at the start gets none for a
+    /// subscriber that did not ask for records before the first batch: a
+    /// gateway that predates the load field would take the publisher's
+    /// first batch for a duplicate of a heartbeat numbered 0. The first real
+    /// batch opens the heartbeats.
     #[tokio::test]
     async fn no_heartbeat_goes_out_before_the_streams_first_batch() {
         let loads = StubLoads::new(2, 0);
@@ -3248,6 +3284,68 @@ mod tests {
         let first = read(&mut stream).await;
         assert_eq!(first.sequence_number, 0);
         assert!(!load_only_marker(&first));
+        let beat = read(&mut stream).await;
+        assert!(load_only_marker(&beat));
+        assert_eq!(beat.sequence_number, 0);
+    }
+
+    /// A subscriber that asks for records before the publisher's first batch
+    /// (every gateway that knows `load_only`) hears from the relay from the
+    /// subscription on: a `load_only` batch numbered 0 within a tick, one
+    /// for each change of the record after it (a frozen engine's growing
+    /// silence is such a change) and the heartbeats between; the publisher's
+    /// first batch is then relayed as itself, not skipped as a repeat of
+    /// their number, and the heartbeats repeat its sequence from there.
+    #[tokio::test]
+    async fn a_subscriber_that_asks_gets_records_before_the_publishers_first_batch() {
+        let loads = StubLoads::new(0, 0);
+        let mut lab = start_lab_with_loads_at(
+            Arc::clone(&loads),
+            Duration::from_millis(20),
+            Duration::from_millis(60),
+            Duration::from_millis(100),
+            false,
+        )
+        .await;
+        let mut stream = lab
+            .subscribe_from_the_start(0)
+            .expect("live from the start");
+        let first = timeout(Duration::from_millis(300), stream.next())
+            .await
+            .expect("a record before the publisher's first batch")
+            .expect("an item")
+            .expect("a batch");
+        assert!(load_only_marker(&first), "{first:?}");
+        assert_eq!((first.sequence_number, first.events.len()), (0, 0));
+        assert_eq!(record_of(&first).running_requests, 0);
+        // The record moves: a batch within a tick or two, numbered 0 still
+        // (heartbeats of the unchanged record may come first).
+        loads.set(1, 0);
+        let started = Instant::now();
+        loop {
+            let batch = read(&mut stream).await;
+            assert!(load_only_marker(&batch), "{batch:?}");
+            assert_eq!(batch.sequence_number, 0);
+            if record_of(&batch).running_requests == 1 {
+                break;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "the change took {:?}",
+            started.elapsed()
+        );
+        // The publisher's first batch is relayed as itself, and the
+        // heartbeats repeat its sequence.
+        lab.prime().await;
+        let live = loop {
+            let batch = read(&mut stream).await;
+            if !load_only_marker(&batch) {
+                break batch;
+            }
+        };
+        assert_eq!(live.sequence_number, 0);
+        assert!(!live.events.is_empty(), "{live:?}");
         let beat = read(&mut stream).await;
         assert!(load_only_marker(&beat));
         assert_eq!(beat.sequence_number, 0);

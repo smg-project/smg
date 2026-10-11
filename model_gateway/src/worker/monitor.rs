@@ -2034,6 +2034,33 @@ mod worker_monitor_tests {
         assert!(worker.stall_reason().is_none(), "the engine produces again");
     }
 
+    /// A worker's first pushed record may be a `load_only` one the servicer
+    /// sends before the engine's first batch (from the subscription on, to
+    /// a gateway that asks for them): with the engine's silence on it, it
+    /// vetoes the worker like any later record, so an engine frozen on the
+    /// first request it ever receives leaves routing within the threshold
+    /// rather than never.
+    #[tokio::test]
+    async fn the_first_record_a_worker_pushes_is_judged_before_any_event_batch() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let record = EngineLoad {
+            engine_silence_ms: Some(5_000),
+            engine_reports_steps: Some(true),
+            prefill_pending_tokens: Some(47),
+            load_only: true,
+            sample: 1,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged)
+        );
+        assert!(!worker.is_healthy_and_eligible());
+    }
+
     /// A record's telemetry feeds the `smg_engine_*` gauges, the PD gauges
     /// included, as a poll's does; a core-only record after it (an event
     /// batch between heartbeats) keeps the telemetry the worker last sent

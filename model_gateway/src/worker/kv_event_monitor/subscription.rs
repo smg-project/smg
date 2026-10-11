@@ -690,6 +690,8 @@ mod tests {
         /// Answers `UNIMPLEMENTED`, as a backend whose KV event publisher is
         /// off does.
         Unimplemented,
+        /// Notes the request, then never answers it, like `Hang`.
+        RecordRequest(Arc<Mutex<Option<common::SubscribeKvEventsRequest>>>),
     }
 
     struct TestScheduler(Subscribe);
@@ -746,10 +748,14 @@ mod tests {
 
         async fn subscribe_kv_events(
             &self,
-            _: Request<common::SubscribeKvEventsRequest>,
+            request: Request<common::SubscribeKvEventsRequest>,
         ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
             match &self.0 {
                 Subscribe::Hang => std::future::pending().await,
+                Subscribe::RecordRequest(seen) => {
+                    *seen.lock().unwrap() = Some(request.into_inner());
+                    std::future::pending().await
+                }
                 Subscribe::Unimplemented => {
                     Err(Status::unimplemented("KV cache events not enabled"))
                 }
@@ -866,6 +872,52 @@ mod tests {
         .expect("removal returns while the subscribe call hangs");
 
         pinger.abort();
+        server.abort();
+    }
+
+    /// The subscription asks the servicer for load records before the
+    /// publisher's first batch: this gateway admits a `load_only` batch to
+    /// no cursor, and the silence of an engine frozen on the first request
+    /// it ever receives reaches the wedge rule through no other record.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_subscription_asks_for_load_records_before_the_first_batch() {
+        let port = portpicker::pick_unused_port().expect("a free port");
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let seen = Arc::new(Mutex::new(None));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test scheduler lives as long as the test"
+        )]
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(TokenSpeedSchedulerServer::new(TestScheduler(
+                    Subscribe::RecordRequest(Arc::clone(&seen)),
+                )))
+                .serve(addr),
+        );
+        wait_until_listening(addr).await;
+        let worker = grpc_worker(addr);
+        let monitor = KvEventMonitor::new(None);
+        monitor.on_worker_added(&worker).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let request = loop {
+            if let Some(request) = *seen.lock().unwrap() {
+                break request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the subscribe call never reached the scheduler"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(request.load_records_before_first_batch, "{request:?}");
+        assert_eq!(request.start_sequence_number, 0);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            monitor.on_worker_removed(worker.url()),
+        )
+        .await
+        .expect("removal returns while the subscribe call hangs");
         server.abort();
     }
 

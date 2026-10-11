@@ -19,6 +19,15 @@ message GetTokenizerChunk {
 message SubscribeKvEventsRequest {
   // Resume from this sequence number (0 = start from current state).
   uint64 start_sequence_number = 1;
+  // The subscriber takes load records before the publisher's first batch:
+  // `load_only` batches numbered 0 (it admits such a batch to no cursor),
+  // carrying the servicer's record from the subscription on, so the engine's
+  // silence on the first request it ever receives reaches the subscriber like
+  // any later one. A subscriber that predates `EngineLoad.load_only` leaves
+  // it unset and gets its first record with the publisher's first batch, as
+  // before: it would take that batch for a duplicate of a heartbeat
+  // numbered 0.
+  bool load_records_before_first_batch = 2;
 }
 
 message KvEventBatch {
