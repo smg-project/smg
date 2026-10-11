@@ -432,9 +432,11 @@ impl ThinkingParam {
 
 impl ChatCompletionRequest {
     /// The cap the client put on the completion: `max_completion_tokens`,
-    /// else the deprecated `max_tokens`. The request keeps whichever field
-    /// the client wrote, so a proxied body reaches its upstream unchanged;
-    /// everything that needs the number reads it here.
+    /// else the deprecated `max_tokens`; when the client wrote both, the
+    /// current name wins, as the serving engines resolve the pair. The
+    /// request keeps whichever fields the client wrote, so a proxied body
+    /// reaches its upstream unchanged; everything that needs the number
+    /// reads it here.
     pub fn output_token_cap(&self) -> Option<u32> {
         #[expect(deprecated, reason = "the one place the deprecated field is read")]
         let max_tokens = self.max_tokens;
@@ -720,20 +722,11 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. `max_tokens` and `max_completion_tokens` are one setting: both at
-    //     once is a contradiction (normalization migrates the deprecated
-    //     name only when the current one is absent)
-    #[expect(deprecated)]
-    if req.max_tokens.is_some() && req.max_completion_tokens.is_some() {
-        return Err(invalid(
-            "invalid_parameter_combination",
-            "'max_tokens' and 'max_completion_tokens' cannot both be set; use \
-             'max_completion_tokens'"
-                .to_string(),
-        ));
-    }
-
-    // 11. Provider-profile contract rules, selected from the model id
+    // 10. Provider-profile contract rules, selected from the model id. Both
+    //     token limits at once are judged there: the request keeps whichever
+    //     the client wrote and `output_token_cap` reads `max_completion_tokens`
+    //     first, the precedence the serving engines apply themselves; only
+    //     OpenAI's own contract refuses the pair.
     ProviderProfile::for_model(&req.model).validate_chat(req)?;
 
     Ok(())
@@ -1473,12 +1466,23 @@ mod request_contract_tests {
         assert_eq!(rejection(&good), None);
     }
 
+    /// Both token limits at once are accepted outside OpenAI's own contract
+    /// (a self-hosted model, a vendor profile), whatever the two values, and
+    /// `max_completion_tokens` is the cap; the deprecated name alone still
+    /// carries it.
     #[test]
-    fn max_tokens_and_max_completion_tokens_together_are_rejected() {
-        let both = request(json!({"max_tokens": 32, "max_completion_tokens": 64}));
-        assert!(rejection(&both).is_some_and(|e| e.contains("invalid_parameter_combination")));
-        // The deprecated name alone still migrates.
+    fn both_token_limits_are_accepted_and_max_completion_tokens_wins() {
+        for model in ["test-model", "MiniMax-M2"] {
+            for (legacy, current) in [(32, 64), (64, 32), (64, 64)] {
+                let both = request(
+                    json!({"model": model, "max_tokens": legacy, "max_completion_tokens": current}),
+                );
+                assert_eq!(rejection(&both), None, "{model}: {legacy} and {current}");
+                assert_eq!(both.output_token_cap(), Some(current), "{model}");
+            }
+        }
         let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
         assert_eq!(rejection(&legacy), None);
+        assert_eq!(legacy.output_token_cap(), Some(32));
     }
 }

@@ -72,16 +72,19 @@ fn test_max_completion_tokens_takes_precedence() {
         "max_completion_tokens should take precedence"
     );
     assert_eq!(req.output_token_cap(), Some(200));
-    // The cap reads the newer field; the public API nevertheless refuses the
-    // pair itself (invalid_parameter_combination), and so does validation.
-    let error = req
-        .validate()
-        .expect_err("both token limits at once are refused");
+    #[expect(deprecated)]
+    {
+        assert_eq!(
+            req.max_tokens,
+            Some(100),
+            "the field the client wrote is kept for the upstream"
+        );
+    }
+    // A self-hosted model takes the pair, as the serving engines do; only
+    // OpenAI's own contract refuses it (pinned by the profile's unit tests).
     assert!(
-        error
-            .to_string()
-            .contains("'max_tokens' and 'max_completion_tokens' cannot both be set"),
-        "{error}"
+        req.validate().is_ok(),
+        "both token limits at once are accepted; max_completion_tokens wins"
     );
 }
 
