@@ -37,8 +37,8 @@ use std::{
 
 use chrono::{TimeDelta, Utc};
 use data_connector::{
-    create_storage, ConversationItemId, HistoryBackend, ListParams, NewConversation,
-    NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
+    create_storage, ConditionalStore, ConversationItemId, HistoryBackend, ListParams,
+    NewConversation, NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
     StorageFactoryConfig, StoredResponse, TableConfig,
 };
 use serde_json::json;
@@ -958,4 +958,84 @@ async fn open_background_responses_are_listed_until_they_close() {
     );
     drop(client);
     let _ = driver.await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_missing_one() {
+    let Some(url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    let base = StoredResponse::new(None);
+    let record = |status: &str| {
+        let mut stored = base.clone();
+        stored.raw_response =
+            json!({"id": stored.id.0, "background": true, "status": status, "output": []});
+        stored
+    };
+    // Missing: nothing is written.
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("in_progress"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Missing
+    ));
+    assert!(storage.get_response(&base.id).await.expect("get").is_none());
+
+    // Open: replaced.
+    storage
+        .store_response(record("queued"))
+        .await
+        .expect("store");
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("in_progress"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    let stored = storage
+        .get_response(&base.id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.raw_response["status"], "in_progress");
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("cancelled"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+
+    // Closed: refused, the record handed back as it is.
+    let ConditionalStore::Closed(current) = storage
+        .store_response_if_open(record("completed"))
+        .await
+        .expect("conditional store")
+    else {
+        panic!("a cancelled record is closed");
+    };
+    assert_eq!(current.raw_response["status"], "cancelled");
+    let stored = storage
+        .get_response(&base.id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.raw_response["status"], "cancelled");
+    assert!(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list")
+            .iter()
+            .all(|r| r.id != base.id),
+        "a closed record is not among the open ones"
+    );
+
+    storage.delete_response(&base.id).await.expect("delete");
 }

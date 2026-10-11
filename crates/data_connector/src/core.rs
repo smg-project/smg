@@ -414,6 +414,12 @@ impl StoredResponse {
 /// The statuses a background response still leaves.
 pub(crate) const OPEN_RESPONSE_STATUSES: [&str; 2] = ["queued", "in_progress"];
 
+/// The statuses a response does not leave any more: a record in one of them
+/// is closed, and [`ResponseStorage::store_response_if_open`] refuses to
+/// rewrite it.
+pub const TERMINAL_RESPONSE_STATUSES: [&str; 4] =
+    ["completed", "incomplete", "failed", "cancelled"];
+
 impl StoredResponse {
     /// Whether this is a background record still in flight (`background:
     /// true` with a status it still leaves): the gateway running it holds a
@@ -425,6 +431,27 @@ impl StoredResponse {
                 .as_str()
                 .is_some_and(|status| OPEN_RESPONSE_STATUSES.contains(&status))
     }
+
+    /// Whether the stored object's status is one a response does not leave
+    /// any more.
+    pub fn is_closed(&self) -> bool {
+        self.raw_response["status"]
+            .as_str()
+            .is_some_and(|status| TERMINAL_RESPONSE_STATUSES.contains(&status))
+    }
+}
+
+/// What [`ResponseStorage::store_response_if_open`] found under the id.
+#[derive(Debug, Clone)]
+pub enum ConditionalStore {
+    /// The record was open (or carried no status) and now reads as the
+    /// response given.
+    Stored,
+    /// The record had reached a terminal status and stays as it is: this is
+    /// it.
+    Closed(Box<StoredResponse>),
+    /// Nothing is stored under the id; nothing was written.
+    Missing,
 }
 
 /// Response chain - a sequence of related responses
@@ -485,6 +512,30 @@ pub trait ResponseStorage: Send + Sync {
     /// its terminal object when the work ends, under the one id its client
     /// polls.
     async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId>;
+
+    /// Store `response` under its id unless the record stored there has
+    /// reached a terminal status ([`TERMINAL_RESPONSE_STATUSES`]) or is
+    /// missing: the write of a background response's status transition
+    /// (`in_progress`, a lease renewal, `cancelled`, `failed`, the terminal
+    /// object) is one conditional write, so a record closed on one gateway
+    /// is never rewritten by another whatever the timing.
+    ///
+    /// The default reads then writes, two round trips with a window between
+    /// them; every backend of this crate overrides it with one atomic
+    /// operation (a check under the lock, a conditional `UPDATE`, a script).
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        match self.get_response(&response.id).await? {
+            None => Ok(ConditionalStore::Missing),
+            Some(current) if current.is_closed() => Ok(ConditionalStore::Closed(Box::new(current))),
+            Some(_) => {
+                self.store_response(response).await?;
+                Ok(ConditionalStore::Stored)
+            }
+        }
+    }
 
     /// Get a response by ID
     async fn get_response(

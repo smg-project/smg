@@ -13,11 +13,11 @@ use tracing::warn;
 use crate::{
     context::{current_request_context, with_extra_columns},
     core::{
-        Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemResult,
-        ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-        ConversationResult, ConversationStorage, ConversationStorageError, ListParams,
-        NewConversation, NewConversationItem, ResponseChain, ResponseId, ResponseResult,
-        ResponseStorage, ResponseStorageError, StoredResponse,
+        ConditionalStore, Conversation, ConversationId, ConversationItem, ConversationItemId,
+        ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
+        ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
+        ListParams, NewConversation, NewConversationItem, ResponseChain, ResponseId,
+        ResponseResult, ResponseStorage, ResponseStorageError, StoredResponse,
     },
     hooks::{BeforeHookResult, ExtraColumns, StorageHook, StorageOperation},
 };
@@ -448,6 +448,42 @@ impl ResponseStorage for HookedResponseStorage {
             StorageOperation::StoreResponse,
             &payload,
             &result_json,
+            &extra,
+        )
+        .await;
+
+        Ok(result)
+    }
+
+    /// A store that may be refused by the record's status: the same hooks
+    /// as [`Self::store_response`] run around it, the after-hook seeing the
+    /// outcome (`stored`, `closed`, `missing`) as its result.
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        let payload = serde_json::to_value(&response).unwrap_or_default();
+        let extra = run_before(
+            &*self.hook,
+            StorageOperation::StoreResponse,
+            &payload,
+            ResponseStorageError::StorageError,
+        )
+        .await?;
+
+        let result =
+            with_extra_columns(extra.clone(), self.inner.store_response_if_open(response)).await?;
+
+        let outcome = match &result {
+            ConditionalStore::Stored => "stored",
+            ConditionalStore::Closed(_) => "closed",
+            ConditionalStore::Missing => "missing",
+        };
+        run_after(
+            &*self.hook,
+            StorageOperation::StoreResponse,
+            &payload,
+            &serde_json::json!(outcome),
             &extra,
         )
         .await;
@@ -1403,6 +1439,43 @@ mod tests {
         // list_identifier_responses triggers its own before/after hook
         assert_eq!(hook.before_calls(), 3);
         assert_eq!(hook.after_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn hooked_conditional_store_runs_the_store_hooks_and_keeps_a_closed_record() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let record = |status: &str| {
+            let mut stored = StoredResponse::new(None);
+            stored.id = ResponseId::from("resp_1");
+            stored.raw_response = json!({"background": true, "status": status});
+            stored
+        };
+        hooked.store_response(record("queued")).await.unwrap();
+        assert!(matches!(
+            hooked
+                .store_response_if_open(record("cancelled"))
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert!(matches!(
+            hooked
+                .store_response_if_open(record("completed"))
+                .await
+                .unwrap(),
+            ConditionalStore::Closed(current) if current.raw_response["status"] == "cancelled"
+        ));
+        assert_eq!(hook.before_calls(), 3, "each store runs the before-hook");
+        assert_eq!(hook.after_calls(), 3);
+        let stored = hooked
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.raw_response["status"], "cancelled");
     }
 
     #[tokio::test]

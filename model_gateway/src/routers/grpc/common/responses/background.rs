@@ -17,11 +17,14 @@
 //!
 //! The stored record is the shared truth, also between gateways that share a
 //! store: a status only moves forward ([`set_stored_status`] never rewrites a
-//! terminal record), the runner reads the record while the work runs and
-//! drops the work once the record was closed elsewhere, and every way a run
-//! can end leaves a terminal record ([`drive`]): the object the work stored,
-//! `failed` with the error of a work that answered one, ended without storing
-//! a result or panicked, or `cancelled`.
+//! terminal record: every transition, the lease renewal and the terminal
+//! object are one conditional write of the store,
+//! `ResponseStorage::store_response_if_open`, refused once the record is
+//! closed), the runner reads the record while the work runs and drops the
+//! work once the record was closed elsewhere, and every way a run can end
+//! leaves a terminal record ([`drive`]): the object the work stored, `failed`
+//! with the error of a work that answered one, ended without storing a
+//! result or panicked, or `cancelled`.
 //!
 //! A gateway that dies mid-run leaves no such record, so every open record
 //! carries a lease ([`Lease`]: the owning registry's id and an expiry), set
@@ -51,7 +54,8 @@ use openai_protocol::responses::{ResponseStatus, ResponsesRequest, ResponsesResp
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_data_connector::{
-    with_request_context, RequestContext as StorageRequestContext, ResponseId, ResponseStorage,
+    with_request_context, ConditionalStore, RequestContext as StorageRequestContext, ResponseId,
+    ResponseStorage,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -328,9 +332,9 @@ pub(crate) enum Transition {
 /// gateway moving it runs the response. A status only moves forward: a
 /// record that is already terminal is left as it is (so a `cancelled`
 /// record is written once, and a result that arrives after a cancel does
-/// not revive the response), whichever gateway wrote it. The read and the
-/// write are two round trips to the store; the window between them is the
-/// one a cross-gateway race can fall into.
+/// not revive the response), whichever gateway wrote it. The record is read
+/// to build the moved object and written with one conditional write, which
+/// the store refuses if the record was closed in between, on any gateway.
 pub(crate) async fn set_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
@@ -356,35 +360,20 @@ pub(crate) async fn set_stored_status(
             with_lease(&mut stored.raw_response, lease);
         }
         let raw = stored.raw_response.clone();
-        storage
-            .store_response(stored)
+        match storage
+            .store_response_if_open(stored)
             .await
-            .map_err(|e| e.to_string())?;
-        Ok(Transition::Moved(raw))
+            .map_err(|e| e.to_string())?
+        {
+            ConditionalStore::Stored => Ok(Transition::Moved(raw)),
+            ConditionalStore::Closed(current) => Ok(Transition::Terminal(current.raw_response)),
+            ConditionalStore::Missing => Ok(Transition::Missing),
+        }
     };
     match request_context {
         Some(ctx) => with_request_context(ctx, update).await,
         None => update.await,
     }
-}
-
-/// Whether the record under `id` has reached a terminal status (closed by a
-/// cancel, here or on another gateway sharing the store); the result of a
-/// work that ends after that is not stored over it.
-pub(crate) async fn is_closed(
-    storage: &Arc<dyn ResponseStorage>,
-    id: &str,
-    request_context: Option<StorageRequestContext>,
-) -> bool {
-    let read = async { storage.get_response(&ResponseId::from(id)).await };
-    let stored = match request_context {
-        Some(ctx) => with_request_context(ctx, read).await,
-        None => read.await,
-    };
-    matches!(
-        stored,
-        Ok(Some(stored)) if is_terminal(stored.raw_response["status"].as_str().unwrap_or(""))
-    )
 }
 
 /// Moves the record under `id` to the terminal `status` (see
@@ -659,13 +648,23 @@ async fn watch_stored_status(
                     continue;
                 }
                 with_lease(&mut stored.raw_response, &lease);
-                let write = async { storage.store_response(stored).await };
+                let write = async { storage.store_response_if_open(stored).await };
                 let written = match request_context.clone() {
                     Some(ctx) => with_request_context(ctx, write).await,
                     None => write.await,
                 };
                 match written {
-                    Ok(_) => renewed = Instant::now(),
+                    Ok(ConditionalStore::Stored) => renewed = Instant::now(),
+                    // Closed between the read and the write: the status it closed with.
+                    Ok(ConditionalStore::Closed(current)) => {
+                        return current.raw_response["status"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    Ok(ConditionalStore::Missing) => {
+                        debug!(response_id = %id, "Background response record gone while its work runs");
+                    }
                     Err(e) => {
                         debug!(response_id = %id, error = %e, "Failed to renew the lease on the background response record");
                     }
@@ -1157,6 +1156,17 @@ mod tests {
             self.inner.store_response(response).await
         }
 
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            let outcome = self.inner.store_response_if_open(response).await?;
+            if matches!(outcome, ConditionalStore::Stored) {
+                self.stores.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(outcome)
+        }
+
         async fn get_response(
             &self,
             response_id: &ResponseId,
@@ -1187,6 +1197,119 @@ mod tests {
         ) -> Result<usize, ResponseStorageError> {
             self.inner.delete_identifier_responses(identifier).await
         }
+    }
+
+    /// A store whose conditional writes stop at a gate once the record was
+    /// read: the window between a transition's read and its write, held open
+    /// for the test.
+    struct GatedStorage {
+        inner: Arc<CountingStorage>,
+        reached: tokio::sync::Notify,
+        gate: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ResponseStorage for GatedStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.inner.store_response(response).await
+        }
+
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.reached.notify_one();
+            self.gate.notified().await;
+            self.inner.store_response_if_open(response).await
+        }
+
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.inner.get_response(response_id).await
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.inner.delete_response(response_id).await
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.inner
+                .list_identifier_responses(identifier, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+        ) -> Result<usize, ResponseStorageError> {
+            self.inner.delete_identifier_responses(identifier).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_write_that_loses_the_race_to_a_close_elsewhere_is_refused() {
+        // Gateway X runs the response and writes its terminal object; gateway
+        // Y cancels it on the shared store between X's read and X's write.
+        let counting = Arc::new(CountingStorage::new());
+        let direct: Arc<dyn ResponseStorage> = counting.clone();
+        store_queued(&direct, "resp_1").await;
+        set_stored_status(&direct, "resp_1", "in_progress", None, None, None)
+            .await
+            .unwrap();
+        let gated = Arc::new(GatedStorage {
+            inner: counting.clone(),
+            reached: tokio::sync::Notify::new(),
+            gate: tokio::sync::Notify::new(),
+        });
+        let through_gate: Arc<dyn ResponseStorage> = gated.clone();
+        let writes = counting.stores();
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let x = tokio::spawn(async move {
+            set_stored_status(&through_gate, "resp_1", "completed", None, None, None)
+                .await
+                .unwrap()
+        });
+        // X has read the open record and stands at its write.
+        gated.reached.notified().await;
+
+        // Y's cancel lands first.
+        let Transition::Moved(raw) =
+            set_stored_status(&direct, "resp_1", "cancelled", None, None, None)
+                .await
+                .unwrap()
+        else {
+            panic!("the open record is cancelled");
+        };
+        assert_eq!(raw["status"], "cancelled");
+
+        // X's write is refused: the record stays cancelled, completed is never written.
+        gated.gate.notify_one();
+        let Transition::Terminal(raw) = x.await.unwrap() else {
+            panic!("the late terminal write is refused");
+        };
+        assert_eq!(raw["status"], "cancelled");
+        assert_eq!(stored_status(&direct, "resp_1").await, "cancelled");
+        assert_eq!(
+            counting.stores(),
+            writes + 1,
+            "cancelled was written once; completed never"
+        );
     }
 
     #[test]
@@ -1516,7 +1639,6 @@ mod tests {
             panic!("a queued record is cancelled");
         };
         assert_eq!(raw["status"], "cancelled");
-        assert!(is_closed(&storage, "resp_1", None).await);
 
         for status in ["failed", "in_progress", "completed", "cancelled"] {
             let error = (status == "failed").then(|| json!({"code": "x", "message": "y"}));
@@ -1532,7 +1654,6 @@ mod tests {
         let raw = stored_raw(&storage, "resp_1").await;
         assert_eq!(raw["status"], "cancelled");
         assert!(raw["error"].is_null(), "{raw}");
-        assert!(!is_closed(&storage, "resp_404", None).await);
     }
 
     #[tokio::test]

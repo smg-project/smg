@@ -16,12 +16,12 @@ use smg_data_connector::{
 use smg_mcp::{McpOrchestrator, McpServerBinding};
 use tracing::{debug, error, warn};
 
-use super::background;
 use crate::{
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client, openai_bridge,
-            persistence_utils::persist_conversation_items,
+            mcp_utils::ensure_request_mcp_client,
+            openai_bridge,
+            persistence_utils::{persist_conversation_items, persist_conversation_items_if_open},
         },
         error,
     },
@@ -325,21 +325,15 @@ pub(crate) async fn persist_response_if_needed(
     if !original_request.store.unwrap_or(true) {
         return;
     }
-    // A background response's record may have been closed while the work
-    // ran (a cancel, here or on another gateway sharing the store): a
-    // terminal record is not rewritten by a late result.
-    if original_request.background.unwrap_or(false)
-        && background::is_closed(&response_storage, &response.id, request_context.clone()).await
-    {
-        debug!(
-            response_id = %response.id,
-            "Background response record already closed; the result is not stored"
-        );
+    let Ok(response_json) = to_value(response) else {
         return;
-    }
-
-    if let Ok(response_json) = to_value(response) {
-        if let Err(e) = persist_conversation_items(
+    };
+    // A background response's record may have been closed while the work
+    // ran (a cancel, here or on another gateway sharing the store, or the
+    // reaper): its terminal object is stored with one conditional write, so
+    // a closed record is never rewritten by a late result.
+    let persisted = if original_request.background.unwrap_or(false) {
+        persist_conversation_items_if_open(
             conversation_storage,
             conversation_item_storage,
             response_storage,
@@ -348,11 +342,25 @@ pub(crate) async fn persist_response_if_needed(
             request_context,
         )
         .await
-        {
-            warn!("Failed to persist response: {}", e);
-        } else {
-            debug!("Persisted response: {}", response.id);
-        }
+    } else {
+        persist_conversation_items(
+            conversation_storage,
+            conversation_item_storage,
+            response_storage,
+            &response_json,
+            original_request,
+            request_context,
+        )
+        .await
+        .map(|()| true)
+    };
+    match persisted {
+        Ok(true) => debug!("Persisted response: {}", response.id),
+        Ok(false) => debug!(
+            response_id = %response.id,
+            "Background response record already closed; the result is not stored"
+        ),
+        Err(e) => warn!("Failed to persist response: {}", e),
     }
 }
 
