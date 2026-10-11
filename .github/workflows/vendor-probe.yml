@@ -164,24 +164,26 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-      # Chat Completions has a curated tier only (no generated tier): --tier is
-      # passed through, the runner ignores the generated tier for this family.
+      # Chat Completions has a curated tier only: a generated-tier run has
+      # nothing to record for this family (the runner would exit with "no
+      # probes matched" and no summary), so the step and its upload are skipped
+      # and the health gate below leaves the family out.
       - name: Probe OpenAI Chat Completions
         id: openai-chat
-        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai-chat' }}
+        if: ${{ (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai-chat') && env.PROBE_TIER != 'generated' }}
         continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          FILTER_ARG=""
-          [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
+          FILTER_ARGS=()
+          [ -n "$PROBE_FILTER" ] && FILTER_ARGS=(--filter "$PROBE_FILTER")
           python -m vendor_probe.runner --provider openai-chat \
             --tier "$PROBE_TIER" --budget "$PROBE_BUDGET" \
             --concurrency "$PROBE_CONCURRENCY" \
-            --out results/openai-chat $FILTER_ARG
+            --out results/openai-chat "${FILTER_ARGS[@]}"
 
       - name: Upload OpenAI Chat Completions artifact
-        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai-chat') }}
+        if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai-chat') && env.PROBE_TIER != 'generated' }}
         uses: actions/upload-artifact@v7
         with:
           name: vendor-probe-openai-chat
@@ -220,7 +222,8 @@ jobs:
           if sel in ("all", "anthropic"):
               checks.append(("anthropic", "results/anthropic/summary.json",
                              os.environ.get("ANTHROPIC_OUTCOME")))
-          if sel in ("all", "openai-chat"):
+          # Chat Completions has no generated tier: nothing to gate on such a run
+          if sel in ("all", "openai-chat") and os.environ.get("PROBE_TIER") != "generated":
               checks.append(("openai-chat", "results/openai-chat/summary.json",
                              os.environ.get("OPENAI_CHAT_OUTCOME")))
           failed = False

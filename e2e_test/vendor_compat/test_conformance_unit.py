@@ -86,7 +86,7 @@ def test_representative_volume_is_bounded():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-chat"])
 def test_skeletons_round_trip_field_paths(provider):
     for c in conformance.clusters(provider):
         if c["kind"] != "json":
@@ -96,7 +96,7 @@ def test_skeletons_round_trip_field_paths(provider):
         assert got == set(c["field_paths"]), c["cluster_id"]
 
 
-@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "openai-chat"])
 def test_synth_records_reproduce_cluster_keys(provider):
     clusters = list(conformance.clusters(provider))
     records = compat_diff.synth_vendor_records(clusters)
@@ -104,6 +104,59 @@ def test_synth_records_reproduce_cluster_keys(provider):
         key = compat_diff.vendor_cluster_key(records[c["members"][0]["id"]], provider)
         assert key[1] == c["status"], c["cluster_id"]
         assert list(key[2]) == (c.get("event_types") or c.get("field_paths") or []), c["cluster_id"]
+
+
+def test_chat_stream_core_ignores_how_the_model_filled_its_chunks():
+    # the vendor sends role with the first tool_calls delta and ends with
+    # finish_reason tool_calls; a text model sends role alone and ends with stop
+    vendor = [
+        "delta.role+tool_calls",
+        "delta.tool_calls",
+        "delta.tool_calls",
+        "delta.empty.finish:tool_calls",
+        "usage",
+        "[DONE]",
+    ]
+    text = [
+        "delta.role",
+        "delta.content",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    divergent, detail = compat_diff.compare_events(vendor, text, "openai-chat")
+    assert not divergent, detail
+    assert (
+        detail["vendor_core"]
+        == detail["smg_core"]
+        == ["delta.role", "finish.finish:<terminal>", "usage", "[DONE]"]
+    )
+    # a chunk that carries content and reasoning at once is content-bound too
+    mixed = [
+        "delta.role",
+        "delta.reasoning",
+        "delta.content+reasoning",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "[DONE]",
+    ]
+    assert not compat_diff.compare_events(mixed, text[:4] + ["[DONE]"], "openai-chat")[0]
+
+
+def test_chat_stream_core_keeps_structural_differences():
+    vendor = ["delta.role", "delta.content", "delta.empty.finish:stop", "usage", "[DONE]"]
+    # a finish class outside stop/length/tool_calls is structural, so is a missing usage chunk
+    assert compat_diff.compare_events(
+        vendor,
+        ["delta.role", "delta.content", "delta.empty.finish:content_filter", "usage", "[DONE]"],
+        "openai-chat",
+    )[0]
+    assert compat_diff.compare_events(
+        vendor, ["delta.role", "delta.content", "delta.empty.finish:stop", "[DONE]"], "openai-chat"
+    )[0]
+    assert compat_diff.chat_core_name("delta.content+usage") == "+usage"
+    assert compat_diff.chat_core_name("delta.content+") is None
 
 
 def test_allowlist_covers_only_known_sigs():

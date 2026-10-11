@@ -178,7 +178,7 @@ _CONTENT_DEPENDENT_EVENTS = {
         "delta.reasoning",
         "delta.refusal",
         "delta.content+usage",
-        "delta.reasoning+content",
+        "delta.content+reasoning",
         "delta.empty",
     ),
 }
@@ -259,8 +259,37 @@ def event_names(record, provider) -> list:
 # naturally (completed). Both collapse to <terminal> in the core comparison;
 # response.failed / error do NOT — failing differently is structural.
 _TERMINAL_EQUIV = {"response.completed", "response.incomplete"}
-# The same for a Chat Completions finish chunk: stop vs length is content-bound.
-_CHAT_FINISH_EQUIV = re.compile(r"\.finish:(stop|length)\b")
+# The same for a Chat Completions finish chunk: stop vs length is content-bound,
+# and so is whether the model ended its turn with tool calls (function_call for
+# the legacy surface) or with text.
+_CHAT_FINISH_EQUIV = re.compile(r"\.finish:(stop|length|tool_calls|function_call)\b")
+# Chat delta parts that are the model's choice: which kinds a chunk carries,
+# and whether the first one rides along with ``role``.
+_CHAT_CONTENT_PARTS = {"content", "tool_calls", "reasoning", "refusal"}
+
+
+def chat_core_name(name: str) -> str | None:
+    """The structural part of a chat chunk name, or ``None`` when nothing
+    structural is left: content-bound delta parts are dropped (``role`` stays),
+    the finish reason keeps its class with stop/length/tool_calls collapsed to
+    ``<terminal>``, ``usage`` stays."""
+    base = name.rstrip("+")
+    usage = base.endswith("+usage")
+    if usage:
+        base = base[: -len("+usage")]
+    finish = ""
+    m = re.search(r"\.finish:[a-z_]+$", base)
+    if m:
+        finish = _CHAT_FINISH_EQUIV.sub(".finish:<terminal>", m.group(0))
+        base = base[: m.start()]
+    if base.startswith("delta."):
+        parts = [p for p in base[len("delta.") :].split("+") if p not in _CHAT_CONTENT_PARTS]
+        base = "delta." + "+".join(parts) if parts else ""
+        if finish:
+            base = "finish"
+    if not base and not finish and not usage:
+        return None
+    return base + finish + ("+usage" if usage else "")
 
 
 def chat_chunk_name(ev):
@@ -673,12 +702,12 @@ def compare_events(v_names, s_names, provider):
             if base in _TERMINAL_EQUIV:
                 out.append("<terminal>")
             elif provider == "openai-chat":
-                # the finish chunk's delta parts are content-bound too: keep the
-                # finish reason class, drop what rode along with it
-                m = re.search(r"\.finish:[a-z_]+", base)
-                finish = _CHAT_FINISH_EQUIV.sub(".finish:<terminal>", m.group(0)) if m else ""
-                suffix = "+usage" if base.endswith("+usage") else ""
-                out.append(("finish" + finish + suffix) if m else n)
+                # every chunk's delta parts are content-bound (the vendor sends
+                # role together with the first tool_calls delta, a text model
+                # sends it alone): keep role, the finish class and usage
+                core = chat_core_name(n)
+                if core is not None:
+                    out.append(core)
             else:
                 out.append(n)
         return tuple(out)

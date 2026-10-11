@@ -338,7 +338,13 @@ _p(
     note="both caps given: invalid_parameter_combination at the vendor",
 )
 _p("openai.chat.params.temp-on-reasoning", P, _base(temperature=0.5), expect="error")
-_p("openai.chat.params.max-tokens-on-reasoning", P, _base(max_tokens=64), expect="error")
+_p(
+    "openai.chat.params.max-tokens-on-reasoning",
+    P,
+    {"model": "@MODEL", "messages": [_u("Say hi in one word.")], "max_tokens": 64},
+    expect="error",
+    note="the legacy cap alone, so the rejection recorded is the model's, not the pair's",
+)
 _p("openai.chat.params.logprobs-on-reasoning", P, _base(logprobs=True), expect="error")
 
 # =============================================================================
