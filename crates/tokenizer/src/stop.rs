@@ -108,6 +108,11 @@ impl StopSequenceDecoder {
         )
     }
 
+    /// Whether this decoder omits special tokens from text.
+    pub fn skip_special_tokens(&self) -> bool {
+        self.sequence.skip_special_tokens()
+    }
+
     fn with_sequence(sequence: Sequence, config: StopSequenceConfig) -> Self {
         // Build Aho-Corasick automaton from all stop sequences
         // Hidden sequences come first, then visible sequences

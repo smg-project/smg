@@ -86,6 +86,7 @@ impl ResponseProcessor {
         // ends to place the reasoning span in tokens.
         let mut final_text = String::new();
         let mut stopped = false;
+        let mut held = false;
         let mut token_ends = Vec::with_capacity(outputs.len());
         for output in outputs {
             match output {
@@ -95,7 +96,7 @@ impl ResponseProcessor {
                     stopped = true;
                 }
                 SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => {}
+                SequenceDecoderOutput::Held => held = true,
             }
             token_ends.push(final_text.len());
             if stopped {
@@ -113,6 +114,16 @@ impl ResponseProcessor {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
+            }
+        }
+        if held && original_request.separate_reasoning && reasoning_parser_available {
+            if let Some(ends) = eager_token_ends(
+                tokenizer,
+                &complete.output_ids()[..token_ends.len()],
+                stop_decoder.skip_special_tokens(),
+                &final_text,
+            ) {
+                token_ends = ends;
             }
         }
         stopped |= stop_decoder.is_stopped();
@@ -658,6 +669,7 @@ impl ResponseProcessor {
         // ends to place the thinking span in tokens (as the chat path does).
         let mut final_text = String::new();
         let mut stopped = false;
+        let mut held = false;
         let mut token_ends = Vec::with_capacity(outputs.len());
         for output in outputs {
             match output {
@@ -667,7 +679,7 @@ impl ResponseProcessor {
                     stopped = true;
                 }
                 SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => {}
+                SequenceDecoderOutput::Held => held = true,
             }
             token_ends.push(final_text.len());
             if stopped {
@@ -685,6 +697,16 @@ impl ResponseProcessor {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
+            }
+        }
+        if held && reasoning_parser_available {
+            if let Some(ends) = eager_token_ends(
+                &tokenizer,
+                &complete.output_ids()[..token_ends.len()],
+                stop_decoder.skip_special_tokens(),
+                &final_text,
+            ) {
+                token_ends = ends;
             }
         }
         stopped |= stop_decoder.is_stopped();
@@ -1052,6 +1074,38 @@ impl ResponseProcessor {
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }
+}
+
+// Byte buffering can release several tokens at once. Observe their original
+// eager boundaries only for accounting; canonical text and stops stay with the
+// stable decoder. A mismatched observation keeps the existing span estimate.
+fn eager_token_ends(
+    tokenizer: &Arc<dyn Tokenizer>,
+    token_ids: &[u32],
+    skip_special_tokens: bool,
+    text: &str,
+) -> Option<Vec<usize>> {
+    let mut ids = Vec::new();
+    let mut prefix = String::new();
+    let mut prefix_index = 0;
+    let mut observed = String::new();
+    let mut ends = Vec::with_capacity(token_ids.len());
+    for &token_id in token_ids {
+        if let Some(delta) = tokenizer
+            .decode_step_eager(
+                token_id,
+                &mut ids,
+                &mut prefix,
+                &mut prefix_index,
+                skip_special_tokens,
+            )
+            .ok()?
+        {
+            observed.push_str(&delta);
+        }
+        ends.push(observed.len().min(text.len()));
+    }
+    observed.starts_with(text).then_some(ends)
 }
 
 /// Tokens of the output whose text overlaps the reasoning span, given the

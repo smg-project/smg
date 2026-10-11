@@ -525,7 +525,7 @@ impl StreamingProcessor {
         }
 
         // Phase 2: Main streaming loop
-        let mut final_indices: Option<Vec<u32>> = None;
+        let mut final_indices: Option<Vec<(u32, bool)>> = None;
         loop {
             let response = if final_indices.is_none() {
                 // Take what the engine has already sent before yielding, so
@@ -551,7 +551,7 @@ impl StreamingProcessor {
             } else {
                 None
             };
-            let final_chunk = response.is_none();
+            let mut final_chunk = response.is_none();
 
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
@@ -720,11 +720,38 @@ impl StreamingProcessor {
                 }
                 Some(ProtoResponseVariant::None) => continue,
                 None => {
-                    // Route each parser's EOF text through the same tool and content path.
-                    let indices = final_indices
-                        .get_or_insert_with(|| reasoning_parsers.keys().copied().collect());
-                    let Some(index) = indices.pop() else { break };
-                    Some((index, String::new(), None, 0))
+                    // Finish decoder text before sending EOF to the parsers. A
+                    // clean transport EOF does not supply Complete metadata.
+                    let indices = final_indices.get_or_insert_with(|| {
+                        let mut indices: Vec<_> = stop_decoders
+                            .keys()
+                            .chain(reasoning_parsers.keys())
+                            .copied()
+                            .collect();
+                        indices.sort_unstable();
+                        indices.dedup();
+                        indices
+                            .into_iter()
+                            .flat_map(|index| [(index, true), (index, false)])
+                            .collect()
+                    });
+                    let Some((index, parser_eof)) = indices.pop() else {
+                        break;
+                    };
+                    final_chunk = parser_eof;
+                    let text = if parser_eof {
+                        String::new()
+                    } else {
+                        match stop_decoders.get_mut(&index) {
+                            Some(decoder) => match decoder.finish().map_err(|e| e.to_string())? {
+                                SequenceDecoderOutput::Text(text)
+                                | SequenceDecoderOutput::StoppedWithText(text) => text,
+                                _ => String::new(),
+                            },
+                            None => String::new(),
+                        }
+                    };
+                    Some((index, text, None, held_tokens.remove(&index).unwrap_or(0)))
                 }
             };
 
@@ -2438,6 +2465,7 @@ impl StreamingProcessor {
         let mut parsed_thinking_tokens: u32 = 0;
         let mut engine_thinking_tokens: u32 = 0;
         let mut was_in_reasoning = false;
+        let mut held_tokens: u32 = 0;
         Self::send_messages_event(
             tx,
             &mut sse_buffer,
@@ -2449,12 +2477,20 @@ impl StreamingProcessor {
 
         // Phase 2: Main streaming loop
         let mut final_chunk = false;
+        let mut decoder_finished_at_eof = false;
         while !final_chunk {
-            let response =
-                grpc_stream.next().await.transpose().map_err(|e| {
-                    utils::StreamFailure::upstream(e, completion_tokens.delivered())
-                })?;
-            final_chunk = response.is_none();
+            let response = if decoder_finished_at_eof {
+                None
+            } else {
+                grpc_stream
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|e| {
+                        utils::StreamFailure::upstream(e, completion_tokens.delivered())
+                    })?
+            };
+            final_chunk = response.is_none() && decoder_finished_at_eof;
 
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
@@ -2491,9 +2527,11 @@ impl StreamingProcessor {
                     }
 
                     if chunk_text.is_empty() {
+                        held_tokens += chunk_tokens;
                         continue;
                     }
 
+                    chunk_tokens += std::mem::take(&mut held_tokens);
                     Some(chunk_text)
                 }
                 Some(ProtoResponseVariant::Complete(complete)) => {
@@ -2525,9 +2563,27 @@ impl StreamingProcessor {
                         finish_reason_str = complete.finish_reason().to_string();
                         matched_stop = complete.matched_stop_json();
                     }
+                    if flushed.is_some() {
+                        chunk_tokens = std::mem::take(&mut held_tokens);
+                    }
                     flushed
                 }
                 Some(ProtoResponseVariant::None) => continue,
+                None if !decoder_finished_at_eof => {
+                    // Emit pending byte text, then flush the parser on the next
+                    // iteration without pretending the engine sent Complete.
+                    decoder_finished_at_eof = true;
+                    match stop_decoder.finish().map_err(|e| e.to_string())? {
+                        SequenceDecoderOutput::Text(text)
+                        | SequenceDecoderOutput::StoppedWithText(text)
+                            if !text.is_empty() =>
+                        {
+                            chunk_tokens = std::mem::take(&mut held_tokens);
+                            Some(text)
+                        }
+                        _ => continue,
+                    }
+                }
                 None if reasoning_parser.is_some() => Some(String::new()),
                 None => break,
             };
@@ -3649,6 +3705,39 @@ impl StreamingProcessor {
                         .map_err(|_| "Channel closed".to_string())?;
                 }
                 ProtoResponseVariant::None => continue,
+            }
+        }
+
+        // Preserve pending decoder text on clean EOF, without inventing the
+        // engine's finish reason, prompt count, or suffix for a missing Complete.
+        for (index, decoder) in &mut stop_decoders {
+            if completed_indices.contains(index) || stopped_indices.contains(index) {
+                continue;
+            }
+            if let SequenceDecoderOutput::Text(text)
+            | SequenceDecoderOutput::StoppedWithText(text) =
+                decoder.finish().map_err(|e| e.to_string())?
+            {
+                if !text.is_empty() {
+                    let stream_resp = CompletionStreamResponse {
+                        id: request_id.clone(),
+                        object: "text_completion".to_string(),
+                        created,
+                        choices: vec![CompletionStreamChoice {
+                            text,
+                            index: *index,
+                            logprobs: None,
+                            finish_reason: None,
+                        }],
+                        model: model.clone(),
+                        system_fingerprint: system_fingerprint.map(String::from),
+                        usage: None,
+                    };
+                    Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
+                    tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                        .await
+                        .map_err(|_| "Channel closed".to_string())?;
+                }
             }
         }
 

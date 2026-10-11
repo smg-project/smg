@@ -630,14 +630,21 @@ impl Decoder for HuggingFaceTokenizer {
         if self.has_byte_fallback {
             if prefix.is_empty() && *prefix_index > 0 {
                 let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+                let stable_seed_end = ids[..*prefix_index]
+                    .iter()
+                    .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
+                    .map_or(0, |index| index + 1);
                 if prefill.ends_with('�') {
                     // Keep an unfinished seed byte run as decode context, but
                     // suppress the stable prompt text before it.
-                    *prefix_index = ids[..*prefix_index]
-                        .iter()
-                        .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
-                        .map_or(0, |index| index + 1);
+                    *prefix_index = stable_seed_end;
                     *prefix = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+                } else if stable_seed_end < *prefix_index {
+                    // A completed seed run is prompt text. Start new bytes at
+                    // its boundary so later invalid bytes cannot rewrite it.
+                    ids.truncate(stable_seed_end);
+                    *prefix_index = stable_seed_end;
+                    *prefix = self.decode(ids, skip_special_tokens)?;
                 } else {
                     *prefix = prefill;
                 }

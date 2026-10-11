@@ -144,6 +144,36 @@ fn byte_fallback_seeded_sequence_does_not_reemit_prompt() {
 }
 
 #[test]
+fn byte_fallback_completed_seed_bytes_do_not_reemit_or_change_prefix() {
+    let native = byte_fallback_tokenizer();
+    for cached in [false, true] {
+        let tokenizer: Arc<dyn crate::TokenizerTrait> = if cached {
+            Arc::new(crate::CachedTokenizer::new(
+                native.clone(),
+                crate::CacheConfig::default(),
+            ))
+        } else {
+            native.clone()
+        };
+        for seed in [vec![2], vec![1, 2], vec![1, 2, 7]] {
+            let mut unchanged =
+                crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
+            assert_eq!(unchanged.finish().unwrap(), "");
+            for (next, expected) in [(2, "t"), (3, "�")] {
+                let mut sequence =
+                    crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
+                assert_eq!(sequence.append_token(next).unwrap(), "");
+                assert_eq!(
+                    sequence.finish().unwrap(),
+                    expected,
+                    "{seed:?} cached={cached}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn byte_fallback_short_combinations_match_batch_decode() {
     use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
     let tokenizer = byte_fallback_tokenizer();
