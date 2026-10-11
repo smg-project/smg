@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::VecDeque,
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -441,7 +442,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// implementations that carry no shared runtime (the language bindings,
     /// test doubles): the gate only reaches a worker that reports a running
     /// window, and any implementation that does report one must override
-    /// these three with a real claim, or the window is not enforced.
+    /// these three with a real claim, or the window is not enforced (and
+    /// the three queue methods after them with a real order, or the wait
+    /// is not first come, first served).
     fn try_admit_pd(&self, _count: usize, _window: usize) -> bool {
         true
     }
@@ -452,6 +455,32 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Rooms currently claimed on this worker.
     fn pd_admitted(&self) -> usize {
         0
+    }
+
+    /// Take a place at the back of this worker's admission queue. The gate
+    /// lets a dispatch claim only while its place is the oldest outstanding
+    /// ([`Worker::pd_is_next`]), which is what hands a freed room to the
+    /// request that has waited longest; the place is given back through
+    /// [`Worker::pd_dequeue`] however the wait ends.
+    fn pd_enqueue(&self) -> u64 {
+        0
+    }
+
+    /// Whether `place` is the oldest one still waiting, and so the only one
+    /// allowed to claim. The default never queues, so it is always next.
+    fn pd_is_next(&self, _place: u64) -> bool {
+        true
+    }
+
+    /// Give `place` back, whether its dispatch claimed, was shed, or stopped
+    /// waiting early; the places behind it move up.
+    fn pd_dequeue(&self, _place: u64) {}
+
+    /// A notifier fired whenever rooms are released or a place is given back
+    /// on this worker, so the oldest waiter claims the moment it can instead
+    /// of at its next retry. `None` leaves the gate to its retry interval.
+    fn pd_wake(&self) -> Option<Arc<Notify>> {
+        None
     }
 
     /// Get the current routing-key load cardinality.
@@ -1382,6 +1411,16 @@ pub struct WorkerRuntime {
     /// the over-window burst the gate exists to prevent. Lives here so a
     /// same-URL replacement inherits the rooms the engine still holds.
     pd_admitted: AtomicUsize,
+    /// The dispatches waiting at the PD admission gate for this worker's
+    /// rooms, oldest first, so a room that frees goes to the one that has
+    /// waited longest (see [`Self::pd_enqueue`]). Kept with the rooms rather
+    /// than in a registry of its own: the order lives and dies with the
+    /// worker, and a same-URL replacement inherits it with them.
+    pd_queue: Mutex<PdQueue>,
+    /// Fired whenever rooms are released or a place is given back, so the
+    /// oldest waiter at the gate claims the moment it can rather than at its
+    /// next retry (see [`Self::pd_wake`]).
+    pd_wake: Arc<Notify>,
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
@@ -1585,6 +1624,16 @@ impl PrefillBook {
     }
 }
 
+/// The PD admission gate's queue on one worker (see [`Worker::pd_enqueue`]):
+/// the places outstanding, oldest first, and the next one to hand out. A
+/// place is handed out and queued under the one lock, so the queue is always
+/// in arrival order and its front is the dispatch that has waited longest.
+#[derive(Debug, Default)]
+struct PdQueue {
+    next: u64,
+    waiting: VecDeque<u64>,
+}
+
 impl WorkerRuntime {
     pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
         Self {
@@ -1598,6 +1647,8 @@ impl WorkerRuntime {
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
             pd_admitted: AtomicUsize::new(0),
+            pd_queue: Mutex::new(PdQueue::default()),
+            pd_wake: Arc::new(Notify::new()),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
@@ -1913,13 +1964,59 @@ impl WorkerRuntime {
             .is_ok()
     }
 
-    /// Release `count` claimed rooms, saturating at zero.
+    /// Release `count` claimed rooms, saturating at zero, and wake the gate's
+    /// waiters: the oldest of them may now claim.
     pub fn release_pd(&self, count: usize) {
         let _ = self
             .pd_admitted
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 Some(admitted.saturating_sub(count))
             });
+        self.pd_wake.notify_waiters();
+    }
+
+    /// Join the admission queue at the back; the place comes back through
+    /// [`Self::pd_dequeue`] on every way out of the wait.
+    pub fn pd_enqueue(&self) -> u64 {
+        let mut queue = self.pd_queue.lock();
+        let place = queue.next;
+        queue.next += 1;
+        queue.waiting.push_back(place);
+        place
+    }
+
+    /// Whether `place` is at the front of the queue: the oldest dispatch
+    /// still waiting, the only one the gate lets claim.
+    pub fn pd_is_next(&self, place: u64) -> bool {
+        self.pd_queue.lock().waiting.front() == Some(&place)
+    }
+
+    /// Leave the queue from wherever the place is: the front after a claim or
+    /// the shed, further back when a dispatch stops waiting early. The places
+    /// behind move up; a place already gone is a no-op. The scan is linear in
+    /// the queue, which holds only the dispatches waiting on this worker now.
+    pub fn pd_dequeue(&self, place: u64) {
+        let removed = {
+            let mut queue = self.pd_queue.lock();
+            match queue.waiting.iter().position(|waiting| *waiting == place) {
+                Some(at) => {
+                    queue.waiting.remove(at);
+                    true
+                }
+                None => false,
+            }
+        };
+        if removed {
+            // The next place is the oldest now; let it try at once.
+            self.pd_wake.notify_waiters();
+        }
+    }
+
+    /// The notifier [`Self::release_pd`] and [`Self::pd_dequeue`] fire, with
+    /// `notify_waiters` semantics: it wakes the waits registered at that
+    /// moment, and the gate registers before every try so none is lost.
+    pub fn pd_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.pd_wake)
     }
 
     // ── Routing-key load ────────────────────────────────────────────
@@ -2355,6 +2452,22 @@ impl Worker for BasicWorker {
 
     fn pd_admitted(&self) -> usize {
         self.runtime.load().pd_admitted()
+    }
+
+    fn pd_enqueue(&self) -> u64 {
+        self.runtime.load().pd_enqueue()
+    }
+
+    fn pd_is_next(&self, place: u64) -> bool {
+        self.runtime.load().pd_is_next(place)
+    }
+
+    fn pd_dequeue(&self, place: u64) {
+        self.runtime.load().pd_dequeue(place);
+    }
+
+    fn pd_wake(&self) -> Option<Arc<Notify>> {
+        Some(self.runtime.load().pd_wake())
     }
 
     fn routing_key_load(&self) -> usize {
@@ -3245,6 +3358,42 @@ mod tests {
 
         assert_eq!(admitted, window, "exactly the window's worth may claim");
         assert_eq!(worker.pd_admitted(), window);
+    }
+
+    #[test]
+    fn test_pd_admission_queue_is_arrival_ordered_and_closes_over_departures() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        let (first, second, third) = (
+            worker.pd_enqueue(),
+            worker.pd_enqueue(),
+            worker.pd_enqueue(),
+        );
+        assert!(worker.pd_is_next(first), "the oldest place is next");
+        assert!(!worker.pd_is_next(second));
+        assert!(!worker.pd_is_next(third));
+
+        // A dispatch that stops waiting from the middle leaves no hole.
+        worker.pd_dequeue(second);
+        assert!(worker.pd_is_next(first));
+        worker.pd_dequeue(first);
+        assert!(worker.pd_is_next(third), "the places behind move up");
+        assert!(
+            !worker.pd_is_next(second),
+            "a place given back never comes back"
+        );
+
+        // Leaving twice, or with a place never handed out, changes nothing.
+        worker.pd_dequeue(second);
+        worker.pd_dequeue(u64::MAX);
+        assert!(worker.pd_is_next(third));
+
+        worker.pd_dequeue(third);
+        assert!(
+            worker.pd_is_next(worker.pd_enqueue()),
+            "with nobody waiting a newcomer is next at once"
+        );
     }
 
     #[test]
