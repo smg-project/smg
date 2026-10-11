@@ -307,7 +307,7 @@ fn coerce_bare_argument(text: &str, schema: &Value) -> Value {
             .get("anyOf")
             .and_then(Value::as_array)
             .map(Vec::as_slice)
-            .unwrap_or(std::slice::from_ref(schema))
+            .unwrap_or_else(|| std::slice::from_ref(schema))
     };
     for branch in branches {
         let Some(declared) = branch.get("type") else {
@@ -316,7 +316,7 @@ fn coerce_bare_argument(text: &str, schema: &Value) -> Value {
         let types = declared
             .as_array()
             .map(Vec::as_slice)
-            .unwrap_or(std::slice::from_ref(declared));
+            .unwrap_or_else(|| std::slice::from_ref(declared));
         for kind in types {
             let converted = match kind.as_str() {
                 Some("string") => None,
