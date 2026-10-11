@@ -1420,9 +1420,9 @@ struct CliArgs {
     webrtc_stun_server: Option<String>,
 
     // ==================== Runtime ====================
-    /// Explicit async runtime worker-thread count. Leave unset to use tokio's
-    /// default (`available_parallelism()`), which already honors the cgroup CPU
-    /// quota on Rust 1.95+ and is therefore container-aware.
+    /// Explicit async runtime worker-thread count, at least 1. Leave unset to
+    /// use tokio's default (`available_parallelism()`), which already honors the
+    /// cgroup CPU quota on Rust 1.95+ and is therefore container-aware.
     #[arg(long, help_heading = "Runtime")]
     runtime_worker_threads: Option<usize>,
 }

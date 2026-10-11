@@ -63,7 +63,8 @@ pub struct RouterConfig {
     pub health_check_port: Option<u16>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
-    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count.
+    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count of at
+    /// least 1: the runtime builder panics on 0, so `ConfigValidator` refuses it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
