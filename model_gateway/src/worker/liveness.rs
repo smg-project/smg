@@ -599,7 +599,7 @@ mod tests {
         );
         // The first tokens arrive: the backlog is gone and the bound is the
         // configured threshold again.
-        w.note_prefill_ended(128 * 1_152, true, true);
+        w.note_prefill_ended(128 * 1_152, true, Some(0));
         assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
         // The bound is capped against leaking books.
         w.note_prefill_started(100_000_000, true);

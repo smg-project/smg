@@ -689,10 +689,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// backlog only.
     fn note_prefill_started(&self, _tokens: u64, _timed: bool) {}
 
-    /// The request's first token came back (`prefilled`), or its stream ended
-    /// or was dropped before one (`!prefilled`): its prompt is no longer
-    /// pending prefill. `timed` as at its start.
-    fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _prefilled: bool) {}
+    /// The request's first token came back, with `cached` of its prompt
+    /// tokens reported served from the engine's prefix cache (`Some`; zero
+    /// when the engine reports no count), or its stream ended or was dropped
+    /// before one (`None`): its prompt is no longer pending prefill. `timed`
+    /// as at its start.
+    fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _cached: Option<u64>) {}
 
     /// How long the engine may still need before the first token of its
     /// in-flight work is due: the prompt tokens dispatched and not yet
@@ -1461,13 +1463,20 @@ const PREFILL_WINDOW_MS: u64 = 1_000;
 /// gaps around it would count as prefill again and its decode would be
 /// timed as the prefill of its prompt.
 ///
-/// Tokens are counted as dispatched, the prompt's length: the gateway does
-/// not see how much of a prompt the engine computed, so a prefix served
-/// from the engine's cache counts as prefilled work, and a worker fed
-/// mostly cache hits learns an optimistic rate, which leaves the bound for
-/// a later burst of cold prompts at the bare threshold (as the wall-time
-/// window already did on a busy worker). Counting the uncached tokens only
-/// needs the engine's or the router's cache-hit count: not done here.
+/// A first token teaches the tokens the engine computed for its prompt:
+/// the prompt's length less the prefix-cache hit the engine reports with
+/// it (the servicers forward the engine's per-request cached-token count
+/// on every chunk; one that reports none teaches the full length). Counted
+/// at full length, a worker fed mostly cache hits (a multi-turn chat)
+/// learned a rate many times its cold one, and a later burst of cold
+/// prompts got a bound at the bare threshold: the false positive the bound
+/// exists to prevent. Two things still err toward patience: the backlog
+/// counts a pending prompt at full length, since its hit is known only
+/// when the engine answers; and the time to first token of a mostly cached
+/// prompt is the engine's step latency more than prefill, so a worker fed
+/// mostly hits learns a rate below its cold one. An underestimate is
+/// halved away by the next cold first token; an overestimate vetoes a
+/// healthy worker, and nothing corrects it.
 #[derive(Debug, Default)]
 struct PrefillBook {
     /// Prompt tokens dispatched to the worker and not yet answered with a
@@ -1504,14 +1513,17 @@ impl PrefillBook {
         self.timed = self.timed.saturating_add(tokens);
     }
 
-    fn ended(&mut self, tokens: u64, timed: bool, prefilled: bool, now_ms: u64) {
+    fn ended(&mut self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
         self.pending = self.pending.saturating_sub(tokens);
         if !timed {
             return;
         }
         self.timed = self.timed.saturating_sub(tokens);
-        if prefilled && tokens > 0 {
-            self.observe(tokens, now_ms);
+        if tokens > 0 {
+            if let Some(cached) = cached {
+                // What the engine computed: the prompt less its cache hit.
+                self.observe(tokens.saturating_sub(cached), now_ms);
+            }
         }
         if self.timed == 0 {
             if let Some(since) = self.busy_since_ms.take() {
@@ -1531,22 +1543,27 @@ impl PrefillBook {
         self.window_busy_ms.saturating_add(open)
     }
 
-    /// Fold `tokens` prefilled at `now_ms` into the observed rate: once the
-    /// window holds [`PREFILL_WINDOW_MS`] of busy time its tokens over that
-    /// time are a sample, and each sample halves into the running estimate.
+    /// Fold `tokens` computed for a prompt whose first token came back at
+    /// `now_ms` into the observed rate: once the window holds
+    /// [`PREFILL_WINDOW_MS`] of busy time its tokens over that time are a
+    /// sample, and each sample halves into the running estimate. A window
+    /// in which the engine computed nothing (every prompt a whole cache
+    /// hit) makes no sample.
     fn observe(&mut self, tokens: u64, now_ms: u64) {
         self.window_tokens = self.window_tokens.saturating_add(tokens);
         let span_ms = self.window_span_ms(now_ms);
         if span_ms < PREFILL_WINDOW_MS {
             return;
         }
-        let sample = self.window_tokens.saturating_mul(1000) / span_ms;
-        self.rate_tps = if self.rate_tps == 0 {
-            sample
-        } else {
-            self.rate_tps.midpoint(sample)
+        if self.window_tokens > 0 {
+            let sample = self.window_tokens.saturating_mul(1000) / span_ms;
+            self.rate_tps = if self.rate_tps == 0 {
+                sample
+            } else {
+                self.rate_tps.midpoint(sample)
+            }
+            .max(1);
         }
-        .max(1);
         self.window_busy_ms = 0;
         self.window_tokens = 0;
         if self.busy_since_ms.is_some() {
@@ -1723,13 +1740,13 @@ impl WorkerRuntime {
         self.prefill.lock().started(tokens, timed, now_ms);
     }
 
-    pub fn note_prefill_ended(&self, tokens: u64, timed: bool, prefilled: bool) {
-        self.note_prefill_ended_at(tokens, timed, prefilled, super::liveness::now_ms().max(1));
+    pub fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
+        self.note_prefill_ended_at(tokens, timed, cached, super::liveness::now_ms().max(1));
     }
 
     /// [`Self::note_prefill_ended`] at `now_ms` on the gateway clock.
-    pub fn note_prefill_ended_at(&self, tokens: u64, timed: bool, prefilled: bool, now_ms: u64) {
-        self.prefill.lock().ended(tokens, timed, prefilled, now_ms);
+    pub fn note_prefill_ended_at(&self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
+        self.prefill.lock().ended(tokens, timed, cached, now_ms);
     }
 
     pub fn prefill_rate_tps(&self) -> u64 {
@@ -2466,10 +2483,8 @@ impl Worker for BasicWorker {
         self.runtime.load().note_prefill_started(tokens, timed);
     }
 
-    fn note_prefill_ended(&self, tokens: u64, timed: bool, prefilled: bool) {
-        self.runtime
-            .load()
-            .note_prefill_ended(tokens, timed, prefilled);
+    fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
+        self.runtime.load().note_prefill_ended(tokens, timed, cached);
     }
 
     fn prefill_backlog(&self) -> Duration {
@@ -4454,14 +4469,14 @@ mod tests {
         // Their first tokens come back within 1.5 s of busy time (the window
         // closes at the first one past a second): an observed rate of ~98k
         // tokens/s replaces the prior, and nothing is pending.
-        runtime.note_prefill_ended_at(64 * 1_152, true, true, 1_600);
-        runtime.note_prefill_ended_at(64 * 1_152, true, true, 2_500);
+        runtime.note_prefill_ended_at(64 * 1_152, true, Some(0), 1_600);
+        runtime.note_prefill_ended_at(64 * 1_152, true, Some(0), 2_500);
         assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
         assert_eq!(runtime.prefill_rate_tps(), 98_304);
         runtime.note_prefill_started_at(1_000_000, true, 3_000);
         assert_eq!(runtime.prefill_backlog(), Duration::from_millis(10_172));
         // A dropped stream releases its tokens without a rate sample.
-        runtime.note_prefill_ended_at(2_000_000, true, false, 3_500);
+        runtime.note_prefill_ended_at(2_000_000, true, None, 3_500);
         assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
     }
 
@@ -4475,9 +4490,9 @@ mod tests {
         // request and no pile. Only busy time counts now.
         let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
         runtime.note_prefill_started_at(47, true, 1_000);
-        runtime.note_prefill_ended_at(47, true, true, 1_010);
+        runtime.note_prefill_ended_at(47, true, Some(0), 1_010);
         runtime.note_prefill_started_at(47, true, 61_000);
-        runtime.note_prefill_ended_at(47, true, true, 61_010);
+        runtime.note_prefill_ended_at(47, true, Some(0), 61_010);
         assert_eq!(
             runtime.prefill_rate_tps(),
             0,
@@ -4489,13 +4504,13 @@ mod tests {
             Duration::from_millis(4),
             "one short pending prompt at the cold prior, not 47 s"
         );
-        runtime.note_prefill_ended_at(47, true, true, 62_010);
+        runtime.note_prefill_ended_at(47, true, Some(0), 62_010);
         // Short prompts do make a rate once their busy time adds up to the
         // window: 100 of them at 10 ms each are a second of prefill.
         let mut now = 100_000;
         for _ in 0..97 {
             runtime.note_prefill_started_at(47, true, now);
-            runtime.note_prefill_ended_at(47, true, true, now + 10);
+            runtime.note_prefill_ended_at(47, true, Some(0), now + 10);
             now += 5_000;
         }
         assert_eq!(
@@ -4508,8 +4523,8 @@ mod tests {
         let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
         runtime.note_prefill_started_at(10_000, true, 1_000);
         runtime.note_prefill_started_at(10_000, true, 1_200);
-        runtime.note_prefill_ended_at(10_000, true, true, 1_900);
-        runtime.note_prefill_ended_at(10_000, true, true, 2_400);
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 1_900);
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 2_400);
         assert_eq!(runtime.prefill_rate_tps(), 20_000 * 1000 / 1_400);
     }
 
@@ -4528,7 +4543,7 @@ mod tests {
             runtime.note_prefill_started_at(500, true, now);
             if i >= 2 {
                 // the prompt dispatched 400 ms ago gets its first token
-                runtime.note_prefill_ended_at(500, true, true, now - 100);
+                runtime.note_prefill_ended_at(500, true, Some(0), now - 100);
             }
             if runtime.prefill_rate_tps() != last_rate {
                 samples += 1;
@@ -4559,18 +4574,18 @@ mod tests {
             runtime.note_prefill_started_at(100, true, 1_000);
             match order {
                 "end-then-start" => {
-                    runtime.note_prefill_ended_at(100, true, true, 1_500);
+                    runtime.note_prefill_ended_at(100, true, Some(0), 1_500);
                     runtime.note_prefill_started_at(50, true, 1_500);
                 }
                 _ => {
                     runtime.note_prefill_started_at(50, true, 1_500);
-                    runtime.note_prefill_ended_at(100, true, true, 1_500);
+                    runtime.note_prefill_ended_at(100, true, Some(0), 1_500);
                 }
             }
             // The next first token, 600 ms later, completes a window of
             // 1.1 s of busy time either way (500 ms banked or still open,
             // plus 600 ms) and makes a rate: 150 tokens over 1.1 s.
-            runtime.note_prefill_ended_at(50, true, true, 2_100);
+            runtime.note_prefill_ended_at(50, true, Some(0), 2_100);
             assert_eq!(
                 runtime.prefill_rate_tps(),
                 150 * 1000 / 1_100,
@@ -4604,7 +4619,7 @@ mod tests {
         let mut now = 6_000;
         for _ in 0..5 {
             runtime.note_prefill_started_at(47, true, now);
-            runtime.note_prefill_ended_at(47, true, true, now + 10);
+            runtime.note_prefill_ended_at(47, true, Some(0), now + 10);
             now += 5_000;
         }
         assert_eq!(
@@ -4613,7 +4628,7 @@ mod tests {
             "50 ms of busy time is no window: the gaps stayed idle"
         );
         // Its answer, 30 s after dispatch: no sample, and the backlog is gone.
-        runtime.note_prefill_ended_at(4_000, false, true, 31_000);
+        runtime.note_prefill_ended_at(4_000, false, Some(0), 31_000);
         assert_eq!(
             runtime.prefill_rate_tps(),
             0,
@@ -4623,6 +4638,57 @@ mod tests {
         // The next short prompt gets the prior's bound, not the gaps'.
         runtime.note_prefill_started_at(47, true, 31_500);
         assert_eq!(runtime.prefill_backlog(), Duration::from_millis(4));
+    }
+
+    #[test]
+    fn a_prefix_cache_hit_teaches_the_tokens_the_engine_computed() {
+        // A worker serving multi-turn conversations: 2,000-token prompts of
+        // which the engine's prefix cache holds 1,900, so it computes 100
+        // tokens per turn, 10 ms each at its 10k tokens/s. Counted at their
+        // full length, a hundred such turns taught 200k tokens/s, and a
+        // burst of four cold 16,000-token prompts then got a backlog of
+        // 320 ms, the bare threshold, for a prefill the engine needs 6.4 s
+        // for, during which nothing streams: the false positive the bound
+        // exists to prevent. A first token teaches the tokens the engine
+        // computed, the prompt less the hit it reports.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let mut now = 1_000;
+        for _ in 0..100 {
+            runtime.note_prefill_started_at(2_000, true, now);
+            runtime.note_prefill_ended_at(2_000, true, Some(1_900), now + 10);
+            now += 500;
+        }
+        assert_eq!(
+            runtime.prefill_rate_tps(),
+            10_000,
+            "a hundred turns of 100 computed tokens over a second of busy time"
+        );
+        runtime.note_prefill_started_at(4 * 16_000, true, now);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(6_400),
+            "the cold burst's prefill time at the rate learned, not 320 ms"
+        );
+        // The cold prompts' first tokens, with no hit, teach their full
+        // length: 64,000 tokens over 6.4 s, the same rate.
+        runtime.note_prefill_ended_at(4 * 16_000, true, Some(0), now + 6_400);
+        assert_eq!(runtime.prefill_rate_tps(), 10_000);
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+        // An engine that serves whole prompts from its cache computes
+        // nothing the window can time: no sample, the prior stands.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        for i in 0..100u64 {
+            let now = 1_000 + i * 500;
+            runtime.note_prefill_started_at(2_000, true, now);
+            runtime.note_prefill_ended_at(2_000, true, Some(2_000), now + 10);
+        }
+        assert_eq!(runtime.prefill_rate_tps(), 0, "nothing computed, nothing learned");
+        runtime.note_prefill_started_at(4 * 16_000, true, 60_000);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(6_400),
+            "the cold prior, 10k tokens/s"
+        );
     }
 
     #[test]
