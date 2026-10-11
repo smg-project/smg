@@ -40,7 +40,7 @@ use openai_protocol::{
 use reqwest::multipart::{Form, Part};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, warn};
+use tracing::{error, warn, Instrument};
 
 use crate::{
     app_context::AppContext,
@@ -83,6 +83,7 @@ use crate::{
                 serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
             },
             request_stream::{CappedBodyStream, StreamProgress},
+            stream_failure::{RelaySource, UpstreamCut},
         },
         BodyPolicy, RouterTrait,
     },
@@ -676,8 +677,8 @@ impl Router {
                     headers,
                     body,
                     upstream_route,
-                    worker.as_ref(),
                     mode,
+                    RelaySource::new(model_id, route, Arc::clone(&worker)),
                     load_guard,
                 )
                 .await
@@ -1294,10 +1295,11 @@ impl Router {
         headers: Option<&HeaderMap>,
         body: Bytes,
         route: &'static str,
-        worker: &dyn Worker,
         mode: StreamRelayMode,
+        source: RelaySource,
         load_guard: WorkerLoadGuard,
     ) -> Response {
+        let worker = source.worker();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
@@ -1330,7 +1332,7 @@ impl Router {
             }
         };
 
-        self.forward_worker_response(res, mode, worker.url(), load_guard)
+        self.forward_worker_response(res, mode, source, load_guard)
             .await
     }
 
@@ -1338,12 +1340,14 @@ impl Router {
     /// through a bounded channel with the load guard attached to the body; a
     /// buffered response is read capped at the ingress payload limit. With
     /// `rechunk`, SSE delta payloads are re-sliced to the provider's
-    /// packet-size contract.
+    /// packet-size contract. A streamed body the worker ends with an error
+    /// after a successful head is accounted to `source` and, when it is SSE,
+    /// ended with the typed error event.
     async fn forward_worker_response(
         &self,
         res: reqwest::Response,
         mode: StreamRelayMode,
-        worker_url: &str,
+        source: RelaySource,
         load_guard: WorkerLoadGuard,
     ) -> Response {
         let StreamRelayMode { is_stream, rechunk } = mode;
@@ -1353,7 +1357,7 @@ impl Router {
         if is_stream {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker_url);
+            header_utils::insert_routed_worker_id(&mut response_headers, source.worker().url());
             if status.is_success() && !response_headers.contains_key(CONTENT_TYPE) {
                 response_headers
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -1379,70 +1383,95 @@ impl Router {
             // relay await on `send` instead of buffering the whole response.
             let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
+            // The relay runs under the request's span, so a failure after
+            // the head went out is logged with the request's id.
+            let span = tracing::Span::current();
             // Spawn task to forward stream
             #[expect(
                 clippy::disallowed_methods,
                 reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
             )]
-            tokio::spawn(async move {
-                let mut stream = stream;
-                // One timer, reset per chunk, instead of a fresh sleep per token.
-                let idle = tokio::time::sleep(IDLE_FLUSH);
-                tokio::pin!(idle);
-                loop {
-                    tokio::select! {
-                        chunk = stream.next() => {
-                            if rechunker.is_some() {
-                                idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
-                            }
-                            match chunk {
-                                // Same as the regular relay: an empty upstream chunk must
-                                // not become an empty h2 DATA frame toward the client.
-                                Some(Ok(bytes)) if bytes.is_empty() => {}
-                                Some(Ok(bytes)) => {
-                                    let bytes = match rechunker.as_mut() {
-                                        Some(r) => r.feed(bytes),
-                                        None => bytes,
-                                    };
-                                    if !bytes.is_empty() && tx.send(Ok(bytes)).await.is_err() {
+            tokio::spawn(
+                async move {
+                    let mut stream = stream;
+                    // What the client has been sent, for the record of a cut.
+                    let mut relayed: u64 = 0;
+                    // One timer, reset per chunk, instead of a fresh sleep per token.
+                    let idle = tokio::time::sleep(IDLE_FLUSH);
+                    tokio::pin!(idle);
+                    loop {
+                        tokio::select! {
+                            chunk = stream.next() => {
+                                if rechunker.is_some() {
+                                    idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                                }
+                                match chunk {
+                                    // Same as the regular relay: an empty upstream chunk must
+                                    // not become an empty h2 DATA frame toward the client.
+                                    Some(Ok(bytes)) if bytes.is_empty() => {}
+                                    Some(Ok(bytes)) => {
+                                        let bytes = match rechunker.as_mut() {
+                                            Some(r) => r.feed(bytes),
+                                            None => bytes,
+                                        };
+                                        if !bytes.is_empty() {
+                                            relayed += bytes.len() as u64;
+                                            if tx.send(Ok(bytes)).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
+                                            if !tail.is_empty() {
+                                                let _ = tx.send(Ok(tail)).await;
+                                            }
+                                        }
+                                        // A head that was a success was answered as one; the
+                                        // body ending in an error after it is the worker's
+                                        // failure, counted here, and an SSE response is ended
+                                        // with the typed event and the stream's own end. A
+                                        // failed head was counted when it arrived; its body
+                                        // is cut as before.
+                                        if status.is_success() {
+                                            let cut = UpstreamCut::of(&e);
+                                            source.account(&cut, relayed);
+                                            if upstream_sse {
+                                                let _ = tx.send(Ok(source.error_event(&cut))).await;
+                                                break;
+                                            }
+                                        }
+                                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                                        break;
+                                    }
+                                    None => {
+                                        if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
+                                            if !tail.is_empty() {
+                                                let _ = tx.send(Ok(tail)).await;
+                                            }
+                                        }
                                         break;
                                     }
                                 }
-                                Some(Err(e)) => {
-                                    if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
-                                        if !tail.is_empty() {
-                                            let _ = tx.send(Ok(tail)).await;
-                                        }
+                            },
+                            () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
+                                idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
+                                if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
+                                    if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
+                                        break;
                                     }
-                                    let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                    break;
-                                }
-                                None => {
-                                    if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
-                                        if !tail.is_empty() {
-                                            let _ = tx.send(Ok(tail)).await;
-                                        }
-                                    }
-                                    break;
                                 }
                             }
-                        },
-                        () = &mut idle, if rechunker.as_ref().is_some_and(SseRechunker::has_pending) => {
-                            idle.as_mut().reset(tokio::time::Instant::now() + IDLE_FLUSH);
-                            if let Some(tail) = rechunker.as_mut().map(SseRechunker::flush_pending) {
-                                if !tail.is_empty() && tx.send(Ok(tail)).await.is_err() {
-                                    break;
-                                }
-                            }
+                            // Client gone with no chunk in flight (long prefill,
+                            // stalled upstream): break so the reqwest stream drops,
+                            // closing the upstream connection and letting the
+                            // engine abort generation.
+                            () = tx.closed() => break,
                         }
-                        // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
-                        () = tx.closed() => break,
                     }
                 }
-            });
+                .instrument(span),
+            );
 
             let stream = ReceiverStream::new(rx);
             let body = Body::from_stream(stream);
@@ -1477,7 +1506,7 @@ impl Router {
                 }
                 Err(error_response) => error_response,
             };
-            header_utils::insert_routed_worker_id(response.headers_mut(), worker_url);
+            header_utils::insert_routed_worker_id(response.headers_mut(), source.worker().url());
 
             // load_guard dropped here automatically after response body is read
             response
@@ -1498,9 +1527,10 @@ impl Router {
         headers: &HeaderMap,
         body: Body,
         route: &'static str,
-        worker: &dyn Worker,
+        source: RelaySource,
         load_guard: WorkerLoadGuard,
     ) -> Response {
+        let worker = source.worker();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
@@ -1585,7 +1615,7 @@ impl Router {
                 is_stream,
                 rechunk: false,
             },
-            worker.url(),
+            source,
             load_guard,
         )
         .await
@@ -1944,7 +1974,7 @@ impl Router {
                 &headers_with_trace,
                 body,
                 route,
-                worker.as_ref(),
+                RelaySource::new(model_id, route, Arc::clone(&worker)),
                 load_guard,
             )
             .await;
@@ -4050,6 +4080,258 @@ mod tests {
             response.headers()[error::HEADER_X_SMG_ERROR_CODE],
             "call_upstream_connection_failed"
         );
+    }
+
+    /// Loopback engine stub on `path`: answers `content_type` with `chunks`,
+    /// one write each, and with `cut` ends the body with an error, so the
+    /// server closes the connection before the transfer's end, as an engine's
+    /// own server that dies mid-stream does.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_cut_stub(
+        path: &'static str,
+        content_type: &'static str,
+        chunks: &'static [&'static str],
+        cut: bool,
+    ) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let items: Vec<Result<Bytes, std::io::Error>> = chunks
+                    .iter()
+                    .map(|chunk| Ok(Bytes::from_static(chunk.as_bytes())))
+                    .chain(cut.then(|| Err(std::io::Error::other("the engine went away"))))
+                    .collect();
+                let body = stream::iter(items).then(|item| async move {
+                    // One write per chunk: the client reads them before the cut.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    item
+                });
+                ([(CONTENT_TYPE, content_type)], Body::from_stream(body))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A regular worker at `url` whose circuit breaker opens on the first failure.
+    fn fragile_worker(url: &str) -> crate::worker::BasicWorker {
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            })
+            .build()
+    }
+
+    fn streaming_chat_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap()
+    }
+
+    /// The events of an SSE body, blank-line separated.
+    fn sse_events(body: &str) -> Vec<&str> {
+        body.split("\n\n")
+            .filter(|event| !event.is_empty())
+            .collect()
+    }
+
+    const CHAT_SSE_CHUNKS: &[&str] = &[
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+    ];
+
+    const MESSAGES_SSE_CHUNKS: &[&str] = &[
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\
+         \"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\
+         \"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\
+         \"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\
+         \"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    ];
+
+    /// An engine's server that closes the connection mid-stream used to leave
+    /// the client a transfer that ended in an error: no event said why, and
+    /// nothing counted the worker's failure. The relay ends the SSE response
+    /// the way the gRPC path does, with a `stream_error` event and `[DONE]`,
+    /// and the worker is charged.
+    #[tokio::test]
+    async fn an_upstream_cut_mid_stream_ends_the_sse_response_with_a_typed_error_event_and_done() {
+        let url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            true,
+        )
+        .await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events[0], CHAT_SSE_CHUNKS[0].trim_end());
+        assert_eq!(events[1], CHAT_SSE_CHUNKS[1].trim_end());
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stream error: "),
+            "{body}"
+        );
+        assert_eq!(events[3], "data: [DONE]");
+        let worker = &router.worker_registry.get_all()[0];
+        assert!(
+            !worker.circuit_breaker_can_execute(),
+            "the cut is the worker's failure: its threshold-1 breaker opens"
+        );
+    }
+
+    /// On the Messages API the same cut ends the stream with the API's own
+    /// error event, typed `api_error` as the gRPC path types a worker's
+    /// failure there; the protocol has no `[DONE]`.
+    #[tokio::test]
+    async fn an_upstream_cut_on_a_messages_stream_ends_it_with_the_api_s_error_event() {
+        let url = spawn_cut_stub(
+            "/v1/messages",
+            "text/event-stream",
+            MESSAGES_SSE_CHUNKS,
+            true,
+        )
+        .await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_typed_request(
+                None,
+                request,
+                "/v1/messages",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        let (name, data) = events[2].split_once("\ndata: ").unwrap();
+        assert_eq!(name, "event: error", "{body}");
+        let error: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "api_error");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stream error: "),
+            "{body}"
+        );
+        assert!(!body.contains("[DONE]"), "{body}");
+        let worker = &router.worker_registry.get_all()[0];
+        assert!(!worker.circuit_breaker_can_execute());
+    }
+
+    /// A body the worker streams under any other content type is cut as
+    /// before, so a partial document is not taken for a complete one, and the
+    /// worker is charged the same.
+    #[tokio::test]
+    async fn an_upstream_cut_on_a_non_sse_body_still_ends_the_transfer_in_error_and_is_counted() {
+        let url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "application/json",
+            &["{\"choices\":[{\"message\":{\"content\":\"par"],
+            true,
+        )
+        .await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            to_bytes(response.into_body(), usize::MAX).await.is_err(),
+            "a cut JSON body is not made to look complete"
+        );
+        let worker = &router.worker_registry.get_all()[0];
+        assert!(
+            !worker.circuit_breaker_can_execute(),
+            "the cut is the worker's failure: its threshold-1 breaker opens"
+        );
+    }
+
+    /// A stream the worker completes is relayed as it was: nothing is added
+    /// and the worker is not charged.
+    #[tokio::test]
+    async fn a_stream_the_upstream_completes_is_relayed_unchanged() {
+        let url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            CHAT_SSE_CHUNKS.concat()
+        );
+        let worker = &router.worker_registry.get_all()[0];
+        assert!(worker.circuit_breaker_can_execute());
     }
 }
 
