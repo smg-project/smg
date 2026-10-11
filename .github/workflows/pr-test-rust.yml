@@ -3,6 +3,9 @@ name: PR Test (SMG)
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened]
@@ -58,8 +61,6 @@ jobs:
         run: pre-commit run --all-files --show-diff-on-failure
 
   python-lint:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.docs-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -87,8 +88,6 @@ jobs:
         run: mypy bindings/python/ --config-file mypy.ini
 
   grpc-proto-build-check:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.docs-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -127,8 +126,6 @@ jobs:
           PY
 
   build-wheel:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.docs-only != 'true'
     # CPU-only Rust/wheel/Go-FFI/WASM compile — no GPU needed. Runs on the CPU
     # runner pool (which also tolerates the nvidia.com/gpu taint, so it can use
     # the abundant stranded CPU on GPU nodes) instead of competing for scarce
@@ -287,7 +284,6 @@ jobs:
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
-      && needs.detect-changes.outputs.docs-only != 'true'
       && (
         github.event_name != 'pull_request'
         || needs.detect-changes.outputs.rust-ci == 'true'
@@ -427,7 +423,9 @@ jobs:
   # uploaded and summarized.
   benchmarks:
     needs: [build-wheel, detect-changes]
-    if: needs.detect-changes.outputs.symphony-only != 'true'
+    if: >-
+      needs.detect-changes.outputs.docs-only != 'true'
+      && needs.detect-changes.outputs.symphony-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -508,10 +506,8 @@ jobs:
       pull-requests: read
       packages: read
     outputs:
-      # Test inputs and explicit manual runs keep the existing test selection.
-      docs-only: ${{ github.event_name != 'workflow_dispatch' && steps.filter.outputs.docs == 'true' && steps.filter.outputs.non-docs == 'false' && steps.filter.outputs.tests == 'false' }}
-      symphony-readme: ${{ steps.filter.outputs.symphony-readme }}
-      servicer-readme: ${{ steps.filter.outputs.servicer-readme }}
+      # Only PRs use this shortcut; main pushes keep their existing test coverage.
+      docs-only: ${{ github.event_name == 'pull_request' && steps.filter.outputs.docs == 'true' && steps.filter.outputs.non-docs == 'false' && steps.filter.outputs.tests == 'false' }}
       common: ${{ steps.filter.outputs.common }}
       chat-completions: ${{ steps.filter.outputs.chat-completions }}
       completions: ${{ steps.filter.outputs.completions }}
@@ -569,10 +565,6 @@ jobs:
               - 'e2e_test/**'
               - '**/tests/**'
               - '**/fixtures/**'
-            symphony-readme:
-              - 'crates/symphony/README.md'
-            servicer-readme:
-              - 'grpc_servicer/README.md'
             common:
               - 'model_gateway/**'
               - 'crates/protocols/**'
@@ -678,40 +670,6 @@ jobs:
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
 
-  docs-checks:
-    needs: detect-changes
-    if: >-
-      needs.detect-changes.outputs.docs-only == 'true'
-      && (needs.detect-changes.outputs.symphony-readme == 'true'
-          || needs.detect-changes.outputs.servicer-readme == 'true')
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Python
-        if: needs.detect-changes.outputs.servicer-readme == 'true'
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-
-      - name: Check documented worker probes
-        if: needs.detect-changes.outputs.servicer-readme == 'true'
-        run: |
-          pip install pytest
-          pytest -q grpc_servicer/tests/test_worker_probe.py::test_the_readme_gives_every_engine_the_same_worker_pod_manifest
-
-      - name: Setup Rust
-        if: needs.detect-changes.outputs.symphony-readme == 'true'
-        uses: ./.github/actions/setup-rust
-        with:
-          cache-key: docs-checks
-
-      - name: Check Symphony's documented models
-        if: needs.detect-changes.outputs.symphony-readme == 'true'
-        run: cargo test --locked -p smg-symphony --test readme
-
   # --- GPU E2E: organized by GPU tier + API, engine as matrix axis ---
 
   # === 1 GPU ===
@@ -722,6 +680,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -785,6 +744,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -842,6 +802,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -866,6 +827,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -917,6 +879,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -966,6 +929,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -998,6 +962,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -1030,6 +995,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -1053,6 +1019,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -1091,6 +1058,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -1494,6 +1462,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
@@ -1637,7 +1606,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, docs-checks, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1699,7 +1668,6 @@ jobs:
           # check, so its own result gates here (smg-project/smg-lab#172).
           if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
                 "${{ needs.pre-commit.result }}" =~ $bad || \
-                "${{ needs.docs-checks.result }}" =~ $bad || \
                 "${{ needs.python-lint.result }}" =~ $bad || \
                 "${{ needs.grpc-proto-build-check.result }}" =~ $bad || \
                 "${{ needs.build-wheel.result }}" =~ $bad || \
