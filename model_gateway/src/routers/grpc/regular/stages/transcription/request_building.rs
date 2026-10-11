@@ -57,7 +57,7 @@ impl BuildStage for TranscriptionRequestBuildingStage {
         // The backend request is chat-shaped: reuse the chat build path on the
         // request synthesized in preparation. Regular-only, so a single-plan
         // request with no PD metadata and no tool constraints.
-        let (plan, stamp) = build_chat_backed_plan(
+        let (plan, stamp, _) = build_chat_backed_plan(
             ctx,
             &chat_request,
             processed_messages.text,

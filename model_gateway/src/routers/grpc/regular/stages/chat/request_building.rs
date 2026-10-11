@@ -42,8 +42,8 @@ impl ChatRequestBuildingStage {
 /// Build the backend `GenerateRequest` from a chat-shaped request, shared by
 /// the chat endpoint and the transcription endpoint. Assembles multimodal
 /// data, applies sampling defaults (from the chat request), finalizes stops,
-/// and injects PD/EPD metadata — returning the plan + attempt stamp. The
-/// caller supplies the `ResponseSpec`.
+/// and injects PD/EPD metadata — returning the plan, attempt stamp and rendered
+/// reasoning state. The caller supplies the `ResponseSpec`.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
@@ -54,7 +54,7 @@ pub(crate) async fn build_chat_backed_plan(
     id_prefix: &'static str,
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
-) -> Result<(ExecutionPlan, AttemptStamp), Response> {
+) -> Result<(ExecutionPlan, AttemptStamp, Option<bool>), Response> {
     let clients = ctx.state.clients.as_ref().ok_or_else(|| {
         error!(
             function = "build_chat_backed_plan",
@@ -117,7 +117,7 @@ pub(crate) async fn build_chat_backed_plan(
 
     // Native Gemma4 channels follow the rendered prompt; other parsers keep
     // their tokenizer-driven preference for the engine's reasoning gate.
-    let require_reasoning = utils::rendered_prompt_reasoning_in_prefill(
+    let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
         &ctx.components.reasoning_parser_factory,
         ctx.components
             .parser_resolver
@@ -125,8 +125,8 @@ pub(crate) async fn build_chat_backed_plan(
             .as_deref(),
         &chat_request.model,
         &processed_text,
-    )
-    .unwrap_or_else(|| {
+    );
+    let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
         ctx.tokenizer_arc().is_some_and(|tokenizer| {
             utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
         })
@@ -238,6 +238,7 @@ pub(crate) async fn build_chat_backed_plan(
             inject_pd_metadata,
             tool_constraint,
         },
+        reasoning_in_prefill,
     ))
 }
 
@@ -269,16 +270,7 @@ impl BuildStage for ChatRequestBuildingStage {
         };
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
-        let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
-            &ctx.components.reasoning_parser_factory,
-            ctx.components
-                .parser_resolver
-                .reasoning_parser(&chat_request.model)
-                .as_deref(),
-            &chat_request.model,
-            &processed_messages.text,
-        );
-        let (plan, stamp) = build_chat_backed_plan(
+        let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
             &chat_request,
             processed_messages.text,
