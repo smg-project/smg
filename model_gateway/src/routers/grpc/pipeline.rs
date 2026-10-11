@@ -708,11 +708,21 @@ impl RequestPipeline {
             };
 
             self.record_error(metrics_endpoint, &dctx.model_id, &failure);
-            error!(
-                attempt,
-                status = %failure.status(),
-                "pipeline attempt failed"
-            );
+            if failure.extensions().get::<ReportedRefusal>().is_some() {
+                // The re-selection wrote this refusal's line (rate-limited,
+                // with the pool's state), as for the first selection.
+                debug!(
+                    attempt,
+                    status = %failure.status(),
+                    "pipeline attempt refused"
+                );
+            } else {
+                error!(
+                    attempt,
+                    status = %failure.status(),
+                    "pipeline attempt failed"
+                );
+            }
             // The failed attempt's worker load must not stay elevated through
             // the backoff window (a fresh context dropped them here before).
             // This releases its PD admission claim too, so the retry is not

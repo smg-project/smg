@@ -285,6 +285,10 @@ impl WireConstraint {
 /// request-derived input past this point.
 pub(crate) struct DispatchContext {
     pub root_request_id: Option<String>,
+    /// The id the request-id middleware gave the request, for a line written
+    /// about it outside its span (a retry's re-selection); always present,
+    /// unlike `root_request_id`, which cache tracing alone fills.
+    pub request_id: Option<String>,
     pub cache_trace: Option<String>,
     pub attempt: u32,
     /// The request's bookkeeping across attempts: circuit-breaker charges
@@ -921,13 +925,16 @@ impl RequestContext {
                     "Worker selection not completed",
                 )
             })?;
+        let request_id =
+            super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
+                .map(str::to_owned);
         Ok(DispatchContext {
             root_request_id: if cache_trace::enabled() {
-                super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
-                    .map(str::to_owned)
+                request_id.clone()
             } else {
                 None
             },
+            request_id,
             cache_trace: None,
             attempt: 0,
             ledger: AttemptLedger::default(),

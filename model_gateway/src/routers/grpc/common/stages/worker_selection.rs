@@ -17,7 +17,7 @@ use super::{helpers, PipelineStage};
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, ReportedRefusal, SHED_RETRY_AFTER_SECS},
     observability::{
-        log_throttle::LogThrottle,
+        log_throttle::KeyedLogThrottle,
         metrics::{metrics_labels, Metrics},
     },
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
@@ -79,18 +79,24 @@ type EncodePrefillDecodeWorkerSelection = (
 /// inside the gateway.
 pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_timeout";
 
-/// Lines per second the stage writes for refusals of a model whose workers
-/// are all unavailable (`no_available_workers`). One line per refusal, with
-/// the request id, the model and the pool's state, shows the condition and
-/// whom it hits; past this rate the lines are counted and the next one
-/// carries the count, while `smg_router_request_errors_total` keeps the
-/// volume. A client retrying at once against a drained pool drew about two
-/// thousand refusals a second, three ERROR lines each, before.
+/// Lines per second and per model the stage writes for refusals of a model
+/// whose workers are all unavailable (`no_available_workers`). One line per
+/// refusal, with the request id, the model and the pool's state, shows the
+/// condition and whom it hits; past this rate the lines are counted and the
+/// next one carries the count, while `smg_router_request_errors_total`
+/// keeps the volume. A client retrying at once against a drained pool drew
+/// about two thousand refusals a second, three ERROR lines each, before.
 const NO_AVAILABLE_WORKERS_LINES_PER_SECOND: u32 = 10;
 
-static NO_AVAILABLE_WORKERS_LOG: LogThrottle = LogThrottle::new(
+/// Models the refusal throttle tracks at once; past this the model seen
+/// least recently is forgotten (a model that is down keeps refusing, so it
+/// stays). One storming model never silences another's first line.
+const NO_AVAILABLE_WORKERS_LOG_MODELS: usize = 64;
+
+static NO_AVAILABLE_WORKERS_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
     NO_AVAILABLE_WORKERS_LINES_PER_SECOND,
     Duration::from_secs(1),
+    NO_AVAILABLE_WORKERS_LOG_MODELS,
 );
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
@@ -250,7 +256,12 @@ impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         self.select(ctx).await.map_err(|refusal| {
             let request_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref());
-            self.report_refusal(request_id, &ctx.input.model_id, refusal)
+            self.report_refusal(
+                "WorkerSelectionStage::execute",
+                request_id,
+                &ctx.input.model_id,
+                refusal,
+            )
         })
     }
 
@@ -476,7 +487,12 @@ impl WorkerSelectionStage {
     /// admission slot for its new prefill worker.
     pub(crate) async fn reselect(&self, ctx: &mut DispatchContext) -> Result<(), Response> {
         self.reselect_workers(ctx).await.map_err(|refusal| {
-            self.report_refusal(ctx.root_request_id.as_deref(), &ctx.model_id, refusal)
+            self.report_refusal(
+                "WorkerSelectionStage::reselect",
+                ctx.request_id.as_deref(),
+                &ctx.model_id,
+                refusal,
+            )
         })
     }
 
@@ -852,19 +868,40 @@ impl WorkerSelectionStage {
 
     /// The log line of a `no_available_workers` refusal, and its marker.
     ///
-    /// One WARN per refusal with the request id, the model and the state of
-    /// the pools the stage draws from, capped at
-    /// [`NO_AVAILABLE_WORKERS_LINES_PER_SECOND`]; a line past the cap is
-    /// counted and the next admitted line carries the count as `suppressed`.
-    /// The response is marked [`ReportedRefusal`], so the pipeline's stage
-    /// line and the access log's response line drop to DEBUG for it: a
-    /// refusal is the gateway's normal answer to "no worker right now", not
-    /// a fault of its own, and three ERROR lines per refusal made a client's
-    /// retry loop against a drained pool a log storm. The error counter
-    /// (`smg_router_request_errors_total`, recorded by the pipeline) keeps
-    /// the volume. Every other refusal passes through unchanged.
+    /// One WARN per refusal with the refusing function, the request id, the
+    /// model and the state of the pools the stage draws from, capped per
+    /// model at [`NO_AVAILABLE_WORKERS_LINES_PER_SECOND`]; a line past the
+    /// cap is counted and the next admitted line for that model carries the
+    /// count as `suppressed`. The response is marked [`ReportedRefusal`], so
+    /// the pipeline's lines and the access log's response line drop to DEBUG
+    /// for it: a refusal is the gateway's normal answer to "no worker right
+    /// now", not a fault of its own, and three ERROR lines per refusal made
+    /// a client's retry loop against a drained pool a log storm. The error
+    /// counter (`smg_router_request_errors_total`, recorded by the pipeline)
+    /// keeps the volume. Every other refusal passes through unchanged.
     fn report_refusal(
         &self,
+        function: &'static str,
+        request_id: Option<&str>,
+        model_id: &str,
+        refusal: Response,
+    ) -> Response {
+        self.report_refusal_with(
+            &NO_AVAILABLE_WORKERS_LOG,
+            function,
+            request_id,
+            model_id,
+            refusal,
+        )
+    }
+
+    /// [`Self::report_refusal`] under an explicit throttle. The id is a
+    /// field only when the caller has one: the request's span carries it
+    /// too, and an empty field would read as an id.
+    fn report_refusal_with(
+        &self,
+        throttle: &KeyedLogThrottle,
+        function: &'static str,
         request_id: Option<&str>,
         model_id: &str,
         mut refusal: Response,
@@ -874,11 +911,11 @@ impl WorkerSelectionStage {
             return refusal;
         }
         refusal.extensions_mut().insert(ReportedRefusal);
-        if let Some(admitted) = NO_AVAILABLE_WORKERS_LOG.admit() {
+        if let Some(admitted) = throttle.admit(model_id) {
             let pool = self.pool_state(model_id);
             warn!(
-                function = "WorkerSelectionStage::execute",
-                request_id = request_id.unwrap_or(""),
+                function,
+                request_id = request_id,
                 mode = ?self.mode,
                 model_id = %model_id,
                 workers = pool.workers(),
@@ -2217,6 +2254,7 @@ mod tests {
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
             root_request_id: None,
+            request_id: None,
             cache_trace: None,
             attempt: 0,
             ledger: AttemptLedger::default(),
@@ -3270,9 +3308,10 @@ mod tests {
 
     /// A model whose only worker is down is refused with the
     /// `no_available_workers` 503, marked as reported for the loggers
-    /// downstream, and written at WARN within the per-second allowance,
-    /// never at ERROR: three ERROR lines per refusal made a client's retry
-    /// loop against a drained pool a log storm.
+    /// downstream, and written at WARN exactly up to the per-second
+    /// allowance of its own, never at ERROR: three ERROR lines per refusal
+    /// made a client's retry loop against a drained pool a log storm, and a
+    /// second model down at the same time still gets its own lines.
     #[tokio::test]
     async fn a_refusal_for_a_drained_pool_is_marked_and_written_at_warn_within_the_allowance() {
         use openai_protocol::worker::WorkerStatus;
@@ -3293,31 +3332,69 @@ mod tests {
         let stage = regular_stage(Arc::clone(&registry));
         let allowance = usize::try_from(NO_AVAILABLE_WORKERS_LINES_PER_SECOND).unwrap();
 
+        // The stage's entry point marks and reports the refusal.
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        let refused = stage
+            .execute(&mut ctx)
+            .await
+            .expect_err("no worker is available");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert!(
+            refused.extensions().get::<ReportedRefusal>().is_some(),
+            "the refusal is marked as reported, so the pipeline and the access log keep quiet"
+        );
+
+        // Under a throttle of its own (the process-wide one is shared with
+        // every other test), the lines are exactly the allowance per model.
+        let throttle = KeyedLogThrottle::new(
+            NO_AVAILABLE_WORKERS_LINES_PER_SECOND,
+            Duration::from_secs(60),
+            NO_AVAILABLE_WORKERS_LOG_MODELS,
+        );
+        refusal_lines.store(0, Ordering::Relaxed);
         let refusals = 5 * allowance;
         for _ in 0..refusals {
             let mut ctx = prepared_ctx(Arc::clone(&registry), None);
             let refused = stage
-                .execute(&mut ctx)
+                .select(&mut ctx)
                 .await
                 .expect_err("no worker is available");
-            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(
-                error::extract_error_code_from_response(&refused),
-                placement::NO_AVAILABLE_WORKERS_CODE
+            let reported = stage.report_refusal_with(
+                &throttle,
+                "WorkerSelectionStage::execute",
+                None,
+                "test-model",
+                refused,
             );
-            assert!(
-                refused.extensions().get::<ReportedRefusal>().is_some(),
-                "the refusal is marked as reported, so the pipeline and the access log keep quiet"
+            assert!(reported.extensions().get::<ReportedRefusal>().is_some());
+        }
+        assert_eq!(
+            refusal_lines.load(Ordering::Relaxed),
+            allowance,
+            "{refusals} refusals of one model inside one window write exactly {allowance} lines"
+        );
+        for _ in 0..refusals {
+            stage.report_refusal_with(
+                &throttle,
+                "WorkerSelectionStage::reselect",
+                Some("req-other"),
+                "other-model",
+                WorkerSelectionStage::workers_unavailable("other-model"),
             );
         }
+        assert_eq!(
+            refusal_lines.load(Ordering::Relaxed),
+            2 * allowance,
+            "a second model down at the same time gets its own {allowance} lines"
+        );
         assert_eq!(
             errors.load(Ordering::Relaxed),
             0,
             "a refusal is not an error of the gateway"
-        );
-        assert!(
-            refusal_lines.load(Ordering::Relaxed) <= allowance,
-            "{refusals} refusals inside one second write at most {allowance} lines"
         );
     }
 }
