@@ -147,6 +147,7 @@ impl HarmonyResponseProcessor {
                 role: "assistant".to_string(),
                 content: (!final_text.is_empty()).then_some(final_text),
                 refusal: None,
+                annotations: Vec::new(),
                 tool_calls,
                 reasoning_content: analysis,
             };

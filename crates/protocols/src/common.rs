@@ -892,9 +892,14 @@ pub struct LogProbs {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ChatLogProbs {
+    /// The public API's object: `content` and `refusal` are both always
+    /// present (`null` when there is none); the gateway produces no refusals,
+    /// so `refusal` is `null`.
     Detailed {
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         content: Option<Vec<ChatLogProbsContent>>,
+        #[serde(default)]
+        refusal: Option<Vec<ChatLogProbsContent>>,
     },
     Raw(Value),
 }
@@ -1191,6 +1196,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_logprobs_object_carries_content_and_refusal() {
+        // Parsed as an engine reports it (content only), the object leaves
+        // with both of the public API's properties, `refusal` null.
+        let logprobs: ChatLogProbs = serde_json::from_value(json!({
+            "content": [{"token": "Hi", "logprob": -0.1, "bytes": [72, 105], "top_logprobs": []}]
+        }))
+        .expect("parse");
+        assert!(matches!(logprobs, ChatLogProbs::Detailed { .. }));
+        let value = serde_json::to_value(&logprobs).expect("serialize");
+        assert_eq!(value["content"][0]["token"], "Hi", "{value}");
+        assert_eq!(value.get("refusal"), Some(&Value::Null), "{value}");
+    }
 
     #[test]
     fn to_value_exact_keeps_f32_fields_as_the_client_wrote_them() {

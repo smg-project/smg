@@ -187,6 +187,7 @@ pub fn message<'a>(choice: u32, events: impl IntoIterator<Item = &'a Event>) -> 
             role: "assistant".to_string(),
             content: (!content.trim().is_empty()).then_some(content),
             refusal: None,
+            annotations: Vec::new(),
             tool_calls: (!calls.is_empty())
                 .then(|| calls.into_iter().map(|(_, call)| call).collect()),
             reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
@@ -439,6 +440,7 @@ mod tests {
                     "role": "assistant",
                     "content": "Let me check.",
                     "refusal": null,
+                    "annotations": [],
                     "tool_calls": [{
                         "id": "call_0",
                         "type": "function",
@@ -462,7 +464,7 @@ mod tests {
             serde_json::to_value(message(0, &events)).expect("serializable"),
             json!({
                 "index": 0,
-                "message": {"role": "assistant", "content": null, "refusal": null, "reasoning_content": null},
+                "message": {"role": "assistant", "content": null, "refusal": null, "annotations": [], "reasoning_content": null},
                 "logprobs": null,
                 "finish_reason": "stop",
             })

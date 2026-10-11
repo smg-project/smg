@@ -256,6 +256,7 @@ impl ResponseProcessor {
             // must be None, not Some("\n\n") — see normalize_assistant_content.
             content: normalize_assistant_content(processed_text),
             refusal: None,
+            annotations: Vec::new(),
             tool_calls,
             reasoning_content: reasoning_text,
         };

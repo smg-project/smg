@@ -974,11 +974,16 @@ pub struct ChatCompletionMessage {
     /// refusals, so it is `null`.
     #[serde(default)]
     pub refusal: Option<String>,
+    /// Always present, as the OpenAI API sends it; the gateway attaches no
+    /// annotations of its own, so the list is empty unless an upstream sent
+    /// some.
+    #[serde(default)]
+    pub annotations: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
-    // Note: annotations, audio are not added yet
+    // Note: audio is not added yet
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1374,6 +1379,7 @@ mod tests {
             role: "assistant".to_string(),
             content: None,
             refusal: None,
+            annotations: Vec::new(),
             tool_calls: Some(vec![crate::common::ToolCall {
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),
@@ -1387,6 +1393,18 @@ mod tests {
         let value = serde_json::to_value(&message).expect("serialize");
         assert_eq!(value.get("content"), Some(&Value::Null), "{value}");
         assert_eq!(value["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn completion_message_carries_the_always_present_annotations() {
+        // Parsed without annotations (an engine's answer), the message leaves
+        // with the public API's empty list.
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null, "reasoning_content": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], json!([]), "{value}");
     }
 }
 

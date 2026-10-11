@@ -1226,6 +1226,7 @@ impl ChatResponseAccumulator {
                         Some(self.content)
                     },
                     refusal: None,
+                    annotations: Vec::new(),
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
