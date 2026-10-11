@@ -64,6 +64,18 @@ where
     Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(false))
 }
 
+/// Deserialize a list that also accepts JSON `null` (mapped to the empty list).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]`
+/// on always-present lists an upstream may write as `null`.
+pub fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 /// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
 ///
 /// Use with `#[serde(default = "default_true", deserialize_with = "deserialize_null_as_true")]`

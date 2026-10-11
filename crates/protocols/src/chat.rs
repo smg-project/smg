@@ -6,11 +6,11 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, deserialize_null_as_true, is_false, is_true,
-        validate_json_schema_shape, validate_stop, CachePartition, ChatLogProbs, ContentPart,
-        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
-        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
-        Usage,
+        default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
+        deserialize_null_as_true, is_false, is_true, validate_json_schema_shape, validate_stop,
+        CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice,
+        GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
+        ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -976,8 +976,8 @@ pub struct ChatCompletionMessage {
     pub refusal: Option<String>,
     /// Always present, as the OpenAI API sends it; the gateway attaches no
     /// annotations of its own, so the list is empty unless an upstream sent
-    /// some.
-    #[serde(default)]
+    /// some. An upstream's missing key or `null` reads as the empty list.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     pub annotations: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -1405,6 +1405,29 @@ mod tests {
         .expect("parse");
         let value = serde_json::to_value(&message).expect("serialize");
         assert_eq!(value["annotations"], json!([]), "{value}");
+    }
+
+    #[test]
+    fn an_upstreams_null_annotations_read_as_the_empty_list_and_a_list_is_kept() {
+        // An upstream that writes the key as `null` parses (the key was ignored
+        // before the field existed) and leaves as the empty list.
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null,
+            "annotations": null, "reasoning_content": null
+        }))
+        .expect("a null annotations list parses");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], json!([]), "{value}");
+        // A list an upstream sent is kept as it was.
+        let sent =
+            json!([{"type": "url_citation", "url_citation": {"url": "https://example.com"}}]);
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null,
+            "annotations": sent, "reasoning_content": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], sent, "{value}");
     }
 }
 
