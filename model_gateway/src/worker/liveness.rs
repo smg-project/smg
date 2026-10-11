@@ -1313,7 +1313,7 @@ mod tests {
         // stats-only step batches) is silent only when its scheduler is.
         let w = worker();
         tracked_pile(&w, 1);
-        w.note_prefill_started(128 * 1_152);
+        w.note_prefill_started(128 * 1_152, true);
         assert!(wedge_bound(&w, DEFAULT_WEDGE) > Duration::from_secs(10));
         on_load_report_with(
             &w,
@@ -1370,19 +1370,28 @@ mod tests {
         // over, the rate being an estimate), not the bare threshold, and not
         // this gateway's own backlog: a second gateway with nothing in flight
         // on the worker sees the same record and reaches the same verdict.
+        // The rate is the one the gateway learns from the first tokens of
+        // its streaming requests over the time their prompts were pending
+        // (a non-streaming generation's one answer times no prefill), so the
+        // allowance follows the engine's measured prefill speed, not the
+        // idle gaps between requests.
         let with_backlog = BasicWorkerBuilder::new("http://w1:8000").build();
         let idle = BasicWorkerBuilder::new("http://w1:8000").build();
         for basic in [&with_backlog, &idle] {
-            // Both gateways have measured the worker: 2,304 tokens in 1.5 s
-            // of first tokens, 1,536 tokens/s.
+            // Both gateways have measured the worker: two 1,152-token
+            // streaming prompts back to back, 750 ms to the first token
+            // each, 2,304 tokens in 1.5 s of busy time, 1,536 tokens/s.
             let runtime = basic.runtime.load_full();
-            runtime.observe_prefill_at(1_152, 1_000);
-            runtime.observe_prefill_at(1_152, 2_500);
+            runtime.note_prefill_started_at(1_152, true, 1_000);
+            runtime.note_prefill_ended_at(1_152, true, true, 1_750);
+            runtime.note_prefill_started_at(1_152, true, 1_750);
+            runtime.note_prefill_ended_at(1_152, true, true, 2_500);
+            assert_eq!(runtime.prefill_rate_tps(), 1_536);
         }
         let with_backlog: Arc<dyn Worker> = Arc::new(with_backlog);
         let idle: Arc<dyn Worker> = Arc::new(idle);
         tracked_pile(&with_backlog, 1);
-        with_backlog.note_prefill_started(16 * 1_152);
+        with_backlog.note_prefill_started(16 * 1_152, true);
         let pending = Some(16 * 1_152);
         // 18,432 tokens at 1,536 tokens/s: 12 s of prefill, 24 s allowed.
         assert_eq!(
@@ -1426,7 +1435,7 @@ mod tests {
         // pending) and the veto; with nothing pending the allowance is the
         // threshold again, so a frozen engine on such a wire is vetoed at the
         // threshold like any other, on both gateways.
-        with_backlog.note_prefill_ended(16 * 1_152, true);
+        with_backlog.note_prefill_ended(16 * 1_152, true, true);
         for w in [&with_backlog, &idle] {
             on_token_progress(w);
             assert!(w.stall_reason().is_none());
@@ -1466,6 +1475,21 @@ mod tests {
             cold.stall_reason().is_none(),
             "no rate shown yet: no verdict"
         );
+        // A gateway whose own requests to the worker never stream is in the
+        // same place: a non-streaming generation's one answer comes after
+        // its decode and times no prefill, so no rate is learned from it
+        // and the silence on a token-batch wire gets no verdict there (its
+        // prompt still counts in the servicer's pending figure, which the
+        // gateways with a rate judge against).
+        let unstreamed = BasicWorkerBuilder::new("http://w1:8000").build();
+        {
+            let runtime = unstreamed.runtime.load_full();
+            runtime.note_prefill_started_at(4_000, false, 1_000);
+            runtime.note_prefill_ended_at(4_000, false, true, 31_000);
+            assert_eq!(runtime.prefill_rate_tps(), 0);
+        }
+        let unstreamed: Arc<dyn Worker> = Arc::new(unstreamed);
+        assert_eq!(silence_allowance(&unstreamed, DEFAULT_WEDGE, pending), None);
         assert_eq!(silence_allowance(&idle, DEFAULT_WEDGE, None), None);
         assert!(!engine_stalled(
             Some(Duration::from_secs(60)),
