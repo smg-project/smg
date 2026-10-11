@@ -1390,6 +1390,15 @@ fn detect_developer_role_support(template: &str) -> bool {
     template.contains("\"developer\"") || template.contains("'developer'")
 }
 
+/// Whether the template mentions the `root` role at all (the MiniMax M3
+/// template reads a leading `root` message into its high-priority system
+/// slot; the vendor's earlier templates read `system` only): a template that
+/// never names it has no branch for it and would drop the message, so the
+/// renderer rewrites root messages to system ones.
+fn detect_root_role_support(template: &str) -> bool {
+    template.contains("\"root\"") || template.contains("'root'")
+}
+
 /// The messages with every `developer` message rewritten as a `system`
 /// message without its `tools` field (the engine's `_convert_developer_to_system`),
 /// then the system messages merged into one at the front when a system
@@ -1415,6 +1424,36 @@ fn developer_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<se
                     serde_json::Value::String("system".to_string()),
                 );
                 fields.remove("tools");
+            }
+            rewritten
+        })
+        .collect();
+    Some(consolidate_system_messages(rewritten))
+}
+
+/// The messages with every `root` message rewritten as a `system` message,
+/// then the system messages merged into one at the front when a system
+/// message is not the first message (the rule of
+/// [`developer_messages_as_system`]), so a template that reads one leading
+/// system message keeps a system message that followed the root. `None`
+/// when no message has the role, so the caller keeps its slice.
+fn root_messages_as_system(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
+    let is_root = |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("root");
+    if !messages.iter().any(is_root) {
+        return None;
+    }
+    let rewritten = messages
+        .iter()
+        .map(|m| {
+            if !is_root(m) {
+                return m.clone();
+            }
+            let mut rewritten = m.clone();
+            if let Some(fields) = rewritten.as_object_mut() {
+                fields.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("system".to_string()),
+                );
             }
             rewritten
         })
@@ -1668,6 +1707,11 @@ pub struct ChatTemplateState {
     /// has none, `apply` renders developer messages as system messages, as
     /// the engine's HF renderer does, instead of letting the template drop them.
     developer_role_supported: bool,
+    /// Whether the template has a branch for the `root` role (the MiniMax M3
+    /// template). When it has none, `apply` renders root messages as system
+    /// messages, the way such a request was dispatched before the MiniMax
+    /// profile kept the role, instead of letting the template drop them.
+    root_role_supported: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1693,6 +1737,7 @@ impl ChatTemplateState {
         let developer_role_supported = template
             .as_deref()
             .is_none_or(detect_developer_role_support);
+        let root_role_supported = template.as_deref().is_none_or(detect_root_role_support);
         let env = template.map(build_environment).transpose()?;
         Ok(Self {
             env,
@@ -1702,6 +1747,7 @@ impl ChatTemplateState {
             think_in_prefill,
             prefill_opens_think_block,
             developer_role_supported,
+            root_role_supported,
         })
     }
 
@@ -1718,6 +1764,7 @@ impl ChatTemplateState {
             think_in_prefill: false,
             prefill_opens_think_block: false,
             developer_role_supported: true,
+            root_role_supported: true,
         }
     }
 
@@ -1747,6 +1794,27 @@ impl ChatTemplateState {
             .then(|| string_content_as_text_parts(messages))
             .flatten();
         let messages = wrapped.as_deref().unwrap_or(messages);
+
+        // A template without a `root` branch (the MiniMax templates before
+        // M3) has no branch that reads the role and would drop a root
+        // message: it gets the message as the leading system message
+        // instead, the way such a request was dispatched before the MiniMax
+        // profile kept the role, and a system message after the root merges
+        // into that one rather than being lost (the consolidation below).
+        // Before the developer step, so a developer message merged next
+        // comes after the root's text.
+        let root_converted;
+        let messages: &[serde_json::Value] = if self.root_role_supported {
+            messages
+        } else {
+            match root_messages_as_system(messages) {
+                Some(rewritten) => {
+                    root_converted = rewritten;
+                    &root_converted
+                }
+                None => messages,
+            }
+        };
 
         // A template without a `developer` branch renders nothing for a
         // developer message; the engine's renderer hands such a template the message
@@ -1814,8 +1882,10 @@ impl ChatTemplateState {
             prefill_opens_think_block,
         ) = detect_all(&template);
         let developer_role_supported = detect_developer_role_support(&template);
+        let root_role_supported = detect_root_role_support(&template);
         let env = build_environment(template)?;
         self.developer_role_supported = developer_role_supported;
+        self.root_role_supported = root_role_supported;
         self.content_format = content_format;
         self.thinking_toggle = thinking_toggle;
         self.thinking_key_name = thinking_key_name;
@@ -2090,6 +2160,86 @@ mod tests {
         assert_eq!(
             rendered,
             "<sys>Be brief.\nNo lists.</sys><usr>hi</usr><ast>hello</ast><usr>go on</usr>"
+        );
+    }
+
+    /// A template that never names the `root` role (the MiniMax templates
+    /// before M3 read `messages[0].role == "system"` only) would drop a root
+    /// message: it gets the message as the leading system message instead.
+    #[test]
+    fn a_root_message_renders_as_the_system_message_when_the_template_has_no_root_branch() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "root", "content": "Answer in French."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<sys>Answer in French.</sys><usr>hi</usr>");
+    }
+
+    /// A system message after the root is not lost on such a template: the
+    /// two merge into one system turn, the root's text first.
+    #[test]
+    fn a_system_message_after_a_root_merges_into_one_system_turn_without_a_root_branch() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "root", "content": "Answer in French."}),
+            serde_json::json!({"role": "system", "content": "You are terse."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>Answer in French.\n\nYou are terse.</sys><usr>hi</usr>"
+        );
+    }
+
+    /// A root followed by a developer message on a template with neither
+    /// branch: both become the one system turn, the root's text first.
+    #[test]
+    fn a_root_and_a_developer_message_merge_root_first_without_either_branch() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "root", "content": "Answer in French."}),
+            serde_json::json!({"role": "developer", "content": "Be brief."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>Answer in French.\n\nBe brief.</sys><usr>hi</usr>"
+        );
+    }
+
+    #[test]
+    fn a_root_message_reaches_a_template_that_handles_the_role() {
+        let template = "{% for m in messages %}{% if m.role == 'root' %}<root>{{ m.content }}</root>\
+                        {% elif m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "root", "content": "Answer in French."}),
+            serde_json::json!({"role": "system", "content": "You are terse."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<root>Answer in French.</root><sys>You are terse.</sys><usr>hi</usr>"
         );
     }
 

@@ -74,8 +74,9 @@ pub enum ChatMessage {
         ext: KimiDeveloperExt,
     },
     /// MiniMax extension: top-priority instruction message, above system.
-    /// Hoisted to the front for dispatch, where the chat template reads it;
-    /// rejected by other profiles.
+    /// Hoisted to the front for dispatch (several merge into one), where the
+    /// chat template reads it; a template without a root branch gets it as
+    /// the leading system message. Rejected by other profiles.
     #[serde(rename = "root")]
     Root {
         content: MessageContent,
@@ -782,8 +783,8 @@ impl Normalizable for ChatCompletionRequest {
     /// Normalize the request:
     /// 1. Apply the profile's rewrites to the request as the client sent it,
     ///    before any migration: drop message extensions that belong to another
-    ///    provider's profile and hoist MiniMax `root` messages to the front
-    ///    (see [`ProviderProfile::normalize_chat`])
+    ///    provider's profile and merge MiniMax `root` messages into one
+    ///    leading root (see [`ProviderProfile::normalize_chat`])
     /// 2. Migrate deprecated fields to their replacements
     /// 3. Clear deprecated fields and log warnings
     /// 4. Apply OpenAI defaults for tool_choice
