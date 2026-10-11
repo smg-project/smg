@@ -268,6 +268,11 @@ pub(crate) struct RoutingSnapshot {
     pub rid_key: Option<String>,
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
+    /// The request carries pixel media (an image or a video) that its
+    /// disaggregated prefill leg takes whole (worker selection's
+    /// `prefill_leg_needs_vision`: prefill/decode mode only), noted at first
+    /// selection so a retry keeps that leg on a worker with a vision encoder.
+    pub needs_vision: bool,
     /// The request's disaggregated decode leg needs a worker with a vision
     /// encoder (worker selection's `decode_leg_needs_vision`: prefill/decode
     /// mode only), noted at first selection so a retry re-selects under the
