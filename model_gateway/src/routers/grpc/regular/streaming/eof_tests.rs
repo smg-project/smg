@@ -564,6 +564,7 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let (tx, rx) = sse_channel();
     let spec = MessagesResponseSpec {
         thinking: None,
+        reasoning_in_prefill: None,
         tool_choice: None,
         has_tools: false,
         history_tool_calls_count: 0,
@@ -639,6 +640,7 @@ fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
             budget_tokens: 1024,
             display: None,
         }),
+        reasoning_in_prefill: None,
         tool_choice: None,
         has_tools: false,
         history_tool_calls_count: 0,
