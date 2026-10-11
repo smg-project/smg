@@ -480,8 +480,10 @@ def write_allowlist(path: Path, provider: str, clusters, stamp: str, prior=None)
     keeps that line's ``first_seen`` and ``note``: the hand-written
     adjudication is the record of why a divergence is accepted, and a
     regeneration must not erase it (its verdict and kinds are rewritten from
-    the replay; the diff against the old file shows what moved). A line in
-    the file being written wins over ``prior``."""
+    the replay; the diff against the old file shows what moved). The two
+    sources merge per field: the file's note when it has one, else the prior
+    one; the earlier ``first_seen`` of the two, so a rerun with ``prior`` after
+    a run without it restores what the first run blanked."""
     keep = []
     prior = dict(prior or {})
     if path.exists():
@@ -494,7 +496,16 @@ def write_allowlist(path: Path, provider: str, clusters, stamp: str, prior=None)
                 if entry.get("provider") != provider:
                     keep.append(entry)
                 else:
-                    prior[entry.get("sig_hash")] = entry
+                    sig = entry.get("sig_hash")
+                    carried = prior.get(sig, {})
+                    prior[sig] = dict(
+                        entry,
+                        note=entry.get("note") or carried.get("note") or "",
+                        first_seen=min(
+                            filter(None, (entry.get("first_seen"), carried.get("first_seen"))),
+                            default=None,
+                        ),
+                    )
     fresh = [
         {
             "provider": provider,
