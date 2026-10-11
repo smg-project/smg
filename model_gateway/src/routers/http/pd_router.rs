@@ -70,7 +70,7 @@ use crate::{
             trim_serialization_slack,
         },
         error,
-        grpc::utils::{error_type_from_status, route_to_endpoint},
+        grpc::utils::{error_type_for_response, error_type_from_status, route_to_endpoint},
         http::router::send_with_stale_conn_retry,
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
@@ -542,7 +542,7 @@ impl PDRouter {
                 metrics_labels::CONNECTION_HTTP,
                 model_label,
                 endpoint,
-                error_type_from_status(response.status()),
+                error_type_for_response(&response),
             );
         }
 
@@ -6415,5 +6415,46 @@ mod tests {
             refusal_lines.load(Ordering::Relaxed) <= allowance,
             "{refusals} refusals inside one second write at most {allowance} lines"
         );
+    }
+
+    /// A refusal this router answers on its own (no prefill/decode pair to
+    /// take the request) is counted as `unavailable`, not as a backend's
+    /// error: no worker was contacted.
+    #[test]
+    fn a_refusal_this_router_answers_is_counted_as_unavailable() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let router = create_test_pd_router();
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let response = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(router.route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID))
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"pd\"")
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"unavailable\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
     }
 }

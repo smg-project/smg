@@ -22,7 +22,7 @@ pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
     convert_proto_to_openai_logprobs,
 };
-pub(crate) use metrics::{error_type_from_status, route_to_endpoint};
+pub(crate) use metrics::{error_type_for_response, error_type_from_status, route_to_endpoint};
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
 // predicate instead of duplicating it.
 pub use parsers::chat_reasoning_starts_in_prefill;

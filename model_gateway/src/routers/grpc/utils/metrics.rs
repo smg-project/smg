@@ -1,8 +1,19 @@
 //! Metrics helper functions (shared by HTTP routers and gRPC pipeline).
 
+use axum::response::Response;
 use http::StatusCode;
 
-use crate::observability::metrics::metrics_labels;
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        common::{
+            overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+            placement::NO_AVAILABLE_WORKERS_CODE,
+        },
+        error::extract_error_code_from_response,
+        grpc::common::stages::SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
+    },
+};
 
 /// Map route path to endpoint label for metrics
 pub(crate) fn route_to_endpoint(route: &str) -> &'static str {
@@ -35,6 +46,32 @@ pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
     }
 }
 
+/// The codes of the refusals the gateway answers on its own ahead of any
+/// worker, each paced by a `Retry-After`: every worker of the model
+/// unavailable (unhealthy or behind an open circuit breaker), the overload
+/// shed, a wait past the selection queue's bound.
+const GATEWAY_REFUSAL_CODES: &[&str] = &[
+    NO_AVAILABLE_WORKERS_CODE,
+    WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
+    SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
+];
+
+/// The `error_type` label of a response the gateway answers.
+///
+/// One of the gateway's own refusals ([`GATEWAY_REFUSAL_CODES`], recognised
+/// by the code the response carries) counts as `unavailable`: no worker was
+/// contacted, so it is not a backend's error whatever its status. Every
+/// other response counts by its status through [`error_type_from_status`],
+/// the map a worker's status takes at dispatch and after the first chunk
+/// alike. The client's `error.type` is untouched: a 503 reads `server_error`
+/// as before.
+pub(crate) fn error_type_for_response(response: &Response) -> &'static str {
+    if GATEWAY_REFUSAL_CODES.contains(&extract_error_code_from_response(response)) {
+        return metrics_labels::ERROR_UNAVAILABLE;
+    }
+    error_type_from_status(response.status())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +97,60 @@ mod tests {
             (StatusCode::CONFLICT, "internal_error"),
         ] {
             assert_eq!(error_type_from_status(status), error_type, "{status}");
+        }
+    }
+
+    /// A refusal the gateway answers on its own counts as `unavailable`,
+    /// whatever its status; a worker's answer with the same status keeps its
+    /// class; the client-facing type of either is the status's, unchanged.
+    #[test]
+    fn a_refusal_the_gateway_answers_on_its_own_counts_as_unavailable() {
+        use crate::routers::{
+            common::{overload, placement},
+            error,
+        };
+
+        let refusals = [
+            placement::no_available_workers("every worker is down"),
+            overload::shed_pd_admission("decode-1", "m", 4, 5),
+            error::service_unavailable(SELECTION_QUEUE_TIMEOUT_ERROR_CODE, "waited too long"),
+        ];
+        for refusal in &refusals {
+            let code = extract_error_code_from_response(refusal);
+            assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE, "{code}");
+            assert_eq!(error_type_for_response(refusal), "unavailable", "{code}");
+            assert_eq!(
+                error_type_for_status(refusal.status()),
+                "server_error",
+                "the client reads the status's type, as before"
+            );
+        }
+        // A worker's answers keep their classes, by status.
+        for (response, error_type) in [
+            (
+                error::service_unavailable("engine_unavailable", "the worker is overloaded"),
+                "backend_error",
+            ),
+            (
+                error::internal_error("engine_failed", "the worker failed"),
+                "backend_error",
+            ),
+            (
+                error::too_many_requests("engine_busy", "kv cache full"),
+                "rate_limit_error",
+            ),
+            (error::model_not_found("m"), "no_workers"),
+            (
+                error::bad_request("invalid_request", "bad"),
+                "validation_error",
+            ),
+        ] {
+            assert_eq!(
+                error_type_for_response(&response),
+                error_type,
+                "{}",
+                extract_error_code_from_response(&response)
+            );
         }
     }
 }

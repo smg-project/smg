@@ -67,7 +67,7 @@ use super::{
     },
     spec::ResponseSpec,
     utils,
-    utils::error_type_from_status,
+    utils::error_type_for_response,
 };
 use crate::{
     config::types::RetryConfig,
@@ -832,8 +832,8 @@ impl RequestPipeline {
         );
     }
 
-    /// A refused request under this pipeline's labels, by the response's
-    /// status class.
+    /// A refused request under this pipeline's labels, by its class: one of
+    /// the gateway's own refusals, or the response's status.
     pub(crate) fn record_error(
         &self,
         endpoint: Option<&'static str>,
@@ -847,7 +847,7 @@ impl RequestPipeline {
                 metrics_labels::CONNECTION_GRPC,
                 self.worker_registry.metric_model_label(model),
                 endpoint,
-                error_type_from_status(response.status()),
+                error_type_for_response(response),
             );
         }
     }
@@ -4243,6 +4243,33 @@ mod request_release_tests {
             0,
             "a model nobody serves is the client's mistake, not an error of the gateway"
         );
+    }
+
+    /// A refusal the gateway answers on its own (every worker of the model
+    /// unavailable) is counted as `unavailable`, not as a backend's error: no
+    /// worker was contacted.
+    #[test]
+    fn a_refusal_for_a_drained_pool_is_counted_as_unavailable_not_as_a_backend_error() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let refusal = placement::no_available_workers("every worker is down");
+        assert_eq!(refusal.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pipeline.record_error(Some(metrics_labels::ENDPOINT_COMPLETIONS), MODEL, &refusal);
+        });
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains(&format!("model=\"{MODEL}\""))
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"unavailable\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
     }
 }
 

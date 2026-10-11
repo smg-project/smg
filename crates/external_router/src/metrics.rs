@@ -230,6 +230,11 @@ pub mod metrics_labels {
     /// turned the request away for now. Named as the client reads it in the
     /// error body's `type`.
     pub const ERROR_RATE_LIMIT: &str = "rate_limit_error";
+    /// A refusal the gateway answered on its own, before any worker took the
+    /// request: every worker of the model unavailable (unhealthy or behind an
+    /// open circuit breaker), the overload shed, a wait past the selection
+    /// queue's bound. No backend answered, so it is not a backend's error.
+    pub const ERROR_UNAVAILABLE: &str = "unavailable";
     pub const ERROR_INTERNAL: &str = "internal_error";
     /// The engine itself reported that the request failed (its finish
     /// reason was `error`), as opposed to a failed call to the worker.
