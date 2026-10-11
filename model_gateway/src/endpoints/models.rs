@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
-    middleware::AuthConfig,
+    middleware::{into_messages_envelope, AuthConfig},
     routers::{common::header_utils::apply_provider_headers, error},
     worker::{ProviderType, RuntimeType, WorkerRegistry},
 };
@@ -61,6 +61,18 @@ impl ModelShape {
         match self {
             Self::OpenAi => Json(card.into_model_object()).into_response(),
             Self::Anthropic => Json(messages::ModelInfo::from_model_card(&card)).into_response(),
+        }
+    }
+
+    /// The 404 of an unknown id: the same OpenAI-shaped envelope an unknown
+    /// model gets on every other route, re-shaped into the Messages envelope
+    /// (`not_found_error`, top-level `type`, `request_id`) for a Messages
+    /// client, as `/v1/messages` answers it.
+    async fn not_found(self, model_id: &str, request_id: String) -> Response {
+        let response = error::model_not_found(model_id);
+        match self {
+            Self::OpenAi => response,
+            Self::Anthropic => into_messages_envelope(response, request_id).await,
         }
     }
 }
@@ -109,28 +121,36 @@ pub(crate) async fn list_models_with(
 
 /// Answer `GET /v1/models/{id}` from the self-hosted inventory: the card of
 /// the model `model_id` names (its id, or an alias the registry resolves),
-/// in the caller's API shape, or the same 404 an unknown model gets on every
-/// other route.
-pub fn retrieve_model(context: &AppContext, headers: &HeaderMap, model_id: &str) -> Response {
-    retrieve_model_with(&context.worker_registry, headers, model_id)
+/// in the caller's API shape, or the 404 an unknown model gets on every other
+/// route, in the caller's error envelope (`request_id` names the request in
+/// the Messages envelope).
+pub async fn retrieve_model(
+    context: &AppContext,
+    headers: &HeaderMap,
+    model_id: &str,
+    request_id: String,
+) -> Response {
+    retrieve_model_with(&context.worker_registry, headers, model_id, request_id).await
 }
 
 /// [`retrieve_model`] over an explicit registry. The lookup is by the
 /// resolved canonical id alone: a canonical id that is also another card's
 /// alias names its own card, as it does on every other route.
-pub(crate) fn retrieve_model_with(
+pub(crate) async fn retrieve_model_with(
     registry: &WorkerRegistry,
     headers: &HeaderMap,
     model_id: &str,
+    request_id: String,
 ) -> Response {
     let canonical = registry.resolve_model_alias(model_id);
     let wanted = canonical.as_deref().unwrap_or(model_id);
     let card = self_hosted_cards(registry)
         .into_iter()
         .find(|card| card.id == wanted);
+    let shape = ModelShape::from_headers(headers);
     match card {
-        Some(card) => ModelShape::from_headers(headers).single(card),
-        None => error::model_not_found(model_id),
+        Some(card) => shape.single(card),
+        None => shape.not_found(model_id, request_id).await,
     }
 }
 
@@ -377,6 +397,11 @@ mod tests {
         registry
     }
 
+    /// A request id for the tests that do not read it back.
+    fn rid() -> String {
+        "req_test".to_owned()
+    }
+
     async fn json_body(response: Response) -> Value {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -430,7 +455,7 @@ mod tests {
         card.aliases = vec!["alias-1".to_owned()];
         let registry = registry_with(vec![card]);
 
-        let by_id = retrieve_model_with(&registry, &HeaderMap::new(), "m1");
+        let by_id = retrieve_model_with(&registry, &HeaderMap::new(), "m1", rid()).await;
         assert_eq!(by_id.status(), StatusCode::OK);
         let body = json_body(by_id).await;
         assert_eq!(body["object"], "model");
@@ -438,14 +463,52 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        let by_alias = retrieve_model_with(&registry, &headers, "alias-1");
+        let by_alias = retrieve_model_with(&registry, &headers, "alias-1", rid()).await;
         assert_eq!(by_alias.status(), StatusCode::OK);
         let body = json_body(by_alias).await;
         assert_eq!(body["type"], "model");
         assert_eq!(body["id"], "m1");
 
-        let unknown = retrieve_model_with(&registry, &headers, "nope");
+        let unknown = retrieve_model_with(&registry, &headers, "nope", rid()).await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// An unknown id is refused in the envelope of the API the caller speaks:
+    /// the OpenAI-shaped one by default, the Messages envelope (top-level
+    /// `type`, `error.type` `not_found_error`, `request_id`) under the header
+    /// every Anthropic client sends, as `/v1/messages` refuses the same model.
+    #[tokio::test]
+    async fn an_unknown_model_is_refused_in_the_callers_envelope() {
+        let registry = registry_with(vec![ModelCard::new("m1")]);
+
+        let openai = retrieve_model_with(&registry, &HeaderMap::new(), "nope", rid()).await;
+        assert_eq!(openai.status(), StatusCode::NOT_FOUND);
+        let body = json_body(openai).await;
+        assert_eq!(body["error"]["code"], "model_not_found", "{body}");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert!(body.get("type").is_none(), "{body}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let messages =
+            retrieve_model_with(&registry, &headers, "nope", "req_models_1".to_owned()).await;
+        assert_eq!(messages.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            messages.headers()["content-type"],
+            "application/json",
+            "{:?}",
+            messages.headers()
+        );
+        let body = json_body(messages).await;
+        assert_eq!(body["type"], "error", "{body}");
+        assert_eq!(body["error"]["type"], "not_found_error", "{body}");
+        assert_eq!(
+            body["error"]["message"], "No worker available for model 'nope'",
+            "{body}"
+        );
+        assert_eq!(body["request_id"], "req_models_1", "{body}");
+        assert!(body["error"].get("code").is_none(), "{body}");
+        assert!(body["error"].get("param").is_none(), "{body}");
     }
 
     /// A canonical id that is also another card's alias names its own card:
@@ -456,7 +519,7 @@ mod tests {
         aliased.aliases = vec!["org/second".to_owned()];
         let registry = registry_with(vec![aliased, ModelCard::new("org/second")]);
 
-        let response = retrieve_model_with(&registry, &HeaderMap::new(), "org/second");
+        let response = retrieve_model_with(&registry, &HeaderMap::new(), "org/second", rid()).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["id"], "org/second");

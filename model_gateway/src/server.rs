@@ -176,7 +176,8 @@ async fn v1_model(
     Path(model_id): Path<String>,
     req: Request,
 ) -> Response {
-    models::retrieve_model(&state.context, req.headers(), &model_id)
+    let request_id = middleware::request_id_of(&req);
+    models::retrieve_model(&state.context, req.headers(), &model_id, request_id).await
 }
 
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
