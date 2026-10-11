@@ -269,8 +269,9 @@ pub(crate) struct RoutingSnapshot {
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
     /// The request's disaggregated decode leg needs a worker with a vision
-    /// encoder (worker selection's `decode_needs_vision`), noted at first
-    /// selection so a retry re-selects under the same demand.
+    /// encoder (worker selection's `decode_leg_needs_vision`: prefill/decode
+    /// mode only), noted at first selection so a retry re-selects under the
+    /// same demand.
     pub decode_needs_vision: bool,
 }
 
