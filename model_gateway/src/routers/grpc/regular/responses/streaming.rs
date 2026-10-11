@@ -1303,6 +1303,7 @@ mod tests {
                     store: Some(false),
                     ..Default::default()
                 },
+                None,
                 Arc::new(smg_data_connector::MemoryResponseStorage::new()),
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
                 Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
