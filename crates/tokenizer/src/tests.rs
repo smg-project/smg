@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tokenizers::{decoders::byte_level::ByteLevel, models::wordlevel::WordLevel};
+
 use crate::{
     mock,
     traits::{Decoder, Encoder},
@@ -27,9 +29,8 @@ fn byte_fallback_tokenizer() -> Arc<dyn crate::TokenizerTrait> {
 
 #[test]
 fn byte_fallback_capability_distinguishes_byte_level_and_survives_cache() {
-    let mut byte_level =
-        tokenizers::Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
-    byte_level.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+    let mut byte_level = tokenizers::Tokenizer::new(WordLevel::default());
+    byte_level.with_decoder(Some(ByteLevel::default()));
     let byte_level: Arc<dyn crate::TokenizerTrait> =
         Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(byte_level));
     for (tokenizer, expected) in [(byte_fallback_tokenizer(), true), (byte_level, false)] {
