@@ -558,12 +558,7 @@ impl StreamingProcessor {
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
                         if let Some(timing) = &pd_timing {
-                            Metrics::record_pd_ttft(
-                                self.backend_type,
-                                model,
-                                timing.runtime,
-                                timing.prefill_start.elapsed(),
-                            );
+                            timing.record_first_decode_token(self.backend_type, model);
                         }
                     }
 
@@ -1439,12 +1434,7 @@ impl StreamingProcessor {
                     if first_token_time.is_none() {
                         first_token_time = Some(Instant::now());
                         if let Some(timing) = &pd_timing {
-                            Metrics::record_pd_ttft(
-                                ctx.backend_type,
-                                &ctx.model,
-                                timing.runtime,
-                                timing.prefill_start.elapsed(),
-                            );
+                            timing.record_first_decode_token(ctx.backend_type, &ctx.model);
                         }
                     }
 

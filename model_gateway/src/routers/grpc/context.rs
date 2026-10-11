@@ -4,7 +4,7 @@
 //! request building is its last reader and [`RequestContext::into_dispatch`]
 //! yields the request-free [`DispatchContext`] the dispatch phase runs on.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::http::HeaderMap;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
@@ -42,7 +42,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    observability::cache_trace,
+    observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
@@ -1388,13 +1388,41 @@ pub(crate) enum ExecutionResult {
 }
 
 /// Timing context threaded from PD execution into the streaming layer so the
-/// first decode token can be measured against prefill start.
+/// first decode token can be measured against the prefill and decode dispatch
+/// instants.
 #[derive(Clone)]
 pub(crate) struct PdTiming {
     /// Monotonic instant the prefill RPC was dispatched.
-    pub prefill_start: std::time::Instant,
+    pub prefill_start: Instant,
+    /// Monotonic instant the decode RPC was dispatched. Sequential dispatch
+    /// sends decode once prefill is drained and relayed; parallel dispatch
+    /// sends both legs together, so this is the prefill instant.
+    pub decode_sent: Instant,
     /// Backend runtime label (e.g. "sglang", "vllm") for the PD metric set.
     pub runtime: &'static str,
+}
+
+impl PdTiming {
+    /// Record the PD time-to-first-token pair at the first decode token: the
+    /// end-to-end value from the prefill dispatch (`smg_pd_ttft_seconds`) and
+    /// the decode phase from the decode dispatch (`smg_pd_decode_ttft_seconds`),
+    /// off one clock reading so that the prefill, relay and decode phases add
+    /// up to the end-to-end value exactly.
+    pub(crate) fn record_first_decode_token(&self, backend_type: &'static str, model: &str) {
+        let now = Instant::now();
+        Metrics::record_pd_ttft(
+            backend_type,
+            model,
+            self.runtime,
+            now.duration_since(self.prefill_start),
+        );
+        Metrics::record_pd_decode_ttft(
+            backend_type,
+            model,
+            self.runtime,
+            now.duration_since(self.decode_sent),
+        );
+    }
 }
 
 /// Final processed response

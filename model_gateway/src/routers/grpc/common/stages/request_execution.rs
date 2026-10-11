@@ -973,8 +973,11 @@ async fn execute_parallel_pd(
                 prefill: prefill_stream,
                 decode: Box::new(decode_stream),
                 prefill_guards: vec![Some(prefill_guard)],
+                // Both legs were dispatched together, so the decode leg's
+                // time to first token is the end-to-end one.
                 pd_timing: PdTiming {
                     prefill_start,
+                    decode_sent: prefill_start,
                     runtime,
                 },
                 // The streaming layer drains the live prefill stream itself.
@@ -1435,11 +1438,9 @@ async fn execute_sequential_pd(
     // Prefill is drained: its admission slot is free while decode runs.
     drop(prefill_guard);
     workers.record_outcome_prefill(ledger, 200);
-    // Captured at drain; recorded below only once decode is established.
-    let prefill_duration = prefill_start.elapsed();
-
-    // KV-transfer window: prefill drain complete to decode send complete.
-    let kv_window_start = Instant::now();
+    // The prefill phase ends at the drain; recorded below only once decode is
+    // established.
+    let prefill_done = Instant::now();
 
     debug!("vLLM PD: prefill completed, sending decode request");
 
@@ -1539,6 +1540,12 @@ async fn execute_sequential_pd(
     if let Some(decode) = workers.decode_worker() {
         Metrics::record_worker_request(decode.url(), decode.model_id());
     }
+    // The relay phase ends at the decode dispatch. Everything after this
+    // instant, including the engines' KV transfer and the decode scheduling,
+    // is the decode leg's time to first token; the instant is taken before the
+    // call so a worker that holds its response headers until the first token
+    // still lands in the decode phase.
+    let decode_sent = Instant::now();
     let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
         if let Some(status) = e.breaker_status() {
             workers.record_outcome_decode(ledger, status);
@@ -1563,13 +1570,13 @@ async fn execute_sequential_pd(
         metrics_labels::BACKEND_PD,
         model,
         runtime,
-        prefill_duration,
+        prefill_done.duration_since(prefill_start),
     );
     Metrics::record_pd_kv_transfer_duration(
         metrics_labels::BACKEND_PD,
         model,
         runtime,
-        kv_window_start.elapsed(),
+        decode_sent.duration_since(prefill_done),
     );
 
     // Prefill has completed and its KV blocks are held pending decode's
@@ -1592,6 +1599,7 @@ async fn execute_sequential_pd(
         prefill_guards: vec![None],
         pd_timing: PdTiming {
             prefill_start,
+            decode_sent,
             runtime,
         },
         prefill_input_logprobs,
