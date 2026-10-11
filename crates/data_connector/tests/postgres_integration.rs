@@ -25,6 +25,16 @@
 //! effect. Postgres doesn't serialize concurrent first-time DDL on the same
 //! table name, so running these in parallel against a fresh database races.
 
+use std::{
+    io::{Read, Write},
+    net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    thread,
+};
+
 use data_connector::{
     create_storage, HistoryBackend, NewConversation, NewConversationItem, PostgresConfig,
     SchemaConfig, StorageBundle, StorageFactoryConfig, StoredResponse, TableConfig,
@@ -485,4 +495,200 @@ async fn a_configured_table_with_a_unique_id_replaces_the_row_under_its_id() {
     a_configured_table_replaces_the_row_under_its_id(true)
         .await
         .expect("a configured table with a unique index on the id");
+}
+
+/// What a relay in front of the database counted: the server's ReadyForQuery
+/// messages (one per round trip the client waited for) and the client's
+/// statement Close messages (a statement prepared for one use is closed
+/// afterwards; a cached one is not).
+struct RoundTripMeter {
+    ready_for_query: Arc<AtomicUsize>,
+    closes: Arc<AtomicUsize>,
+}
+
+/// Copies one direction of a relayed connection and counts the messages of
+/// kind `wanted`, before the bytes go on, so a count is in place when the
+/// receiver acts on them. The client's first message (the startup) has no
+/// type byte; every later message of either side is a type byte and a
+/// length. (The store connects without TLS, so no SSL negotiation precedes
+/// the startup message.)
+fn pump(
+    mut from: TcpStream,
+    mut to: TcpStream,
+    startup_first: bool,
+    wanted: u8,
+    counter: Arc<AtomicUsize>,
+) {
+    let mut chunk = [0u8; 65536];
+    let mut buf: Vec<u8> = Vec::new();
+    let mut startup_pending = startup_first;
+    loop {
+        let n = match from.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        let mut at = 0;
+        loop {
+            if startup_pending {
+                if buf.len() < at + 4 {
+                    break;
+                }
+                let len =
+                    u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize;
+                if buf.len() < at + len {
+                    break;
+                }
+                at += len;
+                startup_pending = false;
+                continue;
+            }
+            if buf.len() < at + 5 {
+                break;
+            }
+            let len =
+                u32::from_be_bytes([buf[at + 1], buf[at + 2], buf[at + 3], buf[at + 4]]) as usize;
+            if buf.len() < at + 1 + len {
+                break;
+            }
+            if buf[at] == wanted {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            at += 1 + len;
+        }
+        buf.drain(..at);
+        if to.write_all(&chunk[..n]).is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown(Shutdown::Write);
+}
+
+/// Starts a relay on a free local port in front of the database `db_url`
+/// names and returns the url that goes through it, with its meter. The url
+/// shape is `scheme://[user:password@]host[:port][/...]`.
+fn relayed_database(db_url: &str) -> Result<(String, RoundTripMeter), String> {
+    let scheme_end = db_url
+        .find("://")
+        .ok_or_else(|| format!("no scheme in the database url {db_url}"))?
+        + 3;
+    let rest = &db_url[scheme_end..];
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let (userinfo, host_port) = match authority.rfind('@') {
+        Some(i) => (&authority[..=i], &authority[i + 1..]),
+        None => ("", authority),
+    };
+    let upstream = if host_port.contains(':') {
+        host_port.to_string()
+    } else {
+        format!("{host_port}:5432")
+    };
+    let upstream_addr = upstream
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {upstream}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{upstream} resolves to nothing"))?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind the relay: {e}"))?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| format!("the relay's address: {e}"))?;
+    let ready_for_query = Arc::new(AtomicUsize::new(0));
+    let closes = Arc::new(AtomicUsize::new(0));
+    let (ready, closed) = (ready_for_query.clone(), closes.clone());
+    thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { break };
+            let Ok(server) = TcpStream::connect(upstream_addr) else {
+                break;
+            };
+            let (Ok(client_rx), Ok(server_rx)) = (client.try_clone(), server.try_clone()) else {
+                break;
+            };
+            let closed = closed.clone();
+            thread::spawn(move || pump(client_rx, server, true, b'C', closed));
+            let ready = ready.clone();
+            thread::spawn(move || pump(server_rx, client, false, b'Z', ready));
+        }
+    });
+    let url = format!(
+        "{}{userinfo}{local}{}",
+        &db_url[..scheme_end],
+        &rest[authority_end..]
+    );
+    Ok((
+        url,
+        RoundTripMeter {
+            ready_for_query,
+            closes,
+        },
+    ))
+}
+
+/// A store costs the round trips of its path and nothing more, measured on
+/// the wire: `expected` per store, after the first store on the connection
+/// prepared the statement, and no statement closed between stores.
+async fn a_store_costs_the_round_trips_of_its_path(
+    unique_id: bool,
+    expected: usize,
+) -> Result<(), String> {
+    let Some(db_url) = test_db_url() else {
+        return Ok(());
+    };
+    let table = if unique_id {
+        "configured_responses_unique_relayed"
+    } else {
+        "configured_responses_plain_relayed"
+    };
+    let (_admin, _driver) = create_configured_responses_table(&db_url, table, unique_id).await?;
+    let (relayed_url, meter) = relayed_database(&db_url)?;
+    let resp = configured_table_bundle(&relayed_url, table)
+        .await?
+        .response_storage;
+
+    let mut first = StoredResponse::new(None);
+    first.raw_response = json!({"id": first.id.0, "status": "queued"});
+    resp.store_response(first.clone())
+        .await
+        .map_err(|e| format!("the first store: {e}"))?;
+    let ready_before = meter.ready_for_query.load(Ordering::SeqCst);
+    let closes_before = meter.closes.load(Ordering::SeqCst);
+
+    // A fresh id, then the first one replaced: both cost the same.
+    let mut second = StoredResponse::new(None);
+    second.raw_response = json!({"id": second.id.0, "status": "queued"});
+    resp.store_response(second)
+        .await
+        .map_err(|e| format!("the store of a fresh id: {e}"))?;
+    first.raw_response = json!({"id": first.id.0, "status": "completed"});
+    resp.store_response(first)
+        .await
+        .map_err(|e| format!("the store that replaces the first record: {e}"))?;
+
+    let round_trips = meter.ready_for_query.load(Ordering::SeqCst) - ready_before;
+    let closes = meter.closes.load(Ordering::SeqCst) - closes_before;
+    if round_trips != 2 * expected || closes != 0 {
+        return Err(format!(
+            "two stores took {round_trips} round trips and closed {closes} statements; \
+             expected {} and none",
+            2 * expected
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_store_is_one_round_trip_with_a_unique_index_on_the_id() {
+    a_store_costs_the_round_trips_of_its_path(true, 1)
+        .await
+        .expect("one round trip per store on a table with a unique index on the id");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_store_is_four_round_trips_without_a_unique_index_on_the_id() {
+    a_store_costs_the_round_trips_of_its_path(false, 4)
+        .await
+        .expect("four round trips per store on a table without a unique index on the id");
 }
