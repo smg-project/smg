@@ -8,8 +8,8 @@
 //! content's edges, so those newlines are the model's to write and reach the content stream;
 //! whose they are is bellwether #17's question, as for Qwen3. Recorded as `glm-4.6`
 //! (zai-org/GLM-4.6). GLM 4.7 and later write the tags with nothing between them and open the
-//! thought in the prompt ([`glm()`](super::glm())); Ling writes these newlines under its own turn
-//! opener ([`ling()`](super::ling())).
+//! thought in the prompt ([`glm()`](super::glm())); Ling writes the newline before the close
+//! instead of after each pair, under its own turn opener ([`ling()`](super::ling())).
 
 use crate::{
     format::{CallSyntax, Emits, Format},

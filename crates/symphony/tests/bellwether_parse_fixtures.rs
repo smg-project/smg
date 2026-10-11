@@ -437,7 +437,8 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Glm,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
-    // GLM 4.5 and 4.6 write Ling's newlines under GLM's turn opener, and the model writes its own
+    // GLM 4.5 and 4.6 write Ling's syntax with a newline after each pair instead of before the
+    // close, under GLM's turn opener, and the model writes its own
     // `<think>`; the template closes an empty thought in the prompt only when the request turns
     // thinking off (as `\n<think></think>`; the tail's newlines are not read, its markers are).
     (
