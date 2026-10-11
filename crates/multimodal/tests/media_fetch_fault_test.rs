@@ -15,7 +15,8 @@ use std::{
 use llm_multimodal::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaFault, MediaSource,
 };
-use reqwest::Client;
+
+mod common;
 
 /// One HTTP/1.1 answer for the first connection, after `header_delay`:
 /// `status` with `body` under `content_type`, declared as `declared` bytes
@@ -59,7 +60,10 @@ fn serve_once(
 /// The connector's reading of fetching `url` as an image under
 /// `fetch_timeout`, with the error's words.
 async fn fault_of(url: String, fetch_timeout: Duration) -> (MediaFault, String) {
-    let client = Client::builder().no_proxy().build().expect("client");
+    let client = common::http_client_builder()
+        .no_proxy()
+        .build()
+        .expect("client");
     let connector = MediaConnector::new(
         client,
         MediaConnectorConfig {
