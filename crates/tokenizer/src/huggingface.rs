@@ -694,71 +694,15 @@ fn remainder_after_rewrite(decoded: &str, emitted: &str) -> (String, bool) {
     }
 }
 
-impl Decoder for HuggingFaceTokenizer {
-    fn uses_byte_fallback(&self) -> bool {
-        self.has_byte_fallback
-    }
-
-    fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
-        self.tokenizer
-            .decode(token_ids, skip_special_tokens)
-            .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
-    }
-
-    /// Native incremental decode (the raw step: a recovery here is not counted,
-    /// see [`Self::step_decode_lenient`]): the algorithm of the HF `step_decode_stream`
-    /// (hold while the decode ends in an incomplete character, emit what grew
-    /// beyond the emitted prefix), run through the concrete `TokenizerImpl`
-    /// rather than `dyn Decoder` dispatch, and lenient when the decoder chain
-    /// rewrites text already emitted (see [`Self::step_decode_lenient`]).
-    ///
-    /// A ByteFallback vocabulary streams the complete characters of a byte run
-    /// as they close, like the serving engines' own detokenizers; only an
-    /// incomplete trailing sequence waits. Batch decoding would turn a run
-    /// with an invalid byte into one replacement character per byte, including
-    /// the characters already streamed: those stay as streamed and the rest of
-    /// the run follows the batch text (counted as a `byte_run` recovery).
-    fn decode_step(
-        &self,
-        token_id: TokenIdType,
-        ids: &mut Vec<TokenIdType>,
-        prefix: &mut String,
-        prefix_index: &mut usize,
-        skip_special_tokens: bool,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .decode_step_reporting(
-                token_id,
-                ids,
-                prefix,
-                prefix_index,
-                skip_special_tokens,
-                false,
-            )?
-            .text)
-    }
-
-    fn decode_step_eager(
-        &self,
-        token_id: TokenIdType,
-        ids: &mut Vec<TokenIdType>,
-        prefix: &mut String,
-        prefix_index: &mut usize,
-        skip_special_tokens: bool,
-    ) -> Result<Option<String>> {
-        Ok(self
-            .step_decode_lenient(
-                vec![token_id],
-                skip_special_tokens,
-                ids,
-                prefix,
-                prefix_index,
-                false,
-            )?
-            .text)
-    }
-
-    fn decode_step_reporting(
+impl HuggingFaceTokenizer {
+    /// The client-visible step (see [`Decoder::decode_step`]): a seeded
+    /// sequence's prompt is decode context, never emitted; a ByteFallback run
+    /// streams each complete character as it closes; `eager` is the
+    /// engine-side observer's path. `count` says whether a recovery goes into
+    /// the process-wide totals (the reporting step counts, the raw step does
+    /// not).
+    #[expect(clippy::too_many_arguments)]
+    fn client_step(
         &self,
         token_id: TokenIdType,
         ids: &mut Vec<TokenIdType>,
@@ -766,6 +710,7 @@ impl Decoder for HuggingFaceTokenizer {
         prefix_index: &mut usize,
         skip_special_tokens: bool,
         eager: bool,
+        count: bool,
     ) -> Result<DecodeStep> {
         // A seeded sequence (every id so far is seed, nothing pending): its prompt
         // text is context, never emitted. With pending ids behind the prefix
@@ -803,6 +748,91 @@ impl Decoder for HuggingFaceTokenizer {
             ids,
             prefix,
             prefix_index,
+            count,
+        )
+    }
+}
+
+impl Decoder for HuggingFaceTokenizer {
+    fn uses_byte_fallback(&self) -> bool {
+        self.has_byte_fallback
+    }
+
+    fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
+        self.tokenizer
+            .decode(token_ids, skip_special_tokens)
+            .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
+    }
+
+    /// Native incremental decode (the raw step: a recovery here is not counted,
+    /// see [`Self::step_decode_lenient`]): the algorithm of the HF `step_decode_stream`
+    /// (hold while the decode ends in an incomplete character, emit what grew
+    /// beyond the emitted prefix), run through the concrete `TokenizerImpl`
+    /// rather than `dyn Decoder` dispatch, and lenient when the decoder chain
+    /// rewrites text already emitted (see [`Self::step_decode_lenient`]).
+    ///
+    /// A ByteFallback vocabulary streams the complete characters of a byte run
+    /// as they close, like the serving engines' own detokenizers; only an
+    /// incomplete trailing sequence waits. Batch decoding would turn a run
+    /// with an invalid byte into one replacement character per byte, including
+    /// the characters already streamed: those stay as streamed and the rest of
+    /// the run follows the batch text (counted as a `byte_run` recovery).
+    fn decode_step(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.client_step(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            false,
+            false,
+        )
+        .map(|step| step.text)
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .step_decode_lenient(
+                vec![token_id],
+                skip_special_tokens,
+                ids,
+                prefix,
+                prefix_index,
+                false,
+            )?
+            .text)
+    }
+
+    fn decode_step_reporting(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+    ) -> Result<DecodeStep> {
+        self.client_step(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
             true,
         )
     }

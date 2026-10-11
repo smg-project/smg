@@ -554,6 +554,48 @@ fn byte_fallback_token_stop_preserves_pending_text() {
 }
 
 #[test]
+fn raw_decode_step_recovers_but_does_not_count() {
+    // <0xC3> <0xA9> <0xF2> " suffix" through the raw steps (what the gateway
+    // replays for token accounting): the rewritten prefix is recovered, and
+    // the process-wide counters do not move for it. The counters are shared
+    // with the other tests of this binary, so the raw steps run a thousand
+    // times: a counting step would add a thousand, concurrent tests a few.
+    const RUNS: u64 = 1_000;
+    let tokenizer = byte_fallback_tokenizer();
+    let before = crate::decode_activity_stats();
+    for eager in [false, true] {
+        for _ in 0..RUNS {
+            let (mut ids, mut prefix, mut prefix_index) = (Vec::new(), String::new(), 0usize);
+            let mut text = String::new();
+            for id in [5, 6, 3, 4] {
+                let step = if eager {
+                    tokenizer.decode_step_eager(id, &mut ids, &mut prefix, &mut prefix_index, true)
+                } else {
+                    tokenizer.decode_step(id, &mut ids, &mut prefix, &mut prefix_index, true)
+                };
+                if let Some(delta) = step.unwrap() {
+                    text.push_str(&delta);
+                }
+            }
+            assert!(
+                text.starts_with("é") && text.ends_with(" suffix"),
+                "eager={eager}: {text:?}"
+            );
+        }
+    }
+    let after = crate::decode_activity_stats();
+    for (b, a) in before.iter().zip(after.iter()) {
+        assert!(
+            a.prefix_mismatches - b.prefix_mismatches < RUNS,
+            "{}: {} -> {}",
+            a.kind,
+            b.prefix_mismatches,
+            a.prefix_mismatches
+        );
+    }
+}
+
+#[test]
 fn test_mock_tokenizer_encode() {
     let tokenizer = mock::MockTokenizer::new();
     let encoding = tokenizer.encode("Hello world", false).unwrap();

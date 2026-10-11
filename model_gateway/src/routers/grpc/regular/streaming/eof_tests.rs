@@ -384,6 +384,44 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
 }
 
 #[tokio::test]
+async fn byte_fallback_generate_mid_run_stop_reports_gateway_stop() {
+    // `t` `t` then <0xF2>: the string stop `tt` closes at the second token,
+    // mid-run, not in the end-of-input tail; the response reports it.
+    let tokenizer = byte_fallback_tokenizer();
+    let mut terminal = complete(0, "length");
+    if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
+        complete.output_ids = vec![1, 1, 2];
+        complete.completion_tokens = 3;
+    }
+    let (stream, server) = scripted_stream(vec![terminal], "0").await;
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer,
+        llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("tt"),
+        true,
+    );
+    let processor = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    );
+    let responses = processor
+        .process_non_streaming_generate_response(
+            context::ExecutionResult::Single { stream },
+            dispatch(),
+            &mut decoder,
+            false,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+    server.abort();
+    let wire = serde_json::to_value(&responses[0]).unwrap();
+    assert_eq!(wire["text"], "");
+    assert_eq!(wire["meta_info"]["finish_reason"]["type"], "stop");
+    assert_eq!(wire["meta_info"]["matched_stop"], "tt");
+}
+
+#[tokio::test]
 async fn byte_fallback_generate_eof_reports_gateway_stop() {
     let tokenizer = byte_fallback_tokenizer();
     let mut terminal = complete(0, "length");
