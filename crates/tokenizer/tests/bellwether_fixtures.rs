@@ -85,72 +85,7 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// pre-tokenizer for instance, and is held to the rule an id is: the run
 /// fails when no loaded case under it differs any more, and when no loaded
 /// case is under it at all.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
-    (
-        "qwen-agentworld-35b-a3b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen-drive-1.0-4b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.5-27b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.5-2b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.5-9b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.8-2.4t-a95b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.8-flash-next/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "phi-4-multimodal-instruct/render/*",
-        "the reference's ids follow transformers' GPT2Tokenizer pattern, which splits \
-         contractions, digit runs and punctuation as GPT-2 does where tokenizer.json carries \
-         an o200k-style regex (smg-project/smg-lab#102); re-recorded with the file's encoder \
-         in smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "tinyllama-1.1b-chat-v1.0/render/*",
-        "the reference's ids follow transformers' LlamaTokenizer with legacy=false, which \
-         prepends the dummy space once per input where tokenizer.json's normalizer prepends \
-         it per segment, so no dummy space follows a special token (smg-project/smg-lab#104); \
-         re-recorded with the file's encoder in smg-project/bellwether#104, the pin bump that \
-         follows removes this entry",
-    ),
-];
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
 
 /// Models whose tokenizer is known not to load, with the reason and where it
 /// is tracked, so the run compares the others: an unlisted model that does

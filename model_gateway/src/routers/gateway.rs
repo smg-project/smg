@@ -488,14 +488,21 @@ impl RouterTrait for Gateway {
         let router = if self.enable_igw {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             if snapshot.pool(RoutingPool::External).is_empty() {
-                // Counting needs only a tokenizer: no gRPC route or decode leg.
+                // Counting needs only the model's tokenizer, which every
+                // self-hosted router holds: a disaggregated pool qualifies by
+                // its prefill leg alone, whichever gRPC family is mounted.
+                let size = |pool| snapshot.pool(pool).len();
+                let grpc_prefill = size(RoutingPool::GrpcPrefill);
                 self.pick_router_by_weights(
-                    0,
-                    0,
-                    snapshot.pool(RoutingPool::HttpPrefill).len(),
-                    0,
-                    snapshot.pool(RoutingPool::HttpRegular).len(),
+                    grpc_prefill,
+                    grpc_prefill,
+                    size(RoutingPool::HttpPrefill),
+                    size(RoutingPool::GrpcPipelineRegular),
+                    size(RoutingPool::HttpRegular),
                 )
+                // A model no pool serves goes to the default router, like
+                // every other route, so the answer is its model_not_found.
+                .or_else(|| self.select_router_for_request(Some(model_id)))
             } else {
                 self.select_router_for_request(Some(model_id))
             }
@@ -1223,49 +1230,74 @@ mod tests {
         );
     }
 
+    /// Counting needs a tokenizer, not a decode leg or a wire: a pool of any
+    /// transport answers it, a disaggregated pool by its prefill workers
+    /// alone, and a deployment of gRPC workers only (the common one) answers
+    /// it from the gateway instead of reporting that no router exists. A
+    /// model no pool serves goes to the default router, whose own answer is
+    /// the 404 model_not_found (the gRPC router's tests cover it); only a
+    /// gateway with no router at all answers the 404 itself.
     #[tokio::test]
-    async fn count_tokens_selects_http_workers_without_a_decode_leg() {
-        for (role, router_id) in [
-            (WorkerType::Regular, router_ids::HTTP_REGULAR),
-            (WorkerType::Prefill, router_ids::HTTP_PD),
+    async fn count_tokens_is_served_by_every_pool() {
+        let tenant = test_tenant_meta();
+        let body = |model: &str| -> CountMessageTokensRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": model, "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap()
+        };
+        for (mode, role, router_id) in [
+            (
+                ConnectionMode::Http,
+                WorkerType::Regular,
+                router_ids::HTTP_REGULAR,
+            ),
+            (
+                ConnectionMode::Http,
+                WorkerType::Prefill,
+                router_ids::HTTP_PD,
+            ),
+            (
+                ConnectionMode::Grpc,
+                WorkerType::Regular,
+                router_ids::GRPC_REGULAR,
+            ),
+            (
+                ConnectionMode::Grpc,
+                WorkerType::Prefill,
+                router_ids::GRPC_PD,
+            ),
         ] {
             let gateway = test_gateway(true);
-            gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
-            gateway.set_default_router(router_ids::GRPC_REGULAR);
-            gateway.register_router(router_id, Arc::new(StubRouter));
-            for (url, mode, worker_type) in [
-                (
-                    "http://grpc:8080",
-                    ConnectionMode::Grpc,
-                    WorkerType::Regular,
-                ),
-                ("http://http:8080", ConnectionMode::Http, role),
-            ] {
-                gateway
-                    .worker_registry
-                    .register(Arc::new(
-                        BasicWorkerBuilder::new(url)
-                            .connection_mode(mode)
-                            .worker_type(worker_type)
-                            .model(ModelCard::new("m"))
-                            .build(),
-                    ))
-                    .unwrap();
-            }
-            let tenant = test_tenant_meta();
-            // An unknown model is a 404 like every other route: Anthropic
-            // SDKs read a 501 as "endpoint unsupported".
-            for (model, expected) in [("m", StatusCode::OK), ("missing", StatusCode::NOT_FOUND)] {
-                let body = serde_json::from_value(serde_json::json!({
-                    "model": model, "messages": []
-                }))
+            gateway.register_router(router_id.clone(), Arc::new(StubRouter));
+            gateway
+                .worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new("http://worker:8080")
+                        .connection_mode(mode)
+                        .worker_type(role)
+                        .model(ModelCard::new("m"))
+                        .build(),
+                ))
                 .unwrap();
+            // The served model and an unknown one both reach the router
+            // (the stub answers 200 to both); the unknown model's 404 is the
+            // router's to give, never a 501 an Anthropic SDK would read as
+            // "endpoint unsupported".
+            for model in ["m", "missing"] {
                 let response = gateway
-                    .route_messages_count_tokens(None, &tenant, body, model)
+                    .route_messages_count_tokens(None, &tenant, body(model), model)
                     .await;
-                assert_eq!(response.status(), expected);
+                assert_eq!(response.status(), StatusCode::OK, "{router_id:?} {model}");
             }
         }
+
+        let mut no_router = Gateway::new(Arc::new(WorkerRegistry::new()));
+        no_router.enable_igw = true;
+        let response = no_router
+            .route_messages_count_tokens(None, &tenant, body("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     fn generate_request_without_model() -> GenerateRequest {

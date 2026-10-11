@@ -171,6 +171,14 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
     models::list_models(&state.context, req.headers()).await
 }
 
+async fn v1_model(
+    State(state): State<Arc<AppState>>,
+    Path(model_id): Path<String>,
+    req: Request,
+) -> Response {
+    models::retrieve_model(&state.context, req.headers(), &model_id)
+}
+
 async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.get_model_info(req).await
 }
@@ -450,7 +458,7 @@ async fn v1_messages_count_tokens(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<CountMessageTokensRequest>,
+    ValidatedJson(body): ValidatedJson<CountMessageTokensRequest>,
 ) -> Response {
     if let Err(refused) = check_anthropic_version(&headers) {
         return refused;
@@ -1131,6 +1139,9 @@ pub fn build_app(
         .route("/engine_metrics", get(engine_metrics))
         .route("/loads", get(get_loads))
         .route("/v1/models", get(v1_models))
+        // The rest of the path: a self-hosted id usually carries a slash
+        // (an organisation and a name), raw or percent-encoded.
+        .route("/v1/models/{*id}", get(v1_model))
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 

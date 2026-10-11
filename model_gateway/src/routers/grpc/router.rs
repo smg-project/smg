@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -12,7 +13,7 @@ use openai_protocol::{
     decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CountMessageTokensResponse, CreateMessageRequest},
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
@@ -31,7 +32,7 @@ use super::{
     multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::{responses, stages::decisions::supports_worker as supports_decisions_worker},
-    utils::ParserResolver,
+    utils::{message_utils, ParserResolver},
 };
 use crate::{
     app_context::AppContext,
@@ -421,7 +422,7 @@ impl GrpcRouter {
                 match serve_harmony_responses(&harmony_ctx, body.into_owned(), tenant_meta.clone())
                     .await
                 {
-                    Ok(response) => axum::Json(response).into_response(),
+                    Ok(response) => Json(response).into_response(),
                     Err(error_response) => error_response,
                 }
             }
@@ -495,6 +496,65 @@ impl GrpcRouter {
 
         Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
         response
+    }
+
+    /// `/v1/messages/count_tokens`, answered from the gateway's own
+    /// tokenizer: the request is rendered through the model's chat template
+    /// exactly as `/v1/messages` renders it and the prompt's token count is
+    /// returned. No worker takes part, so every worker type is covered.
+    async fn route_messages_count_tokens_impl(
+        &self,
+        body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        let model_id = self.resolve_canonical_model_id(model_id);
+        // A model nobody serves is the client's mistake (404), whatever a
+        // removed worker left in the tokenizer registry; a served model with
+        // no tokenizer is a gateway fault (500).
+        if !self.worker_registry.contains_model(&model_id) {
+            return error::model_not_found(&model_id);
+        }
+        let Some(tokenizer) = self.shared_components.tokenizer_registry.get(&model_id) else {
+            return error::internal_error(
+                "tokenizer_not_found",
+                format!("Tokenizer not found for model: {model_id}"),
+            );
+        };
+        let tools = message_utils::template_tools(body.tools.as_deref(), body.tool_choice.as_ref());
+        let media = match message_utils::resolve_messages_media(
+            &self.shared_components,
+            &model_id,
+            &*tokenizer,
+            &body.messages,
+        )
+        .await
+        {
+            Ok(media) => media,
+            Err(refused) => return refused,
+        };
+        match message_utils::count_input_tokens(
+            &body,
+            tokenizer,
+            &tools,
+            media.placeholders(),
+            media.media_order,
+        )
+        .await
+        {
+            Ok(input_tokens) => (
+                StatusCode::OK,
+                Json(CountMessageTokensResponse { input_tokens }),
+            )
+                .into_response(),
+            Err(message_utils::CountError::Render(e)) => {
+                debug!(model = %model_id, error = %e, "count_tokens: the request does not render");
+                error::bad_request("process_messages_failed", e)
+            }
+            Err(message_utils::CountError::Encode(e)) => {
+                tracing::error!(model = %model_id, error = %e, "count_tokens: tokenization failed");
+                error::internal_error("tokenization_failed", format!("Tokenization failed: {e}"))
+            }
+        }
     }
 
     /// Main route_completion implementation
@@ -764,6 +824,16 @@ impl RouterTrait for GrpcRouter {
             .await
     }
 
+    async fn route_messages_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_messages_count_tokens_impl(body, model_id).await
+    }
+
     fn router_type(&self) -> &'static str {
         self.mode.router_type()
     }
@@ -818,6 +888,12 @@ mod pd_tests {
         tenant::TenantKey,
         worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
     };
+
+    fn regular_routing_mode() -> RoutingMode {
+        RoutingMode::Regular {
+            worker_urls: vec![],
+        }
+    }
 
     fn pd_routing_mode() -> RoutingMode {
         RoutingMode::PrefillDecode {
@@ -887,6 +963,90 @@ mod pd_tests {
 
     fn responses_request(model: &str) -> ResponsesRequest {
         serde_json::from_value(json!({"model": model, "input": "hi"})).expect("responses request")
+    }
+
+    fn count_request(model: &str) -> CountMessageTokensRequest {
+        serde_json::from_value(json!({
+            "model": model, "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("count request")
+    }
+
+    /// count_tokens is the router's own answer, from the registry's
+    /// tokenizer: the rendered prompt's token count for a served model (here
+    /// a renderer that encodes itself hands back three ids), the 404
+    /// model_not_found for a model nobody serves. No worker takes part.
+    #[tokio::test]
+    async fn count_tokens_is_answered_from_the_tokenizer() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("m", "m", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("json"),
+            json!({"input_tokens": 3})
+        );
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("nope"), "nope")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+    }
+
+    /// A tokenizer a removed worker left in the registry does not make its
+    /// model served: the count is refused as an unknown model, like every
+    /// other route refuses it.
+    #[tokio::test]
+    async fn count_tokens_refuses_a_model_no_worker_serves_whatever_the_tokenizer_registry_holds() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("gone", "gone", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("gone"), "gone")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "model_not_found"
+        );
     }
 
     /// PD-mode completion must honor a per-model retry override, not the router

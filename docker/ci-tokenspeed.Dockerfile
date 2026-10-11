@@ -42,7 +42,7 @@ RUN bash scripts/ci_apt_mirror.sh \
         python3 python3-dev python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/ci_install_flashinfer.py scripts/ci_ensure_python_headers.sh scripts/
+COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/ci_tokenspeed_scheduler_pin.py scripts/ci_install_flashinfer.py scripts/ci_ensure_python_headers.sh scripts/
 COPY .github/versions/tokenspeed.ref .github/versions/tokenspeed.ref
 
 ARG TOKENSPEED_VERSION

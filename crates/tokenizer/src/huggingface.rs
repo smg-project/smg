@@ -745,6 +745,17 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         }
     }
 
+    fn prefill_opens_think_block(&self) -> bool {
+        match self.renderer {
+            // The native renderers all report a thinking switch, so this flag
+            // (read only for a switchless template) mirrors `think_in_prefill`.
+            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => {
+                self.think_in_prefill()
+            }
+            Renderer::Jinja => self.chat_template.prefill_opens_think_block(),
+        }
+    }
+
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         match self.renderer {
             // The V4.1 shim honours the engine's `enable_thinking` alias, renders a

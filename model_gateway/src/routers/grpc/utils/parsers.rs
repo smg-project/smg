@@ -117,12 +117,17 @@ impl ParserResolver {
 ///
 /// `user_thinking`: `Some(true)` = user enabled thinking, `Some(false)` = user
 /// disabled it, `None` = not specified (use template default).
+///
+/// A template without a switch cannot turn thinking off, whatever the request
+/// asks: when its generation prompt opens the think block (GLM-5.3), the
+/// completion starts inside it and the parser must start there too, or the
+/// reasoning streams as content.
 pub fn should_mark_reasoning_started(
     user_thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
     match tokenizer.thinking_toggle() {
-        ThinkingToggle::None => false,
+        ThinkingToggle::None => tokenizer.prefill_opens_think_block(),
         ThinkingToggle::DefaultOn => user_thinking != Some(false),
         ThinkingToggle::DefaultOff => user_thinking == Some(true),
     }
@@ -496,6 +501,43 @@ pub(crate) fn create_tool_parser(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_without_a_switch_starts_in_reasoning_when_its_prompt_opens_the_think_block() {
+        use llm_tokenizer::MockTokenizer;
+        // GLM-5.3: no thinking switch, the generation prompt ends in `<think>`.
+        // No request field can switch thinking off, so none may disarm the parser.
+        let always_thinks = MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::None)
+            .with_think_in_prefill(true);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(
+                should_mark_reasoning_started(user_thinking, &always_thinks),
+                "{user_thinking:?}"
+            );
+        }
+        // A non-thinking template without a switch writes an empty, closed
+        // think block: the tag is in the prefill, nothing is open.
+        let closed_block = MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::None)
+            .with_think_in_prefill(true)
+            .with_prefill_opens_think_block(false);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(
+                !should_mark_reasoning_started(user_thinking, &closed_block),
+                "{user_thinking:?}"
+            );
+        }
+        // A template without a switch that leaves the think block to the model
+        // starts in content mode, as before.
+        let never_prefills = MockTokenizer::new().with_thinking_toggle(ThinkingToggle::None);
+        for user_thinking in [None, Some(true), Some(false)] {
+            assert!(!should_mark_reasoning_started(
+                user_thinking,
+                &never_prefills
+            ));
+        }
+    }
 
     #[test]
     fn resolve_thinking_pref_precedence() {

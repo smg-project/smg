@@ -240,6 +240,16 @@ pub trait Tokenizer: Encoder + Decoder {
         false
     }
 
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close, so a completion starts inside reasoning. Stricter than
+    /// `think_in_prefill`: a template that writes an empty, closed
+    /// `<think></think>` (a non-thinking template) injects the tag but opens
+    /// nothing. Arms the reasoning parser of a template without a thinking
+    /// switch.
+    fn prefill_opens_think_block(&self) -> bool {
+        self.think_in_prefill()
+    }
+
     /// Renderer behaviours the gateway mirrors when it prepares a request.
     fn renderer_capabilities(&self) -> RendererCapabilities {
         RendererCapabilities::default()

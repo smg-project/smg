@@ -124,12 +124,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "k2-horizon-36b/render/tools-schema-with-defs",
-        "the template merges a tool's `$defs` into its parameters with `dict()` over a list of \
-         (key, value) pairs, which the gateway's template engine does not accept, so the \
-         render fails (smg-project/smg-lab#119)",
-    ),
-    (
         "laguna-xs.2/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -166,6 +160,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "lfm2.5-1.2b-instruct/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "llava-1.5-7b-hf/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and appending \
+         its text after the generation header, which does not reproduce this template's \
+         continued turn (smg-project/smg#2779)",
     ),
     (
         "llava-1.5-7b-hf/render/no-generation-prompt",
@@ -218,6 +218,49 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "olmo-3-7b-instruct/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "phi-4-multimodal-instruct/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "phi-4-multimodal-instruct/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
+    ),
+    (
+        "qwen-agentworld-35b-a3b/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "qwen-agentworld-35b-a3b/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen-agentworld-35b-a3b/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "qwen-drive-1.0-4b/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "qwen-drive-1.0-4b/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen-drive-1.0-4b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
@@ -289,12 +332,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "qwen3-omni-30b-a3b-thinking/render/continue-final-message",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779)",
     ),
     (
         "qwen3-omni-30b-a3b-thinking/render/no-generation-prompt",
@@ -866,30 +903,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "phi-4-multimodal-instruct/render/*",
-        "the reference's ids follow transformers' GPT2Tokenizer pattern (contractions, digit \
-         runs and punctuation split as GPT-2 does) where tokenizer.json carries an \
-         o200k-style regex (smg-project/smg-lab#102); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
-    ),
-    (
-        "qwen-agentworld-35b-a3b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
-    ),
-    (
-        "qwen-drive-1.0-4b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
-    ),
-    (
         "qwen2.5-7b-instruct-1m/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -1167,6 +1180,11 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
+        "qwen3-omni-30b-a3b-thinking/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the engines \
+         do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
         "qwen3-vl-235b-a22b-thinking/render/continue-final-message",
         "the gateway renders continue_final_message by popping the assistant turn and \
          appending its text after the generation header, which does not reproduce this \
@@ -1195,6 +1213,11 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
+        "qwen3-vl-30b-a3b-instruct/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the engines \
+         do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
         "qwen3-vl-8b-instruct/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
@@ -1204,6 +1227,11 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
+    ),
+    (
+        "qwen3-vl-8b-instruct/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the engines \
+         do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "qwen3-vl-8b-thinking/render/continue-final-message",
@@ -1223,20 +1251,30 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "qwen3.5-27b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
+        "qwen3.5-27b/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
     ),
     (
-        "qwen3.5-2b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
+        "qwen3.5-27b/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3.5-27b/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "qwen3.5-2b/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3.5-2b/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "qwen3.5-35b-a3b/render/continue-final-message",
@@ -1255,12 +1293,20 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3.5-9b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
+        "qwen3.5-9b/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "qwen3.5-9b/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3.5-9b/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "qwen3.6-27b/render/continue-final-message",
@@ -1295,12 +1341,20 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3.8-2.4t-a95b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
+        "qwen3.8-2.4t-a95b/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "qwen3.8-2.4t-a95b/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3.8-2.4t-a95b/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "qwen3.8-27b/render/continue-final-message",
@@ -1319,12 +1373,20 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "qwen3.8-flash-next/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
+        "qwen3.8-flash-next/render/continue-final-message",
+        "the gateway renders continue_final_message by popping the assistant turn and \
+         appending its text after the generation header, which does not reproduce this \
+         template's continued turn (smg-project/smg#2779)",
+    ),
+    (
+        "qwen3.8-flash-next/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "qwen3.8-flash-next/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "qwen3guard-gen-0.6b/render/continue-final-message",
@@ -1433,12 +1495,15 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
-        "tinyllama-1.1b-chat-v1.0/render/*",
-        "the reference's ids follow transformers' LlamaTokenizer with legacy=false, which \
-         prepends the dummy space once per input where tokenizer.json's normalizer prepends \
-         it per segment (smg-project/smg-lab#104); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump removes this entry; the model's other \
-         render differences are listed again once the pin moves",
+        "tinyllama-1.1b-chat-v1.0/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "tinyllama-1.1b-chat-v1.0/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template has no \
+         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
+         template run keeps or drops the role",
     ),
     (
         "trinity-mini/render/continue-final-message",
