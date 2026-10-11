@@ -129,7 +129,7 @@ aliases is an open question of the design.
 
 <!-- models: begin -->
 78 groups, 107 checkpoints, newest first.
-25 ready, 29 replaying a recorded set, 0 on main awaiting fixtures, 24 pending.
+25 ready, 30 replaying a recorded set, 0 on main awaiting fixtures, 23 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -177,7 +177,7 @@ aliases is an open question of the design.
 | 2025-10-11 | [qwen3-vl-8b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-8b-thinking) | Qwen/Qwen3-VL-8B-Thinking | Qwen3-VL-2B-Thinking, Qwen3-VL-4B-Thinking, Qwen3-VL-32B-Thinking | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-30 | [qwen3-4b-saferl](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-4b-saferl) | Qwen/Qwen3-4B-SafeRL |  | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-30 | [qwen3-vl-30b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-30b-a3b-instruct) | Qwen/Qwen3-VL-30B-A3B-Instruct | Qwen3-VL-235B-A22B-Instruct | `qwen3` | 41,533 | ready | `qwen`, `qwen3` |
-| 2025-09-29 | [glm-4.6](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6) | zai-org/GLM-4.6 |  | — | — | pending | `glm45_moe`, none |
+| 2025-09-29 | [glm-4.6](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6) | zai-org/GLM-4.6 |  | `glm4` | 43,309 | replaying the set | `glm45_moe`, none |
 | 2025-09-23 | [qwen3guard-gen-0.6b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3guard-gen-0.6b) | Qwen/Qwen3Guard-Gen-0.6B | Qwen3Guard-Gen-4B, Qwen3Guard-Gen-8B | — | — | pending | `qwen`, `qwen3` |
 | 2025-09-22 | [qwen3-vl-235b-a22b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-235b-a22b-thinking) | Qwen/Qwen3-VL-235B-A22B-Thinking | Qwen3-VL-30B-A3B-Thinking | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-20 | [qwen3-omni-30b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-omni-30b-a3b-instruct) | Qwen/Qwen3-Omni-30B-A3B-Instruct |  | `qwen3` | 54,418 | replaying the set | `qwen`, `qwen3` |

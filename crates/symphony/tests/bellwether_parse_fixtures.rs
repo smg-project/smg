@@ -76,8 +76,8 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
-        qwen3, seed_oss, xlam,
+        deepseek_v4_1, glm, glm4, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain,
+        qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -437,6 +437,14 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Glm,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    // GLM 4.5 and 4.6 write Ling's newlines under GLM's turn opener, and the model writes its own
+    // `<think>`; the template closes an empty thought in the prompt only when the request turns
+    // thinking off (as `\n<think></think>`; the tail's newlines are not read, its markers are).
+    (
+        "glm-4.6",
+        Family::Glm4,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     (
         "iquest-q1",
         Family::IQuest,
@@ -506,11 +514,13 @@ enum Family {
     DeepSeekV4_1,
     /// [`seed_oss`]: the tagged syntax under Seed-OSS's markers, typed by the request tools.
     SeedOss,
-    /// [`hy4`], [`ling`], [`iquest`], [`glm`]: keyed arguments, typed by the request tools.
+    /// [`hy4`], [`ling`], [`iquest`], [`glm`], [`glm4`]: keyed arguments, typed by the request
+    /// tools.
     Hy4,
     Ling,
     IQuest,
     Glm,
+    Glm4,
     /// [`olmo3`], [`lfm2_5`]: Python calls.
     Olmo3,
     Lfm2_5,
@@ -558,6 +568,7 @@ impl Family {
             Self::Hy4 => hy4(),
             Self::Ling => ling(),
             Self::Glm => glm(),
+            Self::Glm4 => glm4(),
             Self::IQuest => iquest(),
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
@@ -584,7 +595,7 @@ impl Family {
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
             // but not `<tool_call>`.
-            Self::Ling | Self::Glm => KNOWN_TAGGED_DIFFERENCES,
+            Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
@@ -787,6 +798,9 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
         "qwen3.8-2.4t-a95b",
         "parse/content-with-marker-in-code-fence",
     ),
+    // bellwether's reference refuses the reasoning probe for its template: twelve of the sixteen
+    // common cases are recorded, and that one is not among them.
+    ("glm-4.6", "parse/reasoning-with-marker-text"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker

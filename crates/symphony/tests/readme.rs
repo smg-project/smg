@@ -8,8 +8,8 @@ use std::{fmt::Write as _, fs, path::PathBuf};
 
 use symphony::{
     formats::{
-        deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
-        qwen3, seed_oss, xlam,
+        deepseek_v4_1, glm, glm4, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain,
+        qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Format,
@@ -66,6 +66,7 @@ enum Table {
     MinimaxM3,
     KimiK3,
     Glm,
+    Glm4,
     Plain,
 }
 
@@ -88,6 +89,7 @@ impl Table {
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
             Self::Glm => glm(),
+            Self::Glm4 => glm4(),
             Self::Plain => plain(),
         }
     }
@@ -230,9 +232,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2025-09-29",
         smg: (Some("glm45_moe"), None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Glm4),
+        set: Some(43_309),
+        status: Status::Replaying,
     },
     Group {
         slug: "glm-4.7-flash",
