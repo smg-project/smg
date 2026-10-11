@@ -1562,6 +1562,7 @@ impl WorkerRegistry {
         let transition = match candidate_status {
             Some(new_status) if new_status != old_status => {
                 worker.set_status(new_status);
+                Self::on_status_changed(&worker, new_status);
                 let _ = self.event_tx.send(WorkerEvent::StatusChanged {
                     worker_id: worker_id.clone(),
                     worker: worker.clone(),
@@ -2357,6 +2358,32 @@ impl WorkerRegistry {
         })
     }
 
+    /// What goes with a status change besides the status. Shared by
+    /// [`Self::transition_status_inner`] (connect signals, admin paths) and
+    /// [`Self::apply_if_revision`] (the health probes), so a worker comes
+    /// back the same way whichever of the two promoted it.
+    fn on_status_changed(worker: &Arc<dyn Worker>, new_status: WorkerStatus) {
+        if new_status != WorkerStatus::Ready {
+            return;
+        }
+        // The warm-up slice (cache_aware) counts from here.
+        worker.note_admitted();
+        // A worker promoted to Ready does not wait out its circuit breaker's
+        // timeout: the failures that opened the breaker belong to the outage
+        // its probes just saw end. The breaker goes half-open now, so the
+        // worker takes traffic at once, closes on the usual success threshold
+        // and reopens on the first failure if the engine is not back after
+        // all. A flapping engine gets one trial per promotion, and the next
+        // promotion costs it a full demotion first.
+        if worker.circuit_breaker_try_half_open() {
+            tracing::info!(
+                worker_url = %worker.url(),
+                "Circuit breaker put on trial: the worker's health returned"
+            );
+            Metrics::record_worker_cb_health_readmission(worker.url());
+        }
+    }
+
     /// Shared backend for [`Self::transition_status`] and
     /// [`Self::transition_status_if_revision`]. Holds the per-worker
     /// mutation lock for the full read-modify-emit sequence.
@@ -2384,16 +2411,7 @@ impl WorkerRegistry {
         }
 
         worker.set_status(new_status);
-        if new_status == WorkerStatus::Ready {
-            // The warm-up slice (cache_aware) counts from here.
-            worker.note_admitted();
-            // A worker promoted back from a demotion returns with a closed
-            // circuit breaker: the failures that opened it belong to the
-            // outage its probes just ended.
-            if matches!(old_status, WorkerStatus::NotReady | WorkerStatus::Failed) {
-                worker.reset_circuit_breaker();
-            }
-        }
+        Self::on_status_changed(&worker, new_status);
 
         let _ = self.event_tx.send(WorkerEvent::StatusChanged {
             worker_id: worker_id.clone(),
@@ -2611,6 +2629,103 @@ mod tests {
             disable_health_check: true,
             ..Default::default()
         }
+    }
+
+    /// A worker whose breaker opens on one failed request and would stay
+    /// open for an hour on its own.
+    fn worker_with_a_hair_trigger_breaker() -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    success_threshold: 1,
+                    timeout_duration: std::time::Duration::from_secs(3600),
+                    window_duration: std::time::Duration::from_secs(3600),
+                })
+                .build(),
+        )
+    }
+
+    /// The two promotion paths, `apply_if_revision` (the health probes) and
+    /// `transition_status` (connect signals), both put a promoted worker's
+    /// open circuit breaker on trial: a worker whose health returned is
+    /// routable at once, not at the breaker's timeout.
+    #[test]
+    fn a_promotion_to_ready_puts_an_open_circuit_breaker_on_trial() {
+        for by_probe in [true, false] {
+            let registry = WorkerRegistry::new();
+            let worker = worker_with_a_hair_trigger_breaker();
+            let worker_id = registry.register(worker.clone()).unwrap();
+
+            // The outage: a request fails, the breaker opens, the probes demote.
+            worker.record_outcome(503);
+            assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(
+                registry.transition_status(&worker_id, WorkerStatus::NotReady),
+                Some((WorkerStatus::Ready, WorkerStatus::NotReady))
+            );
+            assert!(!worker.is_available());
+
+            // The return, by either path.
+            let transition = if by_probe {
+                registry
+                    .apply_if_revision(&worker_id, worker.revision(), |_| {
+                        ((), Some(WorkerStatus::Ready))
+                    })
+                    .and_then(|((), transition)| transition)
+            } else {
+                registry.transition_status(&worker_id, WorkerStatus::Ready)
+            };
+            assert_eq!(
+                transition,
+                Some((WorkerStatus::NotReady, WorkerStatus::Ready)),
+                "by_probe={by_probe}"
+            );
+            assert_eq!(
+                worker.circuit_breaker_state(),
+                CircuitState::HalfOpen,
+                "by_probe={by_probe}: the promotion puts the open breaker on trial"
+            );
+            assert!(worker.is_available(), "by_probe={by_probe}");
+        }
+    }
+
+    /// A flapping engine: its probes pass, so it is promoted and its breaker
+    /// goes on trial; the first failed request reopens the breaker, and
+    /// nothing short of another demotion and promotion (or the breaker's own
+    /// timeout) starts another trial.
+    #[test]
+    fn a_breaker_reopened_during_the_trial_waits_for_the_next_promotion() {
+        let registry = WorkerRegistry::new();
+        let worker = worker_with_a_hair_trigger_breaker();
+        let worker_id = registry.register(worker.clone()).unwrap();
+        worker.record_outcome(503);
+        registry.transition_status(&worker_id, WorkerStatus::NotReady);
+        registry.transition_status(&worker_id, WorkerStatus::Ready);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        // The trial fails.
+        worker.record_outcome(503);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert!(!worker.is_available());
+
+        // Passing probes on a Ready worker are no promotion: no new trial.
+        assert_eq!(
+            registry.apply_if_revision(&worker_id, worker.revision(), |_| {
+                ((), Some(WorkerStatus::Ready))
+            }),
+            Some(((), None))
+        );
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert!(!worker.is_available());
+
+        // The next demotion and promotion earn the next trial.
+        registry.transition_status(&worker_id, WorkerStatus::NotReady);
+        registry.transition_status(&worker_id, WorkerStatus::Ready);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        assert!(worker.is_available());
     }
 
     fn worker_with_sampling_defaults(

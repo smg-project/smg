@@ -1375,8 +1375,8 @@ mod tests {
 
     use super::*;
     use crate::worker::{
-        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry,
-        WorkerType,
+        circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker,
+        WorkerError, WorkerRegistry, WorkerType,
     };
 
     fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -1400,6 +1400,53 @@ mod tests {
             default_check_interval_secs: 5,
             remove_unhealthy: false,
         }
+    }
+
+    /// The probes promote a demoted worker through `apply_probe_completion`,
+    /// not through `transition_status`: that path has to put the worker's
+    /// open circuit breaker on trial too, or a restarted engine is Ready and
+    /// still unroutable until the breaker's timeout.
+    #[tokio::test]
+    async fn a_passing_probe_run_readmits_a_demoted_worker_with_its_breaker_on_trial() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 1, 1);
+        let worker_id = registry.register(worker.clone()).unwrap();
+        worker.set_status(WorkerStatus::Ready);
+
+        // The engine died: its requests failed until the breaker opened, and
+        // the probes demoted it.
+        for _ in 0..8 {
+            worker.record_circuit_breaker_outcome(false);
+        }
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        worker.set_status(WorkerStatus::NotReady);
+        assert!(!worker.is_available());
+
+        // The engine is back on the same address: the first passing probe
+        // (success threshold 1) promotes the worker.
+        let completion = ProbeCompletion {
+            worker_id,
+            worker: worker.clone(),
+            expected_revision: worker.revision(),
+            launched_status: WorkerStatus::NotReady,
+            health_config: worker.metadata().health_config.clone(),
+            probe_result: Ok(()),
+        };
+        let applied = apply_probe_completion(&registry, completion, None).await;
+        assert!(matches!(
+            applied,
+            ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
+        ));
+        assert_eq!(worker.status(), WorkerStatus::Ready);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the promotion puts the open breaker on trial instead of leaving it to its timeout"
+        );
+        assert!(
+            worker.is_available(),
+            "a worker promoted by its probes is routable at once"
+        );
     }
 
     fn make_zmq_worker(url: &str) -> Arc<dyn Worker> {

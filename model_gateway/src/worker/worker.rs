@@ -652,6 +652,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// failures like any closed breaker.
     fn reset_circuit_breaker(&self) {}
 
+    /// Put the worker's open circuit breaker on trial (half-open) now, as
+    /// its timeout would, because the worker's health has returned. Returns
+    /// whether the breaker moved; a worker without a breaker never moves.
+    fn circuit_breaker_try_half_open(&self) -> bool {
+        false
+    }
+
     /// Record that the worker just became routable (promotion to Ready, or a
     /// liveness veto cleared); the warm-up slice counts from here.
     fn note_admitted(&self) {}
@@ -2464,6 +2471,10 @@ impl Worker for BasicWorker {
 
     fn reset_circuit_breaker(&self) {
         self.circuit_breaker.load().reset();
+    }
+
+    fn circuit_breaker_try_half_open(&self) -> bool {
+        self.circuit_breaker.load().try_half_open()
     }
 
     fn note_admitted(&self) {

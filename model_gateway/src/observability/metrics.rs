@@ -678,6 +678,11 @@ pub(crate) fn init_metrics() {
         "smg_worker_cb_consecutive_successes",
         "Current consecutive success count per worker"
     );
+    describe_counter!(
+        "smg_worker_cb_health_readmissions_total",
+        "Times a worker's open circuit breaker went half-open because the worker's health \
+         returned (its promotion to Ready) rather than at the breaker's timeout, by worker"
+    );
 
     // Layer 3: Worker resilience metrics (retry)
     describe_counter!(
@@ -2321,6 +2326,28 @@ impl Metrics {
             "outcome" => outcome
         )
         .increment(1);
+    }
+
+    /// Record an open circuit breaker put on trial (half-open) by the
+    /// worker's return to health rather than by its timeout.
+    pub fn record_worker_cb_health_readmission(worker: &str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_health_readmissions_total",
+            "worker" => worker_interned
+        )
+        .increment(1);
+    }
+
+    /// Publish the health-readmission counter at zero, so the series exists
+    /// before the worker's first return.
+    pub fn init_worker_cb_health_readmissions(worker: &str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_health_readmissions_total",
+            "worker" => worker_interned
+        )
+        .absolute(0);
     }
 
     /// Set circuit breaker consecutive failures
