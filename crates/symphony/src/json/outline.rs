@@ -432,6 +432,25 @@ mod tests {
     }
 
     #[test]
+    fn inklings_args_names_the_arguments_for_every_syntax_that_reads_the_outline() {
+        // `args` is Inkling's spelling, and the outline is shared, so a JSON call of any family
+        // written with it has its arguments; the members are read in their order, so the first
+        // member named for the arguments is the arguments.
+        let text = r#"{"name": "f", "args": {"a": 1}}"#;
+        let found = outline(text);
+        assert_eq!(found.name.as_deref(), Some("f"));
+        assert_eq!(
+            found.arguments.expect("arguments").text(text),
+            r#"{"a": 1}"#
+        );
+        let text = r#"{"name": "f", "arguments": {"a": 1}, "args": {"b": 2}}"#;
+        assert_eq!(
+            outline(text).arguments.expect("arguments").text(text),
+            r#"{"a": 1}"#
+        );
+    }
+
+    #[test]
     fn string_number_and_literal_arguments_end_where_json_says() {
         let text = r#"{"name": "f", "arguments": "{\"a\": 1}"}"#;
         assert_eq!(

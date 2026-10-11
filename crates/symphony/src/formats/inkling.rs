@@ -1,13 +1,13 @@
 //! Inkling: a turn of messages, each opened by `<|message_model|>` and closed by `<|end_message|>`,
 //! and what a message is comes after its opener: `<|content_thinking|>` makes it the thought,
 //! `<|content_text|>` the answer, and a tool's name followed by `<|content_invoke_tool_json|>` a
-//! call, written as one JSON object `{"name": …, "args": {…}}`. The template writes an empty answer
-//! (`<|content_text|><|end_message|>`) before the calls when the turn has none, and every message
-//! of a turn in its own `<|message_model|>`. The generation prompt is `<|message_model|>` alone,
-//! whatever the request says: the template has no thinking switch (a system message carries the
-//! `reasoning_effort`), so the output starts where a message's kind is said, and the model writes
-//! the thought or not. Everything the markers do not frame is the message's text. Recorded as
-//! `inkling` (thinkingmachines/Inkling).
+//! call, written as one JSON object `{"name": …, "args": {…}}`. The template writes an empty
+//! answer (`<|content_text|><|end_message|>`) before the calls when the turn has none, and every
+//! message of a turn in its own `<|message_model|>`. The generation prompt is `<|message_model|>`
+//! alone, whatever the request says: the template has no thinking switch (a system message carries
+//! the `reasoning_effort`), so the output starts where a message's kind is said, and the model
+//! writes the thought or not. Everything the markers do not frame is the message's text. Recorded
+//! as `inkling` (thinkingmachines/Inkling).
 //!
 //! What the table says beyond the others:
 //!
@@ -23,7 +23,11 @@
 //!   start inside the first message, before any opener, which the derivation does not write yet.
 //!
 //! What the table leaves out, for want of fixtures: image and audio messages, which the template
-//! writes for the user and never for the model.
+//! writes for the user and never for the model; and the text-mode invocation,
+//! `<|content_invoke_tool_text|>`, which the gateway's older Inkling parsers drop as protocol
+//! data. No recorded set holds one. The table has no terminal for it, so such a message sits in
+//! the named-JSON header until `<|end_message|>` and comes back whole as `Malformed` (a name
+//! without a call), no byte lost; a recording of one decides what it is.
 
 use crate::format::{CallSyntax, Emits, Format};
 

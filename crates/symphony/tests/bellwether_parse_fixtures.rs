@@ -1019,9 +1019,6 @@ impl Said {
         }
     }
 
-    /// The same, with the separator bytes trimmed from content and reasoning (bellwether #17). The
-    /// template's separators are newlines, so only newlines are trimmed: any other whitespace the
-    /// parser kept or lost still counts as a difference.
     /// Whether `other` says the same, the calls' arguments compared as JSON values: a template that
     /// re-serializes the arguments (Inkling's `tojson(sort_keys=true, separators=(",", ":"))`)
     /// writes the keys sorted and the spaces dropped, and the parser hands on what the model
@@ -1039,6 +1036,9 @@ impl Said {
             )
     }
 
+    /// The same, with the separator bytes trimmed from content and reasoning (bellwether #17). The
+    /// template's separators are newlines, so only newlines are trimmed: any other whitespace the
+    /// parser kept or lost still counts as a difference.
     fn trimmed(&self) -> Self {
         let trim = |part: &Option<String>| {
             part.as_deref()

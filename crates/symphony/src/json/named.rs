@@ -69,8 +69,17 @@ impl Assembler {
         if let Some(object) = &mut self.object {
             return object.feed(bytes, out);
         }
+        // The marker can only end inside the new bytes, so the search starts `marker.len() - 1`
+        // bytes before them (at a character boundary): a header that never meets the marker
+        // costs each piece its own length, not the header's.
+        let before = self.header.len();
         self.header.push_str(bytes);
-        let Some(at) = self.header.find(self.marker) else {
+        let from = before.saturating_sub(self.marker.len() - 1);
+        let from = (0..=from)
+            .rev()
+            .find(|&at| self.header.is_char_boundary(at))
+            .unwrap_or(0);
+        let Some(at) = self.header[from..].find(self.marker).map(|at| from + at) else {
             return bytes.len();
         };
         // The marker ends inside this piece, so what follows it is this piece's too.
@@ -201,6 +210,28 @@ mod tests {
         assert_eq!(bytes(&events), pieces.concat());
         assert_eq!(arguments(&events), "{\"city\":\"Paris\"}");
         assert!(matches!(events.last(), Some(Event::ToolCallEnd { .. })));
+    }
+
+    #[test]
+    fn a_long_header_fed_a_byte_at_a_time_reads_as_it_does_whole() {
+        // The search for the marker covers the new bytes and the marker's length before them, so
+        // a long name costs each piece its own length; the result is the same as fed whole, the
+        // marker found whether it arrives in one piece or split anywhere.
+        let name = "n".repeat(4_000);
+        let call = format!("{name}{MARKER}{{\"name\":\"n\",\"args\":{{}}}}");
+        let (whole, taken_whole) = run(&[&call], false);
+        let pieces: Vec<&str> = call
+            .char_indices()
+            .map(|(at, c)| &call[at..at + c.len_utf8()])
+            .collect();
+        let (one_at_a_time, taken) = run(&pieces, false);
+        assert_eq!(bytes(&one_at_a_time), bytes(&whole));
+        assert_eq!(taken, taken_whole);
+        // A multibyte name with the marker split in two: the search never lands inside a character.
+        let call = format!("héé{MARKER}{{\"name\":\"h\",\"args\":{{}}}}");
+        let split = 3 + MARKER.len() / 2;
+        let (events, _) = run(&[&call[..split], &call[split..]], false);
+        assert_eq!(bytes(&events), call);
     }
 
     #[test]

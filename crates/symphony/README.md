@@ -51,7 +51,7 @@ and a client that wants the raw text back can have it.
 | `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
-| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `plain()`. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
@@ -59,7 +59,7 @@ and a client that wants the raw text back can have it.
 
 ### The modules
 
-- `format`, `formats`: the table type and the seventeen tables. A table is data, read by the engine
+- `format`, `formats`: the table type and the eighteen tables. A table is data, read by the engine
   and by the grammar derivation alike; it says what the template writes and nothing about how to
   parse it.
 - `engine`, `markers`, `tokens`: the engine, its scanner and its token ledger.
@@ -129,7 +129,7 @@ aliases is an open question of the design.
 
 <!-- models: begin -->
 78 groups, 107 checkpoints, newest first.
-32 ready, 26 replaying a recorded set, 0 on main awaiting fixtures, 20 pending.
+32 ready, 27 replaying a recorded set, 0 on main awaiting fixtures, 19 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -147,7 +147,7 @@ aliases is an open question of the design.
 | 2026-08-05 | [qwen3.8-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-27b) | Qwen/Qwen3.8-27B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
 | 2026-08-02 | [ling-3.0-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/ling-3.0-flash) | inclusionAI/Ling-3.0-flash |  | `ling` | 54,195 | replaying the set | none |
 | 2026-07-21 | [nanbeige4.2-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/nanbeige4.2-3b) | Nanbeige/Nanbeige4.2-3B |  | `qwen3`, tagged calls | 54,195 | replaying the set | none |
-| 2026-07-14 | [inkling](https://github.com/smg-project/bellwether/tree/main/fixtures/inkling) | thinkingmachines/Inkling |  | — | — | pending | `inkling`, `inkling` |
+| 2026-07-14 | [inkling](https://github.com/smg-project/bellwether/tree/main/fixtures/inkling) | thinkingmachines/Inkling |  | `inkling` | 54,418 | replaying the set | `inkling`, `inkling` |
 | 2026-06-22 | [qwen-agentworld-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-agentworld-35b-a3b) | Qwen/Qwen-AgentWorld-35B-A3B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen`, `qwen3` |
 | 2026-06-13 | [kimi-k3](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k3) | moonshotai/Kimi-K3 |  | `kimi_k3` | 54,418 | ready | `kimi_k3`, `kimi_k3` |
 | 2026-06-02 | [minimax-m3](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m3) | MiniMaxAI/MiniMax-M3 |  | `minimax_m3` | 54,180 | replaying the set | `minimax_m3`, `minimax_m3` |
