@@ -451,9 +451,16 @@ class GrpcRequestManager:
             self._cleanup_request_state(request_id)
 
     def _cleanup_request_state(self, request_id: str):
-        """Clean up local request state (does not notify scheduler)."""
-        if request_id in self.rid_to_state:
-            del self.rid_to_state[request_id]
+        """Drop the request's local state (the scheduler is not notified) and,
+        when no terminal output finished its time stats, finish them here: the
+        client cancelled mid-stream, the scheduler refused or aborted the
+        request, or the dispatch failed. The finish ends the request's root
+        trace span and the slices still open under it, as the terminal output
+        would have; a span left open never reaches the collector and keeps the
+        request's trace context alive."""
+        state = self.rid_to_state.pop(request_id, None)
+        if state is not None and not state.time_stats.finished_time:
+            state.time_stats.set_finished_time()
 
     async def embedding_request(
         self,
@@ -482,7 +489,7 @@ class GrpcRequestManager:
             await self._send_to_scheduler(obj)
             state.time_stats.set_api_server_dispatch_finish_time()
         except Exception as e:
-            del self.rid_to_state[request_id]
+            self._cleanup_request_state(request_id)
             future.set_exception(e)
             return future
 
@@ -495,9 +502,7 @@ class GrpcRequestManager:
             except Exception as e:
                 future.set_exception(e)
             finally:
-                # Clean up
-                if request_id in self.rid_to_state:
-                    del self.rid_to_state[request_id]
+                self._cleanup_request_state(request_id)
 
         asyncio.create_task(wait_for_result())
         return future
