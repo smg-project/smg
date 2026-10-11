@@ -20,6 +20,9 @@
 //! blocks whose argument tags name each value's type.
 //! [`inkling()`] is Inkling: a turn of messages, each saying what it is after its opener, a call
 //! as the tool's name, a marker and one JSON object.
+//! [`minicpm5()`] is MiniCPM5: `<think>` blocks and, with no block around them, `<function
+//! name="…">` calls of `<param name="…">` tags, a value a CDATA section when it holds `<`, `&` or
+//! a newline.
 //! [`plain()`] is the table for a template that writes the message's content and nothing else: one
 //! state, no marker.
 //!
@@ -36,6 +39,7 @@ pub mod k2_horizon;
 pub mod kimi_k3;
 pub mod lfm2_5;
 pub mod ling;
+pub mod minicpm5;
 pub mod minimax_m2;
 pub mod minimax_m3;
 pub mod olmo3;
@@ -55,6 +59,7 @@ pub use k2_horizon::k2_horizon;
 pub use kimi_k3::kimi_k3;
 pub use lfm2_5::lfm2_5;
 pub use ling::ling;
+pub use minicpm5::minicpm5;
 pub use minimax_m2::minimax_m2;
 pub use minimax_m3::minimax_m3;
 pub use olmo3::olmo3;

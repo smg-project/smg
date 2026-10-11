@@ -51,7 +51,7 @@ and a client that wants the raw text back can have it.
 | `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
-| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `plain()`. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
@@ -59,7 +59,7 @@ and a client that wants the raw text back can have it.
 
 ### The modules
 
-- `format`, `formats`: the table type and the eighteen tables. A table is data, read by the engine
+- `format`, `formats`: the table type and the nineteen tables. A table is data, read by the engine
   and by the grammar derivation alike; it says what the template writes and nothing about how to
   parse it.
 - `engine`, `markers`, `tokens`: the engine, its scanner and its token ledger.
@@ -129,13 +129,13 @@ aliases is an open question of the design.
 
 <!-- models: begin -->
 78 groups, 107 checkpoints, newest first.
-53 ready, 6 replaying a recorded set, 0 on main awaiting fixtures, 19 pending.
+54 ready, 6 replaying a recorded set, 0 on main awaiting fixtures, 18 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
 | 2026-09-28 | [iquest-q1](https://github.com/smg-project/bellwether/tree/main/fixtures/iquest-q1) | IQuestLab/IQuest-Q1 |  | `iquest` | 54,193 | ready | none |
 | 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash |  | `deepseek_v4.1` | 54,418 | ready | `deepseek_v41`, `deepseek_v41` |
-| 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | — | — | pending | none |
+| 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | `minicpm5` | 54,181 | ready | none |
 | 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B |  | `k2_horizon` | 12,817 | replaying the set | none |
 | 2026-08-27 | [hy4-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/hy4-preview) | tencent/Hy4-preview |  | `hy4` | 54,195 | ready | `hy_v4`, `hy_v4` |
 | 2026-08-27 | [qwen-drive-1.0-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-drive-1.0-4b) | Qwen/Qwen-Drive-1.0-4B |  | `qwen3`, tagged calls | 54,179 | ready | `qwen`, `qwen3` |

@@ -9,7 +9,7 @@ use std::{fmt::Write as _, fs, path::PathBuf};
 use symphony::{
     formats::{
         deepseek_v4_1, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5, ling,
-        minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Format,
@@ -70,6 +70,7 @@ enum Table {
     Glm4,
     K2Horizon,
     Inkling,
+    MiniCpm5,
     Plain,
 }
 
@@ -95,6 +96,7 @@ impl Table {
             Self::Glm => glm(),
             Self::Glm4 => glm4(),
             Self::Inkling => inkling(),
+            Self::MiniCpm5 => minicpm5(),
             Self::K2Horizon => k2_horizon(),
             Self::Plain => plain(),
         }
@@ -418,9 +420,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-09-06",
         smg: (None, None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::MiniCpm5),
+        set: Some(54_181),
+        status: Status::Ready,
     },
     Group {
         slug: "minimax-m2",

@@ -11,11 +11,18 @@
 //! ```
 //!
 //! inside a `<minimax:tool_call>` block that holds one invoke or several, each tag on a line of
-//! its own. The engine's table owns the block's and the invoke's markers
-//! ([`formats::minimax_m2`]): it enters this assembler at `<invoke name="` and leaves it at
-//! `</invoke>`, so the assembler starts inside the function's name and never sees the invoke's
-//! closing tag; the engine hands it that tag's bytes as the call's end. Between those two the
-//! assembler reads the parameter tags itself.
+//! its own. MiniCPM5 writes the same shape with its own tags and no block,
+//!
+//! ```text
+//! <function name="weather"><param name="city">Paris</param><param name="days">3</param></function>
+//! ```
+//!
+//! one call after another on lines of their own. The engine's table owns the block's and the
+//! invoke's markers ([`formats::minimax_m2`], [`formats::minicpm5`]): it enters this assembler at
+//! `<invoke name="` (`<function name="`) and leaves it at the invoke's closing tag, so the
+//! assembler starts inside the function's name and never sees that tag; the engine hands it the
+//! tag's bytes as the call's end. Between those two the assembler reads the parameter tags itself,
+//! in the family's spelling ([`Tags`]).
 //!
 //! What the syntax says, and what the assembler does with it:
 //!
@@ -27,6 +34,12 @@
 //!   whole tag comes back as `Malformed`, and no parameter opens.
 //! - **Inside a value only `</parameter>` is a tag**; `<parameter name="` there is the value's
 //!   text.
+//! - **A value may be a CDATA section** where the family's template writes one ([`Tags::cdata`]):
+//!   MiniCPM5 wraps a value that holds `<`, `&` or a newline as `<![CDATA[…]]>`. The section's
+//!   opener and closer are the template's wrapping and go into the fragments' sources, not the
+//!   value; the text between them is the value as it is, streamed as it arrives for a declared
+//!   string, read whole at the closing tag for any other type. Text between `]]>` and the closing
+//!   tag, which the template never writes, is reported.
 //! - **The newlines between the tags are the template's** and go into the next event's source;
 //!   text where the syntax has tags is reported.
 //! - **Two endings**, as DSML's: [`Assembler::close`] is the invoke's closing tag, or the block's
@@ -34,6 +47,7 @@
 //! - **Every byte of the call lands in exactly one event.**
 //!
 //! [`formats::minimax_m2`]: crate::formats::minimax_m2()
+//! [`formats::minicpm5`]: crate::formats::minicpm5()
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -44,9 +58,9 @@ use crate::{
     },
 };
 
-/// The invoke's closing tag: the one terminal the call's end carries. The next invoke's opening
-/// and the block's close end a call too, but they belong to the region, and the engine drops them.
-pub const INVOKE_CLOSE: &str = "</invoke>";
+/// A CDATA section's opener and closer, where the family's template writes one around a value.
+const CDATA_OPEN: &str = "<![CDATA[";
+const CDATA_CLOSE: &str = "]]>";
 
 const OPEN: usize = 0;
 const CLOSE: usize = 1;
@@ -57,19 +71,36 @@ const EMPTY_NAME: &str = "a tag without a name";
 const TAG_TAIL: &str = "text after a tag's name";
 const CLOSED_EARLY: &str = "an invoke that closed before its function name closed";
 
-/// The parameter tag's two spellings a family writes: its opening up to the name's quote, and its
-/// closing tag. The invoke's markers are the table's.
+/// How a family spells the syntax: the parameter tag's opening up to the name's quote and its
+/// closing tag, the invoke's closing tag, and whether a value may be a CDATA section. The invoke's
+/// opening is the table's terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tags {
     pub parameter_open: &'static str,
     pub parameter_close: &'static str,
+    /// The invoke's closing tag: the one terminal the call's end carries. The next invoke's
+    /// opening and a block's close end a call too, but they belong to the region, and the engine
+    /// drops them.
+    pub invoke_close: &'static str,
+    /// Whether the template wraps a value as `<![CDATA[…]]>` when it holds `<`, `&` or a newline.
+    pub cdata: bool,
 }
 
 impl Tags {
-    /// MiniMax M2's: `<parameter name="…">` and `</parameter>`.
+    /// MiniMax M2's: `<parameter name="…">`, `</parameter>` and `</invoke>`, no CDATA.
     pub const MINIMAX_M2: Self = Self {
         parameter_open: "<parameter name=\"",
         parameter_close: "</parameter>",
+        invoke_close: "</invoke>",
+        cdata: false,
+    };
+    /// MiniCPM5's: `<param name="…">`, `</param>` and `</function>`, a value a CDATA section when
+    /// it holds `<`, `&` or a newline.
+    pub const MINICPM5: Self = Self {
+        parameter_open: "<param name=\"",
+        parameter_close: "</param>",
+        invoke_close: "</function>",
+        cdata: true,
     };
 
     fn text(&self, tag: usize) -> &'static str {
@@ -117,7 +148,26 @@ struct ValueState {
     kind: Option<Kind>,
     /// Where the value's text starts in `carried`, while it is held.
     start: usize,
+    /// Where it ends, once a CDATA section closed; `carried` holds the closer after it.
+    end: Option<usize>,
     mode: Mode,
+    cdata: Cdata,
+    /// Inside a CDATA section: the trailing bytes that may be the start of its closer, held
+    /// until the next bytes say.
+    held: String,
+}
+
+/// Whether a value is a CDATA section, decided from its first bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cdata {
+    /// The family writes no CDATA sections, or this value's first bytes are not an opener.
+    Plain,
+    /// Fewer bytes than the opener has, all of them the opener's so far.
+    Undecided,
+    /// Inside the section: the text up to `]]>` is the value's.
+    Inside,
+    /// The section closed: only the closing tag should follow.
+    Done,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -150,6 +200,12 @@ impl Assembler {
     /// Whether a call has started, that is, whether `ToolCallStart` has been pushed.
     pub fn started(&self) -> bool {
         self.function.is_some()
+    }
+
+    /// The invoke's closing tag in the family's spelling: the one terminal a started call's end
+    /// carries.
+    pub fn invoke_close(&self) -> &'static str {
+        self.tags.invoke_close
     }
 
     /// Append the next bytes of the invoke and push the events they complete. Every byte is the
@@ -212,6 +268,8 @@ impl Assembler {
             return;
         }
         let held = self.scanner.held().to_string();
+        self.carried.push_str(&held);
+        let held = self.take_held();
         self.carried.push_str(&held);
         if !self.carried.is_empty() {
             out.push(Event::Malformed {
@@ -421,11 +479,103 @@ impl Assembler {
             key,
             kind,
             start: self.carried.len(),
+            end: None,
             mode,
+            cdata: if self.tags.cdata {
+                Cdata::Undecided
+            } else {
+                Cdata::Plain
+            },
+            held: String::new(),
         });
     }
 
+    /// The next bytes of a value. Where the family writes CDATA sections, the first bytes decide
+    /// whether this value is one: they are held until the opener's length has arrived or a byte
+    /// rules the opener out, then read as they would have been.
     fn value_text(&mut self, text: &str, out: &mut Events) {
+        let Stage::Value(value) = &mut self.stage else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        match value.cdata {
+            Cdata::Undecided => {
+                self.carried.push_str(text);
+                let so_far = &self.carried[value.start..];
+                if so_far.len() < CDATA_OPEN.len() {
+                    if CDATA_OPEN.starts_with(so_far) {
+                        return;
+                    }
+                    value.cdata = Cdata::Plain;
+                } else if so_far.starts_with(CDATA_OPEN) {
+                    value.cdata = Cdata::Inside;
+                    value.start += CDATA_OPEN.len();
+                } else {
+                    value.cdata = Cdata::Plain;
+                }
+                let arrived = self.carried.split_off(value.start);
+                self.section_text(&arrived, out);
+            }
+            _ => self.section_text(text, out),
+        }
+    }
+
+    /// The next bytes of a value whose CDATA question is settled: inside a section the text up to
+    /// `]]>` is the value's and a trailing start of the closer is held; after the closer, text is
+    /// out of place; a plain value's bytes are the value's.
+    fn section_text(&mut self, text: &str, out: &mut Events) {
+        let Stage::Value(value) = &mut self.stage else {
+            return;
+        };
+        match value.cdata {
+            Cdata::Inside => {
+                let mut pending = std::mem::take(&mut value.held);
+                pending.push_str(text);
+                if let Some(at) = pending.find(CDATA_CLOSE) {
+                    let inside = pending[..at].to_string();
+                    let after = pending[at + CDATA_CLOSE.len()..].to_string();
+                    self.value_bytes(&inside, out);
+                    if let Stage::Value(value) = &mut self.stage {
+                        value.cdata = Cdata::Done;
+                        if matches!(value.mode, Mode::Whole | Mode::Undecided) {
+                            value.end = Some(self.carried.len());
+                        }
+                    }
+                    self.carried.push_str(CDATA_CLOSE);
+                    self.section_text(&after, out);
+                } else {
+                    // A trailing `]]` or `]` may be the closer's start: held. Both are ASCII, so
+                    // the split falls on a character boundary.
+                    let keep = if pending.ends_with("]]") {
+                        2
+                    } else if pending.ends_with(']') {
+                        1
+                    } else {
+                        0
+                    };
+                    let (give, hold) = pending.split_at(pending.len() - keep);
+                    let give = give.to_string();
+                    value.held = hold.to_string();
+                    self.value_bytes(&give, out);
+                }
+            }
+            Cdata::Done => self.text_between(text, out),
+            Cdata::Plain | Cdata::Undecided => self.value_bytes(text, out),
+        }
+    }
+
+    /// The value's held start of a CDATA closer, if any, taken: value text after all.
+    fn take_held(&mut self) -> String {
+        match &mut self.stage {
+            Stage::Value(value) => std::mem::take(&mut value.held),
+            _ => String::new(),
+        }
+    }
+
+    /// The value's own bytes, by its mode.
+    fn value_bytes(&mut self, text: &str, out: &mut Events) {
         let Stage::Value(value) = &mut self.stage else {
             return;
         };
@@ -478,7 +628,10 @@ impl Assembler {
     }
 
     /// `</parameter>`: a streamed string gets its closing quote, any other value is written whole.
+    /// Bytes held as a CDATA closer's start that never completed are the value's text.
     fn close_value(&mut self, tag: &str, out: &mut Events) {
+        let held = self.take_held();
+        self.value_bytes(&held, out);
         let Stage::Value(value) = &self.stage else {
             return;
         };
@@ -494,7 +647,8 @@ impl Assembler {
                 member
             }
             Mode::Whole | Mode::Undecided => {
-                let written = json(&self.carried[value.start..], value.kind);
+                let end = value.end.unwrap_or(self.carried.len());
+                let written = json(&self.carried[value.start..end], value.kind);
                 let mut member = String::with_capacity(value.key.len() + written.len() + 8);
                 member.push_str(self.separator());
                 push_quoted(&mut member, &value.key);
@@ -513,6 +667,7 @@ impl Assembler {
     /// The call ended inside a value: an open string is closed, and a value never written comes
     /// back as `Malformed`, since its member was never written.
     fn cut_value(&mut self, value: &ValueState, out: &mut Events) {
+        self.carried.push_str(&value.held);
         self.report(TAG_CUT_SHORT, out);
         if matches!(value.mode, Mode::Streaming { opened: true }) {
             self.push_fragment("\"".to_string(), Text::default(), out);
@@ -593,7 +748,11 @@ mod tests {
 
     /// The events of one invoke fed in `pieces`, closed by its tag or cut.
     fn run(pieces: &[&str], cut: bool) -> Vec<Event> {
-        let mut assembler = Assembler::new(0, "call_0", Tags::MINIMAX_M2);
+        run_with(Tags::MINIMAX_M2, pieces, cut)
+    }
+
+    fn run_with(tags: Tags, pieces: &[&str], cut: bool) -> Vec<Event> {
+        let mut assembler = Assembler::new(0, "call_0", tags);
         let mut out = Events::new();
         let declared = declared();
         for piece in pieces {
@@ -602,7 +761,7 @@ mod tests {
         if cut {
             assembler.finish(&mut out);
         } else {
-            assembler.close(INVOKE_CLOSE, &mut out);
+            assembler.close(tags.invoke_close, &mut out);
         }
         out.drain()
     }
@@ -652,7 +811,10 @@ mod tests {
             "<parameter name=\"o\">{\"a\": [1, 2]}</parameter>\n"
         );
         let events = run(&[text], false);
-        assert_eq!(bytes(&events), format!("{text}{INVOKE_CLOSE}"));
+        assert_eq!(
+            bytes(&events),
+            format!("{text}{}", Tags::MINIMAX_M2.invoke_close)
+        );
         assert!(matches!(
             &events[0],
             Event::ToolCallStart { index: 0, name, source, .. }
@@ -664,7 +826,7 @@ mod tests {
         );
         assert!(matches!(
             events.last(),
-            Some(Event::ToolCallEnd { source, .. }) if source.text == INVOKE_CLOSE
+            Some(Event::ToolCallEnd { source, .. }) if source.text == Tags::MINIMAX_M2.invoke_close
         ));
         assert!(malformed(&events).is_empty());
     }
@@ -709,7 +871,10 @@ mod tests {
     fn a_parameter_tag_with_a_tail_is_no_parameter_and_the_text_is_reported() {
         let text = "f\">\n<parameter name=\"n\" type=\"int\">1</parameter>\n";
         let events = run(&[text], false);
-        assert_eq!(bytes(&events), format!("{text}{INVOKE_CLOSE}"));
+        assert_eq!(
+            bytes(&events),
+            format!("{text}{}", Tags::MINIMAX_M2.invoke_close)
+        );
         let reported = malformed(&events);
         assert_eq!(reported[0].1, TAG_TAIL);
         // The template's newline before the tag rides in the report, as every report carries
@@ -727,7 +892,10 @@ mod tests {
     #[test]
     fn an_invoke_that_closes_inside_its_name_is_reported_and_starts_no_call() {
         let events = run(&["get_wea"], false);
-        assert_eq!(bytes(&events), format!("get_wea{INVOKE_CLOSE}"));
+        assert_eq!(
+            bytes(&events),
+            format!("get_wea{}", Tags::MINIMAX_M2.invoke_close)
+        );
         assert_eq!(malformed(&events)[0].1, CLOSED_EARLY);
         assert!(!events
             .iter()
@@ -752,5 +920,92 @@ mod tests {
                 TAG_CUT_SHORT.to_string()
             )
         );
+    }
+
+    /// MiniCPM5's spelling: `<param name="…">`, `</param>`, `</function>`, CDATA sections.
+    const MINICPM5_CALL: &str = concat!(
+        "f\">",
+        "<param name=\"s\"><![CDATA[café <b> & \"q\"\nligne]]></param>",
+        "<param name=\"o\"><![CDATA[{\"k\": \"<v>\"}]]></param>",
+        "<param name=\"n\">3</param>"
+    );
+
+    #[test]
+    fn a_cdata_section_is_the_value_inside_it_for_a_string_and_for_a_whole_value() {
+        let events = run_with(Tags::MINICPM5, &[MINICPM5_CALL], false);
+        assert_eq!(bytes(&events), format!("{MINICPM5_CALL}</function>"));
+        assert_eq!(
+            arguments(&events),
+            r#"{"s": "café <b> & \"q\"\nligne", "o": {"k": "<v>"}, "n": 3}"#
+        );
+        assert!(malformed(&events).is_empty());
+    }
+
+    #[test]
+    fn a_cdata_section_reads_the_same_however_the_bytes_are_cut() {
+        let whole = run_with(Tags::MINICPM5, &[MINICPM5_CALL], false);
+        let expected = arguments(&whole);
+        // Every split at a character boundary, one byte of UTF-8 at a time where the text allows,
+        // the closer's `]]` and `>` apart, the opener in halves.
+        let boundaries: Vec<usize> = MINICPM5_CALL.char_indices().map(|(at, _)| at).collect();
+        for &at in &boundaries[1..] {
+            let events = run_with(
+                Tags::MINICPM5,
+                &[&MINICPM5_CALL[..at], &MINICPM5_CALL[at..]],
+                false,
+            );
+            assert_eq!(
+                bytes(&events),
+                format!("{MINICPM5_CALL}</function>"),
+                "cut at {at}"
+            );
+            assert_eq!(arguments(&events), expected, "cut at {at}");
+            assert!(malformed(&events).is_empty(), "cut at {at}");
+        }
+        let one_by_one: Vec<&str> = MINICPM5_CALL
+            .char_indices()
+            .map(|(at, c)| &MINICPM5_CALL[at..at + c.len_utf8()])
+            .collect();
+        let events = run_with(Tags::MINICPM5, &one_by_one, false);
+        assert_eq!(arguments(&events), expected);
+    }
+
+    #[test]
+    fn a_bracket_inside_a_cdata_value_and_a_short_plain_value_are_read_as_they_are() {
+        // `]` and `]]` that do not start the closer are the value's text.
+        let call = "f\">\n<param name=\"s\"><![CDATA[a[1]] and b]]></param>";
+        let events = run_with(Tags::MINICPM5, &[call], false);
+        assert_eq!(arguments(&events), r#"{"s": "a[1]] and b"}"#);
+        // A value shorter than the opener, and one that starts like it but is not one.
+        let short = run_with(
+            Tags::MINICPM5,
+            &["f\"><param name=\"s\">Rome</param>"],
+            false,
+        );
+        assert_eq!(arguments(&short), r#"{"s": "Rome"}"#);
+        let alike = run_with(
+            Tags::MINICPM5,
+            &["f\"><param name=\"s\"><![CDATB[x]]></param>"],
+            false,
+        );
+        assert_eq!(arguments(&alike), r#"{"s": "<![CDATB[x]]>"}"#);
+    }
+
+    #[test]
+    fn text_after_a_cdata_closer_is_reported_and_a_cut_section_keeps_its_held_bytes() {
+        let events = run_with(
+            Tags::MINICPM5,
+            &["f\"><param name=\"s\"><![CDATA[x]]>tail</param>"],
+            false,
+        );
+        assert_eq!(arguments(&events), r#"{"s": "x"}"#);
+        assert_eq!(
+            malformed(&events),
+            vec![("tail".to_string(), TEXT_BETWEEN_TAGS.to_string())]
+        );
+        // Cut with a `]` held: the byte is value text, not lost.
+        let cut = run_with(Tags::MINICPM5, &["f\"><param name=\"s\"><![CDATA[x]"], true);
+        assert_eq!(bytes(&cut), "f\"><param name=\"s\"><![CDATA[x]");
+        assert_eq!(arguments(&cut), r#"{"s": "x"#);
     }
 }

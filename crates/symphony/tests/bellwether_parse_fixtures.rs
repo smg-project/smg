@@ -81,7 +81,7 @@ use symphony::{
     adapt,
     formats::{
         deepseek_v4_1, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5, ling,
-        minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -524,6 +524,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // request says (a system message carries the reasoning effort); the model writes the thought
     // or not, and its markers are its own.
     ("inkling", Family::Inkling, GenerationPrompt::ModelDecides),
+    // MiniCPM5: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
+    // prompt.
+    (
+        "minicpm5-2b",
+        Family::MiniCpm5,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -577,6 +584,8 @@ enum Family {
     KimiK3,
     /// [`inkling`]: a turn of messages, a call as the tool's name, a marker and a JSON object.
     Inkling,
+    /// [`minicpm5`]: `<function name="…">` calls of `<param name="…">` tags, no block, CDATA.
+    MiniCpm5,
     /// [`plain`]: content and nothing else.
     Plain,
 }
@@ -635,6 +644,7 @@ impl Family {
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
             Self::Inkling => inkling(),
+            Self::MiniCpm5 => minicpm5(),
             Self::Plain => plain(),
         }
     }
@@ -658,10 +668,10 @@ impl Family {
             | Self::Inkling
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5 and MiniMax M2 read
-            // `</think>` but not `<tool_call>`.
+            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2 and
+            // MiniCPM5 read `</think>` but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
-            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 | Self::MinimaxM2 => {
+            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 | Self::MinimaxM2 | Self::MiniCpm5 => {
                 KNOWN_REASONING_PROBE
             }
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,

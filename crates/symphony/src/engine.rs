@@ -244,7 +244,7 @@ impl Call {
             // As for DSML: only the invoke's closing tag is a started call's end, and an invoke
             // that named no call takes whichever terminal ended it.
             (Self::Attributed(assembler), Closed::ByMarker)
-                if terminal == tagged::attributed::INVOKE_CLOSE || !assembler.started() =>
+                if terminal == assembler.invoke_close() || !assembler.started() =>
             {
                 assembler.close(terminal, out);
                 return true;

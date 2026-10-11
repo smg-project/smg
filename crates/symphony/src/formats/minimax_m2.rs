@@ -24,9 +24,11 @@
 //! </minimax:tool_call>
 //! ```
 //!
-//! MiniMax M3 writes its arguments as an XML tree under its own markers ([`minimax_m3()`]).
+//! MiniMax M3 writes its arguments as an XML tree under its own markers ([`minimax_m3()`]);
+//! MiniCPM5 writes this syntax with its own tags and no block ([`minicpm5()`]).
 //!
 //! [`minimax_m3()`]: super::minimax_m3()
+//! [`minicpm5()`]: super::minicpm5()
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -41,7 +43,7 @@ pub fn minimax_m2() -> Format {
         .terminal("calls_open", "<minimax:tool_call>")
         .terminal("calls_close", "</minimax:tool_call>")
         .terminal("invoke_open", "<invoke name=\"")
-        .terminal("invoke_close", attributed::INVOKE_CLOSE)
+        .terminal("invoke_close", attributed::Tags::MINIMAX_M2.invoke_close)
         .state("content", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
