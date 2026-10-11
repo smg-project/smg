@@ -116,8 +116,9 @@ impl RadixTree {
         true
     }
 
-    /// Endpoints whose backing chains have been collected. These handles can no
-    /// longer anchor children; the caller must discard their identity mappings.
+    /// Endpoints whose backing chains have been collected. Discard their
+    /// caller-owned identity mappings before learning new endpoints: recreating
+    /// an identical path can reuse the same canonical handle.
     pub fn drain_retired_contexts(&mut self) -> impl Iterator<Item = PrefixContext> + '_ {
         self.retired_contexts.drain(..)
     }

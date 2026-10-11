@@ -1,4 +1,4 @@
-use radix_tree::{Config, ContextError, OverlapScratch, RadixTree};
+use radix_tree::{Config, ContextError, FlatTree, HolderId, OverlapScratch, RadixTree};
 
 #[test]
 fn contexts_share_paths_and_match_only_complete_endpoints() {
@@ -81,4 +81,97 @@ fn released_contexts_share_the_existing_whole_chain_lifecycle() {
         Err(ContextError::InvalidParent)
     );
     tree.audit().unwrap();
+}
+
+#[test]
+fn context_lifecycle_preserves_holder_membership() {
+    fn check(tree: &RadixTree, flat: &FlatTree, holders: &[HolderId]) {
+        tree.audit().unwrap();
+        flat.audit().unwrap();
+        assert_eq!(tree.stats().holders, flat.stats().holders);
+        assert_eq!(tree.stats().holder_blocks, flat.stats().holder_blocks);
+        assert_eq!(tree.stats().distinct_entries, flat.stats().distinct_entries);
+        for &holder in holders {
+            assert_eq!(tree.holder_blocks(holder), flat.holder_blocks(holder));
+            assert_eq!(
+                tree.enumerate(holder).collect::<Vec<_>>(),
+                flat.enumerate(holder).collect::<Vec<_>>()
+            );
+        }
+        let mut scratch = OverlapScratch::default();
+        let mut actual = Vec::new();
+        let mut expected = Vec::new();
+        for query in [&[1, 2, 3, 4][..], &[1, 2, 8, 9], &[1, 2, 3, 99]] {
+            tree.overlap(query, &mut scratch, &mut actual);
+            flat.overlap(query, &mut scratch, &mut expected);
+            actual.sort_unstable_by_key(|row| row.holder.parts());
+            expected.sort_unstable_by_key(|row| row.holder.parts());
+            assert_eq!(actual, expected);
+        }
+    }
+    let mut tree = RadixTree::new(Config::default());
+    let mut flat = FlatTree::new(Config::default());
+    let holders: Vec<_> = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            let holder = tree.create_holder(name);
+            assert_eq!(holder, flat.create_holder(name));
+            holder
+        })
+        .collect();
+    let parent = tree.learn_context(None, &[1, 2]).unwrap();
+    let tail = tree.learn_context(Some(parent), &[3, 4]).unwrap();
+    let fork = tree.learn_context(Some(parent), &[8, 9]).unwrap();
+    check(&tree, &flat, &holders); // Learned history alone has no membership.
+
+    let first = [(10, 1), (20, 2), (30, 3), (40, 4)];
+    assert_eq!(
+        tree.store(holders[0], None, &first),
+        flat.store(holders[0], None, &first)
+    );
+    check(&tree, &flat, &holders);
+    let second = [(50, 1), (60, 2), (70, 8), (80, 9)];
+    assert_eq!(
+        tree.store(holders[1], None, &second),
+        flat.store(holders[1], None, &second)
+    );
+    check(&tree, &flat, &holders);
+    assert!(tree.release_context(parent));
+    check(&tree, &flat, &holders);
+    assert!(tree.retain_context(parent));
+    check(&tree, &flat, &holders);
+    assert!(tree.release_context(parent));
+    check(&tree, &flat, &holders);
+    assert_eq!(
+        tree.remove(holders[0], &[20, 40]),
+        flat.remove(holders[0], &[20, 40])
+    );
+    check(&tree, &flat, &holders);
+    tree.clear(holders[0]);
+    flat.clear(holders[0]);
+    check(&tree, &flat, &holders);
+    assert!(tree.release_context(tail));
+    check(&tree, &flat, &holders);
+    tree.retire_holder(holders[1]);
+    flat.retire_holder(holders[1]);
+    check(&tree, &flat, &holders); // Fork history keeps ancestry, not residency.
+    assert!(tree.release_context(fork));
+    let retired = tree.drain_retired_contexts().collect::<Vec<_>>();
+    assert_eq!(retired.len(), 3);
+    assert!(retired.contains(&parent) && retired.contains(&tail) && retired.contains(&fork));
+    assert_eq!(tree.retained_contents(), 0);
+    check(&tree, &flat, &holders);
+
+    // Drain caller identity records before identical-path recreation. The new
+    // canonical handle may equal an old one.
+    let recreated = tree.learn_context(None, &[1, 2, 3, 4]).unwrap();
+    let mut matched = Vec::new();
+    tree.matching_contexts(&[1, 2, 3, 4], &mut OverlapScratch::default(), &mut matched);
+    assert_eq!(matched, [recreated]);
+    check(&tree, &flat, &holders);
+    assert!(tree.release_context(recreated));
+    assert!(tree
+        .drain_retired_contexts()
+        .any(|context| context == recreated));
+    check(&tree, &flat, &holders);
 }
