@@ -13,6 +13,8 @@ use axum::{
 use tracing::{debug, error, warn};
 
 use super::{helpers, PipelineStage};
+#[cfg(test)]
+use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
@@ -1059,7 +1061,7 @@ impl WorkerSelectionStage {
     #[cfg(test)]
     fn report_refusal_with(
         &self,
-        throttle: &crate::observability::log_throttle::KeyedLogThrottle,
+        throttle: &KeyedLogThrottle,
         function: &'static str,
         request_id: Option<&str>,
         model_id: &str,
@@ -1680,7 +1682,6 @@ mod tests {
         config::types::PolicyConfig,
         mesh::adapters::tree_sync::RepairEntry,
         middleware::{ReportedRefusal, TenantRequestMeta},
-        observability::log_throttle::KeyedLogThrottle,
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::{
             common::{attempt_ledger::AttemptLedger, retry::is_retryable_response},

@@ -407,7 +407,9 @@ pub(crate) const NO_AVAILABLE_WORKERS_CODE: &str = "no_available_workers";
 /// overload shed, tenant limits): a client that honours the header does not
 /// hammer a fleet that is down and gets the same bounded hint on every path.
 pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
-    let mut response = error::service_unavailable(NO_AVAILABLE_WORKERS_CODE, message);
+    let message = message.into();
+    let mut response = error::service_unavailable(NO_AVAILABLE_WORKERS_CODE, message.clone());
+    response.extensions_mut().insert(RefusalReason(message));
     mark_non_retryable(&mut response);
     response.headers_mut().insert(
         RETRY_AFTER,
@@ -454,6 +456,11 @@ fn admitted_leg(
 /// The client-visible code of [`error::model_not_found`], which the refusal
 /// line recognises the 404 by.
 pub(crate) const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
+
+/// The reason a `no_available_workers` refusal names (the leg that is down,
+/// the policy that declined), carried on the response for its log line.
+#[derive(Clone, Debug)]
+struct RefusalReason(String);
 
 /// Lines per second the gateway writes for each refusal it answers on its
 /// own: a model whose workers are all unavailable (`no_available_workers`)
@@ -523,15 +530,32 @@ impl Refusal {
             Self::ModelNotFound => "No worker serves model",
         }
     }
+
+    /// The key the refusal's line is throttled under. A 503 is keyed by its
+    /// model: the model has workers registered, so the keys are bounded by
+    /// the registry, and one storming model never silences another's first
+    /// line. A 404's "model" is whatever name the client sent, so every
+    /// unknown name shares one allowance: a client varying the name gets no
+    /// fresh lines per name, and the one line still names one of them while
+    /// `suppressed` carries the rest.
+    fn key(self, model_id: &str) -> &str {
+        match self {
+            Self::NoAvailableWorkers => model_id,
+            Self::ModelNotFound => "",
+        }
+    }
 }
 
 /// The log line of a refusal the gateway answers on its own, and its marker.
 ///
 /// A `no_available_workers` 503 or a `model_not_found` 404 gets one WARN
 /// with the request id, the model and the state of the pools `site` draws
-/// from, capped at [`REFUSAL_LINES_PER_SECOND`] per kind and per model; a
-/// line past the cap is counted and the next admitted line of that model
-/// carries the count as `suppressed`. The response is marked [`ReportedRefusal`], so the
+/// from, and the reason the refusal names when it has one (the leg that is
+/// down, the policy that declined), capped at [`REFUSAL_LINES_PER_SECOND`]
+/// per model for the 503 and for all unknown names together for the 404
+/// (see [`Refusal::key`]); a line past the cap is counted and the next
+/// admitted line of its key carries the count as `suppressed`. The response
+/// is marked [`ReportedRefusal`], so the
 /// pipeline's stage line and the access log's response line drop to DEBUG
 /// for it: a refusal is the gateway's normal answer to "no worker for this
 /// request", not a fault of its own, and up to three ERROR lines per refusal
@@ -561,7 +585,7 @@ pub(crate) fn report_refusal(
 }
 
 /// [`report_refusal`] under an explicit throttle (a test's own, or the
-/// static of the refusal's kind), keyed by the model.
+/// static of the refusal's kind), keyed as [`Refusal::key`] says.
 pub(crate) fn report_refusal_under(
     throttle: &KeyedLogThrottle,
     registry: &WorkerRegistry,
@@ -575,8 +599,12 @@ pub(crate) fn report_refusal_under(
     };
     let message = kind.message();
     refusal.extensions_mut().insert(ReportedRefusal);
-    if let Some(admitted) = throttle.admit(model_id) {
+    if let Some(admitted) = throttle.admit(kind.key(model_id)) {
         let pool = PoolState::of(registry, model_id, site.legs);
+        let reason = refusal
+            .extensions()
+            .get::<RefusalReason>()
+            .map(|reason| reason.0.as_str());
         // The request's span carries the id too; the field is for a line
         // written outside it (a retry's re-selection) and is omitted when
         // the router has no id of its own to give.
@@ -585,6 +613,7 @@ pub(crate) fn report_refusal_under(
             request_id = request_id,
             mode = %site.mode,
             model_id = %model_id,
+            reason = reason,
             workers = pool.workers(),
             available = pool.available(),
             pool = %pool,
@@ -2046,10 +2075,10 @@ mod tests {
 
     /// A refusal the gateway answers on its own is marked for the loggers
     /// downstream and written once, at WARN, with the refusing router, the
-    /// request id, the model and the pool's state; past the cap the lines
-    /// are counted onto the model's next admitted one; another model's line
-    /// is its own; a refusal already reported and any other answer pass
-    /// through silently.
+    /// request id, the model, its reason and the pool's state; past the cap
+    /// the lines are counted onto the key's next admitted one: a model's own
+    /// for the 503, one for all unknown names for the 404; a refusal already
+    /// reported and any other answer pass through silently.
     #[test]
     fn a_refusal_is_marked_and_written_once_at_warn_with_the_pools_state() {
         let lines = Arc::new(Mutex::new(Vec::new()));
@@ -2074,76 +2103,45 @@ mod tests {
         };
         let window = Duration::from_millis(100);
         let throttle = KeyedLogThrottle::new(2, window, REFUSAL_LOG_MODELS);
-        let opened = Instant::now();
+        let refuse = |model: &str, refusal: Response| {
+            report_refusal_under(&throttle, &registry, site, Some("req-1"), model, refusal)
+        };
+        let count = || lines.lock().unwrap().len();
+        let line = |i: usize| lines.lock().unwrap()[i].clone();
 
+        // The 503, five times in one window: two lines, the model's own.
+        let opened = Instant::now();
         for _ in 0..5 {
-            let refused = report_refusal_under(
-                &throttle,
-                &registry,
-                site,
-                Some("req-1"),
-                "m1",
-                no_available_workers("every worker is down"),
-            );
+            let refused = refuse("m1", no_available_workers("every worker is down"));
             assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert!(
                 refused.extensions().get::<ReportedRefusal>().is_some(),
                 "the refusal is marked as reported"
             );
         }
-        let written = lines.lock().unwrap().clone();
-        assert_eq!(
-            written.len(),
-            2,
-            "two lines per window, not five: {written:?}"
-        );
+        assert_eq!(count(), 2, "two lines per window, not five: {:?}", line(1));
         for expected in [
             "message=No available workers for model",
             "function=\"Router::route_typed_request\"",
             "request_id=\"req-1\"",
             "mode=Regular",
             "model_id=m1",
+            "reason=\"every worker is down\"",
             "workers=1",
             "available=0",
             "pool=regular 0/1 available (0 healthy)",
             "suppressed=0",
         ] {
             assert!(
-                written[0].contains(expected),
+                line(0).contains(expected),
                 "{expected} missing from {:?}",
-                written[0]
+                line(0)
             );
         }
 
-        // The three lines past the cap ride on the model's next line, here
-        // its 404 after the pool went away entirely.
-        std::thread::sleep(window.saturating_sub(opened.elapsed()) + Duration::from_millis(10));
+        // The 404s share one key: m2 and m3 take the window's two lines, m4
+        // is counted, whatever the name.
         let gone = report_refusal_under(
-            &throttle,
-            &registry,
-            site,
-            None,
-            "m1",
-            error::model_not_found("m1"),
-        );
-        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
-        assert!(gone.extensions().get::<ReportedRefusal>().is_some());
-        let written = lines.lock().unwrap().clone();
-        assert_eq!(written.len(), 3, "{written:?}");
-        assert!(
-            written[2].contains("message=No worker serves model"),
-            "{:?}",
-            written[2]
-        );
-        assert!(written[2].contains("suppressed=3"), "{:?}", written[2]);
-        assert!(
-            !written[2].contains("request_id="),
-            "no id of its own, no field: {:?}",
-            written[2]
-        );
-
-        // Another model's refusal is its own line, with nothing of m1's.
-        let other = report_refusal_under(
             &throttle,
             &registry,
             site,
@@ -2151,25 +2149,48 @@ mod tests {
             "m2",
             error::model_not_found("m2"),
         );
-        assert!(other.extensions().get::<ReportedRefusal>().is_some());
-        let written = lines.lock().unwrap().clone();
-        assert_eq!(written.len(), 4, "{written:?}");
-        assert!(written[3].contains("model_id=m2"), "{:?}", written[3]);
-        assert!(written[3].contains("suppressed=0"), "{:?}", written[3]);
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        assert!(gone.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(count(), 3, "{:?}", line(2));
         assert!(
-            written[3].contains("pool=regular 0/0 available (0 healthy)"),
+            line(2).contains("message=No worker serves model"),
             "{:?}",
-            written[3]
+            line(2)
         );
+        assert!(line(2).contains("model_id=m2"), "{:?}", line(2));
+        assert!(
+            !line(2).contains("request_id="),
+            "no id of its own, no field: {:?}",
+            line(2)
+        );
+        assert!(
+            !line(2).contains("reason="),
+            "a 404 names no reason: {:?}",
+            line(2)
+        );
+        assert!(
+            line(2).contains("pool=regular 0/0 available (0 healthy)"),
+            "{:?}",
+            line(2)
+        );
+        refuse("m3", error::model_not_found("m3"));
+        assert_eq!(count(), 4);
+        refuse("m4", error::model_not_found("m4"));
+        assert_eq!(count(), 4, "a new unknown name opens no fresh allowance");
+
+        // The next window: the model's 503 line carries its three hidden
+        // refusals, the unknown names' line carries the one of theirs.
+        std::thread::sleep(window.saturating_sub(opened.elapsed()) + Duration::from_millis(10));
+        refuse("m1", no_available_workers("every worker is down"));
+        assert!(line(4).contains("suppressed=3"), "{:?}", line(4));
+        refuse("m5", error::model_not_found("m5"));
+        assert!(line(5).contains("model_id=m5"), "{:?}", line(5));
+        assert!(line(5).contains("suppressed=1"), "{:?}", line(5));
 
         // Already reported: no second line, whatever the throttle says.
-        let again = report_refusal(&registry, site, None, "m1", gone);
+        let again = report_refusal(&registry, site, None, "m2", gone);
         assert!(again.extensions().get::<ReportedRefusal>().is_some());
-        assert_eq!(
-            lines.lock().unwrap().len(),
-            4,
-            "a reported refusal is not reported again"
-        );
+        assert_eq!(count(), 6, "a reported refusal is not reported again");
 
         // Another answer is neither marked nor written.
         let unrelated = report_refusal(
@@ -2180,6 +2201,6 @@ mod tests {
             error::service_unavailable("no_compatible_pd_pair", "no pair"),
         );
         assert!(unrelated.extensions().get::<ReportedRefusal>().is_none());
-        assert_eq!(lines.lock().unwrap().len(), 4);
+        assert_eq!(count(), 6);
     }
 }
