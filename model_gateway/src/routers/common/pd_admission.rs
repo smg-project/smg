@@ -24,16 +24,20 @@
 //!
 //! The wait is first come, first served. A dispatch takes a place in the
 //! decode worker's queue the moment it arrives ([`Worker::pd_enqueue`]) and
-//! claims only while it holds the oldest one, so a room that frees goes to
-//! the request that has waited longest — not to whichever attempt happens to
-//! run first, which under a steady arrival rate is a newcomer's first try,
-//! made before any sleeping waiter wakes; a waiter that lost that race once
-//! kept losing it until the budget shed it. The place is given back on every
-//! way out of the wait: a claim, the shed, a dispatch dropped mid-wait. The
-//! worker wakes its waiters when rooms are released, so the oldest one claims
-//! the moment it can; the queue and that wake live on the worker with its
-//! rooms, not in a registry of their own, and a request that finds nobody
-//! waiting still claims at once.
+//! claims only while no older place needs as few rooms as it does, so a room
+//! that frees goes to the request that has waited longest for one — not to
+//! whichever attempt happens to run first, which under a steady arrival rate
+//! is a newcomer's first try, made before any sleeping waiter wakes; a waiter
+//! that lost that race once kept losing it until the budget shed it. A
+//! request that needs more rooms than the ones behind it (a fan-out, a
+//! batch) does not hold them back while its rooms free one at a time: they
+//! pass it, and it claims when its rooms are free together, as before. The
+//! place is given back on every way out of the wait: a claim, the shed, a
+//! dispatch dropped mid-wait. The worker wakes the waits that may claim when
+//! rooms are released or a place ahead of them leaves, so the right one
+//! claims the moment it can; the queue and its notifiers live on the worker
+//! with its rooms, not in a registry of their own, and a request that finds
+//! nobody waiting still claims at once.
 //!
 //! Nothing here runs when the engine does not report a window: admission is
 //! not the gateway's to decide then, and dispatch behaves exactly as it did
@@ -67,15 +71,15 @@ pub const DEFAULT_PD_ADMISSION_WAIT_SECS: u64 = 30;
 
 /// How often the wait retries its claim when nothing wakes it.
 ///
-/// The worker wakes its waiters whenever rooms are released or a place is
-/// given back ([`Worker::pd_wake`]), so the oldest waiter normally claims the
-/// moment it can and a freed room does not idle for a retry interval under a
-/// full window. The retry stays as the backstop — a worker without a
-/// notifier, and the deadline check: 50 ms is far finer than both the engine
-/// step that actually frees a room and the wait deadline below, and the
-/// sleep is asynchronous — a waiting request occupies no thread. The notifier
-/// lives on the worker with its rooms; there is no registry of notifiers
-/// outside it, with the eviction problem that would bring.
+/// The worker wakes the waits that may claim whenever rooms are released or
+/// a place ahead of them leaves ([`Worker::pd_wake`]), so the right waiter
+/// normally claims the moment it can and a freed room does not idle for a
+/// retry interval under a full window. The retry stays as the backstop — a
+/// worker without notifiers, and the deadline check: 50 ms is far finer than
+/// both the engine step that actually frees a room and the wait deadline
+/// below, and the sleep is asynchronous — a waiting request occupies no
+/// thread. The notifiers live on the worker with its rooms; there is no
+/// registry of them outside it, with the eviction problem that would bring.
 const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Seconds a PD dispatch waits for decode rooms before shedding.
@@ -124,26 +128,31 @@ impl std::fmt::Debug for PdAdmissionGuard {
 /// A place in the decode worker's admission queue ([`Worker::pd_enqueue`]),
 /// taken when the dispatch arrives and given back however its wait ends: a
 /// claim, the shed at the deadline, or the dispatch dropped mid-wait (its
-/// client gone). Only the oldest place may claim, which is what makes the
-/// wait first come, first served; giving the place back promptly is what
-/// lets the next one through.
+/// client gone). A place may claim only while no older one needs as few
+/// rooms, which is what makes the wait first come, first served; giving the
+/// place back promptly is what lets the next one through.
 struct Place<'a> {
     worker: &'a dyn Worker,
     place: u64,
 }
 
 impl<'a> Place<'a> {
-    fn take(worker: &'a dyn Worker) -> Self {
+    fn take(worker: &'a dyn Worker, rooms: usize) -> Self {
         Self {
             worker,
-            place: worker.pd_enqueue(),
+            place: worker.pd_enqueue(rooms),
         }
     }
 
-    /// Whether this is the oldest place still waiting — the only one the gate
-    /// lets claim.
-    fn is_next(&self) -> bool {
-        self.worker.pd_is_next(self.place)
+    /// Whether no older place still waiting needs as few rooms as this one:
+    /// the gate lets it claim only then.
+    fn may_claim(&self) -> bool {
+        self.worker.pd_may_claim(self.place)
+    }
+
+    /// The notifier the worker fires when this place is worth a new try.
+    fn wake(&self) -> Option<Arc<Notify>> {
+        self.worker.pd_wake(self.place)
     }
 }
 
@@ -246,10 +255,10 @@ pub(crate) async fn admit_decode(
     // free, and one that finds nobody waiting is next at once and claims
     // without a wait, as before. The guard gives the place back on every
     // way out of the wait, the dispatch dropped mid-wait included.
-    let place = Place::take(decode.as_ref());
-    let wake = decode.pd_wake();
+    let place = Place::take(decode.as_ref(), rooms);
+    let wake = place.wake();
     let claim = claim_within(wait, wake.as_deref(), || {
-        place.is_next() && decode.try_admit_pd(rooms, window)
+        place.may_claim() && decode.try_admit_pd(rooms, window)
     })
     .await;
     drop(place);
@@ -678,6 +687,55 @@ mod tests {
             "woken by the release, not by the retry interval"
         );
         drop(admission);
+    }
+
+    /// A request that needs more rooms than are free does not hold back the
+    /// narrower requests behind it: they take the rooms that free one at a
+    /// time, and the wide request claims when its rooms are free together.
+    #[tokio::test(start_paused = true)]
+    async fn a_wide_request_at_the_front_does_not_hold_back_the_narrow_ones_behind_it() {
+        let decode = decode_worker("grpc://127.0.0.1:9914", Some(2));
+        let first_room = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+        let second_room = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+
+        // The wide request is the oldest waiter, a narrow one behind it.
+        let mut wide = Box::pin(admit_decode(&decode, "m", 2));
+        assert!(futures::poll!(wide.as_mut()).is_pending());
+        let mut narrow = Box::pin(admit_decode(&decode, "m", 1));
+        assert!(futures::poll!(narrow.as_mut()).is_pending());
+
+        // One room frees: the narrow request takes it, the wide one waits on.
+        drop(first_room);
+        let narrow = tokio::time::timeout(Duration::from_secs(5), narrow)
+            .await
+            .expect("the narrow request is not held back by the wide one")
+            .expect("no shed")
+            .expect("a claim");
+        assert!(
+            futures::poll!(wide.as_mut()).is_pending(),
+            "two rooms are not free together yet"
+        );
+        assert_eq!(decode.pd_admitted(), 2);
+
+        // The other held room frees: still one room free, the wide one waits.
+        drop(second_room);
+        assert!(futures::poll!(wide.as_mut()).is_pending());
+
+        // The narrow request ends: its rooms are free together, it claims.
+        drop(narrow);
+        let wide = tokio::time::timeout(Duration::from_secs(5), wide)
+            .await
+            .expect("the wide request claims once its rooms are free together")
+            .expect("no shed")
+            .expect("a claim");
+        assert_eq!(decode.pd_admitted(), 2);
+        drop(wide);
     }
 
     /// The budget is still the bound: a waiter whose room never frees sheds
