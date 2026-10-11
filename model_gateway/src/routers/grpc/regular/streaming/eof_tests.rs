@@ -2201,6 +2201,38 @@ fn connection_lost() -> tonic::Status {
     tonic::Status::internal("h2 protocol error: error reading a body from connection")
 }
 
+#[tokio::test]
+async fn messages_stream_cut_keeps_upstream_failure_and_does_not_finish_decoding() {
+    let (stream, server) = cut_stream(vec![chunk(0, "Hel")], connection_lost()).await;
+    let (tx, rx) = sse_channel();
+    let result = processor(false)
+        .process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            byte_fallback_messages_spec(false),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+
+    match result {
+        Err(utils::StreamFailure::Upstream {
+            status,
+            completion_tokens,
+        }) => {
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert_eq!(completion_tokens, 3);
+        }
+        other => panic!("an upstream failure, not {other:?}"),
+    }
+    assert!(events.iter().all(|event| event["type"] != "message_stop"));
+}
+
 /// A worker whose breaker opens on the first failure.
 fn breaker_worker() -> Arc<dyn Worker> {
     Arc::new(

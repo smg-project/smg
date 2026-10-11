@@ -2479,17 +2479,14 @@ impl StreamingProcessor {
         let mut final_chunk = false;
         let mut decoder_finished_at_eof = false;
         while !final_chunk {
-            let response = if decoder_finished_at_eof {
-                None
-            } else {
-                grpc_stream
-                    .next()
-                    .await
-                    .transpose()
-                    .map_err(|e| {
+            let response =
+                if decoder_finished_at_eof {
+                    None
+                } else {
+                    grpc_stream.next().await.transpose().map_err(|e| {
                         utils::StreamFailure::upstream(e, completion_tokens.delivered())
                     })?
-            };
+                };
             final_chunk = response.is_none() && decoder_finished_at_eof;
 
             // Text the stop decoder produced for this response, if any. Per-chunk
