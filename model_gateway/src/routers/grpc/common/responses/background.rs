@@ -22,6 +22,13 @@
 //! can end leaves a terminal record ([`drive`]): the object the work stored,
 //! `failed` with the error of a work that answered one, ended without storing
 //! a result or panicked, or `cancelled`.
+//!
+//! A response the client asked not to store (`store: false`) runs in the
+//! background the same way: its record is the run's control block and, once
+//! terminal, holds the result for [`UNSTORED_RETENTION`] so the client can
+//! poll it, as the public API keeps such a response for roughly ten minutes;
+//! then the gateway that closed it deletes it ([`finish_unstored`]). Nothing
+//! of it reaches the conversation and history side.
 
 use std::{
     any::Any, collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc,
@@ -62,6 +69,12 @@ const CANCEL_SETTLE: Duration = Duration::from_secs(5);
 /// cancel on another gateway sharing the store closes the record, and the
 /// gateway running the response drops its work within this interval.
 const STATUS_WATCH: Duration = Duration::from_secs(2);
+
+/// How long the record of a background response the client asked not to
+/// store (`store: false`) stays once it reached a terminal status: the public
+/// API keeps the response data of such a request for roughly ten minutes so
+/// that it can be polled, then deletes it.
+pub(crate) const UNSTORED_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 /// The statuses a response does not leave any more.
 const TERMINAL_STATUSES: [&str; 4] = ["completed", "incomplete", "failed", "cancelled"];
@@ -249,15 +262,72 @@ pub(crate) enum Transition {
 /// Moves the record stored under `id` to `status`. A status only moves
 /// forward: a record that is already terminal is left as it is (so a
 /// `cancelled` record is written once, and a result that arrives after a
-/// cancel does not revive the response), whichever gateway wrote it. The
-/// read and the write are two round trips to the store; the window between
-/// them is the one a cross-gateway race can fall into.
+/// cancel does not revive the response), whichever gateway wrote it.
 pub(crate) async fn set_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     status: &str,
     error: Option<Value>,
     request_context: Option<StorageRequestContext>,
+) -> Result<Transition, String> {
+    transition(storage, id, request_context, |raw| {
+        with_status(raw, status, error)
+    })
+    .await
+}
+
+/// The end of a background response the client asked not to store: its
+/// terminal object is written over the record under its id (which keeps its
+/// input items), where a retained response is persisted with its conversation
+/// items. The result is polled from the record for [`UNSTORED_RETENTION`],
+/// then the record is retired; nothing of it reaches the conversation and
+/// history side. A record that is already terminal (closed by a cancel, here
+/// or on another gateway) stays as it is.
+pub(crate) async fn finish_unstored(
+    storage: &Arc<dyn ResponseStorage>,
+    response: &ResponsesResponse,
+    request_context: Option<StorageRequestContext>,
+) {
+    let mut raw = match serde_json::to_value(response) {
+        Ok(raw) => raw,
+        Err(e) => {
+            warn!(response_id = %response.id, error = %e, "Failed to serialize the background response");
+            return;
+        }
+    };
+    raw["store"] = json!(false);
+    match transition(storage, &response.id, request_context, |_| raw).await {
+        Ok(Transition::Moved(_)) => debug!(
+            response_id = %response.id,
+            "Unstored background response finished; its record is kept for the polling window"
+        ),
+        Ok(Transition::Terminal(stored)) => debug!(
+            response_id = %response.id,
+            stored = stored["status"].as_str().unwrap_or(""),
+            "Background response record had already been closed; the result is not stored"
+        ),
+        Ok(Transition::Missing) => {
+            warn!(response_id = %response.id, "No record under the background response id to finish");
+        }
+        Err(e) => warn!(
+            response_id = %response.id,
+            error = %e,
+            "Failed to store the terminal object of the background response"
+        ),
+    }
+}
+
+/// Moves the record under `id` forward to the object `next` makes of the
+/// stored one; a record that is already terminal stays as it is. The read
+/// and the write are two round trips to the store; the window between them
+/// is the one a cross-gateway race can fall into. A record moved to a
+/// terminal status whose object says `store: false` is retired after
+/// [`UNSTORED_RETENTION`] by the gateway that moved it.
+async fn transition(
+    storage: &Arc<dyn ResponseStorage>,
+    id: &str,
+    request_context: Option<StorageRequestContext>,
+    next: impl FnOnce(Value) -> Value,
 ) -> Result<Transition, String> {
     let update = async {
         let response_id = ResponseId::from(id);
@@ -271,7 +341,7 @@ pub(crate) async fn set_stored_status(
         if is_terminal(stored.raw_response["status"].as_str().unwrap_or("")) {
             return Ok(Transition::Terminal(stored.raw_response));
         }
-        stored.raw_response = with_status(stored.raw_response, status, error);
+        stored.raw_response = next(stored.raw_response);
         let raw = stored.raw_response.clone();
         storage
             .store_response(stored)
@@ -279,10 +349,61 @@ pub(crate) async fn set_stored_status(
             .map_err(|e| e.to_string())?;
         Ok(Transition::Moved(raw))
     };
-    match request_context {
+    let transition: Result<Transition, String> = match request_context.clone() {
         Some(ctx) => with_request_context(ctx, update).await,
         None => update.await,
+    };
+    let transition = transition?;
+    if let Transition::Moved(raw) = &transition {
+        retire_unstored(storage, request_context, id, raw);
     }
+    Ok(transition)
+}
+
+/// Deletes the record under `id` once [`UNSTORED_RETENTION`] has passed when
+/// `raw` is the terminal object of a response the client asked not to store:
+/// after its polling window nothing of it is retained. A gateway restarted
+/// inside the window leaves the record, whose object says `store: false`, to
+/// its store's own retention.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the record of an unstored background response outlives its request by the polling window; the task holds only the storage handle"
+)]
+fn retire_unstored(
+    storage: &Arc<dyn ResponseStorage>,
+    request_context: Option<StorageRequestContext>,
+    id: &str,
+    raw: &Value,
+) {
+    if raw["store"].as_bool().unwrap_or(true) || !is_terminal(raw["status"].as_str().unwrap_or(""))
+    {
+        return;
+    }
+    let storage = Arc::clone(storage);
+    let id = id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(UNSTORED_RETENTION).await;
+        let delete = async {
+            storage
+                .delete_response(&ResponseId::from(id.as_str()))
+                .await
+        };
+        let deleted = match request_context {
+            Some(ctx) => with_request_context(ctx, delete).await,
+            None => delete.await,
+        };
+        match deleted {
+            Ok(()) => debug!(
+                response_id = %id,
+                "Unstored background response record retired after its polling window"
+            ),
+            Err(e) => warn!(
+                response_id = %id,
+                error = %e,
+                "Failed to retire the unstored background response record"
+            ),
+        }
+    });
 }
 
 /// Whether the record under `id` has reached a terminal status (closed by a
@@ -1197,5 +1318,152 @@ mod tests {
             let answer = answer_for_closed(json!({"status": status}));
             assert_eq!(answer.status(), StatusCode::BAD_REQUEST, "{status}");
         }
+    }
+
+    /// The request of the public API's probe: `background: true` with
+    /// `store: false`.
+    fn unstored_request() -> ResponsesRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "background": true,
+            "store": false,
+            "max_output_tokens": 64
+        }))
+        .unwrap()
+    }
+
+    /// The terminal object of `request` with one output message.
+    fn completed_response(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
+        let message = serde_json::from_value(json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+        }))
+        .unwrap();
+        ResponsesResponse::builder(id, &request.model)
+            .copy_from_request(request)
+            .created_at(chrono::Utc::now().timestamp())
+            .completed_at(chrono::Utc::now().timestamp())
+            .status(ResponseStatus::Completed)
+            .add_output(message)
+            .build()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unstored_background_response_is_polled_through_its_window_then_retired() {
+        let storage = storage();
+        let request = unstored_request();
+        store_record(
+            &storage,
+            &queued_response("resp_u", &request),
+            &request,
+            None,
+        )
+        .await
+        .unwrap();
+        let raw = stored_raw(&storage, "resp_u").await;
+        assert_eq!(raw["status"], "queued");
+        assert_eq!(raw["background"], true);
+        assert_eq!(raw["store"], false);
+
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_u").unwrap();
+        let store = storage.clone();
+        drive(storage.clone(), None, slot, async move {
+            finish_unstored(
+                &store,
+                &completed_response("resp_u", &unstored_request()),
+                None,
+            )
+            .await;
+            Ok(())
+        })
+        .await;
+        let stored = storage
+            .get_response(&ResponseId::from("resp_u"))
+            .await
+            .unwrap()
+            .expect("the result is polled from the record");
+        assert_eq!(
+            stored.raw_response["status"], "completed",
+            "{}",
+            stored.raw_response
+        );
+        assert_eq!(stored.raw_response["store"], false);
+        assert_eq!(
+            stored.raw_response["output"][0]["content"][0]["text"],
+            "hello"
+        );
+        assert_eq!(stored.input[0]["content"][0]["text"], "hi");
+        assert_eq!(registry.in_flight(), 0);
+
+        tokio::time::sleep(UNSTORED_RETENTION - Duration::from_secs(1)).await;
+        assert_eq!(
+            stored_status(&storage, "resp_u").await,
+            "completed",
+            "polled inside the window"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            stored_raw(&storage, "resp_u").await,
+            Value::Null,
+            "retired after the window"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_unstored_record_is_retired_and_every_other_record_is_kept() {
+        let storage = storage();
+        let request = unstored_request();
+        for id in ["resp_cancelled", "resp_running"] {
+            store_record(&storage, &queued_response(id, &request), &request, None)
+                .await
+                .unwrap();
+        }
+        store_queued(&storage, "resp_stored").await;
+
+        for id in ["resp_cancelled", "resp_stored"] {
+            let Transition::Moved(raw) = set_stored_status(&storage, id, "cancelled", None, None)
+                .await
+                .unwrap()
+            else {
+                panic!("{id} is closed");
+            };
+            assert_eq!(raw["status"], "cancelled");
+        }
+        assert!(matches!(
+            set_stored_status(&storage, "resp_running", "in_progress", None, None)
+                .await
+                .unwrap(),
+            Transition::Moved(_)
+        ));
+        // A result that arrives after the cancel does not revive the record.
+        finish_unstored(
+            &storage,
+            &completed_response("resp_cancelled", &request),
+            None,
+        )
+        .await;
+        assert_eq!(stored_status(&storage, "resp_cancelled").await, "cancelled");
+
+        tokio::time::sleep(UNSTORED_RETENTION + Duration::from_secs(1)).await;
+        assert_eq!(
+            stored_raw(&storage, "resp_cancelled").await,
+            Value::Null,
+            "the closed unstored record is retired"
+        );
+        assert_eq!(
+            stored_status(&storage, "resp_running").await,
+            "in_progress",
+            "a record still running is kept"
+        );
+        assert_eq!(
+            stored_status(&storage, "resp_stored").await,
+            "cancelled",
+            "a stored record is kept"
+        );
     }
 }

@@ -5,8 +5,9 @@ the generation runs behind the response id, which is polled with
 ``GET /v1/responses/{id}`` (``queued`` -> ``in_progress`` -> a terminal
 status) and stopped with ``POST /v1/responses/{id}/cancel``. With
 ``stream: true`` the stream carries ``response.queued`` right after
-``response.created``. A background response has to be stored (``store`` true
-or omitted): an unstored one could never be polled, so the request is refused.
+``response.created``. A background response the client asks not to store
+(``store`` false) is queued the same way: its record is polled through the run
+and holds the result for a polling window, after which it is deleted.
 """
 
 from __future__ import annotations
@@ -48,6 +49,25 @@ def _post_responses(gateway, body: dict, timeout: float = 120.0) -> httpx.Respon
         headers={"Authorization": "Bearer not-used", "Content-Type": "application/json"},
         timeout=timeout,
     )
+
+
+def _poll_raw_until_terminal(
+    gateway, response_id: str, timeout: float = 120.0, interval: float = 0.5
+) -> dict:
+    """Poll ``GET /v1/responses/{id}`` on the raw wire until a terminal status."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = httpx.get(
+            f"{gateway.base_url}/v1/responses/{response_id}",
+            headers={"Authorization": "Bearer not-used"},
+            timeout=30.0,
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        if body["status"] in TERMINAL_STATUSES:
+            return body
+        time.sleep(interval)
+    raise TimeoutError(f"response {response_id} not terminal after {timeout}s")
 
 
 @pytest.mark.engine("sglang")
@@ -205,20 +225,43 @@ class TestBackgroundResponsesGptOss:
 @pytest.mark.gateway(extra_args=["--tool-call-parser", "qwen", "--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestBackgroundResponsesRawLocal:
-    """The refusals, read on the raw wire shape."""
+    """The unstored background response and the refusals, read on the raw
+    wire shape."""
 
-    def test_background_requires_store(self, setup_backend):
-        """``background: true`` with ``store: false`` is refused before anything
-        runs: there would be nothing to poll."""
+    def test_background_without_store_is_queued_and_polled(self, setup_backend):
+        """``background: true`` with ``store: false`` is queued like a stored
+        one: the record is polled through the run and holds the result (the
+        record is deleted after the polling window, which the test does not
+        wait for)."""
         _, model_path, _, gw = setup_backend
         resp = _post_responses(
             gw,
-            {"model": model_path, "input": "hi", "background": True, "store": False},
+            {
+                "model": model_path,
+                "input": "hi",
+                "background": True,
+                "store": False,
+                "max_output_tokens": 64,
+            },
         )
-        assert resp.status_code == 400, resp.text
-        error = resp.json()["error"]
-        assert error["type"] == "invalid_request_error"
-        assert "store" in error["message"]
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] in ("queued", "in_progress"), body
+        assert body["background"] is True
+        assert body["store"] is False
+        assert body["output"] == []
+
+        final = _poll_raw_until_terminal(gw, body["id"])
+        assert final["status"] in ("completed", "incomplete"), final
+        assert final["background"] is True
+        assert final["store"] is False
+        texts = [
+            part["text"]
+            for item in final["output"]
+            for part in item.get("content", [])
+            if part.get("type") == "output_text"
+        ]
+        assert "".join(texts), "the result is polled from the record"
 
     def test_cancel_of_a_finished_response_is_refused(self, setup_backend):
         """A response that already ended cannot be cancelled."""

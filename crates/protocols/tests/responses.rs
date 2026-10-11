@@ -4549,24 +4549,20 @@ fn background_and_the_sampling_extensions_stay_accepted() {
     assert!(request.validate().is_ok());
 }
 
+/// `background: true` with `store: false` is accepted as the public API
+/// accepts it (the response is kept for its polling window), like every other
+/// pairing of the two parameters.
 #[test]
-fn background_without_storage_is_rejected() {
-    let request = plain_request(json!({
-        "model": "m", "input": "hi", "background": true, "store": false
-    }))
-    .unwrap();
-    let code = validation_code(&request);
-    assert!(code.contains("invalid_value"), "{code}");
-    assert!(code.contains("'store'"), "{code}");
-
+fn background_without_storage_is_accepted() {
     for body in [
+        json!({"model": "m", "input": "hi", "background": true, "store": false, "max_output_tokens": 64}),
         json!({"model": "m", "input": "hi", "background": true, "store": true}),
         json!({"model": "m", "input": "hi", "background": true}),
         json!({"model": "m", "input": "hi", "background": false, "store": false}),
         json!({"model": "m", "input": "hi", "store": false}),
     ] {
         let request = plain_request(body.clone()).unwrap();
-        assert!(request.validate().is_ok(), "{body} must stay accepted");
+        assert!(request.validate().is_ok(), "{body} must be accepted");
     }
 }
 

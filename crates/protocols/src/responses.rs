@@ -3597,17 +3597,9 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
         validate_openai_structured_output_rules(request)?;
     }
 
-    // 5. A background response is answered before it is generated and read
-    //    back by polling, which needs it stored: `store: false` has nothing
-    //    to poll, so it is refused as the public API refuses it.
-    if request.background == Some(true) && request.store == Some(false) {
-        let mut e = ValidationError::new("invalid_value");
-        e.message = Some(
-            "Invalid 'store': background mode requires the response to be stored. Set 'store' to true or omit it when 'background' is true."
-                .into(),
-        );
-        return Err(e);
-    }
+    // 5. `background: true` with `store: false` is a valid pair, as in the
+    //    public API: the gateway keeps such a response for its polling
+    //    window, then retains nothing of it.
 
     // Tool-result-only continuations are valid; validate_response_input checks
     // individual items without requiring a message already held in history.

@@ -310,7 +310,9 @@ pub(crate) fn namespace_test_request() -> ResponsesRequest {
     })).unwrap()
 }
 
-/// Persist response to storage if store=true
+/// Persist response to storage if store=true; an unstored background response
+/// keeps its result in the record its client polls, for the polling window
+/// only (see [`background::finish_unstored`]).
 ///
 /// Common helper function to avoid duplication across sync and streaming paths
 /// in both harmony and regular responses implementations.
@@ -323,6 +325,12 @@ pub(crate) async fn persist_response_if_needed(
     request_context: Option<StorageRequestContext>,
 ) {
     if !original_request.store.unwrap_or(true) {
+        // Nothing of an unstored response reaches the conversation and
+        // history side; a background one still has the record its client
+        // polls, and the result goes there.
+        if original_request.background.unwrap_or(false) {
+            background::finish_unstored(&response_storage, response, request_context).await;
+        }
         return;
     }
     // A background response's record may have been closed while the work
@@ -358,10 +366,129 @@ pub(crate) async fn persist_response_if_needed(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use openai_protocol::{
+        model_card::ModelCard, responses::ResponseStatus, worker::HealthCheckConfig,
+    };
+    use serde_json::json;
+    use smg_data_connector::{
+        ListParams, MemoryConversationItemStorage, MemoryConversationStorage,
+        MemoryResponseStorage, NewConversation, ResponseId, SortOrder,
+    };
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID};
+
+    /// The terminal object of `request` with one output message.
+    fn completed_response(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
+        let message = serde_json::from_value(json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+        }))
+        .unwrap();
+        ResponsesResponse::builder(id, &request.model)
+            .copy_from_request(request)
+            .created_at(chrono::Utc::now().timestamp())
+            .completed_at(chrono::Utc::now().timestamp())
+            .status(ResponseStatus::Completed)
+            .add_output(message)
+            .build()
+    }
+
+    /// `background: true` with `store: false`, the public API's probe: the
+    /// result is written over the record the client polls and nothing is
+    /// linked to the conversation; a foreground `store: false` response
+    /// stores nothing at all.
+    #[tokio::test]
+    async fn an_unstored_background_response_finishes_in_its_record_and_the_history_keeps_nothing()
+    {
+        let conversation_storage: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let item_storage: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let response_storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let conversation = conversation_storage
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "background": true,
+            "store": false,
+            "conversation": conversation.id.0,
+            "max_output_tokens": 64
+        }))
+        .unwrap();
+        background::store_record(
+            &response_storage,
+            &background::queued_response("resp_u", &request),
+            &request,
+            None,
+        )
+        .await
+        .unwrap();
+
+        persist_response_if_needed(
+            conversation_storage.clone(),
+            item_storage.clone(),
+            response_storage.clone(),
+            &completed_response("resp_u", &request),
+            &request,
+            None,
+        )
+        .await;
+
+        let stored = response_storage
+            .get_response(&ResponseId::from("resp_u"))
+            .await
+            .unwrap()
+            .expect("the record is polled");
+        assert_eq!(
+            stored.raw_response["status"], "completed",
+            "{}",
+            stored.raw_response
+        );
+        assert_eq!(stored.raw_response["store"], false);
+        assert_eq!(
+            stored.raw_response["output"][0]["content"][0]["text"],
+            "hello"
+        );
+        let items = item_storage
+            .list_items(
+                &conversation.id,
+                ListParams {
+                    limit: 10,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            items.is_empty(),
+            "nothing is linked to the conversation: {items:?}"
+        );
+
+        let mut foreground = request;
+        foreground.background = None;
+        persist_response_if_needed(
+            conversation_storage,
+            item_storage,
+            response_storage.clone(),
+            &completed_response("resp_f", &foreground),
+            &foreground,
+            None,
+        )
+        .await;
+        assert!(response_storage
+            .get_response(&ResponseId::from("resp_f"))
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     fn registry_with_aliased_worker() -> Arc<WorkerRegistry> {
         let registry = Arc::new(WorkerRegistry::new());
