@@ -846,13 +846,18 @@ fn kv_connectors_at(app_context: &AppContext, port: u16) -> Vec<Option<String>> 
 }
 
 /// Editing a live Pod's KV annotation keeps its UID, so the instance is the
-/// same, but its configuration is not: the worker is replaced and registers
-/// with the new connector, instead of keeping the old one until the Pod is
-/// recreated.
+/// same, but its configuration is not: the worker is updated to the new
+/// connector instead of keeping the old one until the Pod is recreated.
+///
+/// It must stay registered throughout. The drain window is real here and the
+/// worker is Ready before the edit: a removal submitted beside the update
+/// would drain the worker, then delete whatever sits at its URL once the
+/// drain ends, which by then is the updated worker.
 #[tokio::test]
-async fn kv_annotation_edit_on_a_live_pod_replaces_its_worker() {
+async fn kv_annotation_edit_on_a_live_pod_updates_its_worker_in_place() {
+    const DRAIN: Duration = Duration::from_secs(2);
     let fake = FakeK8s::start().await;
-    let app_context = test_context().await;
+    let app_context = test_context_with_drain(DRAIN.as_secs()).await;
     let (_engine, port) = start_mock_engine().await;
     let pod = |connector: &str| {
         with_annotation(
@@ -861,6 +866,8 @@ async fn kv_annotation_edit_on_a_live_pod_replaces_its_worker() {
             connector,
         )
     };
+    let mooncake = || vec![Some("MooncakeConnector".to_string())];
+    let nixl = || vec![Some("NixlConnector".to_string())];
 
     fake.apply_pod(pod("MooncakeConnector"));
     let handle = start_service_discovery_with_client(
@@ -868,29 +875,36 @@ async fn kv_annotation_edit_on_a_live_pod_replaces_its_worker() {
         discovery_config(),
         Arc::clone(&app_context),
     );
-    wait_for(
-        &app_context,
-        "the worker registered",
-        Duration::from_secs(15),
-        |urls| has_url(urls, port),
-    )
-    .await;
-    assert_eq!(
-        kv_connectors_at(&app_context, port),
-        vec![Some("MooncakeConnector".to_string())]
-    );
+    wait_for_ready_pod_uid(&app_context, port, "uid-kv-0", "the Ready worker").await;
+    assert_eq!(kv_connectors_at(&app_context, port), mooncake());
 
     fake.apply_pod(pod("NixlConnector"));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while kv_connectors_at(&app_context, port) != vec![Some("NixlConnector".to_string())] {
+    loop {
+        let current = kv_connectors_at(&app_context, port);
+        if current == nixl() {
+            break;
+        }
+        assert!(
+            current == mooncake(),
+            "the worker left the registry while being updated: {current:?}"
+        );
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the edited annotation never reached the worker: {:?}",
-            kv_connectors_at(&app_context, port)
+            "the edited annotation never reached the worker: {current:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Still the same instance.
+    // Past the drain window and several passes, it is still there.
+    let settled = tokio::time::Instant::now() + DRAIN + Duration::from_secs(1);
+    while tokio::time::Instant::now() < settled {
+        assert_eq!(
+            kv_connectors_at(&app_context, port),
+            nixl(),
+            "the updated worker did not stay registered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     wait_for_pod_uid(&app_context, port, "uid-kv-0", "the same Pod UID").await;
 
     handle.abort();
