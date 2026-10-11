@@ -3910,6 +3910,63 @@ mod tests {
         }
     }
 
+    /// A decode worker with the encoder over the thresholds next to an idle
+    /// one without it: a request whose decode leg needs the encoder is
+    /// steered to the vetoed worker by the overload fallback (it is the
+    /// leg's only admitted worker) and, under `--worker-overload-shed`, gets
+    /// the overload shed, not `no_available_workers`; a text request takes
+    /// the idle worker.
+    #[test]
+    fn an_overloaded_only_vision_capable_decode_worker_is_steered_to_not_refused() {
+        let model_id = "test-model-vision-decode-overloaded";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, labels) in [
+            ("grpc://127.0.0.1:9200", WorkerType::Prefill, VISION_ENCODER),
+            ("grpc://127.0.0.1:9210", WorkerType::Decode, VISION_ENCODER),
+            (
+                "grpc://127.0.0.1:9211",
+                WorkerType::Decode,
+                NO_VISION_ENCODER,
+            ),
+        ] {
+            worker_registry
+                .register(pd_worker(url, model_id, worker_type, labels))
+                .unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+        let d1 = worker_registry
+            .get_by_url("grpc://127.0.0.1:9210")
+            .expect("registered");
+        worker_registry.set_worker_overloaded(&d1, true);
+        let demand = VisionDemand::new(false, true);
+
+        let (_, decode, _) = stage
+            .select_pd_pair(model_id, PlacementInputs::default(), None, None, demand)
+            .expect("steered to the only admitted decode worker");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:9210");
+        let (_, decode, _) = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs::default(),
+                None,
+                None,
+                VisionDemand::default(),
+            )
+            .expect("a text request pairs with the idle decode worker");
+        assert_eq!(decode.url(), "grpc://127.0.0.1:9211");
+
+        worker_registry.set_overload_shed(true);
+        let failure = stage
+            .select_pd_pair(model_id, PlacementInputs::default(), None, None, demand)
+            .expect_err("the admitted decode leg is all-overloaded under shedding");
+        let response = stage.pd_selection_failure(model_id, failure, false);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "worker_overload_protection_shed"
+        );
+    }
+
     // ---- the pre-selection queue timeout ---------------------------------------------------
 
     fn regular_stage(registry: Arc<WorkerRegistry>) -> WorkerSelectionStage {
