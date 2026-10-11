@@ -44,11 +44,16 @@ class TestParseMediaRefs:
         ]
 
     def test_audio_refs_preserve_order_and_url(self):
-        items = media_refs.parse_media_refs(_refs(
-            (common_pb2.AUDIO, "data:audio/wav;base64,AAAA"),
-            (common_pb2.IMAGE, "https://a/1.png")))
+        items = media_refs.parse_media_refs(
+            _refs(
+                (common_pb2.AUDIO, "data:audio/wav;base64,AAAA"),
+                (common_pb2.IMAGE, "https://a/1.png"),
+            )
+        )
         assert [(i.modality, i.url) for i in items] == [
-            ("audio", "data:audio/wav;base64,AAAA"), ("image", "https://a/1.png")]
+            ("audio", "data:audio/wav;base64,AAAA"),
+            ("image", "https://a/1.png"),
+        ]
 
     def test_rejects_unspecified_modality(self):
         with pytest.raises(ValueError, match="MODALITY_UNSPECIFIED"):

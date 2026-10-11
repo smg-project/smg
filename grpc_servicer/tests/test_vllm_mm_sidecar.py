@@ -297,8 +297,12 @@ class TestNativeAudio:
 
         async def render(prompt, **kwargs):
             rendered.append((prompt, kwargs))
-            return {"prompt_token_ids": [258881], "mm_kwargs": {},
-                    "mm_hashes": {}, "mm_placeholders": {}}
+            return {
+                "prompt_token_ids": [258881],
+                "mm_kwargs": {},
+                "mm_hashes": {},
+                "mm_placeholders": {},
+            }
 
         s._connector = types.SimpleNamespace(fetch_audio_async=fetch_audio)
         s._tokens_prompt = lambda **kwargs: kwargs
@@ -309,9 +313,12 @@ class TestNativeAudio:
         result = run(s.handle(request))
         assert result.ok, result
         assert fetched == [url]
-        assert rendered == [({"prompt_token_ids": [1, 2, 3],
-                              "multi_modal_data": {"audio": [waveform]}},
-                             {"arrival_time": 0.0, "skip_mm_cache": True})]
+        assert rendered == [
+            (
+                {"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"audio": [waveform]}},
+                {"arrival_time": 0.0, "skip_mm_cache": True},
+            )
+        ]
         assert result.prompt_token_ids == [258881]
 
 

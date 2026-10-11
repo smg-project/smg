@@ -780,12 +780,15 @@ class TestProcess:
         renderer = self._Renderer()
         p = self.processor(renderer)
         waveform = ([0.25, -0.25], 16000)
+
         async def fetch_audio(url):
             assert url == "data:audio/wav;base64,AAAA"
             return waveform
+
         p._connector.fetch_audio_async = fetch_audio
-        out = run(p.process([258881], "<|audio|>",
-            [_Item("audio", "data:audio/wav;base64,AAAA")], 0.0))
+        out = run(
+            p.process([258881], "<|audio|>", [_Item("audio", "data:audio/wav;base64,AAAA")], 0.0)
+        )
         assert out["skip_mm_cache"] is True
         assert renderer.calls[0]["multi_modal_data"]["audio"] == [waveform]
         assert renderer.calls[0]["prompt_token_ids"] == [258881]
