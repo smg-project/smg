@@ -31,6 +31,11 @@ import time
 from collections import deque
 from typing import NamedTuple
 
+from smg_grpc_proto import vllm_engine_pb2
+from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.load_record import engine_load_from
+
 THROUGHPUT_WINDOW = 2.0
 HIT_RATE_SAMPLES = 64
 
@@ -165,3 +170,29 @@ def scheduler_load_fields(
     if max_running_requests > 0:
         fields["max_running_requests"] = int(max_running_requests)
     return fields
+
+
+def load_record(
+    num_running: int,
+    num_waiting: int,
+    kv_usage: float,
+    estimate: LoadEstimate,
+    *,
+    max_total_num_tokens: int = 0,
+    max_running_requests: int = 0,
+) -> common_pb2.EngineLoad:
+    """The load record the KV-event stream carries, from the figures
+    :func:`scheduler_load_fields` reports on ``GetLoads``: the two agree
+    field for field, and the queued token-work is this servicer's estimate,
+    as on the poll."""
+    load = vllm_engine_pb2.SchedulerLoad(
+        **scheduler_load_fields(
+            num_running,
+            num_waiting,
+            kv_usage,
+            estimate,
+            max_total_num_tokens=max_total_num_tokens,
+            max_running_requests=max_running_requests,
+        )
+    )
+    return engine_load_from(load, queued_token_work=True)

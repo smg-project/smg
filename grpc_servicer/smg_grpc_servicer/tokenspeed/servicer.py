@@ -50,6 +50,7 @@ from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import (
     convert_load_to_protobuf,
     convert_snapshot_to_protobuf,
+    load_record,
     running_window,
 )
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
@@ -772,12 +773,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         if load_outputs and snapshots is None and page_size <= 0:
             await context.abort(grpc.StatusCode.UNAVAILABLE, "KV page geometry is unavailable")
             return
-        # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
-        max_total_num_tokens = int(
-            (self.scheduler_info.get("max_total_num_tokens") if self.scheduler_info else None)
-            or getattr(self.async_llm.server_args, "max_total_num_tokens", 0)
-            or 0
-        )
+        max_total_num_tokens = self._max_total_num_tokens()
         max_running_requests = running_window(self.async_llm.server_args)
 
         scheduler_loads = [
@@ -818,6 +814,37 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     # SubscribeKvEvents (server-streaming) — feeds the gateway's
     # cache-aware router the scheduler's actual KV-cache state.
     # ------------------------------------------------------------------
+
+    def _max_total_num_tokens(self) -> int:
+        # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
+        return int(
+            (self.scheduler_info.get("max_total_num_tokens") if self.scheduler_info else None)
+            or getattr(self.async_llm.server_args, "max_total_num_tokens", 0)
+            or 0
+        )
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries for ``dp_rank``: the
+        scheduler's fresh snapshot from the engine's replica, converted as
+        ``GetLoads`` converts it, read for every batch and heartbeat. An
+        encode worker has no scheduler load, and an older engine without the
+        replica would need a scheduler round trip per record: both push none
+        and stay polled."""
+        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+            return None
+        store = getattr(self.async_llm, "load_snapshot_store", None)
+        if store is None:
+            return None
+        try:
+            return load_record(
+                store.fresh_snapshots(),
+                dp_rank,
+                max_total_num_tokens=self._max_total_num_tokens(),
+                max_running_requests=running_window(self.async_llm.server_args),
+            )
+        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
+            logger.debug("load record unavailable", exc_info=True)
+            return None
 
     async def SubscribeKvEvents(
         self,
@@ -866,6 +893,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 decoder.decode,
                 lambda: context.send_initial_metadata(()),
                 context.cancelled,
+                load_source=self._load_record,
             ):
                 yield proto_batch
         except asyncio.CancelledError:

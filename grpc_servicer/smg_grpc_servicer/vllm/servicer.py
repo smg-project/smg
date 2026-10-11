@@ -49,7 +49,7 @@ from smg_grpc_servicer.vllm.kv_transfer import (
 # The launcher imports this module before it defines serve_grpc: the moment
 # the servicer switch has to be in place (see launcher_switch).
 from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
-from smg_grpc_servicer.vllm.loads import LoadTracker, scheduler_load_fields
+from smg_grpc_servicer.vllm.loads import LoadTracker, load_record, scheduler_load_fields
 from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
 from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
@@ -778,16 +778,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetLoadsResponse protobuf
         """
-        stats = _latest_scheduler_stats(self.engine)
-        if stats is not None:
-            num_running = int(getattr(stats, "num_running_reqs", 0) or 0)
-            num_waiting = int(getattr(stats, "num_waiting_reqs", 0) or 0)
-            kv_usage = float(getattr(stats, "kv_cache_usage", 0.0) or 0.0)
-        else:
-            num_running = 0
-            num_waiting = 0
-            kv_usage = 0.0
-
+        num_running, num_waiting, kv_usage = self._scheduler_counts()
         load = vllm_engine_pb2.SchedulerLoad(
             **scheduler_load_fields(
                 num_running,
@@ -805,6 +796,38 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             dp_rank_count=1,
             loads=[load],
         )
+
+    def _scheduler_counts(self) -> tuple[int, int, float]:
+        """Running, waiting and KV usage from the latest ``SchedulerStats``
+        snapshot (zeros before the first engine step or with stats logging
+        off), what ``GetLoads`` and the pushed load record both report."""
+        stats = _latest_scheduler_stats(self.engine)
+        if stats is None:
+            return 0, 0, 0.0
+        return (
+            int(getattr(stats, "num_running_reqs", 0) or 0),
+            int(getattr(stats, "num_waiting_reqs", 0) or 0),
+            float(getattr(stats, "kv_cache_usage", 0.0) or 0.0),
+        )
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries: the figures
+        ``GetLoads`` answers with (vLLM reports one rank, so ``dp_rank`` does
+        not select), read for every batch and heartbeat."""
+        del dp_rank
+        try:
+            num_running, num_waiting, kv_usage = self._scheduler_counts()
+            return load_record(
+                num_running,
+                num_waiting,
+                kv_usage,
+                self._loads.estimate(num_waiting),
+                max_total_num_tokens=_kv_capacity_tokens(self.engine),
+                max_running_requests=_max_running_requests(self.engine),
+            )
+        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
+            logger.debug("load record unavailable", exc_info=True)
+            return None
 
     async def GetTokenizer(
         self,
@@ -1353,5 +1376,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             context,
             topic=str(getattr(config, "topic", "") or ""),
             hwm=getattr(config, "hwm", None),
+            load_source=self._load_record,
         ):
             yield proto_batch

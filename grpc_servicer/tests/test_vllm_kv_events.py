@@ -280,3 +280,61 @@ class TestServicerWiring:
         servicer = VllmEngineServicer(_Engine(), start_time=0.0)
         assert servicer._kv_events_config is not None
         assert hasattr(servicer, "SubscribeKvEvents")
+
+
+# --- The servicer hands its load record to the relay (no vLLM import) ---
+
+
+def _subscribe_method(namespace):
+    """The real ``SubscribeKvEvents`` method of the vLLM servicer, compiled on
+    its own (the servicer module imports the engine)."""
+    import ast
+    from collections.abc import AsyncIterator
+
+    import grpc
+    from smg_grpc_proto.generated import common_pb2
+
+    source_path = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "servicer.py"
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "SubscribeKvEvents"
+    )
+    namespace.update({"AsyncIterator": AsyncIterator, "common_pb2": common_pb2, "grpc": grpc})
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source_path), "exec"), namespace)
+    return namespace["SubscribeKvEvents"]
+
+
+@pytest.mark.asyncio
+async def test_servicer_hands_its_load_record_to_the_relay():
+    from types import SimpleNamespace
+
+    from smg_grpc_proto.generated import common_pb2
+
+    calls = []
+
+    async def fake_relay(sources, engine, start, context, **options):
+        calls.append((sources, engine, start, context, options))
+        yield common_pb2.KvEventBatch(sequence_number=1)
+
+    method = _subscribe_method(
+        {
+            "relay": fake_relay,
+            "rank_sources_for": lambda config, engine: ["rank-0"],
+            "Engine": SimpleNamespace(VLLM="vllm"),
+        }
+    )
+    config = SimpleNamespace(endpoint="tcp://*:5557", topic="kv", hwm=None)
+
+    def load_record(dp_rank):
+        return None
+
+    servicer = SimpleNamespace(_kv_events_config=config, engine=object(), _load_record=load_record)
+    context = SimpleNamespace()
+    request = common_pb2.SubscribeKvEventsRequest(start_sequence_number=0)
+    batches = [batch async for batch in method(servicer, request, context)]
+    assert [b.sequence_number for b in batches] == [1]
+    ((sources, engine, start, got_context, options),) = calls
+    assert (sources, engine, start, got_context) == (["rank-0"], "vllm", 0, context)
+    assert options["topic"] == "kv" and options["load_source"] is load_record

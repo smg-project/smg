@@ -48,7 +48,7 @@ from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
-from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf
+from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf, load_record
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
@@ -754,8 +754,19 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             self.server_args,
             request.start_sequence_number,
             context,
+            load_source=self._load_record,
         ):
             yield batch
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries for ``dp_rank``: the
+        scheduler's published snapshot as ``GetLoads`` reports it, read for
+        every batch and heartbeat; ``None`` while none is published."""
+        try:
+            return load_record(self.request_manager.load_snapshot_reader.read_all(), dp_rank)
+        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
+            logger.debug("load record unavailable", exc_info=True)
+            return None
 
     def _handle_epd_disaggregation_encode_request(
         self,

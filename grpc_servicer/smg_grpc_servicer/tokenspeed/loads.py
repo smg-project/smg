@@ -7,9 +7,13 @@ the same split the SGLang side uses.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from smg_grpc_proto import tokenspeed_scheduler_pb2
+from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.load_record import engine_load_from
 
 
 def running_window(server_args: Any) -> int:
@@ -84,3 +88,30 @@ def convert_snapshot_to_protobuf(
         active_token_usage=snapshot.num_active_pages / snapshot.max_total_pages,
         max_running_requests=max_running_requests,
     )
+
+
+def load_record(
+    snapshots: Iterable[Any],
+    dp_rank: int | None,
+    *,
+    max_total_num_tokens: int,
+    max_running_requests: int,
+) -> common_pb2.EngineLoad | None:
+    """The load record the KV-event stream carries for ``dp_rank`` (the
+    lowest fresh rank when the batch names none), from the engine's native
+    snapshot replica as ``GetLoads`` converts it (:func:`convert_snapshot_to_protobuf`);
+    ``None`` while no fresh snapshot exists. The scheduler reports no queued
+    token-work on this wire, so the record leaves it unset, as the poll does.
+    """
+    snapshots = list(snapshots)
+    if not snapshots:
+        return None
+    chosen = next((s for s in snapshots if dp_rank is not None and int(s.dp_rank) == dp_rank), None)
+    if chosen is None:
+        chosen = min(snapshots, key=lambda s: int(s.dp_rank))
+    load = convert_snapshot_to_protobuf(
+        chosen,
+        max_total_num_tokens=max_total_num_tokens,
+        max_running_requests=max_running_requests,
+    )
+    return engine_load_from(load, queued_token_work=False)
