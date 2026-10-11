@@ -2179,7 +2179,7 @@ impl StreamingProcessor {
                         source.account(&failure);
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse {
-                                error_type: "api_error".to_string(),
+                                error_type: failure.messages_error_type().to_string(),
                                 message: failure.to_string(),
                             },
                         };
@@ -2221,7 +2221,7 @@ impl StreamingProcessor {
                         source.account(&failure);
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse {
-                                error_type: "api_error".to_string(),
+                                error_type: failure.messages_error_type().to_string(),
                                 message: failure.to_string(),
                             },
                         };

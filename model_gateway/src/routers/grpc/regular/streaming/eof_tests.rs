@@ -1627,9 +1627,11 @@ async fn chat_stream_cut_by_the_engine_is_an_upstream_failure_with_the_tokens_so
     assert_eq!(chat_text(&events, 0, "content"), "Hel");
 }
 
-#[tokio::test]
-async fn chat_stream_cut_by_the_engine_ends_with_a_stream_error_event_then_done() {
-    let (stream, server) = cut_stream(vec![chunk(0, "Hi")], connection_lost()).await;
+/// A chat stream of one chunk that the engine ends with `status`, through
+/// `process_streaming_response`: the SSE frames the client read, and the
+/// worker the stream was read from (its breaker opens on the first failure).
+async fn frames_of_a_chat_stream_cut_with(status: tonic::Status) -> (Vec<String>, Arc<dyn Worker>) {
+    let (stream, server) = cut_stream(vec![chunk(0, "Hi")], status).await;
     let worker = breaker_worker();
     let selection = context::WorkerSelection::Single {
         worker: Arc::clone(&worker),
@@ -1658,19 +1660,31 @@ async fn chat_stream_cut_by_the_engine_ends_with_a_stream_error_event_then_done(
         .to_bytes();
     let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
     server.abort();
+    let frames = text
+        .split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .map(str::to_string)
+        .collect();
+    (frames, worker)
+}
+
+/// The error event that ends a cut stream, which `[DONE]` follows.
+fn error_event_before_done(frames: &[String]) -> Value {
+    let [.., error, done] = frames else {
+        panic!("an error event and [DONE]: {frames:?}");
+    };
+    assert_eq!(done, "data: [DONE]");
+    serde_json::from_str(error.strip_prefix("data: ").expect("a data line"))
+        .expect("the error event is JSON")
+}
+
+#[tokio::test]
+async fn chat_stream_cut_by_the_engine_ends_with_a_stream_error_event_then_done() {
+    let (frames, worker) = frames_of_a_chat_stream_cut_with(connection_lost()).await;
 
     // The response ends with the error event, typed as the engine's failure,
     // then [DONE], the shape clients already parse.
-    let frames: Vec<&str> = text
-        .split("\n\n")
-        .filter(|frame| !frame.is_empty())
-        .collect();
-    let [.., error, done] = frames.as_slice() else {
-        panic!("an error event and [DONE]: {text}");
-    };
-    assert_eq!(*done, "data: [DONE]");
-    let error: Value = serde_json::from_str(error.strip_prefix("data: ").expect("a data line"))
-        .expect("the error event is JSON");
+    let error = error_event_before_done(&frames);
     assert_eq!(error["error"]["type"], "stream_error");
     assert_eq!(
         error["error"]["message"],
@@ -1678,4 +1692,22 @@ async fn chat_stream_cut_by_the_engine_ends_with_a_stream_error_event_then_done(
     );
     // The worker that ended the stream is charged the failure.
     assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+}
+
+#[tokio::test]
+async fn chat_stream_the_engine_rejects_after_its_first_chunk_is_the_requests_fault() {
+    let (frames, worker) = frames_of_a_chat_stream_cut_with(tonic::Status::invalid_argument(
+        "the grammar does not compile",
+    ))
+    .await;
+
+    // The event is typed as a failed dispatch of the same status would have
+    // been, and the worker, which did nothing wrong, is not charged.
+    let error = error_event_before_done(&frames);
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        error["error"]["message"],
+        "Stream error: the grammar does not compile"
+    );
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
 }
