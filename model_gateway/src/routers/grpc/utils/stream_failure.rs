@@ -14,7 +14,11 @@
 //! the same `error_type`, and the event's `type` tells a stream the worker
 //! failed (`stream_error`) from a request's own fault (the HTTP error body's
 //! type) and from a failure of the gateway's own processing
-//! (`internal_error`).
+//! (`internal_error`). A dispatch the engine answered with a status (a
+//! refusal before the first token) is classed the same way, so the worker
+//! is charged for it, in the worker-error family, exactly when it would be
+//! for the same status after the first token (see
+//! [`UpstreamClass::account_dispatch_failure`]).
 
 use std::{fmt, sync::Arc};
 
@@ -36,7 +40,7 @@ use crate::{
             proto_wrapper::ENGINE_ERROR_MESSAGE,
         },
     },
-    worker::Worker,
+    worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
 };
 
 /// The SSE error `type` of a stream the worker failed: the engine's
@@ -102,6 +106,58 @@ impl UpstreamClass {
             http,
             error_type,
             breaker_sample,
+        }
+    }
+
+    /// The class of a status the engine answered a dispatch with: the
+    /// dispatch path's own mapping, `Cancelled` included (the request's
+    /// fault there, as [`TonicStatusExt::http_status`] has it).
+    pub(crate) fn of_dispatch(status: &tonic::Status) -> Self {
+        let http = status.http_status();
+        let error_type = if is_the_engines_own_report(status) {
+            metrics_labels::ERROR_ENGINE
+        } else {
+            error_type_from_status(http)
+        };
+        Self {
+            http,
+            error_type,
+            breaker_sample: status.breaker_status(),
+        }
+    }
+
+    /// Count a dispatch the worker answered `status` to, in the worker-error
+    /// family under the worker's labels, when the status is the worker's
+    /// failure: a refusal before the first token is the worker's exactly as
+    /// often as the same status after it. Once per attempt, next to the
+    /// breaker sample the attempt takes through its ledger; the client's
+    /// status and the router-error family are the pipeline's. A rejection of
+    /// the request (4xx) and capacity pushback (429) are not charged to the
+    /// worker, as after the first token.
+    pub(crate) fn account_dispatch_failure(
+        worker_type: &'static str,
+        connection_mode: &'static str,
+        status: &tonic::Status,
+    ) {
+        let class = Self::of_dispatch(status);
+        if class.is_worker_failure() {
+            Metrics::record_worker_error(worker_type, connection_mode, class.error_type);
+        }
+    }
+
+    /// Count a stream `status` ended with, read into a non-streamed answer,
+    /// against `worker` in the worker-error family when it is the worker's
+    /// failure: what [`StreamSource::account`] does for a streamed answer,
+    /// without the streamed answer's event. The client's status and the
+    /// router-error family are the pipeline's.
+    pub(crate) fn account_collected_failure(worker: &dyn Worker, status: &tonic::Status) {
+        let class = Self::of(status);
+        if class.is_worker_failure() {
+            Metrics::record_worker_error(
+                worker.worker_type().as_metric_label(),
+                worker.connection_mode().as_metric_label(),
+                class.error_type,
+            );
         }
     }
 
@@ -891,5 +947,114 @@ mod tests {
             !rendered.contains("smg_router_request_errors_total{"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn a_dispatch_status_is_classed_as_the_same_status_after_the_first_chunk_but_cancelled() {
+        for status in [
+            tonic::Status::unavailable("gone"),
+            tonic::Status::internal("broke"),
+            tonic::Status::internal(ENGINE_ERROR_MESSAGE),
+            tonic::Status::deadline_exceeded("too slow"),
+            tonic::Status::resource_exhausted("full"),
+            tonic::Status::invalid_argument("bad"),
+            tonic::Status::not_found("no such model"),
+        ] {
+            assert_eq!(
+                UpstreamClass::of_dispatch(&status),
+                UpstreamClass::of(&status),
+                "{status:?}"
+            );
+        }
+        // A cancelled dispatch is the request's fault (400), where the same
+        // code after the first chunk is a cut by the engine's server (502).
+        let cancelled = UpstreamClass::of_dispatch(&tonic::Status::cancelled("gone away"));
+        assert_eq!(
+            (
+                cancelled.http,
+                cancelled.error_type,
+                cancelled.breaker_sample
+            ),
+            (StatusCode::BAD_REQUEST, "validation_error", Some(400))
+        );
+        assert!(!cancelled.is_worker_failure());
+    }
+
+    #[test]
+    fn a_failed_dispatch_counts_against_the_worker_only_when_it_is_the_workers_failure() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            for status in [
+                tonic::Status::unavailable("gone"),
+                tonic::Status::internal("broke"),
+                tonic::Status::deadline_exceeded("too slow"),
+                tonic::Status::internal(ENGINE_ERROR_MESSAGE),
+                tonic::Status::resource_exhausted("full"),
+                tonic::Status::invalid_argument("bad"),
+                tonic::Status::not_found("no such model"),
+                tonic::Status::cancelled("gone away"),
+            ] {
+                UpstreamClass::account_dispatch_failure(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::CONNECTION_GRPC,
+                    &status,
+                );
+            }
+        });
+        let rendered = handle.render();
+        let count = |error_type: &str| {
+            sample(
+                &rendered,
+                "smg_worker_errors_total",
+                &[
+                    "worker_type=\"decode\"",
+                    "connection_mode=\"grpc\"",
+                    &format!("error_type=\"{error_type}\""),
+                ],
+            )
+            .map(|line| line.rsplit(' ').next().expect("a value").to_owned())
+        };
+        // The worker's failures, each under its class...
+        assert_eq!(count("backend_error").as_deref(), Some("2"), "{rendered}");
+        assert_eq!(count("timeout").as_deref(), Some("1"), "{rendered}");
+        assert_eq!(count("engine_error").as_deref(), Some("1"), "{rendered}");
+        // ...and nothing for the request's fault or capacity pushback.
+        for error_type in [
+            "rate_limit_error",
+            "validation_error",
+            "no_workers",
+            "internal_error",
+        ] {
+            assert_eq!(count(error_type), None, "{rendered}");
+        }
+    }
+
+    #[test]
+    fn a_collected_stream_failure_counts_against_the_worker_it_came_from() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = worker();
+        metrics::with_local_recorder(&recorder, || {
+            UpstreamClass::account_collected_failure(
+                worker.as_ref(),
+                &tonic::Status::internal(ENGINE_ERROR_MESSAGE),
+            );
+            UpstreamClass::account_collected_failure(
+                worker.as_ref(),
+                &tonic::Status::resource_exhausted("full"),
+            );
+        });
+        let rendered = handle.render();
+        // Under the worker's own labels (this one speaks HTTP): the engine's
+        // report only, capacity pushback is not its failure.
+        let line = sample(
+            &rendered,
+            "smg_worker_errors_total",
+            &["worker_type=\"regular\"", "connection_mode=\"http\""],
+        )
+        .unwrap_or_else(|| panic!("counted under the worker's labels:\n{rendered}"));
+        assert_eq!(label(line, "error_type"), "engine_error");
+        assert!(line.ends_with(" 1"), "{line}");
     }
 }

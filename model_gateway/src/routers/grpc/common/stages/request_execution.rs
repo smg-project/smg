@@ -45,11 +45,12 @@ use crate::{
             },
             utils::{
                 account_pd_leg_failure,
+                stream_failure::UpstreamClass,
                 tonic_ext::{TonicResultExt, TonicStatusExt},
             },
         },
     },
-    worker::{liveness, ConnectionModeExt, PrefillLoadGuard, Worker},
+    worker::{liveness, worker::WorkerTypeExt, ConnectionModeExt, PrefillLoadGuard, Worker},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -785,6 +786,13 @@ async fn execute_single(
     }
 
     let stream = result.map_err(|e| {
+        if let Some(worker) = workers.single() {
+            UpstreamClass::account_dispatch_failure(
+                worker.worker_type().as_metric_label(),
+                worker.connection_mode().as_metric_label(),
+                &e,
+            );
+        }
         start_failure_response(
             &e,
             "execute_single",
@@ -869,6 +877,13 @@ async fn execute_single_embed(
     }
 
     let complete = result.map_err(|e| {
+        if let Some(worker) = workers.single() {
+            UpstreamClass::account_dispatch_failure(
+                worker.worker_type().as_metric_label(),
+                worker.connection_mode().as_metric_label(),
+                &e,
+            );
+        }
         start_failure_response(
             &e,
             "execute_single_embed",
@@ -1194,7 +1209,7 @@ fn pd_leg_error(
             return prefill_silence_response(error, prefill);
         }
     }
-    Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+    UpstreamClass::account_dispatch_failure(leg.name(), connection, error);
     account_pd_leg_failure(leg.name(), error);
     start_failure_response(
         error,
@@ -1291,7 +1306,7 @@ fn retire_pd_leg(
                 }
             }
             Err(error) if retirement.charges() => {
-                Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+                UpstreamClass::account_dispatch_failure(leg.name(), connection, &error);
                 error!(
                     function = "retire_pd_leg",
                     leg = leg.name(),
@@ -1499,11 +1514,7 @@ fn sequential_prefill_failure(
             return prefill_silence_response(e, prefill);
         }
     }
-    Metrics::record_worker_error(
-        metrics_labels::WORKER_PREFILL,
-        connection,
-        metrics_labels::ERROR_BACKEND,
-    );
+    UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_PREFILL, connection, e);
     account_pd_leg_failure(metrics_labels::WORKER_PREFILL, e);
     start_failure_response(
         e,
@@ -1965,11 +1976,7 @@ async fn execute_sequential_pd(
         if let Some(status) = e.breaker_status() {
             workers.record_outcome_decode(ledger, status);
         }
-        Metrics::record_worker_error(
-            metrics_labels::WORKER_DECODE,
-            decode_label,
-            metrics_labels::ERROR_BACKEND,
-        );
+        UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, decode_label, &e);
         account_pd_leg_failure(metrics_labels::WORKER_DECODE, &e);
         start_failure_response(
             &e,

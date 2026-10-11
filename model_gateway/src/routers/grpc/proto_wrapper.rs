@@ -3132,6 +3132,14 @@ impl ProtoStream {
         Ok(first)
     }
 
+    /// The worker this stream was dispatched to, when it is tracked.
+    pub fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        match self {
+            Self::Tracked(tracked) => Some(&tracked.worker),
+            _ => None,
+        }
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let Self::Tracked(tracked) = self else {

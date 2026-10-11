@@ -1742,6 +1742,7 @@ mod request_release_tests {
                 MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
                 SUPPORTS_VISION_LABEL,
             },
+            proto_wrapper::ENGINE_ERROR_MESSAGE,
             utils::tonic_ext::TonicStatusExt,
         },
         worker::{
@@ -1787,7 +1788,9 @@ mod request_release_tests {
     /// immediately -- used for the PD prefill leg. `fail_first` makes the
     /// first generate call return UNAVAILABLE, for retry-replay tests;
     /// `fail_always` fails every call, `fail_internal` answers every call with
-    /// INTERNAL (an engine that took the request and failed on it), and
+    /// INTERNAL (an engine that took the request and failed on it),
+    /// `fail_mid_stream` ends the stream with the engine's own error after
+    /// its first frame, and
     /// `answer_after` stalls the generate RPC, standing in for an engine that
     /// answers only at its own deadline; `frame_gap` paces the response frames,
     /// for a stream that outlasts its dispatch. Every call's input token ids,
@@ -1801,6 +1804,7 @@ mod request_release_tests {
         fail_first: bool,
         fail_always: bool,
         fail_internal: bool,
+        fail_mid_stream: bool,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -1924,14 +1928,20 @@ mod request_release_tests {
             let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
             let released = Arc::clone(&self.released);
             let frame_gap = self.frame_gap;
+            let fail_mid_stream = self.fail_mid_stream;
             tokio::spawn(async move {
                 if let Some(probe) = probe {
                     Self::await_probe(&probe, &released).await;
                 }
-                for frame in generate_frames(&request_id) {
+                for (index, frame) in generate_frames(&request_id).into_iter().enumerate() {
                     if let Some(gap) = frame_gap {
                         tokio::time::sleep(gap).await;
                     }
+                    let frame = if fail_mid_stream && index == 1 {
+                        Err(Status::internal(ENGINE_ERROR_MESSAGE))
+                    } else {
+                        frame
+                    };
                     if tx.send(frame).await.is_err() {
                         return;
                     }
@@ -3904,6 +3914,100 @@ mod request_release_tests {
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("multimodal_not_supported"), "{body}");
         assert!(ids.is_empty(), "nothing must reach the worker");
+    }
+
+    /// The one `smg_worker_errors_total` sample of the regular gRPC workers.
+    fn regular_worker_error_line(rendered: &str) -> &str {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_worker_errors_total{")
+                    && line.contains("worker_type=\"regular\"")
+                    && line.contains("connection_mode=\"grpc\"")
+            })
+            .unwrap_or_else(|| panic!("a worker error is counted:\n{rendered}"))
+    }
+
+    /// Every attempt a worker refuses before the first token is one sample of
+    /// `smg_worker_errors_total` under the worker's labels, however the
+    /// breaker is charged (once per request): three UNAVAILABLE starts of one
+    /// request are three worker errors and one breaker failure.
+    #[test]
+    fn a_refusal_before_the_first_token_counts_against_the_worker_once_per_attempt() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let port = spawn_stub(GatedScheduler {
+                    fail_always: true,
+                    seen_request_ids: Arc::clone(&seen),
+                    ..Default::default()
+                })
+                .await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                let worker = register_worker_with_breaker(&worker_registry, port, 5);
+                let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+                let components = components(worker_registry).await;
+
+                let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
+
+                assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(calls_seen(&seen), 3, "three attempts on the one worker");
+                assert_eq!(
+                    worker.circuit_breaker_state(),
+                    CircuitState::Closed,
+                    "one failed request is one breaker failure"
+                );
+            });
+        });
+        let rendered = handle.render();
+        let line = regular_worker_error_line(&rendered);
+        assert!(line.contains("error_type=\"backend_error\""), "{line}");
+        assert!(line.ends_with(" 3"), "one sample per attempt: {line}");
+    }
+
+    /// A worker stream that fails after its first frame, read into a
+    /// non-streamed answer, is the worker's failure as it is for a streamed
+    /// one: one sample of `smg_worker_errors_total`, `engine_error` for the
+    /// engine's own report.
+    #[test]
+    fn a_worker_stream_that_fails_mid_way_counts_against_the_worker_for_a_non_streamed_answer() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let port = spawn_stub(GatedScheduler {
+                    fail_mid_stream: true,
+                    ..Default::default()
+                })
+                .await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, port, WorkerType::Regular);
+                let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+                let components = components(worker_registry).await;
+
+                let response = run_completion(pipeline, components, &fast_retry_config(1)).await;
+
+                assert_eq!(
+                    response.status(),
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "the engine's error ends a non-streamed answer with a 500"
+                );
+            });
+        });
+        let rendered = handle.render();
+        let line = regular_worker_error_line(&rendered);
+        assert!(line.contains("error_type=\"engine_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
     }
 }
 

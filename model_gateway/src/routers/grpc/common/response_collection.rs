@@ -13,7 +13,9 @@ use crate::{
         grpc::{
             context::ExecutionResult,
             proto_wrapper::{FanoutChild, ProtoGenerateComplete, ProtoResponseVariant},
-            utils::{account_pd_leg_failure, tonic_ext::TonicStatusExt},
+            utils::{
+                account_pd_leg_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
+            },
         },
     },
     worker::PrefillLoadGuard,
@@ -96,6 +98,9 @@ pub(crate) async fn collect_responses(
             })
             .await
             .map_err(|e| {
+                if let Some(worker) = prefill.worker() {
+                    UpstreamClass::account_collected_failure(worker.as_ref(), &e);
+                }
                 e.to_http_error(
                     "worker_stream_failed",
                     format!("Prefill stream failed: {}", e.message()),
@@ -203,6 +208,12 @@ async fn collect_stream_responses<S: FanoutChild>(
                     account_pd_leg_failure(leg, &e);
                 }
                 trace_error!(function = "collect_stream_responses", worker = %worker_name, grpc_code = ?e.code(), error = ?e, "Worker stream error");
+                // The worker's failure counts against it as a streamed
+                // answer's does; the client's status and the router-error
+                // family are the pipeline's.
+                if let Some(worker) = stream.worker() {
+                    UpstreamClass::account_collected_failure(worker.as_ref(), &e);
+                }
                 // Don't mark as completed - let Drop send abort for error cases
                 return Err(e.to_http_error(
                     "worker_stream_failed",
