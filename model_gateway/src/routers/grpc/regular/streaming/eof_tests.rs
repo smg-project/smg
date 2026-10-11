@@ -772,7 +772,6 @@ async fn byte_fallback_messages_complete_counts_held_thinking_tokens() {
     let mut last = complete(0, "length");
     if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
         complete.completion_tokens = ids.len() as u32;
-        complete.reasoning_tokens = 0;
     }
     frames.push(last);
     let (stream, server) = scripted_stream(frames, "0").await;
