@@ -97,8 +97,9 @@ jobs:
       # The OpenAI key is a repository secret, which pull requests from forks do
       # not receive. Without it every probe records a 401, which the health
       # gate (transport failures only) would not catch, so fail fast instead.
+      # The Chat Completions step reads the same key.
       - name: Check OpenAI API key
-        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai' }}
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai' || env.PROVIDER_SEL == 'openai-chat' }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |

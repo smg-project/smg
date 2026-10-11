@@ -125,7 +125,8 @@ names each chunk by what it carries (`delta.role`, `delta.content`,
 `delta.tool_calls`, `...finish:<reason>`, `usage`, `[DONE]`); the differ
 treats the content-bound delta parts (which kinds a chunk carries, and whether
 the first rides along with `role`) and the stop/length/tool_calls finish
-classes as mock-limited, like the other families.
+classes as mock-limited, like the other families; a `role` that repeats on
+every chunk of a single-choice stream stays structural (`delta.role.repeated`).
 
 ## Dual-target replay (SMG diff)
 

@@ -268,11 +268,16 @@ _CHAT_FINISH_EQUIV = re.compile(r"\.finish:(stop|length|tool_calls|function_call
 _CHAT_CONTENT_PARTS = {"content", "tool_calls", "reasoning", "refusal"}
 
 
-def chat_core_name(name: str) -> str | None:
+def chat_core_name(name: str, multi_choice: bool = False) -> str | None:
     """The structural part of a chat chunk name, or ``None`` when nothing
     structural is left: content-bound delta parts are dropped (``role`` stays),
     the finish reason keeps its class with stop/length/tool_calls collapsed to
-    ``<terminal>``, ``usage`` stays."""
+    ``<terminal>``, ``usage`` stays. A collapsed run (trailing ``+``) that still
+    carries ``role`` is ``delta.role.repeated``: a stream sends the role once
+    per choice, and a client that accumulates deltas concatenates a repeated
+    one. A multi-choice stream (``multi_choice``) sends one role chunk per
+    choice index, so its run keeps reading as ``delta.role``."""
+    run = name.endswith("+")
     base = name.rstrip("+")
     usage = base.endswith("+usage")
     if usage:
@@ -284,6 +289,8 @@ def chat_core_name(name: str) -> str | None:
         base = base[: m.start()]
     if base.startswith("delta."):
         parts = [p for p in base[len("delta.") :].split("+") if p not in _CHAT_CONTENT_PARTS]
+        if run and "role" in parts and not multi_choice:
+            parts = ["role.repeated"]
         base = "delta." + "+".join(parts) if parts else ""
         if finish:
             base = "finish"
@@ -324,6 +331,14 @@ def chat_chunk_name(ev):
     if parsed.get("usage"):
         name += "+usage"
     return name
+
+
+def request_choices(record) -> int:
+    """``n`` of the recorded request (1 when absent): a multi-choice stream
+    sends one ``role`` chunk per choice index."""
+    body = ((record or {}).get("request") or {}).get("body")
+    n = body.get("n") if isinstance(body, dict) else None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 1 else 1
 
 
 def collapse_runs(names: list) -> tuple:
@@ -686,8 +701,10 @@ def split_paths(vendor_paths, smg_paths, provider):
     return missing_struct, extra_struct, missing_mock, extra_mock
 
 
-def compare_events(v_names, s_names, provider):
-    """Compare collapsed event sequences; returns (divergent, detail)."""
+def compare_events(v_names, s_names, provider, multi_choice: bool = False):
+    """Compare collapsed event sequences; returns (divergent, detail).
+    ``multi_choice``: the request asked for several choices, whose chat stream
+    sends one ``role`` chunk per choice index (see ``chat_core_name``)."""
     v_seq, s_seq = collapse_runs(v_names), collapse_runs(s_names)
     if v_seq == s_seq:
         return False, None
@@ -704,8 +721,9 @@ def compare_events(v_names, s_names, provider):
             elif provider == "openai-chat":
                 # every chunk's delta parts are content-bound (the vendor sends
                 # role together with the first tool_calls delta, a text model
-                # sends it alone): keep role, the finish class and usage
-                core = chat_core_name(n)
+                # sends it alone): keep role, the finish class and usage; a
+                # role that rides on every chunk of a run stays structural
+                core = chat_core_name(n, multi_choice=multi_choice)
                 if core is not None:
                     out.append(core)
             else:
@@ -809,7 +827,10 @@ def classify(pid, vrec, srec, provider, extension_allowlist):
     elif v_stream:
         # --- (c) SSE event-type sequence ---------------------------------
         divergent, detail = compare_events(
-            event_names(vrec, provider), event_names(srec, provider), provider
+            event_names(vrec, provider),
+            event_names(srec, provider),
+            provider,
+            multi_choice=max(request_choices(vrec), request_choices(srec)) > 1,
         )
         if detail:
             entry["events"] = detail
