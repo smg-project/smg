@@ -159,8 +159,68 @@ def test_chat_stream_core_keeps_structural_differences():
     assert compat_diff.chat_core_name("delta.content+") is None
 
 
+def test_chat_stream_core_flags_a_role_repeated_on_every_chunk():
+    vendor = [
+        "delta.role",
+        "delta.content",
+        "delta.content",
+        "delta.empty.finish:stop",
+        "usage",
+        "[DONE]",
+    ]
+    # role on every content chunk collapses to one run that still carries role;
+    # a client accumulating the deltas concatenates the repeated role strings
+    repeated = ["delta.role+content"] * 3 + ["delta.empty.finish:stop", "usage", "[DONE]"]
+    divergent, detail = compat_diff.compare_events(vendor, repeated, "openai-chat")
+    assert divergent, detail
+    assert detail["vendor_core"][0] == "delta.role"
+    assert detail["smg_core"][0] == "delta.role.repeated"
+    assert compat_diff.chat_core_name("delta.role+") == "delta.role.repeated"
+    assert compat_diff.chat_core_name("delta.role+tool_calls+") == "delta.role.repeated"
+    # a multi-choice stream sends one role chunk per choice index, back to back
+    # or not; the request's n tells the two apart
+    per_index = [
+        "delta.role",
+        "delta.role",
+        "delta.content",
+        "delta.empty.finish:stop+",
+        "usage",
+        "[DONE]",
+    ]
+    one_choice = ["delta.role", "delta.empty.finish:stop", "usage", "[DONE]"]
+    assert compat_diff.compare_events(per_index, one_choice, "openai-chat")[0]
+    multi = compat_diff.compare_events(per_index, one_choice, "openai-chat", multi_choice=True)
+    assert not multi[0], multi[1]
+    assert compat_diff.request_choices({"request": {"body": {"n": 2}}}) == 2
+    assert compat_diff.request_choices({"request": {"body": {"n": 1}}}) == 1
+    assert compat_diff.request_choices({"request": {"body": None}}) == 1
+    assert compat_diff.request_choices(None) == 1
+
+    # classify reads n from the replayed request
+    def sse(names):
+        return {
+            "status": 200,
+            "sse_events": [{"event": n, "data": "", "parsed": {}} for n in names],
+        }
+
+    vrec = {"probe_id": "t.stream", "response": sse(per_index)}
+    srec = {
+        "probe_id": "t.stream",
+        "recorded": True,
+        "request": {"body": {"n": 2}},
+        "response": sse(one_choice),
+    }
+    assert (
+        compat_diff.classify("t.stream", vrec, srec, "openai-chat", frozenset())["severity"] != "S3"
+    )
+    srec["request"]["body"]["n"] = 1
+    assert (
+        compat_diff.classify("t.stream", vrec, srec, "openai-chat", frozenset())["severity"] == "S3"
+    )
+
+
 def test_allowlist_covers_only_known_sigs():
-    for provider in ("openai", "anthropic"):
+    for provider in ("openai", "anthropic", "openai-chat"):
         sigs = {c["sig_hash"] for c in conformance.clusters(provider)}
         for sig, entry in conformance.allowlist(provider).items():
             assert sig in sigs, f"allowlist entry {entry['cluster_id']} orphaned"
