@@ -2811,6 +2811,25 @@ mod tracked_tests {
         assert_eq!(worker.tracked_load(), 0, "released with the stream");
     }
 
+    #[tokio::test]
+    async fn a_tracked_stream_inside_a_tracked_stream_ends_and_releases_both_piles() {
+        // The in-place poll of `next` covers one tracked layer over a
+        // transport stream; a second layer takes the recursive path. Both
+        // layers' bookkeeping holds either way.
+        let outer: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let inner: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w2:8000").build());
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked(Arc::clone(&inner), 0, true)
+            .tracked(Arc::clone(&outer), 0, true);
+        assert_eq!((inner.tracked_load(), outer.tracked_load()), (1, 1));
+        assert!(
+            stream.next().await.is_none(),
+            "an empty fanout ends at once"
+        );
+        drop(stream);
+        assert_eq!((inner.tracked_load(), outer.tracked_load()), (0, 0));
+    }
+
     #[test]
     fn a_non_streaming_generation_joins_no_pile_but_keeps_its_prefill_and_its_progress() {
         // Review finding on the pushed head: left untracked altogether, a
@@ -2901,6 +2920,30 @@ impl ProtoStream {
 
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        let Self::Tracked(tracked) = self else {
+            return self.next_untracked().await;
+        };
+        // Every dispatched stream is one tracked layer over a transport
+        // stream: its messages are polled in place, without a boxed future
+        // per message. A tracked stream inside a tracked stream recurses.
+        let item = if matches!(tracked.inner, Self::Tracked(_)) {
+            Box::pin(tracked.inner.next()).await
+        } else {
+            tracked.inner.next_untracked().await
+        };
+        if let Some(Ok(response)) = &item {
+            liveness::on_token_progress(&tracked.worker);
+            if let Some(ticket) = tracked.prefill.as_mut() {
+                ticket.first_response(u64::from(response.cached_tokens()));
+            }
+            tracked.prefill = None;
+        }
+        item
+    }
+
+    /// The next item of a stream that is not [`Self::Tracked`]; a tracked
+    /// stream goes through [`Self::next`], which does its bookkeeping.
+    async fn next_untracked(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let item = match self {
             Self::Sglang(stream) => stream
                 .next()
@@ -2935,17 +2978,7 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
-            Self::Tracked(tracked) => {
-                let item = Box::pin(tracked.inner.next()).await;
-                if let Some(Ok(response)) = &item {
-                    liveness::on_token_progress(&tracked.worker);
-                    if let Some(ticket) = tracked.prefill.as_mut() {
-                        ticket.first_response(u64::from(response.cached_tokens()));
-                    }
-                    tracked.prefill = None;
-                }
-                return item;
-            }
+            Self::Tracked(_) => return Box::pin(self.next()).await,
         };
         item.map(reject_engine_error)
     }
