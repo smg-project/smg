@@ -61,6 +61,7 @@ impl ResponseProcessor {
     #[expect(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
+        request_id: &str,
         complete: &ProtoGenerateComplete,
         index: usize,
         original_request: &ChatResponseSpec,
@@ -109,13 +110,7 @@ impl ResponseProcessor {
         let tail = stop_decoder
             .finish()
             .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
-        if stop_decoder.prefix_mismatches() > 0 {
-            warn!(
-                index,
-                recoveries = stop_decoder.prefix_mismatches(),
-                "the decoder rewrote text already decoded; the response keeps that text and the remainder"
-            );
-        }
+        utils::warn_detokenize_recoveries(request_id, index as u32, stop_decoder);
         if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
@@ -335,6 +330,7 @@ impl ResponseProcessor {
         for (index, complete) in all_responses.iter().enumerate() {
             match self
                 .process_single_choice(
+                    &dispatch.request_id,
                     complete,
                     index,
                     &chat_request,
@@ -1303,6 +1299,7 @@ mod responses_finish_reason_tests {
             );
             let (choice, _) = processor
                 .process_single_choice(
+                    "test-request",
                     &complete,
                     0,
                     &ChatResponseSpec::from(&request),
@@ -1362,6 +1359,7 @@ mod responses_finish_reason_tests {
             );
             let (choice, _) = processor
                 .process_single_choice(
+                    "test-request",
                     &complete,
                     0,
                     &spec,
@@ -1427,6 +1425,7 @@ plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
             );
             let (choice, _) = processor
                 .process_single_choice(
+                    "test-request",
                     &complete,
                     0,
                     &ChatResponseSpec::from(&request),

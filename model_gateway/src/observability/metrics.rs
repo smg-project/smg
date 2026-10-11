@@ -239,7 +239,7 @@ pub(crate) fn init_metrics() {
         "Tokenizer cache entries removed for capacity; excludes clear, drop and replacement"
     );
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
-    describe_counter!("smg_detokenize_prefix_mismatch_total", "Streams whose incremental decode no longer started with the text already sent and went on with the remainder, by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were streamed) or decoder (another decoder step rewrote the sent prefix)");
+    describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
 
     #[cfg(all(
         feature = "jemalloc-stats",

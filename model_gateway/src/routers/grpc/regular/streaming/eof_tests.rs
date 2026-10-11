@@ -1002,6 +1002,7 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
         let (choice, reasoning_tokens) = processor
             .process_single_choice(
+                "test-request",
                 &ProtoGenerateComplete::Vllm(Box::new(complete.clone())),
                 0,
                 &chat_spec(false),
@@ -1071,6 +1072,7 @@ async fn non_byte_fallback_held_stop_keeps_original_reasoning_accounting() {
     );
     let (choice, reasoning_tokens) = processor
         .process_single_choice(
+            "test-request",
             &complete,
             0,
             &chat_spec(false),
@@ -1119,6 +1121,7 @@ async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
     let (choice, _) = processor
         .process_single_choice(
+            "test-request",
             &complete,
             0,
             &chat_spec(false),

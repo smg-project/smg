@@ -615,6 +615,10 @@ impl HuggingFaceTokenizer {
     /// ByteFallback run whose characters were already streamed, a `Replace`
     /// step spanned the boundary), this emits the remainder past the rewritten
     /// text instead, keeps streaming, and reports the recovery.
+    /// `count` says whether a recovery goes into the process-wide totals:
+    /// the sequence paths and `finish_decode` count, the raw `decode_step` /
+    /// `decode_step_eager` calls do not (the gateway replays an output with
+    /// them for token accounting, which no client sees).
     fn step_decode_lenient(
         &self,
         new_ids: Vec<TokenIdType>,
@@ -622,6 +626,7 @@ impl HuggingFaceTokenizer {
         ids: &mut Vec<TokenIdType>,
         prefix: &mut String,
         prefix_index: &mut usize,
+        count: bool,
     ) -> Result<DecodeStep> {
         if prefix.is_empty() && !ids.is_empty() {
             let new_prefix = self.decode(ids, skip_special_tokens)?;
@@ -648,7 +653,9 @@ impl HuggingFaceTokenizer {
                     byte_run,
                     "decode no longer starts with the emitted text; streaming the remainder"
                 );
-                crate::decode_activity::note_prefix_mismatch(byte_run);
+                if count {
+                    crate::decode_activity::note_prefix_mismatch(byte_run);
+                }
                 (rest, true)
             }
         };
@@ -698,7 +705,8 @@ impl Decoder for HuggingFaceTokenizer {
             .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
     }
 
-    /// Native incremental decode: the algorithm of the HF `step_decode_stream`
+    /// Native incremental decode (the raw step: a recovery here is not counted,
+    /// see [`Self::step_decode_lenient`]): the algorithm of the HF `step_decode_stream`
     /// (hold while the decode ends in an incomplete character, emit what grew
     /// beyond the emitted prefix), run through the concrete `TokenizerImpl`
     /// rather than `dyn Decoder` dispatch, and lenient when the decoder chain
@@ -742,6 +750,7 @@ impl Decoder for HuggingFaceTokenizer {
                 ids,
                 prefix,
                 prefix_index,
+                false,
             )?
             .text)
     }
@@ -762,6 +771,7 @@ impl Decoder for HuggingFaceTokenizer {
                 ids,
                 prefix,
                 prefix_index,
+                true,
             );
         }
         if self.has_byte_fallback {
@@ -802,7 +812,7 @@ impl Decoder for HuggingFaceTokenizer {
         } else {
             vec![token_id]
         };
-        self.step_decode_lenient(tokens, skip_special_tokens, ids, prefix, prefix_index)
+        self.step_decode_lenient(tokens, skip_special_tokens, ids, prefix, prefix_index, true)
     }
 
     /// Byte-level vocabularies decode each id to fixed bytes, so one stream

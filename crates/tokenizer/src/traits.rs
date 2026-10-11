@@ -142,9 +142,11 @@ pub trait Decoder: Send + Sync {
     /// produce incremental text output. The default implementation uses the
     /// double-decode algorithm (decode prefix, decode prefix+new, diff).
     ///
-    /// HuggingFace overrides this with the native `step_decode_stream` from the
-    /// `tokenizers` crate, which uses the same algorithm internally but avoids
-    /// trait-method overhead for the two `decode()` calls.
+    /// HuggingFace overrides this with its own copy of that algorithm run on the
+    /// concrete tokenizer (no trait-method overhead for the two `decode()`
+    /// calls) which, where the decode no longer starts with the emitted text,
+    /// emits the remainder instead of failing (see
+    /// [`decode_step_reporting`](Self::decode_step_reporting) for the report).
     fn decode_step(
         &self,
         token_id: TokenIdType,
