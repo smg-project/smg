@@ -109,6 +109,7 @@ enum Call {
     JsonList(json::list::Assembler),
     Xml(tagged::xml::Assembler),
     Xtml(tagged::xtml::Assembler),
+    Attributed(tagged::attributed::Assembler),
 }
 
 impl Call {
@@ -129,6 +130,9 @@ impl Call {
             Some(CallSyntax::JsonList) => Self::JsonList(json::list::Assembler::new(index)),
             Some(CallSyntax::Xml) => Self::Xml(tagged::xml::Assembler::new(index, id)),
             Some(CallSyntax::Xtml) => Self::Xtml(tagged::xtml::Assembler::new(index, id)),
+            Some(CallSyntax::Attributed(tags)) => {
+                Self::Attributed(tagged::attributed::Assembler::new(index, id, tags))
+            }
         }
     }
 
@@ -158,6 +162,10 @@ impl Call {
             }
             Self::Xtml(assembler) => {
                 assembler.feed(text, out);
+                text.len()
+            }
+            Self::Attributed(assembler) => {
+                assembler.feed(text, declared, out);
                 text.len()
             }
         }
@@ -228,6 +236,16 @@ impl Call {
             }
             (Self::Xtml(assembler), Closed::ByMarker) => assembler.close("", out),
             (Self::Xtml(assembler), Closed::ByEnd) => assembler.finish(out),
+            // As for DSML: only the invoke's closing tag is a started call's end, and an invoke
+            // that named no call takes whichever terminal ended it.
+            (Self::Attributed(assembler), Closed::ByMarker)
+                if terminal == tagged::attributed::INVOKE_CLOSE || !assembler.started() =>
+            {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Attributed(assembler), Closed::ByMarker) => assembler.close("", out),
+            (Self::Attributed(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }

@@ -55,6 +55,7 @@ use crate::{
     tagged::{assembler::TAGS as TAGGED_TAGS, dsml, keyed::Tags as KeyedTags},
 };
 
+mod attributed;
 mod keyed;
 mod schema;
 mod tagged;
@@ -283,6 +284,9 @@ impl Format {
                 Self::keyed_calls(&markers, &named, at_least_one)
             }
             CallSyntax::Dsml => Self::dsml_calls(&markers, &named, at_least_one)?,
+            CallSyntax::Attributed(tags) => {
+                attributed::calls(&markers, tags, &named, at_least_one)?
+            }
             CallSyntax::Keyed(tags) => {
                 let ways_in = self.ways_into_block(&markers);
                 keyed::calls(&markers, &ways_in, tags, &named, at_least_one)
@@ -320,6 +324,7 @@ impl Format {
                 tags.value_close,
             ],
             Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
+            Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
             _ => &[],
         };

@@ -8,8 +8,8 @@ use std::{fmt::Write as _, fs, path::PathBuf};
 
 use symphony::{
     formats::{
-        deepseek_v4_1, glm, glm4, hy4, iquest, k2_horizon, kimi_k3, lfm2_5, ling, minimax_m3,
-        olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v4_1, glm, glm4, hy4, iquest, k2_horizon, kimi_k3, lfm2_5, ling, minimax_m2,
+        minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Format,
@@ -63,6 +63,7 @@ enum Table {
     Olmo3,
     Lfm2_5,
     Xlam,
+    MinimaxM2,
     MinimaxM3,
     KimiK3,
     Glm,
@@ -87,6 +88,7 @@ impl Table {
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
             Self::Glm => glm(),
@@ -424,9 +426,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2025-10-22",
         smg: (Some("minimax_m2"), Some("minimax")),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::MinimaxM2),
+        set: Some(12_821),
+        status: Status::Replaying,
     },
     Group {
         slug: "minimax-m2.7",
@@ -434,9 +436,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-04-09",
         smg: (Some("minimax_m2"), Some("minimax")),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::MinimaxM2),
+        set: Some(12_821),
+        status: Status::Replaying,
     },
     Group {
         slug: "minimax-m3",

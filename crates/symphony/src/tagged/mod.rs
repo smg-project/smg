@@ -11,11 +11,13 @@
 //! streaming a declared string as it arrives and writing every other value at its close; [`dsml`]
 //! does the same for one DeepSeek DSML invoke, whose `string` attribute types each value; and
 //! [`keyed`] for one call written as its name and `<arg_key>`/`<arg_value>` pairs (GLM, Hy4,
-//! Ling, IQuest), typed by the request's tools again; [`xml`] for one MiniMax M3 invoke, whose
-//! arguments are an XML tree, typed by the request's tools at every depth; and [`xtml`] for one
-//! Kimi K3 call, whose argument tags name each value's type.
+//! Ling, IQuest), typed by the request's tools again; [`attributed`] for one MiniMax M2 invoke,
+//! whose parameter tags name their key in an attribute, typed by the request's tools; [`xml`] for
+//! one MiniMax M3 invoke, whose arguments are an XML tree, typed by the request's tools at every
+//! depth; and [`xtml`] for one Kimi K3 call, whose argument tags name each value's type.
 
 pub mod assembler;
+pub mod attributed;
 pub mod dsml;
 pub mod keyed;
 pub mod value;

@@ -76,8 +76,8 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, glm, glm4, hy4, iquest, k2_horizon, kimi_k3, lfm2_5, ling, minimax_m3,
-        olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v4_1, glm, glm4, hy4, iquest, k2_horizon, kimi_k3, lfm2_5, ling, minimax_m2,
+        minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -493,6 +493,19 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::MinimaxM3,
         GenerationPrompt::ModelDecides,
     ),
+    // MiniMax M2 and M2.7 write `<think>` blocks and `<minimax:tool_call>` blocks of invokes
+    // whose parameter tags name their key in an attribute; their prompt opens the thought on its
+    // own line whatever the request says (the template has no thinking switch).
+    (
+        "minimax-m2",
+        Family::MinimaxM2,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    (
+        "minimax-m2.7",
+        Family::MinimaxM2,
+        GenerationPrompt::AlwaysOpensTheThought,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -538,6 +551,8 @@ enum Family {
     Lfm2_5,
     /// [`xlam`]: a bare JSON list of calls.
     Xlam,
+    /// [`minimax_m2`]: parameters named by an attribute, typed by the request tools.
+    MinimaxM2,
     /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
     MinimaxM3,
     /// [`kimi_k3`]: XTML, whose argument tags name their own values' types.
@@ -587,6 +602,7 @@ impl Family {
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
             Self::Plain => plain(),
@@ -614,7 +630,9 @@ impl Family {
             // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
             // but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
-            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 => KNOWN_REASONING_PROBE,
+            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 | Self::MinimaxM2 => {
+                KNOWN_REASONING_PROBE
+            }
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
         // A template that writes no thought for the probe's request leaves the reasoning out, so

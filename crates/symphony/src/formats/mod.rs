@@ -12,6 +12,11 @@
 //! after each pair under that opener, and [`k2_horizon()`] the same newlines under `ifm|`-prefixed
 //! tags in a block of calls. [`olmo3()`] and [`lfm2_5()`] write their calls as Python. [`xlam()`]
 //! is a bare JSON list of calls, or content.
+//! with nothing between the tags, under GLM's turn opener, and [`glm4()`] GLM 4.5 and 4.6's
+//! newline after each pair under that opener. [`olmo3()`] and [`lfm2_5()`]
+//! write their calls as Python. [`xlam()`] is a bare JSON list of calls, or content.
+//! [`minimax_m2()`] is MiniMax M2: `<think>` blocks and `<minimax:tool_call>` blocks of `invoke`
+//! blocks whose parameter tags name their key in an attribute, typed by the request's tools.
 //! [`minimax_m3()`] is MiniMax M3: `<mm:think>` blocks, `<tool_call>` blocks of `invoke` blocks
 //! whose arguments are an XML tree, and a separator token the table ignores. [`kimi_k3()`] is
 //! Kimi K3: a turn of tagged regions, `think`, `response` and `tools`, the last holding `call`
@@ -31,6 +36,7 @@ pub mod k2_horizon;
 pub mod kimi_k3;
 pub mod lfm2_5;
 pub mod ling;
+pub mod minimax_m2;
 pub mod minimax_m3;
 pub mod olmo3;
 pub mod plain;
@@ -48,6 +54,7 @@ pub use k2_horizon::k2_horizon;
 pub use kimi_k3::kimi_k3;
 pub use lfm2_5::lfm2_5;
 pub use ling::ling;
+pub use minimax_m2::minimax_m2;
 pub use minimax_m3::minimax_m3;
 pub use olmo3::olmo3;
 pub use plain::plain;
