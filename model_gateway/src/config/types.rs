@@ -318,7 +318,11 @@ pub struct RouterConfig {
     /// stays valid without a renewal, in seconds. A record whose lease has
     /// expired (its gateway stopped) is closed as `failed` by any gateway
     /// sharing the response store, within one and a half times this value.
-    /// 0 writes no lease and runs no reaper.
+    /// The gateways sharing a store compare their clocks through the lease
+    /// (the lease is renewed every third of this value and holds for the
+    /// whole of it): keep them within a third of this value of each other;
+    /// a gateway running ahead by more than two thirds of it closes live
+    /// responses as lost. 0 writes no lease and runs no reaper.
     #[serde(default = "default_background_lease_ttl_secs")]
     pub background_lease_ttl_secs: u64,
     /// Enable the priority-aware admission scheduler. When false (default),

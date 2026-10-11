@@ -1046,8 +1046,11 @@ struct CliArgs {
     /// How long the lease this gateway holds on a background response it runs
     /// stays valid without a renewal, in seconds: a response whose gateway
     /// stopped is closed as failed by any gateway sharing the response store
-    /// within one and a half times this value. 0 writes no lease and runs no
-    /// reaper.
+    /// within one and a half times this value. The gateways sharing a store
+    /// compare their clocks through the lease: keep them within a third of
+    /// this value of each other (a gateway running ahead by more than two
+    /// thirds of it closes live responses as lost). 0 writes no lease and
+    /// runs no reaper.
     #[arg(long, default_value_t = 30, help_heading = "Rate Limiting")]
     background_lease_ttl_secs: u64,
 

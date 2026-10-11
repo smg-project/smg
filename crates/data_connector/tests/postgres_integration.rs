@@ -933,4 +933,29 @@ async fn open_background_responses_are_listed_until_they_close() {
     for stored in [&open, &closed, &foreground] {
         storage.delete_response(&stored.id).await.expect("delete");
     }
+
+    // The listing is served by the partial index created with the table.
+    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the one query it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    let indexes = client
+        .query(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'responses_open_background_idx'",
+            &[],
+        )
+        .await
+        .expect("pg_indexes");
+    assert_eq!(indexes.len(), 1, "the open-background index exists");
+    let indexdef: String = indexes[0].get(0);
+    assert!(
+        indexdef.contains("WHERE") && indexdef.contains("'status'"),
+        "{indexdef}"
+    );
+    drop(client);
+    let _ = driver.await;
 }

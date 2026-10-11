@@ -1575,7 +1575,9 @@ class RouterArgs:
                 " response it runs stays valid without a renewal, in seconds;"
                 " a response whose gateway stopped is closed as failed by any"
                 " gateway sharing the response store within one and a half"
-                " times this value. 0 writes no lease and runs no reaper."
+                " times this value. Keep the clocks of the gateways sharing a"
+                " store within a third of this value of each other. 0 writes"
+                " no lease and runs no reaper."
             ),
         )
 

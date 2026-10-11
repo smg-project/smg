@@ -71,20 +71,25 @@ impl PostgresStore {
     /// migration-added columns did not yet exist.
     pub(crate) async fn ensure_response_indexes(&self) -> Result<(), String> {
         let s = &self.schema.responses;
-        if s.is_skipped("safety_identifier") {
+        let table = s.qualified_table(self.schema.owner.as_deref());
+        let mut ddl = Vec::new();
+        if !s.is_skipped("safety_identifier") {
+            let col = s.col("safety_identifier");
+            ddl.push(format!(
+                "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({col});"
+            ));
+        }
+        ddl.extend(open_background_index_sql(&self.schema));
+        if ddl.is_empty() {
             return Ok(());
         }
-        let table = s.qualified_table(self.schema.owner.as_deref());
-        let col = s.col("safety_identifier");
-        let idx_ddl =
-            format!("CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({col});");
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| format!("failed to get connection for index creation: {e}"))?;
         client
-            .batch_execute(&idx_ddl)
+            .batch_execute(&ddl.join(" "))
             .await
             .map_err(|e| format!("failed to create response index: {e}"))?;
         Ok(())
@@ -908,6 +913,13 @@ impl PostgresResponseStorage {
                 tracing::debug!("deferred response index creation (column may not exist yet): {e}");
             }
         }
+        if let Some(idx_ddl) = open_background_index_sql(&store.schema) {
+            if let Err(e) = client.batch_execute(&idx_ddl).await {
+                tracing::debug!(
+                    "deferred open-background index creation (column may not exist yet): {e}"
+                );
+            }
+        }
 
         let store_path = store_path_for(&client, &table, s.col("id")).await;
         let select_base = build_response_select_base(&store.schema);
@@ -1007,6 +1019,28 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     Some(format!(
         "{select_base} WHERE {col_raw}::jsonb @> jsonb_build_object('output', \
          jsonb_build_array(jsonb_build_object('id', $1::text))){order} LIMIT 1"
+    ))
+}
+
+/// The index behind [`ResponseStorage::list_open_background_responses`]: a
+/// partial index over the rows whose stored object's status is one a
+/// response still leaves, keyed by that status, so the listing every
+/// gateway's reaper runs reads the few open rows instead of scanning the
+/// table with a `jsonb` cast per row (the `json` to `jsonb` cast is
+/// immutable, so it can be indexed). Created with the table and again by
+/// `ensure_response_indexes`, like the identifier index. `None` when the
+/// schema skips the column.
+fn open_background_index_sql(schema: &SchemaConfig) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let table = s.qualified_table(schema.owner.as_deref());
+    let col_raw = s.col("raw_response");
+    Some(format!(
+        "CREATE INDEX IF NOT EXISTS responses_open_background_idx ON {table} \
+         (({col_raw}::jsonb->>'status')) \
+         WHERE {col_raw}::jsonb->>'status' IN ('queued', 'in_progress');"
     ))
 }
 
@@ -1496,6 +1530,23 @@ mod tests {
     fn parse_metadata_non_object_is_error() {
         assert!(PostgresConversationStorage::parse_metadata(Some(json!("not an object"))).is_err());
     }
+    #[test]
+    fn the_open_background_index_covers_the_listing_s_status_condition() {
+        let schema = SchemaConfig::default();
+        assert_eq!(
+            open_background_index_sql(&schema).unwrap(),
+            "CREATE INDEX IF NOT EXISTS responses_open_background_idx ON responses \
+             ((raw_response::jsonb->>'status')) \
+             WHERE raw_response::jsonb->>'status' IN ('queued', 'in_progress');"
+        );
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_index_sql(&skipped).is_none());
+    }
+
     #[test]
     fn open_background_sql_filters_on_the_stored_status_and_flag_oldest_first() {
         let schema = SchemaConfig::default();
