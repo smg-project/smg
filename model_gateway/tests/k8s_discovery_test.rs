@@ -826,6 +826,76 @@ async fn same_url_pod_replacement_reregisters_with_new_uid() {
     handle.abort();
 }
 
+fn with_annotation(mut pod: Pod, key: &str, value: &str) -> Pod {
+    pod.metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(key.to_string(), value.to_string());
+    pod
+}
+
+/// The KV connector of every registered worker at `port`.
+fn kv_connectors_at(app_context: &AppContext, port: u16) -> Vec<Option<String>> {
+    app_context
+        .worker_registry
+        .get_all()
+        .into_iter()
+        .filter(|worker| worker.url().ends_with(&format!(":{port}")))
+        .map(|worker| worker.metadata().spec.kv_connector.clone())
+        .collect()
+}
+
+/// Editing a live Pod's KV annotation keeps its UID, so the instance is the
+/// same, but its configuration is not: the worker is replaced and registers
+/// with the new connector, instead of keeping the old one until the Pod is
+/// recreated.
+#[tokio::test]
+async fn kv_annotation_edit_on_a_live_pod_replaces_its_worker() {
+    let fake = FakeK8s::start().await;
+    let app_context = test_context().await;
+    let (_engine, port) = start_mock_engine().await;
+    let pod = |connector: &str| {
+        with_annotation(
+            worker_pod("kv-0", "uid-kv-0", &port.to_string(), true),
+            "smg.ai/kv-connector",
+            connector,
+        )
+    };
+
+    fake.apply_pod(pod("MooncakeConnector"));
+    let handle = start_service_discovery_with_client(
+        fake.client(),
+        discovery_config(),
+        Arc::clone(&app_context),
+    );
+    wait_for(
+        &app_context,
+        "the worker registered",
+        Duration::from_secs(15),
+        |urls| has_url(urls, port),
+    )
+    .await;
+    assert_eq!(
+        kv_connectors_at(&app_context, port),
+        vec![Some("MooncakeConnector".to_string())]
+    );
+
+    fake.apply_pod(pod("NixlConnector"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while kv_connectors_at(&app_context, port) != vec![Some("NixlConnector".to_string())] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the edited annotation never reached the worker: {:?}",
+            kv_connectors_at(&app_context, port)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Still the same instance.
+    wait_for_pod_uid(&app_context, port, "uid-kv-0", "the same Pod UID").await;
+
+    handle.abort();
+}
+
 #[tokio::test]
 async fn annotation_port_change_reconciles_worker_set() {
     let fake = FakeK8s::start().await;

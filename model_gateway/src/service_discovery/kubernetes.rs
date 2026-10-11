@@ -1228,10 +1228,13 @@ mod tests {
         crate::worker::endpoint_key(url).expect(url)
     }
 
+    /// A registered worker whose Pod the tests then stop publishing, so its
+    /// fingerprint never comes into play.
     fn owned(url: &str, discovery_id: &str) -> reconciler::OwnedWorker {
         reconciler::OwnedWorker {
             worker_id: WorkerId::from_string(url.to_string()),
             discovery_id: Some(discovery_id.to_string()),
+            spec_hash: None,
             endpoint: Endpoint::parse_with_rank(url).expect(url).0,
             revision: 1,
         }

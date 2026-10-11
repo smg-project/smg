@@ -184,3 +184,49 @@ def test_pd_metadata_reaches_the_registered_workers(gateway, manifest, mock_work
         assert worker.get("kv_connector") == connector, worker
         assert worker.get("kv_role") == role, worker
         assert worker.get("kv_engine_id") == engine_id, worker
+
+
+def test_an_in_place_edit_takes_effect(gateway, manifest, mock_worker):
+    """Fixing a record in place, keeping its id, reaches the registry. The
+    case that motivated it: a prefill worker's bootstrap port corrected."""
+    base = free_port_range(2)
+    mock_worker(
+        *("--host", "127.0.0.1", "--http-base-port", str(base), "--http-count", "2"),
+        *("--model", MODEL),
+        ready_port=base + 1,
+    )
+    prefill, decode = f"http://127.0.0.1:{base}", f"http://127.0.0.1:{base + 1}"
+
+    def write(bootstrap_port: int) -> None:
+        manifest.write(
+            [
+                {
+                    "id": "prefill-a",
+                    "url": prefill,
+                    "worker_type": "prefill",
+                    "bootstrap_port": bootstrap_port,
+                },
+                {"id": "decode-a", "url": decode, "worker_type": "decode"},
+            ]
+        )
+
+    def prefill_registrations(workers: list[dict]) -> list[tuple[str, int | None]]:
+        return [
+            (w.get("labels", {}).get(ID, ""), w.get("bootstrap_port"))
+            for w in workers
+            if w["url"] == prefill
+        ]
+
+    write(29700)
+    gateway.start("--pd-disaggregation")
+    gateway.wait_for(
+        "the prefill worker on bootstrap port 29700",
+        lambda workers: prefill_registrations(workers) == [("prefill-a", 29700)],
+    )
+
+    write(29711)
+    workers = gateway.wait_for(
+        "the corrected bootstrap port registered",
+        lambda workers: prefill_registrations(workers) == [("prefill-a", 29711)],
+    )
+    assert {w["url"] for w in workers} == {prefill, decode}

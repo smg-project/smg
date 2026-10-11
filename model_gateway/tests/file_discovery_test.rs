@@ -227,3 +227,64 @@ async fn a_missing_manifest_is_retried_not_emptied() {
 
     handle.abort();
 }
+
+/// `(discovery id, KV connector)` of every registered worker at `port`.
+fn registrations_at(app_context: &AppContext, port: u16) -> Vec<(String, Option<String>)> {
+    app_context
+        .worker_registry
+        .get_all()
+        .into_iter()
+        .filter(|worker| worker.url().ends_with(&format!(":{port}")))
+        .map(|worker| {
+            let spec = &worker.metadata().spec;
+            let id = spec
+                .labels
+                .get(DISCOVERY_ID_LABEL)
+                .cloned()
+                .unwrap_or_default();
+            (id, spec.kv_connector.clone())
+        })
+        .collect()
+}
+
+/// Editing a record but keeping its id changes its configuration, not its
+/// instance: the worker is replaced with the new settings rather than left as
+/// it was registered. This is the common way to fix a manifest.
+#[tokio::test]
+async fn an_in_place_edit_replaces_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workers.json");
+    let app_context = test_context().await;
+    let (_engine, port) = start_mock_engine().await;
+    let record = |connector: &str| {
+        format!(
+            r#"{{"version": 1, "workers": [{{"id": "engine-a", "url": "127.0.0.1:{port}", "kv_connector": "{connector}"}}]}}"#
+        )
+    };
+    let registered = |connector: &str| vec![("engine-a".to_string(), Some(connector.to_string()))];
+
+    write_manifest(&path, &record("MooncakeConnector"));
+    let handle = start_file_discovery(&path, &app_context).await;
+    let deadline = tokio::time::Instant::now() + CONVERGE;
+    while registrations_at(&app_context, port) != registered("MooncakeConnector") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never registered: {:?}",
+            registrations_at(&app_context, port)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    write_manifest(&path, &record("NixlConnector"));
+    let deadline = tokio::time::Instant::now() + CONVERGE;
+    while registrations_at(&app_context, port) != registered("NixlConnector") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the edit never reached the registry: {:?}",
+            registrations_at(&app_context, port)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    handle.abort();
+}

@@ -52,7 +52,8 @@ impl DiscoveryKind {
 pub(super) struct DiscoveredWorker {
     /// The provider's stable identity for this worker instance, unique within a
     /// snapshot. A different value at an endpoint means a different instance
-    /// there, which the reconciler replaces.
+    /// there, which the reconciler replaces, as it does the same instance
+    /// republished with a different [`Self::fingerprint`].
     ///
     /// Kubernetes uses `{pod_uid}:{port}`: one Pod can serve several ports, and
     /// a Pod *recreated* at the same address — a rescheduled StatefulSet Pod,
@@ -90,6 +91,10 @@ impl DiscoveredWorker {
     /// spelling decides how the worker is registered (`h:p` dual-probes HTTP
     /// and gRPC; `grpc://h:p` does not). Two spellings that parse to the same
     /// endpoint render, and so hash, identically.
+    ///
+    /// The reconciler stamps this on every worker it registers and replaces a
+    /// worker whose stamp no longer matches the published record, so a
+    /// configuration change reaches the registry.
     ///
     /// Never log this next to the endpoint: the rendered form can carry
     /// credentials, and the pair would let a reader test guesses offline.
