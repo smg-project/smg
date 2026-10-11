@@ -1240,10 +1240,10 @@ mod tests {
             assert_eq!(usage["output_tokens"], 7);
             assert_eq!(usage["total_tokens"], 19);
             assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 2);
-            match cached {
-                Some(cached) => assert_eq!(usage["input_tokens_details"]["cached_tokens"], cached),
-                None => assert!(usage.get("input_tokens_details").is_none()),
-            }
+            assert_eq!(
+                usage["input_tokens_details"]["cached_tokens"],
+                cached.unwrap_or(0)
+            );
         }
     }
 
