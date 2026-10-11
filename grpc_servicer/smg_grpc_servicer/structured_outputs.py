@@ -37,11 +37,28 @@ STRUCTURED_OUTPUTS_FIRST_TOKEN = "first_token"
 _UNKNOWN = object()
 
 
+def _resolved_reasoning_parser(server_args: Any) -> Any:
+    """The reasoning parser the engine runs: the last value its argument
+    resolution declared for ``reasoning_parser`` (SGLang keeps
+    ``--reasoning-parser auto`` as typed and records what its template
+    detection resolved it to, a name or None, in ``_resolved_overrides``, last
+    writer wins, which is how its own serving view reads it), else the raw
+    argument; ``_UNKNOWN`` when the server arguments have no such field."""
+    for _source, declared in reversed(getattr(server_args, "_resolved_overrides", None) or ()):
+        if "reasoning_parser" in declared:
+            return declared["reasoning_parser"]
+    return getattr(server_args, "reasoning_parser", _UNKNOWN)
+
+
 def engine_reasoning_parser(server_args: Any) -> str:
     """The engine's reasoning parser (``--reasoning-parser``) as its server
     arguments carry it, for the ``engine_reasoning_parser`` label; "" when it
-    runs none."""
-    return str(getattr(server_args, "reasoning_parser", None) or "")
+    runs none, and for an ``auto`` the engine has not resolved to a name yet
+    (the label names a parser, never the request to pick one)."""
+    parser = _resolved_reasoning_parser(server_args)
+    if parser is _UNKNOWN or parser == "auto":
+        return ""
+    return str(parser or "")
 
 
 def sglang_structured_outputs_start(server_args: Any) -> str:
@@ -51,10 +68,12 @@ def sglang_structured_outputs_start(server_args: Any) -> str:
     generated when the request asks for reasoning (``require_reasoning``, which
     the Router sets on a thinking prompt): ``after_reasoning``. Without a parser
     the grammar runs from the first generated token: ``first_token``. "" when
-    the server arguments predate the reasoning parser, which leaves the Router
-    to the shape that fits either kind of engine."""
-    parser = getattr(server_args, "reasoning_parser", _UNKNOWN)
-    if parser is _UNKNOWN:
+    the server arguments predate the reasoning parser, and for an ``auto`` the
+    engine has not resolved (its detection may find no parser, and then the
+    grammar runs from the first token), which leaves the Router to the shape
+    that fits either kind of engine."""
+    parser = _resolved_reasoning_parser(server_args)
+    if parser is _UNKNOWN or parser == "auto":
         return ""
     if parser:
         return STRUCTURED_OUTPUTS_AFTER_REASONING

@@ -31,6 +31,36 @@ def test_sglang_says_nothing_when_the_server_args_predate_the_parser():
     assert so.sglang_structured_outputs_start(SimpleNamespace(model_path="org/model")) == ""
 
 
+def test_sglang_reads_an_auto_parser_as_the_engine_resolved_it():
+    # `--reasoning-parser auto` stays "auto" on the argument; the engine's
+    # template detection declares what it resolved to (a name, or None when no
+    # rule matched) in _resolved_overrides, last writer wins.
+    named = SimpleNamespace(
+        reasoning_parser="auto",
+        _resolved_overrides=[("template-detection", {"reasoning_parser": "qwen3"})],
+    )
+    assert so.sglang_structured_outputs_start(named) == so.STRUCTURED_OUTPUTS_AFTER_REASONING
+    assert so.engine_reasoning_parser(named) == "qwen3"
+
+    none_found = SimpleNamespace(
+        reasoning_parser="auto",
+        _resolved_overrides=[
+            ("template-detection", {"reasoning_parser": "qwen3"}),
+            ("later", {"reasoning_parser": None}),
+        ],
+    )
+    assert so.sglang_structured_outputs_start(none_found) == so.STRUCTURED_OUTPUTS_FIRST_TOKEN
+    assert so.engine_reasoning_parser(none_found) == ""
+
+    # Not resolved yet (or never, in a process that does not run the
+    # detection): the engine may or may not gate its grammar, so say nothing,
+    # and never advertise "auto" as a parser's name.
+    unresolved = SimpleNamespace(reasoning_parser="auto")
+    assert so.sglang_structured_outputs_start(unresolved) == ""
+    assert so.engine_reasoning_parser(unresolved) == ""
+    assert so.grammar_start_labels(unresolved, so.sglang_structured_outputs_start(unresolved)) == {}
+
+
 def test_engine_reasoning_parser_is_the_servers_argument_or_empty():
     assert so.engine_reasoning_parser(SimpleNamespace(reasoning_parser="deepseek-r1")) == (
         "deepseek-r1"
