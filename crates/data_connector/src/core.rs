@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
@@ -205,6 +205,36 @@ pub struct ListParams {
     pub limit: usize,
     pub order: SortOrder,
     pub after: Option<String>, // item_id cursor
+}
+
+/// Strictly increasing `added_at` stamps for the items one caller links to a conversation.
+///
+/// Every backend lists a conversation's items by `added_at`, then by item id, so items that
+/// share a stamp come back in id order, which is random. A caller that links several items in
+/// one operation stamps each of them from one sequence: the current time, or one microsecond
+/// past the previous stamp when the clock has not moved at least that far. Stamps are whole
+/// microseconds, the resolution the SQL backends store, so two stamps this sequence tells
+/// apart stay apart in every backend.
+#[derive(Debug, Default)]
+pub struct AddedAtSequence {
+    last: Option<DateTime<Utc>>,
+}
+
+impl AddedAtSequence {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The next stamp: later than every stamp this sequence handed out before.
+    pub fn next_added_at(&mut self) -> DateTime<Utc> {
+        let now = Utc::now().trunc_subsecs(6);
+        let next = match self.last {
+            Some(last) if now <= last => last + chrono::TimeDelta::microseconds(1),
+            _ => now,
+        };
+        self.last = Some(next);
+        next
+    }
 }
 
 pub type ConversationItemResult<T> = Result<T, ConversationItemStorageError>;
@@ -886,5 +916,40 @@ mod tests {
         assert_eq!(chain.responses.len(), 2, "chain should have 2 responses");
         assert_eq!(chain.responses[0].id, r1_id, "first response should be r1");
         assert_eq!(chain.responses[1].id, r2_id, "second response should be r2");
+    }
+
+    // ========================================================================
+    // AddedAtSequence tests
+    // ========================================================================
+
+    #[test]
+    fn added_at_sequence_stamps_strictly_increase_at_microsecond_resolution() {
+        let mut stamps = AddedAtSequence::new();
+        let started = Utc::now();
+        let mut previous = stamps.next_added_at();
+        assert!(previous >= started.trunc_subsecs(6));
+        // A tight loop asks faster than the clock moves: every stamp still gets its own
+        // microsecond...
+        for _ in 0..1000 {
+            let next = stamps.next_added_at();
+            assert!(next.timestamp_micros() > previous.timestamp_micros());
+            assert_eq!(
+                next.timestamp_subsec_nanos() % 1000,
+                0,
+                "whole microseconds"
+            );
+            previous = next;
+        }
+        // ...and the sequence runs at most one microsecond per stamp ahead of the clock.
+        assert!(previous <= Utc::now() + chrono::TimeDelta::microseconds(1001));
+    }
+
+    #[test]
+    fn added_at_sequence_follows_the_clock_once_it_has_moved() {
+        let mut stamps = AddedAtSequence::new();
+        let first = stamps.next_added_at();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = stamps.next_added_at();
+        assert!(second - first >= chrono::TimeDelta::milliseconds(1));
     }
 }

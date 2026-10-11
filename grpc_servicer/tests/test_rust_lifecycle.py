@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 
@@ -221,3 +223,242 @@ def test_one_cores_exit_ends_the_group_and_the_cleanup_reaps_every_worker(tmp_pa
 
     for worker in workers:
         _wait_dead(worker, "orphaned worker")
+
+
+class _FakeRank:
+    """A ``multiprocessing``-shaped scheduler process this process started."""
+
+    def __init__(self, pid: int, *, stubborn: bool = False):
+        self.pid = pid
+        self.exitcode: int | None = None
+        self.events: list[str] = []
+        self._stubborn = stubborn  # ignores SIGTERM; only a kill ends it
+
+    def is_alive(self) -> bool:
+        return self.exitcode is None
+
+    def terminate(self) -> None:
+        self.events.append("terminate")
+        if not self._stubborn:
+            self.exitcode = -signal.SIGTERM
+
+    def kill(self) -> None:
+        self.events.append("kill")
+        self.exitcode = -signal.SIGKILL
+
+    def join(self, timeout=None) -> None:
+        self.events.append("join")
+
+
+def _signals(rank: _FakeRank) -> list[str]:
+    return [event for event in rank.events if event != "join"]
+
+
+def test_scheduler_processes_shutdown_terminates_then_kills_what_stays():
+    """Every live process gets SIGTERM; one that outlives the grace period is
+    killed; one that had already exited is left alone."""
+    ranks = [_FakeRank(1), _FakeRank(2, stubborn=True), _FakeRank(3)]
+    ranks[2].exitcode = 0
+    manager = rust_lifecycle.SchedulerProcesses(ranks, grace_secs=0.01)
+    assert manager.pids == [1, 2, 3]
+
+    manager.shutdown()
+
+    assert [_signals(rank) for rank in ranks] == [["terminate"], ["terminate", "kill"], []]
+    assert all(rank.exitcode is not None for rank in ranks)
+
+
+def test_scheduler_processes_wait_for_the_ready_reports_on_a_thread(caplog):
+    """The ready wait runs off the caller's thread and logs its outcome: the
+    count when every process reported, the error when the start failed."""
+    threads: list[threading.Thread] = []
+
+    def ready():
+        threads.append(threading.current_thread())
+
+    manager = rust_lifecycle.SchedulerProcesses([_FakeRank(1), _FakeRank(2)], ready=ready)
+    with caplog.at_level("INFO", logger=rust_lifecycle.logger.name):
+        thread = manager.watch_ready("test scheduler")
+        assert thread is not None
+        thread.join(5)
+    assert threads == [thread] and thread is not threading.main_thread()
+    assert "test scheduler: 2 scheduler process(es) ready" in caplog.text
+    assert manager.ready_error is None
+
+    def failing_ready():
+        raise RuntimeError("rank 1 died")
+
+    failing = rust_lifecycle.SchedulerProcesses([_FakeRank(1)], ready=failing_ready)
+    with caplog.at_level("ERROR", logger=rust_lifecycle.logger.name):
+        failing.watch_ready("test scheduler").join(5)
+    assert str(failing.ready_error) == "rank 1 died"
+    assert "test scheduler: the scheduler processes did not start: rank 1 died" in caplog.text
+    # No ready wait: nothing to watch.
+    assert rust_lifecycle.SchedulerProcesses([_FakeRank(1)]).watch_ready("x") is None
+
+
+def test_wait_for_ready_reports_reads_one_report_per_pipe():
+    pipes = [multiprocessing.Pipe(duplex=False) for _ in range(2)]
+    ranks = [_FakeRank(1), _FakeRank(2)]
+    for index, (_reader, writer) in enumerate(pipes):
+        writer.send({"status": "ready", "rank": index})
+    reports = rust_lifecycle.wait_for_ready_reports(
+        [reader for reader, _writer in pipes], ranks, poll_secs=0.01
+    )
+    assert reports == [{"status": "ready", "rank": 0}, {"status": "ready", "rank": 1}]
+
+
+def test_wait_for_ready_reports_notices_a_failed_start():
+    """A process that died before reporting, a closed pipe, and a report that
+    is not `ready` each end the wait with the reason."""
+    reader, writer = multiprocessing.Pipe(duplex=False)
+    dead = _FakeRank(7)
+    dead.exitcode = -signal.SIGKILL
+    with pytest.raises(RuntimeError, match="process 7 exited with -9 before it was ready"):
+        rust_lifecycle.wait_for_ready_reports([reader], [dead], poll_secs=0.01)
+
+    reader, writer = multiprocessing.Pipe(duplex=False)
+    writer.close()
+    with pytest.raises(RuntimeError, match="process 8 closed its pipe before it was ready"):
+        rust_lifecycle.wait_for_ready_reports([reader], [_FakeRank(8)], poll_secs=0.01)
+
+    reader, writer = multiprocessing.Pipe(duplex=False)
+    writer.send({"status": "error"})
+    with pytest.raises(RuntimeError, match="process 0 failed to start"):
+        rust_lifecycle.wait_for_ready_reports([reader], [_FakeRank(9)], poll_secs=0.01)
+
+
+def test_a_fault_ends_the_group_and_shuts_the_other_processes_down():
+    """`fault` reports a failure a process signalled out of band: the next poll
+    returns the code and terminates the processes still alive; the fault is
+    the group's exit code even when a process exits with another one later."""
+    ranks = [_FakeRank(1), _FakeRank(2)]
+    group = rust_lifecycle.EngineProcessGroup(
+        rust_lifecycle.SchedulerProcesses(ranks, grace_secs=0.01)
+    )
+    assert group.poll() is None
+
+    group.fault(1)
+
+    assert group.poll() == 1
+    assert [_signals(rank) for rank in ranks] == [["terminate"], ["terminate"]]
+    assert group.wait() == 1
+    ranks[0].exitcode = 3
+    assert group.poll() == 1
+    group.fault(5)  # a second report changes nothing
+    assert group.poll() == 1
+
+
+def test_a_fault_signal_ends_the_group_instead_of_the_process(caplog):
+    """The handler `on_fault_signal` installs turns the signal into a fault of
+    the group (the signal's default disposition would end this process); it
+    can only be installed on the main thread."""
+    ranks = [_FakeRank(1), _FakeRank(2)]
+    group = rust_lifecycle.EngineProcessGroup(
+        rust_lifecycle.SchedulerProcesses(ranks, grace_secs=0.01)
+    )
+    previous = signal.getsignal(signal.SIGUSR2)
+    try:
+        assert rust_lifecycle.on_fault_signal(group, signal.SIGUSR2, what="test scheduler")
+        with caplog.at_level("ERROR", logger=rust_lifecycle.logger.name):
+            signal.raise_signal(signal.SIGUSR2)
+        assert group.poll() == 1
+        assert [_signals(rank) for rank in ranks] == [["terminate"], ["terminate"]]
+        assert (
+            "test scheduler: a scheduler process signalled a failure "
+            f"(signal {int(signal.SIGUSR2)}); stopping" in caplog.text
+        )
+
+        other = rust_lifecycle.EngineProcessGroup(
+            rust_lifecycle.SchedulerProcesses([_FakeRank(3)], grace_secs=0.01)
+        )
+        installed: list[bool] = []
+        thread = threading.Thread(
+            target=lambda: installed.append(
+                rust_lifecycle.on_fault_signal(other, signal.SIGUSR2, what="off the main thread")
+            )
+        )
+        thread.start()
+        thread.join(5)
+        assert installed == [False]
+        signal.raise_signal(signal.SIGUSR2)  # still the first group's handler
+        assert other.poll() is None
+    finally:
+        signal.signal(signal.SIGUSR2, previous if previous is not None else signal.SIG_DFL)
+
+
+def test_a_failed_ready_wait_ends_the_group():
+    """A start that fails after the processes are up (a report that is not
+    `ready`, a rank that died) is a fault of the group, not only a log line:
+    the next poll returns 1 and the live processes are terminated, so the
+    supervisor exits instead of reporting the engine alive until its ceiling."""
+    ranks = [_FakeRank(1), _FakeRank(2)]
+    manager = rust_lifecycle.SchedulerProcesses(
+        ranks, ready=lambda: (_ for _ in ()).throw(RuntimeError("rank 2 reported an error"))
+    )
+    group = rust_lifecycle.EngineProcessGroup(manager)
+
+    manager.watch_ready("test scheduler", on_failure=group.fault).join(5)
+
+    assert str(manager.ready_error) == "rank 2 reported an error"
+    assert group.poll() == 1
+    assert [_signals(rank) for rank in ranks] == [["terminate"], ["terminate"]]
+
+
+def test_a_fault_latch_carries_a_signal_sent_before_the_group_exists(caplog):
+    """The handlers go in before the first process starts, so they target a
+    latch: a signal that arrives before the group is attached ends the group
+    the moment it is; one after the attach goes straight through."""
+    latch = rust_lifecycle.FaultLatch()
+    previous = signal.getsignal(signal.SIGUSR2)
+    try:
+        assert rust_lifecycle.on_fault_signal(latch, signal.SIGUSR2, what="test scheduler")
+        with caplog.at_level("ERROR", logger=rust_lifecycle.logger.name):
+            signal.raise_signal(signal.SIGUSR2)
+        ranks = [_FakeRank(1), _FakeRank(2)]
+        group = rust_lifecycle.EngineProcessGroup(
+            rust_lifecycle.SchedulerProcesses(ranks, grace_secs=0.01)
+        )
+        assert group.poll() is None
+        assert latch.attach(group) is group
+        assert group.poll() == 1
+        assert [_signals(rank) for rank in ranks] == [["terminate"], ["terminate"]]
+
+        later = rust_lifecycle.EngineProcessGroup(
+            rust_lifecycle.SchedulerProcesses([_FakeRank(3)], grace_secs=0.01)
+        )
+        rust_lifecycle.FaultLatch().attach(later)
+        assert later.poll() is None  # nothing was reported to that latch
+        attached = rust_lifecycle.FaultLatch()
+        attached.attach(later)
+        attached.fault(4)
+        assert later.poll() == 4
+    finally:
+        signal.signal(signal.SIGUSR2, previous if previous is not None else signal.SIG_DFL)
+
+
+def test_ensure_spawn_start_method_forces_spawn_only_when_it_is_not_set(monkeypatch, caplog):
+    """The engine's own setup sets the start method; the guard only acts, with
+    a warning, when a version stops doing so (a fork from a process running
+    the Rust server's threads can deadlock the child)."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing, "get_start_method", lambda allow_none=False: "spawn"
+    )
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing,
+        "set_start_method",
+        lambda method, force=False: calls.append((method, force)),
+    )
+    rust_lifecycle.ensure_spawn_start_method("test scheduler")
+    assert calls == []
+
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing, "get_start_method", lambda allow_none=False: None
+    )
+    with caplog.at_level("WARNING", logger=rust_lifecycle.logger.name):
+        rust_lifecycle.ensure_spawn_start_method("test scheduler")
+    assert calls == [("spawn", True)]
+    assert "test scheduler: the multiprocessing start method was not spawn; setting it" in (
+        caplog.text
+    )

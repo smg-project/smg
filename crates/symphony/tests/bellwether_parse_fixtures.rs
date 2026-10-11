@@ -235,6 +235,18 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Qwen3,
         GenerationPrompt::AlwaysOpensTheThought,
     ),
+    // Qwen3-Omni: the Qwen3 template over audio and video content too, so the same syntax and
+    // the same switch; both checkpoints leave the thought to the model.
+    (
+        "qwen3-omni-30b-a3b-instruct",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
+    (
+        "qwen3-omni-30b-a3b-thinking",
+        Family::Qwen3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
     // Qwen2.5: no thought at all.
     (
         "qwen2.5-7b-instruct-1m",

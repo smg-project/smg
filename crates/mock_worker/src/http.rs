@@ -199,10 +199,17 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
                 return injected_error(fault.status);
             }
         }
+        // An HTTP worker has no engine-failure frame on its wire: an armed
+        // `finish=error` cuts with a 500 here.
         let cut = injected.and_then(|fault| {
+            let status = if fault.finish_error {
+                500
+            } else {
+                fault.status
+            };
             fault
                 .after_tokens
-                .map(|after| (after, fault.status, engine.cut_counter()))
+                .map(|after| (after, status, engine.cut_counter()))
         });
         let parsed = parsed.unwrap_or(Value::Null);
         let prompt_ids = synth_token_ids(&extract_prompt_text(&parsed));

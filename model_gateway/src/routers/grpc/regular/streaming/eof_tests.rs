@@ -264,7 +264,7 @@ fn dispatch() -> context::DispatchMetadata {
     }
 }
 
-fn chat_spec(with_tools: bool) -> ChatResponseSpec {
+pub(super) fn chat_spec(with_tools: bool) -> ChatResponseSpec {
     chat_spec_with(with_tools, None)
 }
 
@@ -289,7 +289,7 @@ fn chat_spec_with(with_tools: bool, tool_choice: Option<Value>) -> ChatResponseS
     )
 }
 
-async fn collect_events(mut rx: SseReceiver) -> Vec<Value> {
+pub(super) async fn collect_events(mut rx: SseReceiver) -> Vec<Value> {
     let mut events = Vec::new();
     while let Some(frame) = rx.recv().await {
         let frame = frame.expect("successful SSE write");
@@ -1614,6 +1614,7 @@ async fn chat_stream_cut_by_the_engine_is_an_upstream_failure_with_the_tokens_so
         Err(utils::StreamFailure::Upstream {
             status,
             completion_tokens,
+            ..
         }) => {
             assert_eq!(
                 status.message(),

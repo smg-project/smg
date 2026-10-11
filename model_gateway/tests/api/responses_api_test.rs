@@ -2363,6 +2363,156 @@ async fn test_conversation_items_create_and_get() {
     assert_eq!(get_json["role"], "user");
 }
 
+/// The JSON body of a handler's 200 response.
+async fn conversation_json(
+    resp: axum::response::Response,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The ids of a list response's `data[]`, in the order answered.
+fn conversation_item_ids(list: &serde_json::Value) -> Vec<String> {
+    list["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str().map(String::from))
+        .collect()
+}
+
+fn user_message(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}]
+    })
+}
+
+#[tokio::test]
+async fn items_of_one_add_call_are_listed_in_request_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Items that share a stamp are listed by their random ids, which is request order about
+    // half of the time: twenty rounds, each with two items in one call and a third in the next.
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+    let ctx = crate::common::create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    for round in 0..20 {
+        let conv = conversation_json(
+            conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({}))
+                .await,
+        )
+        .await?;
+        let conv_id = conv["id"].as_str().ok_or("conversation id")?;
+
+        let added = conversation_json(
+            conversations::create_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                serde_json::json!({"items": [user_message("first"), user_message("second")]}),
+            )
+            .await,
+        )
+        .await?;
+        let mut expected = conversation_item_ids(&added);
+        assert_eq!(
+            expected.len(),
+            2,
+            "round {round}: the add answers both items"
+        );
+
+        // A second call right after the first: its item follows the first call's items.
+        let third = conversation_json(
+            conversations::create_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                serde_json::json!({"items": [user_message("third")]}),
+            )
+            .await,
+        )
+        .await?;
+        expected.extend(conversation_item_ids(&third));
+        assert_eq!(
+            expected.len(),
+            3,
+            "round {round}: the second add answers its item"
+        );
+
+        let asc = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await?;
+        assert_eq!(
+            conversation_item_ids(&asc),
+            expected,
+            "round {round}: order=asc lists the items as they were added"
+        );
+
+        let desc = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                None,
+                Some("desc"),
+                None,
+            )
+            .await,
+        )
+        .await?;
+        let mut reversed = expected.clone();
+        reversed.reverse();
+        assert_eq!(
+            conversation_item_ids(&desc),
+            reversed,
+            "round {round}: order=desc is the reverse"
+        );
+
+        let after_first = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                conv_id,
+                None,
+                Some("asc"),
+                Some(&expected[0]),
+            )
+            .await,
+        )
+        .await?;
+        assert_eq!(
+            conversation_item_ids(&after_first),
+            expected[1..],
+            "round {round}: after the first item come the others, in order"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation

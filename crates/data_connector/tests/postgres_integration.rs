@@ -35,9 +35,11 @@ use std::{
     thread,
 };
 
+use chrono::{TimeDelta, Utc};
 use data_connector::{
-    create_storage, HistoryBackend, NewConversation, NewConversationItem, PostgresConfig,
-    SchemaConfig, StorageBundle, StorageFactoryConfig, StoredResponse, TableConfig,
+    create_storage, ConversationItemId, HistoryBackend, ListParams, NewConversation,
+    NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
+    StorageFactoryConfig, StoredResponse, TableConfig,
 };
 use serde_json::json;
 use tokio::task::JoinSet;
@@ -691,4 +693,86 @@ async fn a_store_is_four_round_trips_without_a_unique_index_on_the_id() {
     a_store_costs_the_round_trips_of_its_path(false, 4)
         .await
         .expect("four round trips per store on a table without a unique index on the id");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn conversation_items_linked_a_microsecond_apart_list_in_link_order() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let conversation = bundle
+        .conversation_storage
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+        })
+        .await
+        .expect("create conversation");
+    let items = bundle.conversation_item_storage;
+
+    // Ids in the reverse of the link order, unique to this run (the database is shared): a
+    // backend that tied on the stamp would list them by id, backwards. The stamps are one
+    // microsecond apart, the resolution of the column.
+    let nonce = &conversation.id.0;
+    let ids: Vec<ConversationItemId> = ["z", "m", "a"]
+        .iter()
+        .map(|s| ConversationItemId::from(format!("msg_{s}_{nonce}").as_str()))
+        .collect();
+    for id in &ids {
+        items
+            .create_item(NewConversationItem {
+                id: Some(id.clone()),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([]),
+                status: Some("completed".to_string()),
+            })
+            .await
+            .expect("create item");
+    }
+    let base = Utc::now();
+    for (i, id) in ids.iter().enumerate() {
+        items
+            .link_item(
+                &conversation.id,
+                id,
+                base + TimeDelta::microseconds(i as i64),
+            )
+            .await
+            .expect("link item");
+    }
+
+    let list = |order: SortOrder, after: Option<&ConversationItemId>| {
+        let items = items.clone();
+        let conversation_id = conversation.id.clone();
+        let params = ListParams {
+            limit: 10,
+            order,
+            after: after.map(|id| id.0.clone()),
+        };
+        async move {
+            items
+                .list_items(&conversation_id, params)
+                .await
+                .expect("list items")
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    assert_eq!(list(SortOrder::Asc, None).await, ids);
+    let mut reversed = ids.clone();
+    reversed.reverse();
+    assert_eq!(list(SortOrder::Desc, None).await, reversed);
+    assert_eq!(list(SortOrder::Asc, Some(&ids[0])).await, ids[1..]);
+    assert_eq!(
+        list(SortOrder::Desc, Some(&ids[2])).await,
+        [ids[1].clone(), ids[0].clone()]
+    );
 }

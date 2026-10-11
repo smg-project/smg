@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use openai_protocol::responses::{
     generate_id, MessagePhase, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
     StringOrContentParts,
 };
 use serde_json::{json, Value};
 use smg_data_connector::{
-    with_request_context, ConversationId, ConversationItem, ConversationItemId,
+    with_request_context, AddedAtSequence, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationStorage, NewConversationItem,
     RequestContext as StorageRequestContext, ResponseId, ResponseStorage, StoredResponse,
 };
@@ -142,10 +142,13 @@ pub fn split_stored_message_content(raw: Value) -> (Value, Option<MessagePhase>)
 
 /// Create a conversation item and optionally link it to a conversation.
 /// Sets default "completed" status if not provided.
+/// `added_at` stamps the link; a caller linking several items takes the stamps from one
+/// [`AddedAtSequence`], so the conversation lists them in the order they were linked.
 pub async fn create_and_link_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id_opt: Option<&ConversationId>,
     mut new_item: NewConversationItem,
+    added_at: DateTime<Utc>,
 ) -> Result<(), String> {
     if new_item.status.is_none() {
         new_item.status = Some("completed".to_string());
@@ -158,7 +161,7 @@ pub async fn create_and_link_item(
 
     if let Some(conv_id) = conv_id_opt {
         item_storage
-            .link_item(conv_id, &created.id, Utc::now())
+            .link_item(conv_id, &created.id, added_at)
             .await
             .map_err(|e| format!("Failed to link item: {e}"))?;
 
@@ -389,15 +392,30 @@ async fn link_items_to_conversation(
     response_id: &str,
 ) -> Result<(), String> {
     let response_id_opt = Some(response_id.to_string());
+    // The inputs, then the outputs, each stamped later than the one before: the conversation
+    // lists this response's turns in the order they were exchanged.
+    let mut stamps = AddedAtSequence::new();
 
     for item in input_items {
         let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), true);
-        create_and_link_item(item_storage, Some(conv_id), new_item).await?;
+        create_and_link_item(
+            item_storage,
+            Some(conv_id),
+            new_item,
+            stamps.next_added_at(),
+        )
+        .await?;
     }
 
     for item in output_items {
         let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), false);
-        create_and_link_item(item_storage, Some(conv_id), new_item).await?;
+        create_and_link_item(
+            item_storage,
+            Some(conv_id),
+            new_item,
+            stamps.next_added_at(),
+        )
+        .await?;
     }
 
     Ok(())

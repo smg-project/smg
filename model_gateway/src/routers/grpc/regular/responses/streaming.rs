@@ -300,39 +300,20 @@ async fn process_and_transform_sse_stream(
         }
     }
 
-    // Emit final response.completed event with accumulated usage
-    let usage_json = accumulator.usage.as_ref().map(|u| {
-        let mut usage_obj = json!({
-            "input_tokens": u.prompt_tokens,
-            "output_tokens": u.completion_tokens,
-            "total_tokens": u.total_tokens
-        });
-
-        // Include reasoning_tokens if present
-        if let Some(details) = &u.completion_tokens_details {
-            if let Some(reasoning_tokens) = details.reasoning_tokens {
-                usage_obj["output_tokens_details"] =
-                    json!({ "reasoning_tokens": reasoning_tokens });
-            }
-        }
-
-        usage_obj
-    });
-
-    event_emitter
-        .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
-        .await?;
-
-    // Finalize and persist accumulated response
+    // Use the same complete usage representation for the terminal event and storage.
     if terminal_error.is_some() {
         accumulator.finish_reason = Some("failed".into());
     }
     let mut final_response = accumulator.finalize();
     // Persist under the public Responses ID, not the upstream Chat ID.
     final_response.id = response_id;
-    if let Some(error) = terminal_error {
-        final_response.error = Some(error);
+    if let Some(error) = terminal_error.as_ref() {
+        final_response.error = Some(error.clone());
     }
+    let usage_json = final_response.usage.as_ref().map(|usage| json!(usage));
+    event_emitter
+        .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
+        .await?;
     persist_response_if_needed(
         conversation_storage,
         conversation_item_storage,
@@ -1296,6 +1277,64 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_preserves_cache_and_reasoning_usage() {
+        for cached in [Some(0), Some(6), None] {
+            let mut usage = Usage::from_counts(12, 7).with_reasoning_tokens(2);
+            if let Some(cached) = cached {
+                usage = usage.with_cached_tokens(cached);
+            }
+            let chunk = ChatCompletionStreamResponse::builder("chat_test", "test-model")
+                .usage(usage)
+                .build();
+            let frames = vec![
+                format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()),
+                "data: [DONE]\n\n".into(),
+            ];
+            let body = Body::from_stream(futures_util::stream::iter(
+                frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ));
+            let (tx, mut rx) = mpsc::channel(64);
+            process_and_transform_sse_stream(
+                body,
+                ResponsesRequest {
+                    store: Some(false),
+                    ..Default::default()
+                },
+                None,
+                Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+            let mut terminal = None;
+            while let Some(Ok(bytes)) = rx.recv().await {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let data = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap();
+                let event: Value = serde_json::from_str(data).unwrap();
+                if event["type"] == "response.completed" {
+                    terminal = Some(event);
+                }
+            }
+            let terminal = terminal.expect("completed event must be emitted");
+            let usage = &terminal["response"]["usage"];
+            assert_eq!(usage["input_tokens"], 12);
+            assert_eq!(usage["output_tokens"], 7);
+            assert_eq!(usage["total_tokens"], 19);
+            assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 2);
+            assert_eq!(
+                usage["input_tokens_details"]["cached_tokens"],
+                cached.unwrap_or(0)
+            );
+        }
     }
 
     #[test]
