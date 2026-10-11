@@ -6,38 +6,47 @@
 //! the schema's order, joined by `, `, each present when the schema requires it and otherwise
 //! optional; since the comma stands between two present pairs only, the pairs are written as one
 //! choice per pair that may come first, the required ones and those after it following each with
-//! its comma. A value follows the property's type as the templates write it: a string as a Python
-//! string in either quote (`"Paris"`, `'Paris'`), a string `enum` as one of its values quoted the
-//! same way, a boolean as `True` or `False`, `null` as `None`, a number, an object or an array as
-//! the JSON the property's schema accepts, which the templates write with `tojson` and the
-//! assembler reads as it reads a Python literal. A property that pins no type, or a schema without
-//! properties, takes any text up to the call's `)`.
+//! its comma. A value follows the property's type in the dialect's spelling of a value, which is
+//! the template's: LFM2.5 writes Python, a string in either quote (`"Paris"`, `'Paris'`), a
+//! string `enum` as one of its values quoted the same way, a boolean as `True` or `False`, `null`
+//! as `None`; Olmo 3 writes every value through `tojson`, so JSON, a string in double quotes, an
+//! `enum` value the same, `true`, `false` and `null`. A number, an object or an array is the JSON
+//! the property's schema accepts under both, which the templates write with `tojson` and the
+//! assembler reads as it reads a Python literal. An `enum` behind a `$ref` is the target's, as
+//! every keyword is. A property that pins no type, or a schema without properties, takes any text
+//! up to the call's `)`.
 
 use openai_protocol::common::Tool;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{
-    schema::{shape, Definitions},
+    schema::{keyword, shape, Definitions},
     CallMarkers, Grammar, Tag,
 };
-use crate::pythonic::Framing;
+use crate::pythonic::{Dialect, Framing, Values};
 
 /// The calls for `tools` in the region the table's markers frame: one tag, opened by the region's
-/// opener (and the list's `[`), holding one call or more in the framing's spelling, closed by the
-/// list's `]` and the region's close.
+/// opener (and the list's `[`), holding one call or more in the dialect's framing, each value in
+/// its spelling, closed by the list's `]` and the region's close.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
-    framing: Framing,
+    dialect: Dialect,
     tools: &[&Tool],
     at_least_one: bool,
 ) -> Grammar {
     let one_call = Grammar::Or(
         tools
             .iter()
-            .map(|tool| call(&tool.function.name, &tool.function.parameters))
+            .map(|tool| {
+                call(
+                    &tool.function.name,
+                    &tool.function.parameters,
+                    dialect.values,
+                )
+            })
             .collect(),
     );
-    let (open, between, close) = match framing {
+    let (open, between, close) = match dialect.framing {
         Framing::OnePerLine => ("", "\n", ""),
         Framing::List => ("[", ", ", "]"),
     };
@@ -60,10 +69,10 @@ pub(super) fn calls(
 }
 
 /// One call: the name and `(`, the arguments, `)`.
-fn call(name: &str, parameters: &Value) -> Grammar {
+fn call(name: &str, parameters: &Value, values: Values) -> Grammar {
     Grammar::Sequence(vec![
         Grammar::ConstString(format!("{name}(")),
-        arguments(parameters),
+        arguments(parameters, values),
         Grammar::ConstString(")".to_string()),
     ])
 }
@@ -73,7 +82,7 @@ fn call(name: &str, parameters: &Value) -> Grammar {
 /// one choice per pair that may stand first (every pair up to the first required one), each
 /// followed by the pairs after it, a required one with its comma, an optional one with its comma
 /// inside the option. A schema without properties takes any text up to the `)`.
-fn arguments(parameters: &Value) -> Grammar {
+fn arguments(parameters: &Value, values: Values) -> Grammar {
     let Some(properties) = parameters
         .get("properties")
         .and_then(Value::as_object)
@@ -91,7 +100,7 @@ fn arguments(parameters: &Value) -> Grammar {
         .iter()
         .map(|(key, schema)| {
             (
-                argument(key, schema, definitions),
+                argument(key, schema, definitions, values),
                 required.contains(&key.as_str()),
             )
         })
@@ -125,45 +134,79 @@ fn arguments(parameters: &Value) -> Grammar {
 }
 
 /// One pair: the key, `=`, and the value the property's schema pins.
-fn argument(key: &str, schema: &Value, definitions: Definitions<'_>) -> Grammar {
+fn argument(key: &str, schema: &Value, definitions: Definitions<'_>, values: Values) -> Grammar {
     Grammar::Sequence(vec![
         Grammar::ConstString(format!("{key}=")),
-        value(schema, definitions),
+        value(schema, definitions, values),
     ])
 }
 
-/// A value as the templates write one: the strings quoted either way, the words of a boolean and
-/// `None` as Python spells them, the rest as the JSON the schema accepts; any text up to the call's
-/// end where the schema pins nothing.
-fn value(schema: &Value, definitions: Definitions<'_>) -> Grammar {
-    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        if !values.is_empty() && values.iter().all(Value::is_string) {
+/// A value as the dialect writes one: a string `enum` as one of its values quoted the dialect's
+/// way, a string, a boolean and `null` in the dialect's spelling, the rest as the JSON the schema
+/// accepts; any text up to the call's end where the schema pins nothing. The `enum` is read
+/// through the property's `$ref`, as [`shape`] reads every keyword, so that a reference to a
+/// definition holding one (an `Enum` field in Pydantic's schemas) is quoted as the template
+/// quotes it and not written bare.
+fn value(schema: &Value, definitions: Definitions<'_>, values: Values) -> Grammar {
+    let target = definitions.target_of(schema);
+    if let Some(options) = keyword(schema, target, "enum").and_then(Value::as_array) {
+        if !options.is_empty() && options.iter().all(Value::is_string) {
             return Grammar::Or(
-                values
+                options
                     .iter()
                     .filter_map(Value::as_str)
-                    .flat_map(|value| {
-                        [
-                            Grammar::ConstString(format!("\"{}\"", escape(value, '"'))),
-                            Grammar::ConstString(format!("'{}'", escape(value, '\''))),
-                        ]
-                    })
+                    .flat_map(|option| quoted(option, values))
                     .collect(),
             );
         }
     }
+    let string = move || match values {
+        Values::Python => python_string(),
+        Values::Json => json_string(),
+    };
     match shape(schema, definitions, string) {
-        Some(("boolean", _)) => words(&["True", "False"]),
-        Some(("null", _)) => Grammar::ConstString("None".to_string()),
+        Some(("boolean", _)) => match values {
+            Values::Python => words(&["True", "False"]),
+            Values::Json => words(&["true", "false"]),
+        },
+        Some(("null", _)) => Grammar::ConstString(
+            match values {
+                Values::Python => "None",
+                Values::Json => "null",
+            }
+            .to_string(),
+        ),
         Some((_, value)) => value,
         None => any_value(),
     }
 }
 
+/// An `enum` value as the dialect quotes it: in either quote under Python, each with its own
+/// escaping; as the one JSON string under JSON.
+fn quoted(option: &str, values: Values) -> Vec<Grammar> {
+    match values {
+        Values::Python => vec![
+            Grammar::ConstString(format!("\"{}\"", escape(option, '"'))),
+            Grammar::ConstString(format!("'{}'", escape(option, '\''))),
+        ],
+        Values::Json => vec![Grammar::ConstString(
+            Value::String(option.to_string()).to_string(),
+        )],
+    }
+}
+
 /// A Python string in either quote: the quote, any text with its quotes and backslashes escaped,
 /// the same quote.
-fn string() -> Grammar {
+fn python_string() -> Grammar {
     Grammar::Regex(r#""([^"\\]|\\.)*"|'([^'\\]|\\.)*'"#.to_string())
+}
+
+/// A JSON string, as `tojson` writes one.
+fn json_string() -> Grammar {
+    Grammar::JsonSchema {
+        schema: json!({"type": "string"}),
+        style: None,
+    }
 }
 
 /// One of the words.
@@ -239,15 +282,19 @@ mod tests {
         ]
     }
 
-    fn string_json() -> Value {
+    fn python_string_json() -> Value {
         value!({"type": "regex", "pattern": r#""([^"\\]|\\.)*"|'([^'\\]|\\.)*'"#})
+    }
+
+    fn json_string_json() -> Value {
+        value!({"type": "json_schema", "json_schema": {"type": "string"}})
     }
 
     #[test]
     fn olmo3_frames_one_call_per_line_and_types_each_argument() {
         // Olmo 3's template: `<function_calls>`, one call per line, `</function_calls>`; a call is
-        // the name, `(`, `key=value` pairs joined by `, `, `)`; a string quoted, a number as JSON,
-        // an enum as its quoted values.
+        // the name, `(`, `key=value` pairs joined by `, `, `)`, every value through `tojson`: a
+        // string and an enum value as JSON strings, a number as JSON.
         let payload = formats::olmo3()
             .grammar(&weather_tools(), true, false)
             .expect("a grammar")
@@ -259,7 +306,7 @@ mod tests {
             {"type": "sequence", "elements": [
                 {"type": "sequence", "elements": [
                     {"type": "const_string", "value": "city="},
-                    string_json(),
+                    json_string_json(),
                 ]},
                 {"type": "sequence", "elements": [
                     {"type": "const_string", "value": ", "},
@@ -274,9 +321,7 @@ mod tests {
                         {"type": "const_string", "value": "units="},
                         {"type": "or", "elements": [
                             {"type": "const_string", "value": "\"c\""},
-                            {"type": "const_string", "value": "'c'"},
                             {"type": "const_string", "value": "\"f\""},
-                            {"type": "const_string", "value": "'f'"},
                         ]},
                     ]},
                 ]}},
@@ -327,6 +372,93 @@ mod tests {
         assert_eq!(payload["format"]["at_least_one"], false);
         let between = &tag["content"]["elements"][1]["content"]["elements"][0];
         assert_eq!(between, &value!({"type": "const_string", "value": ", "}));
+        // LFM2.5's values are Python's: a string in either quote, an enum value quoted both ways.
+        let weather = &tag["content"]["elements"][0]["elements"][0]["elements"][1];
+        assert_eq!(weather["elements"][0]["elements"][1], python_string_json());
+        assert_eq!(
+            weather["elements"][2]["content"]["elements"][1]["elements"][1],
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"c\""},
+                {"type": "const_string", "value": "'c'"},
+                {"type": "const_string", "value": "\"f\""},
+                {"type": "const_string", "value": "'f'"},
+            ]})
+        );
+    }
+
+    #[test]
+    fn olmo3_writes_a_boolean_and_a_null_as_json_and_lfm2_5_as_python() {
+        // Olmo 3's template writes `key=value | tojson`: every recorded boolean is `true` or
+        // `false` and every null `null`; LFM2.5's writes Python's `True`, `False` and `None`.
+        let tools = vec![tool(
+            "connect",
+            value!({"type": "object", "properties": {
+                "use_ssl": {"type": "boolean"},
+                "proxy": {"type": "null"},
+            }, "required": ["use_ssl", "proxy"]}),
+        )];
+        let olmo3 = formats::olmo3()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let olmo3 =
+            &olmo3["format"]["tags"][0]["content"]["elements"][0]["elements"][0]["elements"][1];
+        assert_eq!(
+            olmo3["elements"][0]["elements"][1],
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "true"},
+                {"type": "const_string", "value": "false"},
+            ]})
+        );
+        assert_eq!(
+            olmo3["elements"][1]["elements"][1]["elements"][1],
+            value!({"type": "const_string", "value": "null"})
+        );
+        let lfm2_5 = formats::lfm2_5()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let lfm2_5 =
+            &lfm2_5["format"]["tags"][0]["content"]["elements"][0]["elements"][0]["elements"][1];
+        assert_eq!(
+            lfm2_5["elements"][0]["elements"][1],
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "True"},
+                {"type": "const_string", "value": "False"},
+            ]})
+        );
+        assert_eq!(
+            lfm2_5["elements"][1]["elements"][1]["elements"][1],
+            value!({"type": "const_string", "value": "None"})
+        );
+    }
+
+    #[test]
+    fn a_string_enum_behind_a_reference_is_quoted_as_the_dialect_quotes_it() {
+        // Pydantic writes an `Enum` field as a `$ref` to a definition holding the `enum`.
+        let root = value!({
+            "type": "object",
+            "properties": {"units": {"$ref": "#/$defs/Unit"}},
+            "$defs": {"Unit": {"type": "string", "enum": ["c", "f"]}},
+        });
+        let definitions = Definitions::of(&root);
+        let units = &root["properties"]["units"];
+        assert_eq!(
+            value(units, definitions, Values::Json).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"c\""},
+                {"type": "const_string", "value": "\"f\""},
+            ]})
+        );
+        assert_eq!(
+            value(units, definitions, Values::Python).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"c\""},
+                {"type": "const_string", "value": "'c'"},
+                {"type": "const_string", "value": "\"f\""},
+                {"type": "const_string", "value": "'f'"},
+            ]})
+        );
     }
 
     #[test]
@@ -336,7 +468,7 @@ mod tests {
             "a": {"type": "integer"},
             "b": {"type": "boolean"},
         }});
-        let grammar = arguments(&schema);
+        let grammar = arguments(&schema, Values::Python);
         let a = value!({"type": "sequence", "elements": [
             {"type": "const_string", "value": "a="},
             {"type": "json_schema", "json_schema": {"type": "integer"}},
@@ -366,29 +498,38 @@ mod tests {
             "a": {"type": "integer"},
             "b": {"type": "boolean"},
         }, "required": ["b"]});
-        let json = arguments(&schema).to_json();
+        let json = arguments(&schema, Values::Python).to_json();
         assert_eq!(json["type"], "or");
         assert_eq!(json["elements"].as_array().expect("two starts").len(), 2);
     }
 
     #[test]
-    fn a_null_and_a_quoted_enum_value_are_spelled_as_python_writes_them() {
+    fn a_null_and_a_quoted_enum_value_are_spelled_as_the_dialect_writes_them() {
         let root = value!({});
         let definitions = Definitions::of(&root);
         assert_eq!(
-            value(&value!({"type": "null"}), definitions).to_json(),
+            value(&value!({"type": "null"}), definitions, Values::Python).to_json(),
             value!({"type": "const_string", "value": "None"})
         );
         assert_eq!(
-            value(&value!({"enum": ["it's"]}), definitions).to_json(),
+            value(&value!({"enum": ["it's"]}), definitions, Values::Python).to_json(),
             value!({"type": "or", "elements": [
                 {"type": "const_string", "value": "\"it's\""},
                 {"type": "const_string", "value": "'it\\'s'"},
             ]})
         );
+        // JSON: one string, escaped as `tojson` escapes it.
         assert_eq!(
-            value(&value!({}), definitions).to_json(),
-            value!({"type": "any_text", "excludes": [")"]})
+            value(&value!({"enum": ["say \"hi\""]}), definitions, Values::Json).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"say \\\"hi\\\"\""},
+            ]})
         );
+        for values in [Values::Python, Values::Json] {
+            assert_eq!(
+                value(&value!({}), definitions, values).to_json(),
+                value!({"type": "any_text", "excludes": [")"]})
+            );
+        }
     }
 }

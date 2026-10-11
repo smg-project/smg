@@ -63,6 +63,38 @@ pub enum Framing {
     List,
 }
 
+/// How a template writes a value, which the grammar derived from the table writes and the
+/// assembler, which reads both, does not need: LFM2.5's template writes Python (`True`, `None`,
+/// a string in either quote); Olmo 3's writes every value through `tojson`, so JSON (`true`,
+/// `null`, a string in double quotes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Values {
+    /// `True`, `False`, `None`, `'Paris'` or `"Paris"`.
+    Python,
+    /// `true`, `false`, `null`, `"Paris"`.
+    Json,
+}
+
+/// How a template spells its pythonic calls: how it frames them and how it writes a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dialect {
+    pub framing: Framing,
+    pub values: Values,
+}
+
+impl Dialect {
+    /// Olmo 3: one call per line, each value as `tojson` writes it.
+    pub const OLMO3: Self = Self {
+        framing: Framing::OnePerLine,
+        values: Values::Json,
+    };
+    /// LFM2.5: a Python list of calls with Python values.
+    pub const LFM2_5: Self = Self {
+        framing: Framing::List,
+        values: Values::Python,
+    };
+}
+
 const TEXT_BETWEEN_CALLS: &str = "text where a call should begin";
 const TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN: &str = "text where an argument should begin";
 const NAME_WITHOUT_A_CALL: &str = "a name without a call";

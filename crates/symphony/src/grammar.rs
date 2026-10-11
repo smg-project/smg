@@ -21,10 +21,14 @@
 //! per property for Ling's newlines and Hy4's suffixed tags (the `keyed` module); `<function=`
 //! and `<parameter=` tags, one per property, for Qwen 3.5's and Seed-OSS's tagged syntax (the
 //! `tagged` module); a tag grammar per parameter for DSML; for Kimi K3's XTML, one argument tag
-//! per property of the schema (the `xtml` module). The gateway's
-//! old parsers wrote these tags by hand, one function per parser; where one exists for a format
-//! Symphony has, the derived tag is pinned to it in the tests, so the switch changes nothing an
-//! engine sees.
+//! per property of the schema (the `xtml` module); `<invoke name="…">` blocks of `<parameter
+//! name="…">` tags for MiniMax M2 (the `attributed` module); Python calls, one per line or as a
+//! list, each value in the template's spelling, for Olmo 3 and LFM2.5 (the `pythonic` module);
+//! xLAM's bare list of JSON objects, written from the tools alone since its table has no markers;
+//! for MiniMax M3, the XML tree of elements with the table's separator before every tag (the
+//! `xml` module). The gateway's old parsers wrote these tags by hand, one function per parser;
+//! where one exists for a format Symphony has, the derived tag is pinned to it in the tests, so
+//! the switch changes nothing an engine sees.
 //!
 //! With the prompt's reasoning still open, the tag is wrapped in a prefix: free text that can
 //! write none of the table's markers but the thought's own, nor the call syntax's inner tags,
@@ -43,9 +47,7 @@
 //! other state, its own row into the block. So the model closes whatever the prompt left open on
 //! its way to the calls, whichever that was.
 //!
-//! Not derived yet, so [`Format::grammar`] gives `None` for them: MiniMax M3's XML tree, the
-//! pythonic tables, xLAM's list, and a table without calls. The gateway then takes the JSON-schema
-//! path, as it does for those models today.
+//! A table without calls gives `None`, and the gateway takes the JSON-schema path for it.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -310,8 +312,8 @@ impl Format {
                 let ways_in = self.ways_into_block(markers);
                 tagged::calls(markers, &ways_in, *spelling, &named, at_least_one)
             }
-            CallSyntax::Pythonic(framing) => {
-                pythonic::calls(markers?, *framing, &named, at_least_one)
+            CallSyntax::Pythonic(dialect) => {
+                pythonic::calls(markers?, *dialect, &named, at_least_one)
             }
             CallSyntax::Xml => {
                 return xml::calls(markers?, self.separator(), &named, at_least_one);
@@ -379,9 +381,11 @@ impl Format {
     /// whose `name` is the tool's and whose `arguments` the tool's schema accepts, spelled as the
     /// template spells it (`{"name": "NAME", "arguments": {...}}`, a space after each colon and
     /// comma); with `at_least_one`, the list alone, and otherwise the list or prose, since the
-    /// model answers in prose instead and the assembler reads an output that does not start with
-    /// `[` as content. The prose may hold no `[`: the one place the grammar is narrower than the
-    /// assembler, which reads a `[` that opens no object as prose too.
+    /// model answers in prose instead. The prose is the assembler's rule exactly: its first byte
+    /// that is not whitespace is not `[`, and the rest is free, a `[` later in it included (a
+    /// Markdown link, in 592 of the 13,085 recorded prose answers). The one place the grammar is
+    /// narrower than the assembler: an output that starts with `[` and opens no object is content
+    /// to the assembler and not writable here.
     fn json_list_calls(tools: &[&Tool], at_least_one: bool) -> Grammar {
         let one_call = Grammar::Or(
             tools
@@ -412,9 +416,12 @@ impl Format {
             list
         } else {
             Grammar::Or(vec![
-                Grammar::AnyText {
-                    excludes: vec!["[".to_string()],
-                },
+                Grammar::Sequence(vec![
+                    Grammar::Regex(r"\s*[^\s\[]".to_string()),
+                    Grammar::AnyText {
+                        excludes: Vec::new(),
+                    },
+                ]),
                 list,
             ])
         }
@@ -1211,7 +1218,10 @@ mod tests {
         assert_eq!(
             either,
             value!({"type": "or", "elements": [
-                {"type": "any_text", "excludes": ["["]},
+                {"type": "sequence", "elements": [
+                    {"type": "regex", "pattern": "\\s*[^\\s\\[]"},
+                    {"type": "any_text", "excludes": []},
+                ]},
                 list,
             ]})
         );

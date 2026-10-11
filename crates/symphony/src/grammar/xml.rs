@@ -1,14 +1,17 @@
 //! MiniMax M3's structural tag: the block of calls as the template writes it, from the table's
 //! markers, its separator and the request's tools.
 //!
-//! The template writes its separator token before every tag. The block is the separator,
-//! `<tool_call>` and a newline, one invoke or more, then the separator and `</tool_call>`; an
-//! invoke is the separator, `<invoke name="NAME">`, its arguments, the separator, `</invoke>` and a
-//! newline. Each argument is an element, the separator and `<key>`, its value, the separator and
-//! `</key>`, one per property in the schema's order, present when the schema requires the property
-//! and otherwise optional. The block's first text triggers the tag, and the text before it is free
-//! (the thought and its close, an answer), so the tag is the same whether the prompt left the
-//! thought open or not.
+//! The template writes its separator token before every tag. The block is `<tool_call>` and a
+//! newline, one invoke or more, then the separator and `</tool_call>`; an invoke is the separator,
+//! `<invoke name="NAME">`, its arguments, the separator, `</invoke>` and a newline. Each argument
+//! is an element, the separator and `<key>`, its value, the separator and `</key>`, one per
+//! property in the schema's order, present when the schema requires the property and otherwise
+//! optional. `<tool_call>` triggers the tag, as the terminal that opens the block is the trigger
+//! under every syntax: the text before it is free (the thought and its close, an answer, and the
+//! separator the template writes before the block's opener), and free text cannot hold the
+//! opener, since the opener is the trigger, so what the engine constrains and what the table
+//! reads as the block's opening are the same bytes. The tag is the same whether the prompt left
+//! the thought open or not.
 //!
 //! A value follows the property's type as the template writes it and the XML assembler reads it
 //! ([`tagged::xml`](crate::tagged::xml)): a string as it is, any text that holds neither the
@@ -27,7 +30,7 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
-    schema::{shape, Definitions},
+    schema::{keyword, shape, Definitions},
     CallMarkers, Grammar, Tag,
 };
 
@@ -55,11 +58,10 @@ pub(super) fn calls(
         .iter()
         .map(|tool| writer.invoke(markers, &tool.function.name, &tool.function.parameters))
         .collect();
-    let trigger = format!("{separator}{}", block.open);
     Some(Grammar::TriggeredTags {
-        triggers: vec![trigger.clone()],
+        triggers: vec![block.open.to_string()],
         tags: vec![Tag::new(
-            format!("{trigger}\n"),
+            format!("{}\n", block.open),
             Grammar::TagsWithSeparator {
                 tags: invokes,
                 separator: String::new(),
@@ -210,13 +212,6 @@ impl Writer<'_> {
     }
 }
 
-/// The schema's own keyword, or its `$ref` target's.
-fn keyword<'a>(schema: &'a Value, target: Option<&'a Value>, name: &str) -> Option<&'a Value> {
-    schema
-        .get(name)
-        .or_else(|| target.and_then(|target| target.get(name)))
-}
-
 /// One of the words.
 fn words(words: &[&str]) -> Grammar {
     Grammar::Or(
@@ -341,10 +336,10 @@ mod tests {
             payload,
             value!({"format": {
                 "type": "triggered_tags",
-                "triggers": [format!("{SEP}<tool_call>")],
+                "triggers": ["<tool_call>"],
                 "tags": [{
                     "type": "tag",
-                    "begin": format!("{SEP}<tool_call>\n"),
+                    "begin": "<tool_call>\n",
                     "content": {
                         "type": "tags_with_separator",
                         "tags": [weather, ping],

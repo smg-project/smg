@@ -45,6 +45,18 @@ pub(super) fn arguments(
     )
 }
 
+/// The schema's own keyword, or its `$ref` target's: a `$ref` lends its target's keywords, and
+/// the property's own win, as in JSON Schema 2020-12.
+pub(super) fn keyword<'a>(
+    schema: &'a Value,
+    target: Option<&'a Value>,
+    name: &str,
+) -> Option<&'a Value> {
+    schema
+        .get(name)
+        .or_else(|| target.and_then(|target| target.get(name)))
+}
+
 /// The type a property's schema pins, by the name the templates write (`integer` as `number`),
 /// and the grammar of a value of that type: a string as `text`, the syntax's own spelling of a
 /// value written as it is; a string `enum` as one of its values; a number, an object or an array

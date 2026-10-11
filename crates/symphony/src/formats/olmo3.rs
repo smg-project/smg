@@ -5,7 +5,7 @@
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    pythonic::Framing,
+    pythonic::Dialect,
 };
 
 /// The Olmo 3 table.
@@ -17,7 +17,7 @@ pub fn olmo3() -> Format {
         .state("calls", Emits::Arguments)
         .transition("content", "calls_open", "calls")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::Pythonic(Framing::OnePerLine))
+        .calls(CallSyntax::Pythonic(Dialect::OLMO3))
         .opens_turn("<|im_start|>assistant")
 }
 
