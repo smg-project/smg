@@ -743,11 +743,24 @@ impl StreamingProcessor {
                         String::new()
                     } else {
                         match stop_decoders.get_mut(&index) {
-                            Some(decoder) => match decoder.finish().map_err(|e| e.to_string())? {
-                                SequenceDecoderOutput::Text(text)
-                                | SequenceDecoderOutput::StoppedWithText(text) => text,
-                                _ => String::new(),
-                            },
+                            Some(decoder) => {
+                                let tail = decoder.finish().map_err(|e| e.to_string())?;
+                                if decoder.is_stopped() {
+                                    stopped_indices.insert(index);
+                                    finish_reasons.insert(index, "stop".to_string());
+                                    matched_stops.insert(
+                                        index,
+                                        decoder
+                                            .matched_stop()
+                                            .map(|s| Value::String(s.to_string())),
+                                    );
+                                }
+                                match tail {
+                                    SequenceDecoderOutput::Text(text)
+                                    | SequenceDecoderOutput::StoppedWithText(text) => text,
+                                    _ => String::new(),
+                                }
+                            }
                             None => String::new(),
                         }
                     };
@@ -3716,37 +3729,45 @@ impl StreamingProcessor {
             }
         }
 
-        // Preserve pending decoder text on clean EOF, without inventing the
-        // engine's finish reason, prompt count, or suffix for a missing Complete.
+        // Preserve pending text and locally matched stops on clean EOF without
+        // inventing engine usage. A local stop still honors the requested suffix.
         for (index, decoder) in &mut stop_decoders {
             if completed_indices.contains(index) || stopped_indices.contains(index) {
                 continue;
             }
-            if let SequenceDecoderOutput::Text(text)
-            | SequenceDecoderOutput::StoppedWithText(text) =
-                decoder.finish().map_err(|e| e.to_string())?
-            {
-                if !text.is_empty() {
-                    let stream_resp = CompletionStreamResponse {
-                        id: request_id.clone(),
-                        object: "text_completion".to_string(),
-                        created,
-                        choices: vec![CompletionStreamChoice {
-                            text,
-                            index: *index,
-                            logprobs: None,
-                            finish_reason: None,
-                        }],
-                        model: model.clone(),
-                        system_fingerprint: system_fingerprint.map(String::from),
-                        usage: None,
-                    };
-                    Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
-                    tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                        .await
-                        .map_err(|_| "Channel closed".to_string())?;
+            let tail = decoder.finish().map_err(|e| e.to_string())?;
+            let stopped = decoder.is_stopped();
+            let mut text = match tail {
+                SequenceDecoderOutput::Text(text)
+                | SequenceDecoderOutput::StoppedWithText(text) => text,
+                _ => String::new(),
+            };
+            if stopped {
+                if let Some(sfx) = suffix {
+                    text.push_str(sfx);
                 }
             }
+            if text.is_empty() && !stopped {
+                continue;
+            }
+            let stream_resp = CompletionStreamResponse {
+                id: request_id.clone(),
+                object: "text_completion".to_string(),
+                created,
+                choices: vec![CompletionStreamChoice {
+                    text,
+                    index: *index,
+                    logprobs: None,
+                    finish_reason: stopped.then(|| "stop".to_string()),
+                }],
+                model: model.clone(),
+                system_fingerprint: system_fingerprint.map(String::from),
+                usage: None,
+            };
+            Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
+            tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                .await
+                .map_err(|_| "Channel closed".to_string())?;
         }
 
         grpc_stream.mark_completed();

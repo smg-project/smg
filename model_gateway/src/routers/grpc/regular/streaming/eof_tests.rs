@@ -689,6 +689,60 @@ async fn byte_fallback_chat_transport_eof_preserves_text_without_finish() {
 }
 
 #[tokio::test]
+async fn byte_fallback_chat_transport_eof_reports_local_stop_without_input_usage() {
+    let tokenizer = byte_fallback_reasoning_tokenizer();
+    for prefix in ["", "t"] {
+        let source = format!("{prefix}é");
+        let ids: Vec<_> = source.bytes().map(|byte| u32::from(byte) + 1).collect();
+        assert_eq!(tokenizer.decode(&ids, true).unwrap(), source);
+        for status in ["0", "13"] {
+            let (stream, server) = scripted_stream(byte_fallback_chunks(&ids), status).await;
+            let (tx, rx) = sse_channel();
+            let mut spec = chat_spec(false);
+            spec.separate_reasoning = false;
+            spec.expected_choices = 1;
+            let result = processor(false)
+                .process_streaming_chunks(
+                    stream,
+                    dispatch(),
+                    tokenizer.clone(),
+                    (
+                        Some(StringOrArray::Array(vec!["é".into()])),
+                        None,
+                        false,
+                        false,
+                        true,
+                    ),
+                    spec,
+                    &tx,
+                    None,
+                )
+                .await;
+            drop(tx);
+            let events = collect_events(rx).await;
+            server.abort();
+            assert_eq!(result.is_ok(), status == "0", "{result:?}");
+            assert_eq!(
+                chat_text(&events, 0, "content"),
+                if status == "0" { prefix } else { "" }
+            );
+            let finishes: Vec<_> = events
+                .iter()
+                .filter(|event| !event["choices"][0]["finish_reason"].is_null())
+                .collect();
+            if status == "0" {
+                assert_eq!(finishes.len(), 1, "{events:?}");
+                assert_eq!(finishes[0]["choices"][0]["finish_reason"], "stop");
+                assert_eq!(finishes[0]["choices"][0]["matched_stop"], "é");
+            } else {
+                assert!(finishes.is_empty(), "{events:?}");
+            }
+            assert!(events.iter().all(|event| !event["usage"].is_object()));
+        }
+    }
+}
+
+#[tokio::test]
 async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage() {
     let tokenizer = byte_fallback_tokenizer();
     for ids in [vec![1], vec![1, 2]] {
@@ -806,6 +860,73 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
             .iter()
             .all(|event| event["choices"][0]["finish_reason"].is_null()));
         assert!(events.iter().all(|event| !event["usage"].is_object()));
+    }
+}
+
+#[tokio::test]
+async fn byte_fallback_completion_transport_eof_reports_local_stop_without_complete() {
+    let tokenizer = byte_fallback_reasoning_tokenizer();
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+                         "ignore_eos":true, "suffix":"requested-suffix"}),
+    )
+    .unwrap();
+    let spec = CompletionResponseSpec::from(&request);
+    for prefix in ["", "t"] {
+        let source = format!("{prefix}é");
+        let ids: Vec<_> = source.bytes().map(|byte| u32::from(byte) + 1).collect();
+        assert_eq!(tokenizer.decode(&ids, true).unwrap(), source);
+        for status in ["0", "13"] {
+            let (stream, server) = scripted_stream(byte_fallback_chunks(&ids), status).await;
+            let (tx, rx) = sse_channel();
+            let result = processor(false)
+                .process_completion_streaming_chunks(
+                    stream,
+                    dispatch(),
+                    tokenizer.clone(),
+                    (
+                        Some(StringOrArray::Array(vec!["é".into()])),
+                        None,
+                        false,
+                        false,
+                        true,
+                    ),
+                    &spec,
+                    "",
+                    0,
+                    &tx,
+                )
+                .await;
+            drop(tx);
+            let events = collect_events(rx).await;
+            server.abort();
+            assert_eq!(result.is_ok(), status == "0", "{result:?}");
+            let text: String = events
+                .iter()
+                .filter_map(|event| event["choices"][0]["text"].as_str())
+                .collect();
+            assert_eq!(
+                text,
+                if status == "0" {
+                    format!("{prefix}requested-suffix")
+                } else {
+                    String::new()
+                }
+            );
+            let finishes: Vec<_> = events
+                .iter()
+                .filter_map(|event| event["choices"][0]["finish_reason"].as_str())
+                .collect();
+            if status == "0" {
+                assert_eq!(finishes, ["stop"], "{events:?}");
+                let outcome = result.unwrap();
+                assert!(!outcome.saw_complete);
+                assert_eq!(outcome.prompt_tokens, 0);
+            } else {
+                assert!(finishes.is_empty(), "{events:?}");
+            }
+            assert!(events.iter().all(|event| !event["usage"].is_object()));
+        }
     }
 }
 
