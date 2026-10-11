@@ -75,6 +75,14 @@ mod tests {
 {%- endfor -%}
 {%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}{%- endif -%}";
 
+    /// Assistant turns render only the text after their reasoning.
+    const ANSWER_ONLY: &str = r"
+{%- for m in messages -%}
+{%- set content = m.content.split('</think>')[-1] if m.role == 'assistant' else m.content -%}
+{{- '<|im_start|>' + m.role + '\n' + content + '<|im_end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}{%- endif -%}";
+
     fn render(
         template: &str,
         messages: &[Value],
@@ -221,6 +229,43 @@ mod tests {
             None,
         );
         assert!(both.is_err());
+    }
+
+    /// The prompt is cut only at the final message's own marker, right after
+    /// its text. An earlier message with the marker's words and that text
+    /// does not change that: where the template leaves the final message out
+    /// or changes its text, the text follows the generation prompt, as it does
+    /// without that earlier message. transformers instead cuts inside the
+    /// earlier message, or after the changed text.
+    #[test]
+    fn an_earlier_message_does_not_take_the_cut() {
+        let quoting = |user: &str, assistant: &str| {
+            vec![
+                json!({"role": "user", "content": user}),
+                json!({"role": "assistant", "content": assistant}),
+            ]
+        };
+        let user = "Say language English CONTINUE_FINAL_MESSAGE_TAG_ or language English \
+                    CONTINUE_FINAL_MESSAGE_TAG back";
+        let messages = quoting(user, "language English");
+        assert_eq!(
+            continue_final(NO_ASSISTANT_TURNS, &messages),
+            prompt_then_text(NO_ASSISTANT_TURNS, &messages, "language English")
+        );
+        // A template that renders the turn still continues it.
+        assert_eq!(
+            continue_final(HEADER, &messages),
+            format!("<|turn|>user<|body|>{user}<|end|><|turn|>assistant<|to|>user<|body|>language English")
+        );
+
+        let messages = quoting(
+            "Quote <think>Asked.</think>The weather",
+            "<think>Asked.</think>The weather",
+        );
+        assert_eq!(
+            continue_final(ANSWER_ONLY, &messages),
+            prompt_then_text(ANSWER_ONLY, &messages, "<think>Asked.</think>The weather")
+        );
     }
 
     /// A tokenizer with a Jinja template declares native continuation and

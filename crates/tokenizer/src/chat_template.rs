@@ -1532,10 +1532,38 @@ fn is_python_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
-/// Append the marker to the text the final message is continued from (its
+/// The marker for one render: transformers' own, unless the request already
+/// carries its words (in a message, a tool, a document or a template kwarg);
+/// then the words followed by one more underscore than ever follows them
+/// there. Either way only the final message carries the marker.
+fn continuation_marker(messages: &[JsonValue], params: &ChatTemplateParams) -> String {
+    let words = CONTINUE_FINAL_MESSAGE_TAG.trim_end();
+    let given = serde_json::to_string(&(
+        messages,
+        params.tools,
+        params.documents,
+        params.template_kwargs,
+    ))
+    .unwrap_or_default();
+    let underscores = given
+        .match_indices(words)
+        .map(|(at, _)| {
+            given[at + words.len()..]
+                .bytes()
+                .take_while(|&b| b == b'_')
+                .count()
+        })
+        .max();
+    match underscores {
+        Some(n) => format!("{words}{} ", "_".repeat(n + 1)),
+        None => CONTINUE_FINAL_MESSAGE_TAG.to_string(),
+    }
+}
+
+/// Append `marker` to the text the final message is continued from (its
 /// string content, or the text of its last part that has one) and return
 /// that text as it was.
-fn tag_final_message(messages: &mut [JsonValue]) -> Result<String> {
+fn tag_final_message(messages: &mut [JsonValue], marker: &str) -> Result<String> {
     let text = match messages.last_mut().and_then(|m| m.get_mut("content")) {
         Some(JsonValue::Array(parts)) => parts.iter_mut().rev().find_map(|p| p.get_mut("text")),
         content => content,
@@ -1544,20 +1572,26 @@ fn tag_final_message(messages: &mut [JsonValue]) -> Result<String> {
         return Err(anyhow!("the final message has no text to continue"));
     };
     let original = text.clone();
-    text.push_str(CONTINUE_FINAL_MESSAGE_TAG);
+    text.push_str(marker);
     Ok(original)
 }
 
 /// Cut a rendering of the tagged conversation right after the continued
-/// text: at the last marker, and also past the whitespace before it when
-/// the template trimmed the marker's trailing space.
-fn cut_at_final_message(rendered: &str, text: &str) -> Result<String> {
+/// text: at `marker`, and also past the whitespace before it when the
+/// template trimmed the marker's trailing space. The text must end right
+/// there (whitespace aside), so the cut belongs to the final message;
+/// transformers only checks that the text appears somewhere in the prompt.
+fn cut_at_final_message(rendered: &str, text: &str, marker: &str) -> Result<String> {
     let tag_at = rendered
-        .rfind(CONTINUE_FINAL_MESSAGE_TAG.trim_end())
-        .filter(|_| rendered.contains(text.trim_matches(is_python_space)))
+        .rfind(marker.trim_end())
+        .filter(|&at| {
+            rendered[..at]
+                .trim_end_matches(is_python_space)
+                .ends_with(text.trim_matches(is_python_space))
+        })
         .ok_or_else(|| anyhow!("the final message does not appear in the rendered chat"))?;
     let head = &rendered[..tag_at];
-    let head = if rendered[tag_at..].starts_with(CONTINUE_FINAL_MESSAGE_TAG) {
+    let head = if rendered[tag_at..].starts_with(marker) {
         head
     } else {
         head.trim_end_matches(is_python_space)
@@ -1571,7 +1605,8 @@ fn cut_at_final_message(rendered: &str, text: &str) -> Result<String> {
 ///
 /// Where transformers raises instead (no text to continue, the template
 /// fails on the message, or the text never reaches the prompt, as with a
-/// template that renders no assistant turns), the message is left out and
+/// template that renders no assistant turns), or would cut anywhere but
+/// right after the final message's text, the message is left out and
 /// its text appended after the generation prompt, which is how every
 /// continued message rendered before. Speech-recognition prompts rely on
 /// this: their forced-language prefill follows a generation prompt the
@@ -1587,14 +1622,15 @@ fn render_continuing_final_message(
             "continue_final_message and add_generation_prompt are not compatible"
         ));
     }
+    let marker = continuation_marker(messages, &params);
     let mut tagged = messages.to_vec();
-    let continued = tag_final_message(&mut tagged).and_then(|text| {
+    let continued = tag_final_message(&mut tagged, &marker).and_then(|text| {
         let params = ChatTemplateParams {
             continue_final_message: false,
             ..params
         };
         let (rendered, _) = render_chat_template(env, &tagged, params)?;
-        cut_at_final_message(&rendered, &text)
+        cut_at_final_message(&rendered, &text, &marker)
     });
     let reason = match continued {
         Ok(prompt) => return Ok((prompt, true)),
