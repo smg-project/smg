@@ -53,7 +53,8 @@ fn smg_binary_uses_global_jemalloc() {
 #[test]
 fn smg_binary_applies_the_server_malloc_conf() {
     // The executable's `_rjem_malloc_conf` symbol: purge on a background
-    // thread, dirty pages back to the OS after 10 s, muzzy pages at once.
+    // thread, dirty pages back to the OS after 10 s, muzzy pages at once,
+    // and 16 arenas instead of four per CPU.
     let stats = jemalloc_stats("stats_print:true,stats_print_opts:J")
         .expect("jemalloc statistics from the SMG executable");
     let opt = opt_section(&stats).expect("an \"opt\" section in the jemalloc statistics");
@@ -63,6 +64,7 @@ fn smg_binary_applies_the_server_malloc_conf() {
         "\"background_thread\":true",
         "\"dirty_decay_ms\":10000",
         "\"muzzy_decay_ms\":0",
+        "\"narenas\":16",
     ] {
         assert!(
             opt.contains(expected),

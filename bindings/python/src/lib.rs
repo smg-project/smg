@@ -21,7 +21,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 61] = observability::metrics::SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 72] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
