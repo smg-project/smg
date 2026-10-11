@@ -23,8 +23,8 @@
 //! <function name="play"><param name="artist">Maroon 5</param><param name="n">15</param></function>
 //! ```
 //!
-//! **No grammar yet.** `Format::grammar` gives `None` for this table: the attributed grammar
-//! writes the calls inside a block, and this syntax has none; its tag follows in its own change.
+//! A forced call's structural tag is each call as a tag its opener triggers, the parameter tags
+//! with nothing between them ([`grammar`](crate::grammar)).
 
 use crate::{
     format::{CallSyntax, Emits, Format},

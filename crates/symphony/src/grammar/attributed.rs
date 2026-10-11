@@ -1,11 +1,16 @@
-//! Parameters named by an attribute, written from the table's own tags: MiniMax M2's. A call is
-//! the invoke's opener with the tool's name, `">` and the template's newline, then one
-//! `<parameter name="KEY">` per property of the tool's schema, in the schema's order, each optional
-//! unless the schema requires it, the value as the templates write it (a string as it is,
-//! everything else as JSON, which [`shape`] pins), `</parameter>` and a newline, then the invoke's
-//! close and a newline; a schema without properties takes any pairs at all. The calls sit in the
-//! block the table has, which the template opens after a newline and on a line of its own and
-//! closes right after the last invoke's newline.
+//! Parameters named by an attribute, written from the table's own tags in the family's spelling
+//! ([`Tags`]): MiniMax M2's, MiniCPM5's and dots3's. A call is the invoke's opener with the tool's
+//! name and `">`, then one parameter tag per property of the tool's schema, in the schema's order,
+//! each optional unless the schema requires it, the value as the templates write it (a string as
+//! it is, everything else as JSON, which [`shape`] pins), its closing tag, then the invoke's
+//! close; a schema without properties takes any pairs at all. Where the family writes each tag on
+//! a line of its own (M2, dots3) a newline follows the invoke's opener, each parameter's close and
+//! the invoke's close; where a value stands on its own line (dots3) a newline frames it on both
+//! sides. The calls sit in the block the table has: M2's one block around the turn's calls, opened
+//! after a newline and on a line of its own and closed right after the last invoke's newline;
+//! dots3's block around each call, the block's opener triggering the tag so the newline the
+//! template writes before it is free text. A table without a block (MiniCPM5) writes each call as
+//! a tag the invoke's opener triggers, the newlines between calls free text.
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -16,37 +21,63 @@ use super::{
 };
 use crate::tagged::attributed::Tags;
 
-/// The calls for `tools`, in the table's block; `None` for a table without one.
+/// The calls for `tools`, in the family's spelling: in the table's one block, in a block each, or
+/// with no block at all.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     tags: &Tags,
     tools: &[&Tool],
     at_least_one: bool,
-) -> Option<Grammar> {
-    let block = markers.block.as_ref()?;
+) -> Grammar {
     let ends = Ends {
         parameter_close: tags.parameter_close,
         call_exits: &markers.call_exits,
     };
-    let invokes = tools
-        .iter()
-        .map(|tool| {
-            Tag::new(
-                format!("{}{}\">\n", markers.call_open, tool.function.name),
-                arguments(tags, &ends, &tool.function.parameters),
-                format!("{}\n", markers.call_close),
-            )
-        })
-        .collect();
-    Some(Grammar::Sequence(vec![
+    let line = if tags.tags_on_their_own_lines {
+        "\n"
+    } else {
+        ""
+    };
+    let invoke = |tool: &Tool, before: &str, after: &str| {
+        Tag::new(
+            format!(
+                "{before}{}{}\">{line}",
+                markers.call_open, tool.function.name
+            ),
+            arguments(tags, &ends, &tool.function.parameters),
+            format!("{}{line}{after}", markers.call_close),
+        )
+    };
+    let Some(block) = markers.block.as_ref() else {
+        // No block: each call is a tag its opener triggers, the text between calls free.
+        return Grammar::TriggeredTags {
+            triggers: vec![markers.call_open.to_string()],
+            tags: tools.iter().map(|tool| invoke(tool, "", "")).collect(),
+            at_least_one,
+        };
+    };
+    if tags.block_per_call {
+        // A block around each call: the block's opener triggers the tag, so the newline the
+        // template writes before it is free text.
+        let before = format!("{}\n", block.open);
+        return Grammar::TriggeredTags {
+            triggers: vec![block.open.to_string()],
+            tags: tools
+                .iter()
+                .map(|tool| invoke(tool, &before, block.close))
+                .collect(),
+            at_least_one,
+        };
+    }
+    Grammar::Sequence(vec![
         Grammar::ConstString(format!("\n{}\n", block.open)),
         Grammar::TagsWithSeparator {
-            tags: invokes,
+            tags: tools.iter().map(|tool| invoke(tool, "", "")).collect(),
             separator: String::new(),
             at_least_one,
         },
         Grammar::ConstString(block.close.to_string()),
-    ]))
+    ])
 }
 
 /// What ends a value: its own closing tag, and the terminals the table has a row for out of the
@@ -78,15 +109,22 @@ fn arguments(tags: &Tags, ends: &Ends<'_>, parameters: &Value) -> Grammar {
     })
 }
 
-/// One pair: the opening tag up to the name's quote, the key, `">`, the value, the closing tag and
-/// the template's newline.
+/// One pair: the opening tag up to the name's quote, the key, `">`, the value, the closing tag;
+/// the value framed by newlines where it stands on its own line, and a newline after the closing
+/// tag where each tag has its own line.
 fn argument(tags: &Tags, key: Grammar, value: Grammar) -> Grammar {
+    let frame = if tags.value_on_its_own_line { "\n" } else { "" };
+    let line = if tags.tags_on_their_own_lines {
+        "\n"
+    } else {
+        ""
+    };
     Grammar::Sequence(vec![
         Grammar::ConstString(tags.parameter_open.to_string()),
         key,
-        Grammar::ConstString("\">".to_string()),
+        Grammar::ConstString(format!("\">{frame}")),
         value,
-        Grammar::ConstString(format!("{}\n", tags.parameter_close)),
+        Grammar::ConstString(format!("{frame}{}{line}", tags.parameter_close)),
     ])
 }
 
@@ -196,6 +234,101 @@ mod tests {
                 },
                 {"type": "const_string", "value": "</minimax:tool_call>"},
             ]}})
+        );
+    }
+
+    #[test]
+    fn minicpm5_writes_each_call_as_a_tag_its_opener_triggers_with_nothing_between_the_tags() {
+        // MiniCPM5's template: `<function name="NAME">`, then per argument the parameter tag, the
+        // value and its closing tag with nothing between them, then `</function>`; one call after
+        // another on lines of their own, so the newline between calls is free text.
+        let tools = [tool(
+            "play",
+            value!({"type": "object", "properties": {
+                "artist": {"type": "string"},
+                "n": {"type": "integer"},
+            }, "required": ["artist"]}),
+        )];
+        let payload = formats::minicpm5()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let text = value!({
+            "type": "any_text",
+            "excludes": ["</param>", "</function>"],
+        });
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<function name=\""],
+                "tags": [{
+                    "type": "tag",
+                    "begin": "<function name=\"play\">",
+                    "content": {"type": "sequence", "elements": [
+                        {"type": "sequence", "elements": [
+                            {"type": "const_string", "value": "<param name=\""},
+                            {"type": "const_string", "value": "artist"},
+                            {"type": "const_string", "value": "\">"},
+                            text,
+                            {"type": "const_string", "value": "</param>"},
+                        ]},
+                        {"type": "optional", "content": {"type": "sequence", "elements": [
+                            {"type": "const_string", "value": "<param name=\""},
+                            {"type": "const_string", "value": "n"},
+                            {"type": "const_string", "value": "\">"},
+                            {"type": "json_schema", "json_schema": {"type": "integer"}},
+                            {"type": "const_string", "value": "</param>"},
+                        ]}},
+                    ]},
+                    "end": "</function>",
+                }],
+                "at_least_one": true,
+            }})
+        );
+    }
+
+    #[test]
+    fn dots3_writes_a_block_around_each_call_and_frames_each_value_with_newlines() {
+        // dots3's template: a newline (free text here), `<dots_function_call>`, a newline,
+        // `<invoke name="NAME">`, a newline, per argument the parameter tag, a newline, the
+        // value, a newline, the closing tag and a newline, then `</invoke>`, a newline and the
+        // block's close.
+        let tools = [tool(
+            "play",
+            value!({"type": "object", "properties": {
+                "artist": {"type": "string"},
+            }, "required": ["artist"]}),
+        )];
+        let payload = formats::dots3()
+            .grammar(&tools, false, false)
+            .expect("a grammar")
+            .payload();
+        let text = value!({
+            "type": "any_text",
+            "excludes": ["</parameter>", "</invoke>", "</dots_function_call>"],
+        });
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<dots_function_call>"],
+                "tags": [{
+                    "type": "tag",
+                    "begin": "<dots_function_call>\n<invoke name=\"play\">\n",
+                    "content": {"type": "sequence", "elements": [
+                        {"type": "sequence", "elements": [
+                            {"type": "const_string", "value": "<parameter name=\""},
+                            {"type": "const_string", "value": "artist"},
+                            {"type": "const_string", "value": "\">\n"},
+                            text,
+                            {"type": "const_string", "value": "\n</parameter>\n"},
+                        ]},
+                    ]},
+                    "end": "</invoke>\n</dots_function_call>",
+                }],
+                "at_least_one": false,
+            }})
         );
     }
 

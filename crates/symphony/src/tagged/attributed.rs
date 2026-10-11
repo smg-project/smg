@@ -94,6 +94,13 @@ pub struct Tags {
     /// Whether the template writes a newline after the parameter tag and one before its closing
     /// tag, so a value stands on a line of its own.
     pub value_on_its_own_line: bool,
+    /// Whether the template writes each tag on a line of its own: a newline after the invoke's
+    /// opening tag, after each parameter's closing tag and after the invoke's closing tag. The
+    /// grammar writes them; the assembler reads the newlines between tags as the template's.
+    pub tags_on_their_own_lines: bool,
+    /// Whether the template opens a block around each call rather than around all of a turn's
+    /// calls. The grammar writes the block the table has that way; the assembler reads neither.
+    pub block_per_call: bool,
 }
 
 impl Tags {
@@ -104,14 +111,18 @@ impl Tags {
         invoke_close: "</invoke>",
         cdata: false,
         value_on_its_own_line: false,
+        tags_on_their_own_lines: true,
+        block_per_call: false,
     };
-    /// dots3's: MiniMax M2's tags, every value on a line of its own.
+    /// dots3's: MiniMax M2's tags, a block around each call, every value on a line of its own.
     pub const DOTS3: Self = Self {
         parameter_open: "<parameter name=\"",
         parameter_close: "</parameter>",
         invoke_close: "</invoke>",
         cdata: false,
         value_on_its_own_line: true,
+        tags_on_their_own_lines: true,
+        block_per_call: true,
     };
     /// MiniCPM5's: `<param name="…">`, `</param>` and `</function>`, a value a CDATA section when
     /// it holds `<`, `&` or a newline.
@@ -121,6 +132,8 @@ impl Tags {
         invoke_close: "</function>",
         cdata: true,
         value_on_its_own_line: false,
+        tags_on_their_own_lines: false,
+        block_per_call: false,
     };
 
     fn text(&self, tag: usize) -> &'static str {

@@ -296,9 +296,7 @@ impl Format {
                 Self::keyed_calls(markers?, &named, at_least_one)
             }
             CallSyntax::Dsml => Self::dsml_calls(markers?, &named, at_least_one)?,
-            CallSyntax::Attributed(tags) => {
-                attributed::calls(markers?, tags, &named, at_least_one)?
-            }
+            CallSyntax::Attributed(tags) => attributed::calls(markers?, tags, &named, at_least_one),
             CallSyntax::Keyed(tags) => {
                 let markers = markers?;
                 let ways_in = self.ways_into_block(markers);
