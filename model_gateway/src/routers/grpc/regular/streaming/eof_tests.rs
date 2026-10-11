@@ -8,7 +8,7 @@ use futures::{stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use llm_tokenizer::{traits::Encoding, SpecialTokens};
-use openai_protocol::chat::ChatCompletionRequest;
+use openai_protocol::{chat::ChatCompletionRequest, worker::HealthCheckConfig};
 use prost::Message as ProstMessage;
 use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
@@ -21,7 +21,10 @@ use tool_parser::types::ToolCallItem;
 use super::*;
 use crate::{
     routers::{common::sse::SseReceiver, grpc::regular::processor::ResponseProcessor},
-    worker::WorkerRegistry,
+    worker::{
+        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        BasicWorkerBuilder, Worker, WorkerRegistry,
+    },
 };
 
 #[derive(Default)]
@@ -304,7 +307,7 @@ async fn chat_events(
     responses: Vec<proto::GenerateResponse>,
     with_tools: bool,
     grpc_status: &'static str,
-) -> (Result<(), String>, Vec<Value>) {
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     chat_events_with_spec(responses, with_tools, chat_spec(with_tools), grpc_status).await
 }
 
@@ -313,7 +316,7 @@ async fn chat_events_with_spec(
     with_tools: bool,
     spec: ChatResponseSpec,
     grpc_status: &'static str,
-) -> (Result<(), String>, Vec<Value>) {
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, grpc_status).await;
     let (tx, rx) = sse_channel();
     let result = processor(with_tools)
@@ -1547,4 +1550,132 @@ async fn messages_tool_arguments_need_an_open_block() {
         );
         assert_eq!(inputs, [input]);
     }
+}
+
+// ── A stream the engine ends before completion ─────────────────────────────
+
+/// A stream the engine ends with `status` after `responses`: what a worker
+/// that goes away mid-stream looks like from the gateway's side.
+async fn cut_stream(
+    responses: Vec<proto::GenerateResponse>,
+    status: tonic::Status,
+) -> (ProtoStream, JoinHandle<()>) {
+    let frames: Vec<Result<Frame<Bytes>, tonic::Status>> = responses
+        .iter()
+        .map(|response| Ok(data_frame(response)))
+        .chain(std::iter::once(Err(status)))
+        .collect();
+    let (client, server) = mock_client().await;
+    let stream = response_stream(stream::iter(frames), client);
+    (stream, server)
+}
+
+/// What a connection to the engine that breaks mid-stream surfaces as.
+fn connection_lost() -> tonic::Status {
+    tonic::Status::internal("h2 protocol error: error reading a body from connection")
+}
+
+/// A worker whose breaker opens on the first failure.
+fn breaker_worker() -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new("http://engine-under-test:8000")
+            .circuit_breaker_config(CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            })
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    )
+}
+
+#[tokio::test]
+async fn chat_stream_cut_by_the_engine_is_an_upstream_failure_with_the_tokens_so_far() {
+    let (stream, server) = cut_stream(vec![chunk(0, "Hel")], connection_lost()).await;
+    let (tx, rx) = sse_channel();
+    let result = processor(false)
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            chat_spec(false),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+
+    match result {
+        Err(utils::StreamFailure::Upstream {
+            status,
+            completion_tokens,
+        }) => {
+            assert_eq!(
+                status.message(),
+                "h2 protocol error: error reading a body from connection"
+            );
+            assert_eq!(completion_tokens, 3, "the tokens delivered before the cut");
+        }
+        other => panic!("an upstream failure, not {other:?}"),
+    }
+    // What the engine produced before the failure went out.
+    assert_eq!(chat_text(&events, 0, "content"), "Hel");
+}
+
+#[tokio::test]
+async fn chat_stream_cut_by_the_engine_ends_with_a_stream_error_event_then_done() {
+    let (stream, server) = cut_stream(vec![chunk(0, "Hi")], connection_lost()).await;
+    let worker = breaker_worker();
+    let selection = context::WorkerSelection::Single {
+        worker: Arc::clone(&worker),
+    };
+    let source =
+        utils::StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+    let response = Arc::new(processor(false))
+        .process_streaming_response(
+            context::ExecutionResult::Single { stream },
+            chat_spec(false),
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            false,
+            None,
+            source,
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the headers were out before the cut"
+    );
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("the SSE body")
+        .to_bytes();
+    let text = std::str::from_utf8(&body).expect("UTF-8 SSE");
+    server.abort();
+
+    // The response ends with the error event, typed as the engine's failure,
+    // then [DONE], the shape clients already parse.
+    let frames: Vec<&str> = text
+        .split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .collect();
+    let [.., error, done] = frames.as_slice() else {
+        panic!("an error event and [DONE]: {text}");
+    };
+    assert_eq!(*done, "data: [DONE]");
+    let error: Value = serde_json::from_str(error.strip_prefix("data: ").expect("a data line"))
+        .expect("the error event is JSON");
+    assert_eq!(error["error"]["type"], "stream_error");
+    assert_eq!(
+        error["error"]["message"],
+        "Stream error: h2 protocol error: error reading a body from connection"
+    );
+    // The worker that ended the stream is charged the failure.
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
 }

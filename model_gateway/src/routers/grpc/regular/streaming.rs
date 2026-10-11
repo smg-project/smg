@@ -215,6 +215,7 @@ impl StreamingProcessor {
     ///
     /// Note: Caller should attach load guards to the returned response using
     /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -223,7 +224,9 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
         reservation: Option<Arc<SharedReservationHandle>>,
+        source: utils::StreamSource,
     ) -> Response {
+        let source = source.with_backend(self.backend_type);
         use bytes::Bytes;
 
         let stop_params = (
@@ -265,8 +268,8 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
+                    if let Err(failure) = result {
+                        utils::send_stream_failure(&tx, &failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -302,8 +305,8 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
+                    if let Err(failure) = result {
+                        utils::send_stream_failure(&tx, &failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -349,7 +352,7 @@ impl StreamingProcessor {
         original_request: ChatResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         self.process_streaming_chunks_inner(
             grpc_stream,
             dispatch,
@@ -377,7 +380,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         // Metrics timing
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -539,7 +542,10 @@ impl StreamingProcessor {
                     Err(e) => {
                         // What was produced before the failure still goes out.
                         Self::flush_chunks(tx, &mut sse_buffer).await?;
-                        return Err(format!("Stream error: {}", e.message()));
+                        return Err(utils::StreamFailure::upstream(
+                            e,
+                            completion_tokens.delivered(),
+                        ));
                     }
                 }
             } else {
@@ -1064,7 +1070,7 @@ impl StreamingProcessor {
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
         // logprobs, but the Prefill reservation must end with this phase.
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
@@ -1109,7 +1115,9 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        source: utils::StreamSource,
     ) -> Response {
+        let source = source.with_backend(self.backend_type);
         // Create SSE channel
         let (tx, rx) = sse_channel();
 
@@ -1139,8 +1147,8 @@ impl StreamingProcessor {
                         Self::process_generate_streaming(tokenizer, stream, ctx, &tx, reservation)
                             .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
+                    if let Err(failure) = result {
+                        utils::send_stream_failure(&tx, &failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -1173,8 +1181,8 @@ impl StreamingProcessor {
                     )
                     .await;
 
-                    if let Err(e) = result {
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
+                    if let Err(failure) = result {
+                        utils::send_stream_failure(&tx, &failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -1213,7 +1221,7 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
@@ -1230,7 +1238,9 @@ impl StreamingProcessor {
         let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
-            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
+            let gen_response = response.map_err(|e| {
+                utils::StreamFailure::upstream(e, completion_tokens_map.values().sum::<u32>())
+            })?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -1358,7 +1368,7 @@ impl StreamingProcessor {
         prefill_input_logprobs: Option<ProtoInputLogProbs>,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         // Drain prefill stream. Collect input_logprobs only when requested.
         // Sequential PD drained the stream in the execution stage, so its
         // logprobs arrive via `prefill_input_logprobs` instead.
@@ -1412,7 +1422,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
@@ -1431,7 +1441,9 @@ impl StreamingProcessor {
         let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
-            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
+            let gen_response = response.map_err(|e| {
+                utils::StreamFailure::upstream(e, completion_tokens_map.values().sum::<u32>())
+            })?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -2116,6 +2128,7 @@ impl StreamingProcessor {
     ///
     /// Parallel to [`Self::process_streaming_response`] for chat, but emits
     /// Anthropic SSE format (`event: {type}\ndata: {json}\n\n`).
+    #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -2124,7 +2137,9 @@ impl StreamingProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
         reservation: Option<Arc<SharedReservationHandle>>,
+        source: utils::StreamSource,
     ) -> Response {
+        let source = source.with_backend(self.backend_type);
         let stop_params = (
             messages_request
                 .stop_sequences
@@ -2160,11 +2175,12 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
+                    if let Err(failure) = result {
+                        source.account(&failure);
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse {
                                 error_type: "api_error".to_string(),
-                                message: e,
+                                message: failure.to_string(),
                             },
                         };
                         let mut buf = Vec::with_capacity(256);
@@ -2201,11 +2217,12 @@ impl StreamingProcessor {
                         )
                         .await;
 
-                    if let Err(e) = result {
+                    if let Err(failure) = result {
+                        source.account(&failure);
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse {
                                 error_type: "api_error".to_string(),
-                                message: e,
+                                message: failure.to_string(),
                             },
                         };
                         let mut buf = Vec::with_capacity(256);
@@ -2253,7 +2270,7 @@ impl StreamingProcessor {
         original_request: MessagesResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
@@ -2428,11 +2445,10 @@ impl StreamingProcessor {
         // Phase 2: Main streaming loop
         let mut final_chunk = false;
         while !final_chunk {
-            let response = grpc_stream
-                .next()
-                .await
-                .transpose()
-                .map_err(|e| format!("Stream error: {}", e.message()))?;
+            let response =
+                grpc_stream.next().await.transpose().map_err(|e| {
+                    utils::StreamFailure::upstream(e, completion_tokens.delivered())
+                })?;
             final_chunk = response.is_none();
 
             // Text the stop decoder produced for this response, if any. Per-chunk
@@ -3041,7 +3057,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
             .await
@@ -3083,7 +3099,9 @@ impl StreamingProcessor {
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        source: utils::StreamSource,
     ) -> Response {
+        let source = source.with_backend(self.backend_type);
         let (tx, rx) = sse_channel();
 
         let units = match Self::completion_stream_units(execution_result) {
@@ -3180,8 +3198,8 @@ impl StreamingProcessor {
                 .await;
 
             match outcomes {
-                Err(e) => {
-                    utils::send_error_sse(&tx, &e, "internal_error").await;
+                Err(failure) => {
+                    utils::send_stream_failure(&tx, &failure, &source).await;
                 }
                 Ok(outcomes) => {
                     let mut total_prompt = 0u32;
@@ -3327,7 +3345,7 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
-    ) -> Result<CompletionStreamOutcome, String> {
+    ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         let mut first_token_time: Option<Instant> = None;
 
         let request_id = &dispatch.request_id;
@@ -3359,7 +3377,8 @@ impl StreamingProcessor {
         let mut completed_indices: HashSet<u32> = HashSet::new();
 
         while let Some(response) = grpc_stream.next().await {
-            let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
+            let gen_response = response
+                .map_err(|e| utils::StreamFailure::upstream(e, total_completion.delivered()))?;
 
             match gen_response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
@@ -3646,7 +3665,7 @@ impl StreamingProcessor {
         index_offset: u32,
         tx: &SseSender,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
-    ) -> Result<CompletionStreamOutcome, String> {
+    ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
             .await
             .map_err(|e| format!("Prefill stream error: {}", e.message()))?;

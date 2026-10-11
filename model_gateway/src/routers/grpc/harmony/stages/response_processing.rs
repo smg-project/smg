@@ -7,12 +7,16 @@ use axum::response::Response;
 use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::{helpers, ProcessStage, RateLimitCell},
-        context::{DispatchContext, FinalResponse},
-        spec::{HarmonyResponseSpec, ResponseSpec},
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        error,
+        grpc::{
+            common::stages::{helpers, ProcessStage, RateLimitCell},
+            context::{DispatchContext, FinalResponse},
+            spec::{HarmonyResponseSpec, ResponseSpec},
+            utils::StreamSource,
+        },
     },
 };
 
@@ -101,6 +105,11 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                         .as_deref()
                         .and_then(RateLimitCell::take_for_streaming_handoff);
 
+                    let source = StreamSource::new(
+                        ctx.workers.as_ref(),
+                        &dispatch,
+                        metrics_labels::ENDPOINT_CHAT,
+                    );
                     let response = self
                         .streaming_processor
                         .clone()
@@ -110,6 +119,7 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                             dispatch,
                             router_stops,
                             reservation.clone(),
+                            source,
                         )
                         .await;
 

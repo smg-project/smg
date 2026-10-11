@@ -12,13 +12,17 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::{helpers, ProcessStage, RateLimitCell},
-        context::{DispatchContext, FinalResponse},
-        regular::{processor, streaming},
-        spec::ResponseSpec,
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        error,
+        grpc::{
+            common::stages::{helpers, ProcessStage, RateLimitCell},
+            context::{DispatchContext, FinalResponse},
+            regular::{processor, streaming},
+            spec::ResponseSpec,
+            utils::StreamSource,
+        },
     },
 };
 
@@ -101,6 +105,11 @@ impl ProcessStage for CompletionResponseProcessingStage {
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
+            let source = StreamSource::new(
+                ctx.workers.as_ref(),
+                &dispatch,
+                metrics_labels::ENDPOINT_COMPLETIONS,
+            );
             let response = self
                 .streaming_processor
                 .clone()
@@ -110,6 +119,7 @@ impl ProcessStage for CompletionResponseProcessingStage {
                     dispatch,
                     tokenizer,
                     reservation.clone(),
+                    source,
                 )
                 .await;
 

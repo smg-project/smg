@@ -9,13 +9,17 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::{helpers, ProcessStage, RateLimitCell},
-        context::{DispatchContext, FinalResponse},
-        regular::{processor, streaming},
-        spec::ResponseSpec,
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        error,
+        grpc::{
+            common::stages::{helpers, ProcessStage, RateLimitCell},
+            context::{DispatchContext, FinalResponse},
+            regular::{processor, streaming},
+            spec::ResponseSpec,
+            utils::StreamSource,
+        },
     },
 };
 
@@ -109,6 +113,11 @@ impl ProcessStage for ChatResponseProcessingStage {
 
             // Streaming: Use StreamingProcessor and return SSE response. The
             // stream task consumes the spec, never the parsed request.
+            let source = StreamSource::new(
+                ctx.workers.as_ref(),
+                &dispatch,
+                metrics_labels::ENDPOINT_CHAT,
+            );
             let response = self
                 .streaming_processor
                 .clone()
@@ -119,6 +128,7 @@ impl ProcessStage for ChatResponseProcessingStage {
                     tokenizer,
                     skip_special_tokens,
                     reservation.clone(),
+                    source,
                 )
                 .await;
 

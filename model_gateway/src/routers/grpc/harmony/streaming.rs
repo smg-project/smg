@@ -107,7 +107,9 @@ impl HarmonyStreamingProcessor {
         dispatch: context::DispatchMetadata,
         router_stop_strings: Vec<String>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        source: utils::StreamSource,
     ) -> Response {
+        let source = source.with_backend(metrics_labels::BACKEND_HARMONY);
         // Create SSE channel
         let (tx, rx) = sse_channel();
 
@@ -125,9 +127,8 @@ impl HarmonyStreamingProcessor {
                     )
                     .await;
 
-                    if let Err(e) = result {
-                        error!("Harmony streaming error: {}", e);
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
+                    if let Err(failure) = result {
+                        utils::send_stream_failure(&tx, &failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(SseEncoder::done())).await;
@@ -153,9 +154,8 @@ impl HarmonyStreamingProcessor {
                     )
                     .await;
 
-                    if let Err(e) = result {
-                        error!("Harmony prefill/decode streaming error: {}", e);
-                        utils::send_error_sse(&tx, &e, "internal_error").await;
+                    if let Err(failure) = result {
+                        utils::send_stream_failure(&tx, &failure, &source).await;
                     }
 
                     let _ = tx.send(Ok(SseEncoder::done())).await;
@@ -196,7 +196,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         router_stop_strings: Vec<String>,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         let mut prompt_tokens = HashMap::new();
         let mut cached_tokens = HashMap::new();
         Self::process_chat_decode_stream(
@@ -226,7 +226,7 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: Vec<String>,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         // Phase 1: Process prefill stream (collect metadata)
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
@@ -273,7 +273,7 @@ impl HarmonyStreamingProcessor {
         cached_tokens: &mut HashMap<u32, u32>,
         router_stop_strings: &[String],
         reservation: Option<Arc<SharedReservationHandle>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), utils::StreamFailure> {
         // Timing for metrics
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
@@ -302,7 +302,8 @@ impl HarmonyStreamingProcessor {
 
         // Process stream
         while let Some(result) = decode_stream.next().await {
-            let response = result.map_err(|e| format!("Stream error: {}", e.message()))?;
+            let response = result
+                .map_err(|e| utils::StreamFailure::upstream(e, completion_tokens.delivered()))?;
 
             match response.into_response() {
                 ProtoResponseVariant::Chunk(chunk_wrapper) => {
