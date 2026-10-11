@@ -61,11 +61,17 @@ pub enum MediaConnectorError {
     #[error("media decode task failed: {0}")]
     Blocking(#[from] tokio::task::JoinError),
     /// This process's own I/O after the bytes arrived: the scratch file a
-    /// decoder reads from, the decoder process it runs, or cannot run because
-    /// the decoder is not installed, not executable or not in this build (see
+    /// decoder reads from, the pipe of the decoder process it runs (see
     /// [`MediaFault::Internal`]); never the request's or the media host's.
     #[error("I/O error while decoding media: {0}")]
     DecodeIo(#[source] std::io::Error),
+    /// A decoder this process cannot run: not installed, not executable, or
+    /// a backend this build does not have. This process's own (see
+    /// [`MediaFault::Internal`]), whatever clip the request sent; and a
+    /// verdict on nothing: as the fallback of a decoder that did run, it
+    /// leaves that decoder's verdict standing (see [`Self::fallback_failed`]).
+    #[error("media decoder unavailable: {0}")]
+    DecoderUnavailable(#[source] std::io::Error),
     #[error("image decode error: {0}")]
     Image(#[from] image::ImageError),
     #[error("audio decode error: {0}")]
@@ -110,7 +116,8 @@ pub enum MediaFault {
     /// scratch file or a decoder process that failed on this side (a
     /// temporary directory that is full or not writable, a pipe that broke),
     /// a decoder this side cannot start (not installed, not executable, a
-    /// backend this build does not have).
+    /// backend this build does not have), unless it was the fallback of a
+    /// decoder that did run: that decoder's verdict on the clip stands.
     Internal,
 }
 
@@ -118,12 +125,15 @@ impl MediaConnectorError {
     /// Whose fault this error is; see [`MediaFault`]. An I/O error is judged
     /// by where it happened, never by its kind: on the local file the request
     /// names it is the request's ([`Self::Io`]), on this process's scratch
-    /// file or decoder process it is this process's ([`Self::DecodeIo`]).
+    /// file or decoder process it is this process's ([`Self::DecodeIo`]), as
+    /// is a decoder this process cannot start ([`Self::DecoderUnavailable`]).
     pub fn fault(&self) -> MediaFault {
         match self {
             Self::Http(http) => http_fault(http),
             Self::Timeout { .. } => MediaFault::Transient,
-            Self::Blocking(_) | Self::DecodeIo(_) => MediaFault::Internal,
+            Self::Blocking(_) | Self::DecodeIo(_) | Self::DecoderUnavailable(_) => {
+                MediaFault::Internal
+            }
             Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }
@@ -138,6 +148,48 @@ impl MediaConnectorError {
             | Self::Image(_)
             | Self::AudioDecode(_)
             | Self::VideoDecode(_) => MediaFault::Client,
+        }
+    }
+
+    /// The error of a decoder this process cannot run, in the operator's
+    /// words: not installed, not executable, or a backend this build does
+    /// not have ([`Self::DecoderUnavailable`]).
+    pub fn decoder_unavailable(message: String) -> Self {
+        Self::DecoderUnavailable(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            message,
+        ))
+    }
+
+    /// The error of a decode whose fallback failed too, with both decoders'
+    /// words in `message`; `media` builds the error for the media's fault
+    /// ([`Self::VideoDecode`], [`Self::AudioDecode`]). The decoder that
+    /// judged the clip last decides whose fault the failure is: the
+    /// fallback's, unless the fallback could not start
+    /// ([`Self::DecoderUnavailable`]) and judged nothing, in which case the
+    /// first decoder's verdict stands. A verdict of this process's own I/O or
+    /// task keeps the error this process's ([`Self::DecodeIo`]); two decoders
+    /// that could not start leave it unavailable, so a decode that runs this
+    /// one as its fallback reads it the same way.
+    pub fn fallback_failed(
+        first: Self,
+        fallback: Self,
+        message: String,
+        media: fn(String) -> Self,
+    ) -> Self {
+        let verdict = match fallback {
+            Self::DecoderUnavailable(_) => first,
+            fallback => fallback,
+        };
+        match verdict {
+            Self::DecoderUnavailable(io) => {
+                Self::DecoderUnavailable(std::io::Error::new(io.kind(), message))
+            }
+            Self::DecodeIo(io) => Self::DecodeIo(std::io::Error::new(io.kind(), message)),
+            verdict if verdict.fault() == MediaFault::Internal => {
+                Self::DecodeIo(std::io::Error::other(message))
+            }
+            _ => media(message),
         }
     }
 }
@@ -230,10 +282,79 @@ mod tests {
                 "{kind:?}"
             );
             assert_eq!(
+                MediaConnectorError::DecoderUnavailable(std::io::Error::from(kind)).fault(),
+                MediaFault::Internal,
+                "{kind:?}"
+            );
+            assert_eq!(
                 MediaConnectorError::Io(std::io::Error::from(kind)).fault(),
                 MediaFault::Client,
                 "{kind:?}"
             );
+        }
+    }
+
+    /// A decode whose fallback failed too is judged by the decoder that
+    /// judged the clip last: the fallback, or the first decoder when the
+    /// fallback could not start and judged nothing. A verdict of this
+    /// process's own I/O keeps the error this process's; two decoders that
+    /// could not start leave it unavailable, which a decode that ran them as
+    /// its fallback reads the same way. The same for video and audio.
+    #[test]
+    fn a_fallback_that_could_not_start_leaves_the_first_decoders_verdict() {
+        use std::io::{Error, ErrorKind};
+        let message = || "first: bad frame; fallback: ffmpeg executable not found".to_string();
+        let unavailable =
+            || MediaConnectorError::decoder_unavailable("ffmpeg executable not found".to_string());
+        let bad_clip = || MediaConnectorError::VideoDecode("bad frame".to_string());
+        let scratch = || MediaConnectorError::DecodeIo(Error::other("no space left on device"));
+        let compose = |first, fallback, media| {
+            MediaConnectorError::fallback_failed(first, fallback, message(), media)
+        };
+
+        for media in [
+            MediaConnectorError::VideoDecode as fn(String) -> MediaConnectorError,
+            MediaConnectorError::AudioDecode,
+        ] {
+            // The fallback ran and judged the clip: its verdict, whatever the
+            // first decoder's failure was.
+            let theirs = compose(scratch(), bad_clip(), media);
+            assert_eq!(theirs.fault(), MediaFault::Client, "{theirs}");
+            assert!(theirs.to_string().contains(&message()), "{theirs}");
+            // The fallback failed on this side: this process's.
+            let ours = compose(bad_clip(), scratch(), media);
+            assert!(
+                matches!(&ours, MediaConnectorError::DecodeIo(io) if io.kind() == ErrorKind::Other),
+                "{ours}"
+            );
+            assert_eq!(ours.fault(), MediaFault::Internal);
+            // The fallback could not start: the first decoder's verdict.
+            let judged_by_first = compose(bad_clip(), unavailable(), media);
+            assert_eq!(
+                judged_by_first.fault(),
+                MediaFault::Client,
+                "{judged_by_first}"
+            );
+            assert!(
+                judged_by_first.to_string().contains(&message()),
+                "{judged_by_first}"
+            );
+            let first_was_ours = compose(scratch(), unavailable(), media);
+            assert!(
+                matches!(first_was_ours, MediaConnectorError::DecodeIo(_)),
+                "{first_was_ours}"
+            );
+            assert_eq!(first_was_ours.fault(), MediaFault::Internal);
+            // Neither could start: unavailable, so a decode that ran them as
+            // its fallback is judged by its own first decoder.
+            let neither = compose(unavailable(), unavailable(), media);
+            assert!(
+                matches!(&neither, MediaConnectorError::DecoderUnavailable(io) if io.kind() == ErrorKind::Unsupported),
+                "{neither}"
+            );
+            assert_eq!(neither.fault(), MediaFault::Internal);
+            let outer = compose(bad_clip(), neither, media);
+            assert_eq!(outer.fault(), MediaFault::Client, "{outer}");
         }
     }
 }

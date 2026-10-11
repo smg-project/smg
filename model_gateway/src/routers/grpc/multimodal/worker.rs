@@ -874,8 +874,9 @@ mod tests {
 
     /// A fetch that ran out of its budget is the media host's fault for now,
     /// a reference the request got wrong the request's, neither the worker's;
-    /// a scratch file that failed on this side is the worker's own, as is a
-    /// failure with no connector error in its chain.
+    /// a scratch file that failed on this side and a decoder this side cannot
+    /// start are the worker's own, as is a failure with no connector error in
+    /// its chain.
     #[test]
     fn fetch_failures_are_classified_by_fault() {
         let timeout = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
@@ -905,6 +906,11 @@ mod tests {
         )))
         .context("Failed to finalize multimodal tracker");
         assert!(matches!(classify(scratch), WorkerMediaError::Internal(_)));
+        let decoder = anyhow::Error::new(MultiModalError::Media(
+            MediaConnectorError::decoder_unavailable("ffmpeg executable not found".to_string()),
+        ))
+        .context("Failed to finalize multimodal tracker");
+        assert!(matches!(classify(decoder), WorkerMediaError::Internal(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
     }

@@ -49,7 +49,7 @@ const HIGH_CONCURRENCY_CPU_BUDGET_NUMERATOR: usize = 6;
 const HIGH_CONCURRENCY_CPU_BUDGET_DENOMINATOR: usize = 7;
 
 use super::{
-    error::{MediaConnectorError, MediaFault},
+    error::MediaConnectorError,
     types::{
         AudioClip, AudioSource, DecodedRgbFrame, DecodedRgbVideo, ImageDetail, ImageFrame,
         ImageSource, VideoClip, VideoSamplingInfo, VideoSource,
@@ -621,9 +621,7 @@ impl MediaConnector {
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
         ensure_input_byte_limit(bytes.len(), audio_max_input_bytes(), "audio")?;
         let hash = crate::hasher::hash_audio(&bytes);
-        let decoded = decode_audio_mono_f32(&bytes)
-            .await
-            .map_err(|e| MediaConnectorError::AudioDecode(e.to_string()))?;
+        let decoded = decode_audio_mono_f32(&bytes).await?;
         Ok(Arc::new(AudioClip::new(bytes, decoded, source, hash)))
     }
 
@@ -868,7 +866,7 @@ async fn decode_video_frames(
                                 let message = format!(
                                     "buffered OpenCV decode failed: {error}; tempfile OpenCV fallback failed: {fallback_error}"
                                 );
-                                fallback_failed(fallback_error, message)
+                                fallback_failed(error, fallback_error, message)
                             })
                     }
                 }
@@ -907,7 +905,7 @@ async fn decode_video_frames(
                                 let message = format!(
                                     "buffered OpenCV decode failed: {opencv_error}; tempfile fallback failed: {fallback_error}"
                                 );
-                                fallback_failed(fallback_error, message)
+                                fallback_failed(opencv_error, fallback_error, message)
                             })
                     }
                 }
@@ -935,30 +933,24 @@ async fn decode_video_bytes_with_tempfile(
     decode_video_frames_from_path(input_file.path(), input_bytes, cfg).await
 }
 
-/// The error of a decode whose fallback failed too, with both decoders'
-/// words in `message`. The fallback's fault decides whose it is: a fallback
-/// that failed on this process's own I/O or task keeps the error this
-/// process's (see [`MediaConnectorError::fault`]); otherwise it is the
-/// media's.
-fn fallback_failed(fallback: MediaConnectorError, message: String) -> MediaConnectorError {
-    if fallback.fault() != MediaFault::Internal {
-        return MediaConnectorError::VideoDecode(message);
-    }
-    let kind = match &fallback {
-        MediaConnectorError::DecodeIo(io) => io.kind(),
-        _ => std::io::ErrorKind::Other,
-    };
-    MediaConnectorError::DecodeIo(std::io::Error::new(kind, message))
+/// The error of a video decode whose fallback failed too, with both
+/// decoders' words in `message`: the decoder that judged the clip last
+/// decides whose fault it is, and a fallback that could not start leaves the
+/// first decoder's verdict standing (see
+/// [`MediaConnectorError::fallback_failed`]).
+fn fallback_failed(
+    first: MediaConnectorError,
+    fallback: MediaConnectorError,
+    message: String,
+) -> MediaConnectorError {
+    MediaConnectorError::fallback_failed(first, fallback, message, MediaConnectorError::VideoDecode)
 }
 
-/// The error of a decoder this process cannot run: not installed, not
-/// executable, or a backend this build does not have. This process's own
-/// ([`MediaConnectorError::DecodeIo`]), whatever clip the request sent.
+/// The error of a video decoder this process cannot run, in the operator's
+/// words: not installed, not executable, or a backend this build does not
+/// have ([`MediaConnectorError::DecoderUnavailable`]).
 fn decoder_unavailable(message: String) -> MediaConnectorError {
-    MediaConnectorError::DecodeIo(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        message,
-    ))
+    MediaConnectorError::decoder_unavailable(message)
 }
 
 async fn decode_video_bytes_with_ffmpeg(
@@ -1031,7 +1023,7 @@ async fn decode_video_frames_from_path(
                                 let message = format!(
                                     "OpenCV decode failed: {opencv_error}; ffmpeg fallback failed: {ffmpeg_error}"
                                 );
-                                Err(fallback_failed(ffmpeg_error, message))
+                                Err(fallback_failed(opencv_error, ffmpeg_error, message))
                             }
                         }
                     }
@@ -1701,7 +1693,7 @@ async fn decode_video_with_ffmpeg(
             let message = format!(
                 "ffmpeg frame selection failed: {selected_error}; fps resampling fallback failed: {fallback_error}"
             );
-            fallback_failed(fallback_error, message)
+            fallback_failed(selected_error, fallback_error, message)
         })
 }
 
@@ -1881,10 +1873,11 @@ fn is_video_command_timeout(error: &MediaConnectorError) -> bool {
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
-/// decoder this process cannot start (not installed, not executable) and the
-/// command's own I/O (a pipe that breaks) are this process's
-/// ([`MediaConnectorError::DecodeIo`]), reported in the operator's terms;
-/// only what the decoder says about the clip is the media's.
+/// decoder this process cannot start (not installed, not executable) is this
+/// process's ([`MediaConnectorError::DecoderUnavailable`]), reported in the
+/// operator's terms, and so is the command's own I/O (a pipe that breaks:
+/// [`MediaConnectorError::DecodeIo`]); only what the decoder says about the
+/// clip is the media's.
 async fn run_video_command_output(
     mut command: Command,
     program: &'static str,
@@ -1899,7 +1892,7 @@ async fn run_video_command_output(
         } else {
             format!("{program} could not be started: {e}")
         };
-        MediaConnectorError::DecodeIo(std::io::Error::new(e.kind(), message))
+        MediaConnectorError::DecoderUnavailable(std::io::Error::new(e.kind(), message))
     })?;
 
     let timeout = video_process_timeout();
@@ -2926,8 +2919,9 @@ mod tests {
         parse_ffmpeg_duration_seconds, parse_ffprobe_video_info, parse_ppm_stream,
         read_file_with_limit, run_video_command_output, split_png_stream, video_temp_suffix,
         write_temp_video_file, FrameSampling, MediaConnector, MediaConnectorConfig,
-        MediaConnectorError, MediaFault, MediaSource, VideoFetchConfig, VideoMetadata,
+        MediaConnectorError, MediaSource, VideoFetchConfig, VideoMetadata,
     };
+    use crate::error::MediaFault;
 
     const TINY_PNG: &[u8] = &[
         137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4,
@@ -3041,17 +3035,23 @@ mod tests {
 
     /// A decode whose fallback failed too is judged by the fallback: on this
     /// process's own I/O it stays this process's fault, with both decoders'
-    /// words kept; on the media it is the media's.
+    /// words kept; on the media it is the media's; a fallback that could not
+    /// start judged nothing, so the first decoder's verdict on the clip
+    /// stands and a corrupt clip stays the request's fault on a worker
+    /// without the fallback decoder.
     #[test]
     fn a_failed_fallback_keeps_an_internal_origin() {
         let message = "first decoder failed: bad frame; fallback failed: no space left on device";
+        let bad_frame = || MediaConnectorError::VideoDecode("bad frame".to_string());
         let ours = fallback_failed(
+            bad_frame(),
             MediaConnectorError::DecodeIo(std::io::Error::other("no space left on device")),
             message.to_string(),
         );
         assert_eq!(ours.fault(), MediaFault::Internal);
         assert!(ours.to_string().contains(message), "{ours}");
         let theirs = fallback_failed(
+            MediaConnectorError::DecodeIo(std::io::Error::other("broken pipe")),
             MediaConnectorError::VideoDecode("no video stream".to_string()),
             message.to_string(),
         );
@@ -3059,6 +3059,16 @@ mod tests {
         assert!(
             matches!(theirs, MediaConnectorError::VideoDecode(_)),
             "{theirs}"
+        );
+        let judged_by_first = fallback_failed(
+            bad_frame(),
+            decoder_unavailable("ffmpeg executable not found".to_string()),
+            message.to_string(),
+        );
+        assert_eq!(judged_by_first.fault(), MediaFault::Client);
+        assert!(
+            matches!(judged_by_first, MediaConnectorError::VideoDecode(_)),
+            "{judged_by_first}"
         );
     }
 
@@ -3074,7 +3084,7 @@ mod tests {
             .await
             .expect_err("a decoder that is not there");
         assert!(
-            matches!(&error, MediaConnectorError::DecodeIo(io) if io.kind() == std::io::ErrorKind::NotFound),
+            matches!(&error, MediaConnectorError::DecoderUnavailable(io) if io.kind() == std::io::ErrorKind::NotFound),
             "{error}"
         );
         assert_eq!(error.fault(), MediaFault::Internal);
@@ -3092,7 +3102,7 @@ mod tests {
                 .await
                 .expect_err("a decoder that cannot be run");
         assert!(
-            matches!(&error, MediaConnectorError::DecodeIo(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
+            matches!(&error, MediaConnectorError::DecoderUnavailable(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
             "{error}"
         );
         assert_eq!(error.fault(), MediaFault::Internal);
@@ -3106,6 +3116,10 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(backend.fault(), MediaFault::Internal);
+        assert!(
+            matches!(&backend, MediaConnectorError::DecoderUnavailable(_)),
+            "{backend}"
+        );
         assert!(backend.to_string().contains("gstreamer"), "{backend}");
     }
 

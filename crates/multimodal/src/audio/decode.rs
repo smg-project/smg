@@ -6,6 +6,7 @@
 use std::{
     io::{Cursor, Write},
     mem::size_of,
+    path::Path,
     process::{Output, Stdio},
     sync::OnceLock,
     time::{Duration, Instant},
@@ -24,7 +25,7 @@ use symphonia::{
 use tokio::{process::Command, task, time};
 use tracing::debug;
 
-use crate::error::TransformError;
+use crate::error::{MediaConnectorError, TransformError};
 
 const DEFAULT_AUDIO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AUDIO_MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
@@ -38,11 +39,16 @@ pub struct DecodedAudio {
     pub sample_rate: usize,
 }
 
-pub async fn decode_audio_mono_f32(bytes: &[u8]) -> Result<DecodedAudio, TransformError> {
+/// The clip as mono `f32` samples, by the in-process decoder first and the
+/// external one when it fails. What a decoder says about the clip is the
+/// media's fault ([`MediaConnectorError::AudioDecode`]); this process's own
+/// scratch file, pipe or task, and a decoder it cannot start, are its own
+/// (see [`MediaConnectorError::fault`]).
+pub async fn decode_audio_mono_f32(bytes: &[u8]) -> Result<DecodedAudio, MediaConnectorError> {
     match audio_decode_backend_override() {
         Some("symphonia") => decode_audio_with_symphonia_blocking(bytes).await,
         Some("ffmpeg") => decode_audio_with_ffmpeg(bytes).await,
-        Some(backend) => Err(TransformError::ShapeError(format!(
+        Some(backend) => Err(MediaConnectorError::decoder_unavailable(format!(
             "unsupported SMG_AUDIO_DECODE_BACKEND={backend}; expected auto, symphonia, or ffmpeg"
         ))),
         None => match decode_audio_with_symphonia_blocking(bytes).await {
@@ -53,9 +59,15 @@ pub async fn decode_audio_mono_f32(bytes: &[u8]) -> Result<DecodedAudio, Transfo
                     "smg_mm_timing audio_decode_auto_symphonia_fallback"
                 );
                 decode_audio_with_ffmpeg(bytes).await.map_err(|ffmpeg_error| {
-                    TransformError::ShapeError(format!(
+                    let message = format!(
                         "Symphonia audio decode failed: {symphonia_error}; ffmpeg fallback failed: {ffmpeg_error}"
-                    ))
+                    );
+                    MediaConnectorError::fallback_failed(
+                        symphonia_error,
+                        ffmpeg_error,
+                        message,
+                        MediaConnectorError::AudioDecode,
+                    )
                 })
             }
         },
@@ -64,11 +76,17 @@ pub async fn decode_audio_mono_f32(bytes: &[u8]) -> Result<DecodedAudio, Transfo
 
 async fn decode_audio_with_symphonia_blocking(
     bytes: &[u8],
-) -> Result<DecodedAudio, TransformError> {
+) -> Result<DecodedAudio, MediaConnectorError> {
     let bytes = bytes.to_vec();
     task::spawn_blocking(move || decode_audio_mono_f32_symphonia(&bytes))
         .await
-        .map_err(|e| TransformError::ShapeError(format!("Symphonia decode task failed: {e}")))?
+        .map_err(MediaConnectorError::Blocking)?
+        .map_err(audio_decode)
+}
+
+/// What a decoder said about the clip: the media's fault.
+fn audio_decode(error: TransformError) -> MediaConnectorError {
+    MediaConnectorError::AudioDecode(error.to_string())
 }
 
 pub(crate) fn decode_audio_mono_f32_symphonia(
@@ -182,7 +200,7 @@ fn decode_audio_mono_f32_symphonia_with_limits(
     finish_decoded_audio(mono, sample_rate)
 }
 
-async fn decode_audio_with_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, TransformError> {
+async fn decode_audio_with_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, MediaConnectorError> {
     let input_file = write_temp_audio_file_async(bytes).await?;
     let sample_rate = probe_audio_sample_rate(input_file.path()).await?;
     // Ask FFmpeg for one sample beyond our limit so a longer stream is
@@ -211,14 +229,15 @@ async fn decode_audio_with_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, Transfor
         ]);
     let output = run_audio_command_output(command, "ffmpeg").await?;
     if !output.status.success() {
-        return Err(TransformError::ShapeError(format!(
+        return Err(MediaConnectorError::AudioDecode(format!(
             "ffmpeg failed: {}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    ensure_decoded_byte_limit(output.stdout.len(), audio_max_decoded_bytes())?;
+    ensure_decoded_byte_limit(output.stdout.len(), audio_max_decoded_bytes())
+        .map_err(audio_decode)?;
     if output.stdout.len() % 4 != 0 {
-        return Err(TransformError::ShapeError(format!(
+        return Err(MediaConnectorError::AudioDecode(format!(
             "ffmpeg f32le output has trailing partial sample: {} bytes",
             output.stdout.len() % 4
         )));
@@ -231,7 +250,7 @@ async fn decode_audio_with_ffmpeg(bytes: &[u8]) -> Result<DecodedAudio, Transfor
         .iter()
         .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
-    finish_decoded_audio(samples, sample_rate)
+    finish_decoded_audio(samples, sample_rate).map_err(audio_decode)
 }
 
 fn ensure_symphonia_deadline(started: Instant, timeout: Duration) -> Result<(), TransformError> {
@@ -287,7 +306,7 @@ fn finish_decoded_audio(
     })
 }
 
-async fn probe_audio_sample_rate(input_path: &std::path::Path) -> Result<usize, TransformError> {
+async fn probe_audio_sample_rate(input_path: &Path) -> Result<usize, MediaConnectorError> {
     let mut command = Command::new("ffprobe");
     command
         .args([
@@ -303,7 +322,7 @@ async fn probe_audio_sample_rate(input_path: &std::path::Path) -> Result<usize, 
         .arg(input_path);
     let output = run_audio_command_output(command, "ffprobe").await?;
     if !output.status.success() {
-        return Err(TransformError::ShapeError(format!(
+        return Err(MediaConnectorError::AudioDecode(format!(
             "ffprobe failed: {}",
             String::from_utf8_lossy(&output.stderr)
         )));
@@ -314,60 +333,70 @@ async fn probe_audio_sample_rate(input_path: &std::path::Path) -> Result<usize, 
         .find_map(|line| line.trim().parse::<usize>().ok())
         .filter(|rate| *rate > 0)
         .ok_or_else(|| {
-            TransformError::ShapeError(format!("failed to parse ffprobe sample rate: {stdout:?}"))
+            MediaConnectorError::AudioDecode(format!(
+                "failed to parse ffprobe sample rate: {stdout:?}"
+            ))
         })
 }
 
 async fn write_temp_audio_file_async(
     bytes: &[u8],
-) -> Result<tempfile::NamedTempFile, TransformError> {
+) -> Result<tempfile::NamedTempFile, MediaConnectorError> {
     let bytes = bytes.to_vec();
-    task::spawn_blocking(move || write_temp_audio_file(&bytes))
+    task::spawn_blocking(move || write_temp_audio_file(&std::env::temp_dir(), &bytes))
         .await
-        .map_err(|e| TransformError::ShapeError(format!("audio tempfile task failed: {e}")))?
+        .map_err(MediaConnectorError::Blocking)?
 }
 
-fn write_temp_audio_file(bytes: &[u8]) -> Result<tempfile::NamedTempFile, TransformError> {
+/// The scratch file the external decoder reads `bytes` from, in `dir`. Its
+/// I/O is this process's own ([`MediaConnectorError::DecodeIo`]): the bytes
+/// have arrived by now, and a directory that is full or not writable is not
+/// the media's fault.
+fn write_temp_audio_file(
+    dir: &Path,
+    bytes: &[u8],
+) -> Result<tempfile::NamedTempFile, MediaConnectorError> {
     let mut input_file = tempfile::Builder::new()
         .prefix("smg-audio-")
         .suffix(audio_temp_suffix(bytes))
-        .tempfile()
-        .map_err(|e| TransformError::ShapeError(format!("audio tempfile failed: {e}")))?;
+        .tempfile_in(dir)
+        .map_err(MediaConnectorError::DecodeIo)?;
     input_file
         .write_all(bytes)
-        .map_err(|e| TransformError::ShapeError(format!("audio tempfile write failed: {e}")))?;
-    input_file
-        .flush()
-        .map_err(|e| TransformError::ShapeError(format!("audio tempfile flush failed: {e}")))?;
+        .map_err(MediaConnectorError::DecodeIo)?;
+    input_file.flush().map_err(MediaConnectorError::DecodeIo)?;
     Ok(input_file)
 }
 
+/// Runs a decoder command to completion under the audio process timeout. A
+/// decoder this process cannot start (not installed, not executable) is this
+/// process's ([`MediaConnectorError::DecoderUnavailable`]), reported in the
+/// operator's terms, and so is the command's own I/O (a pipe that breaks:
+/// [`MediaConnectorError::DecodeIo`]); only what the decoder says about the
+/// clip, and a decode that runs out of its time, is the media's.
 async fn run_audio_command_output(
     mut command: Command,
     program: &'static str,
-) -> Result<Output, TransformError> {
+) -> Result<Output, MediaConnectorError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let child = command.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            TransformError::ShapeError(format!(
-                "{program} executable not found; install {program} for audio decode fallback"
-            ))
+        let message = if e.kind() == std::io::ErrorKind::NotFound {
+            format!("{program} executable not found; install {program} to decode audio inputs")
         } else {
-            TransformError::ShapeError(format!("{program} spawn failed: {e}"))
-        }
+            format!("{program} could not be started: {e}")
+        };
+        MediaConnectorError::DecoderUnavailable(std::io::Error::new(e.kind(), message))
     })?;
 
     let timeout = audio_process_timeout();
     match time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(TransformError::ShapeError(format!(
-            "{program} wait failed: {error}"
-        ))),
-        Err(_) => Err(TransformError::ShapeError(format!(
+        Ok(Err(error)) => Err(MediaConnectorError::DecodeIo(error)),
+        Err(_) => Err(MediaConnectorError::AudioDecode(format!(
             "{program} timed out after {:.3} seconds",
             timeout.as_secs_f64()
         ))),
@@ -459,6 +488,7 @@ fn is_mp3_frame_sync(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::MediaFault;
 
     fn wav_i16_mono(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
         let data_bytes = samples.len() as u32 * 2;
@@ -527,5 +557,84 @@ mod tests {
         assert_eq!(audio_temp_suffix(b"OggS..."), ".ogg");
         assert_eq!(audio_temp_suffix(b"\x1a\x45\xdf\xa3..."), ".webm");
         assert_eq!(audio_temp_suffix(b"\0\0\0\x18ftypM4A "), ".m4a");
+    }
+
+    /// A decoder this process cannot start is this process's fault, not the
+    /// media's, whatever clip the request sent: the executable is not there,
+    /// or is there but cannot be run. The operator's words stay on the error.
+    #[tokio::test]
+    async fn a_decoder_that_cannot_start_is_our_fault() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let missing = dir.path().join("ffprobe");
+        let error = run_audio_command_output(Command::new(&missing), "ffprobe")
+            .await
+            .expect_err("a decoder that is not there");
+        assert!(
+            matches!(&error, MediaConnectorError::DecoderUnavailable(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "{error}"
+        );
+        assert_eq!(error.fault(), MediaFault::Internal);
+        assert!(
+            error
+                .to_string()
+                .contains("ffprobe executable not found; install ffprobe"),
+            "{error}"
+        );
+
+        let not_executable = dir.path().join("ffmpeg");
+        std::fs::write(&not_executable, b"not a program").expect("a plain file");
+        let error = run_audio_command_output(Command::new(&not_executable), "ffmpeg")
+            .await
+            .expect_err("a decoder that cannot be run");
+        assert!(
+            matches!(&error, MediaConnectorError::DecoderUnavailable(io) if io.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error}"
+        );
+        assert_eq!(error.fault(), MediaFault::Internal);
+        assert!(
+            error.to_string().contains("ffmpeg could not be started"),
+            "{error}"
+        );
+    }
+
+    /// The scratch file the external decoder reads from is this process's
+    /// own: in a directory that is not there (or not writable) the error is
+    /// this process's fault, whatever bytes the request sent; the same bytes
+    /// in a writable directory are written as they are.
+    #[test]
+    fn a_scratch_file_that_cannot_be_written_is_our_fault() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let bytes = b"not audio, never decoded";
+        let written = write_temp_audio_file(dir.path(), bytes).expect("a writable dir");
+        assert_eq!(
+            std::fs::read(written.path()).expect("the scratch file"),
+            bytes
+        );
+        let missing = dir.path().join("missing");
+        let error = write_temp_audio_file(&missing, bytes).expect_err("a dir that is not there");
+        assert!(matches!(error, MediaConnectorError::DecodeIo(_)), "{error}");
+        assert_eq!(error.fault(), MediaFault::Internal);
+    }
+
+    /// Bytes no decoder can read are the request's fault, whether the
+    /// external decoder ran and said so or could not start at all: the
+    /// in-process decoder's verdict stands when the fallback judged nothing.
+    #[tokio::test]
+    async fn a_clip_no_decoder_can_read_is_the_requests() {
+        let error = decode_audio_mono_f32(b"not audio at all")
+            .await
+            .expect_err("not audio");
+        assert!(
+            matches!(error, MediaConnectorError::AudioDecode(_)),
+            "{error}"
+        );
+        assert_eq!(error.fault(), MediaFault::Client);
+        if audio_decode_backend_override().is_none() {
+            let words = error.to_string();
+            assert!(
+                words.contains("Symphonia") && words.contains("ffmpeg"),
+                "{words}"
+            );
+        }
     }
 }
