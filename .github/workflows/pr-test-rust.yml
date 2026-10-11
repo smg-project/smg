@@ -722,10 +722,11 @@ jobs:
     secrets: inherit
 
   # The chat cases against the Rust gRPC servicer (SMG_SGLANG_SERVICER_IMPL=rust,
-  # SMG_VLLM_SERVICER_IMPL=rust): the same workers, the Rust request path. One
-  # row per engine with a Rust servicer: every other lane of that engine runs
-  # the Python servicer, so a launcher or binding change that breaks the Rust
-  # servicer's start fails here and nowhere else.
+  # SMG_VLLM_SERVICER_IMPL=rust): the same workers, the Rust request path. A
+  # row for SGLang and one for vLLM (the TokenSpeed Rust servicer has no
+  # PR-time row yet, so this lane says nothing about it): every other lane of
+  # those engines runs the Python servicer, so a launcher or binding change
+  # that breaks the Rust servicer's start fails here and nowhere else.
   e2e-1gpu-chat-rust-servicer:
     name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
