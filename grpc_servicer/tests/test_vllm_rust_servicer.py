@@ -1058,6 +1058,21 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
     assert recorded["configs"][0][0] is args and recorded["configs"][1][0].headless is True
 
 
+def test_serve_rust_fakes_leave_the_installed_package_untouched():
+    """The fakes go under a fake ``smg`` package, so the installed one keeps its
+    own ``servicer`` module once a test is over. Skipped where the `smg` wheel
+    is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    package = sys.modules["smg"]
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _install(monkeypatch, "smg")
+        _install(
+            monkeypatch, "smg.servicer", VllmGrpcServer=object, init_servicer_tracing=lambda: None
+        )
+    assert sys.modules["smg"] is package
+    assert package.servicer is servicer
+
+
 def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):
     """The keyword set `serve_rust` hands the Rust server is bound against the
     compiled binding's constructor: a fact the launcher gains without a

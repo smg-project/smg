@@ -506,6 +506,18 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     signature.bind(**created)
 
 
+def test_serve_rust_fakes_leave_the_installed_package_untouched(tmp_path):
+    """The fakes `_run_serve_rust` installs go under a fake ``smg`` package, so
+    the installed one keeps its own ``servicer`` module once the test is over.
+    Skipped where the `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    package = sys.modules["smg"]
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _run_serve_rust(monkeypatch, tmp_path)
+    assert sys.modules["smg"] is package
+    assert package.servicer is servicer
+
+
 def test_serve_grpc_hands_the_process_to_rust_when_the_flag_says_so(
     monkeypatch, caplog, no_parsed_flag
 ):

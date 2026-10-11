@@ -428,6 +428,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
             )
             self.address = bind_address
 
+    _install(monkeypatch, "smg")
     _install(
         monkeypatch,
         "smg.servicer",
@@ -493,6 +494,7 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
             created.update(kwargs)
             self.address = kwargs["bind_address"]
 
+    _install(monkeypatch, "smg")
     _install(
         monkeypatch,
         "smg.servicer",
@@ -546,3 +548,15 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     assert not unexpected, f"keywords the binding's constructor does not take: {unexpected}"
     # The required parameters are all given too; pyo3 refuses the call otherwise.
     signature.bind(**created)
+
+
+def test_serve_rust_fakes_leave_the_installed_package_untouched(tmp_path):
+    """The fakes `_run_serve_rust` installs go under a fake ``smg`` package, so
+    the installed one keeps its own ``servicer`` module once the test is over.
+    Skipped where the `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    package = sys.modules["smg"]
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _run_serve_rust(monkeypatch, tmp_path)
+    assert sys.modules["smg"] is package
+    assert package.servicer is servicer
