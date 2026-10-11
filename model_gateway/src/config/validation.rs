@@ -4,7 +4,7 @@ use axum::http::HeaderName;
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::policies::cost as selection_cost;
+use crate::{middleware::scheduler, policies::cost as selection_cost};
 
 /// Validate a user-supplied mesh server name. The name keys rate-limit
 /// shards as `rl:{counter}:{name}`, so an empty name or one containing the
@@ -130,6 +130,7 @@ impl ConfigValidator {
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
         Self::validate_prefill_admission(config)?;
+        Self::validate_priority_scheduler(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -202,6 +203,24 @@ impl ConfigValidator {
         }
 
         Ok(())
+    }
+
+    /// With the priority scheduler enabled, the optional YAML file must be
+    /// readable, parsable and valid: an operator who asked for tenant
+    /// priorities gets a start-up error naming the file instead of a gateway
+    /// that serves with the legacy admission (the contract of
+    /// `tenant_rate_limit_config`). Without the flag the path is not read.
+    fn validate_priority_scheduler(config: &RouterConfig) -> ConfigResult<()> {
+        if !config.priority_scheduler_enabled {
+            return Ok(());
+        }
+        scheduler::settings_from_config(config)
+            .map(drop)
+            .map_err(|reason| ConfigError::InvalidValue {
+                field: "priority_scheduler_config".to_string(),
+                value: config.priority_scheduler_config.clone().unwrap_or_default(),
+                reason,
+            })
     }
 
     fn validate_model_aliases(config: &RouterConfig) -> ConfigResult<()> {
@@ -1581,6 +1600,108 @@ mod tests {
 
         let config = RouterConfig {
             mm_per_request_image_limit: Some(128),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn scheduler_config(path: Option<&str>) -> RouterConfig {
+        RouterConfig {
+            priority_scheduler_enabled: true,
+            priority_scheduler_config: path.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// A class entry with every field, `queue_timeout_secs` set to `timeout`.
+    fn class_yaml(class: &str, timeout: u64) -> String {
+        format!(
+            "classes:\n  {class}:\n    reserved_floor: 1\n    queue_size: 16\n    \
+             queue_timeout_secs: {timeout}\n    starvation_threshold_secs: 10\n    \
+             can_preempt: false\n"
+        )
+    }
+
+    /// The `(value, reason)` of the `priority_scheduler_config` error a
+    /// configuration is refused with.
+    fn refused_scheduler_config(config: &RouterConfig) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == "priority_scheduler_config" => (value, reason),
+            other => panic!("expected a priority_scheduler_config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.yaml");
+        let path = path.to_str().unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(Some(path)));
+        assert_eq!(value, path);
+        assert!(
+            reason.starts_with("reading ") && reason.contains(path),
+            "the reason names the file and the read error: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.yaml");
+        std::fs::write(&path, "not: [valid: yaml\n").unwrap();
+        let path = path.to_str().unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(Some(path)));
+        assert_eq!(value, path);
+        assert!(
+            reason.starts_with("parsing ") && reason.contains(path),
+            "the reason names the file and the parse error: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A class the scheduler does not know.
+        let unknown_class = dir.path().join("unknown-class.yaml");
+        std::fs::write(&unknown_class, class_yaml("gold", 1)).unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(unknown_class.to_str()));
+        assert_eq!(value, unknown_class.to_str().unwrap());
+        assert!(
+            reason.contains("gold"),
+            "the reason names the unknown class: {reason}"
+        );
+        // A value the scheduler's own validation refuses.
+        let zero_timeout = dir.path().join("zero-timeout.yaml");
+        std::fs::write(&zero_timeout, class_yaml("bulk", 0)).unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(zero_timeout.to_str()));
+        assert_eq!(value, zero_timeout.to_str().unwrap());
+        assert!(
+            reason.contains("queue_timeout_secs must be > 0"),
+            "the reason is the scheduler's own: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_valid_or_absent_priority_scheduler_config_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("scheduler.yaml");
+        let tenant_policies = "tenant_policies:\n  \"header:a\":\n    max_class: bulk\n";
+        std::fs::write(
+            &valid,
+            format!("{}{tenant_policies}", class_yaml("interactive", 5)),
+        )
+        .unwrap();
+        assert!(ConfigValidator::validate(&scheduler_config(valid.to_str())).is_ok());
+        // Enabled without a file: the built-in class defaults.
+        assert!(ConfigValidator::validate(&scheduler_config(None)).is_ok());
+        // Not enabled: the path is not read, as for the tenant rate limiter.
+        let missing = dir.path().join("missing.yaml");
+        let config = RouterConfig {
+            priority_scheduler_config: missing.to_str().map(str::to_owned),
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());

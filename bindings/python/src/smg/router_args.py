@@ -1585,7 +1585,12 @@ class RouterArgs:
             f"--{prefix}priority-scheduler-config",
             type=str,
             default=None,
-            help="Optional path to the priority-scheduler YAML config.",
+            help=(
+                "Optional path to the priority-scheduler YAML config. With "
+                "--priority-scheduler-enabled, a file that cannot be read, parsed "
+                "or validated is a start-up error; without a path the built-in "
+                "class defaults apply."
+            ),
         )
         scheduler_group.add_argument(
             f"--{prefix}priority-scheduler-tenant-metric-top-n",

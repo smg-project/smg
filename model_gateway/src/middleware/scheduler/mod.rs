@@ -27,4 +27,4 @@ pub use engine::{
 pub use error::{SchedulerError, HEADER_X_SMG_PREEMPTED};
 pub use extract::PreemptionGuard;
 pub use policy::{StaticTenantPolicyResolver, TenantPolicy, TenantPolicyResolver};
-pub use state::{AdmissionMode, SchedulerState};
+pub use state::{settings_from_config, AdmissionMode, SchedulerState};

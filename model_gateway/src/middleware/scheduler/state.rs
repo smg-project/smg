@@ -48,9 +48,13 @@ impl AdmissionMode {
     /// spawns the dispatcher on its watch channel, and returns
     /// `Priority(..)`.
     ///
-    /// On any startup error (bad YAML, reservations exceed capacity), logs
-    /// at ERROR and falls back to `Legacy` rather than aborting the whole
-    /// gateway — a misconfigured scheduler must not take the data plane down.
+    /// The YAML file is checked by `ConfigValidator` before start-up, so a
+    /// file that cannot be read, parsed or validated is a configuration
+    /// error the gateway refuses to start on. What can still fail here is
+    /// the scheduler against the fleet's initial capacity (reservations
+    /// exceed it): that is logged at ERROR and falls back to `Legacy`
+    /// rather than aborting the whole gateway — a too-small fleet must not
+    /// take the data plane down.
     pub fn from_config(
         rc: &RouterConfig,
         registry: Arc<WorkerRegistry>,
@@ -96,15 +100,7 @@ impl AdmissionMode {
         // a gap where the first fleet update is lost.
         let capacity_watch = worker_capacity.watch();
 
-        let default_max_class = Class::parse_header(&rc.priority_scheduler_default_max_class);
-        let yaml = load_yaml(rc.priority_scheduler_config.as_deref())?;
-        let settings = SchedulerSettings::from_cli_and_yaml(
-            true,
-            default_max_class,
-            rc.priority_scheduler_tenant_metric_top_n,
-            yaml.as_ref(),
-        )
-        .map_err(|e| e.to_string())?;
+        let settings = settings_from_config(rc)?;
 
         // The atomic value covers any update that won the race before the
         // receiver subscribed; subsequent updates remain queued for the
@@ -130,6 +126,23 @@ impl AdmissionMode {
             rate_limiter,
         })))
     }
+}
+
+/// The scheduler settings a router configuration describes: the CLI fields
+/// plus the optional YAML file, read, parsed and validated. `ConfigValidator`
+/// runs this before start-up and the admission mode builds on it, so both see
+/// the same file the same way. The error names the file and what is wrong
+/// with it.
+pub fn settings_from_config(rc: &RouterConfig) -> Result<SchedulerSettings, String> {
+    let default_max_class = Class::parse_header(&rc.priority_scheduler_default_max_class);
+    let yaml = load_yaml(rc.priority_scheduler_config.as_deref())?;
+    SchedulerSettings::from_cli_and_yaml(
+        true,
+        default_max_class,
+        rc.priority_scheduler_tenant_metric_top_n,
+        yaml.as_ref(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Load + parse the optional priority-scheduler YAML file.

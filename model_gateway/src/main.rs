@@ -1011,7 +1011,10 @@ struct CliArgs {
     #[arg(long, default_value = "default", help_heading = "Priority Scheduler")]
     priority_scheduler_default_max_class: String,
 
-    /// Optional path to the priority-scheduler YAML config.
+    /// Optional path to the priority-scheduler YAML config. With
+    /// --priority-scheduler-enabled, a file that cannot be read, parsed or
+    /// validated is a start-up error; without a path the built-in class
+    /// defaults apply.
     #[arg(long, help_heading = "Priority Scheduler")]
     priority_scheduler_config: Option<String>,
 
