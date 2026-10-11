@@ -1,9 +1,10 @@
-"""The Python-owned lifecycle around a Rust servicer, shared by the vLLM and
-TokenSpeed launchers: a free port and socket directory for the handshake, the
-engine as a ``Popen``-shaped handle (one spawned headless engine, or the
-engine cores a manager started from this process), its termination, and the
-supervision loop that drains on a signal and exits with the engine or the
-server. Nothing here knows which engine it supervises.
+"""The Python-owned lifecycle around a Rust servicer, shared by the engine
+launchers: a free port and socket directory for the handshake, the engine as
+a ``Popen``-shaped handle (one spawned headless engine, the engine cores a
+manager started from this process, or the scheduler processes this process
+started itself), its termination, and the supervision loop that drains on a
+signal and exits with the engine or the server. Nothing here knows which
+engine it supervises.
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ import os
 import signal
 import socket
 import subprocess
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,13 @@ DEFAULT_STARTUP_TIMEOUT_SECS = 1800.0
 # storage path. 0 lifts the ceiling.
 DEFAULT_STARTUP_CEILING_SECS = 4 * 3600.0
 _POLL_SECS = 0.5
+# Grace a scheduler process this process started gets between SIGTERM and
+# SIGKILL at shutdown, and how long the kill is waited for.
+SCHEDULER_GRACE_SECS = 10.0
+SCHEDULER_KILL_SECS = 2.0
+# How often the wait for the scheduler processes' ready reports looks for one
+# that died during its start instead.
+READY_POLL_SECS = 5.0
 TRACK_INTERVAL_SECS = 2.0  # how often the supervisor's poll refreshes the engine's descendants
 
 # What makes a directory a tokenizer directory to the Rust tokenizer loader.
@@ -218,6 +228,13 @@ class EngineProcessGroup:
             self._shutdown()
         return self._exit_code
 
+    def fault(self, code: int = 1) -> None:
+        """A failure reported out of band (a signal from a process that then
+        exits on its own terms): the group ends with ``code``, and the next
+        poll shuts the processes still alive down. The first report counts."""
+        if self._exit_code is None:
+            self._exit_code = code
+
     def track(self) -> None:
         for engine in self._engines:
             engine.track()
@@ -247,6 +264,123 @@ class EngineProcessGroup:
         code = self.poll()
         assert code is not None
         return code
+
+
+class SchedulerProcesses:
+    """The manager an :class:`EngineProcessGroup` wraps when this process
+    started the scheduler processes itself (the engine's own per-process
+    entry point under ``multiprocessing``, spawned): the ``processes``, and
+    the ``shutdown`` that terminates every live one and kills what outlives
+    the grace period.
+
+    ``ready`` blocks until every process has reported its start on the pipe
+    it was given, or raises; :meth:`watch_ready` runs it on a thread, so the
+    reports are drained (a process never blocks on its report) and a failed
+    start is logged at once, while the supervisor keeps polling the
+    processes themselves.
+    """
+
+    def __init__(
+        self,
+        processes: list,
+        *,
+        ready: Callable[[], Any] | None = None,
+        grace_secs: float = SCHEDULER_GRACE_SECS,
+    ):
+        self.processes = list(processes)
+        self._ready = ready
+        self._grace_secs = grace_secs
+        self.ready_thread: threading.Thread | None = None
+        self.ready_error: Exception | None = None
+
+    @property
+    def pids(self) -> list[int | None]:
+        return [process.pid for process in self.processes]
+
+    def watch_ready(self, what: str) -> threading.Thread | None:
+        """Wait for the ready reports on a daemon thread; logs the outcome."""
+        if self._ready is None:
+            return None
+
+        def wait() -> None:
+            try:
+                self._ready()
+            except Exception as error:
+                self.ready_error = error
+                logger.error("%s: the scheduler processes did not start: %s", what, error)
+                return
+            logger.info("%s: %d scheduler process(es) ready", what, len(self.processes))
+
+        self.ready_thread = threading.Thread(target=wait, name="smg-scheduler-ready", daemon=True)
+        self.ready_thread.start()
+        return self.ready_thread
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        """SIGTERM every live process, wait up to ``timeout`` (the grace
+        period by default) for all of them, SIGKILL what is still alive."""
+        grace = self._grace_secs if timeout is None else timeout
+        for process in self.processes:
+            if process.is_alive():
+                process.terminate()
+        deadline = time.monotonic() + grace
+        for process in self.processes:
+            process.join(max(0.0, deadline - time.monotonic()))
+        for process in self.processes:
+            if process.is_alive():
+                logger.warning(
+                    "Scheduler process %s did not exit within %.0fs; killing it", process.pid, grace
+                )
+                process.kill()
+                process.join(SCHEDULER_KILL_SECS)
+
+
+def wait_for_ready_reports(
+    readers: list, processes: list, *, poll_secs: float = READY_POLL_SECS
+) -> list[dict]:
+    """Collect one ready report per pipe (a scheduler process reports
+    ``{"status": "ready", ...}`` on the pipe it was started with, once its
+    model is loaded), polling so a process that died during its start is
+    noticed instead of waited on for ever. Returns the reports in pipe order;
+    raises when a report says otherwise or a process is gone."""
+    reports: list[dict] = []
+    for index, reader in enumerate(readers):
+        while not reader.poll(poll_secs):
+            dead = next((process for process in processes if not process.is_alive()), None)
+            if dead is not None:
+                raise RuntimeError(
+                    f"scheduler process {dead.pid} exited with {dead.exitcode} before it was ready"
+                )
+        try:
+            report = reader.recv()
+        except EOFError as error:
+            raise RuntimeError(
+                f"scheduler process {processes[index].pid} closed its pipe before it was ready"
+            ) from error
+        if not isinstance(report, dict) or report.get("status") != "ready":
+            raise RuntimeError(f"scheduler process {index} failed to start: {report!r}")
+        reports.append(report)
+    return reports
+
+
+def on_fault_signal(group: EngineProcessGroup, *signals: int, what: str) -> bool:
+    """Make the signals a scheduler process sends its parent when it hits an
+    exception end ``group`` (its next poll reports exit code 1 and shuts the
+    other processes down) instead of this process: their default disposition
+    would take the servicer down with the engine, and an engine's own
+    launch-phase handler kills the whole process tree. Handlers can only be
+    installed on the main thread; returns whether they were."""
+    if threading.current_thread() is not threading.main_thread():
+        return False
+
+    def on_signal(signum: int, _frame: Any) -> None:
+        logger.error(
+            "%s: a scheduler process signalled a failure (signal %d); stopping", what, signum
+        )
+        group.fault(1)
+
+    for sig in signals:
+        signal.signal(sig, on_signal)
+    return True
 
 
 def _descendants(pid: int) -> list[int]:
