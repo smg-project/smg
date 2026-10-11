@@ -837,6 +837,7 @@ impl ResponseProcessor {
                     id: utils::message_utils::anthropic_tool_use_id(&tc.id),
                     name: tc.function.name.clone(),
                     input,
+                    caller: messages::ToolUseCaller::Direct,
                 });
             }
         }

@@ -2710,6 +2710,7 @@ impl StreamingProcessor {
                                     id: message_utils::anthropic_tool_use_id(&tool_call_id),
                                     name: tool_name,
                                     input: Value::Object(serde_json::Map::new()),
+                                    caller: messages::ToolUseCaller::Direct,
                                 },
                             },
                         )
@@ -2827,6 +2828,7 @@ impl StreamingProcessor {
                                                 ),
                                                 name: name.clone(),
                                                 input: Value::Object(serde_json::Map::new()),
+                                                caller: messages::ToolUseCaller::Direct,
                                             },
                                         },
                                     )
@@ -2974,6 +2976,7 @@ impl StreamingProcessor {
                                     id: message_utils::anthropic_tool_use_id(&tool_call_id),
                                     name: name.clone(),
                                     input: Value::Object(serde_json::Map::new()),
+                                    caller: messages::ToolUseCaller::Direct,
                                 },
                             },
                         )

@@ -129,7 +129,9 @@ pub(crate) fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolUseBlock> 
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, name, input } => Some(ToolUseBlock {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some(ToolUseBlock {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
@@ -495,7 +497,9 @@ fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentB
                     citations: citations.clone(),
                 }));
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 blocks.push(InputContentBlock::ToolUse(ToolUseBlock {
                     id: id.clone(),
                     name: name.clone(),

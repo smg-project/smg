@@ -927,6 +927,10 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        /// Who issued the call, as the public API reports it on every
+        /// `tool_use` block (the model itself for a call the gateway builds).
+        #[serde(default)]
+        caller: ToolUseCaller,
     },
     /// Thinking content
     Thinking { thinking: String, signature: String },
@@ -967,6 +971,19 @@ pub enum ContentBlock {
         content: Option<ToolResultContent>,
         is_error: Option<bool>,
     },
+}
+
+/// The caller of a `tool_use` block, as the public API reports it: the model
+/// itself (`{"type": "direct"}`) or a server tool that issued the call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolUseCaller {
+    /// The model issued the call.
+    #[default]
+    Direct,
+    /// A code-execution server tool issued the call.
+    #[serde(rename = "code_execution_20250825")]
+    CodeExecution20250825 { tool_id: String },
 }
 
 /// Stop reasons
@@ -2117,6 +2134,33 @@ mod tests {
     use serde_json::{self, json};
 
     use super::*;
+
+    #[test]
+    fn tool_use_block_carries_the_caller_the_public_api_reports() {
+        // A block built without a caller (every engine-issued call) leaves
+        // with the model as its caller, as the public API's blocks do.
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}
+        }))
+        .expect("a block without a caller still parses");
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"], json!({"type": "direct"}), "{value}");
+        assert_eq!(value["input"], json!({"q": "x"}));
+
+        // A caller an upstream reported is kept as it came.
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {},
+            "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}
+        }))
+        .expect("parse");
+        assert!(matches!(
+            &block,
+            ContentBlock::ToolUse { caller: ToolUseCaller::CodeExecution20250825 { tool_id }, .. }
+                if tool_id == "srvtoolu_1"
+        ));
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"]["type"], "code_execution_20250825");
+    }
 
     #[test]
     fn test_system_blocks_preserve_type_field() {

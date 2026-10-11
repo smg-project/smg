@@ -79,7 +79,9 @@
 
 use std::mem;
 
-use openai_protocol::messages::{ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason};
+use openai_protocol::messages::{
+    ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason, ToolUseCaller,
+};
 use serde_json::{Map, Value};
 
 use crate::event::{Event, FinishReason};
@@ -153,6 +155,7 @@ pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
         id: tool_use_id(&call.id),
         name: call.name,
         input: input(&call.arguments),
+        caller: ToolUseCaller::Direct,
     }));
 
     Output {
@@ -212,6 +215,7 @@ impl Stream {
                     id: tool_use_id(id),
                     name: name.clone(),
                     input: Value::Object(Map::new()),
+                    caller: ToolUseCaller::Direct,
                 },
                 out,
             ),
@@ -436,6 +440,7 @@ mod tests {
                     "id": "toolu_0",
                     "name": "get_weather",
                     "input": {"city": "Paris"},
+                    "caller": {"type": "direct"},
                 },
             ])
         );
@@ -488,8 +493,10 @@ mod tests {
         assert_eq!(
             wire(&output(&events).content),
             json!([
-                {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {"city": "Paris"}},
-                {"type": "tool_use", "id": "toolu_1", "name": "get_time", "input": {"zone": "CET"}},
+                {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {"city": "Paris"},
+                 "caller": {"type": "direct"}},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_time", "input": {"zone": "CET"},
+                 "caller": {"type": "direct"}},
             ])
         );
     }
@@ -651,7 +658,8 @@ mod tests {
                  "delta": {"type": "text_delta", "text": "check."}},
                 {"type": "content_block_stop", "index": 1},
                 {"type": "content_block_start", "index": 2,
-                 "content_block": {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {}}},
+                 "content_block": {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {},
+                                   "caller": {"type": "direct"}}},
                 {"type": "content_block_delta", "index": 2,
                  "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}},
                 {"type": "content_block_delta", "index": 2,
