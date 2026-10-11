@@ -8,8 +8,10 @@ silent-swallow path.
 The gateway deserializes every ``/v1/responses`` body through
 ``ValidatedJson<ResponsesRequest>`` (crates/protocols/src/validated.rs). Any
 serde error surfaces as ``HTTP 400`` with
-``{"error": {"type": "invalid_request_error", "code": "json_parse_error"}}``
-(see validated.rs:60-85), so these tests hit the gateway directly with
+``{"error": {"type": "invalid_request_error", "code": <one of PARSER_CODES>}}``
+(the code names the deserializer's reason, as the public API's does: a missing
+field, an unknown field, a wrong type, a value outside an enumeration, a
+negative integer, malformed JSON), so these tests hit the gateway directly with
 ``httpx`` instead of the OpenAI SDK — both to exercise the exact wire shape
 and to bypass client-side shape enforcement.
 
@@ -62,17 +64,32 @@ def _post_responses(gateway, body: dict, timeout: float = 30.0) -> httpx.Respons
     )
 
 
-def _assert_validation_400(resp: httpx.Response) -> dict:
+# The codes ``ValidatedJson`` gives a body the deserializer refused
+# (crates/protocols/src/validated.rs, ``deserialize_code``): the public API's
+# names for the reason, and ``json_parse_error`` for anything it cannot name.
+PARSER_CODES = frozenset(
+    {
+        "missing_required_parameter",
+        "unknown_parameter",
+        "invalid_type",
+        "invalid_value",
+        "integer_below_min_value",
+        "invalid_json",
+        "json_parse_error",
+    }
+)
+
+
+def _assert_validation_400(resp: httpx.Response, code: str | None = None) -> dict:
     """Assert the gateway returned a 400 with the canonical parser envelope.
 
-    Pins the full shape emitted by ``ValidatedJson``'s ``JsonDataError``
-    branch (``crates/protocols/src/validated.rs:74-84``): status 400,
-    ``error.type == "invalid_request_error"``, and
-    ``error.code == "json_parse_error"``. The ``code`` assertion is what
-    distinguishes a parser-level rejection from the validator-level
-    rejection emitted at validated.rs:91-103 (which uses ``code: 400`` as
-    an integer) or any upstream/auth 400 that happens to share the
-    envelope prefix.
+    Pins the shape emitted by ``ValidatedJson``'s ``JsonDataError`` branch
+    (``crates/protocols/src/validated.rs``): status 400,
+    ``error.type == "invalid_request_error"``, and ``error.code`` one of
+    ``PARSER_CODES`` (or exactly ``code`` when given). The ``code`` assertion
+    is what distinguishes a parser-level rejection from a validator-level one
+    whose code names a rule (``unsupported_value``, ``empty_array``, ...) or
+    any upstream/auth 400 that happens to share the envelope prefix.
 
     Returns the parsed JSON body so individual tests can make per-case
     assertions about the error message contents.
@@ -85,8 +102,9 @@ def _assert_validation_400(resp: httpx.Response) -> dict:
     assert err.get("type") == "invalid_request_error", (
         f"expected invalid_request_error, got {err!r}"
     )
-    assert err.get("code") == "json_parse_error", (
-        f"expected code=json_parse_error (parser branch), got {err!r}"
+    expected = {code} if code else PARSER_CODES
+    assert err.get("code") in expected, (
+        f"expected code in {sorted(expected)} (parser branch), got {err!r}"
     )
     message = err.get("message", "")
     assert isinstance(message, str) and message, f"expected non-empty message, got {err!r}"
@@ -114,7 +132,7 @@ def _is_validation_400(resp: httpx.Response) -> bool:
     err = body.get("error")
     if not isinstance(err, dict):
         return False
-    return err.get("code") == "json_parse_error"
+    return err.get("code") in PARSER_CODES
 
 
 @pytest.mark.vendor("openai")
@@ -208,7 +226,7 @@ class TestResponsesInputValidation:
         }
         resp = _post_responses(gw, body)
         # The critical invariant is narrow: the gateway's *parser* must not
-        # emit its json_parse_error envelope for the extra field. A plain
+        # emit its rejection envelope for the extra field. A plain
         # `status_code != 400` check would let an unrelated downstream 400
         # (e.g. auth, upstream validation) vacuously satisfy the assertion,
         # so we target the parser-specific envelope via _is_validation_400.
@@ -226,7 +244,7 @@ class TestResponsesInputValidation:
 
         The rejection comes from the request validator (``validate()`` after
         the body parser), so the envelope is the validator's
-        ``invalid_request_error``, not the parser's ``json_parse_error``.
+        ``invalid_request_error`` with the rule's code.
         """
         _, model_path, _, gw = setup_backend
         body = {

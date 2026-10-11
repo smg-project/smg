@@ -72,6 +72,40 @@ fn rejection(status: StatusCode, code: &str, param: Option<String>, message: Str
 #[cfg(feature = "axum")]
 const DESERIALIZE_PREFIX: &str = "Failed to deserialize the JSON body into the target type: ";
 
+/// The public API's `code` for a body the deserializer refused, read from
+/// serde's message: `missing_required_parameter` for a field that is not
+/// there, `unknown_parameter` for one the type does not know, `invalid_type`
+/// for a value of the wrong shape (a body that is not an object included),
+/// `invalid_value` for a value outside an enumeration, and
+/// `integer_below_min_value` for a negative integer where the field cannot be
+/// negative; `json_parse_error` for anything else. A JSON array where an
+/// object was expected is a wrong type too, whether serde reports the type
+/// or the length of the sequence.
+#[cfg(feature = "axum")]
+fn deserialize_code(message: &str) -> &'static str {
+    let detail = message
+        .rsplit_once(DESERIALIZE_PREFIX)
+        .map_or(message, |(_, detail)| detail);
+    if detail.contains("missing field `") {
+        "missing_required_parameter"
+    } else if detail.contains("unknown field `") {
+        "unknown_parameter"
+    } else if detail.contains("unknown variant `") {
+        "invalid_value"
+    } else if detail.contains("invalid value: integer `-") {
+        "integer_below_min_value"
+    } else if detail.contains("invalid value") {
+        "invalid_value"
+    } else if detail.contains("invalid type")
+        || detail.contains("invalid length")
+        || detail.contains("did not match any variant")
+    {
+        "invalid_type"
+    } else {
+        "json_parse_error"
+    }
+}
+
 /// The field a deserialization error is about, as the public API's `param`:
 /// the path serde recorded, the field a `missing field` / `unknown field`
 /// error names, or both (`items[0].role`); None for a syntax error.
@@ -260,25 +294,22 @@ where
                                 .to_string(),
                         );
                     }
-                    let error_message = match err {
+                    let (code, error_message) = match err {
                         JsonRejection::JsonDataError(e) => {
-                            format!("Invalid JSON data: {e}")
+                            let message = format!("Invalid JSON data: {e}");
+                            (deserialize_code(&message), message)
                         }
                         JsonRejection::JsonSyntaxError(e) => {
-                            format!("JSON syntax error: {e}")
+                            ("invalid_json", format!("JSON syntax error: {e}"))
                         }
-                        JsonRejection::MissingJsonContentType(_) => {
-                            "Missing Content-Type: application/json header".to_string()
-                        }
-                        _ => format!("Failed to parse JSON: {err}"),
+                        JsonRejection::MissingJsonContentType(_) => (
+                            "json_parse_error",
+                            "Missing Content-Type: application/json header".to_string(),
+                        ),
+                        _ => ("json_parse_error", format!("Failed to parse JSON: {err}")),
                     };
                     let param = param_from_deserialize_message(&error_message);
-                    rejection(
-                        StatusCode::BAD_REQUEST,
-                        "json_parse_error",
-                        param,
-                        error_message,
-                    )
+                    rejection(StatusCode::BAD_REQUEST, code, param, error_message)
                 })?;
 
         // Normalize the request (apply defaults based on other fields)
@@ -425,6 +456,15 @@ mod tests {
         tier: Option<String>,
         #[serde(default)]
         both: bool,
+        #[serde(default)]
+        kind: Option<Kind>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Kind {
+        Plain,
+        Fancy,
     }
 
     impl Normalizable for BodyRequest {}
@@ -586,19 +626,51 @@ mod tests {
 
     #[tokio::test]
     async fn deserialization_errors_name_the_offending_field() {
-        for (body, param) in [
-            (r#"{"value": 0.5}"#, "name"),
-            (r#"{"value": "high", "name": "x"}"#, "value"),
+        for (body, code, param) in [
+            (r#"{"value": 0.5}"#, "missing_required_parameter", "name"),
+            (r#"{"value": "high", "name": "x"}"#, "invalid_type", "value"),
             (
                 r#"{"value": 0.5, "name": "x", "items": [{"nope": 1}]}"#,
+                "missing_required_parameter",
                 "items[0].role",
             ),
         ] {
-            let (status, kind, code, got_param) = envelope(body).await;
+            let (status, kind, got_code, got_param) = envelope(body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(kind, "invalid_request_error", "{body}");
-            assert_eq!(code, "json_parse_error", "{body}");
+            assert_eq!(got_code, code, "{body}");
             assert_eq!(got_param.as_deref(), Some(param), "{body}");
+        }
+    }
+
+    /// The code names the deserializer's reason, as the public API's does:
+    /// a wrong type, a value outside an enumeration, a negative integer
+    /// where the field cannot be negative, a body that is not an object.
+    #[tokio::test]
+    async fn deserialization_errors_carry_the_public_api_code() {
+        for (body, code, param) in [
+            (
+                r#"{"value": 0.5, "name": "x", "kind": "odd"}"#,
+                "invalid_value",
+                Some("kind"),
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "count": -1}"#,
+                "integer_below_min_value",
+                Some("count"),
+            ),
+            (
+                r#"{"value": 0.5, "name": "x", "tags": "a"}"#,
+                "invalid_type",
+                Some("tags"),
+            ),
+            ("[]", "invalid_type", None),
+        ] {
+            let (status, kind, got_code, got_param) = envelope(body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(kind, "invalid_request_error", "{body}");
+            assert_eq!(got_code, code, "{body}");
+            assert_eq!(got_param.as_deref(), param, "{body}");
         }
     }
 
@@ -610,7 +682,7 @@ mod tests {
         let (status, kind, code, param) = envelope(body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(kind, "invalid_request_error");
-        assert_eq!(code, "json_parse_error");
+        assert_eq!(code, "unknown_parameter");
         assert_eq!(param.as_deref(), Some("dependency.nope"));
     }
 
@@ -618,7 +690,7 @@ mod tests {
     async fn syntax_errors_have_no_param() {
         let (status, json) = reject(r#"{"value": "#).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["error"]["code"], "json_parse_error");
+        assert_eq!(json["error"]["code"], "invalid_json");
         assert!(json["error"]["param"].is_null(), "{json}");
         assert!(
             json["error"]["message"]
@@ -626,6 +698,47 @@ mod tests {
                 .is_some_and(|m| m.starts_with("JSON syntax error")),
             "{json}"
         );
+    }
+
+    #[test]
+    fn deserialize_code_follows_the_reason_in_the_message() {
+        for (message, code) in [
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: missing field `model` at line 1 column 14",
+                "missing_required_parameter",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: frobnicate: unknown field `frobnicate`, expected one of `include`, `input` at line 1 column 44",
+                "unknown_parameter",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: include[0]: unknown variant `bogus.field`, expected one of `code_interpreter_call.outputs` at line 1 column 60",
+                "invalid_value",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: max_output_tokens: invalid value: integer `-1`, expected u32 at line 1 column 49",
+                "integer_below_min_value",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages: invalid type: string \"hi\", expected a sequence at line 1 column 29",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: input: data did not match any variant of untagged enum ResponseInput at line 1 column 71",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: invalid type: sequence, expected struct ChatCompletionRequest at line 1 column 0",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: invalid length 0, expected struct BodyRequest with 11 elements at line 1 column 2",
+                "invalid_type",
+            ),
+            ("Missing Content-Type: application/json header", "json_parse_error"),
+        ] {
+            assert_eq!(deserialize_code(message), code, "{message}");
+        }
     }
 
     #[test]
