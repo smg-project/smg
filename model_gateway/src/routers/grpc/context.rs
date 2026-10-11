@@ -128,6 +128,20 @@ impl RequestType {
         }
     }
 
+    /// Parallel samples the request asks for: 1 when unset, or when the
+    /// surface has no such parameter. With more than one, a disaggregated
+    /// decode leg recomputes the prompt locally instead of pulling the
+    /// prefill leg's KV.
+    pub fn sampling_n(&self) -> u32 {
+        let n = match self {
+            Self::Chat(r) => r.n,
+            Self::Completion(r) => r.n,
+            Self::Generate(r) => r.sampling_params.as_ref().and_then(|p| p.n),
+            _ => None,
+        };
+        n.filter(|&n| n > 0).unwrap_or(1)
+    }
+
     /// Client-supplied backend request id (`rid`), where the protocol carries
     /// one. Responses ids are storage-owned (`resp_*`) and never client-set.
     pub fn rid(&self) -> Option<&str> {
@@ -254,6 +268,10 @@ pub(crate) struct RoutingSnapshot {
     pub rid_key: Option<String>,
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
+    /// The request's disaggregated decode leg needs a worker with a vision
+    /// encoder (worker selection's `decode_needs_vision`), noted at first
+    /// selection so a retry re-selects under the same demand.
+    pub decode_needs_vision: bool,
 }
 
 pub(crate) use crate::routers::common::placement::WireConstraint;
