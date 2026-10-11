@@ -839,6 +839,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
                 budget_tokens: 1024,
                 display: None,
             }),
+            reasoning_in_prefill: None,
             tool_choice: None,
             has_tools: false,
             history_tool_calls_count: 0,
@@ -1234,6 +1235,7 @@ async fn messages_blocks_and_inputs(
             budget_tokens: 1024,
             display: None,
         }),
+        reasoning_in_prefill: None,
         tool_choice,
         has_tools: true,
         history_tool_calls_count: 0,
@@ -1491,6 +1493,293 @@ async fn vllm_json_tool_stream_keeps_prefilled_reasoning() {
         assert!(events
             .iter()
             .any(|event| event["choices"][0]["finish_reason"] == "tool_calls"));
+    }
+}
+
+fn gemma4_prompt_outputs() -> [(&'static str, &'static str, &'static str, &'static str); 3] {
+    [
+        ("<|im_start|>model\n", "answer", "", "answer"),
+        (
+            "<|im_start|>model\n",
+            "<|channel>thought\nplan<channel|>answer",
+            "plan",
+            "answer",
+        ),
+        (
+            "<|im_start|>model<|channel>thought\n",
+            r#"plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#,
+            "plan",
+            "",
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn gemma4_rendered_prompt_state_controls_chat_responses() {
+    let model = "google/gemma-4-serve";
+    for configured in [Some("gemma4"), None, Some("unknown-parser")] {
+        for (prompt, output, reasoning, content) in gemma4_prompt_outputs() {
+            for streaming in [false, true] {
+                let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                    "model":model, "messages":[], "separate_reasoning":true,
+                    "chat_template_kwargs":{"enable_thinking":true},
+                    "tools":[{"type":"function","function":{"name":"lookup",
+                        "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
+                }))
+                .unwrap();
+                let resolver = utils::ParserResolver::new(
+                    Arc::new(WorkerRegistry::new()),
+                    Some("gemma4".to_string()),
+                    configured.map(str::to_string),
+                );
+                let mut spec = ChatResponseSpec::from(&request);
+                spec.reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+                    &ReasoningParserFactory::new(),
+                    resolver.reasoning_parser(model).as_deref(),
+                    model,
+                    prompt,
+                );
+                let mut final_frame = complete(0, "stop");
+                if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
+                    complete.output_ids = output.chars().map(u32::from).collect();
+                }
+                let mut frames: Vec<_> = if streaming {
+                    output.chars().map(|ch| chunk(0, &ch.to_string())).collect()
+                } else {
+                    Vec::new()
+                };
+                frames.push(final_frame);
+                let (stream, server) = scripted_stream(frames, "0").await;
+                let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+                let mut metadata = dispatch();
+                metadata.model = model.to_string();
+                if streaming {
+                    let (tx, rx) = sse_channel();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "fixture collector is joined before assertions"
+                    )]
+                    let collector = tokio::spawn(collect_events(rx));
+                    let result = StreamingProcessor::new(
+                        ToolParserFactory::new(),
+                        ReasoningParserFactory::new(),
+                        resolver,
+                        "vllm",
+                    )
+                    .process_streaming_chunks(
+                        stream,
+                        metadata,
+                        tokenizer,
+                        (None, None, false, false, false),
+                        spec,
+                        &tx,
+                        None,
+                    )
+                    .await;
+                    drop(tx);
+                    let events = collector.await.unwrap();
+                    server.abort();
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(chat_text(&events, 0, "reasoning_content"), reasoning);
+                    assert_eq!(chat_text(&events, 0, "content"), content);
+                    let calls: Vec<_> = events
+                        .iter()
+                        .flat_map(|event| {
+                            event["choices"][0]["delta"]["tool_calls"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                        })
+                        .collect();
+                    assert_eq!(calls.len(), usize::from(content.is_empty()), "{events:?}");
+                    if let Some(call) = calls.first() {
+                        assert_eq!(call["function"]["name"], "lookup");
+                        assert_eq!(
+                            serde_json::from_str::<Value>(
+                                call["function"]["arguments"].as_str().unwrap()
+                            )
+                            .unwrap(),
+                            serde_json::json!({"q":"Paris"})
+                        );
+                    }
+                } else {
+                    let mut decoder =
+                        utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+                    let response = ResponseProcessor::new(
+                        ToolParserFactory::new(),
+                        ReasoningParserFactory::new(),
+                        resolver,
+                    )
+                    .process_non_streaming_chat_response(
+                        context::ExecutionResult::Single { stream },
+                        spec,
+                        metadata,
+                        tokenizer,
+                        &mut decoder,
+                        false,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{}", error.status()));
+                    server.abort();
+                    let message = &response.choices[0].message;
+                    assert_eq!(
+                        message.reasoning_content.as_deref().unwrap_or_default(),
+                        reasoning
+                    );
+                    assert_eq!(message.content.as_deref().unwrap_or_default(), content);
+                    assert_eq!(message.tool_calls.is_some(), content.is_empty());
+                    if let Some(calls) = &message.tool_calls {
+                        assert_eq!(calls.len(), 1);
+                        assert_eq!(calls[0].function.name, "lookup");
+                        assert_eq!(
+                            serde_json::from_str::<Value>(
+                                calls[0].function.arguments.as_deref().unwrap()
+                            )
+                            .unwrap(),
+                            serde_json::json!({"q":"Paris"})
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemma4_rendered_prompt_state_controls_messages_responses() {
+    let model = "google/gemma-4-serve";
+    for configured in [Some("gemma4"), None, Some("unknown-parser")] {
+        for (prompt, output, reasoning, content) in gemma4_prompt_outputs() {
+            for streaming in [false, true] {
+                let request: messages::CreateMessageRequest = serde_json::from_value(serde_json::json!({
+                    "model":model, "max_tokens":64, "messages":[],
+                    "thinking":{"type":"enabled", "budget_tokens":1024},
+                    "tools":[{"name":"lookup", "input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}]
+                })).unwrap();
+                let resolver = utils::ParserResolver::new(
+                    Arc::new(WorkerRegistry::new()),
+                    Some("gemma4".to_string()),
+                    configured.map(str::to_string),
+                );
+                let mut spec = MessagesResponseSpec::from(&request);
+                spec.reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+                    &ReasoningParserFactory::new(),
+                    resolver.reasoning_parser(model).as_deref(),
+                    model,
+                    prompt,
+                );
+                let mut final_frame = complete(0, "stop");
+                if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
+                    complete.output_ids = output.chars().map(u32::from).collect();
+                }
+                let mut frames: Vec<_> = if streaming {
+                    output.chars().map(|ch| chunk(0, &ch.to_string())).collect()
+                } else {
+                    Vec::new()
+                };
+                frames.push(final_frame);
+                let (stream, server) = scripted_stream(frames, "0").await;
+                let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+                let mut metadata = dispatch();
+                metadata.model = model.to_string();
+                if streaming {
+                    let (tx, rx) = sse_channel();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "fixture collector is joined before assertions"
+                    )]
+                    let collector = tokio::spawn(collect_events(rx));
+                    let result = StreamingProcessor::new(
+                        ToolParserFactory::new(),
+                        ReasoningParserFactory::new(),
+                        resolver,
+                        "vllm",
+                    )
+                    .process_messages_streaming_chunks(
+                        stream,
+                        metadata,
+                        tokenizer,
+                        (None, None, false, false, false),
+                        spec,
+                        &tx,
+                        None,
+                    )
+                    .await;
+                    drop(tx);
+                    let events = collector.await.unwrap();
+                    server.abort();
+                    assert!(result.is_ok(), "{result:?}");
+                    let thinking: String = events
+                        .iter()
+                        .filter_map(|event| event["delta"]["thinking"].as_str())
+                        .collect();
+                    let text: String = events
+                        .iter()
+                        .filter_map(|event| event["delta"]["text"].as_str())
+                        .collect();
+                    assert_eq!(thinking, reasoning);
+                    assert_eq!(text, content);
+                    let calls: Vec<_> = events
+                        .iter()
+                        .filter(|event| {
+                            event["type"] == "content_block_start"
+                                && event["content_block"]["type"] == "tool_use"
+                        })
+                        .collect();
+                    assert_eq!(calls.len(), usize::from(content.is_empty()), "{events:?}");
+                    if let Some(call) = calls.first() {
+                        assert_eq!(call["content_block"]["name"], "lookup");
+                        let arguments: String = events
+                            .iter()
+                            .filter_map(|event| event["delta"]["partial_json"].as_str())
+                            .collect();
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&arguments).unwrap(),
+                            serde_json::json!({"q":"Paris"})
+                        );
+                    }
+                } else {
+                    let mut decoder =
+                        utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+                    let response = ResponseProcessor::new(
+                        ToolParserFactory::new(),
+                        ReasoningParserFactory::new(),
+                        resolver,
+                    )
+                    .process_non_streaming_messages_response(
+                        context::ExecutionResult::Single { stream },
+                        spec,
+                        metadata,
+                        tokenizer,
+                        &mut decoder,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{}", error.status()));
+                    server.abort();
+                    let response = serde_json::to_value(response).unwrap();
+                    let blocks = response["content"].as_array().unwrap();
+                    let thinking: String = blocks
+                        .iter()
+                        .filter_map(|block| block["thinking"].as_str())
+                        .collect();
+                    let text: String = blocks
+                        .iter()
+                        .filter_map(|block| block["text"].as_str())
+                        .collect();
+                    assert_eq!(thinking, reasoning);
+                    assert_eq!(text, content);
+                    let calls: Vec<_> = blocks
+                        .iter()
+                        .filter(|block| block["type"] == "tool_use")
+                        .collect();
+                    assert_eq!(calls.len(), usize::from(content.is_empty()), "{response}");
+                    if let Some(call) = calls.first() {
+                        assert_eq!(call["name"], "lookup");
+                        assert_eq!(call["input"], serde_json::json!({"q":"Paris"}));
+                    }
+                }
+            }
+        }
     }
 }
 

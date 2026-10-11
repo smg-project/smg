@@ -129,12 +129,21 @@ impl BuildStage for MessageRequestBuildingStage {
             .await?;
         }
 
-        // On a thinking prompt the engine defers a grammar past the model's
-        // own `</think>` (the request's `require_reasoning`; an engine that runs
-        // a reasoning parser does so by itself). A forced-call tag owes nothing
-        // before the calls, so it reads the same with or without the deferral.
-        let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::messages_reasoning_starts_in_prefill(&messages_request, tokenizer.as_ref())
+        // Native Gemma4 channels follow the rendered prompt; other parsers keep
+        // their tokenizer-driven preference for the engine's reasoning gate.
+        let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+            &ctx.components.reasoning_parser_factory,
+            ctx.components
+                .parser_resolver
+                .reasoning_parser(&messages_request.model)
+                .as_deref(),
+            &messages_request.model,
+            &processed_messages.text,
+        );
+        let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
+            ctx.tokenizer_arc().is_some_and(|tokenizer| {
+                utils::messages_reasoning_starts_in_prefill(&messages_request, tokenizer.as_ref())
+            })
         });
 
         // Now that the worker is known, a forced call's grammar takes the
@@ -235,9 +244,11 @@ impl BuildStage for MessageRequestBuildingStage {
             tool_parser.as_deref(),
             &proto_request,
         );
+        let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
+        spec.reasoning_in_prefill = reasoning_in_prefill;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
-            spec: ResponseSpec::Messages(MessagesResponseSpec::from(messages_request.as_ref())),
+            spec: ResponseSpec::Messages(spec),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,

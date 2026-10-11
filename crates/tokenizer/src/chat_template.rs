@@ -145,10 +145,11 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
         return (ThinkingToggle::DefaultOff, Some(key_name));
     }
 
-    // Gemma4 expresses its default with a Jinja filter instead of assignment.
+    // Gemma4 assigns its default through a Jinja filter. A filter on a
+    // message field or another variable does not set the thinking switch.
     let compact: String = template.split_whitespace().collect();
-    if compact.contains("enable_thinking|default(false)")
-        || compact.contains("thinking|default(false)")
+    if compact.contains("setenable_thinking=enable_thinking|default(false)")
+        || compact.contains("setthinking=thinking|default(false)")
     {
         return (ThinkingToggle::DefaultOff, Some(key_name));
     }
@@ -2423,6 +2424,25 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn thinking_filter_on_other_values_does_not_change_the_switch_default() {
+        for template in [
+            "{{ message.thinking | default(false) }}{% if enable_thinking %}<think>{% endif %}",
+            "{{ other_thinking | default(false) }}{% if thinking %}<think>{% endif %}",
+        ] {
+            assert_eq!(
+                detect_thinking_toggle(template).0,
+                ThinkingToggle::DefaultOn
+            );
+        }
+        assert_eq!(
+            detect_thinking_toggle(
+                "{% set thinking = thinking | default(false) %}{% if thinking %}<think>{% endif %}"
+            ),
+            (ThinkingToggle::DefaultOff, Some(ThinkingKeyName::Thinking))
+        );
     }
 
     #[test]

@@ -668,19 +668,8 @@ impl ResponseProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             ) {
-                // If thinking is effectively ON and template has a toggle, start in reasoning mode.
-                {
-                    let user_thinking = match &messages_request.thinking {
-                        Some(
-                            messages::ThinkingConfig::Enabled { .. }
-                            | messages::ThinkingConfig::Adaptive { .. },
-                        ) => Some(true),
-                        Some(messages::ThinkingConfig::Disabled) => Some(false),
-                        None => None,
-                    };
-                    if utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref()) {
-                        parser.mark_reasoning_started();
-                    }
+                if messages_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
+                    parser.mark_reasoning_started();
                 }
 
                 match parser.detect_and_parse_reasoning(&processed_text) {

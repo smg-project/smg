@@ -182,6 +182,8 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
     pub thinking: Option<messages::ThinkingConfig>,
+    /// Native channel formats can derive the initial state from the rendered prompt.
+    pub reasoning_in_prefill: Option<bool>,
     pub tool_choice: Option<messages::ToolChoice>,
     pub has_tools: bool,
     pub history_tool_calls_count: usize,
@@ -194,6 +196,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
         Self {
             thinking: request.thinking.clone(),
+            reasoning_in_prefill: None,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
             history_tool_calls_count: utils::message_utils::get_history_tool_calls_count_messages(
@@ -206,6 +209,23 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
         }
+    }
+}
+
+impl MessagesResponseSpec {
+    pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
+        if let Some(in_prefill) = self.reasoning_in_prefill {
+            return in_prefill;
+        }
+        let user_thinking = match &self.thinking {
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                | messages::ThinkingConfig::Adaptive { .. },
+            ) => Some(true),
+            Some(messages::ThinkingConfig::Disabled) => Some(false),
+            None => None,
+        };
+        utils::should_mark_reasoning_started(user_thinking, tokenizer)
     }
 }
 
@@ -332,6 +352,18 @@ mod tests {
         }));
         let tokenizer = llm_tokenizer::MockTokenizer::new();
         let mut spec = ChatResponseSpec::from(&request);
+        assert_eq!(spec.reasoning_in_prefill, None);
+        for in_prefill in [false, true] {
+            spec.reasoning_in_prefill = Some(in_prefill);
+            assert_eq!(spec.reasoning_starts_in_prefill(&tokenizer), in_prefill);
+        }
+
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model":"vllm-model", "max_tokens":16, "messages":[],
+            "thinking":{"type":"enabled", "budget_tokens":1024}
+        }))
+        .unwrap();
+        let mut spec = MessagesResponseSpec::from(&request);
         assert_eq!(spec.reasoning_in_prefill, None);
         for in_prefill in [false, true] {
             spec.reasoning_in_prefill = Some(in_prefill);

@@ -156,16 +156,17 @@ async fn malformed_and_incomplete_frames_remain_visible_and_reset_discards_state
         }
         streamed.push_str(&parser.take_unstreamed_normal_text());
         assert_eq!(streamed, input);
-        parser
-            .parse_incremental("<|tool_call>call:", &tools())
-            .await
-            .unwrap();
-        parser.reset();
-        let parsed = parser.parse_incremental(WEATHER, &tools()).await.unwrap();
-        assert_eq!(parsed.calls.len(), 1);
-        assert_eq!(parsed.calls[0].tool_index, 0);
-        assert_eq!(parsed.normal_text, "");
     }
+    let mut parser = Gemma4Parser::new();
+    parser
+        .parse_incremental("<|tool_call>call:", &tools())
+        .await
+        .unwrap();
+    parser.reset();
+    let parsed = parser.parse_incremental(WEATHER, &tools()).await.unwrap();
+    assert_eq!(parsed.calls.len(), 1);
+    assert_eq!(parsed.calls[0].tool_index, 0);
+    assert_eq!(parsed.normal_text, "");
 }
 
 #[tokio::test]

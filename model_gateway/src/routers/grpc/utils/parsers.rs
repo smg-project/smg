@@ -431,13 +431,7 @@ pub(crate) fn check_reasoning_parser_availability(
     configured_parser: Option<&str>,
     model: &str,
 ) -> bool {
-    if let Some(parser_name) = configured_parser {
-        reasoning_parser_factory.registry().has_parser(parser_name)
-    } else {
-        reasoning_parser_factory
-            .registry()
-            .has_parser_for_model(model)
-    }
+    create_reasoning_parser(reasoning_parser_factory, configured_parser, model).is_some()
 }
 
 /// Check if a tool parser is available for the given model
@@ -478,6 +472,19 @@ pub(crate) fn create_reasoning_parser(
         // Auto-detect based on model
         reasoning_parser_factory.registry().create_for_model(model)
     }
+}
+
+/// Native Gemma4 channels derive their initial state from the rendered prompt,
+/// using the same explicit, automatic or fallback parser selection as responses.
+pub(crate) fn rendered_prompt_reasoning_in_prefill(
+    reasoning_parser_factory: &ReasoningParserFactory,
+    configured_parser: Option<&str>,
+    model: &str,
+    prompt: &str,
+) -> Option<bool> {
+    create_reasoning_parser(reasoning_parser_factory, configured_parser, model)
+        .filter(|parser| parser.model_type() == "gemma4")
+        .map(|_| reasoning_parser::parsers::Gemma4Parser::prompt_ends_in_reasoning(prompt))
 }
 
 /// Whether the selected reasoning parser needs tokenizer special tokens to be
@@ -1217,6 +1224,58 @@ mod tests {
         let parser = create_reasoning_parser(&factory, Some("qwen3"), "unknown-model")
             .expect("configured qwen3 parser exists");
         assert_eq!(parser.model_type(), "qwen3");
+        assert!(check_reasoning_parser_availability(
+            &factory,
+            Some("qwen3"),
+            "unknown-model",
+        ));
+        for configured in [None, Some("unknown-parser")] {
+            assert!(!check_reasoning_parser_availability(
+                &factory,
+                configured,
+                "unknown-model",
+            ));
+        }
+    }
+
+    #[test]
+    fn gemma4_rendered_prompt_state_follows_actual_parser_selection() {
+        let factory = ReasoningParserFactory::new();
+        for configured in [Some("gemma4"), None, Some("unknown-parser")] {
+            assert!(check_reasoning_parser_availability(
+                &factory,
+                configured,
+                "google/gemma-4-serve",
+            ));
+            for (prompt, expected) in [
+                ("<|im_start|>model\n", false),
+                ("<|im_start|>model<|channel>thought\n", true),
+                ("<|im_start|>model<|channel>thought\nplan<channel|>", false),
+            ] {
+                assert_eq!(
+                    rendered_prompt_reasoning_in_prefill(
+                        &factory,
+                        configured,
+                        "google/gemma-4-serve",
+                        prompt,
+                    ),
+                    Some(expected),
+                    "configured={configured:?}, prompt={prompt:?}"
+                );
+            }
+        }
+        // A valid override wins over the model; other models keep their defaults.
+        for (configured, model) in [(Some("qwen3"), "gemma-4"), (None, "qwen3")] {
+            assert_eq!(
+                rendered_prompt_reasoning_in_prefill(
+                    &factory,
+                    configured,
+                    model,
+                    "<|channel>thought\n",
+                ),
+                None
+            );
+        }
     }
 
     #[test]

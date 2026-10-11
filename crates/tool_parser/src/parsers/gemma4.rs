@@ -51,7 +51,7 @@ impl Gemma4Parser {
 
             if self.buffer.starts_with(START) {
                 match decode_call(&self.buffer) {
-                    Ok((name, mut args, consumed)) => {
+                    Some((name, mut args, consumed)) => {
                         if let Some(tool) = tools.iter().find(|t| t.function.name == name) {
                             coerce_arguments(&mut args, &tool.function.parameters);
                         }
@@ -64,7 +64,7 @@ impl Gemma4Parser {
                         self.buffer.drain(..consumed);
                         self.after_call = true;
                     }
-                    Err(_) => {
+                    None => {
                         // Retain a rejected frame verbatim; recover at the next
                         // native boundary rather than hiding malformed output.
                         let Some(end) = unquoted_marker(&self.buffer[START.len()..], END) else {
@@ -149,34 +149,20 @@ impl ToolParser for Gemma4Parser {
     }
 }
 
-#[derive(Debug)]
-enum DecodeError {
-    Incomplete,
-    Malformed,
-}
-
-fn decode_call(input: &str) -> Result<(String, Value, usize), DecodeError> {
+fn decode_call(input: &str) -> Option<(String, Value, usize)> {
     let body = input[START.len()..].trim_start();
     let prefix = if body.starts_with("call:") {
         "call:"
     } else if body.starts_with(':') {
         ":"
-    } else if "call:".starts_with(body) || body.is_empty() {
-        return Err(DecodeError::Incomplete);
     } else {
-        return Err(DecodeError::Malformed);
+        return None;
     };
     let rest = &body[prefix.len()..];
-    let Some(open) = rest.find(['{', '(']) else {
-        return Err(if rest.contains(END) {
-            DecodeError::Malformed
-        } else {
-            DecodeError::Incomplete
-        });
-    };
+    let open = rest.find(['{', '('])?;
     let name = rest[..open].trim();
     if name.is_empty() || name.chars().any(char::is_whitespace) || name.contains('<') {
-        return Err(DecodeError::Malformed);
+        return None;
     }
     let close = if rest.as_bytes()[open] == b'{' {
         '}'
@@ -189,7 +175,7 @@ fn decode_call(input: &str) -> Result<(String, Value, usize), DecodeError> {
         pos: 0,
     };
     let args = reader.object(close, 0)?;
-    Ok((name.to_owned(), args, args_start + reader.pos))
+    Some((name.to_owned(), args, args_start + reader.pos))
 }
 
 fn unquoted_marker(input: &str, marker: &str) -> Option<usize> {
@@ -226,30 +212,26 @@ impl ArgumentReader<'_> {
         self.pos += tail.len() - trimmed.len();
     }
 
-    fn string(&mut self) -> Result<String, DecodeError> {
+    fn string(&mut self) -> Option<String> {
         self.pos += STRING.len();
-        let Some(end) = self.remaining().find(STRING) else {
-            return Err(DecodeError::Incomplete);
-        };
+        let end = self.remaining().find(STRING)?;
         let value = self.remaining()[..end].to_owned();
         self.pos += end + STRING.len();
-        Ok(value)
+        Some(value)
     }
 
-    fn object(&mut self, close: char, depth: usize) -> Result<Value, DecodeError> {
+    fn object(&mut self, close: char, depth: usize) -> Option<Value> {
         let mut map = Map::new();
         loop {
             self.skip_separators();
             if self.remaining().starts_with(close) {
                 self.pos += close.len_utf8();
-                return Ok(Value::Object(map));
+                return Some(Value::Object(map));
             }
             let key = if self.remaining().starts_with(STRING) {
                 self.string()?
             } else {
-                let Some(end) = self.remaining().find(':') else {
-                    return Err(DecodeError::Incomplete);
-                };
+                let end = self.remaining().find(':')?;
                 let key = self.remaining()[..end].trim().to_owned();
                 self.pos += end;
                 key
@@ -257,28 +239,26 @@ impl ArgumentReader<'_> {
             let whitespace = self.remaining().len() - self.remaining().trim_start().len();
             self.pos += whitespace;
             if key.is_empty() || key.contains(['{', '}', '[', ']', '(', ')', '<']) {
-                return Err(DecodeError::Malformed);
+                return None;
             }
             if !self.remaining().starts_with(':') {
-                return Err(DecodeError::Malformed);
+                return None;
             }
             self.pos += 1;
             map.insert(key, self.value(close, depth + 1)?);
         }
     }
 
-    fn value(&mut self, close: char, depth: usize) -> Result<Value, DecodeError> {
+    fn value(&mut self, close: char, depth: usize) -> Option<Value> {
         if depth > 128 {
-            return Err(DecodeError::Malformed);
+            return None;
         }
         let whitespace = self.remaining().len() - self.remaining().trim_start().len();
         self.pos += whitespace;
         if self.remaining().starts_with(STRING) {
             return self.string().map(Value::String);
         }
-        let Some(first) = self.remaining().chars().next() else {
-            return Err(DecodeError::Incomplete);
-        };
+        let first = self.remaining().chars().next()?;
         if first == '{' {
             self.pos += 1;
             return self.object('}', depth);
@@ -290,22 +270,20 @@ impl ArgumentReader<'_> {
                 self.skip_separators();
                 if self.remaining().starts_with(']') {
                     self.pos += 1;
-                    return Ok(Value::Array(values));
+                    return Some(Value::Array(values));
                 }
                 values.push(self.value(']', depth + 1)?);
             }
         }
-        let Some(end) = self.remaining().find([',', '}', ']', ')']) else {
-            return Err(DecodeError::Incomplete);
-        };
+        let end = self.remaining().find([',', '}', ']', ')'])?;
         let text = self.remaining()[..end].trim();
         let delimiter = self.remaining().as_bytes()[end] as char;
         if text.is_empty() || (delimiter != ',' && delimiter != close) || text.contains('<') {
-            return Err(DecodeError::Malformed);
+            return None;
         }
         let value = Value::String(text.to_owned());
         self.pos += end;
-        Ok(value)
+        Some(value)
     }
 }
 

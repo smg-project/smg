@@ -2336,17 +2336,7 @@ impl StreamingProcessor {
                 model,
             );
 
-        // Determine if thinking is effectively ON (for mark_reasoning_started).
-        let user_thinking = match &original_request.thinking {
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                | messages::ThinkingConfig::Adaptive { .. },
-            ) => Some(true),
-            Some(messages::ThinkingConfig::Disabled) => Some(false),
-            None => None,
-        };
-        let thinking_override =
-            utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref());
+        let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
         let think_in_prefill = tokenizer.think_in_prefill();
 
         let tool_choice_enabled = !matches!(

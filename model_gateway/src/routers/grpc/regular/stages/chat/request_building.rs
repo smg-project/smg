@@ -115,12 +115,21 @@ pub(crate) async fn build_chat_backed_plan(
         .await?;
     }
 
-    // On a thinking prompt the engine defers a grammar past the model's own
-    // `</think>` (the request's `require_reasoning`; an engine that runs a
-    // reasoning parser does so by itself). A forced-call tag owes nothing before the
-    // calls, so it reads the same with or without the deferral.
-    let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-        utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
+    // Native Gemma4 channels follow the rendered prompt; other parsers keep
+    // their tokenizer-driven preference for the engine's reasoning gate.
+    let require_reasoning = utils::rendered_prompt_reasoning_in_prefill(
+        &ctx.components.reasoning_parser_factory,
+        ctx.components
+            .parser_resolver
+            .reasoning_parser(&chat_request.model)
+            .as_deref(),
+        &chat_request.model,
+        &processed_text,
+    )
+    .unwrap_or_else(|| {
+        ctx.tokenizer_arc().is_some_and(|tokenizer| {
+            utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
+        })
     });
 
     // Now that the worker is known, a forced call's grammar takes the shape
@@ -260,16 +269,15 @@ impl BuildStage for ChatRequestBuildingStage {
         };
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
-        let reasoning_in_prefill = ctx
-            .components
-            .parser_resolver
-            .reasoning_parser(&chat_request.model)
-            .filter(|name| name == "gemma4")
-            .map(|_| {
-                reasoning_parser::parsers::Gemma4Parser::prompt_ends_in_reasoning(
-                    &processed_messages.text,
-                )
-            });
+        let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+            &ctx.components.reasoning_parser_factory,
+            ctx.components
+                .parser_resolver
+                .reasoning_parser(&chat_request.model)
+                .as_deref(),
+            &chat_request.model,
+            &processed_messages.text,
+        );
         let (plan, stamp) = build_chat_backed_plan(
             ctx,
             &chat_request,

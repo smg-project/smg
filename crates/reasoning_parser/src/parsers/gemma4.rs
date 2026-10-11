@@ -71,12 +71,12 @@ impl Gemma4Parser {
                 .filter_map(|marker| self.buffer.find(marker).map(|pos| (pos, *marker)))
                 .min_by_key(|(pos, _)| *pos)
             {
-                let text: String = self.buffer.drain(..pos).collect();
                 if self.reasoning {
-                    out.reasoning_text.push_str(&text);
+                    out.reasoning_text.push_str(&self.buffer[..pos]);
                 } else {
-                    out.normal_text.push_str(&text);
+                    out.normal_text.push_str(&self.buffer[..pos]);
                 }
+                self.buffer.drain(..pos);
                 self.reasoning = marker == START;
                 // A native tool frame closes reasoning but belongs to the tool parser.
                 if marker == TOOL_START {
@@ -96,12 +96,13 @@ impl Gemma4Parser {
                 })
                 .max()
                 .unwrap_or(0);
-            let text: String = self.buffer.drain(..self.buffer.len() - held).collect();
+            let consumed = self.buffer.len() - held;
             if self.reasoning {
-                out.reasoning_text.push_str(&text);
+                out.reasoning_text.push_str(&self.buffer[..consumed]);
             } else {
-                out.normal_text.push_str(&text);
+                out.normal_text.push_str(&self.buffer[..consumed]);
             }
+            self.buffer.drain(..consumed);
             return out;
         }
     }
