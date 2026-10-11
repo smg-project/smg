@@ -34,6 +34,15 @@ def _calls(node: ast.AST) -> list[str]:
     return names
 
 
+def _tests_enable_trace(test: ast.expr) -> bool:
+    """Whether an `if` test is `self.enable_trace`, alone or as one operand of an `and`."""
+    if isinstance(test, ast.Attribute):
+        return test.attr == "enable_trace"
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_tests_enable_trace(value) for value in test.values)
+    return False
+
+
 def _guarded_by_enable_trace(node: ast.AST, call_name: str) -> bool:
     """Whether every `call_name` call in `node` sits under an `if self.enable_trace`
     (and there is at least one): a call added outside the switch fails this."""
@@ -42,8 +51,7 @@ def _guarded_by_enable_trace(node: ast.AST, call_name: str) -> bool:
     for branch in ast.walk(node):
         if not isinstance(branch, ast.If):
             continue
-        test = branch.test
-        if isinstance(test, ast.Attribute) and test.attr == "enable_trace":
+        if _tests_enable_trace(branch.test):
             guarded += _calls(ast.Module(body=branch.body, type_ignores=[])).count(call_name)
     return total > 0 and guarded == total
 
@@ -90,3 +98,31 @@ def test_request_tracing_initializes_as_sglangs_own_frontend_does():
     calls = _calls(init)
     assert "process_tracing_init" in calls and "trace_set_thread_info" in calls
     assert "_tracing_enabled" in calls
+
+
+def test_the_abort_paths_end_the_requests_root_span_under_the_switch():
+    tree = ast.parse(SOURCE.read_text())
+    manager = _class(tree, "GrpcRequestManager")
+    for name in ("abort_request", "_handle_abort_req"):
+        assert _guarded_by_enable_trace(_function(manager, name), "set_finished_time"), name
+
+
+def test_request_tracing_survives_an_sglang_without_it_or_a_failing_setup():
+    tree = ast.parse(SOURCE.read_text())
+    init = _function(tree, "init_request_tracing")
+    handled = {
+        handler.type.id
+        for node in ast.walk(init)
+        if isinstance(node, ast.Try)
+        for handler in node.handlers
+        if isinstance(handler.type, ast.Name)
+    }
+    assert {"ImportError", "RuntimeError"} <= handled, handled
+    # process_tracing_init runs inside a try that handles RuntimeError
+    guarded = any(
+        "process_tracing_init" in _calls(ast.Module(body=node.body, type_ignores=[]))
+        for node in ast.walk(init)
+        if isinstance(node, ast.Try)
+        and any(isinstance(h.type, ast.Name) and h.type.id == "RuntimeError" for h in node.handlers)
+    )
+    assert guarded

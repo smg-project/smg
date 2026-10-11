@@ -526,6 +526,10 @@ class GrpcRequestManager:
         # Mark state as finished immediately to stop processing scheduler outputs
         state = self.rid_to_state.get(request_id)
         if state:
+            # The request's root span ends here, once: the scheduler's final
+            # abort output reaches a state already finished (or gone).
+            if self.enable_trace and not state.finished:
+                state.time_stats.set_finished_time()
             state.finished = True
             state.stream_finished = True
             logger.debug(f"Marked request {request_id} as aborted locally")
@@ -920,7 +924,10 @@ class GrpcRequestManager:
 
         state = self.rid_to_state[recv_obj.rid]
 
-        # Mark as finished
+        # Mark as finished; a scheduler-initiated abort ends the request's
+        # root span here, once (a client cancel ended it in abort_request).
+        if self.enable_trace and not state.finished:
+            state.time_stats.set_finished_time()
         state.finished = True
         state.stream_finished = True
 
@@ -1208,15 +1215,25 @@ def init_request_tracing(thread_label: str = "gRPC Servicer") -> bool:
     (`GrpcRequestManager._req_stats_init`). Returns whether tracing is on."""
     if not _tracing_enabled():
         return False
-    from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-    from sglang.srt.runtime_context import get_disagg, get_observability
+    try:
+        from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+        from sglang.srt.runtime_context import get_disagg, get_observability
+    except ImportError as e:  # an SGLang without the tracing modules
+        logger.warning(f"Request tracing unavailable in this SGLang: {e}")
+        return False
 
     observability = get_observability()
-    process_tracing_init(
-        observability.otlp_traces_endpoint,
-        observability.otlp_service_name,
-        trace_modules=observability.trace_modules,
-    )
+    try:
+        process_tracing_init(
+            observability.otlp_traces_endpoint,
+            observability.otlp_service_name,
+            trace_modules=observability.trace_modules,
+        )
+    except RuntimeError as e:
+        # SGLang reports a missing OpenTelemetry or a collector it cannot
+        # reach this way; the servicer serves without request traces.
+        logger.warning(f"Request tracing not started: {e}")
+        return False
     mode = get_disagg().disaggregation_mode
     if mode == "prefill":
         thread_label = "Prefill " + thread_label
