@@ -80,7 +80,7 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5, ling,
+        deepseek_v4_1, dots3, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5, ling,
         minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
@@ -531,6 +531,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::MiniCpm5,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    // dots3: the model writes its own `<think>`, as Qwen3 does; thinking off closes it in the
+    // prompt.
+    (
+        "dots3-note-prev",
+        Family::Dots3,
+        GenerationPrompt::ModelWritesTheThought,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -586,6 +593,8 @@ enum Family {
     Inkling,
     /// [`minicpm5`]: `<function name="…">` calls of `<param name="…">` tags, no block, CDATA.
     MiniCpm5,
+    /// [`dots3`]: MiniMax M2's tags in a block per call, every value on a line of its own.
+    Dots3,
     /// [`plain`]: content and nothing else.
     Plain,
 }
@@ -645,6 +654,7 @@ impl Family {
             Self::KimiK3 => kimi_k3(),
             Self::Inkling => inkling(),
             Self::MiniCpm5 => minicpm5(),
+            Self::Dots3 => dots3(),
             Self::Plain => plain(),
         }
     }
@@ -668,12 +678,15 @@ impl Family {
             | Self::Inkling
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2 and
-            // MiniCPM5 read `</think>` but not `<tool_call>`.
+            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,
+            // MiniCPM5 and dots3 read `</think>` but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
-            Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 | Self::MinimaxM2 | Self::MiniCpm5 => {
-                KNOWN_REASONING_PROBE
-            }
+            Self::IQuest
+            | Self::DeepSeekV4_1
+            | Self::Lfm2_5
+            | Self::MinimaxM2
+            | Self::MiniCpm5
+            | Self::Dots3 => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
         // A template that writes no thought for the probe's request leaves the reasoning out, so

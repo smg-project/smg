@@ -8,7 +8,7 @@ use std::{fmt::Write as _, fs, path::PathBuf};
 
 use symphony::{
     formats::{
-        deepseek_v4_1, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5, ling,
+        deepseek_v4_1, dots3, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5, ling,
         minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
@@ -71,6 +71,7 @@ enum Table {
     K2Horizon,
     Inkling,
     MiniCpm5,
+    Dots3,
     Plain,
 }
 
@@ -97,6 +98,7 @@ impl Table {
             Self::Glm4 => glm4(),
             Self::Inkling => inkling(),
             Self::MiniCpm5 => minicpm5(),
+            Self::Dots3 => dots3(),
             Self::K2Horizon => k2_horizon(),
             Self::Plain => plain(),
         }
@@ -210,9 +212,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-08-09",
         smg: (None, None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Dots3),
+        set: Some(54_195),
+        status: Status::Ready,
     },
     Group {
         slug: "ernie-4.5-21b-a3b-thinking",

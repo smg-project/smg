@@ -17,12 +17,13 @@
 //! <function name="weather"><param name="city">Paris</param><param name="days">3</param></function>
 //! ```
 //!
-//! one call after another on lines of their own. The engine's table owns the block's and the
-//! invoke's markers ([`formats::minimax_m2`], [`formats::minicpm5`]): it enters this assembler at
-//! `<invoke name="` (`<function name="`) and leaves it at the invoke's closing tag, so the
-//! assembler starts inside the function's name and never sees that tag; the engine hands it the
-//! tag's bytes as the call's end. Between those two the assembler reads the parameter tags itself,
-//! in the family's spelling ([`Tags`]).
+//! one call after another on lines of their own; dots3 writes M2's tags with a block per call and
+//! every value on a line of its own. The engine's table owns the block's and the invoke's markers
+//! ([`formats::minimax_m2`], [`formats::minicpm5`], [`formats::dots3`]): it enters this
+//! assembler at `<invoke name="` (`<function name="`) and leaves it at the invoke's closing
+//! tag, so the assembler starts inside the function's name and never sees that tag; the engine
+//! hands it the tag's bytes as the call's end. Between those two the assembler reads the
+//! parameter tags itself, in the family's spelling ([`Tags`]).
 //!
 //! What the syntax says, and what the assembler does with it:
 //!
@@ -40,6 +41,11 @@
 //!   value; the text between them is the value as it is, streamed as it arrives for a declared
 //!   string, read whole at the closing tag for any other type. Text between `]]>` and the closing
 //!   tag, which the template never writes, is reported.
+//! - **A value may stand on its own line** ([`Tags::value_on_its_own_line`]): dots3's template
+//!   writes a newline after the parameter tag and one before its closing tag. Those two are the
+//!   template's framing and go into the fragments' sources, not the value: the first byte of a
+//!   value is dropped when it is a newline, and a trailing newline is held until the closing tag
+//!   says it was the framing, or more text says it was the value's.
 //! - **The newlines between the tags are the template's** and go into the next event's source;
 //!   text where the syntax has tags is reported.
 //! - **Two endings**, as DSML's: [`Assembler::close`] is the invoke's closing tag, or the block's
@@ -48,6 +54,7 @@
 //!
 //! [`formats::minimax_m2`]: crate::formats::minimax_m2()
 //! [`formats::minicpm5`]: crate::formats::minicpm5()
+//! [`formats::dots3`]: crate::formats::dots3()
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -84,6 +91,9 @@ pub struct Tags {
     pub invoke_close: &'static str,
     /// Whether the template wraps a value as `<![CDATA[…]]>` when it holds `<`, `&` or a newline.
     pub cdata: bool,
+    /// Whether the template writes a newline after the parameter tag and one before its closing
+    /// tag, so a value stands on a line of its own.
+    pub value_on_its_own_line: bool,
 }
 
 impl Tags {
@@ -93,6 +103,15 @@ impl Tags {
         parameter_close: "</parameter>",
         invoke_close: "</invoke>",
         cdata: false,
+        value_on_its_own_line: false,
+    };
+    /// dots3's: MiniMax M2's tags, every value on a line of its own.
+    pub const DOTS3: Self = Self {
+        parameter_open: "<parameter name=\"",
+        parameter_close: "</parameter>",
+        invoke_close: "</invoke>",
+        cdata: false,
+        value_on_its_own_line: true,
     };
     /// MiniCPM5's: `<param name="…">`, `</param>` and `</function>`, a value a CDATA section when
     /// it holds `<`, `&` or a newline.
@@ -101,6 +120,7 @@ impl Tags {
         parameter_close: "</param>",
         invoke_close: "</function>",
         cdata: true,
+        value_on_its_own_line: false,
     };
 
     fn text(&self, tag: usize) -> &'static str {
@@ -152,9 +172,13 @@ struct ValueState {
     end: Option<usize>,
     mode: Mode,
     cdata: Cdata,
-    /// Inside a CDATA section: the trailing bytes that may be the start of its closer, held
-    /// until the next bytes say.
+    /// Inside a CDATA section, the trailing bytes that may be the start of its closer; for a value
+    /// on its own line, a trailing newline that may be the template's framing: held until the next
+    /// bytes or the closing tag say.
     held: String,
+    /// For a value on its own line: whether its first byte, the template's newline, is still to
+    /// come.
+    leading_newline_due: bool,
 }
 
 /// Whether a value is a CDATA section, decided from its first bytes.
@@ -487,6 +511,7 @@ impl Assembler {
                 Cdata::Plain
             },
             held: String::new(),
+            leading_newline_due: self.tags.value_on_its_own_line,
         });
     }
 
@@ -499,6 +524,17 @@ impl Assembler {
         };
         if text.is_empty() {
             return;
+        }
+        if value.leading_newline_due {
+            // The newline after the parameter tag is the template's: into the source, not the
+            // value. A value that starts otherwise has no framing to drop.
+            value.leading_newline_due = false;
+            if let Some(rest) = text.strip_prefix('\n') {
+                self.carried.push('\n');
+                value.start += 1;
+                self.value_text(rest, out);
+                return;
+            }
         }
         match value.cdata {
             Cdata::Undecided => {
@@ -562,6 +598,17 @@ impl Assembler {
                 }
             }
             Cdata::Done => self.text_between(text, out),
+            Cdata::Plain | Cdata::Undecided if self.tags.value_on_its_own_line => {
+                // A trailing newline may be the template's framing before the closing tag: held.
+                let mut pending = std::mem::take(&mut value.held);
+                pending.push_str(text);
+                let (give, hold) = match pending.strip_suffix('\n') {
+                    Some(give) => (give.to_string(), "\n".to_string()),
+                    None => (pending, String::new()),
+                };
+                value.held = hold;
+                self.value_bytes(&give, out);
+            }
             Cdata::Plain | Cdata::Undecided => self.value_bytes(text, out),
         }
     }
@@ -631,7 +678,17 @@ impl Assembler {
     /// Bytes held as a CDATA closer's start that never completed are the value's text.
     fn close_value(&mut self, tag: &str, out: &mut Events) {
         let held = self.take_held();
-        self.value_bytes(&held, out);
+        if self.tags.value_on_its_own_line && held == "\n" {
+            // The newline before the closing tag: the template's framing.
+            if let Stage::Value(value) = &mut self.stage {
+                if matches!(value.mode, Mode::Whole | Mode::Undecided) && value.end.is_none() {
+                    value.end = Some(self.carried.len());
+                }
+            }
+            self.carried.push('\n');
+        } else {
+            self.value_bytes(&held, out);
+        }
         let Stage::Value(value) = &self.stage else {
             return;
         };
@@ -1007,5 +1064,47 @@ mod tests {
         let cut = run_with(Tags::MINICPM5, &["f\"><param name=\"s\"><![CDATA[x]"], true);
         assert_eq!(bytes(&cut), "f\"><param name=\"s\"><![CDATA[x]");
         assert_eq!(arguments(&cut), r#"{"s": "x"#);
+    }
+
+    /// dots3's spelling: MiniMax M2's tags, every value on a line of its own.
+    const DOTS3_CALL: &str = concat!(
+        "f\">\n<parameter name=\"s\">\ncafé\nà deux\n</parameter>\n",
+        "<parameter name=\"n\">\n3\n</parameter>\n",
+        "<parameter name=\"o\">\n{\"k\": [1]}\n</parameter>\n"
+    );
+
+    #[test]
+    fn a_value_on_its_own_line_sheds_its_framing_newlines_however_the_bytes_are_cut() {
+        let whole = run_with(Tags::DOTS3, &[DOTS3_CALL], false);
+        assert_eq!(bytes(&whole), format!("{DOTS3_CALL}</invoke>"));
+        assert_eq!(
+            arguments(&whole),
+            r#"{"s": "café\nà deux", "n": 3, "o": {"k": [1]}}"#
+        );
+        assert!(malformed(&whole).is_empty());
+        let boundaries: Vec<usize> = DOTS3_CALL.char_indices().map(|(at, _)| at).collect();
+        for &at in &boundaries[1..] {
+            let events = run_with(Tags::DOTS3, &[&DOTS3_CALL[..at], &DOTS3_CALL[at..]], false);
+            assert_eq!(
+                bytes(&events),
+                format!("{DOTS3_CALL}</invoke>"),
+                "cut at {at}"
+            );
+            assert_eq!(arguments(&events), arguments(&whole), "cut at {at}");
+            assert!(malformed(&events).is_empty(), "cut at {at}");
+        }
+        // Without the framing the value is read as it is; an empty value is an empty string.
+        let bare = run_with(
+            Tags::DOTS3,
+            &["f\">\n<parameter name=\"s\">Rome</parameter>\n"],
+            false,
+        );
+        assert_eq!(arguments(&bare), r#"{"s": "Rome"}"#);
+        let empty = run_with(
+            Tags::DOTS3,
+            &["f\">\n<parameter name=\"s\">\n\n</parameter>\n"],
+            false,
+        );
+        assert_eq!(arguments(&empty), r#"{"s": ""}"#);
     }
 }
