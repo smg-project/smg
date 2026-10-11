@@ -1263,6 +1263,12 @@ where
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
+        // The limit layer refuses a declared over-limit length with a plain
+        // text 413: the gateway's envelope and error code go on here, outside
+        // it, the same as the chunked refusal the extractor builds.
+        .layer(axum::middleware::from_fn(
+            middleware::payload_too_large_envelope_middleware,
+        ))
         // The Messages envelope once more, outside the body-size limit: a
         // declared over-limit length is refused by the limit layer before any
         // route layer runs, and still leaves in the envelope.
@@ -2255,7 +2261,9 @@ mod tests {
         assert_eq!(json["error"]["type"], "request_too_large", "{json}");
         assert_eq!(json["request_id"], request_id, "{json}");
 
-        // Declared length: refused by the limit layer before the body.
+        // Declared length: refused by the limit layer before the body, and
+        // still the JSON envelope with the same code as the chunked refusal
+        // (the limit layer's own answer is plain text).
         let response = app
             .oneshot(
                 http::Request::builder()
@@ -2269,6 +2277,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            route_error::extract_error_code_from_response(&response),
+            "request_body_too_large"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large", "{json}");
+        assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
     }
 
     /// The same answer survives the request-body watchdog the typed-JSON
