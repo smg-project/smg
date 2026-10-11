@@ -148,7 +148,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen2_5),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "apertus-8b-instruct-2509",
@@ -268,7 +268,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen2_5),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "hermes-4-14b",
@@ -278,7 +278,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen2_5),
         set: Some(41_533),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "hunyuan-a13b-instruct",
@@ -318,7 +318,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::IQuest),
         set: Some(54_193),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "k-exaone-236b-a23b",
@@ -328,7 +328,7 @@ const GROUPS: &[Group] = &[
         smg: (None, None),
         table: Some(Table::Qwen3),
         set: Some(54_416),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "k2-horizon-36b",
@@ -704,7 +704,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-omni-30b-a3b-thinking",
@@ -714,7 +714,7 @@ const GROUPS: &[Group] = &[
         smg: (Some("qwen"), Some("qwen3")),
         table: Some(Table::Qwen3),
         set: Some(54_418),
-        status: Status::Replaying,
+        status: Status::Ready,
     },
     Group {
         slug: "qwen3-vl-235b-a22b-thinking",

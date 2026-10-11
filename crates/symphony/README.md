@@ -129,11 +129,11 @@ aliases is an open question of the design.
 
 <!-- models: begin -->
 78 groups, 107 checkpoints, newest first.
-25 ready, 33 replaying a recorded set, 0 on main awaiting fixtures, 20 pending.
+32 ready, 26 replaying a recorded set, 0 on main awaiting fixtures, 20 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
-| 2026-09-28 | [iquest-q1](https://github.com/smg-project/bellwether/tree/main/fixtures/iquest-q1) | IQuestLab/IQuest-Q1 |  | `iquest` | 54,193 | replaying the set | none |
+| 2026-09-28 | [iquest-q1](https://github.com/smg-project/bellwether/tree/main/fixtures/iquest-q1) | IQuestLab/IQuest-Q1 |  | `iquest` | 54,193 | ready | none |
 | 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash |  | `deepseek_v4.1` | 54,418 | ready | `deepseek_v41`, `deepseek_v41` |
 | 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | — | — | pending | none |
 | 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B |  | `k2_horizon` | 12,817 | replaying the set | none |
@@ -156,7 +156,7 @@ aliases is an open question of the design.
 | 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
 | 2026-04-15 | [qwen3.6-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-35b-a3b) | Qwen/Qwen3.6-35B-A3B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
 | 2026-04-09 | [minimax-m2.7](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m2.7) | MiniMaxAI/MiniMax-M2.7 |  | `minimax_m2` | 12,821 | replaying the set | `minimax_m2`, `minimax` |
-| 2026-04-06 | [granite-4.1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-4.1-3b) | ibm-granite/granite-4.1-3b |  | `qwen2.5` | 41,533 | replaying the set | none |
+| 2026-04-06 | [granite-4.1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-4.1-3b) | ibm-granite/granite-4.1-3b |  | `qwen2.5` | 41,533 | ready | none |
 | 2026-03-02 | [gemma-4-e4b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/gemma-4-e4b-it) | google/gemma-4-E4B-it |  | — | — | pending | `json`, none |
 | 2026-02-28 | [qwen3.5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-2b) | Qwen/Qwen3.5-2B | Qwen3.5-0.8B | `qwen3`, tagged calls | 41,360 | ready | `qwen_xml`, `qwen3` |
 | 2026-02-27 | [qwen3.5-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-9b) | Qwen/Qwen3.5-9B | Qwen3.5-4B | `qwen3`, tagged calls | 54,179 | ready | `qwen_xml`, `qwen3` |
@@ -166,9 +166,9 @@ aliases is an open question of the design.
 | 2026-02-01 | [step-3.5-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/step-3.5-flash) | stepfun-ai/Step-3.5-Flash |  | `qwen3`, tagged calls | 54,181 | replaying the set | `step3`, none |
 | 2026-01-30 | [qwen3-coder-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-coder-next) | Qwen/Qwen3-Coder-Next |  | `qwen3`, tagged calls | 41,374 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-01-19 | [glm-4.7-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.7-flash) | zai-org/GLM-4.7-Flash |  | — | — | pending | `glm47_moe`, none |
-| 2026-01-06 | [ai21-jamba2-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/ai21-jamba2-3b) | ai21labs/AI21-Jamba2-3B |  | `qwen2.5` | 41,533 | replaying the set | none |
+| 2026-01-06 | [ai21-jamba2-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/ai21-jamba2-3b) | ai21labs/AI21-Jamba2-3B |  | `qwen2.5` | 41,533 | ready | none |
 | 2026-01-06 | [lfm2.5-1.2b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/lfm2.5-1.2b-instruct) | LiquidAI/LFM2.5-1.2B-Instruct |  | `lfm2.5` | 54,418 | replaying the set | none |
-| 2025-12-26 | [k-exaone-236b-a23b](https://github.com/smg-project/bellwether/tree/main/fixtures/k-exaone-236b-a23b) | LGAI-EXAONE/K-EXAONE-236B-A23B |  | `qwen3` | 54,416 | replaying the set | none |
+| 2025-12-26 | [k-exaone-236b-a23b](https://github.com/smg-project/bellwether/tree/main/fixtures/k-exaone-236b-a23b) | LGAI-EXAONE/K-EXAONE-236B-A23B |  | `qwen3` | 54,416 | ready | none |
 | 2025-12-04 | [nvidia-nemotron-3-nano-30b-a3b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3-nano-30b-a3b-bf16) | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2025-12-01 | [trinity-mini](https://github.com/smg-project/bellwether/tree/main/fixtures/trinity-mini) | arcee-ai/Trinity-Mini |  | — | — | pending | none |
 | 2025-11-19 | [olmo-3-7b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/olmo-3-7b-instruct) | allenai/Olmo-3-7B-Instruct |  | `olmo3` | 41,533 | replaying the set | none |
@@ -180,12 +180,12 @@ aliases is an open question of the design.
 | 2025-09-29 | [glm-4.6](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6) | zai-org/GLM-4.6 |  | `glm4` | 43,309 | replaying the set | `glm45_moe`, none |
 | 2025-09-23 | [qwen3guard-gen-0.6b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3guard-gen-0.6b) | Qwen/Qwen3Guard-Gen-0.6B | Qwen3Guard-Gen-4B, Qwen3Guard-Gen-8B | — | — | pending | `qwen`, `qwen3` |
 | 2025-09-22 | [qwen3-vl-235b-a22b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-235b-a22b-thinking) | Qwen/Qwen3-VL-235B-A22B-Thinking | Qwen3-VL-30B-A3B-Thinking | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
-| 2025-09-20 | [qwen3-omni-30b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-omni-30b-a3b-instruct) | Qwen/Qwen3-Omni-30B-A3B-Instruct |  | `qwen3` | 54,418 | replaying the set | `qwen`, `qwen3` |
-| 2025-09-15 | [qwen3-omni-30b-a3b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-omni-30b-a3b-thinking) | Qwen/Qwen3-Omni-30B-A3B-Thinking |  | `qwen3` | 54,418 | replaying the set | `qwen`, `qwen3` |
+| 2025-09-20 | [qwen3-omni-30b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-omni-30b-a3b-instruct) | Qwen/Qwen3-Omni-30B-A3B-Instruct |  | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
+| 2025-09-15 | [qwen3-omni-30b-a3b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-omni-30b-a3b-thinking) | Qwen/Qwen3-Omni-30B-A3B-Thinking |  | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-09 | [qwen3-next-80b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-next-80b-a3b-instruct) | Qwen/Qwen3-Next-80B-A3B-Instruct |  | `qwen3` | 41,533 | replaying the set | `qwen`, `qwen3` |
 | 2025-09-09 | [qwen3-next-80b-a3b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-next-80b-a3b-thinking) | Qwen/Qwen3-Next-80B-A3B-Thinking |  | `qwen3` | 54,418 | replaying the set | `qwen`, `qwen3` |
 | 2025-09-08 | [ernie-4.5-21b-a3b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/ernie-4.5-21b-a3b-thinking) | baidu/ERNIE-4.5-21B-A3B-Thinking |  | — | — | pending | none |
-| 2025-08-30 | [hermes-4-14b](https://github.com/smg-project/bellwether/tree/main/fixtures/hermes-4-14b) | NousResearch/Hermes-4-14B |  | `qwen2.5` | 41,533 | replaying the set | none |
+| 2025-08-30 | [hermes-4-14b](https://github.com/smg-project/bellwether/tree/main/fixtures/hermes-4-14b) | NousResearch/Hermes-4-14B |  | `qwen2.5` | 41,533 | ready | none |
 | 2025-08-21 | [deepseek-v3.1](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.1) | deepseek-ai/DeepSeek-V3.1 |  | — | — | pending | `deepseek31`, `deepseek_v31` |
 | 2025-08-20 | [seed-oss-36b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/seed-oss-36b-instruct) | ByteDance-Seed/Seed-OSS-36B-Instruct |  | `seed_oss` | 53,178 | replaying the set | none |
 | 2025-08-13 | [apertus-8b-instruct-2509](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-8b-instruct-2509) | swiss-ai/Apertus-8B-Instruct-2509 |  | — | — | pending | none |
