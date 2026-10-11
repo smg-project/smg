@@ -65,33 +65,31 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     Ok(())
 }
 
-/// Rewrite every `root` message to a leading system message for dispatch:
-/// upstream MiniMax serving stacks take the top-priority instruction as the
-/// leading system message, and api.minimax.io itself rejects the literal
-/// role. Roots are hoisted above everything else in their original order.
+/// Hoist every `root` message above everything else, in their original
+/// order, and keep the role. The chat template of the models this profile
+/// targets reads a leading `root` message into its high-priority system slot
+/// and a `system` or `developer` message right after it into its developer
+/// slot (the template's own role mapping: "root -> system sp (high priority),
+/// system/developer -> developer sp (low priority)"), which is what the
+/// engine's own server renders for the request. A root rewritten to a leading
+/// `system` message, as this profile did before, landed in the developer slot
+/// under the template's default identity, and a system message that followed
+/// it was dropped, since the template reads one leading system or developer
+/// message. A root that is not the first message is hoisted so the template
+/// reads it; the template has no branch for the role anywhere else.
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     let is_root = |msg: &ChatMessage| matches!(msg, ChatMessage::Root { .. });
-    if !req.messages.iter().any(is_root) {
+    let root_count = req.messages.iter().filter(|msg| is_root(msg)).count();
+    if root_count == 0 || req.messages.iter().take(root_count).all(is_root) {
         return;
     }
     let (roots, rest): (Vec<_>, Vec<_>) = req.messages.drain(..).partition(is_root);
     tracing::debug!(
         model = %req.model,
         count = roots.len(),
-        "rewrote role root to leading system messages"
+        "hoisted root messages above the conversation"
     );
-    req.messages = roots
-        .into_iter()
-        .map(|msg| match msg {
-            ChatMessage::Root { content, name } => ChatMessage::System {
-                content,
-                name,
-                ext: Default::default(),
-            },
-            other => other,
-        })
-        .chain(rest)
-        .collect();
+    req.messages = roots.into_iter().chain(rest).collect();
 }
 
 fn error(code: &'static str, message: String) -> validator::ValidationError {

@@ -366,3 +366,52 @@ pub fn ensure_deepseek_v4_cached() -> Option<PathBuf> {
 
     Some(cache_dir)
 }
+
+const MINIMAX_M3_REPO: &str =
+    "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/f0e1c1e04d40177e4673a22097036854f536e9c0";
+const MINIMAX_M3_CACHE_DIR: &str = ".tokenizer_cache/minimax_m3";
+
+/// A directory holding the MiniMax-M3 tokenizer files (`tokenizer.json`,
+/// `tokenizer_config.json`) at the revision the render fixtures were recorded
+/// from.
+///
+/// `MINIMAX_M3_MODEL_DIR` points at a full checkpoint directory and skips the
+/// download; otherwise the two files are fetched once from the public
+/// repository into `.tokenizer_cache/minimax_m3/`. Returns `None` only when
+/// offline (the repository is unreachable) and no override is set; a local
+/// failure (unwritable cache directory or file) panics so the parity gate
+/// cannot be skipped silently.
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test helper — panics are intentional"
+)]
+pub fn ensure_minimax_m3_cached() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("MINIMAX_M3_MODEL_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+
+    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
+    let _guard = mutex.lock().unwrap();
+
+    let cache_dir = PathBuf::from(MINIMAX_M3_CACHE_DIR);
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|error| panic!("cannot create {}: {error}", cache_dir.display()));
+    }
+
+    for (file, min_bytes) in [
+        ("tokenizer.json", 9_000_000),
+        ("tokenizer_config.json", 500),
+    ] {
+        let path = cache_dir.join(file);
+        if path.exists() {
+            continue;
+        }
+        if !download_tokenizer_file("MiniMax-M3", MINIMAX_M3_REPO, &cache_dir, file, min_bytes) {
+            return None;
+        }
+    }
+
+    Some(cache_dir)
+}
