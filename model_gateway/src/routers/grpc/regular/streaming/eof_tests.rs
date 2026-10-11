@@ -1,6 +1,9 @@
 //! Test gateway parsers and SSE events with exact gRPC frames.
 
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use bytes::BufMut;
@@ -30,7 +33,7 @@ use crate::{
 #[derive(Default)]
 pub(super) struct CharacterTokenizer {
     special_tokens: SpecialTokens,
-    eager_steps: std::sync::atomic::AtomicUsize,
+    eager_steps: AtomicUsize,
 }
 
 impl llm_tokenizer::traits::Encoder for CharacterTokenizer {
@@ -59,8 +62,7 @@ impl llm_tokenizer::traits::Decoder for CharacterTokenizer {
         prefix_index: &mut usize,
         skip_special_tokens: bool,
     ) -> anyhow::Result<Option<String>> {
-        self.eager_steps
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.eager_steps.fetch_add(1, Ordering::Relaxed);
         self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
     }
 
@@ -921,12 +923,7 @@ async fn non_byte_fallback_held_stop_keeps_original_reasoning_accounting() {
         .unwrap();
     assert_eq!(choice.message.reasoning_content.as_deref(), Some("abST"));
     assert_eq!(reasoning_tokens, 4);
-    assert_eq!(
-        native
-            .eager_steps
-            .load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
+    assert_eq!(native.eager_steps.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -956,7 +953,7 @@ async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
         ..Default::default()
     }));
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
-    let (choice, reasoning_tokens) = processor
+    let (choice, _) = processor
         .process_single_choice(
             &complete,
             0,
@@ -972,7 +969,6 @@ async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
         )
         .await
         .unwrap();
-    eprintln!("malformed tail reasoning_tokens={reasoning_tokens}, content={:?}; exact count is not qualified", choice.message.content);
     assert_eq!(choice.message.reasoning_content.as_deref(), Some("ab"));
     assert_eq!(choice.message.content.as_deref(), Some("���"));
 }
