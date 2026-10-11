@@ -394,6 +394,7 @@ mod tests {
         let mut card = ModelCard::new("m1");
         card.display_name = Some("Model One".to_owned());
         let registry = registry_with(vec![card]);
+        crate::tls::install_crypto_provider();
         let client = reqwest::Client::new();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
