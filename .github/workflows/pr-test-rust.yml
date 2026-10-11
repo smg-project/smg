@@ -508,8 +508,8 @@ jobs:
       pull-requests: read
       packages: read
     outputs:
-      # E2E inputs and explicit manual runs keep the existing test selection.
-      docs-only: ${{ github.event_name != 'workflow_dispatch' && steps.filter.outputs.docs == 'true' && steps.filter.outputs.non-docs == 'false' && steps.filter.outputs.e2e == 'false' }}
+      # Test inputs and explicit manual runs keep the existing test selection.
+      docs-only: ${{ github.event_name != 'workflow_dispatch' && steps.filter.outputs.docs == 'true' && steps.filter.outputs.non-docs == 'false' && steps.filter.outputs.tests == 'false' }}
       symphony-readme: ${{ steps.filter.outputs.symphony-readme }}
       servicer-readme: ${{ steps.filter.outputs.servicer-readme }}
       common: ${{ steps.filter.outputs.common }}
@@ -565,8 +565,10 @@ jobs:
             non-docs:
               - '**'
               - '!**/*.md'
-            e2e:
+            tests:
               - 'e2e_test/**'
+              - '**/tests/**'
+              - '**/fixtures/**'
             symphony-readme:
               - 'crates/symphony/README.md'
             servicer-readme:
