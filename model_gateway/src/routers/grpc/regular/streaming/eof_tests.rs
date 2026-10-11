@@ -1742,6 +1742,68 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
     }
 }
 
+/// A Messages stream the engine stops on its own stop token (the matched id
+/// of the EOS) ends the turn, as the whole message does; one a stop sequence
+/// of the request's stops (the matched string) is `stop_sequence`, naming it.
+#[tokio::test]
+async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
+    use smg_grpc_client::vllm_engine::proto::generate_complete::MatchedStop;
+
+    for (matched, stop_reason, stop_sequence) in [
+        (None, "end_turn", Value::Null),
+        (
+            Some(MatchedStop::MatchedTokenId(7)),
+            "end_turn",
+            Value::Null,
+        ),
+        (
+            Some(MatchedStop::MatchedStopStr("###".to_string())),
+            "stop_sequence",
+            serde_json::json!("###"),
+        ),
+    ] {
+        let mut done = complete(0, "stop");
+        if let Some(GenerationEvent::Complete(complete)) = done.response.as_mut() {
+            complete.matched_stop = matched.clone();
+        }
+        let (stream, server) = scripted_stream(vec![chunk(0, "Hi."), done], "0").await;
+        let (tx, rx) = sse_channel();
+        let spec = MessagesResponseSpec {
+            thinking: None,
+            reasoning_in_prefill: None,
+            tool_choice: None,
+            has_tools: false,
+            history_tool_calls_count: 0,
+            chat_tools: Vec::new(),
+            stop_sequences: Some(vec!["###".to_string()]),
+        };
+        let result = processor(false)
+            .process_messages_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], stop_reason, "{matched:?}");
+        assert_eq!(
+            delta["delta"]["stop_sequence"], stop_sequence,
+            "{matched:?}"
+        );
+    }
+}
+
 /// A Messages response to `text` through the `qwen_xml` tool parser, which
 /// reports a call's name before its arguments: the type of each content block
 /// and the stop reason.

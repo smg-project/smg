@@ -3036,7 +3036,10 @@ impl StreamingProcessor {
             Some(messages::StopReason::MaxTokens)
         } else if has_tool_calls || finish_reason_str == "tool_calls" {
             Some(messages::StopReason::ToolUse)
-        } else if matched_stop.is_some() {
+        } else if matched_stop.as_ref().is_some_and(Value::is_string) {
+            // A stop sequence of the request's (the matched string) is `stop_sequence`; the
+            // engine's own stop token (a matched id, the EOS it stops on) ends the turn, as the
+            // whole message says.
             Some(messages::StopReason::StopSequence)
         } else {
             Some(messages::StopReason::EndTurn)
