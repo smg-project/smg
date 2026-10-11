@@ -51,7 +51,7 @@ and a client that wants the raw text back can have it.
 | `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
-| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m3()`, `kimi_k3()`, `plain()`. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m3()`, `kimi_k3()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a call syntax not derived yet: `to_json()` as the engine reads it, `payload()` as a request carries it. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
@@ -59,7 +59,7 @@ and a client that wants the raw text back can have it.
 
 ### The modules
 
-- `format`, `formats`: the table type and the fourteen tables. A table is data, read by the engine
+- `format`, `formats`: the table type and the fifteen tables. A table is data, read by the engine
   and by the grammar derivation alike; it says what the template writes and nothing about how to
   parse it.
 - `engine`, `markers`, `tokens`: the engine, its scanner and its token ledger.
@@ -129,14 +129,14 @@ aliases is an open question of the design.
 
 <!-- models: begin -->
 78 groups, 107 checkpoints, newest first.
-25 ready, 29 replaying a recorded set, 0 on main awaiting fixtures, 24 pending.
+25 ready, 31 replaying a recorded set, 0 on main awaiting fixtures, 22 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
 | 2026-09-28 | [iquest-q1](https://github.com/smg-project/bellwether/tree/main/fixtures/iquest-q1) | IQuestLab/IQuest-Q1 |  | `iquest` | 54,193 | replaying the set | none |
 | 2026-09-10 | [deepseek-v4.1-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4.1-flash) | deepseek-ai/DeepSeek-V4.1-Flash |  | `deepseek_v4.1` | 54,418 | ready | `deepseek_v41`, `deepseek_v41` |
 | 2026-09-06 | [minicpm5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/minicpm5-2b) | openbmb/MiniCPM5-2B |  | — | — | pending | none |
-| 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B |  | — | — | pending | none |
+| 2026-09-01 | [k2-horizon-36b](https://github.com/smg-project/bellwether/tree/main/fixtures/k2-horizon-36b) | IFM/K2-Horizon-36B |  | `k2_horizon` | 12,817 | replaying the set | none |
 | 2026-08-27 | [hy4-preview](https://github.com/smg-project/bellwether/tree/main/fixtures/hy4-preview) | tencent/Hy4-preview |  | `hy4` | 54,195 | ready | `hy_v4`, `hy_v4` |
 | 2026-08-27 | [qwen-drive-1.0-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-drive-1.0-4b) | Qwen/Qwen-Drive-1.0-4B |  | `qwen3`, tagged calls | 54,179 | ready | `qwen`, `qwen3` |
 | 2026-08-25 | [glm-5.3-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3-flash) | zai-org/GLM-5.3-Flash |  | `glm` | 54,193 | ready | `glm47_moe`, `glm45` |
@@ -177,7 +177,7 @@ aliases is an open question of the design.
 | 2025-10-11 | [qwen3-vl-8b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-8b-thinking) | Qwen/Qwen3-VL-8B-Thinking | Qwen3-VL-2B-Thinking, Qwen3-VL-4B-Thinking, Qwen3-VL-32B-Thinking | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-30 | [qwen3-4b-saferl](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-4b-saferl) | Qwen/Qwen3-4B-SafeRL |  | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-30 | [qwen3-vl-30b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-30b-a3b-instruct) | Qwen/Qwen3-VL-30B-A3B-Instruct | Qwen3-VL-235B-A22B-Instruct | `qwen3` | 41,533 | ready | `qwen`, `qwen3` |
-| 2025-09-29 | [glm-4.6](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6) | zai-org/GLM-4.6 |  | — | — | pending | `glm45_moe`, none |
+| 2025-09-29 | [glm-4.6](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6) | zai-org/GLM-4.6 |  | `glm4` | 43,309 | replaying the set | `glm45_moe`, none |
 | 2025-09-23 | [qwen3guard-gen-0.6b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3guard-gen-0.6b) | Qwen/Qwen3Guard-Gen-0.6B | Qwen3Guard-Gen-4B, Qwen3Guard-Gen-8B | — | — | pending | `qwen`, `qwen3` |
 | 2025-09-22 | [qwen3-vl-235b-a22b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-235b-a22b-thinking) | Qwen/Qwen3-VL-235B-A22B-Thinking | Qwen3-VL-30B-A3B-Thinking | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-09-20 | [qwen3-omni-30b-a3b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-omni-30b-a3b-instruct) | Qwen/Qwen3-Omni-30B-A3B-Instruct |  | `qwen3` | 54,418 | replaying the set | `qwen`, `qwen3` |
