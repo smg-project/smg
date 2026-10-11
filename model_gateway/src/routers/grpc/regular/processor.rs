@@ -12,7 +12,7 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionResponse},
-    common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
+    common::{ChatLogProbs, FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
     completion::{CompletionChoice, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateResponse},
     messages::{self, Message},
@@ -133,6 +133,12 @@ impl ResponseProcessor {
         }
         stopped |= stop_decoder.is_stopped();
 
+        // The decoded output, kept to place the content's tokens for its
+        // logprobs; the content starts after the reasoning span.
+        let output_logprobs = complete.output_logprobs();
+        let decoded_text = output_logprobs.as_ref().map(|_| final_text.clone());
+        let mut content_from = 0;
+
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
         let mut reasoning_tokens = 0;
@@ -161,6 +167,12 @@ impl ResponseProcessor {
                                 &result.reasoning_text,
                                 &result.normal_text,
                             );
+                            content_from = reasoning_span(
+                                &processed_text,
+                                &result.reasoning_text,
+                                &result.normal_text,
+                            )
+                            .1;
                             reasoning_text = Some(result.reasoning_text);
                         }
                         processed_text = result.normal_text;
@@ -241,16 +253,7 @@ impl ResponseProcessor {
             .map(|s| serde_json::Value::String(s.to_string()))
             .or_else(|| complete.matched_stop_json());
 
-        // Step 4: Convert output logprobs if present
-        let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
-            utils::convert_proto_to_openai_logprobs(
-                proto_logprobs,
-                tokenizer,
-                original_request.top_logprobs,
-            )
-        });
-
-        // Step 5: Build ChatCompletionMessage (proper response message type)
+        // Step 4: Build ChatCompletionMessage (proper response message type)
         let chat_message = ChatCompletionMessage {
             role: "assistant".to_string(),
             // Whitespace-only residual (e.g. "\n\n" between </think> and <tool_call>)
@@ -261,6 +264,39 @@ impl ResponseProcessor {
             tool_calls,
             reasoning_content: reasoning_text,
         };
+
+        // Step 5: Convert output logprobs if present. They cover the tokens of
+        // `message.content` only, as a stream's content deltas do: not the
+        // reasoning, the tool calls, the template's markers, or the tokens
+        // a stop sequence or the EOS token cut off.
+        let logprobs = output_logprobs.map(|ref proto_logprobs| {
+            let mut logprobs = utils::convert_proto_to_openai_logprobs(
+                proto_logprobs,
+                tokenizer,
+                original_request.top_logprobs,
+            );
+            if let (
+                ChatLogProbs::Detailed {
+                    content: Some(items),
+                    ..
+                },
+                Some(text),
+            ) = (&mut logprobs, &decoded_text)
+            {
+                let ranges = content_ranges(
+                    text,
+                    content_from,
+                    chat_message.content.as_deref().unwrap_or(""),
+                );
+                let keep = content_tokens(&token_ends, &ranges);
+                let mut position = 0;
+                items.retain(|_| {
+                    position += 1;
+                    keep.get(position - 1).copied().unwrap_or(false)
+                });
+            }
+            logprobs
+        });
 
         // Step 6: Build ChatChoice
         let choice = ChatChoice {
@@ -1133,20 +1169,81 @@ fn eager_token_ends(
 /// released their text; the delimiters around the span are not reasoning,
 /// like the engines' own counts.
 fn reasoning_span_tokens(token_ends: &[usize], text: &str, reasoning: &str, normal: &str) -> u32 {
-    let (start, end) = match text.find(reasoning) {
-        Some(start) => (start, start + reasoning.len()),
-        None => (0, text.len().saturating_sub(normal.len())),
-    };
+    let (start, end) = reasoning_span(text, reasoning, normal);
     let mut token_start = 0;
     let mut count = 0;
     for &token_end in token_ends {
-        // A zero-width token at the span's start held the text that starts it.
-        if token_start < end && (token_end > start || token_start == start) {
+        if token_in_span(token_start, token_end, start, end) {
             count += 1;
         }
         token_start = token_end;
     }
     count
+}
+
+/// The byte range of `reasoning` in `text`: where it is found, else
+/// everything before the normal text.
+fn reasoning_span(text: &str, reasoning: &str, normal: &str) -> (usize, usize) {
+    match text.find(reasoning) {
+        Some(start) => (start, start + reasoning.len()),
+        None => (0, text.len().saturating_sub(normal.len())),
+    }
+}
+
+/// Whether a token whose text is `text[token_start..token_end]` belongs to
+/// the span `text[start..end]`. A zero-width token at the span's start held
+/// the text that starts it.
+fn token_in_span(token_start: usize, token_end: usize, start: usize, end: usize) -> bool {
+    token_start < end && (token_end > start || token_start == start)
+}
+
+/// The byte ranges of `text`, from `from` on, that `content` was taken from:
+/// the first place it appears whole, else its pieces in order, skipping the
+/// text a parser cut out between them (a tool call, a marker).
+fn content_ranges(text: &str, from: usize, content: &str) -> Vec<(usize, usize)> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let from = if text.is_char_boundary(from) { from } else { 0 };
+    if let Some(at) = text[from..].find(content) {
+        return vec![(from + at, from + at + content.len())];
+    }
+    let (text, content) = (text.as_bytes(), content.as_bytes());
+    let (mut at, mut taken) = (from, 0);
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    while at < text.len() && taken < content.len() {
+        let common = text[at..]
+            .iter()
+            .zip(&content[taken..])
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common == 0 {
+            at += 1;
+            continue;
+        }
+        ranges.push((at, at + common));
+        at += common;
+        taken += common;
+    }
+    ranges
+}
+
+/// For each token (by the end of its text, see `reasoning_span_tokens`),
+/// whether its text belongs to one of `ranges` (in order, not overlapping).
+fn content_tokens(token_ends: &[usize], ranges: &[(usize, usize)]) -> Vec<bool> {
+    let mut token_start = 0;
+    let mut ranges = ranges.iter().peekable();
+    token_ends
+        .iter()
+        .map(|&token_end| {
+            while ranges.next_if(|&&(_, end)| end <= token_start).is_some() {}
+            let keep = ranges
+                .peek()
+                .is_some_and(|&&(start, end)| token_in_span(token_start, token_end, start, end));
+            token_start = token_end;
+            keep
+        })
+        .collect()
 }
 
 /// Residual assistant text → OpenAI `content`. Whitespace-only (the `"\n\n"` left
@@ -1189,6 +1286,66 @@ mod content_normalization_tests {
             normalize_assistant_content("\n\nDone.".to_string()),
             Some("\n\nDone.".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod content_logprob_tests {
+    use super::{content_ranges, content_tokens};
+
+    /// The tokens of `tokens` whose text makes up `content`.
+    fn picked<'a>(tokens: &[&'a str], from: usize, content: &str) -> Vec<&'a str> {
+        let text: String = tokens.concat();
+        let ends: Vec<usize> = tokens
+            .iter()
+            .scan(0, |end, token| {
+                *end += token.len();
+                Some(*end)
+            })
+            .collect();
+        let keep = content_tokens(&ends, &content_ranges(&text, from, content));
+        tokens
+            .iter()
+            .zip(keep)
+            .filter_map(|(token, keep)| keep.then_some(*token))
+            .collect()
+    }
+
+    #[test]
+    fn content_tokens_skip_reasoning_markers_and_the_eos() {
+        // Harmony-style framing; the EOS decodes to nothing.
+        let tokens = [
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "Hello",
+            " there",
+            "<|end|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "Hello",
+            " there",
+            "",
+        ];
+        // The reasoning "Hello there" ends at byte 41; the same text as
+        // content is found after it.
+        assert_eq!(picked(&tokens, 41, "Hello there"), ["Hello", " there"]);
+        // Without a reasoning span the first place it appears is taken.
+        assert_eq!(picked(&tokens[8..], 0, "final"), ["final"]);
+        assert!(picked(&tokens, 0, "").is_empty());
+    }
+
+    #[test]
+    fn content_split_by_a_call_takes_its_pieces() {
+        let tokens = ["Look", ":", "<tool_call>", "{}", "</tool_call>", " done"];
+        assert_eq!(picked(&tokens, 0, "Look: done"), ["Look", ":", " done"]);
+        // Stripped content keeps only the tokens it overlaps.
+        assert_eq!(picked(&["\n\n", "Hi", "\n"], 0, "Hi"), ["Hi"]);
+        // A token held back (zero width) inside the content stays with it.
+        assert_eq!(picked(&["a", "", "b", "<eos>"], 0, "ab"), ["a", "", "b"]);
     }
 }
 
