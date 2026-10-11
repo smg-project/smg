@@ -1383,9 +1383,9 @@ mod tests {
             // each, 2,304 tokens in 1.5 s of busy time, 1,536 tokens/s.
             let runtime = basic.runtime.load_full();
             runtime.note_prefill_started_at(1_152, true, 1_000);
-            runtime.note_prefill_ended_at(1_152, true, true, 1_750);
+            runtime.note_prefill_ended_at(1_152, true, Some(0), 1_750);
             runtime.note_prefill_started_at(1_152, true, 1_750);
-            runtime.note_prefill_ended_at(1_152, true, true, 2_500);
+            runtime.note_prefill_ended_at(1_152, true, Some(0), 2_500);
             assert_eq!(runtime.prefill_rate_tps(), 1_536);
         }
         let with_backlog: Arc<dyn Worker> = Arc::new(with_backlog);
@@ -1435,7 +1435,7 @@ mod tests {
         // pending) and the veto; with nothing pending the allowance is the
         // threshold again, so a frozen engine on such a wire is vetoed at the
         // threshold like any other, on both gateways.
-        with_backlog.note_prefill_ended(16 * 1_152, true, true);
+        with_backlog.note_prefill_ended(16 * 1_152, true, Some(0));
         for w in [&with_backlog, &idle] {
             on_token_progress(w);
             assert!(w.stall_reason().is_none());
@@ -1485,7 +1485,7 @@ mod tests {
         {
             let runtime = unstreamed.runtime.load_full();
             runtime.note_prefill_started_at(4_000, false, 1_000);
-            runtime.note_prefill_ended_at(4_000, false, true, 31_000);
+            runtime.note_prefill_ended_at(4_000, false, Some(0), 31_000);
             assert_eq!(runtime.prefill_rate_tps(), 0);
         }
         let unstreamed: Arc<dyn Worker> = Arc::new(unstreamed);
