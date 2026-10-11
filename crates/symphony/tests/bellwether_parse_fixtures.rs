@@ -989,13 +989,18 @@ fn qwen3_parse_fixtures_match_the_reference() {
         &[],
         Family::Qwen3.think_markers(),
     );
+    let verbose = verbose();
     let mut file = ReportFile::create("bellwether_parse_fixtures-qwen3-8b.txt")
         .unwrap_or_else(|e| panic!("{e}"));
     file.write(&report);
-    print!("{}", if verbose() { &report } else { &summary });
+    print!("{}", if verbose { &report } else { &summary });
     let path = file.finish(&failures).unwrap_or_else(|e| panic!("{e}"));
     println!("per-case report: {}", path.display());
-    assert!(failures.is_empty(), "\n{}", capped(&failures, &path));
+    assert!(
+        failures.is_empty(),
+        "\n{}",
+        message(&failures, verbose, &path)
+    );
 }
 
 /// Whether [`VERBOSE_ENV`] asks for the per-case report on stdout: set to anything but empty or
@@ -1049,6 +1054,15 @@ impl ReportFile {
             Some(e) => Err(format!("cannot write {}: {e}", self.path.display())),
             None => Ok(self.path),
         }
+    }
+}
+
+/// The run's failure message: every failure when the run is verbose, else [`capped`].
+fn message(failures: &[String], verbose: bool, report: &std::path::Path) -> String {
+    if verbose {
+        failures.join("\n")
+    } else {
+        capped(failures, report)
     }
 }
 
@@ -1110,7 +1124,11 @@ fn every_recorded_qwen_model_parses_like_its_reference() {
     }
     let path = file.finish(&failures).unwrap_or_else(|e| panic!("{e}"));
     println!("per-case report: {}", path.display());
-    assert!(failures.is_empty(), "\n{}", capped(&failures, &path));
+    assert!(
+        failures.is_empty(),
+        "\n{}",
+        message(&failures, verbose, &path)
+    );
 }
 
 /// What replaying one of [`MODELS`] gave: the notice for a slug the run leaves out, or the
@@ -2091,14 +2109,17 @@ fn stdout_shows_the_first_differing_cases_and_counts_the_rest() {
         .map(|i| format!("m/parse/common-{i}: differs from the reference"))
         .collect();
     let report = std::path::Path::new("reports/parse.txt");
-    let message = capped(&failures, report);
-    assert_eq!(message.lines().count(), SHOWN + 1, "{message}");
+    let listed = capped(&failures, report);
+    assert_eq!(listed.lines().count(), SHOWN + 1, "{listed}");
     assert!(
-        message.starts_with(&failures[0])
-            && message.ends_with("\n... and 2 more, every one in reports/parse.txt"),
-        "{message}"
+        listed.starts_with(&failures[0])
+            && listed.ends_with("\n... and 2 more, every one in reports/parse.txt"),
+        "{listed}"
     );
     assert_eq!(capped(&failures[..2], report), failures[..2].join("\n"));
+    // A verbose run's message is whole.
+    assert_eq!(message(&failures, true, report), failures.join("\n"));
+    assert_eq!(message(&failures, false, report), listed);
 }
 
 #[test]

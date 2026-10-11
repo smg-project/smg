@@ -1700,6 +1700,25 @@ impl Shown {
     }
 }
 
+/// The run's stdout, through `print!`, which the test harness captures as it
+/// does every test's output unless it runs with `--nocapture`.
+struct Stdout;
+
+impl Write for Stdout {
+    #[expect(
+        clippy::print_stdout,
+        reason = "the per-model lines are test diagnostic output"
+    )]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        print!("{}", String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
 /// Where a run writes: the per-case report to `report`, and to `stdout` as
 /// well when the run is verbose; else `stdout` gets one line per model, the
 /// first unlisted differences of each, and the totals.
@@ -1992,7 +2011,7 @@ fn render_fixtures_match_the_reference_byte_for_byte() {
     let known_unloaded: BTreeMap<&str, &str> = KNOWN_UNLOADED.iter().copied().collect();
     let verbose = verbose();
     let (path, mut file) = report_file().unwrap_or_else(|e| panic!("{e}"));
-    let mut stdout = io::stdout();
+    let mut stdout = Stdout;
     let report = compare(
         &root,
         &manifests,
