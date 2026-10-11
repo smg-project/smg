@@ -370,6 +370,34 @@ def test_write_allowlist_keeps_the_adjudication_of_a_persisting_cluster(tmp_path
     assert by_sig["cafecafecafecafe"]["note"] == "theirs"
 
 
+def test_write_allowlist_carries_the_adjudication_from_a_previous_allowlist(tmp_path):
+    # the refresh flow writes a new date's file, which does not exist yet: the
+    # carry-over comes from the previous dated allowlist (--allowlist)
+    old = tmp_path / "old" / "known_divergences.jsonl"
+    old.parent.mkdir()
+    prior = dict(
+        _gate_cluster([], verdict="S2"),
+        provider="openai",
+        first_seen="2026-10-09",
+        note="adjudicated: field drift, tracked",
+    )
+    other = dict(prior, provider="anthropic", sig_hash="cafecafecafecafe", note="theirs")
+    old.write_text(json.dumps(prior) + "\n" + json.dumps(other) + "\n", encoding="utf-8")
+    new = tmp_path / "new" / "known_divergences.jsonl"
+    new.parent.mkdir()
+    clusters = [_gate_cluster([], verdict="S2"), _gate_cluster(["server-error"], sig="beef" * 4)]
+    carried = compat_diff.load_allowlist(old, "openai")
+    assert compat_diff.write_allowlist(new, "openai", clusters, "2026-10-11", prior=carried) == 2
+    by_sig = {
+        e["sig_hash"]: e for e in map(json.loads, new.read_text(encoding="utf-8").splitlines())
+    }
+    assert set(by_sig) == {"feedfeedfeedfeed", "beef" * 4}
+    assert by_sig["feedfeedfeedfeed"]["note"] == prior["note"]
+    assert by_sig["feedfeedfeedfeed"]["first_seen"] == "2026-10-09"
+    assert by_sig["beef" * 4]["note"] == ""
+    assert by_sig["beef" * 4]["first_seen"] == "2026-10-11"
+
+
 def test_generated_mutations_stream_when_the_mutated_body_streams():
     probes = genmatrix._gen_mutations(
         "t", "gen-mutation", genmatrix.O_EP, genmatrix.O_BASE, genmatrix.O_CTX, genmatrix.O_FIELDS

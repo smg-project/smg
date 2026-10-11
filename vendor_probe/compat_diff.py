@@ -44,7 +44,10 @@ allowlisted (or that got *worse* than its allowlisted severity) exits 1.
 
 ``--write-allowlist FILE`` regenerates the allowlist entries for this provider
 from the current run (grandfathering today's divergences); it replaces only
-this provider's lines and suppresses the failing exit.
+this provider's lines and suppresses the failing exit. An entry whose
+``sig_hash`` is already listed, in FILE or in the ``--allowlist`` given
+alongside (the previous dated allowlist when refreshing), keeps its
+``first_seen`` and note.
 
 Severity ranking (worst first):
   S1  status mismatch (wrong status class; accepting what the vendor rejects
@@ -468,15 +471,19 @@ def run_gate(clusters, entries, allow: dict, min_coverage: float):
     return violations, coverage
 
 
-def write_allowlist(path: Path, provider: str, clusters, stamp: str):
+def write_allowlist(path: Path, provider: str, clusters, stamp: str, prior=None):
     """Write this provider's divergent clusters as allowlist lines, keeping
     other providers' existing lines. Idempotent. A cluster whose ``sig_hash``
-    already has a line keeps that line's ``first_seen`` and ``note``: the
-    hand-written adjudication is the record of why a divergence is accepted,
-    and a regeneration must not erase it (its verdict and kinds are rewritten
-    from the replay; the diff against the old file shows what moved)."""
+    already has a line, in the file being written or in ``prior`` (this
+    provider's entries of the previous dated allowlist, as ``load_allowlist``
+    returns them: a refresh writes a new date's file, which starts empty),
+    keeps that line's ``first_seen`` and ``note``: the hand-written
+    adjudication is the record of why a divergence is accepted, and a
+    regeneration must not erase it (its verdict and kinds are rewritten from
+    the replay; the diff against the old file shows what moved). A line in
+    the file being written wins over ``prior``."""
     keep = []
-    prior = {}
+    prior = dict(prior or {})
     if path.exists():
         with path.open("r", encoding="utf-8") as fh:
             for line in fh:
@@ -1005,7 +1012,8 @@ def main(argv=None):
         "--write-allowlist",
         default=None,
         help="baseline mode: (re)write this provider's allowlist lines from the "
-        "current run (grandfather today's divergences); suppresses the failing exit",
+        "current run (grandfather today's divergences); suppresses the failing exit; "
+        "entries already listed in FILE or in --allowlist keep first_seen and note",
     )
     ap.add_argument(
         "--min-replay-coverage",
@@ -1090,7 +1098,10 @@ def main(argv=None):
                 stamp = json.loads(manifest_path.read_text()).get("date")
             if not stamp:
                 stamp = datetime.date.today().isoformat()
-            written = write_allowlist(Path(args.write_allowlist), args.provider, clusters, stamp)
+            prior = load_allowlist(Path(args.allowlist), args.provider) if args.allowlist else None
+            written = write_allowlist(
+                Path(args.write_allowlist), args.provider, clusters, stamp, prior=prior
+            )
             summary["allowlist_written"] = written
         allow = load_allowlist(Path(args.allowlist), args.provider) if args.allowlist else {}
         violations, coverage = run_gate(clusters, entries, allow, args.min_replay_coverage)

@@ -286,11 +286,14 @@ python -m vendor_probe.compat_diff \
 2. `gh release download vendor-truth-<date>`, run `baseline.py` per provider
    into `vendor_probe/baselines/<new-date>/` with the new run's provenance.
 3. Replay locally (mock-worker recipe above, or a real stack) and run
-   `compat_diff --baseline ... --write-allowlist` per provider to re-grandfather
-   the then-current divergences into the new `known_divergences.jsonl` (an
-   entry whose `sig_hash` persists keeps its `first_seen` and note) — diff it
-   against the old allowlist and account for every entry that appeared or
-   disappeared before committing.
+   `compat_diff --baseline <new-date>/<provider> --allowlist
+   <old-date>/known_divergences.jsonl --write-allowlist
+   <new-date>/known_divergences.jsonl` per provider to re-grandfather the
+   then-current divergences into the new `known_divergences.jsonl`: an entry
+   whose `sig_hash` persists keeps the `first_seen` and note of its line in
+   the old allowlist (`--allowlist` is where the carry-over comes from; the
+   new file starts empty) — diff the two files and account for every entry
+   that appeared or disappeared before committing.
 
 ## Real-engine conformance suite (`e2e_test/vendor_compat/`)
 
