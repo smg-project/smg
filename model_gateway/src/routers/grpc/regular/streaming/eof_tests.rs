@@ -331,6 +331,7 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
                 dispatch(),
                 tokenizer.clone(),
                 None,
+                utils::StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_COMPLETIONS),
             )
             .await;
         let body = timeout(
