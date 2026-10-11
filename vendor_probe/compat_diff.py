@@ -389,10 +389,26 @@ def load_allowlist(path: Path, provider: str) -> dict:
     return allow
 
 
+def unlisted_s1_kinds(s1_kinds, allowed: dict) -> list:
+    """S1 kinds of a replay that the allowlist entry does not list.
+
+    An entry with ``s1_kinds`` grandfathers S1 of those kinds only: one written
+    for a ``server-error`` does not also cover a later ``accepts-invalid`` on
+    the same cluster. An entry without the field keeps the rank-only ceiling.
+    Shared by the CLI gate below and the conformance suite's judgment, so the
+    two read one allowlist the same way.
+    """
+    listed = allowed.get("s1_kinds") or []
+    if not listed:
+        return []
+    return sorted(set(s1_kinds) - set(listed))
+
+
 def run_gate(clusters, entries, allow: dict, min_coverage: float):
     """Return (violations, coverage). A violation is a NEW divergent cluster
     (signature not allowlisted), a severity escalation beyond the allowlisted
-    severity, or replay coverage too low to trust a green result."""
+    severity, an S1 of a kind the entry's ``s1_kinds`` does not list, or
+    replay coverage too low to trust a green result."""
     violations = []
     for c in clusters:
         if c["verdict"] not in ("S1", "S2", "S3", "S4"):
@@ -423,6 +439,19 @@ def run_gate(clusters, entries, allow: dict, min_coverage: float):
                     "example_probes": c["example_probes"][:3],
                 }
             )
+        elif unlisted_s1_kinds(c.get("s1_kinds") or [], allowed):
+            violations.append(
+                {
+                    "kind": "s1-kind-escalation",
+                    "cluster_id": c["cluster_id"],
+                    "sig_hash": sig,
+                    "verdict": c["verdict"],
+                    "s1_kinds": c.get("s1_kinds") or [],
+                    "allowlisted_s1_kinds": allowed.get("s1_kinds"),
+                    "size": c["size"],
+                    "example_probes": c["example_probes"][:3],
+                }
+            )
     uncovered = ("replay-gap", "replay-transport")
     usable = sum(1 for e in entries if e["class"] not in uncovered)
     coverage = usable / len(entries) if entries else 0.0
@@ -441,14 +470,24 @@ def run_gate(clusters, entries, allow: dict, min_coverage: float):
 
 def write_allowlist(path: Path, provider: str, clusters, stamp: str):
     """Write this provider's divergent clusters as allowlist lines, keeping
-    other providers' existing lines. Idempotent."""
+    other providers' existing lines. Idempotent. A cluster whose ``sig_hash``
+    already has a line keeps that line's ``first_seen`` and ``note``: the
+    hand-written adjudication is the record of why a divergence is accepted,
+    and a regeneration must not erase it (its verdict and kinds are rewritten
+    from the replay; the diff against the old file shows what moved)."""
     keep = []
+    prior = {}
     if path.exists():
         with path.open("r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if line and json.loads(line).get("provider") != provider:
-                    keep.append(json.loads(line))
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if entry.get("provider") != provider:
+                    keep.append(entry)
+                else:
+                    prior[entry.get("sig_hash")] = entry
     fresh = [
         {
             "provider": provider,
@@ -459,8 +498,8 @@ def write_allowlist(path: Path, provider: str, clusters, stamp: str):
             "size": c["size"],
             "categories": c["categories"][:5],
             "example_probes": c["example_probes"][:3],
-            "first_seen": stamp,
-            "note": "",
+            "first_seen": prior.get(c["sig_hash"], {}).get("first_seen") or stamp,
+            "note": prior.get(c["sig_hash"], {}).get("note") or "",
         }
         for c in clusters
         if c["verdict"] in ("S1", "S2", "S3", "S4") and c.get("sig_hash")

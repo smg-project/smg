@@ -317,6 +317,40 @@ def parse_sse(text):
     return events
 
 
+def content_type(headers):
+    for k, v in (headers or {}).items():
+        if k.lower() == "content-type":
+            return str(v)
+    return None
+
+
+def answered_as_stream(probe, resp_headers) -> bool:
+    """Whether a response is parsed as an event stream: a streaming probe's,
+    unless the server declared another content type. A request rejected
+    before the stream opens answers with a plain JSON envelope, and the record
+    keeps that envelope (as ``body``) rather than an empty event list."""
+    if not probe.get("stream"):
+        return False
+    ctype = content_type(resp_headers)
+    return ctype is None or "text/event-stream" in ctype.lower()
+
+
+def shape_response(probe, status, resp_headers, text):
+    """The record's ``response`` (status, headers, then ``sse_events`` or
+    ``body``) and the parsed JSON body, if any, for placeholder resolution."""
+    response = {"status": status, "headers": resp_headers}
+    parsed_body = None
+    if answered_as_stream(probe, resp_headers):
+        response["sse_events"] = parse_sse(text or "")
+    else:
+        try:
+            parsed_body = json.loads(text) if text else None
+        except Exception:
+            parsed_body = None
+        response["body"] = parsed_body if parsed_body is not None else text
+    return response, parsed_body
+
+
 def _retry_after(headers, attempt):
     ra = headers.get("retry-after") or headers.get("Retry-After")
     if ra:
@@ -446,16 +480,7 @@ async def execute(client, adapter, probe, recordings, cfg):
         break
 
     rec["timing_ms"] = int((time.time() - t0) * 1000)
-    response = {"status": status, "headers": resp_headers}
-    parsed_body = None
-    if probe["stream"]:
-        response["sse_events"] = parse_sse(text or "")
-    else:
-        try:
-            parsed_body = json.loads(text) if text else None
-        except Exception:
-            parsed_body = None
-        response["body"] = parsed_body if parsed_body is not None else text
+    response, parsed_body = shape_response(probe, status, resp_headers, text)
     rec["response"] = response
     rec["recorded"] = True
     rec["_root"] = {"body": parsed_body if isinstance(parsed_body, dict) else None}
