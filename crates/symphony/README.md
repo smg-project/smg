@@ -129,7 +129,7 @@ aliases is an open question of the design.
 
 <!-- models: begin -->
 78 groups, 107 checkpoints, newest first.
-55 ready, 6 replaying a recorded set, 0 on main awaiting fixtures, 17 pending.
+56 ready, 6 replaying a recorded set, 0 on main awaiting fixtures, 16 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -152,7 +152,7 @@ aliases is an open question of the design.
 | 2026-06-13 | [kimi-k3](https://github.com/smg-project/bellwether/tree/main/fixtures/kimi-k3) | moonshotai/Kimi-K3 |  | `kimi_k3` | 54,418 | ready | `kimi_k3`, `kimi_k3` |
 | 2026-06-02 | [minimax-m3](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m3) | MiniMaxAI/MiniMax-M3 |  | `minimax_m3` | 54,180 | ready | `minimax_m3`, `minimax_m3` |
 | 2026-04-27 | [mimo-v2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.5) | XiaomiMiMo/MiMo-V2.5 |  | `qwen3`, tagged calls, the value between the tags | 54,181 | ready | none |
-| 2026-04-23 | [laguna-xs.2](https://github.com/smg-project/bellwether/tree/main/fixtures/laguna-xs.2) | poolside/Laguna-XS.2 |  | — | — | pending | none |
+| 2026-04-23 | [laguna-xs.2](https://github.com/smg-project/bellwether/tree/main/fixtures/laguna-xs.2) | poolside/Laguna-XS.2 |  | `glm4` | 41,372 | ready | none |
 | 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
 | 2026-04-15 | [qwen3.6-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-35b-a3b) | Qwen/Qwen3.6-35B-A3B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
 | 2026-04-09 | [minimax-m2.7](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m2.7) | MiniMaxAI/MiniMax-M2.7 |  | `minimax_m2` | 12,821 | replaying the set | `minimax_m2`, `minimax` |

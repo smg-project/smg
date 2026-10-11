@@ -538,6 +538,9 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Dots3,
         GenerationPrompt::ModelWritesTheThought,
     ),
+    // Laguna writes GLM 4.5's spelling (a newline after the name, each key and each value) under
+    // its own turn opener; its prompt ends in the thought's opener or its closer alone.
+    ("laguna-xs.2", Family::Glm4, GenerationPrompt::MarkerAlone),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -553,6 +556,7 @@ const OPENERS: &[(&str, &str)] = &[
         "granite-4.1-3b",
         "<|start_of_role|>assistant<|end_of_role|>",
     ),
+    ("laguna-xs.2", "<assistant>"),
 ];
 
 /// The table that reads a checkpoint's output.
@@ -767,6 +771,10 @@ enum GenerationPrompt {
     /// the requests do not set), and the template has a thought: the model writes `<mm:think>`
     /// itself or closes an empty thought with `</mm:think>` at once.
     ModelDecides,
+    /// Laguna: the thought's opener alone, with no newline, when the request turns thinking on,
+    /// so the output starts inside the thought; otherwise (the default) its closer alone, which
+    /// closes a thought never opened and leaves the output in content.
+    MarkerAlone,
 }
 
 impl GenerationPrompt {
@@ -788,6 +796,8 @@ impl GenerationPrompt {
             (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
+            (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
+            (Self::MarkerAlone, _) => close.to_string(),
         }
     }
 
@@ -795,7 +805,10 @@ impl GenerationPrompt {
     /// reasoning probe's does, so its reasoning is not in the output and the case is refused or
     /// allowed, not listed.
     fn writes_no_thought_unasked(self) -> bool {
-        matches!(self, Self::Plain | Self::OpensTheThoughtWhenAsked)
+        matches!(
+            self,
+            Self::Plain | Self::OpensTheThoughtWhenAsked | Self::MarkerAlone
+        )
     }
 }
 
@@ -883,6 +896,9 @@ const KNOWN_DIFFERENCES: &[KnownDifference] = &[
 /// difference cannot be among that slug's fixtures, so the check that the list has not rotted
 /// skips it there.
 const REFUSED_PROBES: &[(&str, &str)] = &[
+    // Its template refuses the reasoning probe's request (the recorded common set has the fence
+    // probe and ten more, not it).
+    ("laguna-xs.2", "parse/reasoning-with-marker-text"),
     // Its template raises on a request that turns thinking off, and the content probe's does.
     (
         "qwen3.8-2.4t-a95b",

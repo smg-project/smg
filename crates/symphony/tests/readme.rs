@@ -362,9 +362,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2026-04-23",
         smg: (None, None),
-        table: None,
-        set: None,
-        status: Status::Pending,
+        table: Some(Table::Glm4),
+        set: Some(41_372),
+        status: Status::Ready,
     },
     Group {
         slug: "lfm2.5-1.2b-instruct",
