@@ -221,6 +221,9 @@ pub mod metrics_labels {
     pub const ERROR_BACKEND: &str = "backend_error";
     pub const ERROR_VALIDATION: &str = "validation_error";
     pub const ERROR_INTERNAL: &str = "internal_error";
+    /// The engine itself reported that the request failed (its finish
+    /// reason was `error`), as opposed to a failed call to the worker.
+    pub const ERROR_ENGINE: &str = "engine_error";
 }
 
 /// Recorders for the metrics a router emits.

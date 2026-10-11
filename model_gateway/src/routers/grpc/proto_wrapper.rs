@@ -2848,14 +2848,21 @@ mod tracked_tests {
     }
 }
 
+/// The message of the `Internal` status a stream ends with when the engine
+/// itself finished the request with an error. The ZMQ lane's adapters end
+/// theirs with the same words, and the stream-failure accounting keys its
+/// `engine_error` label on it.
+pub(crate) const ENGINE_ERROR_MESSAGE: &str =
+    "engine finished the request with an error (see engine logs)";
+
 /// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
 fn reject_engine_error(
     item: Result<ProtoGenerateResponse, tonic::Status>,
 ) -> Result<ProtoGenerateResponse, tonic::Status> {
     match item {
-        Ok(response) if response.engine_error() => Err(tonic::Status::internal(
-            "engine finished the request with an error (see engine logs)",
-        )),
+        Ok(response) if response.engine_error() => {
+            Err(tonic::Status::internal(ENGINE_ERROR_MESSAGE))
+        }
         item => item,
     }
 }

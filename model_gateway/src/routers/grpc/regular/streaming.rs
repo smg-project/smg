@@ -1070,7 +1070,7 @@ impl StreamingProcessor {
         // logprobs, but the Prefill reservation must end with this phase.
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
             .await
-            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            .map_err(utils::StreamFailure::prefill)?;
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
         // so the first decode token yields honest PD TTFT.
@@ -1383,7 +1383,7 @@ impl StreamingProcessor {
             }
         })
         .await
-        .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+        .map_err(utils::StreamFailure::prefill)?;
 
         // Process decode stream with input_logprobs prepended. Pass pd_timing so
         // the first decode token yields honest PD TTFT.
@@ -3051,7 +3051,7 @@ impl StreamingProcessor {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
             .await
-            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            .map_err(utils::StreamFailure::prefill)?;
 
         let result = self
             .process_messages_streaming_chunks(
@@ -3658,7 +3658,7 @@ impl StreamingProcessor {
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
             .await
-            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            .map_err(utils::StreamFailure::prefill)?;
 
         let result = self
             .process_completion_streaming_chunks(
@@ -3922,6 +3922,8 @@ fn assistant_choice(
 
 #[cfg(test)]
 mod eof_tests;
+#[cfg(test)]
+mod failure_tests;
 
 #[cfg(test)]
 mod sse_bytes_tests;
