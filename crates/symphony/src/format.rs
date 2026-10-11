@@ -114,7 +114,7 @@ pub enum Emits {
 
 /// One format's table. Built with [`Format::new`] and the methods that add a row each; the
 /// first state added is the initial one.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Format {
     name: String,
     terminals: Vec<Terminal>,
@@ -125,7 +125,7 @@ pub struct Format {
     structural_tokens: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Terminal {
     name: String,
     text: String,
@@ -133,13 +133,13 @@ struct Terminal {
     ignored: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
     name: String,
     emits: Emits,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Transition {
     from: usize,
     on: usize,
@@ -247,6 +247,17 @@ impl Format {
     /// The turn opener, if the table names one.
     pub(crate) fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
+    }
+
+    /// The part of `prompt` the engine replays to find the state the generation starts in: from
+    /// the last occurrence of the turn opener, or the whole prompt when the table names none or
+    /// the prompt does not hold it. A caller that keeps the prompt for a later `Input::Prompt`
+    /// need keep only this.
+    pub fn replay<'p>(&self, prompt: &'p str) -> &'p str {
+        match self.turn_opener().and_then(|opener| prompt.rfind(opener)) {
+            Some(at) => &prompt[at..],
+            None => prompt,
+        }
     }
 
     /// The format's name.

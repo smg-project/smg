@@ -6,14 +6,7 @@
 
 use std::{fmt::Write as _, fs, path::PathBuf};
 
-use symphony::{
-    formats::{
-        deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5,
-        ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
-    },
-    tagged::{Placement, Spelling},
-    CallSyntax, Format,
-};
+use symphony::formats::{groups, table_for, Table};
 
 /// The switch that writes the table into the README instead of checking it.
 const WRITE_ENV: &str = "SYMPHONY_WRITE_README";
@@ -39,7 +32,8 @@ struct Group {
     /// (`crates/tool_parser`, `crates/reasoning_parser`, read at main 0d0808f2); none is
     /// passthrough, the output read as content.
     smg: (Option<&'static str>, Option<&'static str>),
-    /// The table under `formats` that reads the group's output, once one is written.
+    /// The table under `formats` that reads the group's output, once one is written; the
+    /// registry under `formats` must say the same for the primary and every `also`.
     table: Option<Table>,
     /// The parse cases bellwether's main holds for the group, once its set is recorded.
     set: Option<u32>,
@@ -47,75 +41,15 @@ struct Group {
     status: Status,
 }
 
-/// A table under `formats`, by the function that builds it.
-#[derive(Clone, Copy)]
-enum Table {
-    Qwen3,
-    Qwen3Tagged,
-    /// [`qwen3`] with the tagged syntax and the value between the tags directly: MiMo.
-    Qwen3TaggedDirect,
-    Qwen2_5,
-    DeepSeekV4_1,
-    SeedOss,
-    Hy4,
-    Ling,
-    IQuest,
-    Olmo3,
-    Lfm2_5,
-    Xlam,
-    MinimaxM2,
-    MinimaxM3,
-    KimiK3,
-    Glm,
-    Glm4,
-    K2Horizon,
-    Inkling,
-    MiniCpm5,
-    Dots3,
-    Gemma4,
-    Plain,
-}
-
-impl Table {
-    /// The table, built; a name in [`GROUPS`] that the crate does not have fails to compile.
-    fn format(self) -> Format {
-        match self {
-            Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            Self::Qwen3TaggedDirect => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
-            Self::Qwen2_5 => qwen2_5(),
-            Self::DeepSeekV4_1 => deepseek_v4_1(),
-            Self::SeedOss => seed_oss(),
-            Self::Hy4 => hy4(),
-            Self::Ling => ling(),
-            Self::IQuest => iquest(),
-            Self::Olmo3 => olmo3(),
-            Self::Lfm2_5 => lfm2_5(),
-            Self::Xlam => xlam(),
-            Self::MinimaxM2 => minimax_m2(),
-            Self::MinimaxM3 => minimax_m3(),
-            Self::KimiK3 => kimi_k3(),
-            Self::Glm => glm(),
-            Self::Glm4 => glm4(),
-            Self::Inkling => inkling(),
-            Self::MiniCpm5 => minicpm5(),
-            Self::Dots3 => dots3(),
-            Self::Gemma4 => gemma4(),
-            Self::K2Horizon => k2_horizon(),
-            Self::Plain => plain(),
-        }
-    }
-
-    /// How the README names it: the function, and the call syntax where the function takes one.
-    fn cell(self) -> String {
-        match self {
-            Self::Qwen3Tagged => format!("`{}`, tagged calls", self.format().name()),
-            Self::Qwen3TaggedDirect => format!(
-                "`{}`, tagged calls, the value between the tags",
-                self.format().name()
-            ),
-            other => format!("`{}`", other.format().name()),
-        }
+/// How the README names a table: the function, and the call syntax where the function takes one.
+fn table_cell(table: Table) -> String {
+    match table {
+        Table::Qwen3Tagged => format!("`{}`, tagged calls", table.format().name()),
+        Table::Qwen3TaggedDirect => format!(
+            "`{}`, tagged calls, the value between the tags",
+            table.format().name()
+        ),
+        other => format!("`{}`", other.format().name()),
     }
 }
 
@@ -997,7 +931,7 @@ fn render() -> String {
             slug = group.slug,
             model = group.model,
             also = group.also.join(", "),
-            table = group.table.map_or_else(|| "—".to_string(), Table::cell),
+            table = group.table.map_or_else(|| "—".to_string(), table_cell),
             set = group.set.map_or_else(|| "—".to_string(), count),
             status = group.status.cell(),
         );
@@ -1027,6 +961,38 @@ fn the_readme_models_table_is_what_groups_says() {
         "README.md's models table is not what GROUPS says; run `{WRITE_ENV}=1 cargo test -p \
          smg-symphony --test readme` to write it, or replace everything between the markers with:\n\
          {expected}"
+    );
+}
+
+#[test]
+fn the_registry_reads_every_group_with_a_table_and_no_other() {
+    for group in GROUPS {
+        assert_eq!(table_for(group.model), group.table, "{}", group.slug);
+        let organisation = group.model.split('/').next().expect("an organisation");
+        for also in group.also {
+            assert_eq!(
+                table_for(&format!("{organisation}/{also}")),
+                group.table,
+                "{}: {also}",
+                group.slug
+            );
+        }
+    }
+    // And the other way: every group the registry knows is a group here, with the same
+    // checkpoints and table, so neither list gains an entry the other lacks.
+    let mut registered = 0;
+    for (model, also, table) in groups() {
+        let group = GROUPS
+            .iter()
+            .find(|group| group.model == model)
+            .unwrap_or_else(|| panic!("{model}: in the registry, not in the README"));
+        assert_eq!(group.also, also, "{model}");
+        assert_eq!(group.table, Some(table), "{model}");
+        registered += 1;
+    }
+    assert_eq!(
+        registered,
+        GROUPS.iter().filter(|group| group.table.is_some()).count()
     );
 }
 

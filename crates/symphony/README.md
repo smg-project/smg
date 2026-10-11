@@ -45,6 +45,7 @@ and a client that wants the raw text back can have it.
 |---|---|
 | `Parser` (`feed`) | The one trait: one instance per generated choice, fed `Input`s, filling `Events`. |
 | `Input`, `TokenSpan`, `EngineFinish` | The lifecycle steps and the token-to-byte alignment the gateway's decoder gives. |
+| `formats::for_model`, `formats::Table` | The registry: the table that reads a model id's output, with the model's own turn opener, for every checkpoint in the models table below with a table. |
 | `Event`, `Events`, `Text` | The output: `Content`, `ReasoningStart`/`Reasoning`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArguments`/`ToolCallEnd`, `Dropped`, `Malformed`, `Finish`. `Text` carries the bytes and the engine tokens they cost. |
 | `DropReason`, `MalformedReason`, `FinishReason` | Why bytes were dropped, why a region could not be parsed, and the refined finish (`tool_calls` when calls were made). |
 | `ParseError` | Buffer overflow, lifecycle misuse, or a defect in a parser; what was pushed before the error is final. |
@@ -123,9 +124,11 @@ difference. **Pending** means no table yet.
 in `smg serve --model-path Qwen/Qwen3-8B --tool-call-parser qwen --reasoning-parser qwen3`; none
 means passthrough, the output read as content. Symphony's tables carry one name each, the
 **Table** column, and the Qwen3 table takes its call syntax as a second selector (JSON calls, or
-the tagged calls of Qwen 3.5 and later and Qwen3-Coder); once the gateway selects a table, the
-name and that selector are what to pass, and whether they replace the two flags or keep them as
-aliases is an open question of the design.
+the tagged calls of Qwen 3.5 and later and Qwen3-Coder). `formats::for_model` picks the table
+from the model id by its exact repository name in any case, the group's primary or any checkpoint
+under **Also**, so a model listed here with a table needs neither flag once the gateway reads it
+with Symphony (a quantized or renamed checkpoint is not listed, and keeps the older parsers until
+its group names it); whether the flags stay as aliases is an open question of the design.
 
 <!-- models: begin -->
 78 groups, 107 checkpoints, newest first.

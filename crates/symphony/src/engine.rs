@@ -485,14 +485,7 @@ impl Engine {
     /// state, starting at the last turn opener the table names. An arguments state is not entered
     /// from the prompt.
     fn seed(&mut self, prompt: &str, out: &mut Events) {
-        let turn = match self
-            .format
-            .turn_opener()
-            .and_then(|opener| prompt.rfind(opener))
-        {
-            Some(at) => &prompt[at..],
-            None => prompt,
-        };
+        let turn = self.format.replay(prompt);
         let mut scanner = Scanner::new(self.format.terminal_texts());
         let mut state = 0;
         let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());

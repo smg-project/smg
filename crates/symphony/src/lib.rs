@@ -18,7 +18,8 @@
 //!
 //! Status: the public types below are the contract, [`adapt`] renders them for the Chat
 //! Completions, Responses and Messages APIs, streamed and whole, and [`Engine`] runs a [`Format`]
-//! table: the tables in [`formats`] are the families recorded so far, and more follow.
+//! table: the tables in [`formats`] are the families recorded so far, [`formats::for_model`] picks
+//! the one for a model id, and more follow.
 
 #![forbid(unsafe_code)]
 
