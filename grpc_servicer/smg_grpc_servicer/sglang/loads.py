@@ -112,12 +112,17 @@ def load_record(
     """The load record the KV-event stream carries for ``dp_rank`` (the
     first published rank when the batch names none), from the schedulers'
     published snapshots as ``GetLoads`` reports them (every section, the
-    scheduler's queued token-work); ``None`` while no snapshot is published.
+    scheduler's queued token-work); ``None`` while no snapshot is published,
+    and for a named rank that has not published one: its batches go without
+    a record rather than with another rank's figures.
     """
     snapshots = list(snapshots)
     if not snapshots:
         return None
-    chosen = next((s for s in snapshots if dp_rank is not None and s.dp_rank == dp_rank), None)
-    if chosen is None:
+    if dp_rank is None:
         chosen = min(snapshots, key=lambda s: s.dp_rank)
+    else:
+        chosen = next((s for s in snapshots if s.dp_rank == dp_rank), None)
+        if chosen is None:
+            return None
     return engine_load_from(convert_loads_to_protobuf(chosen), queued_token_work=True)

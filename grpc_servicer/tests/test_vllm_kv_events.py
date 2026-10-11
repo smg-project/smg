@@ -338,3 +338,103 @@ async def test_servicer_hands_its_load_record_to_the_relay():
     ((sources, engine, start, got_context, options),) = calls
     assert (sources, engine, start, got_context) == (["rank-0"], "vllm", 0, context)
     assert options["topic"] == "kv" and options["load_source"] is load_record
+
+
+# --- The servicer's record is the batch's rank's own (no vLLM import) ---
+
+
+def _load_record_method():
+    """The real ``_load_record`` of the vLLM servicer with the two readers it
+    calls (``_scheduler_counts``, ``_latest_scheduler_stats``), compiled on
+    their own (the servicer module imports the engine), and the loads module
+    they draw on, loaded by path for the same reason."""
+    import ast
+    import logging
+
+    from smg_grpc_proto.generated import common_pb2
+
+    package = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm"
+    spec = importlib.util.spec_from_file_location("vllm_loads_for_the_record", package / "loads.py")
+    loads_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loads_mod)
+    source_path = package / "servicer.py"
+    wanted = {"_latest_scheduler_stats", "_scheduler_counts", "_load_record"}
+    defs = [
+        node
+        for node in ast.walk(ast.parse(source_path.read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    assert {node.name for node in defs} == wanted
+    namespace = {
+        "common_pb2": common_pb2,
+        "load_record": loads_mod.load_record,
+        "logger": logging.getLogger("vllm_servicer_under_test"),
+        "_kv_capacity_tokens": lambda engine: 0,
+        "_max_running_requests": lambda engine: 0,
+    }
+    exec(compile(ast.Module(body=defs, type_ignores=[]), str(source_path), "exec"), namespace)
+    return loads_mod, namespace
+
+
+def _servicer_over(stat_logger):
+    """A servicer whose engine keeps its scheduler stats on ``stat_logger``."""
+    from types import MethodType, SimpleNamespace
+
+    loads_mod, namespace = _load_record_method()
+    engine = SimpleNamespace(logger_manager=SimpleNamespace(stat_loggers=[stat_logger]))
+    servicer = SimpleNamespace(engine=engine, _loads=loads_mod.LoadTracker())
+    servicer._scheduler_counts = MethodType(namespace["_scheduler_counts"], servicer)
+    servicer._load_record = MethodType(namespace["_load_record"], servicer)
+    return servicer
+
+
+def _stats(running, waiting, usage):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(num_running_reqs=running, num_waiting_reqs=waiting, kv_cache_usage=usage)
+
+
+def _core(record):
+    return record.running_requests, record.waiting_requests, record.token_usage
+
+
+@pytest.mark.parametrize("shape", ["aggregated_logger", "per_engine_loggers"])
+def test_the_record_is_the_batch_ranks_own_with_the_estimate_on_the_first_rank(shape):
+    from types import SimpleNamespace
+
+    first, second = _stats(3, 2, 0.25), _stats(5, 1, 0.5)
+    if shape == "aggregated_logger":
+        stat_logger = SimpleNamespace(last_scheduler_stats_dict={0: first, 1: second})
+    else:
+        stat_logger = SimpleNamespace(
+            per_engine_stat_loggers={
+                0: SimpleNamespace(last_scheduler_stats=first),
+                1: SimpleNamespace(last_scheduler_stats=second),
+            }
+        )
+    servicer = _servicer_over(stat_logger)
+
+    rank_one = servicer._load_record(1)
+    assert _core(rank_one) == (5, 1, 0.5)
+    # The queued-work estimate is the servicer's: the first rank's record carries it, no other.
+    assert not rank_one.HasField("waiting_uncached_tokens")
+    rank_zero = servicer._load_record(0)
+    assert _core(rank_zero) == (3, 2, 0.25)
+    assert rank_zero.HasField("waiting_uncached_tokens")
+    assert servicer._load_record(None) == rank_zero
+
+
+def test_a_rank_the_stat_loggers_do_not_keep_apart_gets_no_record():
+    from types import SimpleNamespace
+
+    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats=_stats(3, 2, 0.25)))
+    assert servicer._load_record(0).running_requests == 3
+    assert servicer._load_record(1) is None
+
+
+def test_the_first_rank_alone_reports_zeros_before_the_first_snapshot():
+    from types import SimpleNamespace
+
+    servicer = _servicer_over(SimpleNamespace())
+    assert servicer._load_record(None).running_requests == 0
+    assert servicer._load_record(1) is None

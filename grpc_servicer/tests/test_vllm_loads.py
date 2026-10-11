@@ -148,3 +148,15 @@ def test_the_load_record_before_the_first_step_is_zero_filled_with_the_capacity_
     assert (record.running_requests, record.waiting_requests, record.token_usage) == (0, 0, 0.0)
     assert record.HasField("waiting_uncached_tokens") and record.waiting_uncached_tokens == 0
     assert record.max_total_num_tokens == 0 and record.max_running_requests == 0
+
+
+def test_the_load_record_of_another_rank_carries_its_own_counts_and_no_estimate(loads_mod):
+    fields = loads_mod.scheduler_load_fields(4, 1, 0.5, None, dp_rank=1, max_total_num_tokens=8_000)
+    assert fields["dp_rank"] == 1
+    assert not {"num_waiting_uncached_tokens", "gen_throughput", "cache_hit_rate"} & fields.keys()
+    record = loads_mod.load_record(4, 1, 0.5, None, dp_rank=1, max_total_num_tokens=8_000)
+    assert (record.running_requests, record.waiting_requests, record.token_usage) == (4, 1, 0.5)
+    assert record.num_used_tokens == 4_000
+    # The estimate is the servicer's and rides the first rank's record: absent here, not 0.
+    assert not record.HasField("waiting_uncached_tokens")
+    assert (record.gen_throughput, record.cache_hit_rate) == (0.0, 0.0)

@@ -126,7 +126,8 @@ def _latest_scheduler_stats(engine, engine_idx: int = 0):
     reaches into ``engine.logger_manager.stat_loggers`` and returns the freshest
     snapshot, handling the logger-shape variants:
 
-    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats``
+    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats`` (its own
+      engine's, ``engine_index``; another index reads nothing from it)
     - ``AggregatedLoggingStatLogger`` (DP)   -> ``.last_scheduler_stats_dict[idx]``
     - ``PerEngineStatLoggerAdapter``         -> ``.per_engine_stat_loggers[idx]``
     - ``PrometheusStatLogger``               -> skipped (no cached snapshot)
@@ -142,7 +143,7 @@ def _latest_scheduler_stats(engine, engine_idx: int = 0):
         if isinstance(per, dict) and engine_idx in per:
             return per[engine_idx]
         stats = getattr(sl, "last_scheduler_stats", None)
-        if stats is not None:
+        if stats is not None and getattr(sl, "engine_index", 0) == engine_idx:
             return stats
         per_engine = getattr(sl, "per_engine_stat_loggers", None)
         if isinstance(per_engine, dict) and engine_idx in per_engine:
@@ -778,7 +779,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetLoadsResponse protobuf
         """
-        num_running, num_waiting, kv_usage = self._scheduler_counts()
+        num_running, num_waiting, kv_usage = self._scheduler_counts() or (0, 0, 0.0)
         load = vllm_engine_pb2.SchedulerLoad(
             **scheduler_load_fields(
                 num_running,
@@ -797,13 +798,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             loads=[load],
         )
 
-    def _scheduler_counts(self) -> tuple[int, int, float]:
+    def _scheduler_counts(self, engine_idx: int = 0) -> tuple[int, int, float] | None:
         """Running, waiting and KV usage from the latest ``SchedulerStats``
-        snapshot (zeros before the first engine step or with stats logging
-        off), what ``GetLoads`` and the pushed load record both report."""
-        stats = _latest_scheduler_stats(self.engine)
+        snapshot of the engine at ``engine_idx`` (the data-parallel rank),
+        what ``GetLoads`` and the pushed load record both report; ``None``
+        when there is none to read (no engine step yet, stats logging off,
+        or a rank the stat loggers do not keep apart)."""
+        stats = _latest_scheduler_stats(self.engine, engine_idx)
         if stats is None:
-            return 0, 0, 0.0
+            return None
         return (
             int(getattr(stats, "num_running_reqs", 0) or 0),
             int(getattr(stats, "num_waiting_reqs", 0) or 0),
@@ -811,17 +814,27 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         )
 
     def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
-        """The load record the KV-event stream carries: the figures
-        ``GetLoads`` answers with (vLLM reports one rank, so ``dp_rank`` does
-        not select), read for every batch and heartbeat."""
-        del dp_rank
+        """The load record the KV-event stream carries for the batch's rank
+        (the first rank when it names none): that rank's own scheduler
+        counts, with this servicer's queued-work estimate on the first rank
+        only, as the Rust servicer stamps its batches. A rank whose snapshot
+        the servicer cannot read gets no record rather than another rank's
+        figures; the first rank reports zeros before its first snapshot, as
+        ``GetLoads`` does."""
+        rank = dp_rank or 0
         try:
-            num_running, num_waiting, kv_usage = self._scheduler_counts()
+            counts = self._scheduler_counts(rank)
+            if counts is None:
+                if rank:
+                    return None
+                counts = (0, 0, 0.0)
+            num_running, num_waiting, kv_usage = counts
             return load_record(
                 num_running,
                 num_waiting,
                 kv_usage,
-                self._loads.estimate(num_waiting),
+                self._loads.estimate(num_waiting) if rank == 0 else None,
+                dp_rank=rank,
                 max_total_num_tokens=_kv_capacity_tokens(self.engine),
                 max_running_requests=_max_running_requests(self.engine),
             )

@@ -102,10 +102,13 @@ class TestLoadRecord:
         assert record.waiting_uncached_tokens == 3  # the scheduler's queued token-work
         assert record.cache_hit_rate == 0.25 and record.max_total_num_tokens == 100
 
-    def test_a_batch_without_a_rank_or_with_an_unknown_one_reads_the_first_rank(self, loads_mod):
+    def test_a_batch_without_a_rank_reads_the_first_rank(self, loads_mod):
         snapshots = list(reversed(self._snapshots()))
         assert loads_mod.load_record(snapshots, None).running_requests == 2
-        assert loads_mod.load_record(snapshots, 7).running_requests == 2
+
+    def test_a_batch_naming_an_unpublished_rank_gets_no_record(self, loads_mod):
+        # Rank 7 has published nothing: no record, not the first rank's figures.
+        assert loads_mod.load_record(self._snapshots(), 7) is None
 
     def test_no_published_snapshot_means_no_record(self, loads_mod):
         assert loads_mod.load_record([], 0) is None

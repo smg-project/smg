@@ -100,15 +100,21 @@ def load_record(
     """The load record the KV-event stream carries for ``dp_rank`` (the
     lowest fresh rank when the batch names none), from the engine's native
     snapshot replica as ``GetLoads`` converts it (:func:`convert_snapshot_to_protobuf`);
-    ``None`` while no fresh snapshot exists. The scheduler reports no queued
-    token-work on this wire, so the record leaves it unset, as the poll does.
+    ``None`` while no fresh snapshot exists, and for a named rank whose
+    snapshot has expired: its batches go without a record rather than with
+    another rank's figures (the rule ``GetLoads`` applies to a partial
+    replica). The scheduler reports no queued token-work on this wire, so
+    the record leaves it unset, as the poll does.
     """
     snapshots = list(snapshots)
     if not snapshots:
         return None
-    chosen = next((s for s in snapshots if dp_rank is not None and int(s.dp_rank) == dp_rank), None)
-    if chosen is None:
+    if dp_rank is None:
         chosen = min(snapshots, key=lambda s: int(s.dp_rank))
+    else:
+        chosen = next((s for s in snapshots if int(s.dp_rank) == dp_rank), None)
+        if chosen is None:
+            return None
     load = convert_snapshot_to_protobuf(
         chosen,
         max_total_num_tokens=max_total_num_tokens,

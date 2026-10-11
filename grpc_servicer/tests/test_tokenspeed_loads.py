@@ -136,5 +136,12 @@ class TestLoadRecord:
         )
         assert record.running_requests == 1
 
+    def test_a_batch_naming_a_rank_without_a_fresh_snapshot_gets_no_record(self, loads_mod):
+        # Rank 7's scheduler stopped publishing (or never did): no record, not rank 0's figures.
+        record = loads_mod.load_record(
+            self._snapshots(), 7, max_total_num_tokens=16384, max_running_requests=16
+        )
+        assert record is None
+
     def test_no_fresh_snapshot_means_no_record(self, loads_mod):
         assert loads_mod.load_record([], 0, max_total_num_tokens=1, max_running_requests=1) is None
