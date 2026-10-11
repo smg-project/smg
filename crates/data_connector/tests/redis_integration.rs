@@ -213,3 +213,37 @@ async fn a_second_link_of_an_item_moves_it_and_the_item_lists_once() {
         .expect("is linked"));
     assert_eq!(list(SortOrder::Asc).await, std::slice::from_ref(&ids[1]));
 }
+
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn deleting_a_conversation_answers_once_whether_it_existed() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage");
+    let conversations = bundle.conversation_storage;
+    let created = conversations
+        .create_conversation(NewConversation::default())
+        .await
+        .expect("create conversation");
+
+    // The delete pipeline removes the conversation key and its item index
+    // (two counts); the store answers whether the conversation existed.
+    let deleted = conversations
+        .delete_conversation(&created.id)
+        .await
+        .expect("delete an existing conversation");
+    assert!(deleted, "the conversation existed");
+    let again = conversations
+        .delete_conversation(&created.id)
+        .await
+        .expect("delete a conversation that is gone");
+    assert!(!again, "a second delete finds nothing");
+    assert!(conversations
+        .get_conversation(&created.id)
+        .await
+        .expect("lookup after delete")
+        .is_none());
+}

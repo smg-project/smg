@@ -259,14 +259,16 @@ impl ConversationStorage for RedisConversationStorage {
             .await
             .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
 
-        let count: usize = redis::pipe()
+        // The pipeline answers one count per DEL (the conversation key, then
+        // its item index); the conversation existed if its key was deleted.
+        let (deleted, _item_index_deleted): (usize, usize) = redis::pipe()
             .del(&key)
             .del(&items_key)
             .query_async(&mut conn)
             .await
             .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
 
-        Ok(count > 0)
+        Ok(deleted > 0)
     }
 }
 
