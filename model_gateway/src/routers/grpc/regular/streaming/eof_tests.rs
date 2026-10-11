@@ -2430,6 +2430,7 @@ async fn messages_stream_cut_keeps_upstream_failure_and_does_not_finish_decoding
         Err(utils::StreamFailure::Upstream {
             status,
             completion_tokens,
+            ..
         }) => {
             assert_eq!(status.code(), tonic::Code::Internal);
             assert_eq!(completion_tokens, 3);
