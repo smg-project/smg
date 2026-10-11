@@ -2514,6 +2514,125 @@ async fn items_of_one_add_call_are_listed_in_request_order(
 }
 
 #[tokio::test]
+async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
+    let ctx = crate::common::create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let add_items = |conv_id: String, items: serde_json::Value| {
+        let conversation_storage = ctx.conversation_storage.clone();
+        let item_storage = ctx.conversation_item_storage.clone();
+        async move {
+            conversations::create_conversation_items(
+                &conversation_storage,
+                &item_storage,
+                &conv_id,
+                serde_json::json!({ "items": items }),
+            )
+            .await
+        }
+    };
+    let list_asc = |conv_id: String| {
+        let conversation_storage = ctx.conversation_storage.clone();
+        let item_storage = ctx.conversation_item_storage.clone();
+        async move {
+            let listed = conversations::list_conversation_items(
+                &conversation_storage,
+                &item_storage,
+                &conv_id,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await;
+            conversation_json(listed)
+                .await
+                .map(|list| conversation_item_ids(&list))
+        }
+    };
+
+    let conv = conversation_json(
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+    )
+    .await?;
+    let conv_id = conv["id"].as_str().ok_or("conversation id")?.to_string();
+    let added = conversation_json(
+        add_items(
+            conv_id.clone(),
+            serde_json::json!([user_message("first"), user_message("second")]),
+        )
+        .await,
+    )
+    .await?;
+    let ids = conversation_item_ids(&added);
+    assert_eq!(ids.len(), 2, "the add answers both items");
+    let reference = serde_json::json!([{ "type": "item_reference", "id": ids[0] }]);
+
+    // A reference to an item the conversation already has is refused, like an item arriving
+    // under an id the conversation already has, and the conversation is left as it was.
+    let refused = add_items(conv_id.clone(), reference.clone()).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "a reference to an item already in the conversation is refused"
+    );
+    let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await?;
+    let error: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(error["error"]["code"], "item_already_in_conversation");
+    assert_eq!(error["error"]["param"], "items");
+    assert_eq!(
+        list_asc(conv_id.clone()).await?,
+        ids,
+        "the refused reference changes nothing: each item once, in order"
+    );
+
+    // The same reference into another conversation links the item there, once.
+    let other = conversation_json(
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await,
+    )
+    .await?;
+    let other_id = other["id"].as_str().ok_or("conversation id")?.to_string();
+    let linked = conversation_json(add_items(other_id.clone(), reference.clone()).await).await?;
+    assert_eq!(conversation_item_ids(&linked), ids[..1]);
+    assert_eq!(list_asc(other_id.clone()).await?, ids[..1]);
+    assert_eq!(
+        add_items(other_id.clone(), reference).await.status(),
+        StatusCode::BAD_REQUEST,
+        "the second reference into the other conversation is refused too"
+    );
+
+    // One link per item: deleting the item takes it out of the conversation.
+    let deleted = conversations::delete_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        &conv_id,
+        &ids[0],
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(list_asc(conv_id).await?, ids[1..]);
+    assert_eq!(
+        list_asc(other_id).await?,
+        ids[..1],
+        "the other conversation keeps its link"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
     let router_cfg = RouterConfig::builder()

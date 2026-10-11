@@ -776,3 +776,89 @@ async fn conversation_items_linked_a_microsecond_apart_list_in_link_order() {
         [ids[1].clone(), ids[0].clone()]
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let conversation = bundle
+        .conversation_storage
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+        })
+        .await
+        .expect("create conversation");
+    let items = bundle.conversation_item_storage;
+
+    // One item, its id unique to this run (the database is shared) and within the 64
+    // characters of the id column.
+    let id = ConversationItemId::from(format!("msg_r_{}", conversation.id.0).as_str());
+    items
+        .create_item(NewConversationItem {
+            id: Some(id.clone()),
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([]),
+            status: Some("completed".to_string()),
+        })
+        .await
+        .expect("create item");
+    let first = Utc::now();
+    items
+        .link_item(&conversation.id, &id, first)
+        .await
+        .expect("link item");
+    assert!(items
+        .is_item_linked(&conversation.id, &id)
+        .await
+        .expect("is linked"));
+
+    // The links table keys one row per (conversation, item): a second link of the same item is
+    // refused by the database. The gateway refuses a duplicate before it gets here, so a client
+    // sees the same 400 on every backend rather than this error.
+    let again = items
+        .link_item(&conversation.id, &id, first + TimeDelta::seconds(1))
+        .await;
+    assert!(
+        again.is_err(),
+        "a second link of the same item is refused by the key"
+    );
+
+    let list = |order: SortOrder| {
+        let items = items.clone();
+        let conversation_id = conversation.id.clone();
+        let params = ListParams {
+            limit: 10,
+            order,
+            after: None,
+        };
+        async move {
+            items
+                .list_items(&conversation_id, params)
+                .await
+                .expect("list items")
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(list(SortOrder::Asc).await, std::slice::from_ref(&id));
+
+    // One link per item: the delete takes the item out of the conversation.
+    items
+        .delete_item(&conversation.id, &id)
+        .await
+        .expect("delete item");
+    assert!(!items
+        .is_item_linked(&conversation.id, &id)
+        .await
+        .expect("is linked"));
+    assert!(list(SortOrder::Asc).await.is_empty());
+}

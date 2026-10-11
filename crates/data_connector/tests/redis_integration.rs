@@ -7,8 +7,10 @@
 //!   DATA_CONNECTOR_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 //!       cargo test -p data-connector --test redis_integration -- --ignored
 
+use chrono::{TimeDelta, Utc};
 use data_connector::{
-    create_storage, HistoryBackend, RedisConfig, StorageBundle, StorageFactoryConfig,
+    create_storage, ConversationItemId, HistoryBackend, ListParams, NewConversation,
+    NewConversationItem, RedisConfig, SortOrder, StorageBundle, StorageFactoryConfig,
     StoredResponse,
 };
 use serde_json::json;
@@ -121,4 +123,93 @@ async fn deleting_the_responses_of_an_identifier_drops_their_output_item_keys() 
         .await
         .expect("lookup after delete");
     assert!(gone.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_second_link_of_an_item_moves_it_and_the_item_lists_once() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage");
+    let conversation = bundle
+        .conversation_storage
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+        })
+        .await
+        .expect("create conversation");
+    let items = bundle.conversation_item_storage;
+
+    // Two items, their ids unique to this run (the server keeps the keys of earlier runs).
+    let nonce = &conversation.id.0;
+    let ids: Vec<ConversationItemId> = ["a", "b"]
+        .iter()
+        .map(|s| ConversationItemId::from(format!("msg_{s}_{nonce}").as_str()))
+        .collect();
+    for id in &ids {
+        items
+            .create_item(NewConversationItem {
+                id: Some(id.clone()),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([]),
+                status: Some("completed".to_string()),
+            })
+            .await
+            .expect("create item");
+    }
+    let base = Utc::now();
+    let at = |seconds: i64| base + TimeDelta::seconds(seconds);
+    items
+        .link_item(&conversation.id, &ids[0], at(0))
+        .await
+        .expect("link item");
+    items
+        .link_item(&conversation.id, &ids[1], at(1))
+        .await
+        .expect("link item");
+
+    // The sorted set holds one member per item: a second link of the first item moves it to
+    // the new score instead of adding a second entry. The gateway refuses a duplicate before
+    // it gets here, so a client sees the same 400 on every backend.
+    items
+        .link_item(&conversation.id, &ids[0], at(2))
+        .await
+        .expect("link item again");
+
+    let list = |order: SortOrder| {
+        let items = items.clone();
+        let conversation_id = conversation.id.clone();
+        let params = ListParams {
+            limit: 10,
+            order,
+            after: None,
+        };
+        async move {
+            items
+                .list_items(&conversation_id, params)
+                .await
+                .expect("list items")
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(list(SortOrder::Asc).await, [ids[1].clone(), ids[0].clone()]);
+
+    // One member per item: the delete takes the item out of the conversation.
+    items
+        .delete_item(&conversation.id, &ids[0])
+        .await
+        .expect("delete item");
+    assert!(!items
+        .is_item_linked(&conversation.id, &ids[0])
+        .await
+        .expect("is linked"));
+    assert_eq!(list(SortOrder::Asc).await, std::slice::from_ref(&ids[1]));
 }

@@ -91,6 +91,26 @@ struct ConversationItemInner {
     rev_index: HashMap<ConversationId, HashMap<String, LinkKey>>,
 }
 
+impl ConversationItemInner {
+    /// Links `item_id` to the conversation at `added_at`. An item the conversation already
+    /// has moves to the new stamp: its previous key, found through the reverse index, goes,
+    /// so one item never has two keys (a list would show it twice, a delete remove one).
+    fn link(
+        &mut self,
+        conversation_id: &ConversationId,
+        item_id: &ConversationItemId,
+        added_at: DateTime<Utc>,
+    ) {
+        let key: LinkKey = (added_at, item_id.0.clone());
+        let links = self.links.entry(conversation_id.clone()).or_default();
+        let rev = self.rev_index.entry(conversation_id.clone()).or_default();
+        if let Some(previous) = rev.insert(item_id.0.clone(), key.clone()) {
+            links.remove(&previous);
+        }
+        links.insert(key, item_id.clone());
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct MemoryConversationItemStorage {
     inner: Arc<RwLock<ConversationItemInner>>,
@@ -132,17 +152,7 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         item_id: &ConversationItemId,
         added_at: DateTime<Utc>,
     ) -> ConversationItemResult<()> {
-        let mut store = self.inner.write();
-        store
-            .links
-            .entry(conversation_id.clone())
-            .or_default()
-            .insert((added_at, item_id.0.clone()), item_id.clone());
-        store
-            .rev_index
-            .entry(conversation_id.clone())
-            .or_default()
-            .insert(item_id.0.clone(), (added_at, item_id.0.clone()));
+        self.inner.write().link(conversation_id, item_id, added_at);
         Ok(())
     }
 
@@ -152,13 +162,8 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         items: &[(ConversationItemId, DateTime<Utc>)],
     ) -> ConversationItemResult<()> {
         let mut store = self.inner.write();
-        let links = store.links.entry(conversation_id.clone()).or_default();
         for (item_id, added_at) in items {
-            links.insert((*added_at, item_id.0.clone()), item_id.clone());
-        }
-        let rev = store.rev_index.entry(conversation_id.clone()).or_default();
-        for (item_id, added_at) in items {
-            rev.insert(item_id.0.clone(), (*added_at, item_id.0.clone()));
+            store.link(conversation_id, item_id, *added_at);
         }
         Ok(())
     }
@@ -1130,5 +1135,55 @@ mod tests {
 
         // But item data itself is still retrievable
         assert!(store.get_item(&item.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn relinking_an_item_keeps_one_link_so_it_lists_once_and_delete_removes_it() {
+        let store = MemoryConversationItemStorage::new();
+        let conv: ConversationId = "conv_relink".into();
+        let mut ids = Vec::new();
+        for id in ["msg_a", "msg_b"] {
+            let mut item = make_item("message", Some("user"), json!([]));
+            item.id = Some(ConversationItemId::from(id));
+            ids.push(store.create_item(item).await.unwrap().id);
+        }
+        let base = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let at = |seconds: i64| base + chrono::TimeDelta::seconds(seconds);
+        store.link_item(&conv, &ids[0], at(0)).await.unwrap();
+        store.link_item(&conv, &ids[1], at(1)).await.unwrap();
+
+        // The first item linked again, later, through both link paths: it moves to the new
+        // stamp instead of being listed under the old one as well.
+        store.link_item(&conv, &ids[0], at(2)).await.unwrap();
+        store
+            .link_items(&conv, &[(ids[0].clone(), at(3))])
+            .await
+            .unwrap();
+
+        let list = |order: SortOrder| {
+            let store = store.clone();
+            let conv = conv.clone();
+            let params = ListParams {
+                limit: 10,
+                order,
+                after: None,
+            };
+            async move {
+                store
+                    .list_items(&conv, params)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| item.id.0)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(list(SortOrder::Asc).await, ["msg_b", "msg_a"]);
+        assert_eq!(list(SortOrder::Desc).await, ["msg_a", "msg_b"]);
+
+        // One link per item: the delete takes the item out of the conversation entirely.
+        store.delete_item(&conv, &ids[0]).await.unwrap();
+        assert!(!store.is_item_linked(&conv, &ids[0]).await.unwrap());
+        assert_eq!(list(SortOrder::Asc).await, ["msg_b"]);
     }
 }
