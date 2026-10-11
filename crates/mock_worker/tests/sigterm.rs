@@ -25,6 +25,8 @@ use futures::StreamExt;
 use serde_json::json;
 use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
 
+mod common;
+
 const BIN: &str = env!("CARGO_BIN_EXE_mock-worker");
 
 /// The binary under test: this build's, or the one `MOCK_WORKER_BIN` names
@@ -253,7 +255,7 @@ async fn sigterm_lets_the_streams_in_flight_finish_then_exits_zero() {
         first.response,
         Some(ts::generate_response::Response::Chunk(_))
     ));
-    let http = reqwest::Client::new()
+    let http = common::http_client()
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
             mock.http_port
