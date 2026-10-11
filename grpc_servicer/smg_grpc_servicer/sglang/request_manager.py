@@ -41,6 +41,8 @@ from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
+from smg_grpc_servicer.trace_context import trace_headers
+
 logger = logging.getLogger(__name__)
 
 
@@ -254,6 +256,10 @@ class GrpcRequestManager:
 
         # disaggregation mode
         self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
+        # Tracing: each request's trace starts from the Router's context in the
+        # call's metadata (as the tokenizer manager starts it from an HTTP
+        # request's headers), see `_req_stats_init`.
+        self.enable_trace = _tracing_enabled()
 
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
@@ -1149,8 +1155,16 @@ class GrpcRequestManager:
         calibrate_time_diff()
         # Create and register request state
         # TODO: support log_request
-        # TODO: support request tracing
         time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+        if self.enable_trace:
+            # The request's trace starts from the Router's W3C context in the
+            # call's metadata, as the tokenizer manager starts it from an HTTP
+            # request's headers: the engine's spans for the request become
+            # children of the Router's span.
+            metadata = grpc_context.invocation_metadata() if grpc_context is not None else ()
+            time_stats.init_trace_ctx(
+                obj.rid, getattr(obj, "bootstrap_room", None), trace_headers(metadata)
+            )
         state = GrpcReqState(
             request_id=obj.rid,
             grpc_context=grpc_context,
@@ -1168,6 +1182,48 @@ class GrpcRequestManager:
 
         self.rid_to_state[obj.rid] = state
         time_stats.set_created_time()
+        if self.enable_trace:
+            # The Router tokenized upstream: the tokenize slice the stats open
+            # with ends at once. The scheduler takes the stats over on its copy
+            # of the request, as it does behind the tokenizer manager, so its
+            # slices join the same trace.
+            time_stats.set_tokenize_finish_time()
+            obj.time_stats = time_stats
+
+
+def _tracing_enabled() -> bool:
+    """Whether the engine was started with tracing (``--enable-trace``), from
+    the runtime context this process published."""
+    try:
+        from sglang.srt.runtime_context import get_observability
+    except ImportError:  # an SGLang without the observability bag: no tracing
+        return False
+    return bool(get_observability().enable_trace)
+
+
+def init_request_tracing(thread_label: str = "gRPC Servicer") -> bool:
+    """Initialize SGLang's tracing in this process when the engine was started
+    with it, as SGLang's own HTTP frontend does in the process that fills the
+    tokenizer manager's role: the request manager starts each request's trace
+    (`GrpcRequestManager._req_stats_init`). Returns whether tracing is on."""
+    if not _tracing_enabled():
+        return False
+    from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+    from sglang.srt.runtime_context import get_disagg, get_observability
+
+    observability = get_observability()
+    process_tracing_init(
+        observability.otlp_traces_endpoint,
+        observability.otlp_service_name,
+        trace_modules=observability.trace_modules,
+    )
+    mode = get_disagg().disaggregation_mode
+    if mode == "prefill":
+        thread_label = "Prefill " + thread_label
+    elif mode == "decode":
+        thread_label = "Decode " + thread_label
+    trace_set_thread_info(thread_label)
+    return True
 
 
 async def print_exception_wrapper(func):

@@ -4,6 +4,8 @@
 // with the class-name tag string as element 0. **Field order is the wire
 // contract** — do not reorder.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use serde::{
     de::{IgnoredAny, SeqAccess, Visitor},
@@ -95,6 +97,35 @@ pub struct TokenizedGenerateReqInput {
     /// Hybrid-reasoning request: the scheduler tracks the reasoning phase and
     /// accounts its tokens separately.
     pub require_reasoning: bool,
+    /// The caller's W3C trace context (`traceparent`, `tracestate`) for the
+    /// engine's tracer. Not a slot of the scheduler's struct (its own
+    /// `time_stats` slot is a pickled object no frontend outside Python can
+    /// fill): it rides in the request's metadata frame after the positional
+    /// array, see [`RequestMeta`]. Never serialized into the array.
+    pub trace_headers: Option<BTreeMap<String, String>>,
+}
+
+/// What rides beside an ADD's positional request, as one more msgpack frame
+/// (a map, every key optional): the request's metadata the scheduler's own
+/// struct has no slot for. The plugin in the scheduler reads it; a scheduler
+/// without the plugin's reader ignores the extra frame. Absent when empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RequestMeta {
+    /// The caller's W3C trace context (`traceparent`, `tracestate`): the
+    /// plugin starts the request's trace from it, as SGLang's own frontend
+    /// starts it from an HTTP request's headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_headers: Option<BTreeMap<String, String>>,
+}
+
+impl RequestMeta {
+    /// The metadata frame for `request`, or `None` when there is nothing to
+    /// carry.
+    pub fn for_request(request: &TokenizedGenerateReqInput) -> Option<Self> {
+        request.trace_headers.as_ref().map(|headers| Self {
+            trace_headers: Some(headers.clone()),
+        })
+    }
 }
 
 impl TokenizedGenerateReqInput {
@@ -120,6 +151,7 @@ impl Default for TokenizedGenerateReqInput {
             lora_id: None,
             custom_logit_processor: None,
             require_reasoning: false,
+            trace_headers: None,
         }
     }
 }
@@ -242,6 +274,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     lora_id,
                     custom_logit_processor,
                     require_reasoning,
+                    trace_headers: None,
                 })
             }
         }
@@ -587,6 +620,43 @@ mod tests {
         let back: TokenizedGenerateReqInput =
             decode_msgpack(&encode_msgpack(&request).unwrap()).unwrap();
         assert_eq!(back, request);
+    }
+
+    #[test]
+    fn trace_headers_ride_as_the_metadata_frame_not_the_positional_array() {
+        use crate::protocol::{sglang::SglangProtocol, EngineProtocol};
+
+        let headers = BTreeMap::from([
+            ("traceparent".to_string(), "00-aa-bb-01".to_string()),
+            ("tracestate".to_string(), "vendor=a".to_string()),
+        ]);
+        let plain = TokenizedGenerateReqInput {
+            rid: "t1".to_string(),
+            input_ids: vec![1, 2],
+            ..TokenizedGenerateReqInput::default()
+        };
+        let traced = TokenizedGenerateReqInput {
+            trace_headers: Some(headers.clone()),
+            ..plain.clone()
+        };
+        let (plain_payload, plain_aux) =
+            SglangProtocol::encode_add(&SglangRequest::Generate(plain)).unwrap();
+        let (payload, aux) = SglangProtocol::encode_add(&SglangRequest::Generate(traced)).unwrap();
+        // The scheduler's own array is byte-identical: the context never enters it.
+        assert_eq!(payload, plain_payload);
+        assert!(plain_aux.is_empty());
+        assert_eq!(aux.len(), 1, "one metadata frame");
+        let meta_frame = &aux[0];
+        let meta: RequestMeta = decode_msgpack(meta_frame.as_ref()).unwrap();
+        assert_eq!(meta.trace_headers, Some(headers));
+        // On the wire the frame is a map keyed by name, as the plugin reads it.
+        let raw: BTreeMap<String, BTreeMap<String, String>> =
+            decode_msgpack(meta_frame.as_ref()).unwrap();
+        assert_eq!(raw["trace_headers"]["traceparent"], "00-aa-bb-01");
+        // A decoded request never carries one: the array has no slot for it.
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&payload).unwrap();
+        assert_eq!(decoded.trace_headers, None);
+        assert!(RequestMeta::for_request(&decoded).is_none());
     }
 
     #[test]

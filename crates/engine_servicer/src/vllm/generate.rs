@@ -19,7 +19,7 @@ use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tokio::sync::oneshot;
-use tonic::{metadata::MetadataMap, Status};
+use tonic::Status;
 
 use super::{media::process_media_refs, State};
 use crate::{
@@ -29,7 +29,9 @@ use crate::{
 };
 
 /// Handle one `Generate` request against the connected engine.
-/// `trace_headers` is the caller's W3C trace context (see [`trace_headers`]).
+/// `trace_headers` is the caller's W3C trace context (see
+/// [`crate::trace_context::trace_headers`]), handed to the engine request in
+/// the shape vLLM's own frontend hands its tracer.
 pub(super) async fn generate(
     state: &Arc<State>,
     req: vllm::GenerateRequest,
@@ -40,20 +42,6 @@ pub(super) async fn generate(
         return Err(Status::invalid_argument("request_id is required"));
     }
     submit(state, client, req, trace_headers).await
-}
-
-/// The W3C trace context the Router sent in the call's metadata, in the
-/// shape vLLM's own frontend hands its tracer: the `trace_headers` of the
-/// engine request. `None` when the call carries no context.
-pub(super) fn trace_headers(metadata: &MetadataMap) -> Option<BTreeMap<String, String>> {
-    let headers: BTreeMap<String, String> = ["traceparent", "tracestate"]
-        .into_iter()
-        .filter_map(|name| {
-            let value = metadata.get(name)?.to_str().ok()?;
-            Some((name.to_string(), value.to_string()))
-        })
-        .collect();
-    (!headers.is_empty()).then_some(headers)
 }
 
 /// The rejection notice a refused PD decode leg owes its prefill side, so the

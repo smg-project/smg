@@ -5,7 +5,7 @@
 //! them itself; the servicer has no stop matcher of its own.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -22,9 +22,13 @@ use super::State;
 use crate::{requests::Registration, BoxStream};
 
 /// Handle one `Generate` request against the connected scheduler.
+/// `trace_headers` is the caller's W3C trace context (see
+/// [`crate::trace_context::trace_headers`]), carried to the scheduler beside
+/// each choice's request so the engine's spans join the Router's trace.
 pub(super) async fn generate(
     state: &Arc<State>,
     req: sg::GenerateRequest,
+    trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
     let client = state.engine()?;
     if req.request_id.is_empty() {
@@ -44,7 +48,9 @@ pub(super) async fn generate(
     // entry, and a duplicate id is refused up front.
     let (registration, cancel) = state.registry.register(&request_id)?;
     let streaming = req.stream;
-    let subs = client.generate_sglang_streams(req).await?;
+    let subs = client
+        .generate_sglang_streams_with_trace(req, trace_headers)
+        .await?;
     let mut choices = SelectAll::new();
     for sub in subs {
         choices.push(ChoiceStream {

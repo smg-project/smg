@@ -29,7 +29,7 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<vllm::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let trace_headers = generate::trace_headers(request.metadata());
+        let trace_headers = crate::trace_context::trace_headers(request.metadata());
         generate::generate(&self.state, request.into_inner(), trace_headers)
             .await
             .map(Response::new)

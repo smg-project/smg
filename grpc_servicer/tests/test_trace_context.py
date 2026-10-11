@@ -1,6 +1,6 @@
-"""The Router's trace context reaches vLLM's tracer (engine-free, no vLLM required)."""
+"""The Router's trace context, read off a call's metadata (engine-free)."""
 
-from smg_grpc_servicer.vllm.trace_context import trace_headers
+from smg_grpc_servicer.trace_context import trace_headers
 
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 

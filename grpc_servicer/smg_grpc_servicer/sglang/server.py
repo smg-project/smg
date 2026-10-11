@@ -29,7 +29,7 @@ from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
-from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager
+from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, serve_rust, servicer_impl_source
 from smg_grpc_servicer.sglang.scheduler_launcher import (
     launch_scheduler_process_only,
@@ -135,6 +135,12 @@ async def serve_grpc(
     # Re-publish is last-publish-wins upstream, so this is safe if the caller
     # already published.
     publish(server_args, role="tokenizer")
+
+    # Tracing, as SGLang's own HTTP frontend initializes it in the process that
+    # fills the tokenizer manager's role: the request manager starts each
+    # request's trace from the Router's context in the call's metadata.
+    if init_request_tracing():
+        logger.info("Request tracing enabled: the engine's spans join the Router's trace")
 
     # Start bootstrap server BEFORE launching scheduler processes (only in PREFILL mode)
     # This ensures the bootstrap server is ready when prefill schedulers try to register

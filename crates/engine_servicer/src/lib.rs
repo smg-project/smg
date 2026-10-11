@@ -35,6 +35,7 @@ mod stop_match;
 mod testing;
 mod tokenizer_bundle;
 pub mod tokenspeed;
+mod trace_context;
 pub mod vllm;
 
 use std::{pin::Pin, time::Duration};

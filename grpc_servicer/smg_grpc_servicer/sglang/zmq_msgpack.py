@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import zmq
 
+from smg_grpc_servicer.sglang.request_traces import TRACE_HEADERS_KEY, RequestTraces
+
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
         BatchEmbeddingOutput,
@@ -407,6 +409,7 @@ _ENC = msgspec.msgpack.Encoder()
 _DEC_ABORT = msgspec.msgpack.Decoder(list[str])
 _DEC_CONTROL = msgspec.msgpack.Decoder(tuple[int, str, list])
 _DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
+_DEC_META = msgspec.msgpack.Decoder(dict)
 _DEC_ADD: msgspec.msgpack.Decoder | None = None
 
 
@@ -489,18 +492,35 @@ def decode_init(payload: bytes) -> WireHandshakeInitMessage:
     return _DEC_INIT.decode(payload)
 
 
-def decode_request_frames(frames: list[bytes]) -> list:
+def request_meta(frame: bytes) -> dict:
+    """An ADD's metadata frame: what the scheduler's own struct has no slot
+    for (the caller's W3C trace context under ``trace_headers``), a msgpack
+    map with every key optional. A frame this side cannot read counts as
+    empty: the request itself is intact."""
+    try:
+        meta = _DEC_META.decode(frame)
+    except Exception as exc:
+        logger.warning("zmq msgpack: ignoring an unreadable request metadata frame: %s", exc)
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def decode_request_frames(frames: list[bytes], traces: RequestTraces | None = None) -> list:
     """Decode one ``[type_byte, payload, *aux]`` message into io_structs. An
-    ADD yields exactly one request (generation or embedding); an ABORT may
-    carry several request ids and yields one ``AbortReq`` each; a CONTROL
-    yields the scheduler's control request for the call."""
+    ADD yields exactly one request (generation or embedding), and starts its
+    trace in ``traces`` when a metadata frame carries the caller's context;
+    an ABORT may carry several request ids and yields one ``AbortReq`` each;
+    a CONTROL yields the scheduler's control request for the call."""
     from sglang.srt.managers.io_struct import AbortReq
 
     if len(frames) < 2:
         raise ValueError(f"request needs >= 2 frames (type, payload), got {len(frames)}")
     type_byte = bytes(frames[0])
     if type_byte == REQ_TYPE_ADD:
-        return [_request_decoder().decode(frames[1])]
+        request = _request_decoder().decode(frames[1])
+        if traces is not None and len(frames) > 2:
+            traces.attach(request, request_meta(frames[2]).get(TRACE_HEADERS_KEY))
+        return [request]
     if type_byte == REQ_TYPE_ABORT:
         return [AbortReq(rid=rid) for rid in _DEC_ABORT.decode(frames[1])]
     if type_byte == REQ_TYPE_CONTROL:
@@ -556,6 +576,9 @@ class MsgpackSendSocket:
         # scheduler was not; the receiver's next drain aborts them there.
         self.pending_aborts: deque[str] = deque()
         self._relay_failures_logged: set[tuple[str, str]] = set()
+        # The traces of the requests in flight (started by the receiver from
+        # the caller's context, ended here on the terminal output).
+        self.traces = RequestTraces()
 
     def attach(
         self,
@@ -658,12 +681,14 @@ class MsgpackSendSocket:
                     output, engine_index=self.engine_index, **self._load_tail()
                 )
             )
+            self.traces.finish_batch(output.rids, getattr(output, "finished_reasons", None) or [])
         elif isinstance(output, BatchEmbeddingOutput):
             self._send_slim(
                 BatchEmbeddingSlimOutput.from_full(
                     output, engine_index=self.engine_index, **self._load_tail()
                 )
             )
+            self.traces.finish_batch(output.rids, getattr(output, "finished_reasons", None) or [])
         elif isinstance(output, (FlushCacheReqOutput, ProfileReqOutput)):
             # The scheduler hands the answered request back; its rid names
             # the call. A reply for a request this side did not issue (the
@@ -713,6 +738,7 @@ class MsgpackSendSocket:
                 **self._load_tail(),
             )
         )
+        self.traces.finish(rid)
 
     def send_engine_dead(self) -> None:
         """Best-effort ENGINE_CORE_DEAD on shutdown or crash; never raises."""
@@ -751,11 +777,15 @@ class MsgpackRecvSocket:
         tokenizer: object | None = None,
         control_reply: Callable[[int, bool, str | None], None] | None = None,
         pending_aborts: deque[str] | None = None,
+        traces: RequestTraces | None = None,
     ) -> None:
         self.socket = socket
         self._vocab_size = vocab_size
         self._reject = reject
         self._control_reply = control_reply
+        # The sender's registry of request traces: an ADD's metadata frame
+        # starts one, the terminal output ends it.
+        self._traces = traces
         # The sender's queue of requests it already ended on SMG's side.
         self._pending_aborts = pending_aborts if pending_aborts is not None else deque()
         # The scheduler's tokenizer when it keeps one (grammar-constrained
@@ -806,7 +836,7 @@ class MsgpackRecvSocket:
                 break
             frames = [frame.buffer for frame in frames]
             try:
-                decoded = decode_request_frames(frames)
+                decoded = decode_request_frames(frames, self._traces)
             except ControlError as exc:
                 logger.warning("zmq msgpack: control call %d refused: %s", exc.call_id, exc)
                 if self._control_reply is not None:
@@ -933,6 +963,7 @@ def connect_msgpack_engine(
         tokenizer,
         control_reply=sender.send_control_reply,
         pending_aborts=sender.pending_aborts,
+        traces=sender.traces,
     )
 
 

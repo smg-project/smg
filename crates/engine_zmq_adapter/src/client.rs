@@ -708,6 +708,19 @@ impl ZmqEngineClient {
         &self,
         req: sglang_proto::GenerateRequest,
     ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
+        self.generate_sglang_streams_with_trace(req, None).await
+    }
+
+    /// [`generate_sglang_streams`](Self::generate_sglang_streams) with the
+    /// caller's W3C trace context: `trace_headers` ride beside every choice's
+    /// request (the scheduler's struct has no slot for them; the plugin in
+    /// the scheduler starts the request's trace from them), so the engine's
+    /// spans join the caller's trace as they do behind SGLang's own frontend.
+    pub async fn generate_sglang_streams_with_trace(
+        &self,
+        req: sglang_proto::GenerateRequest,
+        trace_headers: Option<BTreeMap<String, String>>,
+    ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
         let ZmqBackend::Sglang(client) = &self.backend else {
             return Err(tonic::Status::internal(
                 "this ZMQ backend is not an SGLang scheduler",
@@ -715,7 +728,9 @@ impl ZmqEngineClient {
         };
         let mut streams = Vec::new();
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
-            let request = translate_request_sglang(sub).map_err(tonic::Status::invalid_argument)?;
+            let mut request =
+                translate_request_sglang(sub).map_err(tonic::Status::invalid_argument)?;
+            request.trace_headers.clone_from(&trace_headers);
             let stream = client
                 .submit(SglangRequest::Generate(request))
                 .await

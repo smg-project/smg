@@ -3,7 +3,10 @@
 //! answers with `BatchTokenIDSlimOutput` batches, as the SMG plugin inside a
 //! headless scheduler does.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use engine_zmq_client::{
@@ -14,7 +17,9 @@ use engine_zmq_client::{
     },
     protocol::sglang::{
         output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop},
-        request::{SglangRequestType, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
+        request::{
+            RequestMeta, SglangRequestType, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput,
+        },
     },
     EngineId,
 };
@@ -1524,4 +1529,69 @@ async fn startup_timeout_keeps_the_server_up_and_reports_the_error() {
         .await;
     assert_eq!(generate.err().map(|s| s.code()), Some(Code::Unavailable));
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The Router's W3C trace context (gRPC metadata) rides to the scheduler as
+/// the request's metadata frame beside the positional array, which stays the
+/// scheduler's own struct; a call without the context sends no such frame.
+#[tokio::test]
+async fn trace_context_metadata_reaches_the_scheduler_beside_the_request() {
+    const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let mut h = harness(model_info()).await;
+    let mut request = tonic::Request::new(generate_request("tr1", false, Vec::new()));
+    request
+        .metadata_mut()
+        .insert("traceparent", TRACEPARENT.parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("tracestate", "vendor=a".parse().unwrap());
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    let sent: TokenizedGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+    assert_eq!(sent.rid, "tr1");
+    assert_eq!(frames.len(), 3, "the metadata frame follows the request");
+    let meta: RequestMeta = decode_msgpack(frames[2].as_ref()).unwrap();
+    assert_eq!(
+        meta.trace_headers,
+        Some(BTreeMap::from([
+            ("traceparent".to_string(), TRACEPARENT.to_string()),
+            ("tracestate".to_string(), "vendor=a".to_string()),
+        ]))
+    );
+    send(
+        &mut h.engine_out,
+        &batch("tr1", vec![7], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "length"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut stream = h
+        .client
+        .generate(generate_request("tr2", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    assert_eq!(frames.len(), 2, "no metadata frame without a context");
+    send(
+        &mut h.engine_out,
+        &batch("tr2", vec![7], 1, Some("length"), None),
+    )
+    .await;
+    complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

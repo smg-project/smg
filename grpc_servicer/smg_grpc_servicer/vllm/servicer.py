@@ -34,6 +34,7 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
 from smg_grpc_servicer.vllm.errors import grpc_code_for
@@ -75,7 +76,6 @@ from smg_grpc_servicer.vllm.model_info import (
     server_facts,
     structured_outputs_start,
 )
-from smg_grpc_servicer.vllm.trace_context import trace_headers
 
 from .mm_keys import (
     batches_missing_pixels,

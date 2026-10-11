@@ -89,6 +89,7 @@ def server_mod(monkeypatch):
         "smg_grpc_servicer.sglang.request_manager": _module(
             "smg_grpc_servicer.sglang.request_manager",
             GrpcRequestManager=object,
+            init_request_tracing=lambda: False,
         ),
         "smg_grpc_servicer.sglang.scheduler_launcher": _module(
             "smg_grpc_servicer.sglang.scheduler_launcher",
@@ -466,3 +467,29 @@ def test_failed_startup_cleanup_runs_in_reverse_ownership_order(monkeypatch, ser
 
     assert events == ["health", "server", "schedulers", "manager"]
     terminate_scheduler_processes.assert_called_once_with(scheduler_procs)
+
+
+def test_request_tracing_initializes_after_the_runtime_context_is_published(
+    monkeypatch, server_mod
+):
+    """smg-lab#182: the Python servicer initializes SGLang's tracing in its
+    own process (as SGLang's HTTP frontend does) once the runtime context is
+    published and before anything else starts; the request manager then
+    starts each request's trace from the Router's context."""
+    events = []
+    monkeypatch.setattr(server_mod, "publish", lambda _args, role: events.append(f"publish:{role}"))
+
+    def init_tracing():
+        events.append("tracing")
+        return True
+
+    async def stop_here(**_kwargs):
+        events.append("launch")
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(server_mod, "init_request_tracing", init_tracing)
+    monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", stop_here)
+    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    with pytest.raises(RuntimeError, match="stop here"):
+        asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="null")))
+    assert events == ["publish:tokenizer", "tracing", "launch"]

@@ -13,9 +13,11 @@
 //! The scheduler joins SMG's transport through the SGLang plugin that ships
 //! in `smg_grpc_servicer.sglang` (no SGLang change): it dials the handshake,
 //! decodes `[type_byte, payload]` requests (`ADD = 0x00`, `ABORT = 0x01`, the
-//! abort payload a plain msgpack `list[str]` of request ids) and answers with
-//! that plugin's [`output::BatchTokenIDSlimOutput`]: the token columns a
-//! frontend that detokenizes itself needs, plus a scheduler-load tail.
+//! abort payload a plain msgpack `list[str]` of request ids; an ADD may carry
+//! one more frame, the request's metadata map, see [`request::RequestMeta`])
+//! and answers with that plugin's [`output::BatchTokenIDSlimOutput`]: the
+//! token columns a frontend that detokenizes itself needs, plus a
+//! scheduler-load tail.
 //!
 //! The positional-array helpers (`next_field`, `expect_tag`, `drain_trailing`)
 //! are shared with the TokenSpeed dialect, whose structs follow the same
@@ -33,7 +35,7 @@ use crate::{
     protocol::{
         sglang::{
             output::{SglangOutput, SglangWireOutput},
-            request::{SglangRequest, SglangRequestType},
+            request::{RequestMeta, SglangRequest, SglangRequestType},
         },
         EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
     },
@@ -72,7 +74,18 @@ impl EngineProtocol for SglangProtocol {
     }
 
     fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        Ok((encode_msgpack(request)?, Vec::new()))
+        let payload = encode_msgpack(request)?;
+        // The request's metadata (the caller's trace context) rides as one
+        // more frame: the positional array is the scheduler's own struct.
+        let meta = match request {
+            SglangRequest::Generate(request) => RequestMeta::for_request(request),
+            SglangRequest::Embed(_) => None,
+        };
+        let aux_frames = match meta {
+            Some(meta) => vec![Bytes::from(encode_msgpack(&meta)?)],
+            None => Vec::new(),
+        };
+        Ok((payload, aux_frames))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
