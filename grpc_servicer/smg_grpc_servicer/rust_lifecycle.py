@@ -224,7 +224,12 @@ class EngineProcessGroup:
         other cores down (what vLLM's own liveness monitor does)."""
         codes = [engine.poll() for engine in self._engines]
         if self._exit_code is None:
-            self._exit_code = next((code for code in codes if code is not None), None)
+            # Only a code that was found is stored: a fault reported from the
+            # ready thread or a signal handler between the check and the store
+            # must not be written over with None.
+            code = next((code for code in codes if code is not None), None)
+            if code is not None:
+                self._exit_code = code
         if self._exit_code is not None and None in codes:
             self._shutdown()
         return self._exit_code

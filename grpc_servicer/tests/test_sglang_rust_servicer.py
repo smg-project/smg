@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 from smg_grpc_servicer import rust_lifecycle
-from smg_grpc_servicer.sglang import plugin, rust
+from smg_grpc_servicer.sglang import plugin, rust, zmq_plugin
 
 
 def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
@@ -493,6 +493,10 @@ def _stub_rank_launch(monkeypatch, *, ranks: int = 2) -> dict:
         publish=lambda args, role: recorded["calls"].append(f"publish:{role}"),
     )
     _install(monkeypatch, "sglang.srt.server_args", PortArgs=PortArgs)
+    # The launch writes the plugin's two variables straight into the
+    # environment; registered here so the teardown puts their absence back.
+    monkeypatch.setenv(zmq_plugin.HANDSHAKE_ENV, "")
+    monkeypatch.setenv(zmq_plugin.ENGINE_INDEX_ENV, "")
     # SGLang's own setup sets the spawn method; the launcher's guard reads it
     # and must not switch this test process over.
     recorded["start_method_calls"] = []
