@@ -18,6 +18,7 @@ use axum::{
     response::Response,
 };
 use http_body::Body as _;
+use openai_protocol::validated::RejectionCode;
 use tower::{Layer, Service};
 
 use crate::{
@@ -27,6 +28,22 @@ use crate::{
     },
     routers::error::extract_error_code_from_response,
 };
+
+/// The `error_code` label of a response: the code the gateway's error builder
+/// set, else the code of a body the JSON extractor refused (its envelope is
+/// built in the protocols crate, outside the builder), else `""` (a success,
+/// or an upstream body: an upstream's `X-SMG-Error-Code` header is never read,
+/// so forged codes cannot grow the label set).
+pub(crate) fn error_code_label(response: &Response) -> &str {
+    let code = extract_error_code_from_response(response);
+    if !code.is_empty() {
+        return code;
+    }
+    response
+        .extensions()
+        .get::<RejectionCode>()
+        .map_or("", |code| code.0.as_str())
+}
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
 #[derive(Clone)]
@@ -98,7 +115,7 @@ where
             Metrics::record_http_response(
                 &path,
                 response.status().as_u16(),
-                extract_error_code_from_response(&response),
+                error_code_label(&response),
             );
             Metrics::record_http_duration(method, &path, duration);
 
@@ -265,6 +282,51 @@ mod tests {
     async fn unmatched_path_collapses_to_other() {
         // An unmatched path must collapse to "other", not echo the raw URI.
         assert_eq!(label_at_layer("/totally/unregistered/aaaa").await, "other");
+    }
+
+    /// A body the JSON extractor refused is labelled with the code its envelope
+    /// shows (the extractor builds the envelope outside the gateway's error
+    /// builder); the builder's own code keeps precedence; a success has none.
+    #[tokio::test]
+    async fn validation_rejections_carry_their_code_in_the_metric_label() {
+        use axum::{http::header::CONTENT_TYPE, response::IntoResponse, routing::post};
+        use openai_protocol::{chat::ChatCompletionRequest, validated::ValidatedJson};
+
+        use crate::routers::error::create_error;
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|ValidatedJson(_): ValidatedJson<ChatCompletionRequest>| async { "ok" }),
+        );
+        for (body, code) in [
+            (
+                r#"{"model":"m","messages":[{"role":"user","con"#,
+                "json_parse_error",
+            ),
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#,
+                "integer_below_min_value",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(error_code_label(&response), code, "{body}");
+        }
+        let built = create_error(http::StatusCode::NOT_FOUND, "model_not_found", "no");
+        assert_eq!(error_code_label(&built), "model_not_found");
+        let ok: Response = "ok".into_response();
+        assert_eq!(error_code_label(&ok), "");
     }
 
     #[tokio::test]

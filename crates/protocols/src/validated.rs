@@ -47,12 +47,22 @@ use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKin
 #[cfg(feature = "axum")]
 pub struct ValidatedJson<T>(pub T);
 
+/// The `error.code` of a body this extractor refused, carried as a response
+/// extension: the gateway's HTTP metrics read it when a response did not come
+/// from the gateway's own error builder, so the `error_code` label records the
+/// code the client sees (`json_parse_error`, `integer_below_min_value`, ...).
+/// The codes are the extractor's own fixed set, never client input.
+#[cfg(feature = "axum")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectionCode(pub String);
+
 /// The gateway's JSON error envelope for a rejected request body: the public
 /// API's shape (`message`, `type`, `param`, `code`), `code` a string and
-/// `param` the offending field when one is known.
+/// `param` the offending field when one is known; the code also rides on the
+/// response as a [`RejectionCode`] extension.
 #[cfg(feature = "axum")]
 fn rejection(status: StatusCode, code: &str, param: Option<String>, message: String) -> Response {
-    (
+    let mut response = (
         status,
         Json(json!({
             "error": {
@@ -63,7 +73,11 @@ fn rejection(status: StatusCode, code: &str, param: Option<String>, message: Str
             }
         })),
     )
-        .into_response()
+        .into_response();
+    response
+        .extensions_mut()
+        .insert(RejectionCode(code.to_string()));
+    response
 }
 
 /// The axum prefix of a body that deserialized into the wrong shape; the rest
@@ -450,6 +464,32 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    /// A rejection carries its code as the `RejectionCode` extension (the
+    /// gateway's metrics read it), the same code the envelope shows.
+    #[tokio::test]
+    async fn rejections_carry_their_code_as_an_extension() {
+        for (body, code) in [
+            (r#"{"value":0.5,"name":"x","tier":"vi"#, "json_parse_error"),
+            (r#"{"value":1.5,"name":"x"}"#, "decimal_above_max_value"),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_default();
+            let response = ValidatedJson::<BodyRequest>::from_request(request, &())
+                .await
+                .err()
+                .expect("rejected");
+            assert_eq!(
+                response.extensions().get::<RejectionCode>(),
+                Some(&RejectionCode(code.to_string())),
+                "{body}"
+            );
+        }
     }
 
     /// (status, type, code, param) of a rejection; `code` must be a string
