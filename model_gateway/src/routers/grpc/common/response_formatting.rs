@@ -10,37 +10,85 @@ use openai_protocol::common::Usage;
 
 use crate::routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateStreamChunk};
 
-/// Build usage information from collected gRPC responses
+/// The token counters of one request, aggregated over its choices the way
+/// the engines report them. The `n>1` choices of a chat/generate request
+/// share exactly one prompt, and `cached_tokens` is a property of that same
+/// prompt (how much of it hit the KV cache), so `prompt` and `cached` take
+/// the max over the choices: summing would charge the prompt once per choice
+/// instead of once per request. Each choice is its own generation, so
+/// `completion`, `reasoning` (each choice's own reasoning trace) and the
+/// speculative counts sum. (Completion's own batched usage computation does
+/// this per prompt and sums across prompts.)
 ///
-/// Sums completion_tokens (and reasoning_tokens, each choice's own
-/// independent reasoning trace) across all responses, since each is a
-/// distinct generation. `prompt_tokens` and `cached_tokens` take the max
-/// instead: chat/generate requests have exactly one prompt shared by every
-/// `n>1` choice -- cached_tokens is a property of that same prompt (how much
-/// of it hit the KV cache), not of the individual completion -- and each
-/// response reports that same full length, so summing would charge it once
-/// per choice instead of once per request (Completion's own batched usage
-/// computation already does this correctly per-prompt; mirrored here).
-pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
-    let total_prompt_tokens: u32 = responses
-        .iter()
-        .map(|r| r.prompt_tokens())
-        .max()
-        .unwrap_or(0);
-    let total_completion_tokens: u32 = responses.iter().map(|r| r.completion_tokens()).sum();
-    let total_cached_tokens: u32 = responses
-        .iter()
-        .map(|r| r.cached_tokens())
-        .max()
-        .unwrap_or(0);
-    let total_reasoning_tokens: u32 = responses.iter().map(|r| r.reasoning_tokens()).sum();
-    let total_spec_accepted: u32 = responses.iter().map(|r| r.spec_accepted_tokens()).sum();
-    let total_spec_drafted: u32 = responses.iter().map(|r| r.spec_draft_tokens()).sum();
+/// Every path that aggregates the engine's frames itself builds its usage
+/// from these counters, so the streamed and the non-streamed answer of a
+/// request carry one and the same usage object.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenCounts {
+    pub prompt: u32,
+    pub completion: u32,
+    pub cached: u32,
+    pub reasoning: u32,
+    pub spec_accepted: u32,
+    pub spec_drafted: u32,
+}
 
-    Usage::from_counts(total_prompt_tokens, total_completion_tokens)
-        .with_cached_tokens(total_cached_tokens)
-        .with_reasoning_tokens(total_reasoning_tokens)
-        .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
+impl TokenCounts {
+    /// The counters of the `Complete` frames of one request.
+    pub(crate) fn of(responses: &[ProtoGenerateComplete]) -> Self {
+        Self {
+            prompt: responses
+                .iter()
+                .map(|r| r.prompt_tokens())
+                .max()
+                .unwrap_or(0),
+            completion: responses.iter().map(|r| r.completion_tokens()).sum(),
+            cached: responses
+                .iter()
+                .map(|r| r.cached_tokens())
+                .max()
+                .unwrap_or(0),
+            reasoning: responses.iter().map(|r| r.reasoning_tokens()).sum(),
+            spec_accepted: responses.iter().map(|r| r.spec_accepted_tokens()).sum(),
+            spec_drafted: responses.iter().map(|r| r.spec_draft_tokens()).sum(),
+        }
+    }
+
+    /// The usage object the counters make: the counts with the cached,
+    /// reasoning and speculative details the engine reported. The usage of
+    /// a legacy completion, streamed or not, is this object.
+    pub(crate) fn usage(self) -> Usage {
+        Usage::from_counts(self.prompt, self.completion)
+            .with_cached_tokens(self.cached)
+            .with_reasoning_tokens(self.reasoning)
+            .with_speculative_tokens(self.spec_accepted, self.spec_drafted)
+    }
+}
+
+/// Build usage information from collected gRPC responses (the
+/// [`TokenCounts`] aggregation of their counters).
+pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
+    TokenCounts::of(responses).usage()
+}
+
+/// The usage of a chat completion from `engine_usage`, the usage the
+/// engine's counters make: the rendered prompt tokens the provider does not
+/// bill are dropped, the reasoning the gateway's own parser split off is
+/// accounted (`parsed_reasoning`, see `with_parsed_reasoning_tokens`), and
+/// every detail counter is present as the OpenAI API sends it on every chat
+/// completion, zero where nothing was counted. The streamed answer's usage
+/// chunk and the non-streamed answer both build their usage here, so a
+/// request's two usage objects are the same.
+pub(crate) fn chat_usage(
+    engine_usage: Usage,
+    parsed_reasoning: Option<u32>,
+    unbilled_prompt_tokens: u32,
+) -> Usage {
+    with_parsed_reasoning_tokens(
+        engine_usage.with_unbilled_prompt_tokens(unbilled_prompt_tokens),
+        parsed_reasoning,
+    )
+    .with_complete_details()
 }
 
 /// Account for the reasoning the gateway's own reasoning parser split off:
@@ -48,7 +96,7 @@ pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
 /// for the request, `None` when it did not run. Like an engine with a
 /// reasoning parser, the details are then always reported, zero included; an
 /// engine that counts reasoning itself is not overruled, whatever its count.
-pub(crate) fn with_parsed_reasoning_tokens(mut usage: Usage, parsed: Option<u32>) -> Usage {
+fn with_parsed_reasoning_tokens(mut usage: Usage, parsed: Option<u32>) -> Usage {
     if let Some(parsed) = parsed {
         let details = usage.completion_tokens_details.get_or_insert_default();
         details.reasoning_tokens.get_or_insert(parsed);
@@ -213,6 +261,64 @@ mod tests {
             reasoning_tokens(with_parsed_reasoning_tokens(engine_counted_fewer, Some(5))),
             Some(3),
             "nor when its count is lower than the parser's"
+        );
+    }
+
+    #[test]
+    fn token_counts_usage_carries_the_cached_reasoning_and_speculative_details() {
+        let usage = TokenCounts {
+            prompt: 10,
+            completion: 5,
+            cached: 4,
+            reasoning: 3,
+            spec_accepted: 2,
+            spec_drafted: 3,
+        }
+        .usage();
+
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|details| details.cached_tokens),
+            Some(4)
+        );
+        let details = usage
+            .completion_tokens_details
+            .expect("the reasoning and speculative details");
+        assert_eq!(details.reasoning_tokens, Some(3));
+        assert_eq!(details.accepted_prediction_tokens, Some(2));
+        assert_eq!(details.rejected_prediction_tokens, Some(1));
+    }
+
+    #[test]
+    fn chat_usage_has_every_detail_counter_and_no_unbilled_prompt_tokens() {
+        let usage = serde_json::to_value(chat_usage(build_usage(&[complete(10, 8, 4)]), None, 3))
+            .expect("a JSON usage");
+        assert_eq!(
+            usage,
+            serde_json::json!({
+                "prompt_tokens": 7,
+                "completion_tokens": 4,
+                "total_tokens": 11,
+                "prompt_tokens_details": {"cached_tokens": 7, "audio_tokens": 0},
+                "completion_tokens_details": {
+                    "reasoning_tokens": 0,
+                    "audio_tokens": 0,
+                    "accepted_prediction_tokens": 0,
+                    "rejected_prediction_tokens": 0,
+                },
+            })
+        );
+        let parsed = chat_usage(build_usage(&[complete(10, 8, 4)]), Some(2), 0);
+        assert_eq!(
+            parsed
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            Some(2)
         );
     }
 

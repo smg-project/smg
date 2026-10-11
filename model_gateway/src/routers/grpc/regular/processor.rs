@@ -12,7 +12,7 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionResponse},
-    common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue, Usage},
+    common::{FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
     completion::{CompletionChoice, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateResponse},
     messages::{self, Message},
@@ -356,15 +356,15 @@ impl ResponseProcessor {
             }
         }
 
-        // Build usage from gRPC response counters, with the reasoning tokens
-        // the gateway's parser split off when it ran (zero included), and
-        // every detail counter present as the OpenAI API sends it.
-        let usage = response_formatting::with_parsed_reasoning_tokens(
-            response_formatting::build_usage(&all_responses)
-                .with_unbilled_prompt_tokens(chat_request.unbilled_prompt_tokens),
+        // The usage from the gRPC response counters, built as the streamed
+        // answer builds its usage chunk: with the reasoning tokens the
+        // gateway's parser split off when it ran (zero included) and every
+        // detail counter present as the OpenAI API sends it.
+        let usage = response_formatting::chat_usage(
+            response_formatting::build_usage(&all_responses),
             reasoning_parser_available.then_some(parsed_reasoning_tokens),
-        )
-        .with_complete_details();
+            chat_request.unbilled_prompt_tokens,
+        );
 
         // Build final ChatCompletionResponse
         Ok(
@@ -934,6 +934,8 @@ impl ResponseProcessor {
 
         let mut total_prompt = 0u32;
         let mut total_completion = 0u32;
+        let mut total_cached = 0u32;
+        let mut total_reasoning = 0u32;
         let mut total_spec_accepted = 0u32;
         let mut total_spec_drafted = 0u32;
         let mut choices = Vec::new();
@@ -946,6 +948,7 @@ impl ResponseProcessor {
             let index_offset = prompt_index as u32 * choices_per_prompt;
             // n>1 choices share one prompt: max within a prompt, summed across prompts.
             let mut prompt_tokens = 0u32;
+            let mut cached_tokens = 0u32;
 
             // Arrival order, not `complete.index()`: SGLang non-streaming
             // Complete frames carry index 0 for every choice.
@@ -993,7 +996,9 @@ impl ResponseProcessor {
                 stopped |= stop_decoder.is_stopped();
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
+                cached_tokens = cached_tokens.max(complete.cached_tokens());
                 total_completion += complete.completion_tokens();
+                total_reasoning += complete.reasoning_tokens();
                 total_spec_accepted += complete.spec_accepted_tokens();
                 total_spec_drafted += complete.spec_draft_tokens();
 
@@ -1052,6 +1057,7 @@ impl ResponseProcessor {
             }
 
             total_prompt += prompt_tokens;
+            total_cached += cached_tokens;
         }
 
         Ok(CompletionResponse {
@@ -1060,9 +1066,17 @@ impl ResponseProcessor {
             created: dispatch.created,
             model: dispatch.model.clone(),
             choices,
+            // The usage object the streamed answer's usage chunk carries.
             usage: Some(
-                Usage::from_counts(total_prompt, total_completion)
-                    .with_speculative_tokens(total_spec_accepted, total_spec_drafted),
+                response_formatting::TokenCounts {
+                    prompt: total_prompt,
+                    completion: total_completion,
+                    cached: total_cached,
+                    reasoning: total_reasoning,
+                    spec_accepted: total_spec_accepted,
+                    spec_drafted: total_spec_drafted,
+                }
+                .usage(),
             ),
             system_fingerprint: dispatch.weight_version.clone(),
         })

@@ -47,7 +47,7 @@ use crate::{
             common::{
                 response_collection::drain_prefill,
                 response_formatting::{
-                    effective_weight_version, with_parsed_reasoning_tokens, CompletionTokenTracker,
+                    chat_usage, effective_weight_version, CompletionTokenTracker, TokenCounts,
                 },
                 responses::{build_sse_response, build_sse_response_from_stream},
             },
@@ -148,22 +148,22 @@ impl ChatStreamUsage {
         self.choices.entry(index).or_default().reasoning_parsed += tokens;
     }
 
-    fn snapshot(&self) -> Usage {
+    /// The usage so far, in the shape of the request's final usage.
+    fn snapshot(&self, unbilled_prompt_tokens: u32) -> Usage {
         // Choices share one prompt/cache but each generates its own output.
-        let usage = Usage::from_counts(
-            self.choices.values().map(|c| c.prompt).max().unwrap_or(0),
-            self.choices.values().map(|c| c.completion).sum(),
-        )
-        .with_cached_tokens(self.choices.values().map(|c| c.cached).max().unwrap_or(0))
-        .with_reasoning_tokens(self.choices.values().map(|c| c.reasoning).sum())
-        .with_speculative_tokens(
-            self.choices.values().map(|c| c.spec_accepted).sum(),
-            self.choices.values().map(|c| c.spec_drafted).sum(),
-        );
-        with_parsed_reasoning_tokens(
-            usage,
+        let counts = TokenCounts {
+            prompt: self.choices.values().map(|c| c.prompt).max().unwrap_or(0),
+            completion: self.choices.values().map(|c| c.completion).sum(),
+            cached: self.choices.values().map(|c| c.cached).max().unwrap_or(0),
+            reasoning: self.choices.values().map(|c| c.reasoning).sum(),
+            spec_accepted: self.choices.values().map(|c| c.spec_accepted).sum(),
+            spec_drafted: self.choices.values().map(|c| c.spec_drafted).sum(),
+        };
+        chat_usage(
+            counts.usage(),
             self.reasoning_parsed
                 .then(|| self.choices.values().map(|c| c.reasoning_parsed).sum()),
+            unbilled_prompt_tokens,
         )
     }
 }
@@ -583,9 +583,7 @@ impl StreamingProcessor {
                     // next step's text.
                     if is_firsts.get(&index).copied().unwrap_or(true) {
                         let usage = continuous_usage.as_ref().map(|tracker| {
-                            tracker.snapshot().with_unbilled_prompt_tokens(
-                                original_request.unbilled_prompt_tokens,
-                            )
+                            tracker.snapshot(original_request.unbilled_prompt_tokens)
                         });
                         Self::send_role_chunk(
                             tx,
@@ -765,11 +763,9 @@ impl StreamingProcessor {
                 }
             };
 
-            let mut usage = continuous_usage.as_ref().map(|tracker| {
-                tracker
-                    .snapshot()
-                    .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
-            });
+            let mut usage = continuous_usage
+                .as_ref()
+                .map(|tracker| tracker.snapshot(original_request.unbilled_prompt_tokens));
             let Some((index, text, mut choice_logprobs, chunk_tokens)) = pending else {
                 continue;
             };
@@ -814,10 +810,7 @@ impl StreamingProcessor {
                     *parsed_reasoning_tokens.entry(index).or_default() += chunk_reasoning_tokens;
                     if let Some(tracker) = &mut continuous_usage {
                         tracker.record_reasoning(index, chunk_reasoning_tokens);
-                        usage =
-                            Some(tracker.snapshot().with_unbilled_prompt_tokens(
-                                original_request.unbilled_prompt_tokens,
-                            ));
+                        usage = Some(tracker.snapshot(original_request.unbilled_prompt_tokens));
                     }
                 }
                 if let Some(mut choice) = reasoning_choice {
@@ -920,11 +913,9 @@ impl StreamingProcessor {
 
         Self::flush_chunks(tx, &mut sse_buffer).await?;
 
-        let usage = continuous_usage.as_ref().map(|tracker| {
-            tracker
-                .snapshot()
-                .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens)
-        });
+        let usage = continuous_usage
+            .as_ref()
+            .map(|tracker| tracker.snapshot(original_request.unbilled_prompt_tokens));
 
         // Phase 3: End-of-stream parser flush: first any text still buffered
         // as a prospective tool call that never materialized (dropping it
@@ -982,19 +973,22 @@ impl StreamingProcessor {
         }
 
         // Every choice shares one prompt, so prompt/cache counts take max;
-        // completion and reasoning counts sum across choices.
+        // completion and reasoning counts sum across choices. Built by the
+        // non-streamed answer's builder: the usage chunk carries the usage
+        // object that answer carries.
         let final_usage = (deepseek_usage || include_usage).then(|| {
-            let usage = Usage::from_counts(
-                prompt_tokens.values().copied().max().unwrap_or(0),
-                completion_tokens.total(),
-            )
-            .with_cached_tokens(cached_tokens.values().copied().max().unwrap_or(0))
-            .with_reasoning_tokens(reasoning_tokens.values().sum())
-            .with_speculative_tokens(spec_accepted.values().sum(), spec_drafted.values().sum())
-            .with_unbilled_prompt_tokens(original_request.unbilled_prompt_tokens);
-            with_parsed_reasoning_tokens(
-                usage,
+            let counts = TokenCounts {
+                prompt: prompt_tokens.values().copied().max().unwrap_or(0),
+                completion: completion_tokens.total(),
+                cached: cached_tokens.values().copied().max().unwrap_or(0),
+                reasoning: reasoning_tokens.values().sum(),
+                spec_accepted: spec_accepted.values().sum(),
+                spec_drafted: spec_drafted.values().sum(),
+            };
+            chat_usage(
+                counts.usage(),
                 reasoning_parser_available.then(|| parsed_reasoning_tokens.values().sum()),
+                original_request.unbilled_prompt_tokens,
             )
         });
 
@@ -3314,14 +3308,18 @@ impl StreamingProcessor {
                             choices: vec![],
                             model: dispatch.model.clone(),
                             system_fingerprint: dispatch.weight_version.clone(),
-                            usage: Some(Self::build_completion_streaming_usage(
-                                total_prompt,
-                                total_completion,
-                                total_cached,
-                                total_reasoning,
-                                total_spec_accepted,
-                                total_spec_drafted,
-                            )),
+                            // The usage object the non-streamed answer carries.
+                            usage: Some(
+                                TokenCounts {
+                                    prompt: total_prompt,
+                                    completion: total_completion,
+                                    cached: total_cached,
+                                    reasoning: total_reasoning,
+                                    spec_accepted: total_spec_accepted,
+                                    spec_drafted: total_spec_drafted,
+                                }
+                                .usage(),
+                            ),
                         };
                         let mut sse_buffer = Vec::with_capacity(256);
                         Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
@@ -3825,20 +3823,6 @@ impl StreamingProcessor {
         buffer.extend_from_slice(b"\n\n");
     }
 
-    fn build_completion_streaming_usage(
-        total_prompt: u32,
-        total_completion: u32,
-        total_cached: u32,
-        total_reasoning: u32,
-        total_spec_accepted: u32,
-        total_spec_drafted: u32,
-    ) -> Usage {
-        Usage::from_counts(total_prompt, total_completion)
-            .with_cached_tokens(total_cached)
-            .with_reasoning_tokens(total_reasoning)
-            .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
-    }
-
     /// Skeleton usage for the `message_start` event. Cache counters are
     /// integer zeros, never null: the Anthropic wire contract has
     /// always-present cache counters and clients do arithmetic on them; the
@@ -4060,6 +4044,8 @@ mod failure_tests;
 
 #[cfg(test)]
 mod sse_bytes_tests;
+#[cfg(test)]
+mod usage_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4083,7 +4069,7 @@ mod tests {
                 },
             ));
         }
-        let usage = serde_json::to_value(tracker.snapshot()).unwrap();
+        let usage = serde_json::to_value(tracker.snapshot(0)).unwrap();
         assert_eq!(usage["prompt_tokens"], 10);
         assert_eq!(usage["completion_tokens"], 9);
         assert_eq!(usage["total_tokens"], 19);
@@ -4100,7 +4086,7 @@ mod tests {
             spec_draft_tokens: 3,
             ..Default::default()
         }));
-        let usage = tracker.snapshot();
+        let usage = tracker.snapshot(0);
         assert_eq!(usage.completion_tokens, 10);
         let details = usage.completion_tokens_details.unwrap();
         assert_eq!(details.accepted_prediction_tokens, Some(2));
@@ -4121,7 +4107,7 @@ mod tests {
                 },
             ));
         }
-        assert_eq!(tracker.snapshot().completion_tokens, 3);
+        assert_eq!(tracker.snapshot(0).completion_tokens, 3);
         tracker.record_complete(&ProtoGenerateComplete::Vllm(Box::new(
             proto::GenerateComplete {
                 prompt_tokens: 10,
@@ -4129,30 +4115,7 @@ mod tests {
                 ..Default::default()
             },
         )));
-        assert_eq!(tracker.snapshot().completion_tokens, 3);
-    }
-
-    #[test]
-    fn completion_streaming_usage_includes_reasoning_tokens() {
-        let usage = StreamingProcessor::build_completion_streaming_usage(10, 5, 4, 3, 0, 0);
-
-        assert_eq!(usage.prompt_tokens, 10);
-        assert_eq!(usage.completion_tokens, 5);
-        assert_eq!(usage.total_tokens, 15);
-        assert_eq!(
-            usage
-                .prompt_tokens_details
-                .as_ref()
-                .map(|details| details.cached_tokens),
-            Some(4)
-        );
-        assert_eq!(
-            usage
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|details| details.reasoning_tokens),
-            Some(3)
-        );
+        assert_eq!(tracker.snapshot(0).completion_tokens, 3);
     }
 
     /// Wire contract: cache counters serialize as integer zeros, never null,
