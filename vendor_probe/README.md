@@ -261,8 +261,10 @@ model cards); no status-class change.
 raw vendor recordings — same severity ranking, same report format, plus stable
 cluster ids (`Bnnn`) and a regression gate: with `--allowlist`, any divergent
 cluster whose `sig_hash` is not in `known_divergences.jsonl` — or whose
-severity got worse than allowlisted — exits 1 (plus a replay-coverage floor so
-a dead gateway can't fake green). Each dated allowlist grandfathers the
+severity got worse than allowlisted, or whose S1 is of a kind the entry's
+`s1_kinds` does not list — exits 1 (plus a replay-coverage floor so a dead
+gateway can't fake green); the conformance suite applies the same ceiling to
+the same file. Each dated allowlist grandfathers the
 divergent clusters present when its baseline was cut (2026-08-21: 150 = 133
 OpenAI + 17 Anthropic, replayed against a canned mock; 2026-10-09: 50 = 33
 OpenAI + 17 Anthropic, replayed against a gateway in front of a real engine);
@@ -283,11 +285,12 @@ python -m vendor_probe.compat_diff \
    runs auto-publish gzipped recordings to the `vendor-truth-<date>` release.
 2. `gh release download vendor-truth-<date>`, run `baseline.py` per provider
    into `vendor_probe/baselines/<new-date>/` with the new run's provenance.
-3. Replay locally (mock-worker recipe below, or a real stack) and run
+3. Replay locally (mock-worker recipe above, or a real stack) and run
    `compat_diff --baseline ... --write-allowlist` per provider to re-grandfather
-   the then-current divergences into the new `known_divergences.jsonl` —
-   diff it against the old allowlist and account for every entry that
-   appeared or disappeared before committing.
+   the then-current divergences into the new `known_divergences.jsonl` (an
+   entry whose `sig_hash` persists keeps its `first_seen` and note) — diff it
+   against the old allowlist and account for every entry that appeared or
+   disappeared before committing.
 
 ## Real-engine conformance suite (`e2e_test/vendor_compat/`)
 
@@ -354,4 +357,6 @@ only; the probe job holding the vendor API keys stays read-only.
 Retries honor `Retry-After` with exponential backoff + jitter (max 3). Dependency
 chains run strictly serial (topological); independent probes run at concurrency 4.
 Full runs: OpenAI ~$1–3 (hard-bounded <$10), Anthropic ~$0.60 (<$3 with retries).
-Error probes are free (rejected pre-billing). Nightly, not per-PR.
+Error probes are free (rejected pre-billing). The curated tier runs on
+`pull_request` (changes under `vendor_probe/` or to the workflow); the full
+matrix (`tier=all`) is a `workflow_dispatch` run.

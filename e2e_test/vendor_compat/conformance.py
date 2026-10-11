@@ -268,7 +268,7 @@ def judge_cluster(provider: str, cluster: dict, member_ids, records: dict) -> di
             disposition = "new-divergence"
         elif compat_diff._SEV_RANK[verdict] < compat_diff._SEV_RANK.get(allowed.get("verdict"), 99):
             disposition = "severity-escalation"
-        elif unlisted_s1_kinds(s1_kinds, allowed):
+        elif compat_diff.unlisted_s1_kinds(s1_kinds, allowed):
             disposition = "severity-escalation"
         else:
             disposition = "expected-divergence"
@@ -286,40 +286,38 @@ def judge_cluster(provider: str, cluster: dict, member_ids, records: dict) -> di
     }
 
 
-def unlisted_s1_kinds(s1_kinds, allowed: dict) -> list:
-    """S1 kinds of the replay that the allowlist entry does not list.
-
-    An entry with ``s1_kinds`` grandfathers S1 of those kinds only: one written
-    for a ``server-error`` does not also cover a later ``accepts-invalid`` on
-    the same cluster. An entry without the field keeps the rank-only ceiling.
-    """
-    listed = allowed.get("s1_kinds") or []
-    if not listed:
-        return []
-    return sorted(set(s1_kinds) - set(listed))
-
-
 def triage_allowlist_line(provider: str, cluster: dict, outcome: dict) -> str:
-    """Ready-to-paste allowlist entry for a newly-divergent cluster.
+    """Ready-to-paste allowlist entry for a newly-divergent cluster, or the
+    replacement line for an allowlisted cluster that escalated.
 
     Marked TO-TRIAGE on purpose: adding it silences the failure but the note
     keeps the debt visible until someone adjudicates the divergence.
+    ``load_allowlist`` keeps the last line per ``sig_hash``, so for an
+    allowlisted cluster the pasted line replaces the adjudicated one: it
+    carries the entry's listed S1 kinds (a representative replay sees only
+    some members' kinds), its ``first_seen`` and its note.
     """
     divergent = [e for e in outcome["entries"] if e["class"] == "divergence"]
+    prior = outcome.get("allowlisted") or {}
+    note = (
+        "TO-TRIAGE: surfaced by the real-engine conformance lane; adjudicate "
+        "before treating as accepted divergence"
+    )
+    if prior.get("note"):
+        note += f" | previous note: {prior['note']}"
     entry = {
         "provider": provider,
         "sig_hash": cluster.get("sig_hash"),
         "cluster_id": cluster["cluster_id"],
         "verdict": outcome["verdict"],
-        "s1_kinds": outcome["s1_kinds"],
+        "s1_kinds": sorted(set(outcome["s1_kinds"]) | set(prior.get("s1_kinds") or ())),
         "size": cluster["probe_count"],
         "categories": sorted({m.get("category") for m in cluster["members"] if m.get("category")})[
             :5
         ],
         "example_probes": [e["probe_id"] for e in divergent[:3]],
-        "first_seen": datetime.date.today().isoformat(),
-        "note": "TO-TRIAGE: surfaced by the real-engine conformance lane; adjudicate "
-        "before treating as accepted divergence",
+        "first_seen": prior.get("first_seen") or datetime.date.today().isoformat(),
+        "note": note,
     }
     return json.dumps(entry, ensure_ascii=False, sort_keys=True)
 
@@ -336,7 +334,7 @@ def failure_message(provider: str, cluster: dict, outcome: dict) -> str:
     ]
     if outcome["disposition"] == "severity-escalation" and outcome["allowlisted"]:
         allowed = outcome["allowlisted"]
-        new_kinds = unlisted_s1_kinds(outcome["s1_kinds"], allowed)
+        new_kinds = compat_diff.unlisted_s1_kinds(outcome["s1_kinds"], allowed)
         if allowed.get("verdict") == outcome["verdict"] and new_kinds:
             lines.append(
                 f"allowlisted as {outcome['verdict']} {allowed.get('s1_kinds')} but now "
@@ -359,9 +357,14 @@ def failure_message(provider: str, cluster: dict, outcome: dict) -> str:
         if e.get("events"):
             lines.append(f"    vendor core events: {e['events'].get('vendor_core')}")
             lines.append(f"    smg core events:    {e['events'].get('smg_core')}")
-    lines.append(
-        "If adjudicated as an accepted divergence, append to "
-        f"vendor_probe/baselines/{baseline_date()}/{ALLOWLIST_NAME}:"
-    )
+    allowlist_path = f"vendor_probe/baselines/{baseline_date()}/{ALLOWLIST_NAME}"
+    if outcome["allowlisted"]:
+        lines.append(
+            "If adjudicated as an accepted divergence, replace the existing entry for "
+            f"this sig_hash in {allowlist_path} with (its listed kinds, first_seen and "
+            "note are carried over):"
+        )
+    else:
+        lines.append(f"If adjudicated as an accepted divergence, append to {allowlist_path}:")
     lines.append("  " + triage_allowlist_line(provider, cluster, outcome))
     return "\n".join(lines)

@@ -13,7 +13,7 @@ import json
 import pytest
 from vendor_compat import conformance
 
-from vendor_probe import compat_diff
+from vendor_probe import compat_diff, genmatrix, runner
 
 # ---------------------------------------------------------------------------
 # representative selection
@@ -289,3 +289,113 @@ def test_triage_line_is_valid_allowlist_json(monkeypatch):
     msg = conformance.failure_message("openai", cluster, out)
     assert "TO-TRIAGE" in msg
     assert "t.probe.a" in msg
+    assert "append to" in msg
+
+
+def test_triage_line_for_an_allowlisted_cluster_keeps_what_the_entry_grandfathered(monkeypatch):
+    cluster = _mini_cluster()
+    prior = {
+        "verdict": "S1",
+        "s1_kinds": ["accepts-invalid"],
+        "first_seen": "2026-10-09",
+        "note": "adjudicated: the gateway accepts what the vendor rejects",
+    }
+    monkeypatch.setattr(conformance, "allowlist", lambda provider: {cluster["sig_hash"]: prior})
+    records = {
+        m["id"]: _smg_record(m["id"], status=500, body={"error": "boom"})
+        for m in cluster["members"]
+    }
+    out = conformance.judge_cluster("openai", cluster, ["t.probe.a", "t.probe.b"], records)
+    assert out["disposition"] == "severity-escalation"
+    entry = json.loads(conformance.triage_allowlist_line("openai", cluster, out))
+    # load_allowlist keeps the last line per sig_hash: the pasted line replaces
+    # the adjudicated one, so it must carry the kinds, date and note it had
+    assert entry["s1_kinds"] == ["accepts-invalid", "server-error"]
+    assert entry["first_seen"] == "2026-10-09"
+    assert entry["note"].startswith("TO-TRIAGE")
+    assert prior["note"] in entry["note"]
+    msg = conformance.failure_message("openai", cluster, out)
+    assert "replace the existing entry" in msg
+
+
+def _gate_cluster(kinds, sig="feedfeedfeedfeed", verdict="S1"):
+    return {
+        "cluster_id": "C000",
+        "sig_hash": sig,
+        "verdict": verdict,
+        "s1_kinds": list(kinds),
+        "size": 1,
+        "categories": ["unit"],
+        "example_probes": ["t.probe.a"],
+    }
+
+
+def test_cli_gate_applies_the_allowlisted_s1_kinds_ceiling():
+    entries = [{"class": "divergence"}]
+    listed = {"feedfeedfeedfeed": {"verdict": "S1", "s1_kinds": ["accepts-invalid"]}}
+    violations, _ = compat_diff.run_gate([_gate_cluster(["server-error"])], entries, listed, 0.0)
+    assert [v["kind"] for v in violations] == ["s1-kind-escalation"]
+    assert violations[0]["s1_kinds"] == ["server-error"]
+    assert violations[0]["allowlisted_s1_kinds"] == ["accepts-invalid"]
+    # within the listed kinds it is the expected divergence; an entry without
+    # kinds keeps the rank-only ceiling (same reading as the conformance suite)
+    within = compat_diff.run_gate([_gate_cluster(["accepts-invalid"])], entries, listed, 0.0)
+    assert within[0] == []
+    rank_only = {"feedfeedfeedfeed": {"verdict": "S1"}}
+    assert compat_diff.run_gate([_gate_cluster(["server-error"])], entries, rank_only, 0.0)[0] == []
+
+
+def test_write_allowlist_keeps_the_adjudication_of_a_persisting_cluster(tmp_path):
+    path = tmp_path / "known_divergences.jsonl"
+    prior = dict(
+        _gate_cluster([], verdict="S2"),
+        provider="openai",
+        first_seen="2026-10-09",
+        note="adjudicated: field drift, tracked",
+    )
+    other = dict(prior, provider="anthropic", sig_hash="cafecafecafecafe", note="theirs")
+    path.write_text(json.dumps(prior) + "\n" + json.dumps(other) + "\n", encoding="utf-8")
+    clusters = [
+        _gate_cluster([], verdict="S2"),
+        _gate_cluster(["server-error"], sig="beefbeefbeefbeef"),
+    ]
+    assert compat_diff.write_allowlist(path, "openai", clusters, "2026-10-11") == 2
+    by_sig = {
+        e["sig_hash"]: e for e in map(json.loads, path.read_text(encoding="utf-8").splitlines())
+    }
+    assert by_sig["feedfeedfeedfeed"]["note"] == prior["note"]
+    assert by_sig["feedfeedfeedfeed"]["first_seen"] == "2026-10-09"
+    assert by_sig["beefbeefbeefbeef"]["note"] == ""
+    assert by_sig["beefbeefbeefbeef"]["first_seen"] == "2026-10-11"
+    assert by_sig["cafecafecafecafe"]["note"] == "theirs"
+
+
+def test_generated_mutations_stream_when_the_mutated_body_streams():
+    probes = genmatrix._gen_mutations(
+        "t", "gen-mutation", genmatrix.O_EP, genmatrix.O_BASE, genmatrix.O_CTX, genmatrix.O_FIELDS
+    )
+    streaming = [p for p in probes if p["body"].get("stream") is True]
+    assert streaming  # the stream_options mutations and their unknown-sibling probe
+    assert all(p["stream"] for p in streaming)
+    assert not any(p["stream"] for p in probes if p["body"].get("stream") is not True)
+
+
+def test_stream_probe_rejected_before_the_stream_keeps_the_json_envelope():
+    probe = {"stream": True}
+    envelope = {"error": {"type": "invalid_request_error", "message": "max_tokens: -1"}}
+    headers = {"content-type": "application/json"}
+    response, parsed = runner.shape_response(probe, 400, headers, json.dumps(envelope))
+    assert parsed == envelope
+    assert response["body"] == envelope
+    assert "sse_events" not in response
+    assert runner.fingerprint_sig({"response": response}, "anthropic")[0] == "json"
+    # an event stream is still parsed as one, as is a response without a declared type
+    sse = 'event: message_start\ndata: {"type": "message_start"}\n\n'
+    response, _ = runner.shape_response(probe, 200, {"Content-Type": "text/event-stream"}, sse)
+    assert [e["event"] for e in response["sse_events"]] == ["message_start"]
+    response, _ = runner.shape_response(probe, 200, {}, sse)
+    assert len(response["sse_events"]) == 1
+    # a non-streaming probe is unchanged
+    response, parsed = runner.shape_response({"stream": False}, 200, headers, '{"id": 1}')
+    assert parsed == {"id": 1}
+    assert response["body"] == {"id": 1}

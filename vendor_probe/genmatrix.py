@@ -287,6 +287,7 @@ def _gen_mutations(prefix, category, endpoint, base, ctx_table, fields):
                     category,
                     endpoint,
                     body,
+                    stream=body.get("stream") is True,
                     expect="error",
                 )
             )
@@ -300,6 +301,9 @@ def _gen_mutations(prefix, category, endpoint, base, ctx_table, fields):
                     category,
                     endpoint,
                     body,
+                    # a mutation on top of the stream context is a streaming
+                    # request: an accepted one answers with SSE (as _combo_probe)
+                    stream=body.get("stream") is True,
                     expect="error",
                 )
             )
