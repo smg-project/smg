@@ -28,7 +28,10 @@ use super::{
             handlers::cancel_response_impl, streaming::build_sse_response_from_stream,
             utils::validate_worker_availability, ResponsesContext,
         },
-        stages::{helpers::resolve_request_id_stamp, RateLimitCell, RateLimitOutcome},
+        stages::{
+            context_length_exceeded, helpers::resolve_request_id_stamp, smallest_context_length,
+            RateLimitCell, RateLimitOutcome,
+        },
     },
     context::{RequestType, SharedComponents},
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
@@ -45,6 +48,7 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
+    observability::metrics::metrics_labels,
     routers::{error, RouterTrait},
     worker::{RoutingPool, WorkerRegistry, WorkerType},
 };
@@ -489,13 +493,25 @@ impl GrpcRouter {
 
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
-        // No worker takes part, so the answer carries neither the rate-limit
-        // reservation nor the pipeline's dispatch metrics, as count_tokens
-        // carries neither.
+        // No worker takes part, so the answer carries no rate-limit
+        // reservation, as count_tokens reserves none; it is counted as a
+        // Messages request, refusals included, where the pipeline counts
+        // its own, so the traffic stays visible.
         if canonical_body.max_tokens == 0 {
-            return self
+            const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
+            self.messages_pipeline.record_request(
+                ENDPOINT,
+                &model_id_cloned,
+                canonical_body.stream.unwrap_or(false),
+            );
+            let response = self
                 .empty_message_response(tenant_meta, canonical_body, &model_id_cloned)
                 .await;
+            if !response.status().is_success() {
+                self.messages_pipeline
+                    .record_error(Some(ENDPOINT), &model_id_cloned, &response);
+            }
+            return response;
         }
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
@@ -605,7 +621,12 @@ impl GrpcRouter {
     /// then `message_delta` with the stop reason and `message_stop`. A request
     /// with media is counted at the placeholders the template writes for it,
     /// as count_tokens counts it: the media is neither fetched nor checked, so
-    /// the count is the template's, not the expanded prompt's.
+    /// the count is the template's, not the expanded prompt's. A prompt longer
+    /// than the smallest context window the model's workers advertise is
+    /// refused as the pipeline refuses it after worker selection
+    /// (`context_length_exceeded`), so a 200 here means the prompt fits
+    /// whichever worker a real call lands on; a deployment that advertises no
+    /// window leaves the check to the engine, as the pipeline does.
     async fn empty_message_response(
         &self,
         tenant_meta: &TenantRequestMeta,
@@ -624,6 +645,13 @@ impl GrpcRouter {
             Ok(input_tokens) => input_tokens,
             Err(refused) => return refused,
         };
+        if let Some(limit) =
+            smallest_context_length(&self.worker_registry.get_by_model(model_id), model_id)
+        {
+            if input_tokens > limit {
+                return context_length_exceeded(input_tokens as usize, limit, model_id);
+            }
+        }
         let stream = body.stream.unwrap_or(false);
         let (id, _) = resolve_request_id_stamp(
             &RequestType::Messages(body),
@@ -1193,7 +1221,8 @@ mod pd_tests {
     /// id the pipeline would have given it (the client's `rid` when it sends
     /// one); streamed, that message as `message_start`, then `message_delta`
     /// with the stop reason and `message_stop`. No worker takes part; a
-    /// model nobody serves is a 404.
+    /// model nobody serves is a 404, and a prompt longer than the smallest
+    /// context window the model's workers advertise is the pipeline's 400.
     #[tokio::test]
     async fn max_tokens_zero_is_answered_with_an_empty_message() {
         let ctx = grpc_ctx(regular_routing_mode()).await;
@@ -1254,7 +1283,7 @@ mod pd_tests {
         let message: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(message["id"], "req-7");
 
-        let mut streamed = body;
+        let mut streamed = body.clone();
         streamed["stream"] = json!(true);
         let response = router
             .route_messages(None, &tenant_meta, message_request(streamed), "m")
@@ -1301,6 +1330,46 @@ mod pd_tests {
         assert_eq!(
             error::extract_error_code_from_response(&response),
             "model_not_found"
+        );
+
+        // The window check the pipeline makes after worker selection, here on
+        // the smallest window the model's workers advertise: a worker whose
+        // card holds the three-token prompt exactly changes nothing; one with
+        // a two-token window refuses it as the pipeline would.
+        let window_worker = |url: &str, context_length: u32| {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .model(ModelCard::new("m").with_context_length(context_length))
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        ctx.worker_registry
+            .register(window_worker("grpc://worker-window-3:30000", 3))
+            .expect("register worker");
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(body.clone()), "m")
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a three-token prompt fits a three-token window"
+        );
+        ctx.worker_registry
+            .register(window_worker("grpc://worker-window-2:30000", 2))
+            .expect("register worker");
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(body), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "context_length_exceeded"
         );
     }
 

@@ -10,13 +10,18 @@
 //! Runs once at ingress, after worker selection (the window is a property of
 //! the chosen worker's model card) and before any client is acquired.
 
+use std::sync::Arc;
+
 use axum::response::Response;
 use openai_protocol::profile::ProviderProfile;
 use tracing::debug;
 
-use crate::routers::{
-    error,
-    grpc::context::{PreparationOutput, RequestType, WorkerSelection},
+use crate::{
+    routers::{
+        error,
+        grpc::context::{PreparationOutput, RequestType, WorkerSelection},
+    },
+    worker::Worker,
 };
 
 /// Error code for an input that does not fit the model's window; matches the
@@ -46,17 +51,35 @@ pub(crate) fn enforce_context_length(
     if input_tokens <= limit as usize {
         return Ok(());
     }
+    Err(context_length_exceeded(input_tokens, limit, model_id))
+}
+
+/// The refusal for an input of `input_tokens` tokens that does not fit a
+/// window of `limit` tokens: the pipeline's, so an answer the router gives
+/// by itself refuses an oversized prompt as the pipeline would.
+pub(crate) fn context_length_exceeded(input_tokens: usize, limit: u32, model_id: &str) -> Response {
     debug!(
         function = "enforce_context_length",
         input_tokens, limit, model_id, "Rejecting input longer than the model's context window"
     );
-    Err(error::bad_request(
+    error::bad_request(
         CONTEXT_LENGTH_EXCEEDED,
         format!(
             "This model's maximum context length is {limit} tokens. However, your request has \
              {input_tokens} input tokens. Please reduce the length of the input."
         ),
-    ))
+    )
+}
+
+/// The smallest context window any of `workers` advertises for `model_id`,
+/// for a check made before a worker is selected: an input within it fits
+/// whichever of them a request lands on. `None` when no worker advertises
+/// one; the check is then left to the engine, as it is after selection.
+pub(crate) fn smallest_context_length(workers: &[Arc<dyn Worker>], model_id: &str) -> Option<u32> {
+    workers
+        .iter()
+        .filter_map(|worker| worker.context_length(model_id))
+        .min()
 }
 
 /// Reject prompts reaching SGLang's advertised context boundary. The engine

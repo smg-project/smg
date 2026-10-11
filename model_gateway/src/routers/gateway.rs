@@ -294,6 +294,32 @@ impl Gateway {
         self.pick_router_by_weights(grpc_epd, grpc_pd, http_pd, grpc_regular, http_regular)
     }
 
+    /// The router for a Messages request with `max_tokens: 0`. Its answer,
+    /// the public API's empty message carrying the prompt's token count, is
+    /// given by a router that renders the prompt itself (the gRPC families);
+    /// the HTTP relay refuses the shape. A model served over both wires goes
+    /// to a gRPC router whenever one serves it, so the answer does not depend
+    /// on the weighted draw; a disaggregated pool qualifies by its prefill
+    /// leg alone, as for count_tokens, since no worker takes part. A model no
+    /// gRPC pool serves takes the normal draw: the relay's refusal, an
+    /// external provider's router, or the default router's model_not_found.
+    fn select_router_for_empty_message(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        if !snapshot.pool(RoutingPool::External).is_empty() {
+            return self.select_router_for_request(Some(model_id));
+        }
+        let size = |pool| snapshot.pool(pool).len();
+        let grpc_prefill = size(RoutingPool::GrpcPrefill);
+        self.pick_router_by_weights(
+            grpc_prefill,
+            grpc_prefill,
+            0,
+            size(RoutingPool::GrpcPipelineRegular),
+            0,
+        )
+        .or_else(|| self.select_router_for_request(Some(model_id)))
+    }
+
     /// Whether an external worker serves `model` through a provider router
     /// this build does not carry. Such a request must fail rather than fall
     /// through to a self-hosted router that would proxy it untranslated.
@@ -470,12 +496,19 @@ impl RouterTrait for Gateway {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
-            router
-                .route_messages(headers, tenant_meta, body, model_id)
-                .await
-        })
-        .await
+        let router = if self.enable_igw && body.max_tokens == 0 {
+            self.select_router_for_empty_message(model_id)
+        } else {
+            self.select_router_for_request(Some(model_id))
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_messages(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => NO_ROUTER.into_response(),
+        }
     }
 
     async fn route_messages_count_tokens(
@@ -1296,6 +1329,166 @@ mod tests {
         no_router.enable_igw = true;
         let response = no_router
             .route_messages_count_tokens(None, &tenant, body("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A Messages router that answers with its own name, so a test can read
+    /// which router the gateway chose.
+    #[derive(Debug)]
+    struct NamedMessagesRouter(&'static str);
+
+    #[async_trait]
+    impl RouterTrait for NamedMessagesRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_messages(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: CreateMessageRequest,
+            _model_id: &str,
+        ) -> Response {
+            (StatusCode::OK, self.0).into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            self.0
+        }
+    }
+
+    fn message_request(max_tokens: u32) -> CreateMessageRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m", "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap()
+    }
+
+    /// The name of the router that answered a Messages request for `m`.
+    async fn messages_router(gateway: &Gateway, max_tokens: u32) -> String {
+        let response = gateway
+            .route_messages(None, &test_tenant_meta(), message_request(max_tokens), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn register_worker(gateway: &Gateway, url: &str, mode: ConnectionMode, role: WorkerType) {
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .connection_mode(mode)
+                    .worker_type(role)
+                    .model(ModelCard::new("m"))
+                    .build(),
+            ))
+            .unwrap();
+    }
+
+    /// `max_tokens: 0` goes to a router that renders the prompt itself (the
+    /// gRPC families; the HTTP relay refuses the shape), so a model served
+    /// over both wires gets the same answer however its workers are split,
+    /// instead of one that follows the weighted draw; a disaggregated pool
+    /// qualifies by its prefill leg. A model no gRPC pool serves takes the
+    /// normal draw, and so does a positive `max_tokens`.
+    #[tokio::test]
+    async fn max_tokens_zero_goes_to_a_grpc_router_in_mixed_deployments() {
+        let gateway = test_gateway(true);
+        gateway.register_router(
+            router_ids::HTTP_REGULAR,
+            Arc::new(NamedMessagesRouter("http")),
+        );
+        gateway.register_router(
+            router_ids::GRPC_REGULAR,
+            Arc::new(NamedMessagesRouter("grpc")),
+        );
+        register_worker(
+            &gateway,
+            "grpc://worker-0:30000",
+            ConnectionMode::Grpc,
+            WorkerType::Regular,
+        );
+        for index in 1..=3 {
+            register_worker(
+                &gateway,
+                &format!("http://worker-{index}:8080"),
+                ConnectionMode::Http,
+                WorkerType::Regular,
+            );
+        }
+        let mut answered_by_grpc = 0;
+        for _ in 0..16 {
+            if messages_router(&gateway, 0).await == "grpc" {
+                answered_by_grpc += 1;
+            }
+        }
+        assert_eq!(
+            answered_by_grpc, 16,
+            "max_tokens: 0 followed the weighted draw between the routers"
+        );
+        assert!(["grpc", "http"].contains(&messages_router(&gateway, 1).await.as_str()));
+
+        let gateway = test_gateway(true);
+        gateway.register_router(
+            router_ids::HTTP_REGULAR,
+            Arc::new(NamedMessagesRouter("http")),
+        );
+        gateway.register_router(
+            router_ids::GRPC_PD,
+            Arc::new(NamedMessagesRouter("grpc-pd")),
+        );
+        register_worker(
+            &gateway,
+            "grpc://prefill:30000",
+            ConnectionMode::Grpc,
+            WorkerType::Prefill,
+        );
+        register_worker(
+            &gateway,
+            "grpc://decode:30000",
+            ConnectionMode::Grpc,
+            WorkerType::Decode,
+        );
+        for index in 1..=3 {
+            register_worker(
+                &gateway,
+                &format!("http://worker-{index}:8080"),
+                ConnectionMode::Http,
+                WorkerType::Regular,
+            );
+        }
+        for _ in 0..16 {
+            assert_eq!(messages_router(&gateway, 0).await, "grpc-pd");
+        }
+
+        let gateway = test_gateway(true);
+        gateway.register_router(
+            router_ids::HTTP_REGULAR,
+            Arc::new(NamedMessagesRouter("http")),
+        );
+        gateway.register_router(
+            router_ids::GRPC_REGULAR,
+            Arc::new(NamedMessagesRouter("grpc")),
+        );
+        register_worker(
+            &gateway,
+            "http://worker-1:8080",
+            ConnectionMode::Http,
+            WorkerType::Regular,
+        );
+        assert_eq!(messages_router(&gateway, 0).await, "http");
+
+        let mut no_router = Gateway::new(Arc::new(WorkerRegistry::new()));
+        no_router.enable_igw = true;
+        let response = no_router
+            .route_messages(None, &test_tenant_meta(), message_request(0), "m")
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
