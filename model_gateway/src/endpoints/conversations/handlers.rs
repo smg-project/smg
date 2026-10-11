@@ -631,7 +631,7 @@ fn parse_item_from_value(
         .or_else(|| Some("completed".to_string()));
 
     let content = if item_type == "message" {
-        message_content_parts(item_val.get("content"))
+        message_content_parts(role.as_deref(), item_val.get("content"))
     } else if item_type == "reasoning" {
         item_val.get("content").cloned().unwrap_or(json!([]))
     } else {
@@ -657,12 +657,18 @@ fn parse_item_from_value(
 }
 
 /// The content of a message item as it is stored and listed: a plain string
-/// becomes the one `input_text` part the Responses input path makes of it, so
-/// an item added as `"content": "text"` has the shape of one added with typed
-/// parts or created by a response; typed parts stay as sent, an absent
-/// content is an empty list.
-fn message_content_parts(content: Option<&Value>) -> Value {
+/// becomes the one typed part the public API makes of it for the message's
+/// role, so an item added as `"content": "text"` has the shape of one added
+/// with typed parts or created by a response. An assistant message gets an
+/// `output_text` part (with empty `annotations`), the text part the public
+/// API accepts on that role when the history loaders replay the conversation
+/// upstream; every other role gets an `input_text` part. Typed parts stay as
+/// sent, an absent content is an empty list.
+fn message_content_parts(role: Option<&str>, content: Option<&Value>) -> Value {
     match content {
+        Some(Value::String(text)) if role == Some("assistant") => {
+            json!([{ "type": "output_text", "text": text, "annotations": [] }])
+        }
         Some(Value::String(text)) => json!([{ "type": "input_text", "text": text }]),
         Some(parts) => parts.clone(),
         None => json!([]),
