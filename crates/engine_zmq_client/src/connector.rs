@@ -76,9 +76,19 @@ struct RequestRegistry<O> {
     closed: bool,
     requests: HashMap<String, OutputSender<O>>,
     utility_calls: HashMap<i64, UtilitySender>,
-    /// When `requests` last went from empty to non-empty: the silence
-    /// watchdog counts from here when no output came since.
+    /// When `requests` last went from empty to non-empty, while it is
+    /// non-empty: the start of the busy period the engine is in.
     in_flight_since: Option<Instant>,
+    /// When `requests` last went from non-empty to empty, while it is empty.
+    idle_since: Option<Instant>,
+    /// The in-flight time of the busy periods that ended since the engine's
+    /// last output; with the current one, the engine's unanswered work (see
+    /// [`Self::unanswered_for`]).
+    unanswered_before: Duration,
+    /// The silence watchdog's window ([`ENGINE_SILENCE_DEATH_TIMEOUT`] unless
+    /// [`Client::set_silence_death_timeout`] changed it): the dispatcher's
+    /// deadline, and the idle spell after which the count starts over.
+    silence_window: Duration,
 }
 
 /// Completes one utility call with its value, or the error that ended it.
@@ -91,6 +101,9 @@ impl<O> Default for RequestRegistry<O> {
             requests: HashMap::new(),
             utility_calls: HashMap::new(),
             in_flight_since: None,
+            idle_since: None,
+            unanswered_before: Duration::ZERO,
+            silence_window: ENGINE_SILENCE_DEATH_TIMEOUT,
         }
     }
 }
@@ -108,10 +121,58 @@ impl<O: EngineOutput> RequestRegistry<O> {
         }
         let (sender, receiver) = mpsc::unbounded_channel();
         if self.requests.is_empty() {
-            self.in_flight_since = Some(Instant::now());
+            let now = Instant::now();
+            // A busy period begins. After a whole window idle, the ones before
+            // it say nothing about the engine now: the count starts over.
+            if self
+                .idle_since
+                .take()
+                .is_some_and(|since| now.saturating_duration_since(since) >= self.silence_window)
+            {
+                self.unanswered_before = Duration::ZERO;
+            }
+            self.in_flight_since = Some(now);
         }
         self.requests.insert(request_id, sender);
         Ok(receiver)
+    }
+
+    /// Drop a request's entry. The last one ends the busy period, whose
+    /// in-flight time counts as unanswered until the engine's next output.
+    fn retire(&mut self, request_id: &str) -> Option<OutputSender<O>> {
+        let sender = self.requests.remove(request_id)?;
+        if self.requests.is_empty() {
+            let now = Instant::now();
+            if let Some(since) = self.in_flight_since.take() {
+                self.unanswered_before += now.saturating_duration_since(since);
+            }
+            self.idle_since = Some(now);
+        }
+        Some(sender)
+    }
+
+    /// The engine answered (an output of any kind): nothing in flight is
+    /// unanswered any more, and the busy period, if one is on, counts from
+    /// `now`.
+    fn output_seen(&mut self, now: Instant) {
+        self.unanswered_before = Duration::ZERO;
+        if self.in_flight_since.is_some() {
+            self.in_flight_since = Some(now);
+        }
+    }
+
+    /// How long the engine has had requests in flight since its last output:
+    /// the busy period it is in and the ones that ended since, unless a whole
+    /// window idle separated them from it. The silence watchdog's measure of
+    /// the engine's silence: a request registered just before the watchdog's
+    /// tick has a whole window to answer, while a core that reads every
+    /// request and answers none is given up on even when every request is
+    /// abandoned before the window.
+    fn unanswered_for(&self, now: Instant) -> Duration {
+        self.unanswered_before
+            + self
+                .in_flight_since
+                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
     }
 
     /// Deliver one output to its request stream; drop the entry when terminal.
@@ -122,7 +183,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
         if output.finished() {
             // Terminal: retire the entry before handing the output over, while
             // its request id is still borrowable.
-            match self.requests.remove(output.request_id()) {
+            match self.retire(output.request_id()) {
                 Some(sender) => {
                     let _ = sender.send(Ok(output));
                 }
@@ -143,14 +204,14 @@ impl<O: EngineOutput> RequestRegistry<O> {
         // A failed send hands the output back, so the receiver-gone (stream
         // dropped) path retires the entry without an owned key either.
         if let Err(mpsc::error::SendError(Ok(undelivered))) = sender.send(Ok(output)) {
-            self.requests.remove(undelivered.request_id());
+            self.retire(undelivered.request_id());
         }
     }
 
     /// Remove finished/aborted request ids reported out-of-band by the engine.
     fn remove_all<'a>(&mut self, request_ids: impl IntoIterator<Item = &'a String>) {
         for request_id in request_ids {
-            self.requests.remove(request_id);
+            self.retire(request_id);
         }
     }
 
@@ -190,6 +251,8 @@ impl<O: EngineOutput> RequestRegistry<O> {
         for (_, sender) in self.requests.drain() {
             let _ = sender.send(Err(Error::Shared(error.clone())));
         }
+        self.in_flight_since = None;
+        self.unanswered_before = Duration::ZERO;
         for (_, sender) in self.utility_calls.drain() {
             let _ = sender.send(Err(Error::Shared(error.clone())));
         }
@@ -226,7 +289,7 @@ struct InputFrame {
     payload: Bytes,
     aux_frames: Vec<Bytes>,
     /// Where the caller waits for the write's result; `None` for a frame no
-    /// caller waits on (the dispatcher's aborts).
+    /// caller waits on (the dispatcher's aborts and wakes).
     done: Option<oneshot::Sender<Result<()>>>,
     /// The payload bytes the queue bound counts while the frame waits:
     /// `Some` for an add-request, `None` for a control frame.
@@ -253,10 +316,6 @@ struct ClientInner<P: EngineProtocol> {
     /// [`ENGINE_INPUT_DEATH_TIMEOUT`] unless [`Client::set_input_death_timeout`]
     /// changed it.
     input_death_timeout: Mutex<Duration>,
-    /// How long the engine may stay silent with requests in flight:
-    /// [`ENGINE_SILENCE_DEATH_TIMEOUT`] unless
-    /// [`Client::set_silence_death_timeout`] changed it.
-    silence_death_timeout: Mutex<Duration>,
     /// The bound on waiting add-requests: [`ENGINE_INPUT_QUEUE_FRAMES`] and
     /// [`ENGINE_INPUT_QUEUE_BYTES`] unless [`Client::set_input_queue_limit`]
     /// changed it.
@@ -461,7 +520,11 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// add-requests past the queue bound is refused at once with
     /// [`Error::EngineInputFull`]: it is better served elsewhere than parked
     /// here for the death window, and the frames already waiting keep their
-    /// order behind the blocked one. The check is not synchronized with the
+    /// order behind the blocked one. A request larger than the byte bound on
+    /// its own is refused the same way, with nothing waiting: the bound is
+    /// what may be parked, and a request refused at once is retried elsewhere
+    /// a whole window sooner than one that waits; the error names the
+    /// request's size. The check is not synchronized with the
     /// queue, so a burst can overshoot the bound by a few frames; a burst to
     /// an engine that reads is never refused, whatever its size.
     fn admit_add(&self, bytes: usize) -> Result<()> {
@@ -492,6 +555,9 @@ impl<P: EngineProtocol> ClientInner<P> {
         Err(Error::EngineInputFull {
             frames,
             bytes: waiting,
+            request_bytes: bytes,
+            limit_frames: limit.frames,
+            limit_bytes: limit.bytes,
         })
     }
 
@@ -505,7 +571,20 @@ impl<P: EngineProtocol> ClientInner<P> {
         aux_frames: Vec<Bytes>,
         counted: Option<usize>,
     ) -> Result<()> {
-        let timeout = *self.send_timeout.lock();
+        let done = self.queue_write(engine_id, request_type, payload, aux_frames, counted)?;
+        self.await_writes([done]).await
+    }
+
+    /// Queue a frame for the input writer, returning where the write's result
+    /// arrives (see [`Self::queue_frame`]).
+    fn queue_write(
+        &self,
+        engine_id: &EngineId,
+        request_type: Bytes,
+        payload: Vec<u8>,
+        aux_frames: Vec<Bytes>,
+        counted: Option<usize>,
+    ) -> Result<oneshot::Receiver<Result<()>>> {
         let (done_tx, done_rx) = oneshot::channel();
         self.queue_frame(
             engine_id,
@@ -515,11 +594,28 @@ impl<P: EngineProtocol> ClientInner<P> {
             Some(done_tx),
             counted,
         )?;
-        match tokio::time::timeout(timeout, done_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_writer_gone)) => Err(Error::ClientClosed {
-                message: "the engine input writer ended".to_string(),
-            }),
+        Ok(done_rx)
+    }
+
+    /// Wait at most the send window for the engines to accept the writes
+    /// queued as `pending`, all of them. Past the window the caller's request
+    /// fails with [`Error::EngineInputBlocked`]; the frames stay queued and
+    /// are delivered when the engine reads again.
+    async fn await_writes(
+        &self,
+        pending: impl IntoIterator<Item = oneshot::Receiver<Result<()>>>,
+    ) -> Result<()> {
+        let timeout = *self.send_timeout.lock();
+        let accepted = async {
+            for done in pending {
+                done.await.map_err(|_writer_gone| Error::ClientClosed {
+                    message: "the engine input writer ended".to_string(),
+                })??;
+            }
+            Ok::<(), Error>(())
+        };
+        match tokio::time::timeout(timeout, accepted).await {
+            Ok(result) => result,
             Err(_elapsed) => {
                 warn!(
                     ?timeout,
@@ -573,14 +669,42 @@ impl<P: EngineProtocol> ClientInner<P> {
         let Some((frame, payload)) = P::encode_start_wave(wave)? else {
             return Ok(());
         };
+        // Every rank's frame is queued before any is waited for: a window that
+        // runs out (a frame is blocked ahead in the queue) then never leaves
+        // the group half woken; the wake reaches every rank when the engine
+        // reads again.
+        let pending = self
+            .engines
+            .iter()
+            .map(|engine| {
+                self.queue_write(
+                    &engine.engine_id,
+                    frame.clone(),
+                    payload.clone(),
+                    Vec::new(),
+                    None,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.await_writes(pending).await
+    }
+
+    /// [`Self::broadcast_start_wave`] without waiting for the engines to
+    /// accept the frames: the dispatcher's wake, which must keep routing the
+    /// output of every rank while a frame ahead in the queue is blocked.
+    fn queue_start_wave(&self, wave: u64) -> Result<()> {
+        let Some((frame, payload)) = P::encode_start_wave(wave)? else {
+            return Ok(());
+        };
         for engine in &self.engines {
-            self.send_to_engine(
+            self.queue_frame(
                 &engine.engine_id,
                 frame.clone(),
                 payload.clone(),
                 Vec::new(),
-            )
-            .await?;
+                None,
+                None,
+            )?;
         }
         Ok(())
     }
@@ -610,19 +734,23 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// broadcast plus at most one self-increment (a second needs another wave,
     /// which needs another wake), so `last + 1` is never stale.
     async fn wake_group(&self) -> Result<()> {
-        let Some(state) = self.wave.as_ref() else {
+        let Some(wave) = self.next_wave() else {
             return Ok(());
-        };
-        let wave = {
-            let mut current = state.lock();
-            *current = current.saturating_add(1);
-            *current
         };
         self.broadcast_start_wave(wave).await
     }
 
-    /// Fold a wave notification from an engine into the group's clock.
-    async fn observe_wave(&self, event: WaveEvent, engine_index: u32) {
+    /// Bump the group's wave clock for a wake; `None` for independent ranks.
+    fn next_wave(&self) -> Option<u64> {
+        let state = self.wave.as_ref()?;
+        let mut current = state.lock();
+        *current = current.saturating_add(1);
+        Some(*current)
+    }
+
+    /// Fold a wave notification from an engine into the group's clock. Never
+    /// waits on the engine: the dispatcher calls this between outputs.
+    fn observe_wave(&self, event: WaveEvent, engine_index: u32) {
         let Some(state) = self.wave.as_ref() else {
             warn!(
                 ?event,
@@ -645,8 +773,16 @@ impl<P: EngineProtocol> ClientInner<P> {
                     let mut current = state.lock();
                     *current = (*current).max(wave);
                 }
-                if let Err(error) = self.wake_group().await {
-                    warn!(%error, wave, "failed to start the requested wave");
+                // Queued for every rank, not awaited: a frame blocked ahead in
+                // the input queue must not park the dispatcher (the output of
+                // every rank keeps flowing), and the wake reaches the whole
+                // group when the engine reads again.
+                let queued = match self.next_wave() {
+                    Some(next) => self.queue_start_wave(next),
+                    None => Ok(()),
+                };
+                if let Err(error) = queued {
+                    warn!(%error, wave, "failed to queue the requested wave");
                 }
             }
         }
@@ -701,7 +837,6 @@ impl<P: EngineProtocol> Client<P> {
             input_tx,
             send_timeout: Mutex::new(ENGINE_SEND_TIMEOUT),
             input_death_timeout: Mutex::new(ENGINE_INPUT_DEATH_TIMEOUT),
-            silence_death_timeout: Mutex::new(ENGINE_SILENCE_DEATH_TIMEOUT),
             input_queue_limit: Mutex::new(InputQueueLimit {
                 frames: ENGINE_INPUT_QUEUE_FRAMES,
                 bytes: ENGINE_INPUT_QUEUE_BYTES,
@@ -772,11 +907,11 @@ impl<P: EngineProtocol> Client<P> {
         *self.inner.input_death_timeout.lock() = timeout;
     }
 
-    /// Bound how long the engine may stay silent with requests in flight
-    /// before it is treated as dead ([`ENGINE_SILENCE_DEATH_TIMEOUT`] by
-    /// default).
+    /// Bound how long the engine may have requests in flight, in total since
+    /// its last output, before it is treated as dead
+    /// ([`ENGINE_SILENCE_DEATH_TIMEOUT`] by default).
     pub fn set_silence_death_timeout(&self, timeout: Duration) {
-        *self.inner.silence_death_timeout.lock() = timeout;
+        self.inner.registry.lock().silence_window = timeout;
     }
 
     /// Bound the add-requests that may wait behind a blocked input before new
@@ -968,7 +1103,9 @@ impl<P: EngineProtocol> Drop for PendingUtilityCall<'_, P> {
 /// The client itself stays up: its death is decided on the output side.
 const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// If the engine emits no output for this long while requests are in flight, the
+/// If the engine has had requests in flight for this long, in total, since its
+/// last output (one request's whole window, or a run of shorter ones it read
+/// and never answered, with no window-long idle spell between them), the
 /// dispatcher treats it as dead. A hard engine death (SIGKILL/OOM) sends no
 /// `ENGINE_CORE_DEAD` sentinel, and a bound PULL socket never errors when its
 /// PUSH peer vanishes — so silence is the only available death signal. Generous
@@ -1026,17 +1163,16 @@ async fn run_dispatcher<P: EngineProtocol>(
     // aborts this loop also handles are the client's own events and say
     // nothing about the engine; a steady trickle of them (a gateway retrying
     // into a stalled engine) must not keep a silent engine alive.
-    let mut last_output = Instant::now();
-    let watchdog = tokio::time::sleep_until(last_output + *inner.silence_death_timeout.lock());
+    let watchdog = tokio::time::sleep_until(Instant::now() + inner.registry.lock().silence_window);
     tokio::pin!(watchdog);
     loop {
         tokio::select! {
             output = out_rx.recv() => {
                 if output.is_some() {
-                    last_output = Instant::now();
-                    watchdog
-                        .as_mut()
-                        .reset(last_output + *inner.silence_death_timeout.lock());
+                    let now = Instant::now();
+                    let mut registry = inner.registry.lock();
+                    registry.output_seen(now);
+                    watchdog.as_mut().reset(now + registry.silence_window);
                 }
                 match output {
                     Some(Ok(batch)) => {
@@ -1045,7 +1181,7 @@ async fn run_dispatcher<P: EngineProtocol>(
                             inner.routing.lock().load.insert(batch.engine_index, load);
                         }
                         if let Some(event) = batch.wave {
-                            inner.observe_wave(event, batch.engine_index).await;
+                            inner.observe_wave(event, batch.engine_index);
                         }
                         // Unique finished ids: a terminal output and the
                         // out-of-band finished list may name the same request.
@@ -1105,29 +1241,29 @@ async fn run_dispatcher<P: EngineProtocol>(
                 }
             }
             () = &mut watchdog => {
-                let window = *inner.silence_death_timeout.lock();
+                let now = Instant::now();
                 let mut registry = inner.registry.lock();
+                let window = registry.silence_window;
                 if registry.requests.is_empty() {
                     // Idle with nothing in flight: silence is expected, keep waiting.
                     drop(registry);
-                    watchdog.as_mut().reset(Instant::now() + window);
+                    watchdog.as_mut().reset(now + window);
                     continue;
                 }
-                // Silence counts from the later of the last output and the
-                // moment work became in flight: a request registered just
-                // before this tick has had no time to answer yet.
-                let silent_since = registry
-                    .in_flight_since
-                    .map_or(last_output, |since| since.max(last_output));
-                let deadline = silent_since + window;
-                if deadline > Instant::now() {
+                // The engine's unanswered work: its in-flight time since its
+                // last output, over the busy periods since. Short of a window
+                // it is a request still in its first step (one registered just
+                // before this tick, say); a whole window of it is a dead
+                // engine, however many requests it was spread over.
+                let unanswered = registry.unanswered_for(now);
+                if unanswered < window {
                     drop(registry);
-                    watchdog.as_mut().reset(deadline);
+                    watchdog.as_mut().reset(now + (window - unanswered));
                     continue;
                 }
                 inner.routing.lock().inflight.clear();
                 warn!(
-                    "no engine output for {window:?} with in-flight requests; \
+                    "no engine output through {window:?} of in-flight requests; \
                      treating engine as dead"
                 );
                 registry.fail_all(Arc::new(Error::EngineCoreDead));
@@ -1213,7 +1349,7 @@ async fn run_input_writer<P: EngineProtocol>(
             }
             None => {
                 if let Err(error) = result {
-                    warn!(%error, "failed to write a queued abort");
+                    warn!(%error, "failed to write a queued abort or wake");
                     if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
                         // The socket to the engine is gone, and with it the way
                         // to stop the requests it holds: fail what is in flight,
@@ -2835,6 +2971,197 @@ mod tests {
             .expect("an item")
             .expect("served, not failed by the watchdog");
         assert!(output.finished());
+        assert!(client.is_alive());
+    }
+
+    /// A wake a rank asks for while a frame is blocked ahead in the input
+    /// queue (a lockstep group, one rank not reading) neither parks the
+    /// dispatcher nor skips a rank: the output of the rank that reads is
+    /// routed at once, and when the engine reads again every rank gets the
+    /// wake, the one whose frame was blocked included.
+    #[tokio::test]
+    async fn a_wake_requested_while_a_frame_is_blocked_parks_no_output_and_skips_no_rank() {
+        let (client, mut engines, _ns) = connect_ranks(2, true).await;
+        client.set_send_timeout(SEND_WINDOW);
+        // Rank 1 holds a request and reads its input; rank 0 reads nothing.
+        let mut in_flight = client.submit(request_for("req-1", 1)).await.unwrap();
+        match engines[1].recv().await.unwrap() {
+            EngineInbound::Add(request) => assert_eq!(request.request_id, "req-1"),
+            other => panic!("rank 1 expected the Add, got {other:?}"),
+        }
+        assert_eq!(next_wake(&mut engines[1]).await, 1);
+        // A frame rank 0 does not read blocks the input queue.
+        let (request, aux) = large_request("req-large");
+        let error = client
+            .submit_with_aux(request, aux)
+            .await
+            .err()
+            .expect("rank 0 is not reading a frame this large");
+        assert!(
+            matches!(error, Error::EngineInputBlocked { .. }),
+            "{error:?}"
+        );
+        // Rank 1 took a request for a drained wave and asks for the next one.
+        let requested = 7;
+        engines[1]
+            .send_output(wave_control(1, DpControlMessage::StartWave(requested)))
+            .await
+            .unwrap();
+        // The wake waits on the blocked input; the dispatcher does not.
+        engines[1]
+            .send_output(batch(
+                1,
+                EngineCoreOutput {
+                    request_id: "req-1".into(),
+                    new_token_ids: vec![7],
+                    finish_reason: Some(EngineCoreFinishReason::Stop),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap();
+        let output = tokio::time::timeout(SEND_WINDOW / 2, in_flight.next())
+            .await
+            .expect("output routed while the wake waits on the blocked input")
+            .unwrap()
+            .unwrap();
+        assert!(output.finished());
+        // Rank 0 reads again: its queue drains, the requested wake in it.
+        let woken = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                match engines[0].recv().await.unwrap() {
+                    EngineInbound::StartDpWave { wave, .. } if wave >= requested => return wave,
+                    EngineInbound::StartDpWave { .. }
+                    | EngineInbound::Add(_)
+                    | EngineInbound::Abort(_) => continue,
+                    EngineInbound::Utility(call) => panic!("unexpected utility call {call:?}"),
+                }
+            }
+        })
+        .await
+        .expect("rank 0 is woken for the requested wave once it reads again");
+        assert!(woken >= requested);
+        // And rank 1, whose frame was behind the blocked one, has its wake too:
+        // the broadcast was queued whole, not cut at the window.
+        let woken = tokio::time::timeout(TIMEOUT, next_wake(&mut engines[1]))
+            .await
+            .expect("rank 1 is woken for the requested wave");
+        assert!(woken >= requested);
+        assert!(client.is_alive());
+    }
+
+    /// A core that reads every request and answers none (its input thread
+    /// alive, its step hung) is given up on once it has had requests in
+    /// flight for a whole window in total, even when every request is
+    /// abandoned before the window: the busy periods add up until an output,
+    /// or a whole window idle, starts the count over.
+    #[tokio::test]
+    async fn a_core_that_reads_every_request_and_answers_none_is_given_up_on() {
+        let (client, mut engine, _ns) = connect().await;
+        let window = Duration::from_millis(600);
+        client.set_silence_death_timeout(window);
+        // One answered request arms the watchdog with that window.
+        let mut warm = client.submit(request_for("req-warm", 0)).await.unwrap();
+        engine.recv().await.unwrap();
+        engine
+            .send_output(finished_output("req-warm"))
+            .await
+            .unwrap();
+        assert!(warm.next().await.unwrap().unwrap().finished());
+        // From here the engine reads its input, adds and aborts alike, and
+        // answers nothing. Requests abandoned after less than half a window
+        // each, with a short gap between them: no busy period lasts a window,
+        // together they do.
+        let (busy, gap) = (Duration::from_millis(250), Duration::from_millis(70));
+        let started = std::time::Instant::now();
+        let mut given_up = None;
+        for n in 0..12 {
+            let request_id = format!("req-{n}");
+            let mut stream = match client.submit(request_for(&request_id, 0)).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    given_up = Some(error);
+                    break;
+                }
+            };
+            match engine.recv().await.unwrap() {
+                EngineInbound::Add(request) => assert_eq!(request.request_id, request_id),
+                other => panic!("expected the Add, got {other:?}"),
+            }
+            match tokio::time::timeout(busy, stream.next()).await {
+                Err(_abandoned) => drop(stream),
+                Ok(Some(Err(error))) => {
+                    given_up = Some(error);
+                    break;
+                }
+                Ok(other) => panic!("the engine answers nothing: {other:?}"),
+            }
+            // The abandoned request's abort, read like everything else.
+            match engine.recv().await.unwrap() {
+                EngineInbound::Abort(ids) => assert_eq!(ids, [request_id]),
+                other => panic!("expected the Abort, got {other:?}"),
+            }
+            tokio::time::sleep(gap).await;
+        }
+        let error = given_up.expect("the engine is given up on within a few abandoned requests");
+        assert!(
+            matches!(&error, Error::Shared(shared) if matches!(**shared, Error::EngineCoreDead))
+                || matches!(error, Error::ClientClosed { .. }),
+            "{error:?}"
+        );
+        assert!(!client.is_alive());
+        assert!(
+            started.elapsed() >= window,
+            "given up on no sooner than a window of unanswered work"
+        );
+    }
+
+    /// A request larger than the byte bound on its own is refused while the
+    /// input is blocked, with nothing waiting (the bound is what may be
+    /// parked), and the error names the request's own size against the bound.
+    #[tokio::test]
+    async fn a_request_past_the_byte_bound_on_its_own_is_refused_with_its_size_named() {
+        let (client, _engine, _ns) = connect().await;
+        client.set_send_timeout(SEND_WINDOW);
+        client.set_input_queue_limit(usize::MAX, 1 << 20);
+        let (request, aux) = large_request("req-large");
+        let error = client
+            .submit_with_aux(request, aux)
+            .await
+            .err()
+            .expect("the engine is not reading a frame this large");
+        assert!(
+            matches!(error, Error::EngineInputBlocked { .. }),
+            "{error:?}"
+        );
+        let started = std::time::Instant::now();
+        let error = client
+            .submit_with_aux(
+                request_for("req-big", 0),
+                vec![Bytes::from(vec![0u8; 2 << 20])],
+            )
+            .await
+            .err()
+            .expect("the request alone passes the bound");
+        assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
+        match &error {
+            Error::EngineInputFull {
+                frames: 0,
+                bytes: 0,
+                request_bytes,
+                limit_frames: usize::MAX,
+                limit_bytes,
+            } => {
+                assert!(*request_bytes >= 2 << 20, "{request_bytes}");
+                assert_eq!(*limit_bytes, 1 << 20);
+            }
+            other => panic!("{other:?}"),
+        }
+        let text = error.to_string();
+        assert!(
+            text.contains("this request's") && text.contains("would pass the bound"),
+            "{text}"
+        );
         assert!(client.is_alive());
     }
 }
