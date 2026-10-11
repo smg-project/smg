@@ -728,6 +728,44 @@ async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage
 }
 
 #[tokio::test]
+async fn byte_fallback_messages_transport_eof_reports_local_stop_without_input_usage() {
+    let (stream, server) = scripted_stream(byte_fallback_chunks(&[1, 2]), "0").await;
+    let (tx, rx) = sse_channel();
+    let result = processor(false)
+        .process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            byte_fallback_tokenizer(),
+            (
+                Some(StringOrArray::Array(vec!["é".into()])),
+                None,
+                false,
+                false,
+                true,
+            ),
+            byte_fallback_messages_spec(false),
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert!(events.iter().all(|event| event["delta"]["text"].is_null()));
+    let final_delta = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .unwrap();
+    assert_eq!(final_delta["delta"]["stop_reason"], "stop_sequence");
+    assert_eq!(final_delta["delta"]["stop_sequence"], "é");
+    assert!(
+        final_delta["usage"]["input_tokens"].is_null(),
+        "{final_delta}"
+    );
+}
+
+#[tokio::test]
 async fn byte_fallback_completion_transport_eof_preserves_text_without_complete() {
     let tokenizer = byte_fallback_tokenizer();
     let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
@@ -1143,6 +1181,53 @@ async fn chat_stream_opens_a_forced_tool_call_with_a_null_content() {
             "{tool_choice}: {events:?}"
         );
         assert!(first["logprobs"].is_null() && first["finish_reason"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn chat_empty_decoder_eof_does_not_invent_a_forced_tool_call() {
+    for with_complete in [false, true] {
+        let mut frames = vec![chunk(0, "STOP")];
+        if with_complete {
+            frames.push(complete(0, "stop"));
+        }
+        let (stream, server) = scripted_stream(frames, "0").await;
+        let (tx, rx) = sse_channel();
+        let mut spec = chat_spec_with(
+            true,
+            Some(serde_json::json!({"type":"function", "function":{"name":"lookup"}})),
+        );
+        spec.separate_reasoning = false;
+        spec.expected_choices = 1;
+        let result = processor(true)
+            .process_streaming_chunks(
+                stream,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (
+                    Some(StringOrArray::Array(vec!["STOP".into()])),
+                    None,
+                    false,
+                    false,
+                    true,
+                ),
+                spec,
+                &tx,
+                None,
+            )
+            .await;
+        drop(tx);
+        let events = collect_events(rx).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(chat_text(&events, 0, "content"), "");
+        assert!(
+            events.iter().all(|event| {
+                let choice = &event["choices"][0];
+                choice["delta"]["tool_calls"].is_null() && choice["finish_reason"] != "tool_calls"
+            }),
+            "{events:?}"
+        );
     }
 }
 

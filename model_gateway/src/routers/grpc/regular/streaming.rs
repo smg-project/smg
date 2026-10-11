@@ -751,6 +751,9 @@ impl StreamingProcessor {
                             None => String::new(),
                         }
                     };
+                    if !parser_eof && text.is_empty() {
+                        continue;
+                    }
                     Some((index, text, None, held_tokens.remove(&index).unwrap_or(0)))
                 }
             };
@@ -2570,7 +2573,15 @@ impl StreamingProcessor {
                     // Emit pending byte text, then flush the parser on the next
                     // iteration without pretending the engine sent Complete.
                     decoder_finished_at_eof = true;
-                    match stop_decoder.finish().map_err(|e| e.to_string())? {
+                    let tail = stop_decoder.finish().map_err(|e| e.to_string())?;
+                    if stop_decoder.is_stopped() {
+                        stopped = true;
+                        finish_reason_str = "stop".to_string();
+                        matched_stop = stop_decoder
+                            .matched_stop()
+                            .map(|s| Value::String(s.to_string()));
+                    }
+                    match tail {
                         SequenceDecoderOutput::Text(text)
                         | SequenceDecoderOutput::StoppedWithText(text)
                             if !text.is_empty() =>

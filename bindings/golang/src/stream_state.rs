@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 
-use llm_tokenizer::stream::DecodeStream;
+use llm_tokenizer::{stream::DecodeStream, StopSequenceDecoder};
 
 /// Per-index state for streaming responses
 pub struct StreamIndexState {
-    pub text_buffer: String,
+    pub stop_decoder: Option<StopSequenceDecoder>,
     pub decode_stream: Option<DecodeStream>,
     pub has_tool_calls: bool,
     pub is_first_chunk: bool,
@@ -17,7 +17,7 @@ pub struct StreamIndexState {
 impl Default for StreamIndexState {
     fn default() -> Self {
         Self {
-            text_buffer: String::new(),
+            stop_decoder: None,
             decode_stream: None,
             has_tool_calls: false,
             is_first_chunk: true, // New streams start with first chunk

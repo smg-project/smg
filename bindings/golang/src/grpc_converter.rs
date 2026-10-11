@@ -7,11 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use llm_tokenizer::{
-    stop::{SequenceDecoderOutput, StopSequenceDecoder},
-    stream::DecodeStream,
-    traits::Tokenizer,
-};
+use llm_tokenizer::{stop::SequenceDecoderOutput, stream::DecodeStream, traits::Tokenizer};
 use openai_protocol::common::{
     FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage,
 };
@@ -35,7 +31,8 @@ use super::{
 pub struct GrpcResponseConverterHandle {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) tool_parser: Option<Arc<TokioMutex<Box<dyn ToolParser>>>>,
-    pub(crate) stop_decoder: Option<Arc<TokioMutex<StopSequenceDecoder>>>,
+    pub(crate) stop: Option<StringOrArray>,
+    pub(crate) stop_token_ids: Option<Vec<u32>>,
     pub(crate) model: String,
     pub(crate) request_id: String,
     pub(crate) created: u64,
@@ -148,20 +145,6 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
         serde_json::from_str::<Vec<u32>>(ids_str).ok()
     };
 
-    // Create stop decoder if needed
-    let stop_decoder = if stop.is_some() || stop_token_ids.is_some() {
-        Some(Arc::new(TokioMutex::new(create_stop_decoder(
-            &tokenizer,
-            stop.as_ref(),
-            stop_token_ids.as_ref(),
-            skip_special_tokens != 0,
-            false, // no_stop_trim
-            false, // ignore_eos
-        ))))
-    } else {
-        None
-    };
-
     // Create tool parser if tools are provided
     let tool_parser = if tools.is_some() {
         PARSER_FACTORY
@@ -178,7 +161,8 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
     Box::into_raw(Box::new(GrpcResponseConverterHandle {
         tokenizer,
         tool_parser,
-        stop_decoder,
+        stop,
+        stop_token_ids,
         model: model_str.to_string(),
         request_id: request_id_str.to_string(),
         // unwrap_or_default is acceptable here: if the clock is before UNIX epoch,
@@ -385,8 +369,19 @@ pub(crate) async fn convert_proto_chunk_to_openai(
             state.completion_tokens = chunk.completion_tokens;
 
             // Process tokens through stop decoder if available, otherwise use incremental decoder
-            let chunk_text = if let Some(ref stop_decoder) = handle.stop_decoder {
-                let mut decoder_guard = stop_decoder.lock().await;
+            if state.stop_decoder.is_none()
+                && (handle.stop.is_some() || handle.stop_token_ids.is_some())
+            {
+                state.stop_decoder = Some(create_stop_decoder(
+                    tokenizer,
+                    handle.stop.as_ref(),
+                    handle.stop_token_ids.as_ref(),
+                    handle.skip_special_tokens,
+                    false,
+                    false,
+                ));
+            }
+            let chunk_text = if let Some(decoder_guard) = &mut state.stop_decoder {
                 let mut text = String::new();
                 for &token_id in &chunk.token_ids {
                     match decoder_guard
@@ -457,13 +452,6 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                 return Ok(Some(first_response));
             }
 
-            // Update stream buffer
-            handle
-                .stream_state
-                .get_or_create(index)
-                .text_buffer
-                .push_str(&chunk_text);
-
             if let Some((_, tool_call_deltas)) = parse_tool_text(handle, &chunk_text).await {
                 handle.stream_state.get_or_create(index).has_tool_calls = true;
                 let tool_response = ChatCompletionStreamResponse {
@@ -515,63 +503,59 @@ pub(crate) async fn convert_proto_chunk_to_openai(
         }
         Some(Complete(complete)) => {
             let index = complete.index;
-            let (pending_text, stopped_at_finish, local_matched_stop) =
-                if let Some(decoder) = &handle.stop_decoder {
-                    let mut decoder = decoder.lock().await;
-                    let tail = decoder
-                        .finish()
-                        .map_err(|error| format!("Failed to finish token decoding: {error}"))?;
-                    let stopped = matches!(
-                        tail,
-                        SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
-                    );
-                    let matched = stopped
-                        .then(|| {
-                            decoder
-                                .matched_stop()
-                                .map(|stop| Value::String(stop.to_string()))
-                        })
-                        .flatten();
-                    let text = match tail {
-                        SequenceDecoderOutput::Text(text)
-                        | SequenceDecoderOutput::StoppedWithText(text) => text,
-                        _ => String::new(),
-                    };
-                    (text, stopped, matched)
-                } else {
-                    (String::new(), false, None)
+            let mut removed_state = handle.stream_state.remove(index);
+            let (mut pending_text, stopped_at_finish, local_matched_stop) = if let Some(decoder) =
+                removed_state
+                    .as_mut()
+                    .and_then(|state| state.stop_decoder.as_mut())
+            {
+                let tail = decoder
+                    .finish()
+                    .map_err(|error| format!("Failed to finish token decoding: {error}"))?;
+                let stopped = matches!(
+                    tail,
+                    SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
+                );
+                let matched = stopped
+                    .then(|| {
+                        decoder
+                            .matched_stop()
+                            .map(|stop| Value::String(stop.to_string()))
+                    })
+                    .flatten();
+                let text = match tail {
+                    SequenceDecoderOutput::Text(text)
+                    | SequenceDecoderOutput::StoppedWithText(text) => text,
+                    _ => String::new(),
                 };
+                (text, stopped, matched)
+            } else {
+                (String::new(), false, None)
+            };
 
-            // EOF text is new parser input, just like text released by a Chunk.
-            let (pending_content, eof_tool_calls) =
-                match parse_tool_text(handle, &pending_text).await {
-                    Some((normal_text, calls)) => (normal_text, Some(calls)),
-                    None => (pending_text, None),
-                };
-
-            // Get and remove state for this index
-            let removed_state = handle.stream_state.remove(index);
-            let (mut final_text, has_tool_calls, state_prompt_tokens, state_completion_tokens) =
+            let (has_tool_calls, state_prompt_tokens, state_completion_tokens) =
                 if let Some(mut state) = removed_state {
                     // Flush decode stream
-                    let mut text = std::mem::take(&mut state.text_buffer);
                     if let Some(ref mut decode_stream) = state.decode_stream {
                         if let Ok(Some(remaining)) = decode_stream.flush() {
-                            text.push_str(&remaining);
+                            pending_text.push_str(&remaining);
                         }
                     }
                     (
-                        text,
                         state.has_tool_calls,
                         state.prompt_tokens,
                         state.completion_tokens,
                     )
                 } else {
-                    (String::new(), false, 0, 0)
+                    (false, 0, 0)
                 };
 
+            // Only newly decoded text reaches the parser or the client here.
+            let (final_text, eof_tool_calls) = match parse_tool_text(handle, &pending_text).await {
+                Some((normal_text, calls)) => (normal_text, Some(calls)),
+                None => (pending_text, None),
+            };
             let has_tool_calls = has_tool_calls || eof_tool_calls.is_some();
-            final_text.push_str(&pending_content);
 
             // Determine finish reason
             let engine_finish_reason = if stopped_at_finish {
@@ -713,15 +697,11 @@ mod tests {
     async fn byte_fallback_complete_releases_tail_and_enforces_stop() {
         let tokenizer = byte_fallback_tokenizer();
         for stop in ["NEVER", "é"] {
-            let decoder = StopSequenceDecoder::new(
-                tokenizer.clone(),
-                llm_tokenizer::StopSequenceConfig::default().with_stop_sequence(stop),
-                true,
-            );
             let mut handle = GrpcResponseConverterHandle {
                 tokenizer: tokenizer.clone(),
                 tool_parser: None,
-                stop_decoder: Some(Arc::new(TokioMutex::new(decoder))),
+                stop: Some(StringOrArray::Array(vec![stop.into()])),
+                stop_token_ids: None,
                 model: "byte-fallback-test".into(),
                 request_id: "test".into(),
                 created: 0,
@@ -786,17 +766,13 @@ mod tests {
             }
         }]))
         .unwrap();
-        let decoder = StopSequenceDecoder::new(
-            tokenizer.clone(),
-            llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("NEVER"),
-            true,
-        );
         GrpcResponseConverterHandle {
             tokenizer,
             tool_parser: Some(Arc::new(TokioMutex::new(
                 Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>,
             ))),
-            stop_decoder: Some(Arc::new(TokioMutex::new(decoder))),
+            stop: Some(StringOrArray::Array(vec!["NEVER".into()])),
+            stop_token_ids: None,
             model: "byte-fallback-test".into(),
             request_id: "tool-tail".into(),
             created: 0,
@@ -975,6 +951,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let choice = &final_response.choices[0];
+        assert!(choice.delta.content.is_none(), "{final_response:?}");
         for call in choice.delta.tool_calls.as_ref().unwrap() {
             assert_eq!(call.index, 0);
             if let Some(fragment) = call
@@ -993,5 +970,100 @@ mod tests {
         assert_eq!(wire["usage"]["prompt_tokens"], 7);
         assert_eq!(wire["usage"]["completion_tokens"], completion_tokens);
         assert_eq!(wire["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+    }
+    #[tokio::test]
+    async fn byte_fallback_complete_does_not_repeat_emitted_content() {
+        let tokenizer = byte_fallback_tokenizer();
+        let mut handle = tool_test_handle(
+            tokenizer.clone(),
+            Some(ToolChoice::Value(ToolChoiceValue::None)),
+        );
+        handle.stream_state.get_or_create(0).is_first_chunk = false;
+        let mut text = String::new();
+        for ids in [vec![257], vec![0xC3 + 1, 0xA9 + 1]] {
+            let chunk = proto::GenerateResponse {
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        token_ids: ids,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            };
+            if let Some(response) = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+            {
+                text.push_str(response.choices[0].delta.content.as_deref().unwrap());
+            }
+        }
+        let complete = proto::GenerateResponse {
+            response: Some(proto::generate_response::Response::Complete(
+                proto::GenerateComplete {
+                    finish_reason: "stop".into(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let final_response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
+            .await
+            .unwrap()
+            .unwrap();
+        let tail = final_response.choices[0].delta.content.as_deref().unwrap();
+        assert_eq!(tail, "é");
+        text.push_str(tail);
+        assert_eq!(
+            text,
+            tokenizer.decode(&[257, 0xC3 + 1, 0xA9 + 1], true).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn byte_fallback_complete_keeps_interleaved_choices_separate() {
+        let tokenizer = byte_fallback_tokenizer();
+        let mut handle = tool_test_handle(
+            tokenizer.clone(),
+            Some(ToolChoice::Value(ToolChoiceValue::None)),
+        );
+        for index in [0, 1] {
+            handle.stream_state.get_or_create(index).is_first_chunk = false;
+        }
+        for (index, byte) in [(0, b't'), (1, b's')] {
+            let chunk = proto::GenerateResponse {
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        index,
+                        token_ids: vec![u32::from(byte) + 1],
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            };
+            assert!(
+                convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for (index, expected) in [(0, "t"), (1, "s")] {
+            let complete = proto::GenerateResponse {
+                response: Some(proto::generate_response::Response::Complete(
+                    proto::GenerateComplete {
+                        index,
+                        finish_reason: "stop".into(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            };
+            let response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.choices[0].index, index);
+            assert_eq!(response.choices[0].delta.content.as_deref(), Some(expected));
+        }
     }
 }
