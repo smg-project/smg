@@ -250,7 +250,8 @@ impl PipelineStage for WorkerSelectionStage {
         let media_refs = ctx.state.multimodal_refs.is_some();
         // A disaggregated decode leg a worker without a vision encoder cannot
         // take is kept off such workers while the model pairs one with it.
-        let needs_vision = decode_needs_vision(&ctx.input.request_type, intermediate, media_refs);
+        let needs_vision =
+            self.decode_leg_needs_vision(&ctx.input.request_type, intermediate, media_refs);
 
         let text = prep.routing_text();
 
@@ -529,6 +530,23 @@ impl WorkerSelectionStage {
 
         ctx.workers = Some(workers);
         Ok(())
+    }
+
+    /// Whether this stage's decode leg needs a vision encoder for the
+    /// request ([`decode_needs_vision`]), recorded in the routing snapshot
+    /// and paired under: in prefill/decode mode only. In
+    /// encode/prefill/decode mode the encode workers take the pixels and the
+    /// decode leg is dispatched without them, so it never needs the encoder
+    /// and a retry must not be held to a worker with one; regular mode has
+    /// no decode leg.
+    fn decode_leg_needs_vision(
+        &self,
+        request: &RequestType,
+        intermediate: Option<&multimodal::MultimodalIntermediate>,
+        media_refs: bool,
+    ) -> bool {
+        self.mode == WorkerSelectionMode::PrefillDecode
+            && decode_needs_vision(request, intermediate, media_refs)
     }
 
     /// Select a PD pair and take its Prefill admission slot. With admission
@@ -3153,6 +3171,47 @@ mod tests {
             decode_needs_vision(&chat(None), Some(&gridded), false),
             "grid tensors are read by the decode leg"
         );
+    }
+
+    /// The demand is recorded in prefill/decode mode only: the decode leg of
+    /// encode/prefill/decode mode is dispatched without the pixels (its
+    /// encode workers take them), so neither its first selection nor a retry
+    /// is held to a decode worker with the encoder; regular mode has no
+    /// decode leg.
+    #[test]
+    fn the_decode_leg_demand_is_recorded_in_prefill_decode_mode_only() {
+        use openai_protocol::chat::ChatCompletionRequest;
+
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "n": 2
+        }))
+        .unwrap();
+        let request = RequestType::Chat(Arc::new(request));
+        let gridded = image_intermediate(Some("image_grid_thw"));
+        let stage = |mode| {
+            WorkerSelectionStage::new(
+                Arc::new(WorkerRegistry::new()),
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                mode,
+                None,
+            )
+        };
+
+        let pd = stage(WorkerSelectionMode::PrefillDecode);
+        assert!(pd.decode_leg_needs_vision(&request, Some(&gridded), false));
+        assert!(pd.decode_leg_needs_vision(&request, None, true));
+
+        let epd = stage(WorkerSelectionMode::EncodePrefillDecode);
+        assert!(
+            !epd.decode_leg_needs_vision(&request, Some(&gridded), false),
+            "the encode/prefill/decode decode leg takes no pixels"
+        );
+        assert!(!epd.decode_leg_needs_vision(&request, None, true));
+
+        let regular = stage(WorkerSelectionMode::Regular);
+        assert!(!regular.decode_leg_needs_vision(&request, Some(&gridded), false));
     }
 
     /// A request whose decode leg needs a vision encoder pairs with a decode
