@@ -60,6 +60,18 @@ pub enum Error {
     RequestStreamClosed { request_id: String },
     #[error("engine ZMQ client is closed: {message}")]
     ClientClosed { message: String },
+    #[error("engine did not accept the request within {timeout:?}: its input is not being read")]
+    EngineInputBlocked { timeout: Duration },
+    #[error(
+        "engine is not reading its input: this request's {request_bytes} bytes and the {frames} request frames ({bytes} bytes) already waiting for it would pass the bound of {limit_frames} frames or {limit_bytes} bytes; request refused"
+    )]
+    EngineInputFull {
+        frames: usize,
+        bytes: usize,
+        request_bytes: usize,
+        limit_frames: usize,
+        limit_bytes: usize,
+    },
     #[error("engine utility call failed: {message}")]
     UtilityCallFailed { message: String },
     #[error("utility call `{method}` got no reply within {timeout:?}")]

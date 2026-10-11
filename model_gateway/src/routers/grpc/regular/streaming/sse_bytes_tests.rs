@@ -245,11 +245,13 @@ async fn chat_stream_bytes_match_the_recorded_fixtures() {
     }
 }
 
-/// Chunks the engine has already delivered leave as one frame: the buffered
-/// stream here has every response ready at once, so the role and content
-/// chunks share a frame and only the finish chunk follows separately.
+/// Every engine message leaves as its own frame as soon as it is processed,
+/// even when the engine delivered them all at once: here the role chunk
+/// shares the first content chunk's frame (both are written before the
+/// stream is polled again), the two other content chunks and the finish
+/// chunk follow one frame each.
 #[tokio::test]
-async fn ready_chunks_share_one_frame() {
+async fn each_engine_message_leaves_as_its_own_frame() {
     let scenario = Scenario {
         name: "ready_chunks",
         with_tools: false,
@@ -296,8 +298,8 @@ async fn ready_chunks_share_one_frame() {
     server.abort();
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(events, 5, "role, three content chunks and the finish chunk");
-    assert!(
-        frames <= 2,
-        "{events} ready events arrived in {frames} frames instead of one plus the finish chunk"
+    assert_eq!(
+        frames, 4,
+        "{events} events in {frames} frames: the role with the first content chunk, then one frame per message"
     );
 }

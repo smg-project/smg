@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde_json::Value;
-use tokio_postgres::{NoTls, Row};
+use tokio_postgres::{IsolationLevel, NoTls, Row};
 
 use crate::{
     common::{build_response_select_base, extra_column_defs, resolve_extra_column_values},
@@ -854,6 +854,7 @@ fn build_item_from_row(
 pub(super) struct PostgresResponseStorage {
     store: PostgresStore,
     select_base: String,
+    store_path: StorePath,
 }
 
 impl PostgresResponseStorage {
@@ -908,8 +909,13 @@ impl PostgresResponseStorage {
             }
         }
 
+        let store_path = store_path_for(&client, &table, s.col("id")).await;
         let select_base = build_response_select_base(&store.schema);
-        Ok(Self { store, select_base })
+        Ok(Self {
+            store,
+            select_base,
+            store_path,
+        })
     }
 
     pub fn build_response_from_row(
@@ -1004,6 +1010,152 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     ))
 }
 
+/// How a response is stored under its id, decided once at start-up from the
+/// catalog (`store_path_for`). The table the store creates has a primary key
+/// on the id, so it takes the one-statement path; a configured table that
+/// pre-exists without a unique index on its mapped id column takes the
+/// locked path, which needs none. Either way a record written as `queued`
+/// is replaced by its terminal object under the one id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorePath {
+    /// `INSERT ... ON CONFLICT (id) DO UPDATE`: one statement, no lock, the
+    /// unique index as the arbiter; one round trip once the statement is
+    /// prepared on the connection.
+    Upsert,
+    /// One transaction: a transaction-scoped advisory lock on the id, then
+    /// one statement that updates every column of the rows under the id and
+    /// inserts when none moved (four round trips: begin, lock, statement,
+    /// commit). The lock serializes the stores of one id across every
+    /// gateway sharing the database: the statement takes its snapshot once
+    /// the lock is held, so two first stores of an id cannot both insert.
+    LockedMerge,
+}
+
+/// Whether the mapped id column of a table carries an index that
+/// `INSERT ... ON CONFLICT (id)` can use as its arbiter: unique, valid, not
+/// deferrable, on that one column alone, without a predicate or an
+/// expression. `$1` is the table as configured, `$2` the id column; an
+/// unquoted column name is stored lower-cased, so both spellings are tried.
+const UNIQUE_ID_INDEX_SQL: &str = "SELECT EXISTS (\
+    SELECT 1 FROM pg_catalog.pg_index i \
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] \
+    WHERE i.indrelid = to_regclass($1) AND i.indisunique AND i.indisvalid AND i.indimmediate \
+    AND i.indnkeyatts = 1 AND i.indpred IS NULL AND i.indexprs IS NULL \
+    AND (a.attname::text = $2 OR a.attname::text = lower($2)))";
+
+/// Reads the catalog once and names the path in the log. A failed read (a
+/// server without these catalog columns, a missing privilege) takes the
+/// locked path, which works on any table.
+async fn store_path_for(
+    client: &deadpool_postgres::Client,
+    table: &str,
+    id_col: &str,
+) -> StorePath {
+    let probe = client
+        .query_one(UNIQUE_ID_INDEX_SQL, &[&table, &id_col])
+        .await
+        .map(|row| row.get::<_, bool>(0));
+    match probe {
+        Ok(true) => {
+            tracing::info!(
+                table,
+                id_column = id_col,
+                "Postgres response store: the id column has a unique index; a store is one INSERT ... ON CONFLICT statement"
+            );
+            StorePath::Upsert
+        }
+        Ok(false) => {
+            tracing::warn!(
+                table,
+                id_column = id_col,
+                "Postgres response store: no unique index on the id column; every store takes an advisory lock and an UPDATE-then-INSERT transaction (four round trips, and a table scan while no index covers the column). A unique index on {table} ({id_col}) makes a store one statement"
+            );
+            StorePath::LockedMerge
+        }
+        Err(e) => {
+            tracing::warn!(
+                table,
+                id_column = id_col,
+                error = %e,
+                "Postgres response store: could not read the catalog for a unique index on the id column; stores take the locked UPDATE-then-INSERT path"
+            );
+            StorePath::LockedMerge
+        }
+    }
+}
+
+fn param_placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The statement of the upsert path: the row is inserted, or every other
+/// column of the row under the id (the first column) is replaced;
+/// `DO NOTHING` when the id is the only column.
+fn upsert_sql(table: &str, col_names: &[&str]) -> String {
+    let placeholders = param_placeholders(col_names.len());
+    let id_col = col_names.first().copied().unwrap_or("id");
+    let columns = col_names.join(", ");
+    let updates: Vec<String> = col_names
+        .iter()
+        .skip(1)
+        .map(|col| format!("{col} = EXCLUDED.{col}"))
+        .collect();
+    if updates.is_empty() {
+        return format!(
+            "INSERT INTO {table} ({columns}) VALUES ({placeholders}) ON CONFLICT ({id_col}) DO NOTHING"
+        );
+    }
+    format!(
+        "INSERT INTO {table} ({columns}) VALUES ({placeholders}) ON CONFLICT ({id_col}) DO UPDATE SET {}",
+        updates.join(", ")
+    )
+}
+
+/// The data statement of the locked path, run once the advisory lock is
+/// held: an UPDATE of every column of the rows under the id, then the INSERT
+/// when no row moved, as one statement. Neither part needs a unique index.
+/// The id is assigned to itself so every parameter takes its type from the
+/// SET list (the INSERT's select list reuses them) and the list is never
+/// empty.
+fn locked_merge_sql(table: &str, col_names: &[&str]) -> String {
+    let placeholders = param_placeholders(col_names.len());
+    let id_col = col_names.first().copied().unwrap_or("id");
+    let assignments: Vec<String> = col_names
+        .iter()
+        .enumerate()
+        .map(|(i, col)| format!("{col} = ${}", i + 1))
+        .collect();
+    format!(
+        "WITH upd AS (UPDATE {table} SET {} WHERE {id_col} = $1 RETURNING 1) \
+         INSERT INTO {table} ({}) SELECT {placeholders} WHERE NOT EXISTS (SELECT 1 FROM upd)",
+        assignments.join(", "),
+        col_names.join(", ")
+    )
+}
+
+/// The lock statement of the locked path, sent through the simple query
+/// protocol (one round trip, nothing to prepare): the key is a locally
+/// computed integer.
+fn lock_sql(key: i64) -> String {
+    format!("SELECT pg_advisory_xact_lock({key})")
+}
+
+/// The key of the transaction-scoped advisory lock a store of `id` holds on
+/// the locked path (FNV-1a over the id's bytes): stores of one id serialize
+/// across every gateway sharing the database, so two first stores of an id
+/// cannot both insert without a unique index on the id column.
+fn store_lock_key(id: &str) -> i64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let hash = id.bytes().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    });
+    hash as i64
+}
+
 #[async_trait]
 impl ResponseStorage for PostgresResponseStorage {
     async fn store_response(
@@ -1066,26 +1218,52 @@ impl ResponseStorage for PostgresResponseStorage {
             params.push(val);
         }
 
-        let placeholders: String = (1..=params.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({placeholders})",
-            col_names.join(", ")
-        );
-
-        let client = self
+        let mut client = self
             .store
             .pool
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        let insert_count = client
-            .execute(&sql, &params)
-            .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        tracing::debug!(rows_affected = insert_count, "Response stored in Postgres");
+        let store_err =
+            |e: tokio_postgres::Error| ResponseStorageError::StorageError(e.to_string());
+        // The statement is prepared once per pooled connection (the cache
+        // keeps it), so a store on the upsert path is one round trip.
+        let rows = match self.store_path {
+            StorePath::Upsert => {
+                let stmt = client
+                    .prepare_cached(&upsert_sql(&table, &col_names))
+                    .await
+                    .map_err(store_err)?;
+                client.execute(&stmt, &params).await.map_err(store_err)?
+            }
+            StorePath::LockedMerge => {
+                // One READ COMMITTED transaction: the statement takes its
+                // snapshot once the lock is held, so it sees the row of every
+                // store of this id that finished before it, and inserts only
+                // when there is none.
+                let tx = client
+                    .build_transaction()
+                    .isolation_level(IsolationLevel::ReadCommitted)
+                    .start()
+                    .await
+                    .map_err(store_err)?;
+                tx.batch_execute(&lock_sql(store_lock_key(&response_id.0)))
+                    .await
+                    .map_err(store_err)?;
+                let stmt = tx
+                    .prepare_cached(&locked_merge_sql(&table, &col_names))
+                    .await
+                    .map_err(store_err)?;
+                let inserted = tx.execute(&stmt, &params).await.map_err(store_err)?;
+                tx.commit().await.map_err(store_err)?;
+                inserted
+            }
+        };
+        tracing::debug!(
+            path = ?self.store_path,
+            rows,
+            "Response stored in Postgres"
+        );
         Ok(response_id)
     }
 
@@ -1270,5 +1448,52 @@ mod tests {
     #[test]
     fn parse_metadata_non_object_is_error() {
         assert!(PostgresConversationStorage::parse_metadata(Some(json!("not an object"))).is_err());
+    }
+    #[test]
+    fn upsert_sql_replaces_the_row_under_its_id_in_one_statement() {
+        let sql = upsert_sql("responses", &["id", "input", "raw_response"]);
+        assert_eq!(
+            sql,
+            "INSERT INTO responses (id, input, raw_response) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET input = EXCLUDED.input, raw_response = EXCLUDED.raw_response"
+        );
+        // The mapped id is the first column; with no other column there is
+        // nothing to replace.
+        assert_eq!(
+            upsert_sql("r", &["response_key"]),
+            "INSERT INTO r (response_key) VALUES ($1) ON CONFLICT (response_key) DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn locked_merge_sql_updates_the_rows_under_the_id_and_inserts_when_none_moved() {
+        let sql = locked_merge_sql("responses", &["id", "input", "raw_response"]);
+        assert_eq!(
+            sql,
+            "WITH upd AS (UPDATE responses SET id = $1, input = $2, raw_response = $3 \
+             WHERE id = $1 RETURNING 1) \
+             INSERT INTO responses (id, input, raw_response) SELECT $1, $2, $3 \
+             WHERE NOT EXISTS (SELECT 1 FROM upd)"
+        );
+        // One statement, and nothing in it needs a unique index on the id
+        // column (a configured table that pre-exists may have none).
+        assert!(!sql.contains("ON CONFLICT"));
+        // The SET list is never empty: the id is assigned to itself.
+        assert_eq!(
+            locked_merge_sql("r", &["response_key"]),
+            "WITH upd AS (UPDATE r SET response_key = $1 WHERE response_key = $1 RETURNING 1) \
+             INSERT INTO r (response_key) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM upd)"
+        );
+        assert_eq!(lock_sql(-42), "SELECT pg_advisory_xact_lock(-42)");
+    }
+
+    #[test]
+    fn store_lock_key_is_stable_and_tells_ids_apart() {
+        assert_eq!(store_lock_key("resp_1"), store_lock_key("resp_1"));
+        assert_ne!(store_lock_key("resp_1"), store_lock_key("resp_2"));
+        // Pinned FNV-1a 64 values: gateways of different builds share one
+        // database, so the key of an id must never change.
+        assert_eq!(store_lock_key(""), 0xcbf2_9ce4_8422_2325_u64 as i64);
+        assert_eq!(store_lock_key("a"), 0xaf63_dc4c_8601_ec8c_u64 as i64);
     }
 }

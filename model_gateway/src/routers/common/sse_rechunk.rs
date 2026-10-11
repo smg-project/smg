@@ -6,7 +6,10 @@
 //! piece, so the gateway buffers `content`, `reasoning_content`, `reasoning`
 //! and tool-call `arguments` and emits them again in moderate slices. Text is
 //! only held back briefly: the relays flush it when the upstream has been
-//! quiet for [`IDLE_FLUSH`].
+//! quiet for [`IDLE_FLUSH`], except a remainder shorter than `MIN_TAIL_CHARS`
+//! (a token or two that arrived just before the engine paused), which waits
+//! for the next text or the end of the stream: an event of its own would be
+//! exactly the tiny delta the contract forbids.
 //!
 //! Only single-choice chat completion streams are re-sliced. Everything else
 //! is forwarded as it came, after any buffered text so the order never
@@ -28,7 +31,8 @@ use serde_json::value::RawValue;
 
 /// Slices hold at most `SLICE_CHARS` characters and are cut once at least
 /// `EMIT_THRESHOLD` are buffered. A cut never leaves a tail shorter than
-/// `MIN_TAIL_CHARS`, so only a delta that is tiny in total yields a tiny event.
+/// `MIN_TAIL_CHARS`, and an idle flush holds back a remainder shorter than
+/// it, so only a delta that is tiny in total yields a tiny event.
 const SLICE_CHARS: usize = 160;
 const EMIT_THRESHOLD: usize = 80;
 const MIN_TAIL_CHARS: usize = 5;
@@ -120,18 +124,22 @@ impl SseRechunker {
         Bytes::from(out)
     }
 
-    /// Whether text is waiting for more input before it is emitted.
+    /// Whether text is waiting that an idle flush would emit: a buffer of at
+    /// least `MIN_TAIL_CHARS`. A shorter remainder waits for more text.
     pub fn has_pending(&self) -> bool {
         self.fields
             .iter()
             .chain(self.tool_args.values())
-            .any(|pending| pending.chars > 0)
+            .any(|pending| pending.chars >= MIN_TAIL_CHARS)
     }
 
-    /// Emits all buffered text without waiting for more input.
+    /// Emits the buffered text without waiting for more input, except a
+    /// remainder shorter than `MIN_TAIL_CHARS`, which stays for the next
+    /// text or [`Self::finish`]: an engine that pauses between tokens must
+    /// not turn every token into an event of its own.
     pub fn flush_pending(&mut self) -> Bytes {
         let mut out = Vec::new();
-        self.flush(&mut out);
+        self.flush_from(MIN_TAIL_CHARS, &mut out);
         Bytes::from(out)
     }
 
@@ -381,14 +389,23 @@ impl SseRechunker {
 
     /// Emits every buffered slice.
     fn flush(&mut self, out: &mut Vec<u8>) {
+        self.flush_from(1, out);
+    }
+
+    /// Emits every buffered slice of the buffers holding at least `min_chars`.
+    fn flush_from(&mut self, min_chars: usize, out: &mut Vec<u8>) {
         for (field, pending) in PAYLOAD_FIELDS.iter().zip(&mut self.fields) {
-            while pending.chars > 0 {
-                emit_text(&self.envelope, field, pending, out);
+            if pending.chars >= min_chars {
+                while pending.chars > 0 {
+                    emit_text(&self.envelope, field, pending, out);
+                }
             }
         }
         for (index, pending) in &mut self.tool_args {
-            while pending.chars > 0 {
-                emit_arguments(&self.envelope, *index, pending, out);
+            if pending.chars >= min_chars {
+                while pending.chars > 0 {
+                    emit_arguments(&self.envelope, *index, pending, out);
+                }
             }
         }
     }
@@ -1388,11 +1405,142 @@ mod tests {
     #[test]
     fn flush_pending_emits_what_is_buffered() {
         let mut r = SseRechunker::new();
-        assert!(r.feed(bytes(content_event("hi"))).is_empty());
+        assert!(r.feed(bytes(content_event("hello"))).is_empty());
         assert!(r.has_pending());
         let evs = events(&r.flush_pending());
-        assert_eq!(evs[0]["choices"][0]["delta"]["content"], Value::from("hi"));
+        assert_eq!(
+            evs[0]["choices"][0]["delta"]["content"],
+            Value::from("hello")
+        );
         assert!(!r.has_pending());
+    }
+
+    #[test]
+    fn flush_pending_holds_a_remainder_shorter_than_the_tiny_band() {
+        let mut r = SseRechunker::new();
+        assert!(r.feed(bytes(content_event("hi"))).is_empty());
+        assert!(!r.has_pending(), "two characters are not worth an event");
+        assert!(r.flush_pending().is_empty());
+        assert!(r.feed(bytes(content_event(" there"))).is_empty());
+        assert!(r.has_pending());
+        let evs = events(&r.flush_pending());
+        assert_eq!(
+            evs[0]["choices"][0]["delta"]["content"],
+            Value::from("hi there")
+        );
+        assert!(!r.has_pending());
+        // The end of the stream still releases a tiny remainder.
+        assert!(r.feed(bytes(content_event("ok"))).is_empty());
+        let evs = events(&r.finish());
+        assert_eq!(evs[0]["choices"][0]["delta"]["content"], Value::from("ok"));
+    }
+
+    /// The frames of a forced function call: the call's identity, then one
+    /// `arguments` delta per decoded token.
+    fn tool_identity_event() -> String {
+        "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"functions.write_file:0\",\"type\":\"function\",\"function\":{\"name\":\"write_file\"}}]},\"logprobs\":null,\"finish_reason\":null}]}\n\n".to_string()
+    }
+
+    fn arguments_event(text: &str) -> String {
+        format!(
+            "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":{}}}}}]}},\"logprobs\":null,\"finish_reason\":null}}]}}\n\n",
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
+    /// An upstream that repeats null identity fields on every piece.
+    fn arguments_event_with_nulls(text: &str) -> String {
+        format!(
+            "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":null,\"content\":null,\"tool_calls\":[{{\"id\":null,\"index\":0,\"type\":\"function\",\"function\":{{\"name\":null,\"arguments\":{}}}}}]}},\"logprobs\":null,\"finish_reason\":null}}]}}\n\n",
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
+    /// An upstream that sends the identity together with the first piece.
+    fn identity_with_arguments_event(text: &str) -> String {
+        format!(
+            "data: {{\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"write_file\",\"arguments\":{}}}}}]}},\"logprobs\":null,\"finish_reason\":null}}]}}\n\n",
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
+    const FINISH_EVENT: &str = "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"logprobs\":null,\"finish_reason\":\"tool_calls\"}]}\n\n";
+
+    fn argument_pieces(evs: &[Value]) -> Vec<String> {
+        evs.iter()
+            .filter_map(|e| {
+                e["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    /// The tokens of `{"path":"a.txt","content":"<hex>"}` as a byte-level
+    /// tokenizer cuts them: the JSON punctuation is one to three characters.
+    fn forced_call_tokens() -> Vec<String> {
+        let mut tokens: Vec<String> = [
+            "{\"", "path", "\":\"", "a", ".txt", "\",\"", "content", "\":\"",
+        ]
+        .iter()
+        .map(|t| (*t).to_string())
+        .collect();
+        tokens.extend((0..40).map(|i| format!("{i:04x}")));
+        tokens.push("\"}".to_string());
+        tokens
+    }
+
+    /// Streams `frames` with the idle timer firing after every one of them,
+    /// as it does when the engine pauses between tokens.
+    fn run_with_pauses(frames: &[String]) -> Vec<u8> {
+        let mut r = SseRechunker::new();
+        let mut all = Vec::new();
+        for frame in frames {
+            all.extend_from_slice(r.feed(bytes(frame)).as_ref());
+            all.extend_from_slice(r.flush_pending().as_ref());
+        }
+        all.extend_from_slice(r.feed(bytes(FINISH_EVENT)).as_ref());
+        all.extend_from_slice(r.finish().as_ref());
+        all
+    }
+
+    fn assert_no_tiny_pieces_before_the_tail(all: &[u8], tokens: &[String]) {
+        let pieces = argument_pieces(&events(all));
+        let sizes: Vec<usize> = pieces.iter().map(|p| p.chars().count()).collect();
+        let (tail, body) = sizes.split_last().expect("some argument piece");
+        assert!(body.iter().all(|&s| s >= 5), "sizes: {sizes:?}");
+        assert!(*tail >= 1);
+        assert_eq!(pieces.concat(), tokens.concat());
+    }
+
+    #[test]
+    fn an_engine_pausing_between_tokens_does_not_make_tiny_argument_events() {
+        let tokens = forced_call_tokens();
+        let mut frames = vec![tool_identity_event()];
+        frames.extend(tokens.iter().map(|t| arguments_event(t)));
+        assert_no_tiny_pieces_before_the_tail(&run_with_pauses(&frames), &tokens);
+    }
+
+    #[test]
+    fn null_identity_fields_on_every_piece_still_merge_across_pauses() {
+        let tokens = forced_call_tokens();
+        let mut frames = vec![tool_identity_event()];
+        frames.extend(tokens.iter().map(|t| arguments_event_with_nulls(t)));
+        assert_no_tiny_pieces_before_the_tail(&run_with_pauses(&frames), &tokens);
+    }
+
+    #[test]
+    fn identity_sent_with_the_first_piece_still_merges_across_pauses() {
+        let tokens = forced_call_tokens();
+        let mut frames = vec![identity_with_arguments_event(&tokens[0])];
+        frames.extend(tokens[1..].iter().map(|t| arguments_event(t)));
+        let all = run_with_pauses(&frames);
+        let evs = events(&all);
+        assert_eq!(
+            evs[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            Value::from("write_file")
+        );
+        assert_no_tiny_pieces_before_the_tail(&all, &tokens);
     }
 
     #[test]
@@ -1451,6 +1599,26 @@ mod tests {
         let frame = out.next().await.unwrap().unwrap();
         assert_eq!(contents(&[frame]), vec!["ababab"]);
         drop(tx);
+        assert!(out.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_adapter_holds_a_tiny_remainder_across_an_upstream_pause() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+        let mut out = Box::pin(rechunk_stream(ReceiverStream::new(rx)));
+        tx.send(Ok(chunk("ab"))).await.unwrap();
+        // Quiet for far longer than the idle flush: nothing worth an event yet.
+        assert!(tokio::time::timeout(IDLE_FLUSH * 4, out.next())
+            .await
+            .is_err());
+        tx.send(Ok(chunk("cde"))).await.unwrap();
+        let frame = out.next().await.unwrap().unwrap();
+        assert_eq!(contents(&[frame]), vec!["abcde"]);
+        // The end of the stream releases what the idle flush held.
+        tx.send(Ok(chunk("f"))).await.unwrap();
+        drop(tx);
+        let frame = out.next().await.unwrap().unwrap();
+        assert_eq!(contents(&[frame]), vec!["f"]);
         assert!(out.next().await.is_none());
     }
 

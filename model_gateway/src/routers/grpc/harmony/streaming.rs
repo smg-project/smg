@@ -236,7 +236,7 @@ impl HarmonyStreamingProcessor {
             cached_tokens.insert(complete.index(), complete.cached_tokens());
         })
         .await
-        .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+        .map_err(utils::StreamFailure::prefill)?;
 
         // Phase 2: Decode (shared helper)
         Self::process_chat_decode_stream(

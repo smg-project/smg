@@ -23,6 +23,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::{pending, Future},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -73,6 +74,18 @@ fn router(state: Arc<AdminState>) -> Router {
 
 /// Serve the admin API on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
+    serve_until(cfg, host, port, pending()).await;
+}
+
+/// Serve the admin API on `port` until `shutdown` resolves (the drain of a
+/// termination signal): the requests in flight are answered, no new one is
+/// accepted.
+pub async fn serve_until(
+    cfg: Arc<Config>,
+    host: String,
+    port: u16,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let listener = match TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -81,7 +94,10 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
         }
     };
     let state = Arc::new(AdminState { cfg });
-    if let Err(e) = axum::serve(listener, router(state)).await {
+    if let Err(e) = axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         tracing::error!("admin server stopped: {e}");
     }
 }
@@ -131,6 +147,7 @@ fn status_json(e: &Engine) -> Value {
         "fail_pending": fail_pending,
         "fail_secs_left": fail_secs_left,
         "fail_after_tokens": fail.and_then(|f| f.after_tokens),
+        "fail_finish_error": fail.is_some_and(|f| f.finish_error),
         "fail_stall_ms": fail.map_or(0, |f| f.stall.as_millis() as u64),
         "failed_total": s.failed_total,
         "cut_total": s.cut_total,
@@ -166,23 +183,32 @@ fn optional<T: std::str::FromStr>(
 /// `status=S` (0, or 400 to 599) answered instead of serving, for the next
 /// `count=N` requests or every request for `secs=T` (neither: until cleared),
 /// after a `stall_ms=M` hold; `after_tokens=K` serves K tokens first and cuts
-/// the stream with S. `status=0` alone clears; with `stall_ms` it stalls and
-/// then serves.
+/// the stream with S. `finish=error` ends the stream as an engine that failed
+/// the request does, a `Complete` with finish reason `error` after K tokens
+/// (0 when unset), with no status needed. `status=0` alone clears; with
+/// `stall_ms` it stalls and then serves.
 fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, String> {
     let status: u16 = optional(q, "status")?.unwrap_or(0);
     let count: Option<u32> = optional(q, "count")?;
     let secs: Option<f64> = optional(q, "secs")?;
-    let after_tokens: Option<u32> = optional(q, "after_tokens")?;
+    let mut after_tokens: Option<u32> = optional(q, "after_tokens")?;
     let stall_ms: u64 = optional(q, "stall_ms")?.unwrap_or(0);
+    let finish_error = match q.get("finish").map(String::as_str) {
+        None => false,
+        Some("error") => true,
+        Some(other) => return Err(format!("finish must be \"error\", got {other}")),
+    };
     if status != 0 && !(400..=599).contains(&status) {
         return Err(format!(
             "status must be 0 or an error status (400-599), got {status}"
         ));
     }
-    if status == 0 && after_tokens.is_some() {
+    if finish_error {
+        after_tokens = Some(after_tokens.unwrap_or(0));
+    } else if status == 0 && after_tokens.is_some() {
         return Err("after_tokens needs a status to cut the stream with".to_string());
     }
-    if status == 0 && stall_ms == 0 {
+    if status == 0 && stall_ms == 0 && !finish_error {
         return Ok(None);
     }
     let scope = match (count, secs) {
@@ -201,6 +227,7 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
         status,
         stall: Duration::from_millis(stall_ms),
         after_tokens,
+        finish_error,
         scope,
     }))
 }

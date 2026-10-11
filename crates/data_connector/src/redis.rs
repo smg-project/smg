@@ -382,6 +382,14 @@ impl RedisConversationItemStorage {
     }
 }
 
+/// The sorted-set score of a conversation link: `added_at` in milliseconds, with the
+/// microseconds as the fraction. Links a microsecond apart keep their order (on whole
+/// milliseconds they tied, and Redis orders a tie by the member, the random item id); a
+/// whole-millisecond stamp scores as before, so links already stored keep their place.
+fn link_score(added_at: DateTime<Utc>) -> f64 {
+    added_at.timestamp_micros() as f64 / 1000.0
+}
+
 #[async_trait]
 impl ConversationItemStorage for RedisConversationItemStorage {
     async fn create_item(
@@ -478,7 +486,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         let iid = item_id.0.as_str();
         let key = self.conv_items_key(cid);
 
-        let score = added_at.timestamp_millis() as f64;
+        let score = link_score(added_at);
 
         let mut conn = self
             .store
@@ -514,7 +522,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
 
         let mut pipe = redis::pipe();
         for (item_id, added_at) in items {
-            let score = added_at.timestamp_millis() as f64;
+            let score = link_score(*added_at);
             pipe.zadd(&key, item_id.0.as_str(), score).ignore();
         }
         pipe.query_async::<()>(&mut *conn)
@@ -1163,5 +1171,23 @@ mod tests {
         assert_eq!(output_item_ids(&raw), vec!["rs_1", "msg_1"]);
         assert!(output_item_ids(&json!({"id": "resp_2"})).is_empty());
         assert!(output_item_ids(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn link_scores_a_microsecond_apart_keep_their_order() {
+        let base = DateTime::from_timestamp_micros(1_700_000_000_123_456).unwrap();
+        let later = base + chrono::TimeDelta::microseconds(1);
+        assert!(link_score(base) < link_score(later));
+        assert!(link_score(later) < link_score(later + chrono::TimeDelta::microseconds(1)));
+    }
+
+    #[test]
+    fn link_score_of_a_whole_millisecond_is_its_millisecond_count() {
+        // The score links were stored with before, so stored and new links sort together.
+        let whole = DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
+        assert_eq!(
+            link_score(whole).to_bits(),
+            1_700_000_000_123.0_f64.to_bits()
+        );
     }
 }
