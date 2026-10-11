@@ -69,10 +69,10 @@ def vendor_replay(request, setup_backend):
             f"probe matrix — the checked-in baseline is stale; refresh it "
             f"(vendor_probe/README.md, 'Refreshing the baselines')"
         )
-    if health["attempted"] and health["responded_fraction"] < _MIN_RESPONDED_FRACTION:
+    problem = conformance.replay_health_problem(health, _MIN_RESPONDED_FRACTION)
+    if problem:
         pytest.fail(
-            f"replay unhealthy: only {health['responded']}/{health['attempted']} attempted "
-            f"probes got an HTTP response from {gateway.base_url} — gateway/worker problem, "
-            f"not a conformance signal"
+            f"replay unhealthy: {problem} (gateway {gateway.base_url}) — a gateway, worker "
+            f"or selection problem, not a conformance signal"
         )
     yield provider, records, sel

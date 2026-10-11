@@ -68,7 +68,7 @@ env:
 
 jobs:
   probe:
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -94,6 +94,19 @@ jobs:
           echo "::add-mask::${ANTHROPIC_API_KEY}"
           echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
 
+      # The OpenAI key is a repository secret, which pull requests from forks do
+      # not receive. Without it every probe records a 401, which the health
+      # gate (transport failures only) would not catch, so fail fast instead.
+      - name: Check OpenAI API key
+        if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY secret is not available to this run"
+            exit 1
+          fi
+
       - name: Probe OpenAI
         id: openai
         if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai' }}
@@ -101,12 +114,13 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          FILTER_ARG=""
-          [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
+          # an array keeps the regex one argument (no word splitting, no globbing)
+          FILTER_ARGS=()
+          [ -n "$PROBE_FILTER" ] && FILTER_ARGS=(--filter "$PROBE_FILTER")
           python -m vendor_probe.runner --provider openai \
             --tier "$PROBE_TIER" --budget "$PROBE_BUDGET" \
             --concurrency "$PROBE_CONCURRENCY" \
-            --out results/openai $FILTER_ARG
+            --out results/openai "${FILTER_ARGS[@]}"
 
       - name: Compress OpenAI results if large
         if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'openai') }}
@@ -128,12 +142,12 @@ jobs:
         if: ${{ env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic' }}
         continue-on-error: true
         run: |
-          FILTER_ARG=""
-          [ -n "$PROBE_FILTER" ] && FILTER_ARG="--filter $PROBE_FILTER"
+          FILTER_ARGS=()
+          [ -n "$PROBE_FILTER" ] && FILTER_ARGS=(--filter "$PROBE_FILTER")
           python -m vendor_probe.runner --provider anthropic \
             --tier "$PROBE_TIER" --budget "$PROBE_BUDGET" \
             --concurrency "$PROBE_CONCURRENCY" \
-            --out results/anthropic $FILTER_ARG
+            --out results/anthropic "${FILTER_ARGS[@]}"
 
       - name: Compress Anthropic results if large
         if: ${{ always() && (env.PROVIDER_SEL == 'all' || env.PROVIDER_SEL == 'anthropic') }}
@@ -203,10 +217,12 @@ jobs:
   # vendor-truth-<date>. These archives are the input for refreshing the
   # checked-in baselines (vendor_probe/baselines/ — see the README). Runs only
   # when the probe job passed its health gate: unhealthy runs are not truth.
+  # Only a complete matrix is truth: a probe filter or a generated-tier budget
+  # would publish a subset under the same asset names (--clobber below).
   publish-truth:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'all' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'all' && inputs.probe_filter == '' && inputs.budget == '0' }}
     needs: probe
-    runs-on: k8s-runner-cpu
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 15
     # WIDER THAN THE WORKFLOW DEFAULT (contents: read): creating the
     # vendor-truth-<date> release and uploading its assets needs
