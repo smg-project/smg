@@ -84,6 +84,7 @@ impl BuildStage for DecisionsRequestBuildingStage {
                 sampling_mask: None,
                 sampling_baseline: None,
                 inject_pd_metadata: false,
+                tool_constraint: None,
             },
         })
     }

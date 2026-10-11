@@ -1766,6 +1766,77 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// The structural tag the request's constraint carries, when that is its
+    /// constraint (TRT-LLM: a structural-tag guide; MLX: never, its builder
+    /// refuses constraints).
+    pub fn structural_tag(&self) -> Option<&str> {
+        match self {
+            Self::Sglang(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                sglang::sampling_params::Constraint::StructuralTag(tag) => Some(tag),
+                _ => None,
+            },
+            Self::Vllm(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                vllm::sampling_params::Constraint::StructuralTag(tag) => Some(tag),
+                _ => None,
+            },
+            Self::TokenSpeed(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                tokenspeed::sampling_params::Constraint::StructuralTag(tag) => Some(tag),
+                _ => None,
+            },
+            Self::Trtllm(req) => {
+                let guided = req.guided_decoding.as_ref()?;
+                (guided.guide_type
+                    == trtllm::guided_decoding_params::GuideType::StructuralTag as i32)
+                    .then_some(guided.guide.as_str())
+            }
+            Self::Mlx(_) => None,
+        }
+    }
+
+    /// Replace the structural tag the request's constraint carries; a request
+    /// whose constraint is anything else, or none, is left as it is.
+    pub fn set_structural_tag(&mut self, tag: String) {
+        match self {
+            Self::Sglang(req) => {
+                if let Some(sglang::sampling_params::Constraint::StructuralTag(current)) = req
+                    .sampling_params
+                    .as_mut()
+                    .and_then(|params| params.constraint.as_mut())
+                {
+                    *current = tag;
+                }
+            }
+            Self::Vllm(req) => {
+                if let Some(vllm::sampling_params::Constraint::StructuralTag(current)) = req
+                    .sampling_params
+                    .as_mut()
+                    .and_then(|params| params.constraint.as_mut())
+                {
+                    *current = tag;
+                }
+            }
+            Self::TokenSpeed(req) => {
+                if let Some(tokenspeed::sampling_params::Constraint::StructuralTag(current)) = req
+                    .sampling_params
+                    .as_mut()
+                    .and_then(|params| params.constraint.as_mut())
+                {
+                    *current = tag;
+                }
+            }
+            Self::Trtllm(req) => {
+                if let Some(guided) = req.guided_decoding.as_mut() {
+                    if guided.guide_type
+                        == trtllm::guided_decoding_params::GuideType::StructuralTag as i32
+                    {
+                        guided.guide = tag;
+                    }
+                }
+            }
+            Self::Mlx(_) => {}
+        }
+    }
+
     /// Offset an explicit sampling seed so fanned-out samples stay distinct
     /// yet deterministic; an unset seed stays unset (the engine then seeds
     /// each request on its own). Engines without a seed field ignore it.

@@ -142,12 +142,16 @@ impl BuildStage for MessageRequestBuildingStage {
         // gate, the thought and then the calls from the first token (the
         // worker's `structured_outputs_start` label; see
         // `utils::tool_constraints_for_worker`).
+        // The unshaped constraint stays on the attempt stamp: a retry gives
+        // the worker it selects the same shaping (`helpers::ToolConstraintStamp`).
+        let tool_parser = ctx
+            .components
+            .parser_resolver
+            .tool_parser(&messages_request.model);
+        let unshaped_tool_constraints = tool_constraints.clone();
         let tool_constraints = utils::tool_constraints_for_worker(
             &ctx.components.tool_parser_factory,
-            ctx.components
-                .parser_resolver
-                .tool_parser(&messages_request.model)
-                .as_deref(),
+            tool_parser.as_deref(),
             tool_constraints,
             ctx.state.workers.as_ref(),
         )
@@ -226,6 +230,11 @@ impl BuildStage for MessageRequestBuildingStage {
             ctx.state.media_refs_forwarded = true;
         }
 
+        let tool_constraint = helpers::ToolConstraintStamp::capture(
+            unshaped_tool_constraints,
+            tool_parser.as_deref(),
+            &proto_request,
+        );
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
             spec: ResponseSpec::Messages(MessagesResponseSpec::from(messages_request.as_ref())),
@@ -234,6 +243,7 @@ impl BuildStage for MessageRequestBuildingStage {
                 sampling_mask,
                 sampling_baseline,
                 inject_pd_metadata: self.inject_pd_metadata,
+                tool_constraint,
             },
         })
     }

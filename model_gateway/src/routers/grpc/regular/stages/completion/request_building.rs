@@ -222,6 +222,7 @@ impl BuildStage for CompletionRequestBuildingStage {
                 sampling_mask,
                 sampling_baseline,
                 inject_pd_metadata: self.inject_pd_metadata,
+                tool_constraint: None,
             },
         })
     }

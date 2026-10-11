@@ -270,6 +270,8 @@ pub(crate) struct RequestPipeline {
     mode: Mode,
     /// The registry, read at dispatch for `--worker-overload-shed`.
     worker_registry: Arc<WorkerRegistry>,
+    /// Shapes a forced tool call's constraint for each attempt's worker.
+    tool_parser_factory: ToolParserFactory,
 }
 
 /// Outcome of one full pipeline run.
@@ -448,6 +450,7 @@ impl RequestPipeline {
             backend_type: backend,
             mode,
             worker_registry: deps.worker_registry.clone(),
+            tool_parser_factory: deps.tool_parser_factory.clone(),
         })
     }
 
@@ -530,9 +533,9 @@ impl RequestPipeline {
         dctx.attempt = attempt;
         if attempt > 0 {
             // Fresh worker selection per attempt; the retained plan is
-            // re-stamped (engine ids, sampling defaults, PD rooms) for the
-            // new workers. Buffered decode state from the failed attempt is
-            // reset.
+            // re-stamped (engine ids, sampling defaults, the forced tool
+            // call's shape, PD rooms) for the new workers. Buffered decode
+            // state from the failed attempt is reset.
             self.stages.worker_selection.reselect(dctx).await?;
             let workers = dctx.workers.as_ref().ok_or_else(|| {
                 error!(
@@ -556,7 +559,7 @@ impl RequestPipeline {
                 error!(function = "run_attempt", "Execution plan already consumed");
                 error::internal_error("execution_plan_consumed", "Execution plan already consumed")
             })?;
-            helpers::restamp_plan_for_attempt(retained, stamp, workers)?;
+            helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }
