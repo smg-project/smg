@@ -298,11 +298,13 @@ fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
 #[tokio::test]
 async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
     let tokenizer = byte_fallback_tokenizer();
-    for (ids, stop) in [
-        (vec![1, 2, 3], None),
-        (vec![1, 2], None),
-        (vec![1, 1], None),
-        (vec![1, 2], Some("�")),
+    // `t` is text as soon as it arrives; the invalid byte after it is held, and comes out as one
+    // replacement when ` suffix` closes the run or the stream ends (or is the stop sequence).
+    for (ids, stop, text) in [
+        (vec![1, 2, 3], None, "t� suffix"),
+        (vec![1, 2], None, "t�"),
+        (vec![1, 1], None, "tt"),
+        (vec![1, 2], Some("�"), "t"),
     ] {
         let mut frames: Vec<_> = ids
             .iter()
@@ -358,18 +360,11 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
             !events.iter().any(|event| event.get("error").is_some()),
             "{wire}"
         );
-        let text: String = events
+        let streamed: String = events
             .iter()
             .filter_map(|event| event["choices"][0]["text"].as_str())
             .collect();
-        assert_eq!(
-            text,
-            if stop.is_some() {
-                String::new()
-            } else {
-                tokenizer.decode(&ids, true).unwrap()
-            }
-        );
+        assert_eq!(streamed, text, "{ids:?} stop={stop:?}");
         assert!(
             events
                 .iter()
@@ -418,7 +413,8 @@ async fn byte_fallback_generate_eof_reports_gateway_stop() {
         .unwrap();
     server.abort();
     let wire = serde_json::to_value(&responses[0]).unwrap();
-    assert_eq!(wire["text"], "");
+    // `t` is text before the invalid byte, which is the stop sequence.
+    assert_eq!(wire["text"], "t");
     assert_eq!(wire["meta_info"]["finish_reason"]["type"], "stop");
     assert_eq!(wire["meta_info"]["matched_stop"], "�");
 }
@@ -546,10 +542,11 @@ async fn byte_fallback_chat_eof_emits_exact_text_before_finish() {
     let events = collect_events(rx).await;
     server.abort();
     assert!(result.is_ok(), "{result:?}");
-    assert_eq!(chat_text(&events, 0, "content"), "��");
+    // `t` at once, the invalid byte held to the end and released as a replacement.
+    assert_eq!(chat_text(&events, 0, "content"), "t�");
     let content = events
         .iter()
-        .position(|event| event["choices"][0]["delta"]["content"].as_str() == Some("��"))
+        .position(|event| event["choices"][0]["delta"]["content"].as_str() == Some("�"))
         .unwrap();
     let finish = events
         .iter()
@@ -590,10 +587,10 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
         .iter()
         .filter_map(|event| event["delta"]["text"].as_str())
         .collect();
-    assert_eq!(text, "��");
+    assert_eq!(text, "t�");
     let content = events
         .iter()
-        .position(|event| event["delta"]["text"].as_str() == Some("��"))
+        .position(|event| event["delta"]["text"].as_str() == Some("�"))
         .unwrap();
     let stop = events
         .iter()
@@ -652,7 +649,9 @@ fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
 #[tokio::test]
 async fn byte_fallback_chat_transport_eof_preserves_text_without_finish() {
     let tokenizer = byte_fallback_tokenizer();
-    for ids in [vec![1], vec![1, 2]] {
+    // `t` goes out as it arrives, so a transport error afterwards cannot take it back; the invalid
+    // byte held behind it is released at a clean end and lost at an error.
+    for (ids, clean, cut) in [(vec![1], "t", "t"), (vec![1, 2], "t�", "t")] {
         for status in ["0", "13"] {
             let (stream, server) = scripted_stream(byte_fallback_chunks(&ids), status).await;
             let (tx, rx) = sse_channel();
@@ -676,11 +675,8 @@ async fn byte_fallback_chat_transport_eof_preserves_text_without_finish() {
             assert_eq!(result.is_ok(), status == "0", "{result:?}");
             assert_eq!(
                 chat_text(&events, 0, "content"),
-                if status == "0" {
-                    tokenizer.decode(&ids, true).unwrap()
-                } else {
-                    String::new()
-                }
+                if status == "0" { clean } else { cut },
+                "{ids:?} status={status}"
             );
             assert!(events
                 .iter()
@@ -724,10 +720,9 @@ async fn byte_fallback_chat_transport_eof_reports_local_stop_without_input_usage
             let events = collect_events(rx).await;
             server.abort();
             assert_eq!(result.is_ok(), status == "0", "{result:?}");
-            assert_eq!(
-                chat_text(&events, 0, "content"),
-                if status == "0" { prefix } else { "" }
-            );
+            // The stop sequence completes inside the stream, so the text before it is out before
+            // a transport error can arrive; the finish chunk is the clean end's alone.
+            assert_eq!(chat_text(&events, 0, "content"), prefix, "status={status}");
             let finishes: Vec<_> = events
                 .iter()
                 .filter(|event| !event["choices"][0]["finish_reason"].is_null())
@@ -747,7 +742,7 @@ async fn byte_fallback_chat_transport_eof_reports_local_stop_without_input_usage
 #[tokio::test]
 async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage() {
     let tokenizer = byte_fallback_tokenizer();
-    for ids in [vec![1], vec![1, 2]] {
+    for (ids, text) in [(vec![1], "t"), (vec![1, 2], "t�")] {
         let (stream, server) = scripted_stream(byte_fallback_chunks(&ids), "0").await;
         let (tx, rx) = sse_channel();
         let result = processor(false)
@@ -765,11 +760,11 @@ async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage
         let events = collect_events(rx).await;
         server.abort();
         assert!(result.is_ok(), "{result:?}");
-        let text: String = events
+        let streamed: String = events
             .iter()
             .filter_map(|event| event["delta"]["text"].as_str())
             .collect();
-        assert_eq!(text, tokenizer.decode(&ids, true).unwrap());
+        assert_eq!(streamed, text, "{ids:?}");
         let final_delta = events
             .iter()
             .find(|event| event["type"] == "message_delta")
@@ -832,7 +827,7 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
     )
     .unwrap();
     let spec = CompletionResponseSpec::from(&request);
-    for ids in [vec![1], vec![1, 2]] {
+    for (ids, text) in [(vec![1], "t"), (vec![1, 2], "t�")] {
         let (stream, server) = scripted_stream(byte_fallback_chunks(&ids), "0").await;
         let (tx, rx) = sse_channel();
         let result = processor(false)
@@ -851,11 +846,11 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
         drop(tx);
         let events = collect_events(rx).await;
         server.abort();
-        let text: String = events
+        let streamed: String = events
             .iter()
             .filter_map(|event| event["choices"][0]["text"].as_str())
             .collect();
-        assert_eq!(text, tokenizer.decode(&ids, true).unwrap());
+        assert_eq!(streamed, text, "{ids:?}");
         assert!(!result.saw_complete);
         assert_eq!(result.prompt_tokens, 0);
         assert!(events
@@ -903,29 +898,22 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
             let events = collect_events(rx).await;
             server.abort();
             assert_eq!(result.is_ok(), status == "0", "{:?}", result.as_ref().err());
+            // The stop sequence completes inside the stream, so the text before it and the
+            // requested suffix are out, and the stop reported, before a transport error can arrive.
             let text: String = events
                 .iter()
                 .filter_map(|event| event["choices"][0]["text"].as_str())
                 .collect();
-            assert_eq!(
-                text,
-                if status == "0" {
-                    format!("{prefix}requested-suffix")
-                } else {
-                    String::new()
-                }
-            );
+            assert_eq!(text, format!("{prefix}requested-suffix"), "status={status}");
             let finishes: Vec<_> = events
                 .iter()
                 .filter_map(|event| event["choices"][0]["finish_reason"].as_str())
                 .collect();
+            assert_eq!(finishes, ["stop"], "{events:?}");
             if status == "0" {
-                assert_eq!(finishes, ["stop"], "{events:?}");
                 let outcome = result.unwrap();
                 assert!(!outcome.saw_complete);
                 assert_eq!(outcome.prompt_tokens, 0);
-            } else {
-                assert!(finishes.is_empty(), "{events:?}");
             }
             assert!(events.iter().all(|event| !event["usage"].is_object()));
         }
@@ -1093,7 +1081,9 @@ async fn non_byte_fallback_held_stop_keeps_original_reasoning_accounting() {
 #[tokio::test]
 async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
     // A deliberately mismatched eager observation is a usage-estimate limit:
-    // the invalid final byte run changes "de" into two replacements plus F2.
+    // the whole decode turns "de" into two replacements plus F2, while the
+    // stream, which had "de" out before the invalid byte arrived, keeps it and
+    // releases one replacement for the byte at the end.
     let tokenizer = byte_fallback_reasoning_tokenizer();
     let ids = [
         257,
@@ -1134,7 +1124,7 @@ async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
         .await
         .unwrap();
     assert_eq!(choice.message.reasoning_content.as_deref(), Some("ab"));
-    assert_eq!(choice.message.content.as_deref(), Some("���"));
+    assert_eq!(choice.message.content.as_deref(), Some("de�"));
 }
 
 #[tokio::test]

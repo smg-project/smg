@@ -41,37 +41,77 @@ fn byte_fallback_capability_distinguishes_byte_level_and_survives_cache() {
     assert!(!mock::MockTokenizer::new().uses_byte_fallback());
 }
 
-#[test]
-fn byte_fallback_streaming_preserves_exact_text() {
+/// Every token of `ids` through a stop decoder with no stops: the text each
+/// token gives, `None` where the decoder holds, and the text the end of the
+/// stream releases.
+fn streamed(
+    tokenizer: &Arc<dyn crate::TokenizerTrait>,
+    ids: &[u32],
+    skip_special_tokens: bool,
+) -> (Vec<Option<String>>, String) {
     use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer.clone(),
+        StopSequenceConfig::default(),
+        skip_special_tokens,
+    );
+    let steps = ids
+        .iter()
+        .map(|&id| match decoder.process_token(id).unwrap() {
+            SequenceDecoderOutput::Text(delta) => Some(delta),
+            SequenceDecoderOutput::Held => None,
+            other => panic!("unexpected stop: {other:?}"),
+        })
+        .collect();
+    let released = match decoder.finish().unwrap() {
+        SequenceDecoderOutput::Text(delta) => delta,
+        SequenceDecoderOutput::Held => String::new(),
+        other => panic!("unexpected stop: {other:?}"),
+    };
+    (steps, released)
+}
 
+/// The streaming rule, spelled out: a run of byte tokens is text as soon as
+/// it decodes to complete characters and is held while it does not, as the
+/// reference stream does (and the bellwether fixtures pin). ByteFallback
+/// decodes a run as one unit, so a run complete when its first bytes went out
+/// can turn invalid at a later byte, when the decoder replaces every byte of
+/// it; the emitted text stands, and the rest is one replacement character per
+/// byte that failed. The end of the stream releases a held run the same way.
+#[test]
+fn byte_fallback_streaming_emits_a_run_as_soon_as_it_is_complete() {
     let tokenizer = byte_fallback_tokenizer();
-    for ids in [
-        vec![2, 3, 4],
-        vec![1, 2, 3, 4],
-        vec![2, 2, 4],
-        vec![5, 6, 4],
-        vec![2, 7, 3, 4],
-    ] {
-        let mut decoder =
-            StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), true);
-        let mut text = String::new();
-        for &id in &ids {
-            match decoder.process_token(id).unwrap() {
-                SequenceDecoderOutput::Text(delta) => text.push_str(&delta),
-                SequenceDecoderOutput::Held => {}
-                other => panic!("Unexpected stop: {other:?}"),
-            }
-        }
-        if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
-            text.push_str(&delta);
-        }
-        assert_eq!(text, tokenizer.decode(&ids, true).unwrap(), "{ids:?}");
+    let cases: [(&[u32], &[Option<&str>], &str); 5] = [
+        // `t` is a character on its own; the invalid byte after it is held,
+        // and the token that closes the run brings one replacement for it.
+        (&[2, 3, 4], &[Some("t"), None, Some("� suffix")], ""),
+        (
+            &[1, 2, 3, 4],
+            &[Some("regular"), Some("t"), None, Some("� suffix")],
+            "",
+        ),
+        (&[2, 2, 4], &[Some("t"), Some("t"), Some(" suffix")], ""),
+        // Two bytes of one character: held, then the character.
+        (&[5, 6, 4], &[None, Some("é"), Some(" suffix")], ""),
+        // A skipped special token adds no text and does not close the run.
+        (
+            &[2, 7, 3, 4],
+            &[Some("t"), None, None, Some("� suffix")],
+            "",
+        ),
+    ];
+    for (ids, steps, released) in cases {
+        let expected: Vec<Option<String>> = steps.iter().map(|s| s.map(str::to_string)).collect();
+        assert_eq!(
+            streamed(&tokenizer, ids, true),
+            (expected, released.to_string()),
+            "{ids:?}"
+        );
     }
 }
 
 #[test]
-fn byte_fallback_eof_preserves_text_and_stops() {
+fn byte_fallback_eof_releases_an_incomplete_run_and_stops() {
     use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 
     for cached in [false, true] {
@@ -84,32 +124,28 @@ fn byte_fallback_eof_preserves_text_and_stops() {
         } else {
             native
         };
-        for ids in [
-            vec![2],
-            vec![2, 3],
-            vec![5, 6],
-            vec![1, 2],
-            vec![1, 2, 3],
-            vec![2, 7, 3],
+        for (ids, text) in [
+            (vec![2], "t"),
+            // The invalid byte held at the end comes out as a replacement.
+            (vec![2, 3], "t�"),
+            (vec![5, 6], "é"),
+            (vec![1, 2], "regulart"),
+            (vec![1, 2, 3], "regulart�"),
+            (vec![2, 7, 3], "t�"),
         ] {
+            let (steps, released) = streamed(&tokenizer, &ids, true);
+            let whole: String = steps.into_iter().flatten().chain([released]).collect();
+            assert_eq!(whole, text, "{ids:?} cached={cached}");
             let mut decoder =
                 StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), true);
-            let mut text = String::new();
             for &id in &ids {
-                if let SequenceDecoderOutput::Text(delta) = decoder.process_token(id).unwrap() {
-                    text.push_str(&delta);
-                }
+                decoder.process_token(id).unwrap();
             }
-            if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
-                text.push_str(&delta);
-            }
-            assert_eq!(
-                text,
-                tokenizer.decode(&ids, true).unwrap(),
-                "{ids:?} cached={cached}"
-            );
+            decoder.finish().unwrap();
             assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Held);
         }
+        // A complete byte is text at once, so a stop sequence it spells stops
+        // at that token.
         let mut decoder = StopSequenceDecoder::new(
             tokenizer.clone(),
             StopSequenceConfig::default().with_stop_sequence("t"),
@@ -117,9 +153,8 @@ fn byte_fallback_eof_preserves_text_and_stops() {
         );
         assert_eq!(
             decoder.process_token(2).unwrap(),
-            SequenceDecoderOutput::Held
+            SequenceDecoderOutput::Stopped
         );
-        assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Stopped);
         assert!(decoder.is_stopped());
     }
 }
@@ -132,31 +167,34 @@ fn byte_fallback_seeded_sequence_does_not_reemit_prompt() {
         assert_eq!(unchanged.finish().unwrap(), "");
     }
     let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![1], true);
-    assert_eq!(sequence.append_token(2).unwrap(), "");
+    assert_eq!(sequence.append_token(2).unwrap(), "t");
     assert_eq!(sequence.append_token(3).unwrap(), "");
-    assert_eq!(sequence.append_token(4).unwrap(), "�� suffix");
+    assert_eq!(sequence.append_token(4).unwrap(), "� suffix");
     assert_eq!(sequence.finish().unwrap(), "");
 
+    // An incomplete byte at the end of the seed is kept as decode context, and
+    // comes out as a replacement when a real token closes it.
     for seed in [vec![1, 5], vec![1, 5, 7]] {
         let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed, true);
         assert_eq!(sequence.append_token(4).unwrap(), "� suffix");
         assert_eq!(sequence.finish().unwrap(), "");
     }
+    // ...or as the character it completes.
     let mut sequence =
         crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![1, 5], true);
-    assert_eq!(sequence.append_token(6).unwrap(), "");
-    assert_eq!(sequence.finish().unwrap(), "é");
+    assert_eq!(sequence.append_token(6).unwrap(), "é");
+    assert_eq!(sequence.finish().unwrap(), "");
 
     // An incomplete prefill must not consume generated bytes when they become
     // a valid character; the native streaming decoder emits that character.
     let tokenizer = byte_fallback_tokenizer();
     let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![5], true);
-    assert_eq!(sequence.append_token(6).unwrap(), "");
-    assert_eq!(sequence.append_token(4).unwrap(), "é suffix");
+    assert_eq!(sequence.append_token(6).unwrap(), "é");
+    assert_eq!(sequence.append_token(4).unwrap(), " suffix");
     assert_eq!(sequence.finish().unwrap(), "");
     let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer, vec![5], true);
-    assert_eq!(sequence.append_token(6).unwrap(), "");
-    assert_eq!(sequence.finish().unwrap(), "é");
+    assert_eq!(sequence.append_token(6).unwrap(), "é");
+    assert_eq!(sequence.finish().unwrap(), "");
 }
 
 #[test]
@@ -175,13 +213,19 @@ fn byte_fallback_completed_seed_bytes_do_not_reemit_or_change_prefix() {
             let mut unchanged =
                 crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
             assert_eq!(unchanged.finish().unwrap(), "");
-            for (next, expected) in [(2, "t"), (3, "�")] {
+            // A complete byte after the seed is text at once; an invalid one
+            // is held to the end, which releases it as a replacement.
+            for (next, appended, released) in [(2, "t", ""), (3, "", "�")] {
                 let mut sequence =
                     crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
-                assert_eq!(sequence.append_token(next).unwrap(), "");
+                assert_eq!(
+                    sequence.append_token(next).unwrap(),
+                    appended,
+                    "{seed:?} cached={cached}"
+                );
                 assert_eq!(
                     sequence.finish().unwrap(),
-                    expected,
+                    released,
                     "{seed:?} cached={cached}"
                 );
             }
@@ -189,44 +233,68 @@ fn byte_fallback_completed_seed_bytes_do_not_reemit_or_change_prefix() {
     }
 }
 
+/// The streaming rule applied to the batch decodes of a sequence's prefixes:
+/// a prefix whose decode is complete text (not ending in a replacement
+/// character) and longer than what was emitted emits the rest, past the
+/// emitted text when the decode still starts with it, else past as many
+/// characters; the end of the stream releases the rest of the whole decode the
+/// same way.
+fn streaming_rule(tokenizer: &Arc<dyn crate::TokenizerTrait>, ids: &[u32], skip: bool) -> String {
+    let past = |decoded: &str, emitted: &str| -> String {
+        decoded.strip_prefix(emitted).map_or_else(
+            || decoded.chars().skip(emitted.chars().count()).collect(),
+            str::to_string,
+        )
+    };
+    let mut emitted = String::new();
+    for end in 1..=ids.len() {
+        let decoded = tokenizer.decode(&ids[..end], skip).unwrap();
+        if decoded.len() > emitted.len() && !decoded.ends_with('�') {
+            let rest = past(&decoded, &emitted);
+            emitted.push_str(&rest);
+        }
+    }
+    let whole = tokenizer.decode(ids, skip).unwrap();
+    let rest = past(&whole, &emitted);
+    emitted.push_str(&rest);
+    emitted
+}
+
 #[test]
-fn byte_fallback_short_combinations_match_batch_decode() {
-    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+fn byte_fallback_short_combinations_follow_the_streaming_rule() {
     let tokenizer = byte_fallback_tokenizer();
+    let mut unlike_batch = 0;
     for skip_special in [false, true] {
         for a in 1..=7 {
             for b in 1..=7 {
                 for c in 1..=7 {
                     let ids = [a, b, c];
-                    let mut decoder = StopSequenceDecoder::new(
-                        tokenizer.clone(),
-                        StopSequenceConfig::default(),
-                        skip_special,
-                    );
-                    let mut text = String::new();
-                    for id in ids {
-                        if let SequenceDecoderOutput::Text(delta) =
-                            decoder.process_token(id).unwrap()
-                        {
-                            text.push_str(&delta);
-                        }
+                    let (steps, released) = streamed(&tokenizer, &ids, skip_special);
+                    let whole: String = steps.into_iter().flatten().chain([released]).collect();
+                    let batch = tokenizer.decode(&ids, skip_special).unwrap();
+                    let expected = streaming_rule(&tokenizer, &ids, skip_special);
+                    assert_eq!(whole, expected, "{ids:?} skip_special={skip_special}");
+                    if whole != batch {
+                        // Only a run that was complete and turned invalid can
+                        // differ from the batch decode, by what was emitted.
+                        assert!(
+                            batch.chars().all(|c| c == '�' || whole.contains(c)),
+                            "{ids:?} skip_special={skip_special}: {whole:?} vs batch {batch:?}"
+                        );
+                        unlike_batch += 1;
                     }
-                    if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
-                        text.push_str(&delta);
-                    }
-                    assert_eq!(
-                        text,
-                        tokenizer.decode(&ids, skip_special).unwrap(),
-                        "{ids:?} skip_special={skip_special}"
-                    );
                 }
             }
         }
     }
+    assert!(
+        unlike_batch > 0,
+        "the rule and the batch decode never differed"
+    );
 }
 
 #[test]
-fn byte_fallback_token_stop_preserves_pending_text() {
+fn byte_fallback_token_stop_closes_the_run_before_it() {
     use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
     let tokenizer = byte_fallback_tokenizer();
     for visible in [false, true] {
@@ -238,16 +306,32 @@ fn byte_fallback_token_stop_preserves_pending_text() {
         let mut decoder = StopSequenceDecoder::new(tokenizer.clone(), config, false);
         assert_eq!(
             decoder.process_token(2).unwrap(),
-            SequenceDecoderOutput::Held
+            SequenceDecoderOutput::Text("t".to_string())
         );
         assert_eq!(
             decoder.process_token(7).unwrap(),
-            SequenceDecoderOutput::StoppedWithText(
-                if visible { "t[EOS]" } else { "t" }.to_string(),
-            )
+            if visible {
+                SequenceDecoderOutput::StoppedWithText("[EOS]".to_string())
+            } else {
+                SequenceDecoderOutput::Stopped
+            }
         );
         assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Held);
     }
+    // An invalid byte held before the stop token comes out with the stop.
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer.clone(),
+        StopSequenceConfig::default().with_stop_token(7),
+        false,
+    );
+    assert_eq!(
+        decoder.process_token(3).unwrap(),
+        SequenceDecoderOutput::Held
+    );
+    assert_eq!(
+        decoder.process_token(7).unwrap(),
+        SequenceDecoderOutput::StoppedWithText("�".to_string())
+    );
     let mut decoder = StopSequenceDecoder::new(
         tokenizer,
         StopSequenceConfig::default()
@@ -257,10 +341,6 @@ fn byte_fallback_token_stop_preserves_pending_text() {
     );
     assert_eq!(
         decoder.process_token(2).unwrap(),
-        SequenceDecoderOutput::Held
-    );
-    assert_eq!(
-        decoder.process_token(7).unwrap(),
         SequenceDecoderOutput::Stopped
     );
     assert_eq!(decoder.matched_stop(), Some("t"));

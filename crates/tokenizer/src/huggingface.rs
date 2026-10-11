@@ -13,7 +13,9 @@ use tokenizers::{
         PreTokenizerWrapper,
     },
     processors::template::TemplateProcessing,
-    tokenizer::{step_decode_stream, SplitDelimiterBehavior, Tokenizer as HfTokenizer},
+    tokenizer::{
+        step_decode_stream, DecodeStreamError, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
+    },
     AddedToken,
 };
 use tracing::debug;
@@ -65,6 +67,17 @@ fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
         DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_fallback),
         _ => false,
     }
+}
+
+/// The part of `decoded` past the text already `emitted`: the rest after it
+/// when it starts with the emitted text, else the rest after as many
+/// characters, which is where a ByteFallback decoder's wholesale replacement
+/// of a run leaves one replacement character per byte that failed.
+fn past_the_emitted(decoded: &str, emitted: &str) -> String {
+    decoded.strip_prefix(emitted).map_or_else(
+        || decoded.chars().skip(emitted.chars().count()).collect(),
+        str::to_string,
+    )
 }
 
 pub(crate) const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -331,6 +344,52 @@ impl HuggingFaceTokenizer {
                         .get_added_vocabulary()
                         .is_special_token(token))
         })
+    }
+
+    /// One step of the native stream, `tokens` appended to the held `ids`.
+    ///
+    /// The stream refuses a decode that no longer starts with the text already
+    /// emitted. With a ByteFallback decoder that happens when a run of byte
+    /// tokens was complete as its first bytes went out and turns invalid at a
+    /// later byte: the decoder replaces every byte of the run, the emitted
+    /// ones included, with one replacement character each. A stream cannot
+    /// take text back, so the emitted text stands and the decode past as many
+    /// characters as it has is the new text, one replacement character per
+    /// byte that failed; the held ids and the prefix move on as after any
+    /// other emitted step.
+    fn step(
+        &self,
+        tokens: Vec<TokenIdType>,
+        skip_special_tokens: bool,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+    ) -> Result<Option<String>> {
+        match step_decode_stream(
+            &self.tokenizer,
+            tokens,
+            skip_special_tokens,
+            ids,
+            prefix,
+            prefix_index,
+        ) {
+            Ok(step) => Ok(step),
+            Err(e) => match e.downcast_ref::<DecodeStreamError>() {
+                Some(DecodeStreamError::InvalidPrefix {
+                    expected_prefix,
+                    actual_string,
+                    ..
+                }) => {
+                    let new_text = past_the_emitted(actual_string, expected_prefix);
+                    let new_prefix_index = ids.len() - *prefix_index;
+                    *ids = ids.drain(*prefix_index..).collect();
+                    *prefix = self.decode(ids, skip_special_tokens)?;
+                    *prefix_index = new_prefix_index;
+                    Ok(Some(new_text))
+                }
+                None => Err(Error::msg(format!("Decode stream error: {e}"))),
+            },
+        }
     }
 
     /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
@@ -621,6 +680,14 @@ impl Decoder for HuggingFaceTokenizer {
     /// This delegates to the same algorithm the default trait method uses, but
     /// the two internal `decode()` calls go directly through the concrete
     /// `TokenizerImpl` rather than through `dyn Decoder` vtable dispatch.
+    ///
+    /// A ByteFallback decoder reads a run of byte tokens as one unit, so the
+    /// run is text as soon as it decodes to complete characters (a newline, an
+    /// emoji's last byte) and is held while it does not; that is what the
+    /// reference stream does, and the bellwether fixtures pin it. A run that
+    /// was complete when its first bytes went out and turns invalid at a later
+    /// byte is handed on by [`Self::step`]; a run still incomplete at the end
+    /// of the stream is released by [`Decoder::finish_decode`].
     fn decode_step(
         &self,
         token_id: TokenIdType,
@@ -629,8 +696,6 @@ impl Decoder for HuggingFaceTokenizer {
         prefix_index: &mut usize,
         skip_special_tokens: bool,
     ) -> Result<Option<String>> {
-        // ByteFallback replaces every byte of an invalid run, including ASCII
-        // bytes already decoded. Do not emit a run until a real token closes it.
         if self.has_byte_fallback {
             if prefix.is_empty() && *prefix_index > 0 {
                 let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
@@ -653,10 +718,6 @@ impl Decoder for HuggingFaceTokenizer {
                     *prefix = prefill;
                 }
             }
-            if self.byte_fallback_piece(token_id, skip_special_tokens) {
-                ids.push(token_id);
-                return Ok(None);
-            }
         }
         let tokens = if self.has_byte_fallback && prefix.is_empty() {
             // These IDs have not been emitted, so they are input, not a prefill
@@ -668,15 +729,7 @@ impl Decoder for HuggingFaceTokenizer {
         } else {
             vec![token_id]
         };
-        step_decode_stream(
-            &self.tokenizer,
-            tokens,
-            skip_special_tokens,
-            ids,
-            prefix,
-            prefix_index,
-        )
-        .map_err(|e| Error::msg(format!("Decode stream error: {e}")))
+        self.step(tokens, skip_special_tokens, ids, prefix, prefix_index)
     }
 
     fn decode_step_eager(
@@ -687,15 +740,13 @@ impl Decoder for HuggingFaceTokenizer {
         prefix_index: &mut usize,
         skip_special_tokens: bool,
     ) -> Result<Option<String>> {
-        step_decode_stream(
-            &self.tokenizer,
+        self.step(
             vec![token_id],
             skip_special_tokens,
             ids,
             prefix,
             prefix_index,
         )
-        .map_err(|e| Error::msg(format!("Decode stream error: {e}")))
     }
 
     /// Byte-level vocabularies decode each id to fixed bytes, so one stream
@@ -728,10 +779,7 @@ impl Decoder for HuggingFaceTokenizer {
             return Ok(String::new());
         }
         let decoded = self.decode(ids, skip_special_tokens)?;
-        let pending = decoded
-            .strip_prefix(prefix.as_str())
-            .ok_or_else(|| Error::msg("Decode stream prefix changed at end of input"))?
-            .to_string();
+        let pending = past_the_emitted(&decoded, prefix);
         ids.clear();
         prefix.clear();
         *prefix_index = 0;
