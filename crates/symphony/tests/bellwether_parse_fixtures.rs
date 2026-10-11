@@ -864,9 +864,9 @@ const FENCE_PROBE: KnownDifference = KnownDifference {
 /// Under the tagged syntax both probes differ.
 const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[REASONING_PROBE, FENCE_PROBE];
 
-/// Under a table that reads `</think>` but not `<tool_call>` (DSML, IQuest), only the reasoning
-/// probe differs: the fence holds Qwen's syntax, which the table never reads as a call, so it is
-/// content, as the reference says.
+/// Under a table that reads `</think>` but not `<tool_call>`, only the reasoning probe differs:
+/// the fence holds Qwen's syntax, which the table never reads as a call, so it is content, as the
+/// reference says. The match on the family says which tables these are.
 const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
 
 /// Under the MiniMax M3 table only the code-fence probe differs: the fence holds `<tool_call>`,
