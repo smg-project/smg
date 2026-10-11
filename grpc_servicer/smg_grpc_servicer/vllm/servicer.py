@@ -118,6 +118,23 @@ def _max_running_requests(engine) -> int:
     return running_window(getattr(engine, "vllm_config", None))
 
 
+def _first_rank(engine) -> int:
+    """The lowest data-parallel rank this servicer serves: the first of the
+    engine client's managed ranks (a slice of all the ranks under external or
+    hybrid load balancing, from ``data_parallel_rank`` on), else that start
+    rank from the config, else 0. ``GetLoads`` reports this rank, and its
+    pushed record is the one that carries the servicer's estimate, as the
+    first entry of the Rust servicer's ``GetLoads`` does."""
+    managed = getattr(getattr(engine, "engine_core", None), "engine_ranks_managed", None)
+    if isinstance(managed, (list, tuple, range)):
+        ranks = [rank for rank in managed if isinstance(rank, int)]
+        if ranks:
+            return min(ranks)
+    parallel = getattr(getattr(engine, "vllm_config", None), "parallel_config", None)
+    start = getattr(parallel, "data_parallel_rank", 0)
+    return start if isinstance(start, int) and start > 0 else 0
+
+
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
     """Best-effort read of the most recent ``SchedulerStats`` snapshot.
 
@@ -768,9 +785,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         dropping the poll.
 
         Note: ``request.dp_rank`` and ``request.include`` are accepted but not yet
-        applied — vLLM reports a single DP rank (``dp_rank_count=1``) with only
-        core metrics, so there is nothing to filter. They are reserved for future
-        multi-DP / sectioned-metrics support.
+        applied — vLLM reports a single DP rank (the servicer's first, see
+        ``_first_rank``; ``dp_rank_count=1``) with only core metrics, so there is
+        nothing to filter. They are reserved for future multi-DP /
+        sectioned-metrics support.
 
         Args:
             request: The GetLoadsRequest protobuf
@@ -779,13 +797,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetLoadsResponse protobuf
         """
-        num_running, num_waiting, kv_usage = self._scheduler_counts() or (0, 0, 0.0)
+        first_rank = _first_rank(self.engine)
+        num_running, num_waiting, kv_usage = self._scheduler_counts(first_rank) or (0, 0, 0.0)
         load = vllm_engine_pb2.SchedulerLoad(
             **scheduler_load_fields(
                 num_running,
                 num_waiting,
                 kv_usage,
                 self._loads.estimate(num_waiting),
+                dp_rank=first_rank,
                 max_total_num_tokens=_kv_capacity_tokens(self.engine),
                 max_running_requests=_max_running_requests(self.engine),
             )
@@ -815,17 +835,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
     def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
         """The load record the KV-event stream carries for the batch's rank
-        (the first rank when it names none): that rank's own scheduler
-        counts, with this servicer's queued-work estimate on the first rank
-        only, as the Rust servicer stamps its batches. A rank whose snapshot
-        the servicer cannot read gets no record rather than another rank's
-        figures; the first rank reports zeros before its first snapshot, as
-        ``GetLoads`` does."""
-        rank = dp_rank or 0
+        (the servicer's first rank when it names none, see ``_first_rank``):
+        that rank's own scheduler counts, with this servicer's queued-work
+        estimate on the first rank only, as the Rust servicer stamps its
+        batches. A rank whose snapshot the servicer cannot read gets no
+        record rather than another rank's figures; the first rank reports
+        zeros before its first snapshot, as ``GetLoads`` does."""
         try:
+            first_rank = _first_rank(self.engine)
+            rank = first_rank if dp_rank is None else dp_rank
             counts = self._scheduler_counts(rank)
             if counts is None:
-                if rank:
+                if rank != first_rank:
                     return None
                 counts = (0, 0, 0.0)
             num_running, num_waiting, kv_usage = counts
@@ -833,7 +854,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 num_running,
                 num_waiting,
                 kv_usage,
-                self._loads.estimate(num_waiting) if rank == 0 else None,
+                self._loads.estimate(num_waiting) if rank == first_rank else None,
                 dp_rank=rank,
                 max_total_num_tokens=_kv_capacity_tokens(self.engine),
                 max_running_requests=_max_running_requests(self.engine),

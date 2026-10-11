@@ -344,10 +344,10 @@ async def test_servicer_hands_its_load_record_to_the_relay():
 
 
 def _load_record_method():
-    """The real ``_load_record`` of the vLLM servicer with the two readers it
-    calls (``_scheduler_counts``, ``_latest_scheduler_stats``), compiled on
-    their own (the servicer module imports the engine), and the loads module
-    they draw on, loaded by path for the same reason."""
+    """The real ``_load_record`` of the vLLM servicer with the readers it
+    calls (``_scheduler_counts``, ``_latest_scheduler_stats``, ``_first_rank``),
+    compiled on their own (the servicer module imports the engine), and the
+    loads module they draw on, loaded by path for the same reason."""
     import ast
     import logging
 
@@ -358,7 +358,7 @@ def _load_record_method():
     loads_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loads_mod)
     source_path = package / "servicer.py"
-    wanted = {"_latest_scheduler_stats", "_scheduler_counts", "_load_record"}
+    wanted = {"_latest_scheduler_stats", "_scheduler_counts", "_load_record", "_first_rank"}
     defs = [
         node
         for node in ast.walk(ast.parse(source_path.read_text()))
@@ -376,15 +376,19 @@ def _load_record_method():
     return loads_mod, namespace
 
 
-def _servicer_over(stat_logger):
-    """A servicer whose engine keeps its scheduler stats on ``stat_logger``."""
+def _servicer_over(stat_logger, managed=None):
+    """A servicer whose engine keeps its scheduler stats on ``stat_logger``
+    (and whose engine client manages the ranks ``managed``, when given)."""
     from types import MethodType, SimpleNamespace
 
     loads_mod, namespace = _load_record_method()
     engine = SimpleNamespace(logger_manager=SimpleNamespace(stat_loggers=[stat_logger]))
+    if managed is not None:
+        engine.engine_core = SimpleNamespace(engine_ranks_managed=managed)
     servicer = SimpleNamespace(engine=engine, _loads=loads_mod.LoadTracker())
     servicer._scheduler_counts = MethodType(namespace["_scheduler_counts"], servicer)
     servicer._load_record = MethodType(namespace["_load_record"], servicer)
+    servicer._first_rank = MethodType(lambda self: namespace["_first_rank"](self.engine), servicer)
     return servicer
 
 
@@ -438,3 +442,38 @@ def test_the_first_rank_alone_reports_zeros_before_the_first_snapshot():
     servicer = _servicer_over(SimpleNamespace())
     assert servicer._load_record(None).running_requests == 0
     assert servicer._load_record(1) is None
+
+
+def test_a_servicer_managing_a_slice_of_the_ranks_counts_from_its_first_rank():
+    from types import SimpleNamespace
+
+    # External or hybrid load balancing: this servicer's engines are ranks 4 and
+    # 5, the stat loggers are keyed by those global ranks, and the aggregated
+    # logger's own snapshot is the aggregate (index -1), no rank's own.
+    stat_logger = SimpleNamespace(
+        engine_index=-1,
+        last_scheduler_stats=_stats(9, 9, 0.9),
+        last_scheduler_stats_dict={4: _stats(3, 2, 0.25), 5: _stats(5, 1, 0.5)},
+    )
+    servicer = _servicer_over(stat_logger, managed=[4, 5])
+
+    assert servicer._first_rank() == 4
+    # What GetLoads reads: the first rank's own counts, not the aggregate.
+    assert servicer._scheduler_counts(servicer._first_rank()) == (3, 2, 0.25)
+    first = servicer._load_record(None)
+    assert _core(first) == (3, 2, 0.25) and first.HasField("waiting_uncached_tokens")
+    assert servicer._load_record(4) == first
+    assert not servicer._load_record(5).HasField("waiting_uncached_tokens")
+    assert servicer._load_record(0) is None
+
+
+def test_the_first_rank_falls_back_to_the_configured_start_rank():
+    from types import SimpleNamespace
+
+    servicer = _servicer_over(SimpleNamespace(last_scheduler_stats_dict={3: _stats(1, 0, 0.1)}))
+    servicer.engine.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_rank=3)
+    )
+    assert servicer._first_rank() == 3
+    record = servicer._load_record(None)
+    assert _core(record) == (1, 0, 0.1) and record.HasField("waiting_uncached_tokens")
