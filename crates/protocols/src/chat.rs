@@ -7,10 +7,10 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, is_false, is_true, validate_json_schema_shape, validate_stop,
-        CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall, FunctionChoice,
-        GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
-        ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+        deserialize_null_as_true, invalid, is_false, is_true, validate_json_schema_shape,
+        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -499,16 +499,13 @@ where
 
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::ValidationError> {
     if messages.is_empty() {
-        return Err(validator::ValidationError::new("messages cannot be empty"));
+        return Err(invalid(
+            "empty_array",
+            "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead.".to_string(),
+        ));
     }
 
     Ok(())
-}
-
-fn invalid(code: &'static str, message: String) -> validator::ValidationError {
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    e
 }
 
 fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError> {

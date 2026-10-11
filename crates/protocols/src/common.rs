@@ -253,6 +253,13 @@ impl<'a> Iterator for StringOrArrayIter<'a> {
 
 impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
+/// A validation error with the public API's `code` and message.
+pub(crate) fn invalid(code: &'static str, message: String) -> validator::ValidationError {
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    e
+}
+
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest
 pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
@@ -266,8 +273,12 @@ pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationEr
         }
         StringOrArray::Array(arr) => {
             if arr.len() > 4 {
-                return Err(validator::ValidationError::new(
-                    "maximum 4 stop sequences allowed",
+                return Err(invalid(
+                    "array_above_max_length",
+                    format!(
+                        "Invalid 'stop': array too long. Expected an array with maximum length 4, but got an array with length {} instead.",
+                        arr.len()
+                    ),
                 ));
             }
             for s in arr {

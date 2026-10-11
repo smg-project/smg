@@ -4570,6 +4570,35 @@ fn background_without_storage_is_rejected() {
     }
 }
 
+/// `top_p` above 1 and more than four `stop` sequences (an extension of the
+/// Responses request) name the bound crossed, as on Chat Completions.
+#[test]
+fn bounds_crossed_are_named_as_the_public_api_names_them() {
+    for (field, value, code) in [
+        ("top_p", json!(1.5), "decimal_above_max_value"),
+        ("top_p", json!(0.0), "decimal_below_min_value"),
+        (
+            "stop",
+            json!(["a", "b", "c", "d", "e"]),
+            "array_above_max_length",
+        ),
+    ] {
+        let mut body = json!({"model": "m", "input": "hi"});
+        body[field] = value;
+        let request = plain_request(body).unwrap();
+        let errors = request.validate().unwrap_err();
+        assert_eq!(errors.field_errors()[field][0].code, code, "{field}");
+    }
+    for (field, value) in [("top_p", json!(1.0)), ("stop", json!(["a", "b", "c", "d"]))] {
+        let mut body = json!({"model": "m", "input": "hi"});
+        body[field] = value;
+        assert!(
+            plain_request(body).unwrap().validate().is_ok(),
+            "{field} within its bound"
+        );
+    }
+}
+
 #[test]
 fn unknown_input_message_role_is_rejected() {
     let request = plain_request(json!({
