@@ -87,6 +87,12 @@ pub enum CallSyntax {
     /// `boolean`, `null`, `array`, `object`). The terminal that enters the state is the call tag's
     /// opening, and the one that leaves it is `<|close|>call<|sep|>`, which the call's end carries.
     Xtml,
+    /// The tool's name as text, then this marker, then one JSON object `{"name": …, "args": …}`:
+    /// Inkling, whose every message starts the arguments state and says what it is only after
+    /// its opener (`<|content_thinking|>`, `<|content_text|>`, or the name and the marker). The
+    /// terminals that leave the state are the message's own; the object's close is the call's end,
+    /// and the message's closing terminal is the region's.
+    NamedJson(&'static str),
 }
 
 /// What the text inside a state is.

@@ -18,6 +18,8 @@
 //! whose arguments are an XML tree, and a separator token the table ignores. [`kimi_k3()`] is
 //! Kimi K3: a turn of tagged regions, `think`, `response` and `tools`, the last holding `call`
 //! blocks whose argument tags name each value's type.
+//! [`inkling()`] is Inkling: a turn of messages, each saying what it is after its opener, a call
+//! as the tool's name, a marker and one JSON object.
 //! [`plain()`] is the table for a template that writes the message's content and nothing else: one
 //! state, no marker.
 //!
@@ -28,6 +30,7 @@ pub mod deepseek_v4_1;
 pub mod glm;
 pub mod glm4;
 pub mod hy4;
+pub mod inkling;
 pub mod iquest;
 pub mod k2_horizon;
 pub mod kimi_k3;
@@ -46,6 +49,7 @@ pub use deepseek_v4_1::deepseek_v4_1;
 pub use glm::glm;
 pub use glm4::glm4;
 pub use hy4::hy4;
+pub use inkling::inkling;
 pub use iquest::iquest;
 pub use k2_horizon::k2_horizon;
 pub use kimi_k3::kimi_k3;

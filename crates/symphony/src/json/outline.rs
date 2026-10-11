@@ -12,10 +12,11 @@
 //! difference to the previous serialization, so that clients saw `{"city":"Paris"}` where the model
 //! had written `{"city": "Paris"}`.
 //!
-//! The member names a call uses are the ones the old crate accepted: `name` or `tool_name` for the
-//! name, `arguments` or `parameters` for the arguments; the first of each that appears counts. The
-//! outline says nothing about whether the name is a declared tool or whether the arguments are an
-//! object; those are the format's decisions, made with the span in hand.
+//! The member names a call uses are the ones the old crate accepted, `name` or `tool_name` for the
+//! name and `arguments` or `parameters` for the arguments, and `args`, which Inkling's template
+//! writes; the first of each that appears counts. The outline says nothing about whether the name
+//! is a declared tool or whether the arguments are an object; those are the format's decisions,
+//! made with the span in hand.
 
 use std::ops::Range;
 
@@ -60,7 +61,7 @@ impl Span {
 }
 
 const NAME_KEYS: [&str; 2] = ["name", "tool_name"];
-const ARGUMENTS_KEYS: [&str; 2] = ["arguments", "parameters"];
+const ARGUMENTS_KEYS: [&str; 3] = ["arguments", "parameters", "args"];
 
 /// Read the object in `text`, which may be cut anywhere after its opening brace.
 ///

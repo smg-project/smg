@@ -318,6 +318,7 @@ impl Format {
             CallSyntax::Xml => {
                 return xml::calls(markers?, self.separator(), &named, at_least_one);
             }
+            CallSyntax::NamedJson(_) => return None,
         };
         if !reasoning_open {
             return Some(calls);

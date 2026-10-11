@@ -9,6 +9,7 @@
 
 pub mod assembler;
 pub mod list;
+pub mod named;
 pub mod outline;
 pub mod partial;
 pub mod prefix;

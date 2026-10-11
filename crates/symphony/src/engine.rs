@@ -110,6 +110,7 @@ enum Call {
     Xml(tagged::xml::Assembler),
     Xtml(tagged::xtml::Assembler),
     Attributed(tagged::attributed::Assembler),
+    NamedJson(json::named::Assembler),
 }
 
 impl Call {
@@ -132,6 +133,9 @@ impl Call {
             Some(CallSyntax::Xtml) => Self::Xtml(tagged::xtml::Assembler::new(index, id)),
             Some(CallSyntax::Attributed(tags)) => {
                 Self::Attributed(tagged::attributed::Assembler::new(index, id, tags))
+            }
+            Some(CallSyntax::NamedJson(marker)) => {
+                Self::NamedJson(json::named::Assembler::new(index, id, marker))
             }
         }
     }
@@ -168,6 +172,7 @@ impl Call {
                 assembler.feed(text, declared, out);
                 text.len()
             }
+            Self::NamedJson(assembler) => assembler.feed(text, out),
         }
     }
 
@@ -246,6 +251,10 @@ impl Call {
             }
             (Self::Attributed(assembler), Closed::ByMarker) => assembler.close("", out),
             (Self::Attributed(assembler), Closed::ByEnd) => assembler.finish(out),
+            // The message's closing terminal is the region's, as Qwen3's `</tool_call>` is: the
+            // object closed the call at its brace.
+            (Self::NamedJson(assembler), Closed::ByMarker) => assembler.close(out),
+            (Self::NamedJson(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
