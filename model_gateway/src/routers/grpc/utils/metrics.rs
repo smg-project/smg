@@ -49,7 +49,12 @@ pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
 /// The codes of the refusals the gateway answers on its own ahead of any
 /// worker, each paced by a `Retry-After`: every worker of the model
 /// unavailable (unhealthy or behind an open circuit breaker), the overload
-/// shed, a wait past the selection queue's bound.
+/// shed, a wait past the selection queue's bound. The gateway's other
+/// self-made 503s, `no_compatible_pd_pair` and `no_media_ref_capable_worker`,
+/// are left out on purpose: they are configuration and capability
+/// mismatches that no wait clears (no `Retry-After`), not the capacity
+/// refusals this label names, and they keep their class by status until
+/// one of their own is decided.
 const GATEWAY_REFUSAL_CODES: &[&str] = &[
     NO_AVAILABLE_WORKERS_CODE,
     WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
@@ -59,9 +64,12 @@ const GATEWAY_REFUSAL_CODES: &[&str] = &[
 /// The `error_type` label of a response the gateway answers.
 ///
 /// One of the gateway's own refusals ([`GATEWAY_REFUSAL_CODES`], recognised
-/// by the code the response carries) counts as `unavailable`: no worker was
-/// contacted, so it is not a backend's error whatever its status. Every
-/// other response counts by its status through [`error_type_from_status`],
+/// by the code the response carries) counts as `unavailable`: the gateway
+/// minted the code, no worker took the request, so it is not a backend's
+/// error whatever its status. The one relay that copies a worker's own code
+/// into the response, the Decisions path, counts a worker that answers with
+/// one of these codes the same way; every other response counts by its
+/// status through [`error_type_from_status`],
 /// the map a worker's status takes at dispatch and after the first chunk
 /// alike. The client's `error.type` is untouched: a 503 reads `server_error`
 /// as before.
