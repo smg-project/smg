@@ -627,8 +627,8 @@ impl Family {
             | Self::K2Horizon
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
-            // but not `<tool_call>`.
+            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5 and MiniMax M2 read
+            // `</think>` but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 | Self::MinimaxM2 => {
                 KNOWN_REASONING_PROBE

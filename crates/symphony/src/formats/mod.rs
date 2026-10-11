@@ -12,9 +12,6 @@
 //! after each pair under that opener, and [`k2_horizon()`] the same newlines under `ifm|`-prefixed
 //! tags in a block of calls. [`olmo3()`] and [`lfm2_5()`] write their calls as Python. [`xlam()`]
 //! is a bare JSON list of calls, or content.
-//! with nothing between the tags, under GLM's turn opener, and [`glm4()`] GLM 4.5 and 4.6's
-//! newline after each pair under that opener. [`olmo3()`] and [`lfm2_5()`]
-//! write their calls as Python. [`xlam()`] is a bare JSON list of calls, or content.
 //! [`minimax_m2()`] is MiniMax M2: `<think>` blocks and `<minimax:tool_call>` blocks of `invoke`
 //! blocks whose parameter tags name their key in an attribute, typed by the request's tools.
 //! [`minimax_m3()`] is MiniMax M3: `<mm:think>` blocks, `<tool_call>` blocks of `invoke` blocks
