@@ -10,8 +10,9 @@ use axum::{
 use chrono::Utc;
 use serde_json::{json, Value};
 use smg_data_connector::{
-    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
-    ConversationStorage, ListParams, NewConversation, NewConversationItem, SortOrder,
+    AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
+    ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
+    SortOrder,
 };
 use tracing::info;
 
@@ -315,9 +316,12 @@ pub async fn create_conversation_items(
     let mut warnings = Vec::new();
     let mut link_pairs = Vec::new();
     let mut seen_ids = HashSet::new();
-    let added_at = Utc::now();
+    // One stamp per item, each later than the one before: the stores order a conversation's
+    // items by `added_at`, so the items of this call list in the order the request gave them.
+    let mut stamps = AddedAtSequence::new();
 
     for item_val in items_array {
+        let added_at = stamps.next_added_at();
         match process_item(item_storage, &conversation_id, item_val, added_at).await {
             Ok((item_json, item_id, warning)) => {
                 if seen_ids.insert(item_id.0.clone()) {
