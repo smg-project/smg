@@ -80,6 +80,84 @@ async fn nested_values_and_special_token_strings_match_native_arguments() {
 }
 
 #[tokio::test]
+async fn primitive_schemas_coerce_bare_values_and_preserve_native_quoted_strings() {
+    let input = r#"<|tool_call>call:typed{number:42,quoted_number:<|"|>42<|"|>,enabled:true,quoted_enabled:<|"|>true<|"|>,nothing:null,quoted_nothing:<|"|>null<|"|>,as_string:42,nested:{values:[42,<|"|>42<|"|>]}}<tool_call|>"#;
+    let expected = json!({
+        "number": 42, "quoted_number": "42", "enabled": true,
+        "quoted_enabled": "true", "nothing": null, "quoted_nothing": "null",
+        "as_string": "42", "nested": {"values": [42, "42"]}
+    });
+    for style in [1, 2, 0] {
+        let primitive = |kind: &str| match style {
+            0 => json!({"type": kind}),
+            1 => json!({"type": [kind, "null"]}),
+            _ => json!({"anyOf": [{"type": kind}, {"type": "null"}]}),
+        };
+        let tools: Vec<Tool> = serde_json::from_value(json!([{
+            "type": "function", "function": {
+                "name": "typed", "parameters": {"type": "object", "properties": {
+                    "number": primitive("integer"), "quoted_number": primitive("integer"),
+                    "enabled": primitive("boolean"), "quoted_enabled": primitive("boolean"),
+                    "nothing": primitive("null"), "quoted_nothing": primitive("null"),
+                    "as_string": {"type": "string", "anyOf": [{"type": "string"}, {"type": "integer"}]},
+                    "nested": {"type": "object", "properties": {
+                        "values": {"type": "array", "items": primitive("integer")}
+                    }}
+                }}
+            }
+        }]))
+        .unwrap();
+        let (_, calls) = Gemma4Parser::new()
+            .parse_complete_with_tools(input, &tools)
+            .await
+            .unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, expected, "schema style {style}");
+
+        let mut parser = Gemma4Parser::new();
+        let mut streamed_calls = Vec::new();
+        for character in input.chars() {
+            let result = parser
+                .parse_incremental(&character.to_string(), &tools)
+                .await
+                .unwrap();
+            assert!(result.normal_text.is_empty());
+            streamed_calls.extend(result.calls);
+        }
+        assert_eq!(streamed_calls.len(), 1);
+        let args: Value = serde_json::from_str(&streamed_calls[0].parameters).unwrap();
+        assert_eq!(args, expected, "streaming schema style {style}");
+    }
+}
+
+#[tokio::test]
+async fn unknown_schemas_keep_raw_primitive_text_in_complete_and_streaming_calls() {
+    let input = r#"<|tool_call>call:raw{number:42,quoted_number:<|"|>42<|"|>,enabled:true,nothing:null}<tool_call|>"#;
+    let expected =
+        json!({"number": "42", "quoted_number": "42", "enabled": "true", "nothing": "null"});
+    let unknown_schema: Vec<Tool> = serde_json::from_value(json!([{
+        "type": "function", "function": {
+            "name": "raw", "parameters": {"type": "object", "properties": {
+                "number": {}, "quoted_number": {}, "enabled": {}, "nothing": {}
+            }}
+        }
+    }]))
+    .unwrap();
+    for tools in [Vec::new(), unknown_schema] {
+        let (_, calls) = Gemma4Parser::new()
+            .parse_complete_with_tools(input, &tools)
+            .await
+            .unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, expected);
+        let mut parser = Gemma4Parser::new();
+        let result = parser.parse_incremental(input, &tools).await.unwrap();
+        let args: Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
+        assert_eq!(args, expected);
+    }
+}
+
+#[tokio::test]
 async fn every_chunk_split_has_the_same_native_call_and_no_marker_leak() {
     let input = format!("Before {WEATHER}<|tool_response>After");
     let tools = tools();

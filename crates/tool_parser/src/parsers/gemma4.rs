@@ -50,11 +50,8 @@ impl Gemma4Parser {
             }
 
             if self.buffer.starts_with(START) {
-                match decode_call(&self.buffer) {
-                    Some((name, mut args, consumed)) => {
-                        if let Some(tool) = tools.iter().find(|t| t.function.name == name) {
-                            coerce_arguments(&mut args, &tool.function.parameters);
-                        }
+                match decode_call(&self.buffer, tools) {
+                    Some((name, args, consumed)) => {
                         result.calls.push(ToolCallItem {
                             tool_index: self.next_tool_index,
                             name: Some(name),
@@ -149,7 +146,7 @@ impl ToolParser for Gemma4Parser {
     }
 }
 
-fn decode_call(input: &str) -> Option<(String, Value, usize)> {
+fn decode_call(input: &str, tools: &[Tool]) -> Option<(String, Value, usize)> {
     let body = input[START.len()..].trim_start();
     let prefix = if body.starts_with("call:") {
         "call:"
@@ -174,7 +171,12 @@ fn decode_call(input: &str) -> Option<(String, Value, usize)> {
         input: &input[args_start..],
         pos: 0,
     };
-    let args = reader.object(close, 0)?;
+    let schema = tools
+        .iter()
+        .find(|tool| tool.function.name == name)
+        .map(|tool| &tool.function.parameters)
+        .unwrap_or(&Value::Null);
+    let args = reader.object(close, 0, schema)?;
     Some((name.to_owned(), args, args_start + reader.pos))
 }
 
@@ -220,7 +222,7 @@ impl ArgumentReader<'_> {
         Some(value)
     }
 
-    fn object(&mut self, close: char, depth: usize) -> Option<Value> {
+    fn object(&mut self, close: char, depth: usize, schema: &Value) -> Option<Value> {
         let mut map = Map::new();
         loop {
             self.skip_separators();
@@ -245,11 +247,15 @@ impl ArgumentReader<'_> {
                 return None;
             }
             self.pos += 1;
-            map.insert(key, self.value(close, depth + 1)?);
+            let property = schema
+                .get("properties")
+                .and_then(|properties| properties.get(&key))
+                .unwrap_or(&Value::Null);
+            map.insert(key, self.value(close, depth + 1, property)?);
         }
     }
 
-    fn value(&mut self, close: char, depth: usize) -> Option<Value> {
+    fn value(&mut self, close: char, depth: usize, schema: &Value) -> Option<Value> {
         if depth > 128 {
             return None;
         }
@@ -261,7 +267,7 @@ impl ArgumentReader<'_> {
         let first = self.remaining().chars().next()?;
         if first == '{' {
             self.pos += 1;
-            return self.object('}', depth);
+            return self.object('}', depth, schema);
         }
         if first == '[' {
             self.pos += 1;
@@ -272,7 +278,11 @@ impl ArgumentReader<'_> {
                     self.pos += 1;
                     return Some(Value::Array(values));
                 }
-                values.push(self.value(']', depth + 1)?);
+                values.push(self.value(
+                    ']',
+                    depth + 1,
+                    schema.get("items").unwrap_or(&Value::Null),
+                )?);
             }
         }
         let end = self.remaining().find([',', '}', ']', ')'])?;
@@ -281,45 +291,47 @@ impl ArgumentReader<'_> {
         if text.is_empty() || (delimiter != ',' && delimiter != close) || text.contains('<') {
             return None;
         }
-        let value = Value::String(text.to_owned());
+        // Coerce only bare leaves. Native quoted strings must stay strings even
+        // when the model emits one for a numeric schema.
+        let value = coerce_bare_argument(text, schema);
         self.pos += end;
         Some(value)
     }
 }
 
-fn coerce_arguments(value: &mut Value, schema: &Value) {
-    if let Value::String(text) = value {
-        let declared_type = schema.get("type").and_then(Value::as_str);
-        // Native quoted strings are already decoded; do not unwrap JSON-looking
-        // string contents. The existing helper accepts raw JSON string literals.
-        let converted = match declared_type {
-            Some("string") => None,
-            Some("null") if text.eq_ignore_ascii_case("null") => Some(Value::Null),
-            Some("boolean") if text.trim() == "1" => Some(Value::Bool(true)),
-            Some("boolean") if text.trim() == "0" => Some(Value::Bool(false)),
-            _ => coerce_by_schema_type(text, declared_type),
+fn coerce_bare_argument(text: &str, schema: &Value) -> Value {
+    let branches = if schema.get("type").is_some() {
+        std::slice::from_ref(schema)
+    } else {
+        schema
+            .get("anyOf")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(std::slice::from_ref(schema))
+    };
+    for branch in branches {
+        let Some(declared) = branch.get("type") else {
+            continue;
         };
-        if let Some(converted) = converted {
-            *value = converted;
-        }
-    }
-    match value {
-        Value::Object(values) => {
-            if let Some(properties) = schema.get("properties") {
-                for (name, value) in values {
-                    if let Some(property) = properties.get(name) {
-                        coerce_arguments(value, property);
-                    }
+        let types = declared
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(std::slice::from_ref(declared));
+        for kind in types {
+            let converted = match kind.as_str() {
+                Some("string") => None,
+                Some("null") if text.eq_ignore_ascii_case("null") => Some(Value::Null),
+                Some("boolean") if text == "1" => Some(Value::Bool(true)),
+                Some("boolean") if text == "0" => Some(Value::Bool(false)),
+                Some(kind @ ("integer" | "number" | "boolean")) => {
+                    coerce_by_schema_type(text, Some(kind))
                 }
+                _ => None,
+            };
+            if let Some(converted) = converted {
+                return converted;
             }
         }
-        Value::Array(values) => {
-            if let Some(items) = schema.get("items") {
-                for value in values {
-                    coerce_arguments(value, items);
-                }
-            }
-        }
-        _ => {}
     }
+    Value::String(text.to_owned())
 }
