@@ -41,6 +41,7 @@ use smg_grpc_client::{
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
 };
 use smg_mm_rdma::RdmaExporter;
+use tokio::time::error::Elapsed;
 
 use crate::{
     routers::grpc::{
@@ -2712,6 +2713,10 @@ pub struct TrackedStream {
     /// The request's place in the worker's pile; a non-streaming generation
     /// holds none.
     progress: Option<ProgressTicket>,
+    /// A response (or the stream's end) pulled ahead of the stream's reader
+    /// by [`ProtoStream::first_response_within`], handed to the next `next`
+    /// as it was: its bookkeeping ran when it was pulled.
+    replay: Option<Option<Result<ProtoGenerateResponse, tonic::Status>>>,
 }
 
 /// The request's place in its worker's tracked pile (see
@@ -2865,6 +2870,49 @@ mod tracked_tests {
         drop(stream);
         assert_eq!(worker.tracked_load(), 0);
     }
+
+    #[test]
+    fn a_prefill_leg_books_its_prompt_timed_and_joins_no_pile() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_leg(Arc::clone(&worker), 4_096);
+        assert_eq!(worker.tracked_load(), 0, "a leg is never part of a pile");
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "its prompt is pending prefill on the prefill worker (cold prior)"
+        );
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.progress.is_none());
+                assert!(tracked.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+            }
+            _ => panic!("a tracked stream"),
+        }
+        drop(stream);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "released with the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_response_pulled_ahead_is_replayed_to_the_reader_once() {
+        // An empty fan-out ends at once: the end is what is pulled ahead, and
+        // the reader sees it once more, then the stream as it is.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_leg(Arc::clone(&worker), 16);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(stream.first_response_within(deadline).await.is_ok());
+        assert!(
+            stream.first_response_within(deadline).await.is_ok(),
+            "a second wait does not pull past the held item"
+        );
+        assert!(stream.next().await.is_none(), "the held end is replayed");
+        assert!(stream.next().await.is_none(), "and the stream stays ended");
+    }
 }
 
 /// The message of the `Internal` status a stream ends with when the engine
@@ -2922,7 +2970,58 @@ impl ProtoStream {
             worker,
             prefill,
             progress,
+            replay: None,
         }))
+    }
+
+    /// Track this stream as the prefill leg of a disaggregated dispatch to
+    /// `worker`: its `prompt_tokens` are pending prefill there until its
+    /// first response, which times the prompt's prefill for the worker's
+    /// rate (the leg's first response is the end of its prefill, on either
+    /// dispatch shape), and every response is progress for the worker. The
+    /// leg joins no pile: the gateway bounds its silence per request (see
+    /// [`crate::worker::liveness::prefill_leg_bound`]) instead of judging the
+    /// worker by legs it cannot see progress on.
+    #[must_use]
+    pub fn tracked_prefill_leg(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {
+        let prefill = (prompt_tokens > 0).then(|| {
+            worker.note_prefill_started(prompt_tokens, true);
+            PrefillTicket {
+                worker: Arc::clone(&worker),
+                tokens: prompt_tokens,
+                timed: true,
+                released: false,
+            }
+        });
+        Self::Tracked(Box::new(TrackedStream {
+            inner: self,
+            worker,
+            prefill,
+            progress: None,
+            replay: None,
+        }))
+    }
+
+    /// Wait for the stream's first response, or its end, until `deadline`.
+    /// Within the deadline the stream is left for its reader as if nothing
+    /// had been read: the response (or the end) is replayed by the next
+    /// [`Self::next`], its bookkeeping already done. Past the deadline the
+    /// stream has produced nothing, and the caller decides its fate. Only a
+    /// tracked stream can hold a response back, so any other returns at once
+    /// as if the response had come (the dispatch paths wrap a leg before they
+    /// bound it).
+    pub async fn first_response_within(&mut self, deadline: Instant) -> Result<(), Elapsed> {
+        let Self::Tracked(tracked) = self else {
+            return Ok(());
+        };
+        if tracked.replay.is_some() {
+            return Ok(());
+        }
+        let item = tokio::time::timeout_at(deadline.into(), self.next()).await?;
+        if let Self::Tracked(tracked) = self {
+            tracked.replay = Some(item);
+        }
+        Ok(())
     }
 
     /// Get next item from stream
@@ -2930,6 +3029,9 @@ impl ProtoStream {
         let Self::Tracked(tracked) = self else {
             return self.next_untracked().await;
         };
+        if let Some(item) = tracked.replay.take() {
+            return item;
+        }
         // Every dispatched stream is one tracked layer over a transport
         // stream: its messages are polled in place, without a boxed future
         // per message. A tracked stream inside a tracked stream recurses.
@@ -3028,12 +3130,14 @@ impl ProtoStream {
                     worker,
                     prefill,
                     progress,
+                    replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
                     inner: inner.defer_abort_until_first_item(),
                     worker,
                     prefill,
                     progress,
+                    replay,
                 }))
             }
         }

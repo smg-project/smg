@@ -760,6 +760,14 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         Duration::ZERO
     }
 
+    /// [`Self::prefill_backlog`] with `tokens` more prompt tokens about to
+    /// be dispatched: how long the engine may need before the first token of
+    /// a prompt of that length is due, behind what is already pending. Zero
+    /// for a worker that does not track it.
+    fn prefill_eta(&self, _tokens: u64) -> Duration {
+        Duration::ZERO
+    }
+
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
     /// reads status, load, processed and the overload veto together so the hot
     /// path takes one `ArcSwap` guard per backing cell per worker instead of one
@@ -1638,15 +1646,18 @@ impl PrefillBook {
         }
     }
 
-    fn backlog(&self) -> Duration {
-        if self.pending == 0 {
+    /// The time to prefill what is pending plus `extra` tokens at the
+    /// observed rate (the cold prior until one is observed).
+    fn eta(&self, extra: u64) -> Duration {
+        let pending = self.pending.saturating_add(extra);
+        if pending == 0 {
             return Duration::ZERO;
         }
         let rate = match self.rate_tps {
             0 => COLD_PREFILL_TOKENS_PER_SEC,
             rate => rate,
         };
-        Duration::from_millis(self.pending.saturating_mul(1000) / rate)
+        Duration::from_millis(pending.saturating_mul(1000) / rate)
     }
 }
 
@@ -1889,7 +1900,11 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_backlog(&self) -> Duration {
-        self.prefill.lock().backlog()
+        self.prefill.lock().eta(0)
+    }
+
+    pub fn prefill_eta(&self, tokens: u64) -> Duration {
+        self.prefill.lock().eta(tokens)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -2735,6 +2750,10 @@ impl Worker for BasicWorker {
 
     fn prefill_backlog(&self) -> Duration {
         self.runtime.load().prefill_backlog()
+    }
+
+    fn prefill_eta(&self, tokens: u64) -> Duration {
+        self.runtime.load().prefill_eta(tokens)
     }
 
     fn note_tracked_started(&self) {
@@ -4813,6 +4832,24 @@ mod tests {
         // A dropped stream releases its tokens without a rate sample.
         runtime.note_prefill_ended_at(2_000_000, true, None, 3_500);
         assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+    }
+
+    #[test]
+    fn prefill_eta_adds_a_prompt_about_to_be_dispatched_to_the_backlog() {
+        // The disaggregated prefill leg's bound is read before its prompt is
+        // booked: the ETA is the backlog plus that prompt, at the rate the
+        // worker has shown (the cold prior until it has).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(runtime.prefill_eta(0), Duration::ZERO);
+        assert_eq!(runtime.prefill_eta(30_000), Duration::from_secs(3));
+        runtime.note_prefill_started_at(20_000, true, 1_000);
+        assert_eq!(runtime.prefill_eta(30_000), Duration::from_secs(5));
+        assert_eq!(runtime.prefill_eta(0), runtime.prefill_backlog());
+        // A measured rate of 98k tokens/s (as above) replaces the prior.
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 1_600);
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 2_500);
+        assert_eq!(runtime.prefill_rate_tps(), 13_333);
+        assert_eq!(runtime.prefill_eta(40_000), Duration::from_millis(3_000));
     }
 
     #[test]
