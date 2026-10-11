@@ -83,7 +83,7 @@ use crate::{
                 serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
             },
             request_stream::{CappedBodyStream, StreamProgress},
-            stream_failure::{RelaySource, UpstreamCut},
+            stream_failure::{note_sent, on_frame_boundary, RelaySource, UpstreamCut},
         },
         BodyPolicy, RouterTrait,
     },
@@ -1394,8 +1394,11 @@ impl Router {
             tokio::spawn(
                 async move {
                     let mut stream = stream;
-                    // What the client has been sent, for the record of a cut.
+                    // What the client has been sent, for the record of a cut, and
+                    // its last bytes, so the event that ends a cut SSE body is
+                    // written on a frame boundary.
                     let mut relayed: u64 = 0;
+                    let mut sent_tail: Vec<u8> = Vec::with_capacity(4);
                     // One timer, reset per chunk, instead of a fresh sleep per token.
                     let idle = tokio::time::sleep(IDLE_FLUSH);
                     tokio::pin!(idle);
@@ -1416,6 +1419,7 @@ impl Router {
                                         };
                                         if !bytes.is_empty() {
                                             relayed += bytes.len() as u64;
+                                            note_sent(&mut sent_tail, &bytes);
                                             if tx.send(Ok(bytes)).await.is_err() {
                                                 break;
                                             }
@@ -1424,6 +1428,7 @@ impl Router {
                                     Some(Err(e)) => {
                                         if let Some(tail) = rechunker.as_mut().map(SseRechunker::finish) {
                                             if !tail.is_empty() {
+                                                note_sent(&mut sent_tail, &tail);
                                                 let _ = tx.send(Ok(tail)).await;
                                             }
                                         }
@@ -1437,7 +1442,18 @@ impl Router {
                                             let cut = UpstreamCut::of(&e);
                                             source.account(&cut, relayed);
                                             if upstream_sse {
-                                                let _ = tx.send(Ok(source.error_event(&cut))).await;
+                                                // On its own frame: a cut inside a frame leaves
+                                                // a partial line the event must not merge into.
+                                                let event = source.error_event(&cut);
+                                                let event = if on_frame_boundary(&sent_tail) {
+                                                    event
+                                                } else {
+                                                    let mut framed = Vec::with_capacity(event.len() + 2);
+                                                    framed.extend_from_slice(b"\n\n");
+                                                    framed.extend_from_slice(&event);
+                                                    Bytes::from(framed)
+                                                };
+                                                let _ = tx.send(Ok(event)).await;
                                                 break;
                                             }
                                         }
@@ -4211,6 +4227,42 @@ mod tests {
             !worker.circuit_breaker_can_execute(),
             "the cut is the worker's failure: its threshold-1 breaker opens"
         );
+    }
+
+    /// A cut that lands inside a frame (the worker died mid-write) leaves the
+    /// partial line as it is and writes the error event on its own frame, so
+    /// a client that parses frame by frame still reads the typed error.
+    #[tokio::test]
+    async fn an_upstream_cut_inside_a_frame_writes_the_error_event_on_its_own_frame() {
+        const CHUNKS: &[&str] = &[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"con",
+        ];
+        let url = spawn_cut_stub("/v1/chat/completions", "text/event-stream", CHUNKS, true).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events[0], CHUNKS[0].trim_end());
+        assert_eq!(events[1], CHUNKS[1], "the partial frame stands alone");
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[3], "data: [DONE]");
     }
 
     /// On the Messages API the same cut ends the stream with the API's own

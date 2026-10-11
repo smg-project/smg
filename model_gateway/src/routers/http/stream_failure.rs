@@ -152,6 +152,25 @@ impl RelaySource {
     }
 }
 
+/// Whether a relayed SSE body stands on a frame boundary after `tail`, the
+/// last bytes sent: nothing yet, or a blank line. The error event that ends
+/// a cut body is written on its own frame, so a cut that lands inside a
+/// frame (a reset mid-write, an intermediary that re-chunks) does not merge
+/// the partial line and the event into one line a client cannot parse.
+pub(crate) fn on_frame_boundary(tail: &[u8]) -> bool {
+    tail.is_empty() || tail.ends_with(b"\n\n") || tail.ends_with(b"\r\n\r\n")
+}
+
+/// Keep the last four bytes of what was sent: enough to recognise a blank
+/// line whatever chunking the bytes arrived in.
+pub(crate) fn note_sent(tail: &mut Vec<u8>, bytes: &[u8]) {
+    tail.extend_from_slice(&bytes[bytes.len().saturating_sub(4)..]);
+    if tail.len() > 4 {
+        let excess = tail.len() - 4;
+        tail.drain(..excess);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
@@ -307,5 +326,26 @@ mod tests {
             other => panic!("the protocol's error event, got {other:?}"),
         }
         assert!(!text.contains("[DONE]"), "{text:?}");
+    }
+
+    /// The boundary is read from the last bytes sent, across chunks.
+    #[test]
+    fn the_frame_boundary_is_read_from_the_last_bytes_sent() {
+        let mut tail = Vec::new();
+        assert!(on_frame_boundary(&tail), "nothing sent yet");
+        note_sent(&mut tail, b"data: {\"choices\":[]}\n\n");
+        assert!(on_frame_boundary(&tail));
+        note_sent(&mut tail, b"data: {\"cho");
+        assert!(!on_frame_boundary(&tail), "a frame cut mid-line");
+        note_sent(&mut tail, b"ices\":[]}\n");
+        assert!(!on_frame_boundary(&tail), "one newline is not a blank line");
+        note_sent(&mut tail, b"\n");
+        assert!(
+            on_frame_boundary(&tail),
+            "the blank line split across two chunks"
+        );
+        note_sent(&mut tail, b"event: x\r\ndata: 1\r\n\r\n");
+        assert!(on_frame_boundary(&tail));
+        assert!(tail.len() <= 4);
     }
 }
