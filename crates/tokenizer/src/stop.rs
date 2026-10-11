@@ -211,6 +211,16 @@ impl StopSequenceDecoder {
 
         let hidden_stop = self.config.stop_tokens.contains(&token_id);
         let visible_stop = self.config.visible_stop_tokens.contains(&token_id);
+        if self.token_only && !hidden_stop && !visible_stop {
+            // The common path: no string stops and not a stop token, so the
+            // decoded text goes out as it is, with no jail to run.
+            let new_text = self.sequence.append_token(token_id)?;
+            return Ok(if new_text.is_empty() {
+                SequenceDecoderOutput::Held
+            } else {
+                SequenceDecoderOutput::Text(new_text)
+            });
+        }
         if hidden_stop || visible_stop {
             // A stop token closes the byte run before it; it must not discard
             // pending text, and a string stop within that text takes precedence.
@@ -245,6 +255,7 @@ impl StopSequenceDecoder {
         Ok(self.process_decoded_text(new_text))
     }
 
+    #[inline]
     fn process_decoded_text(&mut self, new_text: String) -> SequenceDecoderOutput {
         // Token-only fast path: no string stops means no jail is needed.
         if self.token_only {
