@@ -220,6 +220,10 @@ pub mod metrics_labels {
     pub const ERROR_TIMEOUT: &str = "timeout";
     pub const ERROR_BACKEND: &str = "backend_error";
     pub const ERROR_VALIDATION: &str = "validation_error";
+    /// Capacity pushback (a 429): the worker, or the gateway's own admission,
+    /// turned the request away for now. Named as the client reads it in the
+    /// error body's `type`.
+    pub const ERROR_RATE_LIMIT: &str = "rate_limit_error";
     pub const ERROR_INTERNAL: &str = "internal_error";
 }
 

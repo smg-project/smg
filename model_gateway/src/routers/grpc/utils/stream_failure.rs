@@ -464,9 +464,13 @@ mod tests {
             assert_eq!(class.client_type("stream_error"), "stream_error");
         }
         // Capacity pushback is not the worker's failure (and the breaker
-        // takes no sample of a 429 either way).
+        // takes no sample of a 429 either way); it counts as the rate-limit
+        // error the client reads, not as an internal error of the router.
         let capacity = class(tonic::Status::resource_exhausted("full"));
-        assert_eq!(capacity.http, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            (capacity.http, capacity.error_type, capacity.breaker_sample),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", Some(429))
+        );
         assert!(!capacity.is_worker_failure());
         assert_eq!(capacity.client_type("stream_error"), "rate_limit_error");
     }
@@ -561,7 +565,11 @@ mod tests {
         );
         let (worker, handle) = account_on_a_fresh_worker(status);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
-        assert_eq!(worker_error_type(&handle.render()), None);
+        let rendered = handle.render();
+        assert_eq!(worker_error_type(&rendered), None);
+        // The router counts the rate-limit error the client read, not an
+        // internal error.
+        assert_eq!(router_error_type(&rendered), "rate_limit_error");
     }
 
     #[test]

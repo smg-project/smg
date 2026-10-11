@@ -1699,6 +1699,7 @@ mod request_release_tests {
     use llm_tokenizer::{
         traits::Tokenizer, HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
     };
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::{
         completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
     };
@@ -1714,8 +1715,9 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::grpc::multimodal::{
-            MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+        routers::grpc::{
+            multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
+            utils::tonic_ext::TonicStatusExt,
         },
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
@@ -3418,6 +3420,38 @@ mod request_release_tests {
             "the image span is contiguous"
         );
         assert_eq!(mm, vec![vec![(first as u32, V41_CORN_TOKENS as u32)]]);
+    }
+
+    /// A dispatch the engine answered with RESOURCE_EXHAUSTED is counted as
+    /// the rate-limit error the client reads in the 429 body, not as an
+    /// internal error of the router.
+    #[test]
+    fn a_dispatch_the_engine_throttled_is_counted_as_a_rate_limit_error() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let failure = Status::resource_exhausted("kv cache full")
+            .to_http_error("engine_busy", "kv cache full".to_string());
+        assert_eq!(failure.status(), http::StatusCode::TOO_MANY_REQUESTS);
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pipeline.record_error(Some(metrics_labels::ENDPOINT_COMPLETIONS), MODEL, &failure);
+        });
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains(&format!("model=\"{MODEL}\""))
+                    && line.contains(&format!(
+                        "endpoint=\"{}\"",
+                        metrics_labels::ENDPOINT_COMPLETIONS
+                    ))
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"rate_limit_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
     }
 }
 
