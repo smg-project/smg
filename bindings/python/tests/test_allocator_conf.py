@@ -3,8 +3,10 @@
 The router launched from Python (``smg launch``, ``python -m smg``) runs the
 Rust gateway inside ``smg.smg_rs``, whose jemalloc must take the same
 ``malloc_conf`` as the ``smg`` executable: a background purging thread, dirty
-pages returned after ten seconds, muzzy pages at once. Otherwise a traffic
-burst's freed pages stay resident for the life of the process. Asked to
+pages returned after ten seconds, muzzy pages at once, 16 arenas. Otherwise a
+traffic burst's freed pages stay resident for the life of the process and a
+many-core host spreads a small live heap over one arena's slabs per thread.
+Asked to
 through ``_RJEM_MALLOC_CONF``, jemalloc prints its statistics when the process
 exits, and the options in effect are their ``opt`` section.
 """
@@ -21,6 +23,7 @@ SERVER_MALLOC_CONF = (
     '"background_thread":true',
     '"dirty_decay_ms":10000',
     '"muzzy_decay_ms":0',
+    '"narenas":16',
 )
 
 
