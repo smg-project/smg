@@ -106,11 +106,17 @@ impl ResponseProcessor {
 
         // Complete token decoding, including bytes and a partial stop match.
         // The last token takes the tail so the token spans reach the text end.
-        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
-            stop_decoder
-                .finish()
-                .map_err(|e| format!("Failed to finish token decoding: {e}"))?
-        {
+        let tail = stop_decoder
+            .finish()
+            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
+        if stop_decoder.prefix_mismatches() > 0 {
+            warn!(
+                index,
+                recoveries = stop_decoder.prefix_mismatches(),
+                "the decoder rewrote text already decoded; the response keeps that text and the remainder"
+            );
+        }
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
@@ -488,6 +494,7 @@ impl ResponseProcessor {
                     format!("Failed to finish token decoding: {e}"),
                 )
             })?;
+            utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
             let stopped_at_finish = matches!(
                 tail,
                 SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
@@ -690,14 +697,14 @@ impl ResponseProcessor {
                 break;
             }
         }
-        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
-            stop_decoder.finish().map_err(|e| {
-                error::internal_error(
-                    "process_tokens_failed",
-                    format!("Failed to finish token decoding: {e}"),
-                )
-            })?
-        {
+        let tail = stop_decoder.finish().map_err(|e| {
+            error::internal_error(
+                "process_tokens_failed",
+                format!("Failed to finish token decoding: {e}"),
+            )
+        })?;
+        utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
@@ -980,13 +987,19 @@ impl ResponseProcessor {
                     }
                 }
 
+                let tail = stop_decoder.finish().map_err(|e| {
+                    error::internal_error(
+                        "process_tokens_failed",
+                        format!("Failed to finish token decoding: {e}"),
+                    )
+                })?;
+                utils::warn_detokenize_recoveries(
+                    &dispatch.request_id,
+                    index_offset + i as u32,
+                    stop_decoder,
+                );
                 if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
-                    stop_decoder.finish().map_err(|e| {
-                        error::internal_error(
-                            "process_tokens_failed",
-                            format!("Failed to finish token decoding: {e}"),
-                        )
-                    })?
+                    tail
                 {
                     decoded_text.push_str(&t);
                 }

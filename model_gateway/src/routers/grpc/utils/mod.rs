@@ -32,3 +32,22 @@ pub(crate) use parsers::{
     should_mark_reasoning_started, tool_constraints_for_worker, ParserResolver,
 };
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
+
+/// One WARN per choice whose stream recovered from a rewritten decode prefix
+/// (see `smg_detokenize_prefix_mismatch_total`): the client got the text as
+/// streamed plus the remainder, not the batch text.
+pub(crate) fn warn_detokenize_recoveries(
+    request_id: &str,
+    index: u32,
+    decoder: &llm_tokenizer::StopSequenceDecoder,
+) {
+    let recoveries = decoder.prefix_mismatches();
+    if recoveries > 0 {
+        tracing::warn!(
+            request_id,
+            index,
+            recoveries,
+            "the decoder rewrote text already streamed; the stream kept its text and sent the remainder"
+        );
+    }
+}

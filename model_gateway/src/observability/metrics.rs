@@ -3,7 +3,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
-use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
+use llm_tokenizer::{
+    cache::{cache_activity_stats, CacheActivityStats},
+    decode_activity_stats,
+};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{
     DistributionBuilder, Matcher, PrometheusBuilder, PrometheusHandle,
@@ -236,6 +239,7 @@ pub(crate) fn init_metrics() {
         "Tokenizer cache entries removed for capacity; excludes clear, drop and replacement"
     );
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
+    describe_counter!("smg_detokenize_prefix_mismatch_total", "Streams whose incremental decode no longer started with the text already sent and went on with the remainder, by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were streamed) or decoder (another decoder step rewrote the sent prefix)");
 
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -909,6 +913,13 @@ pub fn init_startup_series() {
 pub(super) fn record_tokenizer_cache_activity() {
     for stats in cache_activity_stats() {
         record_tokenizer_cache_activity_snapshot(stats);
+    }
+}
+
+pub(super) fn record_detokenize_activity() {
+    for stats in decode_activity_stats() {
+        counter!("smg_detokenize_prefix_mismatch_total", "kind" => stats.kind)
+            .absolute(stats.prefix_mismatches);
     }
 }
 

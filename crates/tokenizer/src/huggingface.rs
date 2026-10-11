@@ -13,7 +13,7 @@ use tokenizers::{
         PreTokenizerWrapper,
     },
     processors::template::TemplateProcessing,
-    tokenizer::{step_decode_stream, SplitDelimiterBehavior, Tokenizer as HfTokenizer},
+    tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
     AddedToken,
 };
 use tracing::debug;
@@ -27,7 +27,7 @@ use crate::{
     encoders::{deepseek_v32, deepseek_v4, deepseek_v41},
     native::NativeEncoder,
     traits::{
-        Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens, TokenIdType,
+        DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens, TokenIdType,
         Tokenizer as TokenizerTrait,
     },
 };
@@ -605,6 +605,88 @@ impl Encoder for HuggingFaceTokenizer {
     }
 }
 
+impl HuggingFaceTokenizer {
+    /// One step of the HF `step_decode_stream` algorithm over this tokenizer's
+    /// `TokenizerImpl`: `ids` holds the tokens of the emitted `prefix` (the
+    /// first `prefix_index`) and the tokens still pending; the step emits the
+    /// decode's growth beyond the prefix once it no longer ends in an
+    /// incomplete character. Where the native function fails because the
+    /// decode no longer starts with the prefix (an invalid byte collapsed a
+    /// ByteFallback run whose characters were already streamed, a `Replace`
+    /// step spanned the boundary), this emits the remainder past the rewritten
+    /// text instead, keeps streaming, and reports the recovery.
+    fn step_decode_lenient(
+        &self,
+        new_ids: Vec<TokenIdType>,
+        skip_special_tokens: bool,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+    ) -> Result<DecodeStep> {
+        if prefix.is_empty() && !ids.is_empty() {
+            let new_prefix = self.decode(ids, skip_special_tokens)?;
+            if !new_prefix.ends_with('\u{FFFD}') {
+                *prefix = new_prefix;
+                *prefix_index = ids.len();
+            }
+        }
+        let token_id = new_ids.last().copied();
+        ids.extend(new_ids);
+        let string = self.decode(ids, skip_special_tokens)?;
+        if string.ends_with('\u{FFFD}') {
+            return Ok(DecodeStep::default());
+        }
+        let (new_text, prefix_mismatch) = match string.strip_prefix(prefix.as_str()) {
+            Some("") => return Ok(DecodeStep::default()),
+            Some(rest) => (rest.to_string(), false),
+            None => {
+                let (rest, byte_run) = remainder_after_rewrite(&string, prefix);
+                debug!(
+                    ?token_id,
+                    emitted = prefix.len(),
+                    decoded = string.len(),
+                    byte_run,
+                    "decode no longer starts with the emitted text; streaming the remainder"
+                );
+                crate::decode_activity::note_prefix_mismatch(byte_run);
+                (rest, true)
+            }
+        };
+        let new_prefix_index = ids.len() - *prefix_index;
+        ids.drain(..*prefix_index);
+        *prefix = self.decode(ids, skip_special_tokens)?;
+        *prefix_index = new_prefix_index;
+        Ok(DecodeStep {
+            text: Some(new_text),
+            prefix_mismatch,
+        })
+    }
+}
+
+/// The part of `decoded` that follows what `emitted` already covers, when the
+/// decoder chain rewrote `emitted`. The common character prefix is skipped;
+/// beyond it, a ByteFallback run collapsed by an invalid byte decodes to one
+/// replacement character per byte, so one such character is skipped for every
+/// byte of the emitted characters (the second value says that applied).
+/// Nothing already emitted is retracted: a reader sees the emitted text, then
+/// the remainder as the batch decode would end.
+fn remainder_after_rewrite(decoded: &str, emitted: &str) -> (String, bool) {
+    let common = decoded
+        .char_indices()
+        .zip(emitted.chars())
+        .find(|((_, a), b)| a != b)
+        .map_or_else(|| decoded.len().min(emitted.len()), |((index, _), _)| index);
+    let rewritten_bytes = emitted.len() - common;
+    let rest = &decoded[common..];
+    let replacement_run = rest.chars().take_while(|&c| c == '\u{FFFD}').count();
+    if rewritten_bytes > 0 && replacement_run >= rewritten_bytes {
+        let skip = '\u{FFFD}'.len_utf8() * rewritten_bytes;
+        (rest[skip..].to_string(), true)
+    } else {
+        (rest.to_string(), false)
+    }
+}
+
 impl Decoder for HuggingFaceTokenizer {
     fn uses_byte_fallback(&self) -> bool {
         self.has_byte_fallback
@@ -616,11 +698,15 @@ impl Decoder for HuggingFaceTokenizer {
             .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
     }
 
-    /// Native incremental decode using the HF `step_decode_stream`.
+    /// Native incremental decode: the algorithm of the HF `step_decode_stream`
+    /// (hold while the decode ends in an incomplete character, emit what grew
+    /// beyond the emitted prefix), run through the concrete `TokenizerImpl`
+    /// rather than `dyn Decoder` dispatch, and lenient when the decoder chain
+    /// rewrites text already emitted (see [`Self::step_decode_lenient`]).
     ///
-    /// This delegates to the same algorithm the default trait method uses, but
-    /// the two internal `decode()` calls go directly through the concrete
-    /// `TokenizerImpl` rather than through `dyn Decoder` vtable dispatch.
+    /// A ByteFallback vocabulary holds a client-visible byte run until a
+    /// regular token closes it: an invalid byte later in the run would make
+    /// batch decoding rewrite the run's earlier characters.
     fn decode_step(
         &self,
         token_id: TokenIdType,
@@ -629,16 +715,64 @@ impl Decoder for HuggingFaceTokenizer {
         prefix_index: &mut usize,
         skip_special_tokens: bool,
     ) -> Result<Option<String>> {
-        // ByteFallback replaces every byte of an invalid run, including ASCII
-        // bytes already decoded. Do not emit a run until a real token closes it.
+        Ok(self
+            .decode_step_reporting(
+                token_id,
+                ids,
+                prefix,
+                prefix_index,
+                skip_special_tokens,
+                false,
+            )?
+            .text)
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .step_decode_lenient(
+                vec![token_id],
+                skip_special_tokens,
+                ids,
+                prefix,
+                prefix_index,
+            )?
+            .text)
+    }
+
+    fn decode_step_reporting(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+    ) -> Result<DecodeStep> {
+        if eager {
+            return self.step_decode_lenient(
+                vec![token_id],
+                skip_special_tokens,
+                ids,
+                prefix,
+                prefix_index,
+            );
+        }
         if self.has_byte_fallback {
             if prefix.is_empty() && *prefix_index > 0 {
+                // A seeded sequence: its prompt text is context, never emitted.
                 let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
                 let stable_seed_end = ids[..*prefix_index]
                     .iter()
                     .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
                     .map_or(0, |index| index + 1);
-                if prefill.ends_with('�') {
+                if prefill.ends_with('\u{FFFD}') {
                     // Keep an unfinished seed byte run as decode context, but
                     // suppress the stable prompt text before it.
                     *prefix_index = stable_seed_end;
@@ -655,12 +789,12 @@ impl Decoder for HuggingFaceTokenizer {
             }
             if self.byte_fallback_piece(token_id, skip_special_tokens) {
                 ids.push(token_id);
-                return Ok(None);
+                return Ok(DecodeStep::default());
             }
         }
         let tokens = if self.has_byte_fallback && prefix.is_empty() {
             // These IDs have not been emitted, so they are input, not a prefill
-            // prefix for the native streaming decoder.
+            // prefix for the streaming decoder.
             let mut pending = std::mem::take(ids);
             pending.push(token_id);
             *prefix_index = 0;
@@ -668,34 +802,7 @@ impl Decoder for HuggingFaceTokenizer {
         } else {
             vec![token_id]
         };
-        step_decode_stream(
-            &self.tokenizer,
-            tokens,
-            skip_special_tokens,
-            ids,
-            prefix,
-            prefix_index,
-        )
-        .map_err(|e| Error::msg(format!("Decode stream error: {e}")))
-    }
-
-    fn decode_step_eager(
-        &self,
-        token_id: TokenIdType,
-        ids: &mut Vec<TokenIdType>,
-        prefix: &mut String,
-        prefix_index: &mut usize,
-        skip_special_tokens: bool,
-    ) -> Result<Option<String>> {
-        step_decode_stream(
-            &self.tokenizer,
-            vec![token_id],
-            skip_special_tokens,
-            ids,
-            prefix,
-            prefix_index,
-        )
-        .map_err(|e| Error::msg(format!("Decode stream error: {e}")))
+        self.step_decode_lenient(tokens, skip_special_tokens, ids, prefix, prefix_index)
     }
 
     /// Byte-level vocabularies decode each id to fixed bytes, so one stream
@@ -718,24 +825,38 @@ impl Decoder for HuggingFaceTokenizer {
         prefix: &mut String,
         prefix_index: &mut usize,
         skip_special_tokens: bool,
-    ) -> Result<String> {
+    ) -> Result<DecodeStep> {
         if !self.has_byte_fallback {
-            return Ok(String::new());
+            return Ok(DecodeStep::default());
         }
         if prefix.is_empty() && ids.len() == *prefix_index {
+            // A seeded sequence that generated nothing: the seed is prompt text.
             ids.clear();
             *prefix_index = 0;
-            return Ok(String::new());
+            return Ok(DecodeStep::default());
         }
         let decoded = self.decode(ids, skip_special_tokens)?;
-        let pending = decoded
-            .strip_prefix(prefix.as_str())
-            .ok_or_else(|| Error::msg("Decode stream prefix changed at end of input"))?
-            .to_string();
+        let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
+            Some(pending) => (pending.to_string(), false),
+            None => {
+                let (pending, byte_run) = remainder_after_rewrite(&decoded, prefix);
+                debug!(
+                    emitted = prefix.len(),
+                    decoded = decoded.len(),
+                    byte_run,
+                    "end-of-input decode no longer starts with the emitted text; streaming the remainder"
+                );
+                crate::decode_activity::note_prefix_mismatch(byte_run);
+                (pending, true)
+            }
+        };
         ids.clear();
         prefix.clear();
         *prefix_index = 0;
-        Ok(pending)
+        Ok(DecodeStep {
+            text: (!pending.is_empty()).then_some(pending),
+            prefix_mismatch,
+        })
     }
 }
 

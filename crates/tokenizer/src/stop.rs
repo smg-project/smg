@@ -113,6 +113,12 @@ impl StopSequenceDecoder {
         self.sequence.skip_special_tokens()
     }
 
+    /// How many decode steps of this stream found the decoder had rewritten
+    /// text already emitted and streamed a best-effort remainder instead.
+    pub fn prefix_mismatches(&self) -> u32 {
+        self.sequence.prefix_mismatches()
+    }
+
     fn with_sequence(sequence: Sequence, config: StopSequenceConfig) -> Self {
         // Build Aho-Corasick automaton from all stop sequences
         // Hidden sequences come first, then visible sequences

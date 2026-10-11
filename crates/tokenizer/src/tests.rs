@@ -266,6 +266,136 @@ fn byte_fallback_token_stop_preserves_pending_text() {
     assert_eq!(decoder.matched_stop(), Some("t"));
 }
 
+/// Every byte-run fixture of this file at once: the streamed text, the batch
+/// text, and how many steps streamed a remainder because batch decoding would
+/// have rewritten characters already sent (an invalid byte after them).
+fn stream_all(
+    tokenizer: &Arc<dyn crate::TokenizerTrait>,
+    ids: &[u32],
+    config: crate::StopSequenceConfig,
+    skip_special_tokens: bool,
+) -> (Vec<String>, String, u32) {
+    use crate::{SequenceDecoderOutput, StopSequenceDecoder};
+    let mut decoder = StopSequenceDecoder::new(tokenizer.clone(), config, skip_special_tokens);
+    let mut deltas = Vec::new();
+    for &id in ids {
+        match decoder.process_token(id).unwrap() {
+            SequenceDecoderOutput::Text(delta) => deltas.push(delta),
+            SequenceDecoderOutput::Held => {}
+            other => panic!("Unexpected stop: {other:?}"),
+        }
+    }
+    if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
+        deltas.push(delta);
+    }
+    let batch = tokenizer.decode(ids, skip_special_tokens).unwrap();
+    (deltas, batch, decoder.prefix_mismatches())
+}
+
+#[test]
+fn decoder_rewrite_of_streamed_text_emits_the_remainder_without_failing() {
+    // A `Replace` step after ByteFallback rewrites "regular suffix" to "X"
+    // once the second token arrives: "regular" was streamed, so the stream
+    // sends "X" and reports the recovery instead of failing.
+    let definition = serde_json::json!({
+        "version": "1.0", "added_tokens": [],
+        "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": {
+            "[UNK]": 0, "regular": 1, "<0x74>": 2, "<0xF2>": 3, " suffix": 4
+        }},
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "ByteFallback"}, {"type": "Fuse"},
+            {"type": "Replace", "pattern": {"String": "regular suffix"}, "content": "X"},
+            {"type": "Replace", "pattern": {"String": "regular\u{FFFD}"}, "content": "Y"}
+        ]}
+    });
+    let native =
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&definition).unwrap()).unwrap();
+    let tokenizer: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(native));
+    let before = crate::decode_activity_stats();
+    let (deltas, batch, recoveries) = stream_all(
+        &tokenizer,
+        &[1, 4],
+        crate::StopSequenceConfig::default(),
+        true,
+    );
+    assert_eq!(batch, "X");
+    assert_eq!(deltas, vec!["regular", "X"]);
+    assert_eq!(recoveries, 1);
+    // The rewrite only shows at the end of input: "regular" + an unfinished
+    // byte decodes to "Y"; the end of input sends it rather than failing.
+    let (deltas, batch, recoveries) = stream_all(
+        &tokenizer,
+        &[1, 3],
+        crate::StopSequenceConfig::default(),
+        true,
+    );
+    assert_eq!(batch, "Y");
+    assert_eq!(deltas, vec!["regular", "Y"]);
+    assert_eq!(recoveries, 1);
+    let after = crate::decode_activity_stats();
+    let decoder = |stats: &[crate::DecodeActivityStats; 2]| {
+        stats
+            .iter()
+            .find(|s| s.kind == "decoder")
+            .map_or(0, |s| s.prefix_mismatches)
+    };
+    assert!(
+        decoder(&after) >= decoder(&before) + 2,
+        "{before:?} -> {after:?}"
+    );
+}
+
+#[test]
+fn byte_fallback_eager_stop_observation_survives_an_invalid_byte_after_a_character() {
+    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+    // <0xC3> <0xA9> <0xF2> " suffix": "é" is observed, then batch decoding
+    // rewrites the run as three replacement characters. The eager observer
+    // keeps "é", goes on with "\u{FFFD} suffix", and never fails.
+    let tokenizer = byte_fallback_tokenizer();
+    let ids = [5, 6, 3, 4];
+    for (stops, expected) in [
+        (vec!["t"], None),
+        (vec!["regular"], None),
+        (vec!["suffix"], Some("suffix")),
+        (vec!["é"], Some("é")),
+        (vec!["\u{FFFD} suf"], Some("\u{FFFD} suf")),
+    ] {
+        let mut config = StopSequenceConfig::default();
+        for stop in &stops {
+            config = config.with_stop_sequence(*stop);
+        }
+        let mut decoder = StopSequenceDecoder::for_stop_matching(tokenizer.clone(), config, true);
+        let mut text = String::new();
+        let mut stopped = false;
+        for &id in &ids {
+            match decoder.process_token(id).unwrap() {
+                SequenceDecoderOutput::Text(delta) => text.push_str(&delta),
+                SequenceDecoderOutput::Held => {}
+                SequenceDecoderOutput::StoppedWithText(delta) => {
+                    text.push_str(&delta);
+                    stopped = true;
+                    break;
+                }
+                SequenceDecoderOutput::Stopped => {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        if !stopped {
+            if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(decoder.matched_stop(), expected, "{stops:?}");
+        if expected.is_none() {
+            assert_eq!(text, "é\u{FFFD} suffix", "{stops:?}");
+            assert_eq!(decoder.prefix_mismatches(), 1, "{stops:?}");
+        }
+    }
+}
+
 #[test]
 fn test_mock_tokenizer_encode() {
     let tokenizer = mock::MockTokenizer::new();

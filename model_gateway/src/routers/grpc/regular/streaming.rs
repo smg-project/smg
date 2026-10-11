@@ -666,6 +666,7 @@ impl StreamingProcessor {
                     let flushed = match stop_decoders.get_mut(&index) {
                         Some(decoder) => {
                             let tail = decoder.finish().map_err(|e| e.to_string())?;
+                            utils::warn_detokenize_recoveries(request_id, index, decoder);
                             if decoder.is_stopped() {
                                 stopped_indices.insert(index);
                                 finish_reasons.insert(index, "stop".to_string());
@@ -739,6 +740,7 @@ impl StreamingProcessor {
                         match stop_decoders.get_mut(&index) {
                             Some(decoder) => {
                                 let tail = decoder.finish().map_err(|e| e.to_string())?;
+                                utils::warn_detokenize_recoveries(request_id, index, decoder);
                                 if decoder.is_stopped() {
                                     stopped_indices.insert(index);
                                     finish_reasons.insert(index, "stop".to_string());
@@ -2521,6 +2523,7 @@ impl StreamingProcessor {
                 }
                 Some(ProtoResponseVariant::Complete(complete)) => {
                     let tail = stop_decoder.finish().map_err(|e| e.to_string())?;
+                    utils::warn_detokenize_recoveries(request_id, 0, &stop_decoder);
                     if stop_decoder.is_stopped() {
                         stopped = true;
                         finish_reason_str = "stop".to_string();
@@ -2559,6 +2562,7 @@ impl StreamingProcessor {
                     // iteration without pretending the engine sent Complete.
                     decoder_finished_at_eof = true;
                     let tail = stop_decoder.finish().map_err(|e| e.to_string())?;
+                    utils::warn_detokenize_recoveries(request_id, 0, &stop_decoder);
                     if stop_decoder.is_stopped() {
                         stopped = true;
                         finish_reason_str = "stop".to_string();
@@ -3599,6 +3603,7 @@ impl StreamingProcessor {
 
                     if let Some(decoder) = stop_decoders.get_mut(&index) {
                         let tail = decoder.finish().map_err(|e| e.to_string())?;
+                        utils::warn_detokenize_recoveries(request_id, index, decoder);
                         if decoder.is_stopped() {
                             stopped_indices.insert(index);
                         }
@@ -3707,6 +3712,7 @@ impl StreamingProcessor {
                 continue;
             }
             let tail = decoder.finish().map_err(|e| e.to_string())?;
+            utils::warn_detokenize_recoveries(request_id, *index, decoder);
             let stopped = decoder.is_stopped();
             let mut text = match tail {
                 SequenceDecoderOutput::Text(text)
@@ -4253,7 +4259,7 @@ mod tests {
             _prefix: &mut String,
             _prefix_index: &mut usize,
             _skip_special_tokens: bool,
-        ) -> anyhow::Result<String> {
+        ) -> anyhow::Result<llm_tokenizer::DecodeStep> {
             Err(anyhow::anyhow!("pending token decode failed"))
         }
     }

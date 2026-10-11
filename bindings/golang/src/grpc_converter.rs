@@ -512,6 +512,14 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                 let tail = decoder
                     .finish()
                     .map_err(|error| format!("Failed to finish token decoding: {error}"))?;
+                if decoder.prefix_mismatches() > 0 {
+                    tracing::warn!(
+                        request_id = %handle.request_id,
+                        index,
+                        recoveries = decoder.prefix_mismatches(),
+                        "the decoder rewrote text already streamed; the stream kept its text and sent the remainder"
+                    );
+                }
                 let stopped = matches!(
                     tail,
                     SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)

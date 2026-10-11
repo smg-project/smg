@@ -17,6 +17,7 @@ struct MetricsState {
 
 async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoResponse {
     super::metrics::record_tokenizer_cache_activity();
+    super::metrics::record_detokenize_activity();
     let mut body = state.handle.render();
     super::worker_metrics::render_into(&mut body);
     (

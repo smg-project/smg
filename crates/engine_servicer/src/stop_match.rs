@@ -137,4 +137,40 @@ mod tests {
             assert_eq!(matcher.feed(&[3]).unwrap(), Some("té".into()));
         }
     }
+
+    #[test]
+    fn byte_fallback_invalid_byte_after_a_character_does_not_fail_stop_observation() {
+        // <0xC3> <0xA9> <0xF2> " suffix": "é" is observed before the invalid
+        // byte makes batch decoding rewrite the run; observation goes on with
+        // the rest of the run instead of failing, for matching and
+        // non-matching stops alike.
+        for cached in [false, true] {
+            let native = byte_fallback_tokenizer();
+            let tokenizer: Arc<dyn Tokenizer> = if cached {
+                Arc::new(llm_tokenizer::CachedTokenizer::new(
+                    native,
+                    llm_tokenizer::CacheConfig::default(),
+                ))
+            } else {
+                native
+            };
+            for (stop, expected) in [
+                ("t", None),
+                ("é", Some("é".to_string())),
+                ("suffix", Some("suffix".to_string())),
+                ("\u{FFFD} suf", Some("\u{FFFD} suf".to_string())),
+            ] {
+                let decoder = stop_decoder(Some(&tokenizer), &[stop.into()], true).unwrap();
+                let mut matcher = StopMatcher::new(decoder, 0);
+                let mut matched = None;
+                for &id in &[2, 3, 4, 5] {
+                    matched = matcher.feed(&[id]).unwrap();
+                    if matched.is_some() {
+                        break;
+                    }
+                }
+                assert_eq!(matched, expected, "stop {stop:?} cached={cached}");
+            }
+        }
+    }
 }
