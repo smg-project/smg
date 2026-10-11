@@ -19,6 +19,12 @@ use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
 
 const BIN: &str = env!("CARGO_BIN_EXE_mock-worker");
 
+/// The binary under test: this build's, or the one `MOCK_WORKER_BIN` names
+/// (to run the suite against another build for a before/after).
+fn binary() -> String {
+    std::env::var("MOCK_WORKER_BIN").unwrap_or_else(|_| BIN.to_string())
+}
+
 /// A slow stream: one token per decode pass of this many milliseconds.
 const DECODE_MS: &str = "20";
 
@@ -52,7 +58,7 @@ impl Mock {
     fn start(extra: &[&str]) -> Self {
         let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let (grpc_port, http_port) = free_ports();
-        let mut child = Command::new(BIN)
+        let mut child = Command::new(binary())
             .args(["--grpc-base-port", &grpc_port.to_string()])
             .args(["--grpc-count", "1"])
             .args(["--http-base-port", &http_port.to_string()])
@@ -358,4 +364,78 @@ async fn the_drain_deadline_bounds_the_exit() {
         "a stream cut by the exit has no Complete"
     );
     assert!(delivered.chunks < 400);
+}
+
+#[tokio::test]
+async fn sigterm_ends_a_kv_event_subscription_held_open() {
+    // The gateway's cache-aware policy keeps a SubscribeKvEvents stream open
+    // on every worker; a stop that waited for it would never drain.
+    let mock = Mock::start(&["--engine", "realistic"]);
+    let client =
+        TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{}", mock.grpc_port))
+            .await
+            .expect("connect to the gRPC worker");
+    let mut events = client
+        .subscribe_kv_events(0)
+        .await
+        .expect("subscribe to KV events");
+    // The subscription is live: it carries a load heartbeat before any event.
+    let first = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("a first batch within 5 s");
+    assert!(first.is_some(), "a subscription that ends by itself");
+
+    let sent = mock.signal("TERM");
+    let ended = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(batch) = events.next().await {
+            if batch.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the subscription ends at the stop");
+    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
+    eprintln!(
+        "kv subscription held open: exit {:?} after SIGTERM",
+        exited - sent
+    );
+    assert!(
+        exited - sent < Duration::from_secs(2),
+        "the held subscription does not run the drain to its deadline: {:?}",
+        exited - sent
+    );
+    assert!(log.contains("drained; exiting"), "log:\n{log}");
+}
+
+#[tokio::test]
+async fn a_second_signal_during_the_drain_exits_at_once() {
+    // A long stream against the default 5 s drain; a second SIGTERM a moment
+    // later ends the wait.
+    let mock = Mock::start(&["--engine", "realistic", "--decode-base-ms", DECODE_MS]);
+    let client =
+        TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{}", mock.grpc_port))
+            .await
+            .expect("connect to the gRPC worker");
+    let mut grpc = client
+        .generate(generate_request("long", 400))
+        .await
+        .expect("generate");
+    grpc.next().await.expect("a first frame").expect("ok");
+
+    let first = mock.signal("TERM");
+    thread::sleep(Duration::from_millis(300));
+    mock.signal("TERM");
+    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
+    assert!(
+        exited - first < Duration::from_secs(2),
+        "the second signal cuts the drain short: {:?}",
+        exited - first
+    );
+    assert!(
+        log.contains("SIGTERM during the drain: exiting now with 1 request(s) in flight"),
+        "log:\n{log}"
+    );
 }

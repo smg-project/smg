@@ -25,7 +25,10 @@ use engine_zmq_client::{
     },
     EngineId,
 };
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::mpsc,
+    task::{AbortHandle, JoinSet},
+};
 
 use crate::{
     config::Config,
@@ -106,18 +109,48 @@ pub async fn serve_until(
 
     let mut shutdown = pin!(shutdown);
     let mut stopped = false;
-    let mut inflight: HashMap<String, JoinHandle<()>> = HashMap::new();
+    // The forwarders of the admitted requests, and their abort handles by
+    // request id. A stop admits nothing more and keeps reading the input
+    // (an Abort still lands) until the last forwarder is done.
+    let mut forwarders = JoinSet::new();
+    let mut inflight: HashMap<String, AbortHandle> = HashMap::new();
     loop {
         let inbound = tokio::select! {
             inbound = input.recv() => inbound,
-            () = &mut shutdown => {
-                tracing::info!("zmq engine {engine_index}: stopping, admitting no more requests");
+            () = &mut shutdown, if !stopped => {
+                tracing::info!(
+                    "zmq engine {engine_index}: stopping, admitting no more requests; {} in flight",
+                    forwarders.len()
+                );
                 stopped = true;
-                break;
+                continue;
+            }
+            // Finished forwarders are reaped as they go; after the stop the
+            // last of them ends the rank (the guard keeps an empty set from
+            // yielding `None` before it).
+            joined = forwarders.join_next(), if stopped || !forwarders.is_empty() => {
+                match joined {
+                    Some(Ok(())) => continue,
+                    Some(Err(e)) => {
+                        tracing::error!("zmq engine {engine_index} forwarder panicked: {e}");
+                        continue;
+                    }
+                    None => break,
+                }
             }
         };
         match inbound {
+            Ok(EngineInbound::Add(request)) if stopped => {
+                // Nothing is admitted during the drain: the frontend's stream
+                // for the request ends with a terminal Abort.
+                let _ = out_tx.send(terminal_batch(
+                    engine_index,
+                    request.request_id,
+                    EngineCoreFinishReason::Abort,
+                ));
+            }
             Ok(EngineInbound::Add(request)) => {
+                inflight.retain(|_, forwarder| !forwarder.is_finished());
                 let request_id = request.request_id.clone();
                 let prompt = request.prompt_token_ids.clone().unwrap_or_default();
                 // Honor the request's max_tokens; fall back to the worker default.
@@ -147,11 +180,7 @@ pub async fn serve_until(
                     }
                 }
 
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "forwarder self-terminates on Done or abort"
-                )]
-                let forwarder = tokio::spawn(forward_request(
+                let forwarder = forwarders.spawn(forward_request(
                     request_id.clone(),
                     engine_index,
                     gen_rx,
@@ -202,13 +231,9 @@ pub async fn serve_until(
             }
         }
     }
-    // A stop lets the requests admitted before it finish (the frontend is
-    // still there to read their outputs); the deadline is the caller's.
-    if stopped {
-        for forwarder in inflight.into_values() {
-            let _ = forwarder.await;
-        }
-    }
+    // The input closed with forwarders still running: they finish on their
+    // own, as before (their outputs go nowhere once the writer fails).
+    forwarders.detach_all();
 }
 
 /// Forward one request's generation events to the output funnel as

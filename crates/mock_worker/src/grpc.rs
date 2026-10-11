@@ -15,7 +15,7 @@ use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, watch},
 };
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -96,10 +96,19 @@ pub async fn serve_with_listener_until(
             .map(|kv| crate::kv_zmq::serve(engine.clone(), kv))
     });
     let max_message_bytes = cfg.grpc_max_message_bytes;
+    // The stop reaches the service's streams that have no end of their own
+    // (a KV-event subscription) before the server's graceful shutdown
+    // begins, which waits for every open stream.
+    let (stop, stopped) = watch::channel(false);
+    let shutdown = async move {
+        shutdown.await;
+        let _ = stop.send(true);
+    };
     let service = MockScheduler {
         cfg,
         engine,
         capture,
+        stopped,
     };
     let server = async {
         // tonic's 4 MiB default would refuse the Generate of a long prompt (a
@@ -158,6 +167,9 @@ struct MockScheduler {
     engine: Option<Engine>,
     /// Present iff `--capture` is set: every `Generate` request is recorded.
     capture: Option<Arc<Capture>>,
+    /// Flips when the worker stops: ends the streams that have no end of
+    /// their own.
+    stopped: watch::Receiver<bool>,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -376,11 +388,19 @@ impl TokenSpeedScheduler for MockScheduler {
             // each carrying the load record a servicer attaches.
             Some(engine) if engine.kv_enabled() => {
                 let start = request.into_inner().start_sequence_number;
-                Ok(Response::new(with_load_records(
+                let events = with_load_records(
                     engine.clone(),
                     self.cfg.loads_like,
                     engine.subscribe_kv(start),
-                )))
+                );
+                // A subscription ends with the worker's stop, as a serving
+                // engine's ends with its process; nothing else ends it, and
+                // the server's shutdown waits for it.
+                let mut stopped = self.stopped.clone();
+                let stop = async move {
+                    let _ = stopped.wait_for(|stop| *stop).await;
+                };
+                Ok(Response::new(Box::pin(events.take_until(stop))))
             }
             // Otherwise Unimplemented, on which the gateway's KvEventMonitor gives
             // up cleanly instead of keeping an idle per-worker task.
