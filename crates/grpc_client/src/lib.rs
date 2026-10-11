@@ -192,17 +192,44 @@ pub const KV_EVENT_MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 macro_rules! impl_subscribe_kv_events {
     () => {
         /// Subscribe to KV cache events from the backend.
-        /// Returns a long-lived server-streaming response.
+        /// Returns a long-lived server-streaming response. The servicer's
+        /// load records (`KvEventBatch.load`) start with the publisher's
+        /// first batch; a caller that skips `load_only` batches before any
+        /// sequence check can have them from the subscription on through
+        /// [`Self::subscribe_kv_events_with_load_records`].
         pub async fn subscribe_kv_events(
             &self,
             start_sequence_number: u64,
         ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe_kv_events_asking(start_sequence_number, false)
+                .await
+        }
+
+        /// [`Self::subscribe_kv_events`] asking the servicer for its load
+        /// records before the publisher's first batch
+        /// (`SubscribeKvEventsRequest.load_records_before_first_batch`):
+        /// `load_only` batches numbered 0 arrive from the subscription on,
+        /// the engine's silence on its first request among them. The caller
+        /// must skip `load_only` batches before any sequence check: one that
+        /// dedupes by `sequence_number` alone would take the publisher's
+        /// first batch for a repeat of them, and belongs on
+        /// [`Self::subscribe_kv_events`].
+        pub async fn subscribe_kv_events_with_load_records(
+            &self,
+            start_sequence_number: u64,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
+            self.subscribe_kv_events_asking(start_sequence_number, true)
+                .await
+        }
+
+        async fn subscribe_kv_events_asking(
+            &self,
+            start_sequence_number: u64,
+            load_records_before_first_batch: bool,
+        ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
             let request = tonic::Request::new($crate::common_proto::SubscribeKvEventsRequest {
                 start_sequence_number,
-                // This client admits a `load_only` batch to no cursor, so the
-                // servicer may send its records before the publisher's first
-                // batch (the field's note in the proto).
-                load_records_before_first_batch: true,
+                load_records_before_first_batch,
             });
             let mut client = self
                 .client

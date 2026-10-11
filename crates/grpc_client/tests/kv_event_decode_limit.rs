@@ -3,7 +3,10 @@
 //! their token ids, about 4.8 MB at 1,152-token blocks. The client must decode
 //! such a message instead of failing the stream at every reconnect.
 
-use std::{pin::Pin, sync::Arc};
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 
 use futures::Stream;
 use prost::Message;
@@ -55,10 +58,12 @@ fn snapshot_chunk() -> common::KvEventBatch {
     }
 }
 
-/// An engine whose KV event stream begins with one snapshot chunk.
+/// An engine whose KV event stream begins with one snapshot chunk; it notes
+/// every subscribe request it is sent.
 #[derive(Clone)]
 struct SnapshotEngine {
     chunk: Arc<common::KvEventBatch>,
+    seen: Arc<Mutex<Vec<common::SubscribeKvEventsRequest>>>,
 }
 
 #[tonic::async_trait]
@@ -132,8 +137,12 @@ impl proto::vllm_engine_server::VllmEngine for SnapshotEngine {
 
     async fn subscribe_kv_events(
         &self,
-        _request: Request<common::SubscribeKvEventsRequest>,
+        request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.into_inner());
         let chunk = common::KvEventBatch::clone(&self.chunk);
         Ok(Response::new(Box::pin(futures::stream::once(async move {
             Ok(chunk)
@@ -154,6 +163,7 @@ async fn a_snapshot_chunk_over_the_default_decode_limit_is_decoded() {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let engine = SnapshotEngine {
         chunk: Arc::new(chunk),
+        seen: Arc::default(),
     };
     #[expect(
         clippy::disallowed_methods,
@@ -181,4 +191,50 @@ async fn a_snapshot_chunk_over_the_default_decode_limit_is_decoded() {
         .iter()
         .all(|block| block.token_ids.len() == BLOCK_SIZE));
     assert_eq!(stream.message().await.unwrap(), None);
+}
+
+/// The two subscribe methods differ in one thing: whether they ask the
+/// servicer for its load records before the publisher's first batch. The
+/// plain one leaves the field unset, for a caller that dedupes by sequence
+/// number alone; the other sets it, for a caller that skips `load_only`
+/// batches before any sequence check.
+#[tokio::test]
+async fn the_subscribe_methods_differ_in_the_records_they_ask_for() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let engine = SnapshotEngine {
+        chunk: Arc::new(common::KvEventBatch::default()),
+        seen: Arc::default(),
+    };
+    let seen = Arc::clone(&engine.seen);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "mock server for one test; lives until the test process exits"
+    )]
+    tokio::spawn(
+        Server::builder()
+            .add_service(proto::vllm_engine_server::VllmEngineServer::new(engine))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    client.subscribe_kv_events(3).await.unwrap();
+    client
+        .subscribe_kv_events_with_load_records(5)
+        .await
+        .unwrap();
+    let requests = seen.lock().unwrap().clone();
+    assert_eq!(
+        requests,
+        vec![
+            common::SubscribeKvEventsRequest {
+                start_sequence_number: 3,
+                load_records_before_first_batch: false,
+            },
+            common::SubscribeKvEventsRequest {
+                start_sequence_number: 5,
+                load_records_before_first_batch: true,
+            },
+        ]
+    );
 }

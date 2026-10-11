@@ -357,17 +357,37 @@ impl GrpcClient {
         }
     }
 
-    /// Subscribe to KV cache events. Returns `Unimplemented` on backends
-    /// without KV-event streaming.
+    /// Subscribe to KV cache events, asking the servicer for its load records
+    /// before the publisher's first batch: the gateway's stream reader skips a
+    /// `load_only` batch before any sequence check (the KV-event monitor's
+    /// `process_stream`), so the records numbered 0 cost it nothing and a
+    /// worker's first request is judged like any later one. Returns
+    /// `Unimplemented` on backends without KV-event streaming.
     pub async fn subscribe_kv_events(
         &self,
         start_seq: u64,
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
         match self {
-            Self::Sglang(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Vllm(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Trtllm(client) => client.subscribe_kv_events(start_seq).await,
-            Self::TokenSpeed(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Sglang(client) => {
+                client
+                    .subscribe_kv_events_with_load_records(start_seq)
+                    .await
+            }
+            Self::Vllm(client) => {
+                client
+                    .subscribe_kv_events_with_load_records(start_seq)
+                    .await
+            }
+            Self::Trtllm(client) => {
+                client
+                    .subscribe_kv_events_with_load_records(start_seq)
+                    .await
+            }
+            Self::TokenSpeed(client) => {
+                client
+                    .subscribe_kv_events_with_load_records(start_seq)
+                    .await
+            }
             Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "SubscribeKvEvents RPC not supported for MLX backend",
             )),
