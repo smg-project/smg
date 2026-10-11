@@ -194,11 +194,24 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
 /// thread purges on schedule instead; dirty pages are returned after 10 s and
-/// muzzy pages at once. This is jemalloc's application-provided `malloc_conf`
-/// string under the vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF`
-/// environment variable is read after it and overrides it entry by entry.
-pub const SERVER_MALLOC_CONF: &[u8; 61] =
-    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0\0";
+/// muzzy pages at once.
+///
+/// jemalloc runs 16 arenas. Its default is four per CPU of the affinity mask
+/// (one on a single CPU) with every thread on an arena of its own, and each
+/// (arena, size class) pair keeps at least one partly used slab, a 64 KiB
+/// page on the aarch64 build: with ~240 threads on a many-core host a gateway
+/// holding 235 MB of live objects kept 1.6 GB of slabs (1.17 GB resident)
+/// under a steady multi-turn mix, and every new blocking-pool thread added a
+/// fresh set. With 16 arenas the same load and live heap took 0.4 GB of slabs
+/// (0.46 GB resident) at the same CPU per request; 4 arenas saved little more
+/// and cost 12 % CPU in arena contention. On a host with fewer than four CPUs
+/// the fixed count is more arenas than the default, a few mostly empty slabs.
+///
+/// This is jemalloc's application-provided `malloc_conf` string under the
+/// vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF` environment
+/// variable is read after it and overrides it entry by entry.
+pub const SERVER_MALLOC_CONF: &[u8; 72] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16\0";
 
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///

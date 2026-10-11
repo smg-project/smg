@@ -3,6 +3,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod drain;
 pub mod engine;
 pub mod grpc;
 pub mod http;

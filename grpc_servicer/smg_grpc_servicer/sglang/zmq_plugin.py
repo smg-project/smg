@@ -35,7 +35,8 @@ from smg_grpc_servicer.sglang.zmq_msgpack import (
 
 logger = logging.getLogger(__name__)
 
-# The headless launcher sets these for the scheduler ranks it spawns.
+# Whoever spawns the scheduler ranks (the Rust servicer, or the standalone
+# headless launcher) sets these for them.
 HANDSHAKE_ENV = "SMG_SGLANG_ZMQ_HANDSHAKE"
 ENGINE_INDEX_ENV = "SMG_SGLANG_ZMQ_ENGINE_INDEX"
 

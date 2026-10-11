@@ -584,6 +584,10 @@ pub(crate) struct RequestFault {
     /// Serve this many tokens, then cut the stream with `status`; `None`
     /// answers before admission, so the request never counts as served.
     pub after_tokens: Option<u32>,
+    /// End the stream the way an engine that failed the request does: a
+    /// `Complete` whose finish reason is `error` after `after_tokens` tokens,
+    /// instead of a status.
+    pub finish_error: bool,
     /// How long the fault stays armed.
     pub scope: FaultScope,
 }
@@ -605,6 +609,7 @@ pub(crate) struct Injected {
     pub status: u16,
     pub stall: Duration,
     pub after_tokens: Option<u32>,
+    pub finish_error: bool,
 }
 
 /// The hooks' current state.
@@ -912,6 +917,7 @@ impl Engine {
             status: fault.status,
             stall: fault.stall,
             after_tokens: fault.after_tokens,
+            finish_error: fault.finish_error,
         })
     }
 
@@ -3201,12 +3207,14 @@ mod tests {
             status: 503,
             stall: Duration::ZERO,
             after_tokens: None,
+            finish_error: false,
             scope: FaultScope::Requests(2),
         }));
         let injected = Injected {
             status: 503,
             stall: Duration::ZERO,
             after_tokens: None,
+            finish_error: false,
         };
         assert_eq!(engine.inject(), Some(injected));
         assert_eq!(
@@ -3235,6 +3243,7 @@ mod tests {
             status: 500,
             stall: Duration::from_millis(5),
             after_tokens: Some(3),
+            finish_error: false,
             scope: FaultScope::Until(Instant::now() + Duration::from_millis(100)),
         }));
         let injected = engine.inject().expect("armed");
@@ -3264,6 +3273,7 @@ mod tests {
             status: 429,
             stall: Duration::ZERO,
             after_tokens: None,
+            finish_error: false,
             scope: FaultScope::Open,
         }));
         assert!(engine.inject().is_some());

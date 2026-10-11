@@ -10,7 +10,7 @@ use std::{
 
 use axum::response::Response;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{future::try_join_all, FutureExt};
+use futures::future::try_join_all;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
     traits::Tokenizer,
@@ -409,7 +409,6 @@ impl StreamingProcessor {
 
         // Phase 1: Initialize state tracking (per-index for n>1 support)
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
-        let mut stream_buffers: HashMap<u32, String> = HashMap::new();
         let mut finish_reasons: HashMap<u32, String> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<Value>> = HashMap::new();
         // Indices whose local stop decoder fired: their finish reason is pinned
@@ -427,12 +426,10 @@ impl StreamingProcessor {
         let mut spec_accepted: HashMap<u32, u32> = HashMap::new();
         let mut spec_drafted: HashMap<u32, u32> = HashMap::new();
 
-        // Parser state (lazy initialization per index)
-        type PooledReasoningParser = Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>;
-        let mut reasoning_parsers: HashMap<u32, PooledReasoningParser> = HashMap::new();
-
-        type PooledToolParser = Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>;
-        let mut tool_parsers: HashMap<u32, PooledToolParser> = HashMap::new();
+        // Parser state (lazy initialization per index); the parsers are this
+        // loop's own, nothing else reaches them.
+        let mut reasoning_parsers: HashMap<u32, Box<dyn ReasoningParser>> = HashMap::new();
+        let mut tool_parsers: HashMap<u32, Box<dyn ToolParser>> = HashMap::new();
         let mut has_tool_calls: HashMap<u32, bool> = HashMap::new();
 
         // Per-index stop decoders (each index needs its own state for n>1 support)
@@ -528,15 +525,12 @@ impl StreamingProcessor {
         let mut final_indices: Option<Vec<u32>> = None;
         loop {
             let response = if final_indices.is_none() {
-                // Take what the engine has already sent before yielding, so
-                // the chunks of one wake leave as one frame of the response.
-                let item = match grpc_stream.next().now_or_never() {
-                    Some(item) => item,
-                    None => {
-                        Self::flush_chunks(tx, &mut sse_buffer).await?;
-                        grpc_stream.next().await
-                    }
-                };
+                // The chunks written so far leave as a frame before the
+                // engine is polled, so every engine message reaches the
+                // client as its own frame as soon as it is processed; the
+                // engine stream is polled once per message.
+                Self::flush_chunks(tx, &mut sse_buffer).await?;
+                let item = grpc_stream.next().await;
                 match item.transpose() {
                     Ok(response) => response,
                     Err(e) => {
@@ -722,9 +716,6 @@ impl StreamingProcessor {
                 continue;
             };
 
-            // Initialize stream buffer if first time
-            let stream_buffer = stream_buffers.entry(index).or_default();
-
             // Text that reaches here without an engine chunk before it (a
             // decoder flush on the terminal frame) still opens its choice.
             if is_firsts.get(&index).copied().unwrap_or(true) {
@@ -743,7 +734,6 @@ impl StreamingProcessor {
 
             // Calculate delta
             let mut delta = text;
-            stream_buffer.push_str(&delta);
 
             // Reasoning content handling
             let in_reasoning = if separate_reasoning && reasoning_parser_available {
@@ -757,8 +747,7 @@ impl StreamingProcessor {
                         think_in_prefill,
                         reasoning_parser_name.as_deref(),
                         model,
-                    )
-                    .await;
+                    );
                 // Recorded before this frame's usage is snapshotted again, so
                 // a continuous usage counts the reasoning text it rides with,
                 // and the content or tool chunks that follow in the frame
@@ -883,9 +872,7 @@ impl StreamingProcessor {
         // as a prospective tool call that never materialized (dropping it
         // produced fully-empty streams), then any parsed-but-unstreamed tool
         // arguments.
-        for (index, parser) in &tool_parsers {
-            let mut parser_guard = parser.lock().await;
-
+        for (index, parser_guard) in &mut tool_parsers {
             let leftover_text = parser_guard.take_unstreamed_normal_text();
             if !leftover_text.is_empty() {
                 let content_chunk = ChatCompletionStreamResponse::builder(request_id, model)
@@ -1070,7 +1057,7 @@ impl StreamingProcessor {
         // logprobs, but the Prefill reservation must end with this phase.
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
             .await
-            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            .map_err(utils::StreamFailure::prefill)?;
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
         // so the first decode token yields honest PD TTFT.
@@ -1383,7 +1370,7 @@ impl StreamingProcessor {
             }
         })
         .await
-        .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+        .map_err(utils::StreamFailure::prefill)?;
 
         // Process decode stream with input_logprobs prepended. Pass pd_timing so
         // the first decode token yields honest PD TTFT.
@@ -1648,10 +1635,10 @@ impl StreamingProcessor {
                 .map_err(|e| format!("Stop decoder failed to process token {token_id}: {e}"))?
             {
                 SequenceDecoderOutput::Text(text) => {
-                    chunk_text.push_str(&text);
+                    append_decoded(&mut chunk_text, text);
                 }
                 SequenceDecoderOutput::StoppedWithText(text) => {
-                    chunk_text.push_str(&text);
+                    append_decoded(&mut chunk_text, text);
                     return Ok((chunk_text, true));
                 }
                 SequenceDecoderOutput::Stopped => {
@@ -1669,12 +1656,12 @@ impl StreamingProcessor {
     /// whether the parser is still inside reasoning, and how many of the chunk's
     /// `chunk_tokens` are reasoning tokens.
     #[expect(clippy::too_many_arguments)]
-    async fn process_reasoning_stream(
+    fn process_reasoning_stream(
         &self,
         delta: Option<&str>,
         chunk_tokens: u32,
         index: u32,
-        reasoning_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
+        reasoning_parsers: &mut HashMap<u32, Box<dyn ReasoningParser>>,
         thinking_override: bool,
         think_in_prefill: bool,
         // Resolved once per request by the caller: re-resolving here could
@@ -1701,12 +1688,11 @@ impl StreamingProcessor {
                     parser.mark_think_start_stripped();
                 }
             }
-            Arc::new(tokio::sync::Mutex::new(parser))
+            parser
         });
 
-        if let Some(pooled_parser) = reasoning_parsers.get(&index) {
+        if let Some(parser) = reasoning_parsers.get_mut(&index) {
             let (parse_result, was_in_reasoning, in_reasoning) = {
-                let mut parser = pooled_parser.lock().await;
                 let was_in_reasoning = parser.is_in_reasoning();
                 let result = match delta {
                     Some(text) => parser.parse_reasoning_streaming_incremental(text),
@@ -1828,7 +1814,7 @@ impl StreamingProcessor {
         &self,
         delta: &str,
         index: u32,
-        tool_parsers: &mut HashMap<u32, Arc<tokio::sync::Mutex<Box<dyn ToolParser>>>>,
+        tool_parsers: &mut HashMap<u32, Box<dyn ToolParser>>,
         has_tool_calls: &mut HashMap<u32, bool>,
         tools: &[Tool],
         // Resolved once per request by the caller (see process_reasoning_stream).
@@ -1845,19 +1831,16 @@ impl StreamingProcessor {
             reason = "parser availability is checked upfront before streaming begins"
         )]
         tool_parsers.entry(index).or_insert_with(|| {
-            let parser = if use_json_parser {
+            if use_json_parser {
                 utils::create_tool_parser(&self.tool_parser_factory, Some("json"), model)
                     .expect("JSON parser should be available")
             } else {
                 utils::create_tool_parser(&self.tool_parser_factory, tool_parser_name, model)
                     .expect("Parser should be available - checked upfront")
-            };
-            Arc::new(tokio::sync::Mutex::new(parser))
+            }
         });
 
-        if let Some(pooled_parser) = tool_parsers.get(&index) {
-            let mut parser = pooled_parser.lock().await;
-
+        if let Some(parser) = tool_parsers.get_mut(&index) {
             match parser.parse_incremental(delta, tools).await {
                 Ok(StreamingParseResult { normal_text, calls }) => {
                     // Emit normal text if present
@@ -2061,10 +2044,10 @@ impl StreamingProcessor {
     /// Returns `(normal_text, reasoning_text, in_reasoning)`.
     /// `None` marks EOF and releases the parser's held text.
     /// Caller handles SSE event emission.
-    async fn process_messages_reasoning(
+    fn process_messages_reasoning(
         &self,
         delta: Option<&str>,
-        reasoning_parser: &mut Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>>,
+        reasoning_parser: &mut Option<Box<dyn ReasoningParser>>,
         thinking_override: bool,
         think_in_prefill: bool,
         // Resolved once per request by the caller (see process_reasoning_stream).
@@ -2084,13 +2067,12 @@ impl StreamingProcessor {
                         parser.mark_think_start_stripped();
                     }
                 }
-                *reasoning_parser = Some(Arc::new(tokio::sync::Mutex::new(parser)));
+                *reasoning_parser = Some(parser);
             }
         }
 
-        if let Some(ref parser_arc) = reasoning_parser {
+        if let Some(parser) = reasoning_parser {
             let (parse_result, in_reasoning) = {
-                let mut parser = parser_arc.lock().await;
                 let result = match delta {
                     Some(text) => parser.parse_reasoning_streaming_incremental(text),
                     None => parser.flush(),
@@ -2280,7 +2262,7 @@ impl StreamingProcessor {
         let mut has_tool_calls = false;
 
         // Parser state (simple variables — Messages is always n=1)
-        let mut reasoning_parser: Option<Arc<tokio::sync::Mutex<Box<dyn ReasoningParser>>>> = None;
+        let mut reasoning_parser: Option<Box<dyn ReasoningParser>> = None;
 
         // Stop decoder
         let mut stop_decoder = {
@@ -2512,7 +2494,6 @@ impl StreamingProcessor {
                     reasoning_parser_name.as_deref(),
                     model,
                 )
-                .await
             } else {
                 (chunk_text, String::new(), false)
             };
@@ -3041,7 +3022,7 @@ impl StreamingProcessor {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
             .await
-            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            .map_err(utils::StreamFailure::prefill)?;
 
         let result = self
             .process_messages_streaming_chunks(
@@ -3648,7 +3629,7 @@ impl StreamingProcessor {
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
             .await
-            .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            .map_err(utils::StreamFailure::prefill)?;
 
         let result = self
             .process_completion_streaming_chunks(
@@ -3853,6 +3834,17 @@ struct OpeningDelta {
     refusal: Option<()>,
 }
 
+/// Append a decoded piece to the chunk's text: the first piece (a chunk
+/// usually has one) is taken over rather than copied into a second
+/// allocation.
+fn append_decoded(chunk_text: &mut String, text: String) {
+    if chunk_text.is_empty() {
+        *chunk_text = text;
+    } else {
+        chunk_text.push_str(&text);
+    }
+}
+
 fn opening_choice(index: u32, opens_tool_call: bool) -> OpeningChoice {
     OpeningChoice {
         index,
@@ -3912,6 +3904,8 @@ fn assistant_choice(
 
 #[cfg(test)]
 mod eof_tests;
+#[cfg(test)]
+mod failure_tests;
 
 #[cfg(test)]
 mod sse_bytes_tests;
@@ -4139,5 +4133,20 @@ mod tests {
 
         let err = result.expect_err("decode failure must propagate");
         assert!(err.contains("Stop decoder failed to process token"));
+    }
+
+    #[test]
+    fn decoded_pieces_of_a_chunk_concatenate_in_order() {
+        // The first piece is taken over, later ones appended: the chunk's
+        // text is the pieces in order either way.
+        let mut one = String::new();
+        append_decoded(&mut one, "Hello".to_string());
+        assert_eq!(one, "Hello");
+
+        let mut several = String::new();
+        append_decoded(&mut several, "Hel".to_string());
+        append_decoded(&mut several, "lo".to_string());
+        append_decoded(&mut several, ", world".to_string());
+        assert_eq!(several, "Hello, world");
     }
 }

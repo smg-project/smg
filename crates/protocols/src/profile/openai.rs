@@ -1,7 +1,11 @@
 //! OpenAI's own contract: the public Chat Completions API's structured-output
-//! and tool-message rules, applied to OpenAI-named models only. The default
+//! and tool-message rules, and its refusal of `max_tokens` together with
+//! `max_completion_tokens`, applied to OpenAI-named models only. The default
 //! profile ([`super::ProviderProfile::Generic`]) passes these shapes through
-//! to the engine, whose grammar compiler validates what it needs.
+//! to the engine: its grammar compiler validates what it needs, and the pair
+//! of token limits resolves to `max_completion_tokens`
+//! ([`ChatCompletionRequest::output_token_cap`]), the precedence the serving
+//! engines apply themselves.
 
 use std::collections::HashSet;
 
@@ -13,9 +17,32 @@ use crate::{
 };
 
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
+    validate_single_token_limit(req)?;
     validate_tool_message_pairing(&req.messages)?;
     validate_json_object_prompt(req)?;
     validate_strict_schemas(req)
+}
+
+/// `max_tokens` and `max_completion_tokens` are one setting to the public
+/// API, which refuses a request carrying both (`invalid_parameter_combination`),
+/// whatever the two values.
+fn validate_single_token_limit(
+    req: &ChatCompletionRequest,
+) -> Result<(), validator::ValidationError> {
+    #[expect(
+        deprecated,
+        reason = "the rule is about the deprecated field being present"
+    )]
+    let legacy = req.max_tokens;
+    if legacy.is_some() && req.max_completion_tokens.is_some() {
+        return Err(invalid(
+            "invalid_parameter_combination",
+            "'max_tokens' and 'max_completion_tokens' cannot both be set; use \
+             'max_completion_tokens'"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Tool messages answer the `tool_calls` of the assistant message right
@@ -322,11 +349,32 @@ mod tests {
             {"role": "tool", "tool_call_id": "call_1", "content": "18C"}
         ]}));
         assert_eq!(code(&loose_history), None);
+        let both_limits = generic(json!({"max_tokens": 32, "max_completion_tokens": 64}));
+        assert_eq!(code(&both_limits), None);
+        assert_eq!(both_limits.output_token_cap(), Some(64));
         // Structural rules are not profile-scoped.
         let bad_parameters = generic(
             json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": "oops"}}]}),
         );
         assert!(code(&bad_parameters).is_some_and(|e| e.contains("invalid_type")));
+    }
+
+    /// The public API refuses the pair of token limits whatever the values
+    /// (recorded: `invalid_parameter_combination`); either name alone is fine.
+    #[test]
+    fn max_tokens_and_max_completion_tokens_together_are_refused() {
+        for (legacy, current) in [(32, 64), (64, 32), (64, 64)] {
+            let both = request(json!({"max_tokens": legacy, "max_completion_tokens": current}));
+            assert!(
+                code(&both).is_some_and(|e| e.contains("invalid_parameter_combination")),
+                "{legacy} and {current}"
+            );
+        }
+        let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
+        assert_eq!(code(&legacy), None);
+        assert_eq!(legacy.output_token_cap(), Some(32));
+        let current = request(json!({"max_completion_tokens": 64}));
+        assert_eq!(code(&current), None);
     }
 
     #[test]

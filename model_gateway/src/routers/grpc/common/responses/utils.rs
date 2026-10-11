@@ -16,6 +16,7 @@ use smg_data_connector::{
 use smg_mcp::{McpOrchestrator, McpServerBinding};
 use tracing::{debug, error, warn};
 
+use super::background;
 use crate::{
     routers::{
         common::{
@@ -322,6 +323,18 @@ pub(crate) async fn persist_response_if_needed(
     request_context: Option<StorageRequestContext>,
 ) {
     if !original_request.store.unwrap_or(true) {
+        return;
+    }
+    // A background response's record may have been closed while the work
+    // ran (a cancel, here or on another gateway sharing the store): a
+    // terminal record is not rewritten by a late result.
+    if original_request.background.unwrap_or(false)
+        && background::is_closed(&response_storage, &response.id, request_context.clone()).await
+    {
+        debug!(
+            response_id = %response.id,
+            "Background response record already closed; the result is not stored"
+        );
         return;
     }
 
