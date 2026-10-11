@@ -263,7 +263,9 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_responses_total",
-        "Total HTTP responses by path, status_code and error_code"
+        "Total HTTP responses by path, status_code and error_code, counted once the \
+         response has gone out in full; a request whose client closed the connection \
+         first counts as status_code 499 with error_code client_closed_request"
     );
     describe_gauge!(
         "smg_http_connections_active",
