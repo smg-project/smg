@@ -22,17 +22,22 @@ use crate::{
 /// Worker label carrying the engine's vision-input capability (the vLLM
 /// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
 /// multimodal architecture means the engine runs `--language-model-only`:
-/// no vision encoder, encoder-cache budget 0, so no multimodal payload may
-/// reach it. A multimodal model reports `"true"`; a text-only model also
-/// reports `"false"`. The label is tri-state: only the vLLM servicer sets
-/// the field on purpose, so for the other runtimes a proto-default `false`
-/// is not turned into a label at all (`ModelInfo::to_labels`), and an
-/// absent label reads as unknown, never as a refusal.
+/// no vision encoder, encoder-cache budget 0, so no pixel payload (image,
+/// video) may reach it. A multimodal model reports `"true"`; a text-only
+/// model also reports `"false"`. The label speaks for the vision encoder
+/// only: the servicer reports `"false"` as well for an engine that still
+/// takes audio or pre-computed embeddings, so it says nothing about those
+/// (the runtime capability matrix below does). The label is tri-state:
+/// only vLLM's `false` becomes a label; for the other runtimes a `false`
+/// cannot be told from a servicer's default and is dropped
+/// (`ModelInfo::to_labels`), and an absent label reads as unknown, never as
+/// a refusal.
 pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
 
-/// Whether the worker's engine accepts no multimodal inputs at all (a vLLM
-/// `--language-model-only` worker). Absent label (non-vLLM runtimes, older
-/// servicers) reads as multimodal-capable so behavior stays as today.
+/// Whether the worker's engine runs without a vision encoder (a vLLM
+/// `--language-model-only` worker), so no pixel payload may reach it. Absent
+/// label (non-vLLM runtimes, older servicers) reads as vision-capable so
+/// behavior stays as today.
 pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
     worker
         .metadata()
@@ -44,11 +49,16 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
 
 /// Whether every worker registered for `model_id` runs without a vision
 /// encoder (`supports_vision=false`, see [`SUPPORTS_VISION_LABEL`]). Such a
-/// pool takes no multimodal payload at all: a vLLM engine admits the request
-/// and never schedules it (encoder-cache budget 0), so a request carrying
-/// media must be refused before any of it is decoded, preprocessed or
+/// pool takes no pixel payload at all: a vLLM engine admits the request and
+/// never schedules it (encoder-cache budget 0), so a request carrying images
+/// or video must be refused before any of it is decoded, preprocessed or
 /// dispatched. An empty pool reads as capable: worker selection answers for a
-/// model with no workers.
+/// model with no workers. So does a mixed pool (some workers with the vision
+/// encoder, some without, or unlabeled: a rolling redeploy, or the vision
+/// workers unhealthy): its image requests go on to worker selection, which
+/// does not consult the label yet, so one can still land on a worker that
+/// never schedules it; keeping such workers out of the candidates is the
+/// follow-up smg-project/smg-lab#186.
 pub(crate) fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
     let workers = registry.get_by_model(model_id);
     !workers.is_empty()
@@ -57,22 +67,36 @@ pub(crate) fn model_workers_language_model_only(registry: &WorkerRegistry, model
             .all(|worker| worker_language_model_only(worker.as_ref()))
 }
 
-/// Refuse a request's media when every worker of `model_id` is language model
-/// only: the same prompt 400 the public API gives image input to a model
-/// without vision, instead of a dispatch the engine never schedules. Runs in
-/// preparation, before the media is decoded or preprocessed. A plan without
-/// media passes; so does a model with no registered workers (selection
-/// answers for it).
+/// The modalities of `plan` that need a vision encoder: the pixel payloads
+/// the `supports_vision` label speaks for. Audio and pre-computed image
+/// embeddings are not among them: an engine may take those with every visual
+/// input disabled, and whether a runtime takes them at all is the capability
+/// matrix's call at worker selection ([`ensure_backend_supports_modalities`]).
+fn pixel_modalities(plan: &MediaPlan) -> Vec<Modality> {
+    plan.modalities()
+        .iter()
+        .copied()
+        .filter(|modality| matches!(modality, Modality::Image | Modality::Video))
+        .collect()
+}
+
+/// Refuse a request's images and video when every worker of `model_id` is
+/// language model only: the same prompt 400 the public API gives image input
+/// to a model without vision, instead of a dispatch the engine never
+/// schedules. Runs in preparation, before the media is decoded or
+/// preprocessed. A plan without pixel media passes (text, and audio or
+/// embeddings, which the label does not speak for); so does a model with no
+/// registered workers (selection answers for it).
 pub(crate) fn ensure_model_accepts_media(
     registry: &WorkerRegistry,
     model_id: &str,
     plan: &MediaPlan,
 ) -> Result<(), Response> {
-    if plan.is_empty() || !model_workers_language_model_only(registry, model_id) {
+    let pixel = pixel_modalities(plan);
+    if pixel.is_empty() || !model_workers_language_model_only(registry, model_id) {
         return Ok(());
     }
-    let modalities = plan
-        .modalities()
+    let modalities = pixel
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
@@ -278,13 +302,24 @@ mod tests {
             registry
         }
 
-        fn image_plan() -> MediaPlan {
-            MediaPlan::new([MediaContentPart::ImageUrl {
+        fn image_part() -> MediaContentPart {
+            MediaContentPart::ImageUrl {
                 url: "data:image/png;base64,AAAA".to_string(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: None,
-            }])
+            }
+        }
+
+        fn audio_part() -> MediaContentPart {
+            MediaContentPart::AudioUrl {
+                url: "data:audio/wav;base64,AAAA".to_string(),
+                uuid: None,
+            }
+        }
+
+        fn image_plan() -> MediaPlan {
+            MediaPlan::new([image_part()])
         }
 
         /// Only a pool whose every worker says `supports_vision=false` is
@@ -338,6 +373,31 @@ mod tests {
                 &[(SUPPORTS_VISION_LABEL, "true")],
             )]);
             assert!(ensure_model_accepts_media(&vision, MODEL, &image_plan()).is_ok());
+        }
+
+        /// The label speaks for the vision encoder only: audio to a
+        /// language-model-only pool passes here (the runtime matrix answers
+        /// for it at worker selection), and a request mixing audio with an
+        /// image is refused for the image alone.
+        #[test]
+        fn audio_to_a_language_model_only_pool_is_not_refused_here() {
+            let all_lmo = registry_with(vec![worker(
+                "grpc://10.0.0.1:1",
+                &[(SUPPORTS_VISION_LABEL, "false")],
+            )]);
+            let audio = MediaPlan::new([audio_part()]);
+            assert!(!audio.is_empty());
+            assert!(pixel_modalities(&audio).is_empty());
+            assert!(ensure_model_accepts_media(&all_lmo, MODEL, &audio).is_ok());
+
+            let mixed = MediaPlan::new([audio_part(), image_part()]);
+            assert_eq!(pixel_modalities(&mixed), vec![Modality::Image]);
+            let response = ensure_model_accepts_media(&all_lmo, MODEL, &mixed).unwrap_err();
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+                "multimodal_not_supported"
+            );
         }
     }
 }

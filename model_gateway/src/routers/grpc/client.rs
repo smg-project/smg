@@ -806,9 +806,13 @@ pub enum ServerInfo {
 impl ModelInfo {
     pub fn to_labels(&self) -> HashMap<String, String> {
         match self {
-            // The vLLM servicer answers `supports_vision` deliberately (the
+            // The vLLM servicer computes `supports_vision` itself (the
             // engine's own verdict; `false` = `--language-model-only` or a
-            // text model), so its `false` is a fact worth a label.
+            // text model), so its `false` is a fact worth a label. One
+            // caveat: when that computation fails on an unexpected config
+            // shape, the servicer logs a warning and reports `false` as
+            // well, and a vision model in that state is refused images
+            // with the label's message instead of being served.
             ModelInfo::Vllm(info) => flat_labels(info),
             ModelInfo::Sglang(info) => without_unset_vision(flat_labels(info)),
             ModelInfo::Trtllm(info) => without_unset_vision(flat_labels(info)),
@@ -818,12 +822,15 @@ impl ModelInfo {
     }
 }
 
-/// A proto3 `bool` cannot tell "unset" from `false`, and only the vLLM
-/// servicer sets `supports_vision` on purpose; the other servicers may leave
-/// the field at its default even for a vision model (a vision model served
-/// by SGLang was refused images on it). Their `false` therefore means
-/// "unknown": no label, so nothing downstream reads a refusal into it; a
-/// `true` is kept.
+/// A proto3 `bool` cannot tell "unset" from `false`. The SGLang Python
+/// servicer reads `supports_vision` from its scheduler info with a default
+/// of `false` (a vision model served by it was refused images on that
+/// default), and a servicer that predates the field sends the proto default;
+/// TokenSpeed's servicer derives the field from its static modality list, an
+/// accurate answer, but the field cannot tell that derivation from an older
+/// servicer's default. For every runtime but vLLM a `false` is therefore
+/// dropped as no verdict: no label, so nothing downstream reads a refusal
+/// into it; a `true` is kept.
 fn without_unset_vision(mut labels: HashMap<String, String>) -> HashMap<String, String> {
     if labels
         .get(SUPPORTS_VISION_LABEL)
