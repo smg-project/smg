@@ -729,13 +729,16 @@ async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage
 
 #[tokio::test]
 async fn byte_fallback_messages_transport_eof_reports_local_stop_without_input_usage() {
-    let (stream, server) = scripted_stream(byte_fallback_chunks(&[1, 2]), "0").await;
+    let tokenizer = byte_fallback_reasoning_tokenizer();
+    let ids = [0xC3 + 1, 0xA9 + 1];
+    assert_eq!(tokenizer.decode(&ids, true).unwrap(), "é");
+    let (stream, server) = scripted_stream(byte_fallback_chunks(&ids), "0").await;
     let (tx, rx) = sse_channel();
     let result = processor(false)
         .process_messages_streaming_chunks(
             stream,
             dispatch(),
-            byte_fallback_tokenizer(),
+            tokenizer,
             (
                 Some(StringOrArray::Array(vec!["é".into()])),
                 None,
