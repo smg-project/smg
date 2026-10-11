@@ -368,7 +368,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_pd_bootstrap_failures_total",
-        "PD bootstrap injection failures"
+        "PD bootstrap failures: the HTTP router's injection failures (unlabelled); by leg and phase, a bootstrap port that refused the registration probe (probe) and the rendezvous failures the engines report on the gRPC path (bootstrap, transfer)"
     );
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",
@@ -1704,6 +1704,18 @@ impl Metrics {
     /// Record a PD bootstrap injection failure.
     pub fn record_pd_bootstrap_failure() {
         counter!("smg_pd_bootstrap_failures_total").increment(1);
+    }
+
+    /// Record a PD bootstrap failure by `leg` (the worker type of the leg
+    /// that failed) and `phase` (`probe` at registration; `bootstrap` or
+    /// `transfer` as the engine reported it).
+    pub fn record_pd_bootstrap_failure_for(leg: &'static str, phase: &'static str) {
+        counter!(
+            "smg_pd_bootstrap_failures_total",
+            "leg" => leg,
+            "phase" => phase
+        )
+        .increment(1);
     }
 
     /// Record a PD KV-transfer failure (missing connector params at handoff).
@@ -3420,6 +3432,45 @@ mod tests {
         assert!(
             rendered.contains("smg_pd_kv_transfer_failures_total 2"),
             "kv transfer failure counter wrong; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_record_pd_bootstrap_failure_by_leg_and_phase() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_bootstrap_failure();
+            Metrics::record_pd_bootstrap_failure_for(metrics_labels::WORKER_PREFILL, "probe");
+            Metrics::record_pd_bootstrap_failure_for(metrics_labels::WORKER_DECODE, "bootstrap");
+            Metrics::record_pd_bootstrap_failure_for(metrics_labels::WORKER_DECODE, "bootstrap");
+        });
+        // One family: the unlabelled injection series and the labelled ones.
+        assert!(
+            rendered.contains("smg_pd_bootstrap_failures_total 1"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("# TYPE smg_pd_bootstrap_failures_total")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        let labelled: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_bootstrap_failures_total{"))
+            .collect();
+        assert_eq!(labelled.len(), 2, "{rendered}");
+        assert!(
+            labelled.iter().any(|line| line.contains(r#"leg="prefill""#)
+                && line.contains(r#"phase="probe""#)
+                && line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            labelled.iter().any(|line| line.contains(r#"leg="decode""#)
+                && line.contains(r#"phase="bootstrap""#)
+                && line.ends_with(" 2")),
+            "{rendered}"
         );
     }
 }

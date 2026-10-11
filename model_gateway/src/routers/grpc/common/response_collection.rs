@@ -7,6 +7,7 @@ use axum::response::Response;
 use tracing::error as trace_error;
 
 use crate::{
+    observability::metrics::metrics_labels,
     routers::{
         error,
         grpc::{
@@ -14,7 +15,7 @@ use crate::{
             proto_wrapper::{
                 FanoutChild, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
             },
-            utils::tonic_ext::TonicStatusExt,
+            utils::{account_pd_leg_failure, tonic_ext::TonicStatusExt},
         },
     },
     worker::PrefillLoadGuard,
@@ -34,7 +35,11 @@ pub(crate) async fn drain_prefill<S: FanoutChild>(
     let mut remaining = guards.len();
     let single_dispatch = remaining == 1;
     while let Some(response) = stream.next_item().await {
-        if let ProtoResponseVariant::Complete(complete) = response?.into_response() {
+        // A prefill leg the engine retires with its rendezvous verdict is
+        // counted under the bootstrap family before the failure propagates.
+        let response = response
+            .inspect_err(|status| account_pd_leg_failure(metrics_labels::WORKER_PREFILL, status))?;
+        if let ProtoResponseVariant::Complete(complete) = response.into_response() {
             // Fan-out responses are restamped with their dispatch positions.
             // For a single dispatch, preserve the collector's existing guard
             // lifetime: EOF-based collectors release it when the stream ends.
@@ -222,6 +227,56 @@ mod tests {
         fn defer_abort_until_first_item(self) -> Self {
             self
         }
+    }
+
+    /// A stream the engine ends with `status` before any response.
+    struct FailingStream(Option<tonic::Status>);
+
+    impl FanoutChild for FailingStream {
+        async fn next_item(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+            self.0.take().map(Err)
+        }
+
+        fn mark_completed(&mut self) {}
+
+        fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefill_leg_retired_at_its_rendezvous_is_counted_while_draining() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let status = tonic::Status::internal(
+            "Prefill bootstrap failed for request rank=0 req.rid='r1' req.bootstrap_room=41 \
+             with exception KVTransferError(bootstrap_room=41): Request 41 timed out after \
+             120.0s in KVPoll.Bootstrapping",
+        );
+        let result = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            drain_prefill(
+                &mut FailingStream(Some(status)),
+                vec![None],
+                true,
+                |_complete| {},
+            )
+            .await
+        };
+        assert_eq!(
+            result.expect_err("the failure propagates").code(),
+            tonic::Code::Internal
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_pd_bootstrap_failures_total{")
+                    && line.contains(r#"leg="prefill""#)
+                    && line.contains(r#"phase="bootstrap""#)
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

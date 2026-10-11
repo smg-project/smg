@@ -1,5 +1,6 @@
 //! Worker domain — identity, registry, health, resilience, monitoring, service.
 
+pub(crate) mod bootstrap_probe;
 pub mod builder;
 pub mod capacity;
 pub mod circuit_breaker;

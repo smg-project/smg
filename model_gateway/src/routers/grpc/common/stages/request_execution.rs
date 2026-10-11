@@ -38,7 +38,10 @@ use crate::{
                 FanoutStream, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest,
                 ProtoResponseVariant, ProtoStream,
             },
-            utils::tonic_ext::{TonicResultExt, TonicStatusExt},
+            utils::{
+                account_pd_leg_failure,
+                tonic_ext::{TonicResultExt, TonicStatusExt},
+            },
         },
     },
     worker::{ConnectionModeExt, PrefillLoadGuard, Worker},
@@ -1083,8 +1086,10 @@ async fn dispatch_pd_legs(
 }
 
 /// Log, count and translate one leg's dispatch failure into the client answer.
+/// A failure that names the rendezvous counts under the bootstrap family too.
 fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
     Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
+    account_pd_leg_failure(leg.name(), error);
     start_failure_response(
         error,
         "execute_parallel_pd",
@@ -1389,6 +1394,7 @@ async fn execute_sequential_pd(
                 prefill_label,
                 metrics_labels::ERROR_BACKEND,
             );
+            account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
             start_failure_response(
                 &e,
                 "execute_sequential_pd",
@@ -1426,6 +1432,7 @@ async fn execute_sequential_pd(
                     prefill_label,
                     metrics_labels::ERROR_BACKEND,
                 );
+                account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
                 return Err(e.to_http_error(
                     "prefill_stream_error",
@@ -1555,6 +1562,7 @@ async fn execute_sequential_pd(
             decode_label,
             metrics_labels::ERROR_BACKEND,
         );
+        account_pd_leg_failure(metrics_labels::WORKER_DECODE, &e);
         start_failure_response(
             &e,
             "execute_sequential_pd",
@@ -1643,6 +1651,43 @@ mod tests {
             decode: leg("grpc://decode:30000", WorkerType::Decode),
             runtime_type: RuntimeType::TokenSpeed,
         }
+    }
+
+    /// A leg whose dispatch fails with the engine's rendezvous verdict is
+    /// counted under the bootstrap family, by leg and phase; any other
+    /// dispatch failure of a leg is not.
+    #[test]
+    fn a_leg_that_fails_its_rendezvous_at_dispatch_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pd_leg_error(
+                PdLeg::Prefill,
+                metrics_labels::CONNECTION_GRPC,
+                &tonic::Status::internal(
+                    "Prefill bootstrap failed for request rank=0 req.rid='r1' \
+                     req.bootstrap_room=41 with exception KVTransferError(bootstrap_room=41): \
+                     Request 41 timed out after 120.0s in KVPoll.Bootstrapping",
+                ),
+            );
+            pd_leg_error(
+                PdLeg::Decode,
+                metrics_labels::CONNECTION_GRPC,
+                &tonic::Status::unavailable("connection reset"),
+            );
+        });
+        let rendered = handle.render();
+        let counted: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_bootstrap_failures_total{"))
+            .collect();
+        assert_eq!(counted.len(), 1, "{rendered}");
+        assert!(
+            counted[0].contains(r#"leg="prefill""#)
+                && counted[0].contains(r#"phase="bootstrap""#)
+                && counted[0].ends_with(" 1"),
+            "{rendered}"
+        );
     }
 
     #[test]
