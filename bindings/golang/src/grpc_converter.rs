@@ -520,10 +520,9 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                         "the decoder rewrote text already streamed; the stream kept its text and sent the remainder"
                     );
                 }
-                let stopped = matches!(
-                    tail,
-                    SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
-                );
+                // A stop the decoder found at an earlier chunk (text streams as soon
+                // as its characters are complete) counts the same as one in the tail.
+                let stopped = decoder.is_stopped();
                 let matched = stopped
                     .then(|| {
                         decoder
@@ -721,6 +720,7 @@ mod tests {
                 initial_prompt_tokens: None,
                 skip_special_tokens: true,
             };
+            handle.stream_state.get_or_create(0).is_first_chunk = false;
             let chunk = proto::GenerateResponse {
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
@@ -731,12 +731,18 @@ mod tests {
                     },
                 )),
             };
-            assert!(
-                convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            // The character is complete with its second byte: it streams at
+            // once, or the stop on it fires at once (nothing to send then).
+            let streamed = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap();
+            if stop == "é" {
+                assert!(streamed.is_none(), "{streamed:?}");
+            } else {
+                let streamed = streamed.unwrap();
+                assert_eq!(streamed.choices[0].delta.content.as_deref(), Some("é"));
+                assert!(streamed.choices[0].finish_reason.is_none());
+            }
             let complete = proto::GenerateResponse {
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Complete(
@@ -757,7 +763,7 @@ mod tests {
                 assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
                 assert_eq!(choice.matched_stop, Some(Value::String("é".into())));
             } else {
-                assert_eq!(choice.delta.content.as_deref(), Some("é"));
+                assert!(choice.delta.content.is_none(), "{response:?}");
                 assert_eq!(choice.finish_reason.as_deref(), Some("length"));
             }
         }
@@ -803,6 +809,7 @@ mod tests {
         for tool_choice in [None, Some(ToolChoice::Value(ToolChoiceValue::None))] {
             let disabled = tool_choice.is_some();
             let mut handle = tool_test_handle(tokenizer.clone(), tool_choice);
+            handle.stream_state.get_or_create(0).is_first_chunk = false;
             let chunk = proto::GenerateResponse {
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
@@ -814,12 +821,14 @@ mod tests {
                     },
                 )),
             };
-            assert!(
-                convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            // Every byte of the JSON is a complete character: the text streams
+            // with its chunk and goes through the tool parser there.
+            let streamed = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .unwrap();
+            let streamed_choice = &streamed.choices[0];
+            assert!(streamed_choice.finish_reason.is_none());
             let complete = proto::GenerateResponse {
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Complete(
@@ -847,13 +856,17 @@ mod tests {
             assert_eq!(wire["usage"]["completion_tokens"], completion_tokens);
             assert_eq!(wire["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
             if disabled {
-                assert_eq!(choice.delta.content.as_deref(), Some(tool_text));
+                assert_eq!(streamed_choice.delta.content.as_deref(), Some(tool_text));
+                assert!(streamed_choice.delta.tool_calls.is_none());
+                assert!(choice.delta.content.is_none(), "{response:?}");
                 assert!(choice.delta.tool_calls.is_none());
                 assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
             } else {
+                assert!(streamed_choice.delta.content.is_none());
                 assert!(choice.delta.content.is_none());
                 assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
-                let calls = choice.delta.tool_calls.as_ref().unwrap();
+                let mut calls = streamed_choice.delta.tool_calls.clone().unwrap_or_default();
+                calls.extend(choice.delta.tool_calls.clone().unwrap_or_default());
                 // The existing parser sends the name and arguments as two deltas
                 // for one index; preserve that conversion instead of coalescing it.
                 assert_eq!(calls.len(), 2);
@@ -932,12 +945,26 @@ mod tests {
                 },
             )),
         };
-        assert!(
+        // The tail's bytes are complete characters: they stream with their
+        // chunk and the parser releases the arguments there.
+        if let Some(tail_response) =
             convert_proto_chunk_to_openai(tail_chunk, &mut handle, &tokenizer)
                 .await
                 .unwrap()
-                .is_none()
-        );
+        {
+            let tail_choice = &tail_response.choices[0];
+            assert!(tail_choice.delta.content.is_none(), "{tail_response:?}");
+            for call in tail_choice.delta.tool_calls.iter().flatten() {
+                assert_eq!(call.index, 0);
+                if let Some(fragment) = call
+                    .function
+                    .as_ref()
+                    .and_then(|function| function.arguments.as_deref())
+                {
+                    arguments.push_str(fragment);
+                }
+            }
+        }
         let mut output_ids = vec![257];
         output_ids.extend(tail_ids);
         let complete = proto::GenerateResponse {
@@ -960,7 +987,7 @@ mod tests {
             .unwrap();
         let choice = &final_response.choices[0];
         assert!(choice.delta.content.is_none(), "{final_response:?}");
-        for call in choice.delta.tool_calls.as_ref().unwrap() {
+        for call in choice.delta.tool_calls.iter().flatten() {
             assert_eq!(call.index, 0);
             if let Some(fragment) = call
                 .function
@@ -1018,8 +1045,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let tail = final_response.choices[0].delta.content.as_deref().unwrap();
-        assert_eq!(tail, "é");
+        // "é" streamed with its chunk; Complete repeats nothing.
+        let tail = final_response.choices[0]
+            .delta
+            .content
+            .as_deref()
+            .unwrap_or("");
+        assert_eq!(tail, "");
         text.push_str(tail);
         assert_eq!(
             text,
@@ -1037,7 +1069,7 @@ mod tests {
         for index in [0, 1] {
             handle.stream_state.get_or_create(index).is_first_chunk = false;
         }
-        for (index, byte) in [(0, b't'), (1, b's')] {
+        for (index, byte, expected) in [(0, b't', "t"), (1, b's', "s")] {
             let chunk = proto::GenerateResponse {
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -1048,14 +1080,14 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            assert!(
-                convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            let response = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.choices[0].index, index);
+            assert_eq!(response.choices[0].delta.content.as_deref(), Some(expected));
         }
-        for (index, expected) in [(0, "t"), (1, "s")] {
+        for index in [0, 1] {
             let complete = proto::GenerateResponse {
                 response: Some(proto::generate_response::Response::Complete(
                     proto::GenerateComplete {
@@ -1071,7 +1103,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(response.choices[0].index, index);
-            assert_eq!(response.choices[0].delta.content.as_deref(), Some(expected));
+            assert!(response.choices[0].delta.content.is_none(), "{response:?}");
+            assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
         }
     }
 }

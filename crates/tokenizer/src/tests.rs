@@ -27,269 +27,117 @@ fn byte_fallback_tokenizer() -> Arc<dyn crate::TokenizerTrait> {
     Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(native))
 }
 
-#[test]
-fn byte_fallback_capability_distinguishes_byte_level_and_survives_cache() {
-    let mut byte_level = tokenizers::Tokenizer::new(WordLevel::default());
-    byte_level.with_decoder(Some(ByteLevel::default()));
-    let byte_level: Arc<dyn crate::TokenizerTrait> =
-        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(byte_level));
-    for (tokenizer, expected) in [(byte_fallback_tokenizer(), true), (byte_level, false)] {
-        assert_eq!(tokenizer.uses_byte_fallback(), expected);
-        let cached = crate::CachedTokenizer::new(tokenizer, crate::CacheConfig::default());
-        assert_eq!(cached.uses_byte_fallback(), expected);
+/// A ByteFallback vocabulary with every byte (`<0x00>`..`<0xFF>` = 2..=257),
+/// one regular token `x` (1) and a special `[EOS]` (258).
+fn byte_fallback_full_tokenizer(
+    extra_decoders: Vec<serde_json::Value>,
+) -> Arc<dyn crate::TokenizerTrait> {
+    let mut vocab = serde_json::Map::new();
+    vocab.insert("[UNK]".into(), serde_json::json!(0));
+    vocab.insert("x".into(), serde_json::json!(1));
+    for byte in 0u32..=255 {
+        vocab.insert(format!("<0x{byte:02X}>"), serde_json::json!(byte + 2));
     }
-    assert!(!mock::MockTokenizer::new().uses_byte_fallback());
+    vocab.insert("[EOS]".into(), serde_json::json!(258));
+    let mut decoders = vec![
+        serde_json::json!({"type": "ByteFallback"}),
+        serde_json::json!({"type": "Fuse"}),
+    ];
+    decoders.extend(extra_decoders);
+    let definition = serde_json::json!({
+        "version": "1.0", "added_tokens": [{
+            "id": 258, "content": "[EOS]", "special": true, "single_word": false,
+            "lstrip": false, "rstrip": false, "normalized": false
+        }],
+        "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": vocab},
+        "decoder": {"type": "Sequence", "decoders": decoders}
+    });
+    let native =
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&definition).unwrap()).unwrap();
+    Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(native))
+}
+
+/// The byte tokens of `text` in the full-byte fixture.
+fn byte_ids(text: &str) -> Vec<u32> {
+    text.bytes().map(|byte| u32::from(byte) + 2).collect()
 }
 
 #[test]
-fn byte_fallback_streaming_preserves_exact_text() {
-    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
-
-    let tokenizer = byte_fallback_tokenizer();
-    for ids in [
-        vec![2, 3, 4],
-        vec![1, 2, 3, 4],
-        vec![2, 2, 4],
-        vec![5, 6, 4],
-        vec![2, 7, 3, 4],
-    ] {
-        let mut decoder =
-            StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), true);
-        let mut text = String::new();
-        for &id in &ids {
-            match decoder.process_token(id).unwrap() {
-                SequenceDecoderOutput::Text(delta) => text.push_str(&delta),
-                SequenceDecoderOutput::Held => {}
-                other => panic!("Unexpected stop: {other:?}"),
-            }
-        }
-        if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
-            text.push_str(&delta);
-        }
-        assert_eq!(text, tokenizer.decode(&ids, true).unwrap(), "{ids:?}");
-    }
-}
-
-#[test]
-fn byte_fallback_eof_preserves_text_and_stops() {
-    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
-
-    for cached in [false, true] {
-        let native = byte_fallback_tokenizer();
-        let tokenizer: Arc<dyn crate::TokenizerTrait> = if cached {
-            Arc::new(crate::CachedTokenizer::new(
-                native,
-                crate::CacheConfig::default(),
-            ))
-        } else {
-            native
-        };
-        for ids in [
-            vec![2],
-            vec![2, 3],
-            vec![5, 6],
-            vec![1, 2],
-            vec![1, 2, 3],
-            vec![2, 7, 3],
-        ] {
-            let mut decoder =
-                StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), true);
-            let mut text = String::new();
-            for &id in &ids {
-                if let SequenceDecoderOutput::Text(delta) = decoder.process_token(id).unwrap() {
-                    text.push_str(&delta);
-                }
-            }
-            if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
-                text.push_str(&delta);
-            }
-            assert_eq!(
-                text,
-                tokenizer.decode(&ids, true).unwrap(),
-                "{ids:?} cached={cached}"
-            );
-            assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Held);
-        }
-        let mut decoder = StopSequenceDecoder::new(
-            tokenizer.clone(),
-            StopSequenceConfig::default().with_stop_sequence("t"),
-            true,
-        );
-        assert_eq!(
-            decoder.process_token(2).unwrap(),
-            SequenceDecoderOutput::Held
-        );
-        assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Stopped);
-        assert!(decoder.is_stopped());
-    }
-}
-
-#[test]
-fn byte_fallback_seeded_sequence_does_not_reemit_prompt() {
-    let tokenizer = byte_fallback_tokenizer();
-    for seed in [vec![1], vec![5]] {
-        let mut unchanged = crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed, true);
-        assert_eq!(unchanged.finish().unwrap(), "");
-    }
-    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![1], true);
-    assert_eq!(sequence.append_token(2).unwrap(), "");
-    assert_eq!(sequence.append_token(3).unwrap(), "");
-    assert_eq!(sequence.append_token(4).unwrap(), "�� suffix");
-    assert_eq!(sequence.finish().unwrap(), "");
-
-    for seed in [vec![1, 5], vec![1, 5, 7]] {
-        let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed, true);
-        assert_eq!(sequence.append_token(4).unwrap(), "� suffix");
-        assert_eq!(sequence.finish().unwrap(), "");
-    }
-    let mut sequence =
-        crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![1, 5], true);
-    assert_eq!(sequence.append_token(6).unwrap(), "");
-    assert_eq!(sequence.finish().unwrap(), "é");
-
-    // An incomplete prefill must not consume generated bytes when they become
-    // a valid character; the native streaming decoder emits that character.
-    let tokenizer = byte_fallback_tokenizer();
-    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![5], true);
-    assert_eq!(sequence.append_token(6).unwrap(), "");
-    assert_eq!(sequence.append_token(4).unwrap(), "é suffix");
-    assert_eq!(sequence.finish().unwrap(), "");
-    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer, vec![5], true);
-    assert_eq!(sequence.append_token(6).unwrap(), "");
-    assert_eq!(sequence.finish().unwrap(), "é");
-}
-
-#[test]
-fn byte_fallback_completed_seed_bytes_do_not_reemit_or_change_prefix() {
-    let native = byte_fallback_tokenizer();
-    for cached in [false, true] {
-        let tokenizer: Arc<dyn crate::TokenizerTrait> = if cached {
-            Arc::new(crate::CachedTokenizer::new(
-                native.clone(),
-                crate::CacheConfig::default(),
-            ))
-        } else {
-            native.clone()
-        };
-        for seed in [vec![2], vec![1, 2], vec![1, 2, 7]] {
-            let mut unchanged =
-                crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
-            assert_eq!(unchanged.finish().unwrap(), "");
-            for (next, expected) in [(2, "t"), (3, "�")] {
-                let mut sequence =
-                    crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
-                assert_eq!(sequence.append_token(next).unwrap(), "");
-                assert_eq!(
-                    sequence.finish().unwrap(),
-                    expected,
-                    "{seed:?} cached={cached}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn byte_fallback_short_combinations_match_batch_decode() {
-    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
-    let tokenizer = byte_fallback_tokenizer();
-    for skip_special in [false, true] {
-        for a in 1..=7 {
-            for b in 1..=7 {
-                for c in 1..=7 {
-                    let ids = [a, b, c];
-                    let mut decoder = StopSequenceDecoder::new(
-                        tokenizer.clone(),
-                        StopSequenceConfig::default(),
-                        skip_special,
-                    );
-                    let mut text = String::new();
-                    for id in ids {
-                        if let SequenceDecoderOutput::Text(delta) =
-                            decoder.process_token(id).unwrap()
-                        {
-                            text.push_str(&delta);
-                        }
-                    }
-                    if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
-                        text.push_str(&delta);
-                    }
-                    assert_eq!(
-                        text,
-                        tokenizer.decode(&ids, skip_special).unwrap(),
-                        "{ids:?} skip_special={skip_special}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn byte_fallback_token_stop_preserves_pending_text() {
-    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
-    let tokenizer = byte_fallback_tokenizer();
-    for visible in [false, true] {
-        let config = if visible {
-            StopSequenceConfig::default().with_visible_stop_token(7)
-        } else {
-            StopSequenceConfig::default().with_stop_token(7)
-        };
-        let mut decoder = StopSequenceDecoder::new(tokenizer.clone(), config, false);
-        assert_eq!(
-            decoder.process_token(2).unwrap(),
-            SequenceDecoderOutput::Held
-        );
-        assert_eq!(
-            decoder.process_token(7).unwrap(),
-            SequenceDecoderOutput::StoppedWithText(
-                if visible { "t[EOS]" } else { "t" }.to_string(),
-            )
-        );
-        assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Held);
-    }
-    let mut decoder = StopSequenceDecoder::new(
-        tokenizer,
-        StopSequenceConfig::default()
-            .with_stop_token(7)
-            .with_stop_sequence("t"),
+fn byte_fallback_run_streams_each_complete_character() {
+    let tokenizer = byte_fallback_full_tokenizer(Vec::new());
+    // Nine byte tokens, three CJK characters: each streams as its last byte
+    // arrives, nothing waits for the end of the run or of the input.
+    let (deltas, batch, recoveries) = stream_all(
+        &tokenizer,
+        &byte_ids("日本語"),
+        crate::StopSequenceConfig::default(),
         true,
     );
-    assert_eq!(
-        decoder.process_token(2).unwrap(),
-        SequenceDecoderOutput::Held
-    );
-    assert_eq!(
-        decoder.process_token(7).unwrap(),
-        SequenceDecoderOutput::Stopped
-    );
-    assert_eq!(decoder.matched_stop(), Some("t"));
+    assert_eq!(deltas, vec!["日", "本", "語"]);
+    assert_eq!(deltas.concat(), batch);
+    assert_eq!(recoveries, 0);
+    // An emoji (four bytes) followed by a regular token and more bytes.
+    let mut ids = byte_ids("😀");
+    ids.push(1);
+    ids.extend(byte_ids("é"));
+    let (deltas, batch, recoveries) =
+        stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+    assert_eq!(deltas, vec!["😀", "x", "é"]);
+    assert_eq!(deltas.concat(), batch);
+    assert_eq!(recoveries, 0);
+    // An incomplete trailing sequence is the only thing held; the end of
+    // input releases it as its own replacement characters. Batch decoding
+    // would replace the whole run, the streamed character included, so this
+    // counts as a recovery.
+    let mut ids = byte_ids("日");
+    ids.extend(byte_ids("本")[..2].iter());
+    let (deltas, batch, recoveries) =
+        stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+    assert_eq!(deltas, vec!["日", "\u{FFFD}\u{FFFD}"]);
+    assert_eq!(batch, "\u{FFFD}".repeat(5));
+    assert_eq!(run_bytes(&deltas.concat()), run_bytes(&batch));
+    assert_eq!(recoveries, 1);
 }
 
-/// Every byte-run fixture of this file at once: the streamed text, the batch
-/// text, and how many steps streamed a remainder because batch decoding would
-/// have rewritten characters already sent (an invalid byte after them).
-fn stream_all(
-    tokenizer: &Arc<dyn crate::TokenizerTrait>,
-    ids: &[u32],
-    config: crate::StopSequenceConfig,
-    skip_special_tokens: bool,
-) -> (Vec<String>, String, u32) {
-    use crate::{SequenceDecoderOutput, StopSequenceDecoder};
-    let mut decoder = StopSequenceDecoder::new(tokenizer.clone(), config, skip_special_tokens);
-    let mut deltas = Vec::new();
-    for &id in ids {
-        match decoder.process_token(id).unwrap() {
-            SequenceDecoderOutput::Text(delta) => deltas.push(delta),
-            SequenceDecoderOutput::Held => {}
-            other => panic!("Unexpected stop: {other:?}"),
-        }
-    }
-    if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
-        deltas.push(delta);
-    }
-    let batch = tokenizer.decode(ids, skip_special_tokens).unwrap();
-    (deltas, batch, decoder.prefix_mismatches())
+#[test]
+fn byte_fallback_invalid_byte_keeps_streamed_text_and_counts_the_recovery() {
+    let tokenizer = byte_fallback_full_tokenizer(Vec::new());
+    let before = crate::decode_activity_stats();
+    // "日本" streamed, then an invalid byte, then "語" and a regular token.
+    // Batch decoding turns the whole run into ten replacement characters; the
+    // stream keeps "日本" (six bytes) and sends the remaining four, then "x".
+    let mut ids = byte_ids("日本");
+    ids.push(0xFF + 2);
+    ids.extend(byte_ids("語"));
+    ids.push(1);
+    let (deltas, batch, recoveries) =
+        stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+    assert_eq!(batch, format!("{}x", "\u{FFFD}".repeat(10)));
+    assert_eq!(
+        deltas,
+        vec!["日", "本", format!("{}x", "\u{FFFD}".repeat(4)).as_str()]
+    );
+    assert_eq!(recoveries, 1);
+    // The same run cut by the end of input instead of a regular token.
+    let mut ids = byte_ids("日本");
+    ids.push(0xFF + 2);
+    ids.extend(byte_ids("語"));
+    let (deltas, batch, recoveries) =
+        stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+    assert_eq!(batch, "\u{FFFD}".repeat(10));
+    assert_eq!(deltas, vec!["日", "本", "\u{FFFD}".repeat(4).as_str()]);
+    assert_eq!(recoveries, 1);
+    let after = crate::decode_activity_stats();
+    let byte_run = |stats: &[crate::DecodeActivityStats; 2]| {
+        stats
+            .iter()
+            .find(|s| s.kind == "byte_run")
+            .map_or(0, |s| s.prefix_mismatches)
+    };
+    assert!(
+        byte_run(&after) >= byte_run(&before) + 2,
+        "{before:?} -> {after:?}"
+    );
 }
 
 #[test]
@@ -394,6 +242,315 @@ fn byte_fallback_eager_stop_observation_survives_an_invalid_byte_after_a_charact
             assert_eq!(decoder.prefix_mismatches(), 1, "{stops:?}");
         }
     }
+}
+
+#[test]
+fn byte_fallback_capability_distinguishes_byte_level_and_survives_cache() {
+    let mut byte_level = tokenizers::Tokenizer::new(WordLevel::default());
+    byte_level.with_decoder(Some(ByteLevel::default()));
+    let byte_level: Arc<dyn crate::TokenizerTrait> =
+        Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(byte_level));
+    for (tokenizer, expected) in [(byte_fallback_tokenizer(), true), (byte_level, false)] {
+        assert_eq!(tokenizer.uses_byte_fallback(), expected);
+        let cached = crate::CachedTokenizer::new(tokenizer, crate::CacheConfig::default());
+        assert_eq!(cached.uses_byte_fallback(), expected);
+    }
+    assert!(!mock::MockTokenizer::new().uses_byte_fallback());
+}
+
+/// Every byte-run fixture of this file at once: the streamed text, the batch
+/// text, and how many steps streamed a remainder because batch decoding would
+/// have rewritten characters already sent (an invalid byte after them).
+fn stream_all(
+    tokenizer: &Arc<dyn crate::TokenizerTrait>,
+    ids: &[u32],
+    config: crate::StopSequenceConfig,
+    skip_special_tokens: bool,
+) -> (Vec<String>, String, u32) {
+    use crate::{SequenceDecoderOutput, StopSequenceDecoder};
+    let mut decoder = StopSequenceDecoder::new(tokenizer.clone(), config, skip_special_tokens);
+    let mut deltas = Vec::new();
+    for &id in ids {
+        match decoder.process_token(id).unwrap() {
+            SequenceDecoderOutput::Text(delta) => deltas.push(delta),
+            SequenceDecoderOutput::Held => {}
+            other => panic!("Unexpected stop: {other:?}"),
+        }
+    }
+    if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
+        deltas.push(delta);
+    }
+    let batch = tokenizer.decode(ids, skip_special_tokens).unwrap();
+    (deltas, batch, decoder.prefix_mismatches())
+}
+
+/// Bytes of text accounted as the engine produced them: a replacement
+/// character stands for one byte of a collapsed run, any other character for
+/// its own UTF-8 bytes. Equal for the streamed and the batch text of one
+/// sequence whatever the stream kept.
+fn run_bytes(text: &str) -> usize {
+    text.chars()
+        .map(|c| if c == '\u{FFFD}' { 1 } else { c.len_utf8() })
+        .sum()
+}
+
+#[test]
+fn byte_fallback_streaming_matches_batch_until_an_invalid_byte_follows_sent_text() {
+    let tokenizer = byte_fallback_tokenizer();
+    // (ids, the streamed deltas, recoveries): `t` (<0x74>) is a complete
+    // character and streams at once; a <0xF2> after it makes batch decoding
+    // rewrite the whole run as replacement characters, which the stream never
+    // retracts: it keeps `t` and sends the rest of the run as batch would.
+    for (ids, expected, recoveries) in [
+        (vec![2, 3, 4], vec!["t", "\u{FFFD} suffix"], 1),
+        (vec![1, 2, 3, 4], vec!["regular", "t", "\u{FFFD} suffix"], 1),
+        (vec![2, 2, 4], vec!["t", "t", " suffix"], 0),
+        (vec![5, 6, 4], vec!["é", " suffix"], 0),
+        (vec![2, 7, 3, 4], vec!["t", "\u{FFFD} suffix"], 1),
+        // A skipped special token before an open byte run: the run's own
+        // replacement character is kept when the regular token closes it.
+        (vec![7, 3, 1], vec!["\u{FFFD}regular"], 0),
+    ] {
+        let (deltas, batch, seen) =
+            stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+        assert_eq!(deltas, expected, "{ids:?}");
+        assert_eq!(seen, recoveries, "{ids:?}");
+        if recoveries == 0 {
+            assert_eq!(deltas.concat(), batch, "{ids:?}");
+        } else {
+            assert_ne!(deltas.concat(), batch, "{ids:?}");
+            assert_eq!(run_bytes(&deltas.concat()), run_bytes(&batch), "{ids:?}");
+        }
+    }
+}
+
+#[test]
+fn byte_fallback_eof_preserves_text_and_stops() {
+    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+
+    for cached in [false, true] {
+        let native = byte_fallback_tokenizer();
+        let tokenizer: Arc<dyn crate::TokenizerTrait> = if cached {
+            Arc::new(crate::CachedTokenizer::new(
+                native,
+                crate::CacheConfig::default(),
+            ))
+        } else {
+            native
+        };
+        // An unfinished run at the end of input is released as batch decoding
+        // ends it; a `t` already sent stays, the invalid byte after it becomes
+        // its replacement character (one recovery).
+        for (ids, expected, recoveries) in [
+            (vec![2], "t", 0),
+            (vec![2, 3], "t\u{FFFD}", 1),
+            (vec![5, 6], "é", 0),
+            (vec![1, 2], "regulart", 0),
+            (vec![1, 2, 3], "regulart\u{FFFD}", 1),
+            (vec![2, 7, 3], "t\u{FFFD}", 1),
+            (vec![3], "\u{FFFD}", 0),
+            (vec![3, 3], "\u{FFFD}\u{FFFD}", 0),
+            (vec![5], "\u{FFFD}", 0),
+        ] {
+            let (deltas, batch, seen) =
+                stream_all(&tokenizer, &ids, StopSequenceConfig::default(), true);
+            assert_eq!(deltas.concat(), expected, "{ids:?} cached={cached}");
+            assert_eq!(seen, recoveries, "{ids:?} cached={cached}");
+            if recoveries == 0 {
+                assert_eq!(batch, expected, "{ids:?} cached={cached}");
+            }
+            let mut decoder =
+                StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), true);
+            for &id in &ids {
+                decoder.process_token(id).unwrap();
+            }
+            decoder.finish().unwrap();
+            assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Held);
+        }
+        // A string stop inside a complete character stops at once.
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            StopSequenceConfig::default().with_stop_sequence("t"),
+            true,
+        );
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert!(decoder.is_stopped());
+        assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Held);
+        // A string stop that needs the next byte waits for it, then matches.
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            StopSequenceConfig::default().with_stop_sequence("t suffix"),
+            true,
+        );
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Held
+        );
+        assert_eq!(
+            decoder.process_token(4).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert_eq!(decoder.matched_stop(), Some("t suffix"));
+    }
+}
+
+#[test]
+fn byte_fallback_seeded_sequence_does_not_reemit_prompt() {
+    let tokenizer = byte_fallback_tokenizer();
+    for seed in [vec![1], vec![5]] {
+        let mut unchanged = crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed, true);
+        assert_eq!(unchanged.finish().unwrap(), "");
+    }
+    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![1], true);
+    assert_eq!(sequence.append_token(2).unwrap(), "t");
+    assert_eq!(sequence.append_token(3).unwrap(), "");
+    assert_eq!(sequence.append_token(4).unwrap(), "\u{FFFD} suffix");
+    assert_eq!(sequence.finish().unwrap(), "");
+    assert_eq!(sequence.prefix_mismatches(), 1);
+
+    for seed in [vec![1, 5], vec![1, 5, 7]] {
+        let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed, true);
+        assert_eq!(sequence.append_token(4).unwrap(), "� suffix");
+        assert_eq!(sequence.finish().unwrap(), "");
+    }
+    let mut sequence =
+        crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![1, 5], true);
+    assert_eq!(sequence.append_token(6).unwrap(), "é");
+    assert_eq!(sequence.finish().unwrap(), "");
+
+    // An incomplete prefill must not consume generated bytes when they become
+    // a valid character; that character streams as soon as it is complete.
+    let tokenizer = byte_fallback_tokenizer();
+    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer.clone(), vec![5], true);
+    assert_eq!(sequence.append_token(6).unwrap(), "é");
+    assert_eq!(sequence.append_token(4).unwrap(), " suffix");
+    assert_eq!(sequence.finish().unwrap(), "");
+    let mut sequence = crate::Sequence::with_tokens_and_options(tokenizer, vec![5], true);
+    assert_eq!(sequence.append_token(6).unwrap(), "é");
+    assert_eq!(sequence.finish().unwrap(), "");
+}
+
+#[test]
+fn byte_fallback_completed_seed_bytes_do_not_reemit_or_change_prefix() {
+    let native = byte_fallback_tokenizer();
+    for cached in [false, true] {
+        let tokenizer: Arc<dyn crate::TokenizerTrait> = if cached {
+            Arc::new(crate::CachedTokenizer::new(
+                native.clone(),
+                crate::CacheConfig::default(),
+            ))
+        } else {
+            native.clone()
+        };
+        for seed in [vec![2], vec![1, 2], vec![1, 2, 7]] {
+            let mut unchanged =
+                crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
+            assert_eq!(unchanged.finish().unwrap(), "");
+            for (next, streamed, finished) in [(2, "t", ""), (3, "", "\u{FFFD}")] {
+                let mut sequence =
+                    crate::Sequence::with_tokens_and_options(tokenizer.clone(), seed.clone(), true);
+                assert_eq!(
+                    sequence.append_token(next).unwrap(),
+                    streamed,
+                    "{seed:?} cached={cached}"
+                );
+                assert_eq!(
+                    sequence.finish().unwrap(),
+                    finished,
+                    "{seed:?} cached={cached}"
+                );
+                assert_eq!(sequence.prefix_mismatches(), 0, "{seed:?} cached={cached}");
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_fallback_short_combinations_match_batch_decode() {
+    use crate::StopSequenceConfig;
+    let tokenizer = byte_fallback_tokenizer();
+    for skip_special in [false, true] {
+        for a in 1..=7 {
+            for b in 1..=7 {
+                for c in 1..=7 {
+                    let ids = [a, b, c];
+                    let (deltas, batch, recoveries) = stream_all(
+                        &tokenizer,
+                        &ids,
+                        StopSequenceConfig::default(),
+                        skip_special,
+                    );
+                    let text = deltas.concat();
+                    if recoveries == 0 {
+                        assert_eq!(text, batch, "{ids:?} skip_special={skip_special}");
+                    } else {
+                        // Batch decoding rewrote characters already streamed as
+                        // replacement characters (one per byte): the stream kept
+                        // them and sent the rest of the run as batch ends it.
+                        assert_ne!(text, batch, "{ids:?} skip_special={skip_special}");
+                        assert_eq!(
+                            run_bytes(&text),
+                            run_bytes(&batch),
+                            "{ids:?} skip_special={skip_special}"
+                        );
+                        assert!(
+                            batch.contains('\u{FFFD}'),
+                            "{ids:?} skip_special={skip_special}: {text:?} vs {batch:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn byte_fallback_token_stop_preserves_pending_text() {
+    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+    let tokenizer = byte_fallback_tokenizer();
+    for visible in [false, true] {
+        let config = if visible {
+            StopSequenceConfig::default().with_visible_stop_token(7)
+        } else {
+            StopSequenceConfig::default().with_stop_token(7)
+        };
+        let mut decoder = StopSequenceDecoder::new(tokenizer.clone(), config, false);
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Text("t".to_string())
+        );
+        // An incomplete run before the stop token is released by it.
+        assert_eq!(
+            decoder.process_token(3).unwrap(),
+            SequenceDecoderOutput::Held
+        );
+        assert_eq!(
+            decoder.process_token(7).unwrap(),
+            SequenceDecoderOutput::StoppedWithText(
+                if visible { "\u{FFFD}[EOS]" } else { "\u{FFFD}" }.to_string(),
+            )
+        );
+        assert_eq!(decoder.finish().unwrap(), SequenceDecoderOutput::Held);
+    }
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer,
+        StopSequenceConfig::default()
+            .with_stop_token(7)
+            .with_stop_sequence("t"),
+        true,
+    );
+    assert_eq!(
+        decoder.process_token(2).unwrap(),
+        SequenceDecoderOutput::Stopped
+    );
+    assert_eq!(decoder.matched_stop(), Some("t"));
+    assert_eq!(
+        decoder.process_token(7).unwrap(),
+        SequenceDecoderOutput::Stopped
+    );
 }
 
 #[test]

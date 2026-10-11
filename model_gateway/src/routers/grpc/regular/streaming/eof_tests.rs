@@ -298,11 +298,14 @@ fn byte_fallback_tokenizer() -> Arc<dyn Tokenizer> {
 #[tokio::test]
 async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
     let tokenizer = byte_fallback_tokenizer();
-    for (ids, stop) in [
-        (vec![1, 2, 3], None),
-        (vec![1, 2], None),
-        (vec![1, 1], None),
-        (vec![1, 2], Some("�")),
+    // `t` streams at once; a <0xF2> after it ends as a replacement character
+    // (batch decoding would rewrite `t` too, which the stream never does); a
+    // stop on that replacement character hides it.
+    for (ids, stop, expected) in [
+        (vec![1, 2, 3], None, "t\u{FFFD} suffix"),
+        (vec![1, 2], None, "t\u{FFFD}"),
+        (vec![1, 1], None, "tt"),
+        (vec![1, 2], Some("�"), "t"),
     ] {
         let mut frames: Vec<_> = ids
             .iter()
@@ -362,14 +365,7 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
             .iter()
             .filter_map(|event| event["choices"][0]["text"].as_str())
             .collect();
-        assert_eq!(
-            text,
-            if stop.is_some() {
-                String::new()
-            } else {
-                tokenizer.decode(&ids, true).unwrap()
-            }
-        );
+        assert_eq!(text, expected, "{ids:?} {stop:?}");
         assert!(
             events
                 .iter()
@@ -418,7 +414,7 @@ async fn byte_fallback_generate_eof_reports_gateway_stop() {
         .unwrap();
     server.abort();
     let wire = serde_json::to_value(&responses[0]).unwrap();
-    assert_eq!(wire["text"], "");
+    assert_eq!(wire["text"], "t");
     assert_eq!(wire["meta_info"]["finish_reason"]["type"], "stop");
     assert_eq!(wire["meta_info"]["matched_stop"], "�");
 }
@@ -546,10 +542,10 @@ async fn byte_fallback_chat_eof_emits_exact_text_before_finish() {
     let events = collect_events(rx).await;
     server.abort();
     assert!(result.is_ok(), "{result:?}");
-    assert_eq!(chat_text(&events, 0, "content"), "��");
+    assert_eq!(chat_text(&events, 0, "content"), "t\u{FFFD}");
     let content = events
         .iter()
-        .position(|event| event["choices"][0]["delta"]["content"].as_str() == Some("��"))
+        .position(|event| event["choices"][0]["delta"]["content"].as_str() == Some("\u{FFFD}"))
         .unwrap();
     let finish = events
         .iter()
@@ -590,10 +586,10 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
         .iter()
         .filter_map(|event| event["delta"]["text"].as_str())
         .collect();
-    assert_eq!(text, "��");
+    assert_eq!(text, "t\u{FFFD}");
     let content = events
         .iter()
-        .position(|event| event["delta"]["text"].as_str() == Some("��"))
+        .position(|event| event["delta"]["text"].as_str() == Some("\u{FFFD}"))
         .unwrap();
     let stop = events
         .iter()
@@ -601,6 +597,27 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
         .unwrap();
     assert!(content < stop);
     assert!(events.iter().any(|event| event["type"] == "message_stop"));
+}
+
+/// What the stop decoder streams for `ids` on its own (complete characters as
+/// they close, an unfinished run at the end as its replacement characters):
+/// the gateway must put exactly this on the wire.
+fn streamed_text(tokenizer: &Arc<dyn Tokenizer>, ids: &[u32]) -> String {
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer.clone(),
+        llm_tokenizer::StopSequenceConfig::default(),
+        true,
+    );
+    let mut text = String::new();
+    for &id in ids {
+        if let SequenceDecoderOutput::Text(delta) = decoder.process_token(id).unwrap() {
+            text.push_str(&delta);
+        }
+    }
+    if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
+        text.push_str(&delta);
+    }
+    text
 }
 
 fn byte_fallback_chunks(ids: &[u32]) -> Vec<proto::GenerateResponse> {
@@ -674,12 +691,14 @@ async fn byte_fallback_chat_transport_eof_preserves_text_without_finish() {
             let events = collect_events(rx).await;
             server.abort();
             assert_eq!(result.is_ok(), status == "0", "{result:?}");
+            // `t` streamed with its chunk either way; the unfinished byte is
+            // released only by a clean end of input, never by a cut.
             assert_eq!(
                 chat_text(&events, 0, "content"),
                 if status == "0" {
-                    tokenizer.decode(&ids, true).unwrap()
+                    streamed_text(&tokenizer, &ids)
                 } else {
-                    String::new()
+                    "t".to_string()
                 }
             );
             assert!(events
@@ -724,10 +743,7 @@ async fn byte_fallback_chat_transport_eof_reports_local_stop_without_input_usage
             let events = collect_events(rx).await;
             server.abort();
             assert_eq!(result.is_ok(), status == "0", "{result:?}");
-            assert_eq!(
-                chat_text(&events, 0, "content"),
-                if status == "0" { prefix } else { "" }
-            );
+            assert_eq!(chat_text(&events, 0, "content"), prefix);
             let finishes: Vec<_> = events
                 .iter()
                 .filter(|event| !event["choices"][0]["finish_reason"].is_null())
@@ -769,7 +785,7 @@ async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage
             .iter()
             .filter_map(|event| event["delta"]["text"].as_str())
             .collect();
-        assert_eq!(text, tokenizer.decode(&ids, true).unwrap());
+        assert_eq!(text, streamed_text(&tokenizer, &ids));
         let final_delta = events
             .iter()
             .find(|event| event["type"] == "message_delta")
@@ -855,7 +871,7 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
             .iter()
             .filter_map(|event| event["choices"][0]["text"].as_str())
             .collect();
-        assert_eq!(text, tokenizer.decode(&ids, true).unwrap());
+        assert_eq!(text, streamed_text(&tokenizer, &ids));
         assert!(!result.saw_complete);
         assert_eq!(result.prompt_tokens, 0);
         assert!(events
@@ -907,25 +923,18 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
                 .iter()
                 .filter_map(|event| event["choices"][0]["text"].as_str())
                 .collect();
-            assert_eq!(
-                text,
-                if status == "0" {
-                    format!("{prefix}requested-suffix")
-                } else {
-                    String::new()
-                }
-            );
+            // The stop fires as soon as its character is complete, before the
+            // stream ends either way: text, suffix and finish are the same.
+            assert_eq!(text, format!("{prefix}requested-suffix"));
             let finishes: Vec<_> = events
                 .iter()
                 .filter_map(|event| event["choices"][0]["finish_reason"].as_str())
                 .collect();
+            assert_eq!(finishes, ["stop"], "{events:?}");
             if status == "0" {
-                assert_eq!(finishes, ["stop"], "{events:?}");
                 let outcome = result.unwrap();
                 assert!(!outcome.saw_complete);
                 assert_eq!(outcome.prompt_tokens, 0);
-            } else {
-                assert!(finishes.is_empty(), "{events:?}");
             }
             assert!(events.iter().all(|event| !event["usage"].is_object()));
         }
@@ -1094,8 +1103,8 @@ async fn non_byte_fallback_held_stop_keeps_original_reasoning_accounting() {
 
 #[tokio::test]
 async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
-    // A deliberately mismatched eager observation is a usage-estimate limit:
-    // the invalid final byte run changes "de" into two replacements plus F2.
+    // An invalid final byte: batch decoding turns "de" + <0xF2> into three
+    // replacement characters; the response keeps "de" and ends with one.
     let tokenizer = byte_fallback_reasoning_tokenizer();
     let ids = [
         257,
@@ -1137,7 +1146,9 @@ async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
         .await
         .unwrap();
     assert_eq!(choice.message.reasoning_content.as_deref(), Some("ab"));
-    assert_eq!(choice.message.content.as_deref(), Some("���"));
+    // "de" streams as it decodes; the invalid last byte ends as one
+    // replacement character (batch decoding would rewrite "de" as well).
+    assert_eq!(choice.message.content.as_deref(), Some("de\u{FFFD}"));
 }
 
 #[tokio::test]

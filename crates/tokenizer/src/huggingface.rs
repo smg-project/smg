@@ -712,9 +712,12 @@ impl Decoder for HuggingFaceTokenizer {
     /// rather than `dyn Decoder` dispatch, and lenient when the decoder chain
     /// rewrites text already emitted (see [`Self::step_decode_lenient`]).
     ///
-    /// A ByteFallback vocabulary holds a client-visible byte run until a
-    /// regular token closes it: an invalid byte later in the run would make
-    /// batch decoding rewrite the run's earlier characters.
+    /// A ByteFallback vocabulary streams the complete characters of a byte run
+    /// as they close, like the serving engines' own detokenizers; only an
+    /// incomplete trailing sequence waits. Batch decoding would turn a run
+    /// with an invalid byte into one replacement character per byte, including
+    /// the characters already streamed: those stay as streamed and the rest of
+    /// the run follows the batch text (counted as a `byte_run` recovery).
     fn decode_step(
         &self,
         token_id: TokenIdType,
@@ -764,55 +767,44 @@ impl Decoder for HuggingFaceTokenizer {
         skip_special_tokens: bool,
         eager: bool,
     ) -> Result<DecodeStep> {
-        if eager {
-            return self.step_decode_lenient(
-                vec![token_id],
-                skip_special_tokens,
-                ids,
-                prefix,
-                prefix_index,
-                true,
-            );
-        }
-        if self.has_byte_fallback {
-            if prefix.is_empty() && *prefix_index > 0 {
-                // A seeded sequence: its prompt text is context, never emitted.
-                let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
-                let stable_seed_end = ids[..*prefix_index]
-                    .iter()
-                    .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
-                    .map_or(0, |index| index + 1);
-                if prefill.ends_with('\u{FFFD}') {
-                    // Keep an unfinished seed byte run as decode context, but
-                    // suppress the stable prompt text before it.
-                    *prefix_index = stable_seed_end;
-                    *prefix = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
-                } else if stable_seed_end < *prefix_index {
-                    // A completed seed run is prompt text. Start new bytes at
-                    // its boundary so later invalid bytes cannot rewrite it.
-                    ids.truncate(stable_seed_end);
-                    *prefix_index = stable_seed_end;
-                    *prefix = self.decode(ids, skip_special_tokens)?;
-                } else {
-                    *prefix = prefill;
-                }
-            }
-            if self.byte_fallback_piece(token_id, skip_special_tokens) {
-                ids.push(token_id);
-                return Ok(DecodeStep::default());
+        // A seeded sequence (every id so far is seed, nothing pending): its prompt
+        // text is context, never emitted. With pending ids behind the prefix
+        // (a skipped special token followed by an open byte run) the step
+        // algorithm's own prefix bookkeeping applies instead.
+        if self.has_byte_fallback
+            && !eager
+            && prefix.is_empty()
+            && *prefix_index > 0
+            && *prefix_index == ids.len()
+        {
+            let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+            let stable_seed_end = ids[..*prefix_index]
+                .iter()
+                .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
+                .map_or(0, |index| index + 1);
+            if prefill.ends_with('\u{FFFD}') {
+                // Keep an unfinished seed byte run as decode context, but
+                // suppress the stable prompt text before it.
+                *prefix_index = stable_seed_end;
+                *prefix = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+            } else if stable_seed_end < *prefix_index {
+                // A completed seed run is prompt text. Start new bytes at
+                // its boundary so later invalid bytes cannot rewrite it.
+                ids.truncate(stable_seed_end);
+                *prefix_index = stable_seed_end;
+                *prefix = self.decode(ids, skip_special_tokens)?;
+            } else {
+                *prefix = prefill;
             }
         }
-        let tokens = if self.has_byte_fallback && prefix.is_empty() {
-            // These IDs have not been emitted, so they are input, not a prefill
-            // prefix for the streaming decoder.
-            let mut pending = std::mem::take(ids);
-            pending.push(token_id);
-            *prefix_index = 0;
-            pending
-        } else {
-            vec![token_id]
-        };
-        self.step_decode_lenient(tokens, skip_special_tokens, ids, prefix, prefix_index, true)
+        self.step_decode_lenient(
+            vec![token_id],
+            skip_special_tokens,
+            ids,
+            prefix,
+            prefix_index,
+            true,
+        )
     }
 
     /// Byte-level vocabularies decode each id to fixed bytes, so one stream
