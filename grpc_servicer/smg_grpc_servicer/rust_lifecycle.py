@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import glob
 import logging
+import multiprocessing
 import os
 import signal
 import socket
@@ -297,8 +298,15 @@ class SchedulerProcesses:
     def pids(self) -> list[int | None]:
         return [process.pid for process in self.processes]
 
-    def watch_ready(self, what: str) -> threading.Thread | None:
-        """Wait for the ready reports on a daemon thread; logs the outcome."""
+    def watch_ready(
+        self, what: str, *, on_failure: Callable[[int], None] | None = None
+    ) -> threading.Thread | None:
+        """Wait for the ready reports on a daemon thread; logs the outcome. A
+        failed start is handed to ``on_failure`` (the group's ``fault``, so
+        its next poll shuts the processes down and the supervisor exits): the
+        processes may well stay alive after a bad report, and the supervisor
+        would otherwise keep reporting the engine alive until its startup
+        ceiling."""
         if self._ready is None:
             return None
 
@@ -308,6 +316,8 @@ class SchedulerProcesses:
             except Exception as error:
                 self.ready_error = error
                 logger.error("%s: the scheduler processes did not start: %s", what, error)
+                if on_failure is not None:
+                    on_failure(1)
                 return
             logger.info("%s: %d scheduler process(es) ready", what, len(self.processes))
 
@@ -362,13 +372,52 @@ def wait_for_ready_reports(
     return reports
 
 
-def on_fault_signal(group: EngineProcessGroup, *signals: int, what: str) -> bool:
+class FaultLatch:
+    """The target of a fault handler installed before the process group
+    exists: the handlers go in ahead of the first process start (a process
+    that fails during its start signals its parent right away, and a signal
+    at its default disposition would end the servicer), the group is built
+    once the processes are started, and a fault reported in between is
+    passed on when the group is attached."""
+
+    def __init__(self):
+        self._code: int | None = None
+        self._group: EngineProcessGroup | None = None
+
+    def fault(self, code: int = 1) -> None:
+        if self._group is not None:
+            self._group.fault(code)
+        elif self._code is None:
+            self._code = code
+
+    def attach(self, group: EngineProcessGroup) -> EngineProcessGroup:
+        """Hand faults on to ``group`` from now on, and the one already
+        reported, if any, at once. Returns the group."""
+        self._group = group
+        if self._code is not None:
+            group.fault(self._code)
+        return group
+
+
+def ensure_spawn_start_method(what: str) -> None:
+    """The scheduler processes must be spawned, never forked: this process
+    runs the Rust server's threads, and a fork can leave the child deadlocked
+    on a lock one of them held. The engine's own launch setup sets the method;
+    this keeps the guarantee in our hands should a version stop doing so."""
+    if multiprocessing.get_start_method(allow_none=True) != "spawn":
+        logger.warning("%s: the multiprocessing start method was not spawn; setting it", what)
+        multiprocessing.set_start_method("spawn", force=True)
+
+
+def on_fault_signal(target: Any, *signals: int, what: str) -> bool:
     """Make the signals a scheduler process sends its parent when it hits an
-    exception end ``group`` (its next poll reports exit code 1 and shuts the
-    other processes down) instead of this process: their default disposition
-    would take the servicer down with the engine, and an engine's own
-    launch-phase handler kills the whole process tree. Handlers can only be
-    installed on the main thread; returns whether they were."""
+    exception end ``target`` (an :class:`EngineProcessGroup`, or the
+    :class:`FaultLatch` that stands in for one before the processes start:
+    the group's next poll reports exit code 1 and shuts the other processes
+    down) instead of this process: their default disposition would take the
+    servicer down with the engine, and an engine's own launch-phase handler
+    kills the whole process tree. Handlers can only be installed on the main
+    thread; returns whether they were."""
     if threading.current_thread() is not threading.main_thread():
         return False
 
@@ -376,7 +425,7 @@ def on_fault_signal(group: EngineProcessGroup, *signals: int, what: str) -> bool
         logger.error(
             "%s: a scheduler process signalled a failure (signal %d); stopping", what, signum
         )
-        group.fault(1)
+        target.fault(1)
 
     for sig in signals:
         signal.signal(sig, on_signal)

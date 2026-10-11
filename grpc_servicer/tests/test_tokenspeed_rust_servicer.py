@@ -460,9 +460,14 @@ class _FakeRankProcess:
         self.started_in: int | None = None
         _FakeRankProcess.started.append(self)
 
+    report: dict | None = None  # what `start` sends; the ready report by default
+
     def start(self) -> None:
         self.started_in = os.getpid()
-        self.args[2].send({"status": "ready", "pid": self.pid})
+        self.handlers_in_at_start = callable(signal.getsignal(signal.SIGUSR1)) and callable(
+            signal.getsignal(signal.SIGQUIT)
+        )
+        self.args[2].send(self.report or {"status": "ready", "pid": self.pid})
 
     def is_alive(self) -> bool:
         return self.exitcode is None
@@ -482,6 +487,10 @@ class _FakeRankProcess:
 class _FakePipeEnd:
     def __init__(self, queue: list):
         self._queue = queue
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
     def send(self, report) -> None:
         self._queue.append(report)
@@ -549,6 +558,17 @@ def _stub_rank_launch(monkeypatch, *, ranks: int = 2, missing: str | None = None
     monkeypatch.setattr(_FakeRankProcess, "started", [])
     monkeypatch.setattr(rust.multiprocessing, "Process", _FakeRankProcess)
     monkeypatch.setattr(rust.multiprocessing, "Pipe", _fake_pipe)
+    # TokenSpeed's own setup sets the spawn method; the launcher's guard
+    # reads it and must not switch this test process over.
+    recorded["start_method_calls"] = []
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing, "get_start_method", lambda allow_none=False: "spawn"
+    )
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing,
+        "set_start_method",
+        lambda method, force=False: recorded["start_method_calls"].append((method, force)),
+    )
     recorded["attrs"] = attrs
     recorded["port_args"] = port_args
     return recorded
@@ -904,3 +924,55 @@ def test_install_undoes_a_fake_under_a_real_package():
         fake = _install(monkeypatch, name)
         assert package.servicer is fake and sys.modules[name] is fake
     assert (vars(package).get("servicer"), sys.modules.get(name)) == before
+
+
+def test_the_fault_handlers_are_in_before_the_first_rank_starts_and_the_pipes_close(
+    monkeypatch, restore_fault_signals
+):
+    """A rank that fails during its start signals its parent at once, so the
+    SIGUSR1/SIGQUIT handlers are installed before any rank starts; the
+    parent's end of each ready pipe is closed after the start (a rank that
+    dies before reporting shows as EOF, and no descriptor pair outlives the
+    launch); the start method set by the engine's setup is left alone."""
+    recorded = _stub_rank_launch(monkeypatch, ranks=2)
+
+    rust.launch_scheduler_ranks(rust.headless_server_args(FakeServerArgs(), handshake_port=1))
+
+    processes = _FakeRankProcess.started
+    assert len(processes) == 2
+    assert all(process.handlers_in_at_start for process in processes)
+    assert all(process.args[2].closed for process in processes)
+    assert recorded["start_method_calls"] == []
+
+
+def test_a_rank_that_reports_a_failed_start_ends_the_group(
+    monkeypatch, caplog, restore_fault_signals
+):
+    """A report that is not `ready` (a rank that failed to load and stays up)
+    is a fault of the group: its poll turns 1 and the other rank is
+    terminated, so the servicer drains and exits instead of supervising a
+    scheduler that never came up."""
+    _stub_rank_launch(monkeypatch, ranks=2)
+    monkeypatch.setattr(_FakeRankProcess, "report", {"status": "error", "message": "no model"})
+
+    with caplog.at_level("ERROR"):
+        engine = rust.launch_scheduler_ranks(
+            rust.headless_server_args(FakeServerArgs(), handshake_port=1)
+        )
+        _wait_until(lambda: engine.poll() == 1, "the failed start never ended the group")
+
+    assert [process.events[0] for process in _FakeRankProcess.started] == ["terminate", "terminate"]
+    assert "TokenSpeed scheduler: the scheduler processes did not start" in caplog.text
+
+
+def test_the_spawn_start_method_is_forced_when_the_engines_setup_left_it_unset(
+    monkeypatch, restore_fault_signals
+):
+    recorded = _stub_rank_launch(monkeypatch, ranks=1)
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing, "get_start_method", lambda allow_none=False: None
+    )
+
+    rust.launch_scheduler_ranks(rust.headless_server_args(FakeServerArgs(), handshake_port=1))
+
+    assert recorded["start_method_calls"] == [("spawn", True)]

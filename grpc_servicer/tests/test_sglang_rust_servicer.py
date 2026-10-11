@@ -453,11 +453,14 @@ def _stub_rank_launch(monkeypatch, *, ranks: int = 2) -> dict:
                 target=run_scheduler_process_func,
                 started_in=os.getpid(),
                 thread=threading.current_thread(),
+                handler_in=callable(signal.getsignal(signal.SIGQUIT)),
             )
 
             def wait_for_ready():
                 recorded["ready_waits"] += 1
                 recorded["ready_thread"] = threading.current_thread()
+                if recorded.get("ready_error") is not None:
+                    raise recorded["ready_error"]
 
             return SimpleNamespace(wait_for_ready=wait_for_ready), list(recorded["processes"])
 
@@ -490,6 +493,17 @@ def _stub_rank_launch(monkeypatch, *, ranks: int = 2) -> dict:
         publish=lambda args, role: recorded["calls"].append(f"publish:{role}"),
     )
     _install(monkeypatch, "sglang.srt.server_args", PortArgs=PortArgs)
+    # SGLang's own setup sets the spawn method; the launcher's guard reads it
+    # and must not switch this test process over.
+    recorded["start_method_calls"] = []
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing, "get_start_method", lambda allow_none=False: "spawn"
+    )
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing,
+        "set_start_method",
+        lambda method, force=False: recorded["start_method_calls"].append((method, force)),
+    )
     _install(
         monkeypatch,
         "sglang.srt.utils",
@@ -812,3 +826,51 @@ def test_serve_grpc_hands_the_process_to_rust_when_the_flag_says_so(
             asyncio.run(server.serve_grpc(SimpleNamespace()))
     assert raised.value.code == 3
     assert "Servicer implementation: rust (source=env)" in caplog.text
+
+
+def test_the_fault_handler_is_in_before_the_spawner_starts_a_rank(
+    monkeypatch, restore_fault_signals
+):
+    """A rank that fails during its start signals its parent at once, so the
+    SIGQUIT handler is installed before SGLang's spawner starts any rank; the
+    start method set by SGLang's own setup is left alone."""
+    recorded = _stub_rank_launch(monkeypatch)
+
+    rust.launch_scheduler_ranks(_preparable_args(recorded), handshake_port=24321)
+
+    assert recorded["launch"]["handler_in"] is True
+    assert recorded["start_method_calls"] == []
+
+
+def test_a_failed_ready_wait_ends_the_group(monkeypatch, caplog, restore_fault_signals):
+    """SGLang's ready wait raising (a rank that failed to load and stays up)
+    is a fault of the group: its poll turns 1 and the ranks are terminated,
+    so the servicer drains and exits instead of supervising a scheduler that
+    never came up."""
+    recorded = _stub_rank_launch(monkeypatch)
+    recorded["ready_error"] = RuntimeError("rank 1 failed to load")
+
+    with caplog.at_level("ERROR"):
+        engine = rust.launch_scheduler_ranks(_preparable_args(recorded), handshake_port=24321)
+        deadline = time.monotonic() + 5
+        while engine.poll() != 1:
+            assert time.monotonic() < deadline, "the failed start never ended the group"
+            time.sleep(0.01)
+
+    assert [process.events[0] for process in recorded["processes"]] == ["terminate", "terminate"]
+    assert "SGLang scheduler: the scheduler processes did not start: rank 1 failed to load" in (
+        caplog.text
+    )
+
+
+def test_the_spawn_start_method_is_forced_when_the_engines_setup_left_it_unset(
+    monkeypatch, restore_fault_signals
+):
+    recorded = _stub_rank_launch(monkeypatch)
+    monkeypatch.setattr(
+        rust_lifecycle.multiprocessing, "get_start_method", lambda allow_none=False: None
+    )
+
+    rust.launch_scheduler_ranks(_preparable_args(recorded), handshake_port=24321)
+
+    assert recorded["start_method_calls"] == [("spawn", True)]

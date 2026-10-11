@@ -23,6 +23,7 @@ emulates: ``FlushCache`` and profiling answer UNIMPLEMENTED, ranked
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import dataclasses
 import json
@@ -42,8 +43,10 @@ from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     EngineProcessGroup,
+    FaultLatch,
     SchedulerProcesses,
     default_socket_dir,
+    ensure_spawn_start_method,
     env_float,
     free_port,
     on_fault_signal,
@@ -365,12 +368,17 @@ def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProce
 
     configure_logger(server_args)
     set_envs_and_config(server_args)
+    ensure_spawn_start_method("TokenSpeed scheduler")
     port_args = port_args_type.init_new(server_args)
     server_args.model, server_args.tokenizer = prepare_model_and_tokenizer(
         server_args.model, server_args.tokenizer
     )
+    # The processes are built first and started only once the fault handlers
+    # are in: a rank that fails during its start signals its parent at once.
     processes: list = []
     readers: list = []
+    writers: list = []
+    starts: list = []
     if not server_args.mapping.attn.has_dp:
         memory_saver = memory_saver_type.create(enable=server_args.enable_memory_saver)
         for rank in scheduler_ranks(server_args):
@@ -378,29 +386,40 @@ def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProce
             rank_args.mapping = copy.deepcopy(server_args.mapping)
             rank_args.mapping.rank = rank
             reader, writer = multiprocessing.Pipe(duplex=False)
-            process = multiprocessing.Process(
-                target=run_event_loop,
-                args=(rank_args, port_args, writer),
-                name=f"smg-scheduler-rank-{rank}",
+            processes.append(
+                multiprocessing.Process(
+                    target=run_event_loop,
+                    args=(rank_args, port_args, writer),
+                    name=f"smg-scheduler-rank-{rank}",
+                )
             )
-            with memory_saver.configure_subprocess():
-                process.start()
-            processes.append(process)
             readers.append(reader)
+            writers.append(writer)
+            starts.append(memory_saver.configure_subprocess)
     else:
         reader, writer = multiprocessing.Pipe(duplex=False)
-        process = multiprocessing.Process(
-            target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
-            name="smg-scheduler-dp-controller",
+        processes.append(
+            multiprocessing.Process(
+                target=run_data_parallel_controller_process,
+                args=(server_args, port_args, writer),
+                name="smg-scheduler-dp-controller",
+            )
         )
-        process.start()
-        processes.append(process)
         readers.append(reader)
+        writers.append(writer)
+        starts.append(contextlib.nullcontext)
+    latch = FaultLatch()
+    on_fault_signal(latch, signal.SIGUSR1, signal.SIGQUIT, what="TokenSpeed scheduler")
+    for process, writer, around_start in zip(processes, writers, starts):
+        with around_start():
+            process.start()
+        # The child holds its end of the pipe; this one closes, so a rank that
+        # dies before reporting shows as EOF on the reader rather than as a
+        # wait, and no descriptor pair stays open for the servicer's life.
+        writer.close()
     ranks = SchedulerProcesses(processes, ready=lambda: wait_for_ready_reports(readers, processes))
-    engine = EngineProcessGroup(ranks)
-    on_fault_signal(engine, signal.SIGUSR1, signal.SIGQUIT, what="TokenSpeed scheduler")
-    ranks.watch_ready("TokenSpeed scheduler")
+    engine = latch.attach(EngineProcessGroup(ranks))
+    ranks.watch_ready("TokenSpeed scheduler", on_failure=engine.fault)
     logger.info(
         "Started %d scheduler rank process(es) from the servicer process: pids %s",
         len(ranks.processes),

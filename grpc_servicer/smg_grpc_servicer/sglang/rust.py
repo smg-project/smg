@@ -43,8 +43,10 @@ from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     EngineProcessGroup,
+    FaultLatch,
     SchedulerProcesses,
     default_socket_dir,
+    ensure_spawn_start_method,
     env_float,
     free_port,
     on_fault_signal,
@@ -379,19 +381,23 @@ def launch_scheduler_ranks(
     configure_logger(server_args)
     server_args.resolve_once()
     _set_envs_and_config(server_args)
+    ensure_spawn_start_method("SGLang scheduler")
     load_plugins()
     server_args.check_server_args()
     # This process fills the tokenizer manager's role for argument resolution
     # only; the ranks publish their own records when they start.
     publish(server_args, role="tokenizer")
     port_args = PortArgs.init_new(server_args)
+    # The fault handler goes in before the spawner starts a rank: a rank that
+    # fails during its start signals its parent at once.
+    latch = FaultLatch()
+    on_fault_signal(latch, signal.SIGQUIT, what="SGLang scheduler")
     init, processes = Engine._launch_scheduler_processes(
         server_args, port_args, run_scheduler_process
     )
     ranks = SchedulerProcesses(list(processes or []), ready=init.wait_for_ready)
-    engine = EngineProcessGroup(ranks)
-    on_fault_signal(engine, signal.SIGQUIT, what="SGLang scheduler")
-    ranks.watch_ready("SGLang scheduler")
+    engine = latch.attach(EngineProcessGroup(ranks))
+    ranks.watch_ready("SGLang scheduler", on_failure=engine.fault)
     logger.info(
         "Started %d scheduler rank process(es) from the servicer process: pids %s",
         len(ranks.processes),
