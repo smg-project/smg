@@ -396,6 +396,17 @@ def test_write_allowlist_carries_the_adjudication_from_a_previous_allowlist(tmp_
     assert by_sig["feedfeedfeedfeed"]["first_seen"] == "2026-10-09"
     assert by_sig["beef" * 4]["note"] == ""
     assert by_sig["beef" * 4]["first_seen"] == "2026-10-11"
+    # a first run without the previous allowlist blanks the note and stamps
+    # first_seen; a rerun with it restores both (per-field merge, earliest date)
+    blank = new.parent / "blank.jsonl"
+    compat_diff.write_allowlist(blank, "openai", clusters, "2026-10-11")
+    first = {e["sig_hash"]: e for e in map(json.loads, blank.read_text().splitlines())}
+    assert first["feedfeedfeedfeed"]["note"] == ""
+    assert first["feedfeedfeedfeed"]["first_seen"] == "2026-10-11"
+    compat_diff.write_allowlist(blank, "openai", clusters, "2026-10-11", prior=carried)
+    rerun = {e["sig_hash"]: e for e in map(json.loads, blank.read_text().splitlines())}
+    assert rerun["feedfeedfeedfeed"]["note"] == prior["note"]
+    assert rerun["feedfeedfeedfeed"]["first_seen"] == "2026-10-09"
 
 
 def test_generated_mutations_stream_when_the_mutated_body_streams():
