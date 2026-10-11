@@ -789,10 +789,12 @@ impl GrpcRouter {
     /// given it. A streaming request gets that message as `message_start`,
     /// then `message_delta` with the stop reason and `message_stop`. A request
     /// with media is counted at the placeholders the template writes for it,
-    /// as count_tokens counts it: the media is neither fetched nor checked, so
-    /// the count is the template's, not the expanded prompt's. A prompt longer
-    /// than the smallest context window the model's workers advertise is
-    /// refused as the pipeline refuses it after worker selection
+    /// as count_tokens counts it: the media is neither fetched nor decoded, so
+    /// the count is the template's, not the expanded prompt's; an image or a
+    /// video to a pool whose every worker is language model only is refused
+    /// with `multimodal_not_supported` here as on every Messages path. A
+    /// prompt longer than the smallest context window the model's workers
+    /// advertise is refused as the pipeline refuses it after worker selection
     /// (`context_length_exceeded`), so a 200 here means the prompt fits
     /// whichever worker a real call lands on; a deployment that advertises no
     /// window leaves the check to the engine, as the pipeline does.

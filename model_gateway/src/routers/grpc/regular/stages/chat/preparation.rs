@@ -103,8 +103,9 @@ pub(crate) async fn prepare_chat_like(
         // rendering, fetching, preprocessing, and final count validation.
         let media_plan = multimodal::media_plan_chat(&request.messages);
         // A pool whose every worker runs without a vision encoder takes no
-        // media: the engine admits such a request and never schedules it.
-        // Refuse it here, before any byte of media is decoded or sent.
+        // images or video: the engine admits such a request and never
+        // schedules it. Refuse it here, before any byte of media is decoded
+        // or sent.
         multimodal::ensure_model_accepts_media(
             &ctx.components.worker_registry,
             model_id,
