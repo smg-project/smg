@@ -10,7 +10,7 @@ use std::{
 
 use axum::response::Response;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{future::try_join_all, FutureExt};
+use futures::future::try_join_all;
 use llm_tokenizer::{
     stop::{SequenceDecoderOutput, StopSequenceDecoder},
     traits::Tokenizer,
@@ -525,15 +525,12 @@ impl StreamingProcessor {
         let mut final_indices: Option<Vec<u32>> = None;
         loop {
             let response = if final_indices.is_none() {
-                // Take what the engine has already sent before yielding, so
-                // the chunks of one wake leave as one frame of the response.
-                let item = match grpc_stream.next().now_or_never() {
-                    Some(item) => item,
-                    None => {
-                        Self::flush_chunks(tx, &mut sse_buffer).await?;
-                        grpc_stream.next().await
-                    }
-                };
+                // The chunks written so far leave as a frame before the
+                // engine is polled, so every engine message reaches the
+                // client as its own frame as soon as it is processed; the
+                // engine stream is polled once per message.
+                Self::flush_chunks(tx, &mut sse_buffer).await?;
+                let item = grpc_stream.next().await;
                 match item.transpose() {
                     Ok(response) => response,
                     Err(e) => {
