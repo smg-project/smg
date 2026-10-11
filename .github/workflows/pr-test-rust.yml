@@ -1622,8 +1622,9 @@ jobs:
           # not pass, and finish stays a verdict on every head.
           bad='^(failure|cancelled)$'
           # detect-changes selects the lanes: when it fails or is cancelled, the
-          # unit tests and every e2e lane are skipped, and a skipped job passes
-          # this check, so its own result gates here (smg-project/smg-lab#172).
+          # Rust unit tests, the benchmarks and the EPD lane skip on every event
+          # (and, on a pull request, every e2e lane); a skipped job passes this
+          # check, so its own result gates here (smg-project/smg-lab#172).
           if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
                 "${{ needs.pre-commit.result }}" =~ $bad || \
                 "${{ needs.python-lint.result }}" =~ $bad || \
