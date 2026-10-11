@@ -57,6 +57,7 @@ use crate::{
 
 mod attributed;
 mod keyed;
+mod pythonic;
 mod schema;
 mod tagged;
 mod xtml;
@@ -299,7 +300,10 @@ impl Format {
                 let ways_in = self.ways_into_block(&markers);
                 tagged::calls(&markers, &ways_in, *spelling, &named, at_least_one)
             }
-            CallSyntax::Pythonic | CallSyntax::JsonList | CallSyntax::Xml => return None,
+            CallSyntax::Pythonic(framing) => {
+                pythonic::calls(&markers, *framing, &named, at_least_one)
+            }
+            CallSyntax::JsonList | CallSyntax::Xml => return None,
         };
         if !reasoning_open {
             return Some(calls);
@@ -1089,13 +1093,7 @@ mod tests {
         assert!(formats::glm()
             .grammar(&[tool("", None, value!({}))], true, false)
             .is_none());
-        for format in [
-            formats::minimax_m3(),
-            formats::olmo3(),
-            formats::lfm2_5(),
-            formats::xlam(),
-            formats::plain(),
-        ] {
+        for format in [formats::minimax_m3(), formats::xlam(), formats::plain()] {
             assert!(
                 format.grammar(&tools, true, false).is_none(),
                 "{}",

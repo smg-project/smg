@@ -34,7 +34,10 @@
 //! [`Engine`]: crate::Engine
 //! [`formats`]: crate::formats
 
-use crate::tagged::{self, keyed};
+use crate::{
+    pythonic,
+    tagged::{self, keyed},
+};
 
 /// How the model writes a call between the call markers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,10 +60,12 @@ pub enum CallSyntax {
     /// enter and leave the state are the call's own markers, and the call's end carries the
     /// closing one.
     Keyed(keyed::Tags),
-    /// Python calls, `name(key=value, ...)`, one or several, bare or in a list: Olmo 3, LFM2.5,
-    /// Llama 3.2's pythonic template. The region's markers are the terminals; each call ends at
-    /// its own `)`, and the region's closing marker is wrapping.
-    Pythonic,
+    /// Python calls, `name(key=value, ...)`, one or several, framed as the family's template
+    /// frames them (one per line: Olmo 3; a Python list: LFM2.5, Llama 3.2's pythonic template).
+    /// The region's markers are the terminals; each call ends at its own `)`, and the region's
+    /// closing marker is wrapping. The assembler reads either framing; the grammar derived from
+    /// the table writes the one named.
+    Pythonic(pythonic::Framing),
     /// A JSON list of calls with no markers around it, or content: xLAM. The table's one state is
     /// an arguments state entered at the output's start, and the assembler decides at the first
     /// byte that is not whitespace.

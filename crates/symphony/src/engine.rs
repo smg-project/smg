@@ -126,7 +126,7 @@ impl Call {
             Some(CallSyntax::Keyed(tags)) => {
                 Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))
             }
-            Some(CallSyntax::Pythonic) => Self::Pythonic(pythonic::Assembler::new(index)),
+            Some(CallSyntax::Pythonic(_)) => Self::Pythonic(pythonic::Assembler::new(index)),
             Some(CallSyntax::JsonList) => Self::JsonList(json::list::Assembler::new(index)),
             Some(CallSyntax::Xml) => Self::Xml(tagged::xml::Assembler::new(index, id)),
             Some(CallSyntax::Xtml) => Self::Xtml(tagged::xtml::Assembler::new(index, id)),

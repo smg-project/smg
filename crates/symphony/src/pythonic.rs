@@ -52,6 +52,17 @@ use crate::{
     tagged::value::{json, python_literal},
 };
 
+/// How a template frames the calls of one turn, which the grammar derived from the table writes
+/// and the assembler, which reads either, does not need: Olmo 3 writes them one per line between
+/// its markers, LFM2.5 as a Python list, `[` and `]` around calls joined by `, `.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Framing {
+    /// One call per line: `get_weather(city="Paris")\nget_stock_price()`.
+    OnePerLine,
+    /// A Python list: `[get_weather(city='Paris'), get_stock_price()]`.
+    List,
+}
+
 const TEXT_BETWEEN_CALLS: &str = "text where a call should begin";
 const TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN: &str = "text where an argument should begin";
 const NAME_WITHOUT_A_CALL: &str = "a name without a call";

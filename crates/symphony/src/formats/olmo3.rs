@@ -3,7 +3,10 @@
 //! A turn opens with `<|im_start|>assistant`, so the prompt's replay starts there. Recorded as
 //! `olmo-3-7b-instruct` (allenai/Olmo-3-7B-Instruct).
 
-use crate::format::{CallSyntax, Emits, Format};
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    pythonic::Framing,
+};
 
 /// The Olmo 3 table.
 pub fn olmo3() -> Format {
@@ -14,7 +17,7 @@ pub fn olmo3() -> Format {
         .state("calls", Emits::Arguments)
         .transition("content", "calls_open", "calls")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::Pythonic)
+        .calls(CallSyntax::Pythonic(Framing::OnePerLine))
         .opens_turn("<|im_start|>assistant")
 }
 
