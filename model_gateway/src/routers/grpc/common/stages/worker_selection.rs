@@ -11,7 +11,6 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
-use llm_multimodal::Modality;
 use tracing::{debug, error, warn};
 
 use super::{helpers, PipelineStage};
@@ -314,12 +313,13 @@ impl WorkerSelectionStage {
         let intermediate = ctx.state.multimodal_intermediate.as_ref();
         // Media references only go to workers that advertise worker-side processing.
         let media_refs = ctx.state.multimodal_refs.is_some();
-        // A disaggregated leg a worker that accepts no vision input cannot take
-        // is kept off such workers (see `VisionDemand`).
-        let pixel_media =
-            self.prefill_leg_needs_vision(intermediate, ctx.state.multimodal_refs.as_ref());
+        // Pixel media (an image or a video) only goes to workers that accept
+        // vision input: regular mode's single worker takes the whole request,
+        // and the disaggregated legs their shares of it (see `VisionDemand`).
+        let needs_vision =
+            multimodal::request_needs_vision(intermediate, ctx.state.multimodal_refs.as_ref());
         let demand = VisionDemand::new(
-            pixel_media,
+            self.prefill_leg_needs_vision(needs_vision),
             self.decode_leg_needs_vision(&ctx.input.request_type, intermediate, media_refs),
         )
         .with_media_refs(media_refs);
@@ -358,7 +358,7 @@ impl WorkerSelectionStage {
             token_ids: ids.to_vec(),
             rid_key: rid_key.clone(),
             cache_namespace,
-            needs_vision: pixel_media,
+            needs_vision,
             decode_needs_vision: demand.decode,
         });
         let rid_key = rid_key.as_deref();
@@ -382,6 +382,17 @@ impl WorkerSelectionStage {
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
             });
+        // The single worker takes the whole request, so it must meet every
+        // demand of the request's media. The disaggregated legs take the
+        // media-refs predicate from here and their vision demands from
+        // `VisionDemand` in the pair selection: the prefill leg's for any
+        // pixel media, the decode leg's for what a stripped leg cannot serve.
+        let media = MediaDemands {
+            media_refs,
+            vision: needs_vision,
+        };
+        let accepts_media = |worker: &dyn Worker| media.accepts(worker);
+        let media_filter: Option<CandidateFilter<'_>> = media.any().then_some(&accepts_media);
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(
@@ -392,7 +403,7 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     wire,
-                    media_refs.then_some(ACCEPTS_MEDIA_REFS),
+                    media_filter,
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
@@ -400,7 +411,7 @@ impl WorkerSelectionStage {
                             model_id,
                             &[WorkerType::Regular],
                             wire,
-                            media_refs,
+                            media,
                         ))
                     }
                 }
@@ -541,9 +552,14 @@ impl WorkerSelectionStage {
         let cache_namespace = ctx.routing.cache_namespace;
         let headers = ctx.headers.as_ref();
         let model_id = ctx.model_id.as_str();
-        // The retained wire carries the media-refs pin; the helpers derive it.
+        // The retained wire carries the media-refs pin (the helpers derive it)
+        // and the routing snapshot the pixel-media fact.
         let wire = Some(ctx.wire);
         let media_refs = ctx.wire.requires_media_refs;
+        let media = MediaDemands {
+            media_refs: false,
+            vision: ctx.routing.needs_vision,
+        };
         // A retry skips the workers that already answered this request
         // definitively (see `routers::common::attempt_ledger`).
         let ledger = &ctx.ledger;
@@ -551,6 +567,7 @@ impl WorkerSelectionStage {
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
+                let admits_media = |worker: &dyn Worker| admits(worker) && media.accepts(worker);
                 match self.select_single_worker_for_attempt(
                     model_id,
                     text,
@@ -559,7 +576,7 @@ impl WorkerSelectionStage {
                     rid_key,
                     cache_namespace,
                     wire,
-                    Some(&admits),
+                    Some(&admits_media),
                     &ctx.tried,
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
@@ -568,7 +585,7 @@ impl WorkerSelectionStage {
                             model_id,
                             &[WorkerType::Regular],
                             wire,
-                            false,
+                            media,
                         ))
                     }
                 }
@@ -594,7 +611,7 @@ impl WorkerSelectionStage {
                         wire,
                         media_refs,
                         VisionDemand::new(
-                            ctx.routing.needs_vision,
+                            self.prefill_leg_needs_vision(ctx.routing.needs_vision),
                             ctx.routing.decode_needs_vision,
                         )
                         .with_media_refs(media_refs),
@@ -626,17 +643,14 @@ impl WorkerSelectionStage {
             && decode_needs_vision(request, intermediate, media_refs)
     }
 
-    /// Whether this stage's prefill leg needs a vision encoder for the
-    /// request ([`carries_pixel_media`]), recorded in the routing snapshot
-    /// and paired under: in prefill/decode mode only, where the prefill leg
-    /// takes the request's media whole. In encode/prefill/decode mode the
-    /// encode workers take the pixels; regular mode has no prefill leg.
-    fn prefill_leg_needs_vision(
-        &self,
-        intermediate: Option<&multimodal::MultimodalIntermediate>,
-        refs: Option<&multimodal::MediaPlan>,
-    ) -> bool {
-        self.mode == WorkerSelectionMode::PrefillDecode && carries_pixel_media(intermediate, refs)
+    /// Whether this stage's prefill leg needs a vision encoder for a request
+    /// that carries pixel media (`needs_vision`, see
+    /// [`multimodal::request_needs_vision`]), paired under in prefill/decode
+    /// mode only, where the prefill leg takes the request's media whole. In
+    /// encode/prefill/decode mode the encode workers take the pixels; regular
+    /// mode holds its single worker to the demand itself ([`MediaDemands`]).
+    fn prefill_leg_needs_vision(&self, needs_vision: bool) -> bool {
+        self.mode == WorkerSelectionMode::PrefillDecode && needs_vision
     }
 
     /// Select a PD pair and take its Prefill admission slot. With admission
@@ -697,7 +711,7 @@ impl WorkerSelectionStage {
                 } else {
                     &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
                 };
-                self.selection_failure(model_id, legs, None, false)
+                self.selection_failure(model_id, legs, None, MediaDemands::NONE)
             })
         })
     }
@@ -769,9 +783,10 @@ fn accepts_media_refs(worker: &dyn Worker) -> bool {
     multimodal::worker_accepts_media_refs(worker)
 }
 
-/// Candidate predicate for a request whose disaggregated decode leg needs a
-/// vision encoder: a worker that advertises none (`supports_vision=false`)
-/// cannot take it. A worker without the label reads as capable, as today.
+/// Candidate predicate for a request, or a disaggregated leg of one, that
+/// needs a vision encoder: a worker that advertises none
+/// (`supports_vision=false`) admits such a request and never schedules it. A
+/// worker without the label reads as capable, as today.
 fn vision_capable(worker: &dyn Worker) -> bool {
     !multimodal::worker_language_model_only(worker)
 }
@@ -792,23 +807,6 @@ fn decode_needs_vision(
     media_refs
         || intermediate
             .is_some_and(|intermediate| request.sampling_n() > 1 || intermediate.has_mrope_grids())
-}
-
-/// Whether a request carries an image or a video, the inputs a vision
-/// encoder takes: among its router-processed batches (`intermediate`) or in
-/// the media-reference plan the workers expand themselves (`refs`). Audio
-/// is not one: an engine may take it with its visual inputs disabled.
-fn carries_pixel_media(
-    intermediate: Option<&multimodal::MultimodalIntermediate>,
-    refs: Option<&multimodal::MediaPlan>,
-) -> bool {
-    let pixel = |modality: Modality| matches!(modality, Modality::Image | Modality::Video);
-    intermediate.is_some_and(|intermediate| {
-        intermediate
-            .batches()
-            .iter()
-            .any(|batch| pixel(batch.media.modality()))
-    }) || refs.is_some_and(|plan| plan.modalities().iter().copied().any(pixel))
 }
 
 /// Which legs of a disaggregated request need a worker with a vision
@@ -832,7 +830,7 @@ struct VisionDemand {
 
 impl VisionDemand {
     /// The demand of a request that carries pixel media (`pixel_media`, see
-    /// [`carries_pixel_media`]) and whose decode leg needs the encoder
+    /// [`multimodal::request_needs_vision`]) and whose decode leg needs the encoder
     /// (`decode`, see [`decode_needs_vision`]).
     fn new(pixel_media: bool, decode: bool) -> Self {
         Self {
@@ -891,6 +889,45 @@ fn pair_admitted_by(
         })
 }
 
+/// What a request's media demands of a regular-mode candidate, beyond the
+/// pool and the wire. Across a retry the wire pin carries the media-refs
+/// demand and the routing snapshot the vision one; [`Self::with_wire`] folds
+/// the pin in for the verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MediaDemands {
+    /// Media references are forwarded: only a worker that processes them
+    /// itself ([`accepts_media_refs`]).
+    media_refs: bool,
+    /// Pixel media is carried: only a worker with a vision encoder
+    /// ([`vision_capable`]).
+    vision: bool,
+}
+
+impl MediaDemands {
+    /// No demand: every worker of the pool qualifies.
+    const NONE: Self = Self {
+        media_refs: false,
+        vision: false,
+    };
+
+    /// These demands plus the retained plan's media-refs pin on a retry.
+    fn with_wire(self, wire: Option<WireConstraint>) -> Self {
+        Self {
+            media_refs: self.media_refs || wire.is_some_and(|w| w.requires_media_refs),
+            vision: self.vision,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.media_refs || self.vision
+    }
+
+    /// Whether `worker` meets every demand.
+    fn accepts(self, worker: &dyn Worker) -> bool {
+        (!self.media_refs || accepts_media_refs(worker)) && (!self.vision || vision_capable(worker))
+    }
+}
+
 /// Runtime of the leg that builds the generate request: the sole worker in
 /// regular mode, the prefill worker in disaggregated (PD/EPD) mode.
 fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
@@ -912,16 +949,18 @@ impl WorkerSelectionStage {
     /// `wire` narrows the verdict to the retained plan's runtime/transport on
     /// the retry path: a drained pinned pool must not answer 404 just because
     /// other runtimes still serve the model.
+    /// `media` are the request's media demands: a leg with candidates but
+    /// none meeting them is a capability verdict ([`Self::media_failure`]).
     fn selection_failure(
         &self,
         model_id: &str,
         legs: &[WorkerType],
         wire: Option<WireConstraint>,
-        media_refs: bool,
+        media: MediaDemands,
     ) -> Response {
-        let media_refs = media_refs || wire.is_some_and(|w| w.requires_media_refs);
-        if media_refs {
-            return self.media_refs_failure(model_id, legs, wire);
+        let media = media.with_wire(wire);
+        if media.any() {
+            return self.media_failure(model_id, legs, wire, media);
         }
         let mut unavailable = false;
         for leg in legs {
@@ -967,15 +1006,18 @@ impl WorkerSelectionStage {
         error::model_not_found(model_id)
     }
 
-    /// Selection failure for a request carrying media references, judged
-    /// from the capability-filtered pool: an absent model stays 404, an
-    /// overloaded capable pool keeps its shed, and only a leg with candidates
-    /// but no capable one is the capability shed.
-    fn media_refs_failure(
+    /// Selection failure for a request with media demands, judged from the
+    /// capability-filtered pool: an absent model stays 404, an overloaded
+    /// capable pool keeps its shed, and only a leg with candidates but no
+    /// capable one is a capability verdict. The vision encoder is judged
+    /// first: a pool with no worker that can take the request's pixels is
+    /// the request's own 400, whichever workers process references.
+    fn media_failure(
         &self,
         model_id: &str,
         legs: &[WorkerType],
         wire: Option<WireConstraint>,
+        media: MediaDemands,
     ) -> Response {
         let mut unavailable = false;
         for leg in legs {
@@ -990,10 +1032,17 @@ impl WorkerSelectionStage {
             if candidates.is_empty() {
                 continue;
             }
-            let capable: Vec<Arc<dyn Worker>> = candidates
+            let vision_capable: Vec<Arc<dyn Worker>> = candidates
                 .iter()
-                .filter(|w| accepts_media_refs(w.as_ref()))
+                .filter(|w| !media.vision || vision_capable(w.as_ref()))
                 .cloned()
+                .collect();
+            if vision_capable.is_empty() {
+                return self.vision_refusal(model_id, "workers");
+            }
+            let capable: Vec<Arc<dyn Worker>> = vision_capable
+                .into_iter()
+                .filter(|w| !media.media_refs || accepts_media_refs(w.as_ref()))
                 .collect();
             if capable.is_empty() {
                 return self.media_refs_shed(model_id);
@@ -1164,28 +1213,31 @@ impl WorkerSelectionStage {
             PdSelectionFailure::Placement(failure) => {
                 self.pd_pair_failure(model_id, *failure, media_refs)
             }
-            PdSelectionFailure::NoVisionCapablePrefill => self.vision_refusal(model_id),
+            PdSelectionFailure::NoVisionCapablePrefill => {
+                self.vision_refusal(model_id, "prefill workers")
+            }
         }
     }
 
-    /// A request carrying pixel media for a model that pairs no prefill
-    /// worker with a vision encoder: such a worker admits the request and
-    /// never schedules it, so the request is refused up front, as an
-    /// unsupported modality is. Terminal: the pool's capability does not
-    /// change within a retry window.
-    fn vision_refusal(&self, model_id: &str) -> Response {
+    /// `workers` (the regular pool's, or the prefill leg's) serve the model
+    /// but none has a vision encoder, so none can take the request's images
+    /// or video: the 400 a model without vision gives image input, instead
+    /// of a dispatch the engine admits and never schedules. A 400 is
+    /// terminal for the retry layer by status.
+    fn vision_refusal(&self, model_id: &str, workers: &str) -> Response {
         warn!(
             function = "WorkerSelectionStage::execute",
             mode = ?self.mode,
             model_id = %model_id,
-            "No prefill worker that accepts vision input for a request carrying pixel media"
+            workers,
+            "No worker that accepts vision input for a request carrying pixel media"
         );
         error::bad_request(
             "multimodal_not_supported",
             format!(
                 "image or video input is not supported by model '{model_id}': none of its \
-                 prefill workers accept vision input (the engine runs as a language model only, \
-                 or its servicer does not carry media to it)"
+                 {workers} accept vision input (the engine runs as a language model only, or \
+                 its servicer does not carry media to it)"
             ),
         )
     }
@@ -2118,7 +2170,7 @@ mod tests {
             model_id,
             &[WorkerType::Prefill, WorkerType::Decode],
             None,
-            false,
+            TEXT,
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -2162,7 +2214,7 @@ mod tests {
             model_id,
             &[WorkerType::Prefill, WorkerType::Decode],
             None,
-            false,
+            TEXT,
         );
         assert_eq!(text_only.status(), StatusCode::NOT_FOUND);
 
@@ -2171,7 +2223,7 @@ mod tests {
             model_id,
             &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode],
             None,
-            false,
+            TEXT,
         );
         assert_eq!(with_encode.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -2192,7 +2244,7 @@ mod tests {
                     "nobody",
                     &[WorkerType::Prefill, WorkerType::Decode],
                     None,
-                    false
+                    TEXT
                 )
                 .status(),
             StatusCode::NOT_FOUND
@@ -2445,7 +2497,7 @@ mod tests {
             "the veto empties the candidate pool"
         );
 
-        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, false);
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, TEXT);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             extract_error_code_from_response(&response),
@@ -2460,7 +2512,7 @@ mod tests {
             .is_some());
         assert_eq!(
             stage
-                .selection_failure("no-such-model", &[WorkerType::Regular], None, false)
+                .selection_failure("no-such-model", &[WorkerType::Regular], None, TEXT)
                 .status(),
             StatusCode::NOT_FOUND
         );
@@ -2497,7 +2549,7 @@ mod tests {
             .select_single_worker(model_id, None, None, None, None, None, None, None)
             .is_none());
 
-        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, false);
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, TEXT);
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -2508,7 +2560,7 @@ mod tests {
         // A model nobody serves stays a 404.
         assert_eq!(
             stage
-                .selection_failure("no-such-model", &[WorkerType::Regular], None, false)
+                .selection_failure("no-such-model", &[WorkerType::Regular], None, TEXT)
                 .status(),
             StatusCode::NOT_FOUND
         );
@@ -2541,7 +2593,7 @@ mod tests {
             model_id,
             &[WorkerType::Prefill, WorkerType::Decode],
             None,
-            false,
+            TEXT,
         );
         let pair = stage.pair_failure(
             model_id,
@@ -3083,7 +3135,7 @@ mod tests {
                 Some(ACCEPTS_MEDIA_REFS),
             )
             .is_none());
-        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, REFS);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -3102,15 +3154,385 @@ mod tests {
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
             .is_none());
-        let response = stage.selection_failure(model_id, &[WorkerType::Regular], Some(wire), false);
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], Some(wire), TEXT);
         assert_eq!(
             error::extract_error_code_from_response(&response),
             "no_media_ref_capable_worker"
         );
 
         // An absent model stays a 404 even in worker mode.
-        let response = stage.selection_failure("no-such-model", &[WorkerType::Regular], None, true);
+        let response = stage.selection_failure("no-such-model", &[WorkerType::Regular], None, REFS);
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The media demands of a text request, of media references, and of
+    /// pixel media.
+    const TEXT: MediaDemands = MediaDemands::NONE;
+    const REFS: MediaDemands = MediaDemands {
+        media_refs: true,
+        vision: false,
+    };
+    const VISION: MediaDemands = MediaDemands {
+        media_refs: false,
+        vision: true,
+    };
+    /// The label of a worker without a vision encoder, of one with it, and
+    /// of one whose servicer gave no verdict.
+    const LANGUAGE_MODEL_ONLY: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "false")];
+    const WITH_VISION: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "true")];
+    const NO_VERDICT: &[(&str, &str)] = &[];
+
+    fn labeled_grpc_worker(url: &str, model_id: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .model(ModelCard::new(model_id))
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::Vllm)
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check());
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        Arc::new(builder.build())
+    }
+
+    fn regular_round_robin_stage(worker_registry: &Arc<WorkerRegistry>) -> WorkerSelectionStage {
+        WorkerSelectionStage::new(
+            Arc::clone(worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        )
+    }
+
+    fn urls_seen(stage: &WorkerSelectionStage, model_id: &str, media: MediaDemands) -> Vec<String> {
+        let accepts = |worker: &dyn Worker| media.accepts(worker);
+        let filter: Option<CandidateFilter<'_>> = media.any().then_some(&accepts);
+        let mut seen = HashMap::new();
+        for _ in 0..6 {
+            let worker = stage
+                .select_single_worker(model_id, None, None, None, None, None, None, filter)
+                .expect("a worker is selectable");
+            *seen.entry(worker.url().to_string()).or_insert(0) += 1;
+        }
+        let mut urls: Vec<String> = seen.into_keys().collect();
+        urls.sort();
+        urls
+    }
+
+    /// Pixel media never reaches a worker labeled without a vision encoder:
+    /// in a mixed pool every image request lands on a worker with one or
+    /// without a verdict, while a text request still uses the whole pool.
+    #[test]
+    fn pixel_media_selection_skips_language_model_only_workers() {
+        let model_id = "test-model-pixel-media-mixed";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, labels) in [
+            ("grpc://127.0.0.1:8760", LANGUAGE_MODEL_ONLY),
+            ("grpc://127.0.0.1:8761", WITH_VISION),
+            ("grpc://127.0.0.1:8762", NO_VERDICT),
+        ] {
+            worker_registry
+                .register(labeled_grpc_worker(url, model_id, labels))
+                .unwrap();
+        }
+        let stage = regular_round_robin_stage(&worker_registry);
+
+        assert_eq!(
+            urls_seen(&stage, model_id, VISION),
+            ["grpc://127.0.0.1:8761", "grpc://127.0.0.1:8762"],
+            "an image goes to the worker with the encoder or without a verdict"
+        );
+        assert_eq!(
+            urls_seen(&stage, model_id, TEXT),
+            [
+                "grpc://127.0.0.1:8760",
+                "grpc://127.0.0.1:8761",
+                "grpc://127.0.0.1:8762"
+            ],
+            "a text request uses the whole pool"
+        );
+    }
+
+    /// With no worker with a vision encoder serving the model, an image
+    /// request is refused at once with the modality 400 a model without
+    /// vision gives, not dispatched to a worker that never schedules it and
+    /// not the 503 of an unavailable pool; the same worker still serves text,
+    /// and an absent model stays a 404.
+    #[test]
+    fn pixel_media_selection_refuses_when_no_worker_has_a_vision_encoder() {
+        let model_id = "test-model-pixel-media-none";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry
+            .register(labeled_grpc_worker(
+                "grpc://127.0.0.1:8770",
+                model_id,
+                LANGUAGE_MODEL_ONLY,
+            ))
+            .unwrap();
+        let stage = regular_round_robin_stage(&worker_registry);
+
+        assert!(stage
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&vision_capable),
+            )
+            .is_none());
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, VISION);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "multimodal_not_supported"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "capability cannot change inside a retry window"
+        );
+
+        assert_eq!(
+            urls_seen(&stage, model_id, TEXT),
+            ["grpc://127.0.0.1:8770"],
+            "text still goes to the language-model-only worker"
+        );
+
+        let response =
+            stage.selection_failure("no-such-model", &[WorkerType::Regular], None, VISION);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A vision-capable worker that is merely overloaded keeps the overload
+    /// verdict, with the language-model-only worker still out of the
+    /// candidates: the refusal is for a pool that cannot take pixels at all.
+    #[test]
+    fn pixel_media_overloaded_vision_workers_keep_the_overload_shed() {
+        let model_id = "test-model-pixel-media-overload";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.set_overload_shed(true);
+        worker_registry
+            .register(labeled_grpc_worker(
+                "grpc://127.0.0.1:8780",
+                model_id,
+                LANGUAGE_MODEL_ONLY,
+            ))
+            .unwrap();
+        let capable = labeled_grpc_worker("grpc://127.0.0.1:8781", model_id, WITH_VISION);
+        worker_registry.register(Arc::clone(&capable)).unwrap();
+        let stage = regular_round_robin_stage(&worker_registry);
+        worker_registry.set_worker_overloaded(&capable, true);
+
+        assert!(stage
+            .select_single_worker(
+                model_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&vision_capable),
+            )
+            .is_none());
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, VISION);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(
+            error::extract_error_code_from_response(&response),
+            "multimodal_not_supported"
+        );
+        assert!(response.headers().contains_key(RETRY_AFTER));
+    }
+
+    /// Pixel media forwarded as references needs both capabilities; the
+    /// verdicts are judged vision first: a pool whose reference-processing
+    /// workers all lack the encoder but which has an encoder elsewhere is the
+    /// media-refs shed, one with no encoder at all the modality refusal.
+    #[test]
+    fn pixel_media_as_references_needs_both_capabilities() {
+        let both = MediaDemands {
+            media_refs: true,
+            vision: true,
+        };
+        let refs_with_vision = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+            (multimodal::SUPPORTS_VISION_LABEL, "true"),
+        ];
+        let refs_without_vision = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+            (multimodal::SUPPORTS_VISION_LABEL, "false"),
+        ];
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let stage = regular_round_robin_stage(&worker_registry);
+
+        let mixed = "test-model-pixel-refs-mixed";
+        for (url, labels) in [
+            ("grpc://127.0.0.1:8790", &refs_with_vision[..]),
+            ("grpc://127.0.0.1:8791", &refs_without_vision[..]),
+            ("grpc://127.0.0.1:8792", WITH_VISION),
+        ] {
+            worker_registry
+                .register(labeled_grpc_worker(url, mixed, labels))
+                .unwrap();
+        }
+        assert_eq!(urls_seen(&stage, mixed, both), ["grpc://127.0.0.1:8790"]);
+
+        let no_capable_refs = "test-model-pixel-refs-shed";
+        for (url, labels) in [
+            ("grpc://127.0.0.1:8793", &refs_without_vision[..]),
+            ("grpc://127.0.0.1:8794", WITH_VISION),
+        ] {
+            worker_registry
+                .register(labeled_grpc_worker(url, no_capable_refs, labels))
+                .unwrap();
+        }
+        let response = stage.selection_failure(no_capable_refs, &[WorkerType::Regular], None, both);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker"
+        );
+
+        let no_vision = "test-model-pixel-refs-refused";
+        worker_registry
+            .register(labeled_grpc_worker(
+                "grpc://127.0.0.1:8795",
+                no_vision,
+                &refs_without_vision,
+            ))
+            .unwrap();
+        let response = stage.selection_failure(no_vision, &[WorkerType::Regular], None, both);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "multimodal_not_supported"
+        );
+    }
+
+    /// The retry path re-selects under the snapshot's pixel-media fact:
+    /// a retried image request stays off the language-model-only worker.
+    #[tokio::test]
+    async fn reselect_keeps_pixel_media_off_language_model_only_workers() {
+        let model_id = "test-model-pixel-media-reselect";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry
+            .register(labeled_grpc_worker(
+                "grpc://127.0.0.1:8800",
+                model_id,
+                LANGUAGE_MODEL_ONLY,
+            ))
+            .unwrap();
+        worker_registry
+            .register(labeled_grpc_worker(
+                "grpc://127.0.0.1:8801",
+                model_id,
+                WITH_VISION,
+            ))
+            .unwrap();
+        let stage = regular_round_robin_stage(&worker_registry);
+        let wire = WireConstraint {
+            runtime: RuntimeType::Vllm,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+        };
+
+        let stage = &stage;
+        let reselected = |needs_vision: bool| async move {
+            let mut seen = HashMap::new();
+            for _ in 0..4 {
+                let mut ctx = dispatch_ctx(model_id, wire);
+                ctx.routing.needs_vision = needs_vision;
+                stage
+                    .reselect(&mut ctx)
+                    .await
+                    .expect("re-selection succeeds");
+                match ctx.workers.expect("a worker is selected") {
+                    WorkerSelection::Single { worker } => {
+                        *seen.entry(worker.url().to_string()).or_insert(0) += 1;
+                    }
+                    WorkerSelection::Disaggregated { .. } => panic!("regular mode selects one"),
+                }
+            }
+            let mut urls: Vec<String> = seen.into_keys().collect();
+            urls.sort();
+            urls
+        };
+        assert_eq!(reselected(true).await, ["grpc://127.0.0.1:8801"]);
+        assert_eq!(
+            reselected(false).await,
+            ["grpc://127.0.0.1:8800", "grpc://127.0.0.1:8801"]
+        );
+    }
+
+    /// The stage reads the demand off the request's media: an image
+    /// forwarded as a reference selects a reference-processing worker with a
+    /// vision encoder and the routing snapshot carries the fact for retries,
+    /// while a text request uses the whole pool.
+    #[tokio::test]
+    async fn execute_keeps_an_image_request_off_language_model_only_workers() {
+        use llm_multimodal::MediaContentPart;
+
+        let registry = Arc::new(WorkerRegistry::new());
+        for (url, verdict) in [
+            ("grpc://127.0.0.1:8810", "false"),
+            ("grpc://127.0.0.1:8811", "true"),
+        ] {
+            let labels = [
+                ("mm_processor", "inprocess"),
+                ("mm_media_ref_schemes", "http,https,data"),
+                (multimodal::SUPPORTS_VISION_LABEL, verdict),
+            ];
+            registry
+                .register(labeled_grpc_worker(url, "test-model", &labels))
+                .unwrap();
+        }
+        let stage = regular_stage(Arc::clone(&registry));
+        let image = multimodal::MediaPlan::new([MediaContentPart::ImageUrl {
+            url: "data:image/png;base64,AAAA".to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }]);
+
+        for _ in 0..4 {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            ctx.state.multimodal_refs = Some(image.clone());
+            stage
+                .execute(&mut ctx)
+                .await
+                .expect("an image request selects");
+            match ctx.state.workers.as_ref().expect("a worker is selected") {
+                WorkerSelection::Single { worker } => {
+                    assert_eq!(worker.url(), "grpc://127.0.0.1:8811");
+                }
+                WorkerSelection::Disaggregated { .. } => panic!("regular mode selects one"),
+            }
+            let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
+            assert!(snapshot.needs_vision);
+        }
+
+        let mut seen = HashMap::new();
+        for _ in 0..4 {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            stage
+                .execute(&mut ctx)
+                .await
+                .expect("a text request selects");
+            if let Some(WorkerSelection::Single { worker }) = ctx.state.workers.as_ref() {
+                *seen.entry(worker.url().to_string()).or_insert(0) += 1;
+            }
+            let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
+            assert!(!snapshot.needs_vision);
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "a text request uses the whole pool: {seen:?}"
+        );
     }
 
     /// The steering default: with every worker over the thresholds the gRPC
@@ -3221,7 +3643,7 @@ mod tests {
                 Some(ACCEPTS_MEDIA_REFS),
             )
             .is_none());
-        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, true);
+        let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, REFS);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_ne!(
             error::extract_error_code_from_response(&response),
@@ -3439,9 +3861,9 @@ mod tests {
     fn vision_demand_follows_the_request_s_media() {
         use llm_multimodal::MediaContentPart;
 
-        assert!(!carries_pixel_media(None, None), "text");
+        assert!(!multimodal::request_needs_vision(None, None), "text");
         assert!(
-            carries_pixel_media(Some(&image_intermediate(None)), None),
+            multimodal::request_needs_vision(Some(&image_intermediate(None)), None),
             "a processed image"
         );
         let image_refs = multimodal::MediaPlan::new([MediaContentPart::ImageUrl {
@@ -3451,11 +3873,11 @@ mod tests {
             max_long_side_pixel: None,
         }]);
         assert!(
-            carries_pixel_media(None, Some(&image_refs)),
+            multimodal::request_needs_vision(None, Some(&image_refs)),
             "a referenced image"
         );
         assert!(
-            !carries_pixel_media(None, Some(&multimodal::MediaPlan::default())),
+            !multimodal::request_needs_vision(None, Some(&multimodal::MediaPlan::default())),
             "an empty plan"
         );
 
@@ -3486,16 +3908,13 @@ mod tests {
                 None,
             )
         };
-        let plain = image_intermediate(None);
+        assert!(stage(WorkerSelectionMode::PrefillDecode).prefill_leg_needs_vision(true));
         assert!(
-            stage(WorkerSelectionMode::PrefillDecode).prefill_leg_needs_vision(Some(&plain), None)
-        );
-        assert!(
-            !stage(WorkerSelectionMode::EncodePrefillDecode)
-                .prefill_leg_needs_vision(Some(&plain), None),
+            !stage(WorkerSelectionMode::EncodePrefillDecode).prefill_leg_needs_vision(true),
             "the encode workers take the pixels"
         );
-        assert!(!stage(WorkerSelectionMode::Regular).prefill_leg_needs_vision(Some(&plain), None));
+        assert!(!stage(WorkerSelectionMode::Regular).prefill_leg_needs_vision(true));
+        assert!(!stage(WorkerSelectionMode::PrefillDecode).prefill_leg_needs_vision(false));
 
         let prefill = pd_worker("grpc://127.0.0.1:9000", "m", WorkerType::Prefill, UNLABELED);
         let decode = pd_worker("grpc://127.0.0.1:9001", "m", WorkerType::Decode, UNLABELED);

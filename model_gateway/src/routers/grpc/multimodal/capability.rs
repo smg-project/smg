@@ -58,9 +58,8 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
 /// model with no workers. So does a mixed pool (some workers with the vision
 /// encoder, some without, or unlabeled: a rolling redeploy, or the vision
 /// workers unhealthy): its image requests go on to worker selection, which
-/// does not consult the label yet, so one can still land on a worker that
-/// never schedules it; keeping such workers out of the candidates is the
-/// follow-up smg-project/smg-lab#186.
+/// keeps them off the workers without the encoder ([`request_needs_vision`]
+/// is the demand) and refuses them the same way once no candidate has one.
 pub(crate) fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
     let workers = registry.get_by_model(model_id);
     !workers.is_empty()
@@ -78,7 +77,7 @@ fn pixel_modalities(plan: &MediaPlan) -> Vec<Modality> {
     plan.modalities()
         .iter()
         .copied()
-        .filter(|modality| matches!(modality, Modality::Image | Modality::Video))
+        .filter(|modality| is_pixel_modality(*modality))
         .collect()
 }
 
@@ -156,6 +155,32 @@ pub(crate) fn ensure_backend_supports_modalities(
     Ok(())
 }
 
+/// Whether `modality` is a pixel payload that needs a vision encoder: image
+/// or video, the inputs the `supports_vision` label speaks for. Audio and
+/// pre-computed image embeddings are not: an engine may take those with its
+/// visual inputs disabled, and whether a runtime takes them at all is
+/// [`runtime_supports_modality`]'s call.
+pub(crate) fn is_pixel_modality(modality: Modality) -> bool {
+    matches!(modality, Modality::Image | Modality::Video)
+}
+
+/// Whether a request needs a worker with a vision encoder: a pixel modality
+/// among its decoded batches (`intermediate`, router-side processing) or in
+/// its media-reference plan (`refs`, worker-side processing). A worker
+/// without one ([`worker_language_model_only`]) admits such a request and
+/// never schedules it, so worker selection keeps the request off it.
+pub(crate) fn request_needs_vision(
+    intermediate: Option<&MultimodalIntermediate>,
+    refs: Option<&MediaPlan>,
+) -> bool {
+    let decoded = intermediate
+        .into_iter()
+        .flat_map(MultimodalIntermediate::batches)
+        .map(|batch| batch.media.modality());
+    let referenced = refs.into_iter().flat_map(MediaPlan::modalities).copied();
+    decoded.chain(referenced).any(is_pixel_modality)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +235,44 @@ mod tests {
                 assert!(!runtime_supports_modality(runtime, modality));
             }
         }
+    }
+
+    /// Only image and video need a vision encoder; audio and pre-computed
+    /// embeddings go by the runtime matrix alone.
+    #[test]
+    fn pixel_modalities_are_image_and_video() {
+        assert!(is_pixel_modality(Modality::Image));
+        assert!(is_pixel_modality(Modality::Video));
+        assert!(!is_pixel_modality(Modality::Audio));
+        assert!(!is_pixel_modality(Modality::ImageEmbeds));
+    }
+
+    /// A request needs vision for an image among its decoded batches or in
+    /// its reference plan, and not for audio alone or for no media at all.
+    #[test]
+    fn request_needs_vision_for_pixel_media_only() {
+        use llm_multimodal::MediaContentPart;
+
+        assert!(!request_needs_vision(None, None));
+
+        let decoded = single_image_intermediate();
+        assert!(request_needs_vision(Some(&decoded), None));
+
+        let audio = MediaPlan::new([MediaContentPart::AudioUrl {
+            url: "data:audio/wav;base64,AAAA".to_string(),
+            uuid: None,
+        }]);
+        assert!(!audio.is_empty());
+        assert!(!request_needs_vision(None, Some(&audio)));
+
+        let image = MediaPlan::new([MediaContentPart::ImageUrl {
+            url: "data:image/png;base64,AAAA".to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }]);
+        assert!(request_needs_vision(None, Some(&image)));
+        assert!(!request_needs_vision(None, Some(&MediaPlan::default())));
     }
 
     fn single_image_intermediate() -> MultimodalIntermediate {
