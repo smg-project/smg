@@ -10,10 +10,11 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use llm_tokenizer::{
     cache::{CacheConfig, CachedTokenizer},
     factory,
-    registry::LoadOutcome,
+    registry::{LoadOutcome, TokenizerRegistry},
     traits::Tokenizer,
 };
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,100 @@ pub struct TokenizerConfigRequest {
 pub struct TokenizerRemovalRequest {
     /// UUID of the tokenizer to remove
     pub id: String,
+}
+
+/// Why a served model's tokenizer will not register on its own: the terminal
+/// outcome of its load, kept per model so that a request for the model is
+/// answered with that fact (503 `tokenizer_load_failed`, no `Retry-After`)
+/// instead of the retry hint of a load still in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenizerLoadFailure {
+    /// Nothing to load from: neither `tokenizer_path` nor `model_path` among
+    /// the worker's labels, and no `--tokenizer-path` or `--model-path` in
+    /// the router configuration.
+    NoSource,
+    /// The registration workflow failed; its error, for the log.
+    Failed(String),
+}
+
+impl TokenizerLoadFailure {
+    /// The reason as a response names it: the class only, never a path or an
+    /// error text (the gateway's log line for the model has those).
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::NoSource => {
+                "no tokenizer path in the worker's labels or the router configuration"
+            }
+            Self::Failed(_) => "the load failed; see the gateway log",
+        }
+    }
+}
+
+/// The models whose tokenizer load ended without a tokenizer, by model id. A
+/// model without an entry and without a registered tokenizer is pending (a
+/// load in flight, or none started yet). An entry is made when a load is
+/// skipped for lack of a source or fails for good, and removed when a load
+/// starts or succeeds (a worker re-registering with a usable path, an
+/// operator's `POST /v1/tokenizers`).
+#[derive(Debug, Default)]
+pub struct TokenizerLoadFailures {
+    by_model: DashMap<String, TokenizerLoadFailure>,
+}
+
+impl TokenizerLoadFailures {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the model's failure; `true` when the model was not in that
+    /// state before (the moment to log it: once per model and entry).
+    pub fn record(&self, model: &str, failure: TokenizerLoadFailure) -> bool {
+        self.by_model
+            .insert(model.to_string(), failure.clone())
+            .as_ref()
+            != Some(&failure)
+    }
+
+    /// Forgets the model's failure, a load having started or succeeded;
+    /// `true` when there was one.
+    pub fn clear(&self, model: &str) -> bool {
+        self.by_model.remove(model).is_some()
+    }
+
+    /// The model's recorded failure, if its last load ended in one.
+    pub fn get(&self, model: &str) -> Option<TokenizerLoadFailure> {
+        self.by_model.get(model).map(|entry| entry.clone())
+    }
+}
+
+/// Notes the outcome of a tokenizer registration job for `model` (the
+/// autoload a worker's registration starts and an operator's request alike):
+/// a success clears the model's record; a failure is recorded, and logged
+/// once per model and entry, unless the registry holds a tokenizer for the
+/// model anyway (a duplicate registration fails without taking anything
+/// away). Requests for a recorded model are answered 503
+/// `tokenizer_load_failed` without a retry hint until a tokenizer registers.
+pub fn note_tokenizer_load_outcome(
+    failures: &TokenizerLoadFailures,
+    registry: &TokenizerRegistry,
+    model: &str,
+    result: &Result<String, String>,
+) {
+    match result {
+        Ok(_) => {
+            failures.clear(model);
+        }
+        Err(_) if registry.contains(model) => {}
+        Err(error) => {
+            if failures.record(model, TokenizerLoadFailure::Failed(error.clone())) {
+                warn!(
+                    model = %model,
+                    error = %error,
+                    "Tokenizer load failed for a served model; its requests answer 503 tokenizer_load_failed until a tokenizer is registered"
+                );
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -583,5 +678,54 @@ mod tests {
         workflow
             .validate()
             .expect("Workflow validation should pass");
+    }
+
+    /// A failed load is recorded once per model and entry (the log line's
+    /// allowance), a different reason is a new entry, and the next load,
+    /// starting or succeeding, clears the record.
+    #[test]
+    fn a_load_failure_is_recorded_once_per_entry_and_cleared_by_the_next_load() {
+        let failures = TokenizerLoadFailures::new();
+        let registry = TokenizerRegistry::new();
+        let error = "Workflow failed at step load_tokenizer: boom".to_string();
+        assert_eq!(failures.get("m"), None);
+
+        note_tokenizer_load_outcome(&failures, &registry, "m", &Err(error.clone()));
+        assert_eq!(
+            failures.get("m"),
+            Some(TokenizerLoadFailure::Failed(error.clone()))
+        );
+        assert!(!failures.record("m", TokenizerLoadFailure::Failed(error.clone())));
+        assert!(failures.record("m", TokenizerLoadFailure::NoSource));
+        assert_eq!(failures.get("m"), Some(TokenizerLoadFailure::NoSource));
+        assert_eq!(failures.get("other"), None);
+
+        assert!(failures.clear("m"));
+        assert!(!failures.clear("m"));
+        assert!(failures.record("m", TokenizerLoadFailure::Failed(error.clone())));
+        note_tokenizer_load_outcome(&failures, &registry, "m", &Ok("m completed".to_string()));
+        assert_eq!(failures.get("m"), None);
+    }
+
+    /// A registration that fails for a model whose tokenizer the registry
+    /// holds (a duplicate) takes nothing away and is not recorded.
+    #[tokio::test]
+    async fn a_failed_duplicate_registration_of_a_registered_tokenizer_is_no_failure() {
+        let failures = TokenizerLoadFailures::new();
+        let registry = TokenizerRegistry::new();
+        registry
+            .load("id", "m", "mock", || async {
+                factory::create_tokenizer_with_chat_template("mock", None)
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .expect("the mock tokenizer loads");
+        note_tokenizer_load_outcome(
+            &failures,
+            &registry,
+            "m",
+            &Err("Tokenizer 'm' already exists (id: id)".to_string()),
+        );
+        assert_eq!(failures.get("m"), None);
     }
 }

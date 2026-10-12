@@ -51,6 +51,7 @@ use crate::{
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
     },
+    workflow::TokenizerLoadFailures,
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -204,6 +205,11 @@ pub(crate) struct SharedComponents {
     /// tokenizer is a transient not-ready state (the one `/readiness` reports
     /// as "tokenizer not yet registered"), not a fault of the gateway.
     pub tokenizer_autoload: bool,
+    /// The served models whose tokenizer load was skipped or failed for good,
+    /// as the registration workflow recorded them: a request for one of them
+    /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
+    /// of the not-ready 503 of a load in flight.
+    pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,

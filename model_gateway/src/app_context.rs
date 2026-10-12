@@ -35,7 +35,7 @@ use crate::{
         http_client::build_client, liveness, KvEventMonitor, PrefillAdmission,
         WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
     },
-    workflow::{JobQueue, WorkflowEngines},
+    workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
 /// Error type for AppContext builder
@@ -68,6 +68,11 @@ pub struct AppContext {
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    /// The served models whose tokenizer load was skipped or failed for good:
+    /// written by the tokenizer registration (a worker's autoload, an
+    /// operator's request), read where a request finds no tokenizer for its
+    /// model.
+    pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -487,6 +492,7 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
+            tokenizer_load_failures: Arc::new(TokenizerLoadFailures::new()),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,

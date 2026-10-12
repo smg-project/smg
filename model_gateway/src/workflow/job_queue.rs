@@ -25,9 +25,9 @@ use crate::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        create_worker_workflow_data, McpServerConfigRequest, TokenizerConfigRequest,
-        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode,
+        create_worker_workflow_data, note_tokenizer_load_outcome, McpServerConfigRequest,
+        TokenizerConfigRequest, TokenizerRemovalRequest, WasmModuleConfigRequest,
+        WasmModuleRemovalRequest, WorkerRegistrationMode,
     },
 };
 
@@ -701,34 +701,48 @@ impl JobQueue {
                     .await
             }
             Job::AddTokenizer { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                // A load in flight: the model is pending again until this job
+                // ends, when its outcome is noted for the model (a failure
+                // answers the model's requests 503 tokenizer_load_failed).
+                context.tokenizer_load_failures.clear(&config.name);
+                let result = async {
+                    let engines = context
+                        .workflow_engines
+                        .get()
+                        .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let workflow_data =
-                    create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
+                    let workflow_data =
+                        create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
 
-                let instance_id = engines
-                    .tokenizer
-                    .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_data)
-                    .await
-                    .map_err(|e| {
-                        format!("Failed to start tokenizer registration workflow: {e:?}")
-                    })?;
+                    let instance_id = engines
+                        .tokenizer
+                        .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_data)
+                        .await
+                        .map_err(|e| {
+                            format!("Failed to start tokenizer registration workflow: {e:?}")
+                        })?;
 
-                debug!(
-                    "Started tokenizer registration workflow for '{}' id={} (instance: {})",
-                    config.name, config.id, instance_id
+                    debug!(
+                        "Started tokenizer registration workflow for '{}' id={} (instance: {})",
+                        config.name, config.id, instance_id
+                    );
+
+                    // Allow up to 10 minutes for HuggingFace downloads
+                    let timeout_duration = Duration::from_secs(600);
+
+                    engines
+                        .tokenizer
+                        .wait_for_completion(instance_id, &config.id, timeout_duration)
+                        .await
+                }
+                .await;
+                note_tokenizer_load_outcome(
+                    &context.tokenizer_load_failures,
+                    &context.tokenizer_registry,
+                    &config.name,
+                    &result,
                 );
-
-                // Allow up to 10 minutes for HuggingFace downloads
-                let timeout_duration = Duration::from_secs(600);
-
-                engines
-                    .tokenizer
-                    .wait_for_completion(instance_id, &config.id, timeout_duration)
-                    .await
+                result
             }
             Job::RemoveTokenizer { request } => {
                 // Tokenizer removal is synchronous and fast
