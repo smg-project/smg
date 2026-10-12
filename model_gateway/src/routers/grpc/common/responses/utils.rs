@@ -619,7 +619,6 @@ mod tests {
     /// result is written over the record the client polls and nothing is
     /// linked to the conversation; a foreground `store: false` response
     /// stores nothing at all.
-
     #[tokio::test]
     async fn an_unstored_background_response_finishes_in_its_record_and_the_history_keeps_nothing()
     {
