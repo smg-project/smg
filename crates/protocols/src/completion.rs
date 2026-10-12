@@ -41,7 +41,8 @@ pub struct CompletionRequest {
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Include the log probabilities on the `logprobs` most likely tokens
-    #[validate(range(min = 0, max = 5))]
+    /// (0 to 20, as chat's `top_logprobs`)
+    #[validate(range(min = 0, max = 20))]
     pub logprobs: Option<u32>,
 
     /// The maximum number of tokens to generate
@@ -304,6 +305,66 @@ mod tests {
             .expect("object")
             .append(extra.as_object_mut().expect("object"));
         serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    fn logprobs_body(logprobs: u32) -> Value {
+        serde_json::json!({
+            "model": "m",
+            "prompt": "hello",
+            "echo": true,
+            "logprobs": logprobs,
+            "max_tokens": 1
+        })
+    }
+
+    /// `logprobs` takes up to 20 alternatives, the bound of chat's
+    /// `top_logprobs`; 21 crosses it.
+    #[test]
+    fn logprobs_takes_up_to_20_alternatives() {
+        for logprobs in [0, 5, 20] {
+            let request: CompletionRequest =
+                serde_json::from_value(logprobs_body(logprobs)).expect("request");
+            assert!(request.validate().is_ok(), "logprobs {logprobs}");
+        }
+        let request: CompletionRequest =
+            serde_json::from_value(logprobs_body(21)).expect("request");
+        let errors = request.validate().expect_err("logprobs 21 must be refused");
+        let error = &errors.field_errors()["logprobs"][0];
+        assert_eq!(error.code, "range");
+        assert_eq!(error.params["max"], 20);
+        assert_eq!(error.params["value"], 21);
+    }
+
+    /// Above 20 the body gets the public API's error for a crossed bound.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn logprobs_above_20_is_refused_with_the_public_error() {
+        use axum::{
+            body::Body,
+            extract::{FromRequest, Request},
+            http::StatusCode,
+        };
+
+        use crate::validated::ValidatedJson;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(logprobs_body(21).to_string()))
+            .expect("request");
+        let Err(response) = ValidatedJson::<CompletionRequest>::from_request(request, &()).await
+        else {
+            panic!("logprobs 21 must be refused");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("JSON body");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "integer_above_max_value");
+        assert_eq!(body["error"]["param"], "logprobs");
     }
 
     #[test]
