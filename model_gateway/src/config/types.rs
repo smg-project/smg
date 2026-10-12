@@ -468,6 +468,10 @@ pub struct RouterConfig {
     /// who else can read that file names it (the key itself is `server_key`)
     #[serde(skip)]
     pub server_key_path: Option<String>,
+    /// Path the mTLS client private key was read from, for the same check
+    /// (the key itself is in `client_identity`)
+    #[serde(skip)]
+    pub client_key_path: Option<String>,
     /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
     #[serde(skip)]
     pub client_identity: Option<Vec<u8>>,
@@ -1733,6 +1737,7 @@ impl Default for RouterConfig {
             server_cert: None,
             server_key: None,
             server_key_path: None,
+            client_key_path: None,
         }
     }
 }

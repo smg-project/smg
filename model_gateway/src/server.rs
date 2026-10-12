@@ -1499,6 +1499,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if let Some(path) = &config.router_config.server_key_path {
         crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
     }
+    if let Some(path) = &config.router_config.client_key_path {
+        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--client-key-path");
+    }
     if let Some(mtls) = config
         .mesh_server_config
         .as_ref()
