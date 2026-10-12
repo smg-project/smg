@@ -245,7 +245,7 @@ impl RelaySource {
 /// a cut body is written on its own frame, so a cut that lands inside a
 /// frame (a reset mid-write, an intermediary that re-chunks) does not merge
 /// the partial line and the event into one line a client cannot parse.
-fn on_frame_boundary(tail: &[u8]) -> bool {
+pub(crate) fn on_frame_boundary(tail: &[u8]) -> bool {
     tail.is_empty() || tail.ends_with(b"\n\n") || tail.ends_with(b"\r\n\r\n")
 }
 

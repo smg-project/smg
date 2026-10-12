@@ -21,7 +21,7 @@ mod support;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use support::{app, stream, Arrival, MODEL};
+use support::{app, stream, stream_to_end, Arrival, MODEL};
 
 const COMMENT: &str = ": ping\n\n";
 const PING: &str = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
@@ -113,7 +113,8 @@ fn keep_alives<'a>(arrivals: &'a [Arrival], keep_alive: &str) -> Vec<&'a Arrival
 async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_silence() {
     let (app, server) = app(SILENCE, Some(1)).await;
     for endpoint in endpoints() {
-        let arrivals = stream(&app, endpoint.path, endpoint.body.clone(), BUDGET).await;
+        let (arrivals, eof) =
+            stream_to_end(&app, endpoint.path, endpoint.body.clone(), BUDGET).await;
         let (silence, flowing) = split_at_first_token(&arrivals, endpoint.keep_alive, SILENCE);
         let during = keep_alives(silence, endpoint.keep_alive);
         assert!(
@@ -139,10 +140,9 @@ async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_sile
             endpoint.path
         );
         let whole: String = arrivals.iter().map(Arrival::text).collect();
-        let last = arrivals.last().map(Arrival::text).unwrap_or_default();
         assert!(
-            last.contains(endpoint.end),
-            "{}: the stream ends as before: {whole:?}",
+            eof && whole.contains(endpoint.end),
+            "{}: the stream ends as before and the body closes (eof={eof}): {whole:?}",
             endpoint.path
         );
         // Every data line is still whole JSON (or the terminator): no

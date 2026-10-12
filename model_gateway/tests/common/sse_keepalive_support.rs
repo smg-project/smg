@@ -106,15 +106,25 @@ impl Arrival {
 }
 
 /// Posts `body` to `path` and reads the response's chunks as they arrive,
-/// until the body ends or `budget` has passed since the request.
-#[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]
+/// until the body ends or `budget` has passed since the response headers.
 pub async fn stream(
     app: &Router,
     path: &str,
     body: serde_json::Value,
     budget: Duration,
 ) -> Vec<Arrival> {
-    let started = Instant::now();
+    stream_to_end(app, path, body, budget).await.0
+}
+
+/// [`stream`], and whether the body closed (EOF) within the budget rather
+/// than the budget running out with the body still open.
+#[expect(clippy::unwrap_used, reason = "test helper: failures should panic")]
+pub async fn stream_to_end(
+    app: &Router,
+    path: &str,
+    body: serde_json::Value,
+    budget: Duration,
+) -> (Vec<Arrival>, bool) {
     let request = Request::builder()
         .method(Method::POST)
         .uri(path)
@@ -122,6 +132,9 @@ pub async fn stream(
         .body(Body::from(body.to_string()))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
+    // The keep-alive interval counts from the response headers, so the
+    // arrival clock and the budget start here, not before the request.
+    let started = Instant::now();
     let (parts, body) = response.into_parts();
     if parts.status != StatusCode::OK {
         let text = axum::body::to_bytes(body, 1 << 16)
@@ -133,7 +146,7 @@ pub async fn stream(
             "{path}: {}",
             String::from_utf8_lossy(&text)
         );
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let content_type = parts
         .headers
@@ -148,6 +161,7 @@ pub async fn stream(
     let mut body = body;
     let mut arrivals = Vec::new();
     let mut failure = None;
+    let mut eof = false;
     loop {
         let left = budget.saturating_sub(started.elapsed());
         if left.is_zero() {
@@ -166,9 +180,13 @@ pub async fn stream(
                 failure = Some(error.to_string());
                 break;
             }
-            Ok(None) | Err(_) => break,
+            Ok(None) => {
+                eof = true;
+                break;
+            }
+            Err(_) => break,
         }
     }
     assert!(failure.is_none(), "{path}: the body failed: {failure:?}");
-    arrivals
+    (arrivals, eof)
 }

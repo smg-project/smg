@@ -1025,7 +1025,7 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}sse-keepalive-secs",
-            type=int,
+            type=_non_negative_int,
             default=RouterArgs.sse_keepalive_secs,
             help=(
                 "Seconds of upstream silence after which an open SSE stream"
