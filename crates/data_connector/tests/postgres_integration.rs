@@ -1132,3 +1132,162 @@ async fn gateways_starting_together_come_up_under_a_repeatable_read_default() {
         );
     }
 }
+
+/// A read or a write costs one round trip after the first on a connection:
+/// the statement is prepared once and cached on the connection, not parsed
+/// again on every call (a parse round trip and an execute round trip each),
+/// and no statement is closed, so the cache kept it. Measured on the wire,
+/// with the relay counting the server's ReadyForQuery and the client's Close
+/// messages.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let (relayed_url, meter) = relayed_database(&db_url).expect("start the relay");
+    let bundle = postgres_bundle(&relayed_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let (resp, conv, items) = (
+        bundle.response_storage,
+        bundle.conversation_storage,
+        bundle.conversation_item_storage,
+    );
+
+    // One record of each kind, and the first call of every statement, which
+    // prepares it (the pool hands the same connection back to sequential
+    // calls).
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({"id": stored.id.0, "status": "completed"});
+    let response_id = resp.store_response(stored).await.expect("store response");
+    let conversation = conv
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+        })
+        .await
+        .expect("create conversation");
+    let second = conv
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+        })
+        .await
+        .expect("create a second conversation");
+    let item = items
+        .create_item(NewConversationItem {
+            id: None,
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([]),
+            status: Some("completed".to_string()),
+        })
+        .await
+        .expect("create item");
+    items
+        .link_item(&conversation.id, &item.id, Utc::now())
+        .await
+        .expect("link item");
+    let params = || ListParams {
+        limit: 10,
+        order: SortOrder::Asc,
+        after: None,
+    };
+    resp.get_response(&response_id).await.expect("read");
+    conv.get_conversation(&conversation.id).await.expect("read");
+    items
+        .is_item_linked(&conversation.id, &item.id)
+        .await
+        .expect("read");
+    items
+        .list_items(&conversation.id, params())
+        .await
+        .expect("read");
+
+    // Every later call of a statement: one round trip, and no statement closed.
+    let closes_before = meter.closes.load(Ordering::SeqCst);
+    let mut costs = Vec::new();
+    for (name, call) in [
+        ("get_response", {
+            let resp = resp.clone();
+            let id = response_id.clone();
+            Box::pin(async move {
+                resp.get_response(&id)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>
+        }),
+        ("get_conversation", {
+            let conv = conv.clone();
+            let id = conversation.id.clone();
+            Box::pin(async move {
+                conv.get_conversation(&id)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        }),
+        ("is_item_linked", {
+            let items = items.clone();
+            let (cid, iid) = (conversation.id.clone(), item.id.clone());
+            Box::pin(async move {
+                items
+                    .is_item_linked(&cid, &iid)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        }),
+        ("list_items", {
+            let items = items.clone();
+            let cid = conversation.id.clone();
+            Box::pin(async move {
+                items
+                    .list_items(&cid, params())
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        }),
+        ("create_conversation", {
+            let conv = conv.clone();
+            Box::pin(async move {
+                conv.create_conversation(NewConversation {
+                    id: None,
+                    metadata: None,
+                })
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string())
+            })
+        }),
+        ("link_item", {
+            let items = items.clone();
+            let (cid, iid) = (second.id.clone(), item.id.clone());
+            Box::pin(async move {
+                items
+                    .link_item(&cid, &iid, Utc::now())
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }),
+    ] {
+        let before = meter.ready_for_query.load(Ordering::SeqCst);
+        call.await.expect(name);
+        costs.push((name, meter.ready_for_query.load(Ordering::SeqCst) - before));
+    }
+    let costly: Vec<_> = costs.iter().filter(|(_, trips)| *trips != 1).collect();
+    assert!(
+        costly.is_empty(),
+        "round trips per call after the first: {costs:?}; expected one each"
+    );
+    assert_eq!(
+        meter.closes.load(Ordering::SeqCst) - closes_before,
+        0,
+        "no statement was closed: each stayed cached on its connection"
+    );
+}
