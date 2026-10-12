@@ -205,6 +205,25 @@ impl ConfigValidator {
                 Self::validate_oracle(oracle)?;
             }
         }
+        // The Redis and Postgres configurations carry their own rules (the
+        // URL, the pool size, a retention of 0 days that would expire every
+        // record as it is written); the command line ran them while building
+        // its config, the bindings and a directly built RouterConfig did not,
+        // so they run here for every start-up.
+        if config.history_backend == HistoryBackend::Redis {
+            if let Some(redis) = &config.redis {
+                redis
+                    .validate()
+                    .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+            }
+        }
+        if config.history_backend == HistoryBackend::Postgres {
+            if let Some(postgres) = &config.postgres {
+                postgres
+                    .validate()
+                    .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+            }
+        }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
 
@@ -2082,6 +2101,47 @@ mod tests {
             other => panic!("expected a log_dir error, got {other:?}"),
         }
         assert!(!under.exists());
+    }
+
+    /// The Redis configuration's own rules run through the shared validation
+    /// too, so the bindings and a directly built configuration refuse a
+    /// retention of 0 days (every record expired as it is written) as the
+    /// command line does; unset, the retention is persistent and passes.
+    #[test]
+    fn a_redis_retention_of_zero_days_is_refused_through_the_shared_validation() {
+        let redis = |retention_days| RedisConfig {
+            url: "redis://localhost:6379".to_string(),
+            pool_max: 4,
+            op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+            schema: None,
+            retention_days,
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(Some(0))),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(
+                    reason.contains("retention_days must be at least 1"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected the Redis rule, got {other:?}"),
+        }
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(None)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        // Another backend leaves the Redis block unread.
+        let config = RouterConfig {
+            redis: Some(redis(Some(0))),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
