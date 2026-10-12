@@ -1111,13 +1111,16 @@ async fn gateways_starting_together_come_up_under_a_repeatable_read_default() {
         let scratch = ScratchDatabase::create(&db_url, &format!("rr{round}"))
             .await
             .expect("create a scratch database");
-        scratch
+        if let Err(e) = scratch
             .admin(&format!(
                 "ALTER DATABASE \"{}\" SET default_transaction_isolation TO 'repeatable read'",
                 scratch.name
             ))
             .await
-            .expect("set the database's default isolation");
+        {
+            scratch.drop().await;
+            panic!("set the database's default isolation: {e}");
+        }
         let (failures, versions) = six_gateways_start_together(&scratch).await;
         scratch.drop().await;
         assert!(
