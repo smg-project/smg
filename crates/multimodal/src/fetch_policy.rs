@@ -106,19 +106,44 @@ fn check_address(host: &str, address: IpAddr) -> Result<(), MediaConnectorError>
 }
 
 /// The class of an address media is not fetched from, as the refusal names
-/// it; `None` for a public address. An IPv4 address carried in IPv6 notation
-/// (`::ffff:a.b.c.d`) is judged as the IPv4 address it is.
+/// it; `None` for a public address. An IPv6 address that carries an IPv4
+/// address a translator or a relay connects to ([`embedded_ipv4`]) is judged
+/// as that IPv4 address.
 pub(crate) fn non_public_address_class(address: IpAddr) -> Option<&'static str> {
     match address {
         IpAddr::V4(address) => ipv4_class(address),
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map_or_else(|| ipv6_class(address), ipv4_class),
+        IpAddr::V6(address) => match embedded_ipv4(address) {
+            Some(carried) => ipv4_class(carried),
+            None => ipv6_class(address),
+        },
+    }
+}
+
+/// The IPv4 address an IPv6 address carries and leads to, in the forms a
+/// translator or a relay turns into an IPv4 connection: IPv4-mapped
+/// (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`; `::` and `::1` are
+/// addresses of their own), NAT64 (the well-known prefix `64:ff9b::/96` and
+/// the local-use `64:ff9b:1::/48`, the IPv4 address in the low 32 bits as
+/// the well-known prefix and the usual local-use deployment carry it; a
+/// local-use deployment that embeds it higher reads as `0.0.0.0/8` here and
+/// is refused) and 6to4 (`2002::/16`, the IPv4 address in the next 32 bits).
+fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let low_32 = |high: u16, low: u16| Ipv4Addr::from((u32::from(high) << 16) | u32::from(low));
+    match address.segments() {
+        [0, 0, 0, 0, 0, 0, 0, 0 | 1] => None,
+        [0, 0, 0, 0, 0, 0, high, low] => Some(low_32(high, low)),
+        [0x64, 0xff9b, 0, 0, 0, 0, high, low] => Some(low_32(high, low)),
+        [0x64, 0xff9b, 1, _, _, _, high, low] => Some(low_32(high, low)),
+        [0x2002, high, low, ..] => Some(low_32(high, low)),
+        _ => None,
     }
 }
 
 fn ipv4_class(address: Ipv4Addr) -> Option<&'static str> {
-    let [first, second, ..] = address.octets();
+    let [first, second, third, _] = address.octets();
     if first == 0 {
         // 0.0.0.0/8: "this network", the unspecified address included.
         Some("unspecified")
@@ -131,10 +156,19 @@ fn ipv4_class(address: Ipv4Addr) -> Option<&'static str> {
     } else if first == 100 && (64..128).contains(&second) {
         // 100.64.0.0/10, the carrier-grade NAT range.
         Some("shared address space")
+    } else if first == 192 && second == 0 && third == 0 {
+        // 192.0.0.0/24, the IETF protocol assignments.
+        Some("reserved")
+    } else if first == 198 && (second == 18 || second == 19) {
+        // 198.18.0.0/15, the benchmarking range.
+        Some("benchmarking")
     } else if address.is_multicast() {
         Some("multicast")
     } else if address.is_broadcast() {
         Some("broadcast")
+    } else if first >= 240 {
+        // 240.0.0.0/4, reserved.
+        Some("reserved")
     } else {
         None
     }
@@ -367,9 +401,24 @@ mod tests {
             ("224.0.0.1", "multicast"),
             ("ff02::1", "multicast"),
             ("255.255.255.255", "broadcast"),
-            // IPv4 in IPv6 notation is the IPv4 address it carries.
+            ("192.0.0.1", "reserved"),
+            ("192.0.0.255", "reserved"),
+            ("198.18.0.1", "benchmarking"),
+            ("198.19.255.255", "benchmarking"),
+            ("240.0.0.1", "reserved"),
+            ("255.255.255.254", "reserved"),
+            // IPv4 in IPv6 notation is the IPv4 address it carries: mapped,
+            // compatible, NAT64 (both prefixes) and 6to4.
             ("::ffff:127.0.0.1", "loopback"),
             ("::ffff:10.1.2.3", "private"),
+            ("::10.1.2.3", "private"),
+            ("64:ff9b::a9fe:a9fe", "link-local"),
+            ("64:ff9b::7f00:1", "loopback"),
+            ("64:ff9b:1::a00:5", "private"),
+            ("64:ff9b:1:abcd::c0a8:101", "private"),
+            ("2002:a00:5::", "private"),
+            ("2002:7f00:1::1", "loopback"),
+            ("2002:a9fe:a9fe::", "link-local"),
         ] {
             assert_eq!(
                 non_public_address_class(ip(address)),
@@ -387,6 +436,14 @@ mod tests {
             "172.32.0.0",
             "2606:4700::1111",
             "::ffff:8.8.8.8",
+            "::5db8:d822",
+            "64:ff9b::5db8:d822",
+            "64:ff9b:1::5db8:d822",
+            "2002:5db8:d822::1",
+            "192.0.1.0",
+            "198.17.255.255",
+            "198.20.0.0",
+            "223.255.255.255",
         ] {
             assert_eq!(non_public_address_class(ip(address)), None, "{address}");
         }
