@@ -72,12 +72,40 @@ pub const CLIENT_CLOSED_REQUEST_CODE: &str = "client_closed_request";
 /// else what the body itself knows exactly. An HTTP/1.1 server writes that
 /// many bytes and stops asking for frames, so a body that has sent them has
 /// gone out in full whether or not its trailing `None` is ever polled.
-pub(super) fn declared_body_length(response: &Response) -> Option<u64> {
+fn declared_body_length(response: &Response) -> Option<u64> {
     response
         .headers()
         .get(http::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok()?.trim().parse().ok())
         .or_else(|| response.body().size_hint().exact())
+}
+
+/// Where a response body stands: the length its response declared and the
+/// data bytes out so far. The body has gone out in full at its last frame,
+/// or once the bytes add up to the declared length. One rule for the
+/// metrics wrapper and the logging wrapper, so a response cannot count as
+/// complete in one and as cut short in the other.
+pub(super) struct BodyProgress {
+    declared: Option<u64>,
+    sent: u64,
+}
+
+impl BodyProgress {
+    pub(super) fn new(response: &Response) -> Self {
+        Self {
+            declared: declared_body_length(response),
+            sent: 0,
+        }
+    }
+
+    /// A frame went out; `at_end` is the body's own word (`is_end_stream`)
+    /// after it. Whether the body has now gone out in full.
+    pub(super) fn frame_out(&mut self, frame: &http_body::Frame<Bytes>, at_end: bool) -> bool {
+        if let Some(data) = frame.data_ref() {
+            self.sent = self.sent.saturating_add(data.len() as u64);
+        }
+        at_end || self.declared.is_some_and(|declared| self.sent >= declared)
+    }
 }
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
@@ -162,14 +190,14 @@ where
             // The outcome rides along: the response counts when its body
             // ends, and as a client-closed request when the body is dropped
             // before that.
-            let declared = declared_body_length(&response);
+            let progress = BodyProgress::new(&response);
             let (parts, body) = response.into_parts();
             let body = Body::new(TrackedBody::new(
                 body,
                 guard,
                 in_flight_request_tracker,
                 outcome,
-                declared,
+                progress,
             ));
             Ok(Response::from_parts(parts, body))
         })
@@ -258,12 +286,9 @@ struct TrackedBody {
     /// one the server never meant to send (the answer to a HEAD request), not
     /// one the client cut short.
     polled: bool,
-    /// The length the response declared for its body, and the data bytes out
-    /// so far: once they add up the body has gone out in full, whether or
-    /// not it is ever polled for its trailing `None` (an HTTP/1.1 server
-    /// stops at the declared length).
-    declared: Option<u64>,
-    sent: u64,
+    /// The declared length and the bytes out: the end-of-body rule shared
+    /// with the logging wrapper.
+    progress: BodyProgress,
 }
 
 impl TrackedBody {
@@ -272,7 +297,7 @@ impl TrackedBody {
         guard: InFlightGuard,
         tracker: Arc<InFlightRequestTracker>,
         outcome: ResponseOutcome,
-        declared: Option<u64>,
+        progress: BodyProgress,
     ) -> Self {
         let mut body = Self {
             inner,
@@ -280,8 +305,7 @@ impl TrackedBody {
             tracker,
             outcome,
             polled: false,
-            declared,
-            sent: 0,
+            progress,
         };
         // An already-complete body (e.g. an empty unary response) may never be
         // polled at all; do not retain the guard past construction for it,
@@ -306,12 +330,6 @@ impl TrackedBody {
         self.release();
         self.outcome.completed();
     }
-
-    /// Whether the data frames so far add up to the length the response
-    /// declared for its body.
-    fn declared_length_sent(&self) -> bool {
-        self.declared.is_some_and(|declared| self.sent >= declared)
-    }
 }
 
 impl http_body::Body for TrackedBody {
@@ -335,10 +353,7 @@ impl http_body::Body for TrackedBody {
         match &poll {
             Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.ended(),
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    this.sent = this.sent.saturating_add(data.len() as u64);
-                }
-                if this.inner.is_end_stream() || this.declared_length_sent() {
+                if this.progress.frame_out(frame, this.inner.is_end_stream()) {
                     this.ended();
                 }
             }
@@ -930,6 +945,31 @@ mod client_closed_tests {
         assert_eq!(
             responses(&rendered, "/relay"),
             sample("503", ""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_body_under_a_content_length_dropped_before_its_declared_bytes_counts_as_a_client_closed_request(
+    ) {
+        // The other side of the declared-length rule: nine of twelve bytes
+        // out when the client leaves is a body cut short.
+        let rendered = render(|_| async {
+            let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+            let app = relay_app(503, 12, Body::from_stream(ReceiverStream::new(rx)));
+            let response = app.oneshot(request("/relay")).await.expect("response");
+            let mut body = response.into_body();
+            tx.send(Ok(Bytes::from_static(b"{\"error\":")))
+                .await
+                .expect("send");
+            let frame = body.frame().await.expect("a frame").expect("frame ok");
+            assert_eq!(frame.data_ref().map(Bytes::len), Some(9));
+            drop(body);
+            drop(tx);
+        });
+        assert_eq!(
+            responses(&rendered, "/relay"),
+            sample("499", "client_closed_request"),
             "{rendered}"
         );
     }

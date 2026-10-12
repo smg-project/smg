@@ -27,7 +27,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Spa
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{
-    metrics::{declared_body_length, matched_path_label, CLIENT_CLOSED_REQUEST_STATUS},
+    metrics::{matched_path_label, BodyProgress, CLIENT_CLOSED_REQUEST_STATUS},
     request_id::RequestId,
 };
 use crate::observability::{
@@ -310,15 +310,14 @@ where
             };
             ResponseLogger.on_response(&response, start.elapsed(), &span);
             close_log.head_sent();
-            let declared = declared_body_length(&response);
+            let progress = BodyProgress::new(&response);
             Ok(response.map(|body| {
                 Body::new(SpannedBody {
                     inner: body,
                     span,
                     close_log,
                     polled: false,
-                    declared,
-                    sent: 0,
+                    progress,
                 })
             }))
         })
@@ -413,11 +412,9 @@ struct SpannedBody {
     /// one the server never meant to send (the answer to a HEAD request), not
     /// one the client cut short.
     polled: bool,
-    /// The length the response declared for its body, and the data bytes out
-    /// so far: once they add up the body has gone out in full (an HTTP/1.1
-    /// server asks for no more after that).
-    declared: Option<u64>,
-    sent: u64,
+    /// The declared length and the bytes out: the end-of-body rule shared
+    /// with the metrics wrapper.
+    progress: BodyProgress,
 }
 
 impl http_body::Body for SpannedBody {
@@ -442,12 +439,10 @@ impl http_body::Body for SpannedBody {
             }
             Poll::Ready(None) => this.close_log.done(),
             Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    this.sent = this.sent.saturating_add(data.len() as u64);
-                }
                 // At its end: the last frame, or the declared length out.
-                if http_body::Body::is_end_stream(&this.inner)
-                    || this.declared.is_some_and(|declared| this.sent >= declared)
+                if this
+                    .progress
+                    .frame_out(frame, http_body::Body::is_end_stream(&this.inner))
                 {
                     this.close_log.done();
                 }
@@ -763,6 +758,37 @@ mod client_closed_tests {
         assert_eq!(
             sink.lines(),
             vec![line(Level::INFO, "finished processing request")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_under_a_content_length_dropped_before_its_declared_bytes_logs_a_client_close() {
+        // The other side of the declared-length rule: the client left with
+        // the body short of its declared bytes.
+        let sink = ResponseLines::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+        let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
+            .oneshot(request("/relay"))
+            .await
+            .expect("response");
+        tx.send(Ok(Bytes::from_static(b"data:")))
+            .await
+            .expect("send");
+        let mut body = response.into_body();
+        let frame = body.frame().await.expect("one frame").expect("frame ok");
+        assert_eq!(frame.data_ref().map(Bytes::len), Some(5));
+        drop(body);
+        drop(tx);
+        assert_eq!(
+            sink.lines(),
+            vec![
+                line(Level::INFO, "finished processing request"),
+                line(
+                    Level::INFO,
+                    "client closed the connection before the response stream ended"
+                ),
+            ]
         );
     }
 
