@@ -59,9 +59,14 @@ fn a_runtime_worker_thread_count_of_one_serves() {
         "the gateway did not serve its health route with one worker thread (exit {:?})\n{}",
         launch.status, launch.log
     );
-    assert!(
-        launch.log.contains(r#""worker_threads":1"#),
-        "the runtime's size did not reach the log\n{}",
-        launch.log
-    );
+    // The line is flat JSON: read it exactly, so a default-sized runtime on
+    // a host whose core count starts with 1 cannot pass for the pinned one.
+    let sized = launch
+        .log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["message"] == "Tokio runtime sized")
+        .unwrap_or_else(|| panic!("the runtime's size did not reach the log\n{}", launch.log));
+    assert_eq!(sized["worker_threads"], 1, "{sized}");
+    assert_eq!(sized["pinned"], true, "{sized}");
 }
