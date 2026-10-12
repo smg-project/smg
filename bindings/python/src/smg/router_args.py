@@ -603,7 +603,10 @@ class RouterArgs:
             f"--{prefix}prefix-hash-load-factor",
             type=float,
             default=RouterArgs.prefix_hash_load_factor,
-            help="Load factor above which prefix_hash walks the ring (multiple of average load)",
+            help=(
+                "Load factor above which prefix_hash walks the ring (multiple of"
+                " average load; finite, at least 1.0)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}prefix-hash-balance-abs-threshold",
@@ -678,6 +681,7 @@ class RouterArgs:
             help=(
                 "Spill gate, relative part: a matched worker is skipped when its load exceeds"
                 " this multiple of the healthy-fleet mean AND the absolute threshold is also met."
+                " Finite, at least 1.0."
             ),
         )
         routing_group.add_argument(
@@ -689,7 +693,8 @@ class RouterArgs:
                 " coldest backend KV utilization above which cache affinity is"
                 " abandoned for shortest-queue. Catches long-context KV imbalance that"
                 " in-flight request counts miss, and is invariant to gateway replica"
-                " count. Backend must report token_usage. Defaults to 1.0 (disabled)."
+                " count. Backend must report token_usage. Finite and > 0.0; >= 1.0"
+                " disables it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -700,7 +705,8 @@ class RouterArgs:
                 "Cache-aware KV-utilization CEILING (0.0-1.0): when the hottest backend"
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
-                " Backend must report token_usage. Defaults to 1.0 (disabled)."
+                " Backend must report token_usage. Finite and > 0.0; >= 1.0 disables"
+                " it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -832,7 +838,10 @@ class RouterArgs:
             f"--{prefix}worker-warmup-share",
             type=float,
             default=RouterArgs.worker_warmup_share,
-            help="Share of cache misses offered to warming workers (0.0 to 1.0). Defaults to 0.25.",
+            help=(
+                "Share of cache misses offered to warming workers (a finite value from"
+                " 0.0 to 1.0). Defaults to 0.25."
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}worker-warmup-blocks",
@@ -850,8 +859,8 @@ class RouterArgs:
             help=(
                 "A worker whose index holds less than this share of the fleet's"
                 " median (or nothing) is thin and receives the warm-up slice until"
-                " it has grown by --worker-warmup-blocks, whatever emptied it. 0"
-                " keeps the age rule alone. Defaults to 0.5."
+                " it has grown by --worker-warmup-blocks, whatever emptied it. A"
+                " finite value from 0.0 to 1.0; 0 keeps the age rule alone. Defaults to 0.5."
             ),
         )
         routing_group.add_argument(
@@ -1320,8 +1329,8 @@ class RouterArgs:
             type=_non_negative_int,
             default=RouterArgs.rdma_slot_ttl_s,
             help=(
-                "Seconds a leased RDMA pixel slot lives without a free notification;"
-                " must exceed the worker's hold or it is ignored. Falls back to"
+                "Seconds a leased RDMA pixel slot lives without a free notification"
+                " (at least 1); must exceed the worker's hold or it is ignored. Falls back to"
                 " SMG_RDMA_SLOT_TTL_S"
             ),
         )
@@ -1493,10 +1502,7 @@ class RouterArgs:
             f"--{prefix}prometheus-port",
             type=int,
             default=29000,
-            help=(
-                "Port to expose Prometheus metrics (default: 29000)."
-                " 0 binds an OS-assigned ephemeral port, logged at startup."
-            ),
+            help="Port to expose Prometheus metrics (at least 1; default: 29000)",
         )
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
@@ -1746,7 +1752,7 @@ class RouterArgs:
             f"--{prefix}retry-backoff-multiplier",
             type=float,
             default=RouterArgs.retry_backoff_multiplier,
-            help="Multiplier for exponential backoff between retries",
+            help="Multiplier for exponential backoff between retries (finite, at least 1.0)",
         )
         retry_group.add_argument(
             f"--{prefix}retry-jitter-factor",
@@ -2071,7 +2077,10 @@ class RouterArgs:
             f"--{prefix}redis-retention-days",
             type=int,
             default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
-            help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
+            help=(
+                "Redis data retention in days (at least 1; -1 for persistent, default: 30,"
+                " env: REDIS_RETENTION_DAYS)"
+            ),
         )
         redis_group.add_argument(
             f"--{prefix}redis-op-timeout-secs",

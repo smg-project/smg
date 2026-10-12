@@ -162,6 +162,7 @@ pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
+        bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
@@ -678,19 +679,25 @@ impl ConfigValidator {
                     });
                 }
 
-                if *balance_token_usage_threshold <= 0.0 {
+                // NaN passes every comparison and an infinite threshold is a typo
+                // for "disabled": both are refused with the sign errors.
+                if !balance_token_usage_threshold.is_finite()
+                    || *balance_token_usage_threshold <= 0.0
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_token_usage_threshold".to_string(),
                         value: balance_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
-                if *overload_token_usage_threshold <= 0.0 {
+                if !overload_token_usage_threshold.is_finite()
+                    || *overload_token_usage_threshold <= 0.0
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "overload_token_usage_threshold".to_string(),
                         value: overload_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
@@ -702,11 +709,11 @@ impl ConfigValidator {
                     });
                 }
 
-                if *balance_rel_threshold < 1.0 {
+                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_rel_threshold".to_string(),
                         value: balance_rel_threshold.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
                     });
                 }
 
@@ -782,11 +789,11 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
             } => {
-                if *balance_rel_threshold < 1.0 {
+                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_rel_threshold".to_string(),
                         value: balance_rel_threshold.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
                     });
                 }
 
@@ -819,11 +826,11 @@ impl ConfigValidator {
                     });
                 }
 
-                if *load_factor < 1.0 {
+                if !load_factor.is_finite() || *load_factor < 1.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "load_factor".to_string(),
                         value: load_factor.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
                     });
                 }
 
@@ -1262,7 +1269,8 @@ impl ConfigValidator {
             return Err(ConfigError::InvalidValue {
                 field: "metrics.port".to_string(),
                 value: metrics.port.to_string(),
-                reason: "Port must be > 0".to_string(),
+                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
+                    .to_string(),
             });
         }
 
@@ -1373,11 +1381,11 @@ impl ConfigValidator {
                 reason: "Must be >= initial_backoff_ms".to_string(),
             });
         }
-        if retry.backoff_multiplier < 1.0 {
+        if !retry.backoff_multiplier.is_finite() || retry.backoff_multiplier < 1.0 {
             return Err(ConfigError::InvalidValue {
                 field: "retry.backoff_multiplier".to_string(),
                 value: retry.backoff_multiplier.to_string(),
-                reason: "Must be >= 1.0".to_string(),
+                reason: "Must be finite and >= 1.0".to_string(),
             });
         }
         if !(0.0..=1.0).contains(&retry.jitter_factor) {
@@ -2553,6 +2561,155 @@ mod tests {
         assert!(ConfigValidator::validate(&make(0.0, -1.0)).is_err());
         assert!(ConfigValidator::validate(&make(f32::NAN, 0.0)).is_err());
         assert!(ConfigValidator::validate(&make(0.0, f32::INFINITY)).is_err());
+    }
+
+    /// NaN passes every `<` and `<=` comparison and an infinity passes the
+    /// ones written as a lower bound, so the thresholds a policy compares
+    /// that way are checked for finiteness first: a spill gate, token-usage
+    /// threshold or load factor that is NaN never fires, which reads as a
+    /// quiet routing change instead of the typo it is.
+    #[test]
+    fn non_finite_policy_thresholds_are_rejected() {
+        fn refused_field(config: &RouterConfig) -> String {
+            match ConfigValidator::validate(config) {
+                Err(ConfigError::InvalidValue { field, .. }) => field,
+                other => panic!("accepted, or refused for another reason: {other:?}"),
+            }
+        }
+        let two_workers = || RoutingMode::Regular {
+            worker_urls: vec![
+                "http://worker1:8000".to_string(),
+                "http://worker2:8000".to_string(),
+            ],
+        };
+        let cache_aware = |balance_rel_threshold: f32,
+                           balance_token_usage_threshold: f32,
+                           overload_token_usage_threshold: f32| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold,
+                    overload_token_usage_threshold,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
+                },
+            )
+        };
+        let bucket = |balance_rel_threshold: f32| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    bucket_adjust_interval_secs: 60,
+                },
+            )
+        };
+        let prefix_hash = |load_factor: f64| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::PrefixHash {
+                    prefix_token_count: 256,
+                    load_factor,
+                    balance_abs_threshold: 10,
+                    cache_boundaries: Vec::new(),
+                },
+            )
+        };
+        assert!(ConfigValidator::validate(&cache_aware(1.5, 1.0, 1.0)).is_ok());
+        assert!(ConfigValidator::validate(&bucket(1.5)).is_ok());
+        assert!(ConfigValidator::validate(&prefix_hash(1.25)).is_ok());
+        for bad in [f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                refused_field(&cache_aware(bad, 1.0, 1.0)),
+                "balance_rel_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&cache_aware(1.5, bad, 1.0)),
+                "balance_token_usage_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&cache_aware(1.5, 1.0, bad)),
+                "overload_token_usage_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&bucket(bad)),
+                "balance_rel_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&prefix_hash(f64::from(bad))),
+                "load_factor",
+                "{bad}"
+            );
+        }
+    }
+
+    /// The retry backoff multiplier is a lower bound too.
+    #[test]
+    fn a_non_finite_retry_backoff_multiplier_is_rejected() {
+        let with_multiplier = |backoff_multiplier: f32| {
+            let mut config = regular_mode_config();
+            config.retry = RetryConfig {
+                backoff_multiplier,
+                ..Default::default()
+            };
+            config
+        };
+        assert!(ConfigValidator::validate(&with_multiplier(1.5)).is_ok());
+        for bad in [f32::NAN, f32::INFINITY, 0.5] {
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&with_multiplier(bad)),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "retry.backoff_multiplier"
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The metrics port is a stable, operator-configured port like the other
+    /// listeners' ports: 0 (an OS-assigned ephemeral port) is refused naming
+    /// the field, as the flag help says.
+    #[test]
+    fn a_metrics_port_of_zero_is_rejected() {
+        let mut config = regular_mode_config();
+        config.metrics = Some(MetricsConfig {
+            port: 0,
+            host: "127.0.0.1".to_string(),
+        });
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "metrics.port");
+                assert_eq!(value, "0");
+                assert!(reason.contains("ephemeral"), "{reason}");
+            }
+            other => panic!("a metrics port of 0 was accepted: {other:?}"),
+        }
+        config.metrics = Some(MetricsConfig {
+            port: 29000,
+            host: "127.0.0.1".to_string(),
+        });
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

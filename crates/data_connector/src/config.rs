@@ -225,6 +225,13 @@ impl RedisConfig {
         if self.op_timeout_secs == 0 {
             return Err("op_timeout_secs must be greater than 0".to_string());
         }
+        // A retention of 0 days would expire every record the moment it is
+        // written; persistent records are spelled by leaving the retention unset.
+        if self.retention_days == Some(0) {
+            return Err(
+                "retention_days must be at least 1 (unset it for persistent records)".to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -537,6 +544,22 @@ mod tests {
         let err = redis.validate().expect_err("op_timeout_secs=0 should fail");
         assert!(
             err.contains("op_timeout_secs"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn redis_retention_zero_fails() {
+        let cfg = RedisConfig {
+            url: "redis://localhost:6379/0".to_string(),
+            pool_max: 16,
+            op_timeout_secs: 5,
+            retention_days: Some(0),
+            schema: None,
+        };
+        let err = cfg.validate().expect_err("retention_days=0 should fail");
+        assert!(
+            err.contains("retention_days must be at least 1"),
             "unexpected error message: {err}"
         );
     }

@@ -318,8 +318,8 @@ struct CliArgs {
     )]
     balance_abs_threshold: usize,
 
-    /// Spill gate, relative part (multiple of the healthy-fleet mean); fires
-    /// only together with --balance-abs-threshold
+    /// Spill gate, relative part (multiple of the healthy-fleet mean; finite,
+    /// at least 1.0); fires only together with --balance-abs-threshold
     #[arg(
         long,
         visible_alias = "spill-rel-threshold",
@@ -331,13 +331,14 @@ struct CliArgs {
     /// Abandon cache affinity for shortest-queue when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
     /// long-context KV imbalance that request counts miss. Backend must
-    /// report token_usage. >= 1.0 disables it.
+    /// report token_usage. Finite and > 0.0; >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     balance_token_usage_threshold: f32,
 
     /// Safety valve for critically-saturated engines: when the hottest
     /// backend's KV utilization (0.0-1.0) exceeds this, shed load off it
-    /// regardless of spread. Best set high (e.g. 0.9). >= 1.0 disables it.
+    /// regardless of spread. Best set high (e.g. 0.9). Finite and > 0.0;
+    /// >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
@@ -469,7 +470,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
     prefix_token_count: usize,
 
-    /// Load factor threshold for prefix_hash policy
+    /// Load factor threshold for prefix_hash policy (finite, at least 1.0)
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
 
@@ -687,7 +688,8 @@ struct CliArgs {
     #[arg(long, default_value_t = 60, help_heading = "Routing Policy")]
     worker_warmup_secs: u64,
 
-    /// Share of cache misses offered to warming workers (0.0 to 1.0).
+    /// Share of cache misses offered to warming workers (a finite value from
+    /// 0.0 to 1.0).
     #[arg(long, default_value_t = 0.25, help_heading = "Routing Policy")]
     worker_warmup_share: f32,
 
@@ -700,7 +702,8 @@ struct CliArgs {
     /// (or nothing) is thin and receives the warm-up slice until it has grown
     /// by --worker-warmup-blocks, whatever emptied it (a resync after a
     /// publisher restart, an out-of-range or data-loss resubscription, an
-    /// engine that came back empty). 0 keeps the age rule alone.
+    /// engine that came back empty). A finite value from 0.0 to 1.0; 0 keeps
+    /// the age rule alone.
     #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
     worker_warmup_thin_ratio: f32,
 
@@ -826,8 +829,9 @@ struct CliArgs {
     #[arg(long, help_heading = "Multimodal")]
     rdma_listen_ip: Option<String>,
 
-    /// Seconds a leased RDMA pixel slot lives without a free notification;
-    /// must exceed the worker's hold or it is ignored for the derived TTL.
+    /// Seconds a leased RDMA pixel slot lives without a free notification (at
+    /// least 1); must exceed the worker's hold or it is ignored for the derived
+    /// TTL.
     /// Falls back to `SMG_RDMA_SLOT_TTL_S`.
     #[arg(long, help_heading = "Multimodal")]
     rdma_slot_ttl_s: Option<u64>,
@@ -945,7 +949,7 @@ struct CliArgs {
     log_json: bool,
 
     // ==================== Prometheus Metrics ====================
-    /// Port to expose Prometheus metrics. Each listener (--port,
+    /// Port to expose Prometheus metrics (at least 1). Each listener (--port,
     /// --prometheus-port, --health-check-port, --mesh-port) needs its own
     /// port.
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
@@ -1145,7 +1149,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 30000, help_heading = "Retry Configuration")]
     retry_max_backoff_ms: u64,
 
-    /// Multiplier for exponential backoff
+    /// Multiplier for exponential backoff (finite, at least 1.0)
     #[arg(long, default_value_t = 1.5, help_heading = "Retry Configuration")]
     retry_backoff_multiplier: f32,
 
@@ -1379,7 +1383,7 @@ struct CliArgs {
     #[arg(long, help_heading = "Redis Database")]
     redis_pool_max_size: Option<usize>,
 
-    /// Redis data retention in days (-1 for persistent, default 30)
+    /// Redis data retention in days (at least 1; -1 for persistent; default 30)
     #[arg(long, allow_negative_numbers = true, help_heading = "Redis Database")]
     redis_retention_days: Option<i64>,
 
@@ -2094,6 +2098,14 @@ impl CliArgs {
 
         let retention_days = match self.redis_retention_days {
             Some(d) if d < 0 => None, // Persistent
+            // A retention of 0 days would expire every record as it is written.
+            Some(0) => {
+                return Err(ConfigError::InvalidValue {
+                    field: "redis_retention_days".to_string(),
+                    value: "0".to_string(),
+                    reason: "Must be at least 1 (-1 keeps records persistent)".to_string(),
+                });
+            }
             Some(d) => Some(d as u64),
             None => Some(30), // Default 30 days
         };

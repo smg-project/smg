@@ -154,6 +154,8 @@ pub struct RouterConfig {
     /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
     #[serde(default = "default_worker_warmup_secs")]
     pub worker_warmup_secs: u64,
+    /// The share of cache misses offered to warming workers: a finite value
+    /// from 0.0 to 1.0.
     #[serde(default = "default_worker_warmup_share")]
     pub worker_warmup_share: f32,
     #[serde(default = "default_worker_warmup_blocks")]
@@ -163,7 +165,7 @@ pub struct RouterConfig {
     /// the warm-up slice until it has grown by `worker_warmup_blocks`,
     /// whatever emptied it (a resync after a publisher restart, an
     /// out-of-range or data-loss resubscription, an engine that came back
-    /// empty). 0 keeps the age rule alone.
+    /// empty). A finite value from 0.0 to 1.0; 0 keeps the age rule alone.
     #[serde(default = "default_worker_warmup_thin_ratio")]
     pub worker_warmup_thin_ratio: f32,
     /// One cache hit in this many is diverted to a thin worker although
@@ -1007,8 +1009,9 @@ pub enum PolicyConfig {
         /// can spill at all.
         #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
-        /// Spill gate, relative part (multiple of the healthy-fleet mean);
-        /// fires only together with `balance_abs_threshold`.
+        /// Spill gate, relative part (multiple of the healthy-fleet mean;
+        /// finite, at least 1.0); fires only together with
+        /// `balance_abs_threshold`.
         #[serde(alias = "spill_rel_threshold")]
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
@@ -1159,7 +1162,8 @@ pub enum PolicyConfig {
         #[serde(default = "default_prefix_token_count")]
         prefix_token_count: usize,
         /// Relative load threshold - a worker is overloaded when its load
-        /// exceeds both avg * factor and the absolute margin (default: 1.25)
+        /// exceeds both avg * factor and the absolute margin (finite, at
+        /// least 1.0; default: 1.25)
         #[serde(default = "default_load_factor")]
         load_factor: f64,
         /// Absolute load difference over average a worker must also exceed
