@@ -1786,8 +1786,6 @@ mod tests {
             .build()
     }
 
-    /// The sweep takes the unstored records whose window ended and leaves a
-    /// fresh one, a stored one and one still running.
     /// With background mode off the sweeper still runs once at start-up, for
     /// the records an earlier gateway left, and then ends.
     #[tokio::test]
@@ -1814,6 +1812,8 @@ mod tests {
             .is_none());
     }
 
+    /// The sweep takes the unstored records whose window ended and leaves a
+    /// fresh one, a stored one and one still running.
     #[tokio::test]
     async fn the_sweep_retires_the_unstored_records_left_past_their_window() {
         use smg_data_connector::{MemoryResponseStorage, StoredResponse};

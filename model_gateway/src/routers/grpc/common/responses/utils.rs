@@ -604,7 +604,7 @@ mod tests {
         let refused = previous_response_chain(&storage, "resp_unstored")
             .await
             .expect_err("an unstored record is no previous response");
-        assert_eq!(refused.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         let chain = previous_response_chain(&storage, "resp_stored")
             .await
             .expect("a stored record is a previous response");
@@ -612,7 +612,7 @@ mod tests {
         let unknown = previous_response_chain(&storage, "resp_unknown")
             .await
             .expect_err("an unknown id is refused");
-        assert_eq!(unknown.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
     }
 
     /// `background: true` with `store: false`, the public API's probe: the
