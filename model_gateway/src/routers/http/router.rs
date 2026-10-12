@@ -4211,6 +4211,25 @@ mod tests {
         worker
     }
 
+    /// A half-open worker at `url` whose breaker closes only after `successes`
+    /// successes: one recorded head leaves it half-open, a second closes it.
+    fn half_open_worker_closing_after(url: &str, successes: u32) -> crate::worker::BasicWorker {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                failure_threshold: 2,
+                success_threshold: successes,
+                timeout_duration: Duration::ZERO,
+                ..Default::default()
+            })
+            .build();
+        worker.record_circuit_breaker_outcome(false);
+        worker.record_circuit_breaker_outcome(false);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        worker
+    }
+
     /// A regular worker at `url` whose circuit breaker opens on the first failure.
     fn fragile_worker(url: &str) -> crate::worker::BasicWorker {
         BasicWorkerBuilder::new(url)
@@ -4451,6 +4470,64 @@ mod tests {
             reopened.is_empty(),
             "the cut was sampled before the head's success in {} of {ROUNDS} rounds: {reopened:?}",
             reopened.len()
+        );
+    }
+
+    /// The head's success is recorded once per request: with a breaker that
+    /// closes after two successes, one clean streamed request leaves it
+    /// half-open on both routes. A caller recording the head again behind
+    /// `forward_worker_response` would close it (and the guards at the two
+    /// callers could be removed unnoticed).
+    #[tokio::test]
+    async fn a_streamed_heads_success_is_recorded_once_on_both_routes() {
+        let url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![half_open_worker_closing_after(&url, 2)],
+        );
+        let response = router
+            .route_typed_request(
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            router.worker_registry.get_all()[0].circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the typed route recorded the head's success once"
+        );
+
+        let url = spawn_cut_stub("/generate", "text/event-stream", CHAT_SSE_CHUNKS, false).await;
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![half_open_worker_closing_after(&url, 2)],
+        );
+        let response = router
+            .route_streaming_request(
+                streamed_request(&[b"{\"text\":\"hi\"}"]),
+                "/generate",
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            router.worker_registry.get_all()[0].circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the streamed route recorded the head's success once"
         );
     }
 
