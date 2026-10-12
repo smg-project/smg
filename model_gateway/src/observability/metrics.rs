@@ -191,7 +191,8 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
 ];
 
 /// Jemalloc's run-time options for a long-running gateway, for every final
-/// artifact (the `smg` executable, the Python extension) to export as
+/// artifact (the `smg` executable, the Python extension, the Go FFI library)
+/// to export as
 /// `_rjem_malloc_conf` next to its `#[global_allocator]`. With the stock
 /// settings a thread's freed pages decay back to the OS only when that thread
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB

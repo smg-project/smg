@@ -127,6 +127,7 @@ mod allocator_tests {
         // The crate's `_rjem_malloc_conf` symbol: purge on a background
         // thread, dirty pages back to the OS after 10 s, muzzy pages at once,
         // and 16 arenas instead of four per CPU.
+        #[cfg_attr(target_vendor = "apple", expect(unused_variables))]
         let (background_thread, dirty_decay_ms, muzzy_decay_ms, narenas) =
             options_in_effect().expect("the options in effect");
         // jemalloc does not compile background-thread support for Mach-O.

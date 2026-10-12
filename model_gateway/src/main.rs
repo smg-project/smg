@@ -12,7 +12,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // Jemalloc's run-time options for a long-running server (see
 // `SERVER_MALLOC_CONF`): the executable exports them as jemalloc's
 // application-provided `malloc_conf`, as the Python extension does for the
-// router launched from Python.
+// router launched from Python and the Go FFI library for a Go host.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 use smg::observability::metrics::SERVER_MALLOC_CONF;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
