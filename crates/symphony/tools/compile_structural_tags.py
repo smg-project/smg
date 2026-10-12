@@ -53,9 +53,9 @@ def main() -> int:
         return 1
     failures = 0
     for path in paths:
-        text = path.read_text(encoding="utf-8")
         started = time.perf_counter()
         try:
+            text = path.read_text(encoding="utf-8")
             grammar = xgr.Grammar.from_structural_tag(json.loads(text))
             if compiler is not None:
                 compiler.compile_grammar(grammar)
