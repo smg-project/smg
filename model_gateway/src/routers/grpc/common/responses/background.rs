@@ -354,15 +354,17 @@ pub(crate) async fn is_closed(
 }
 
 /// Moves the record under `id` to the terminal `status` (see
-/// [`set_stored_status`]); a record that is already terminal stays.
+/// [`set_stored_status`]); a record that is already terminal stays. The
+/// store's answer is logged here and returned for the caller that retries.
 async fn close(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     status: &str,
     error: Option<Value>,
     request_context: Option<StorageRequestContext>,
-) {
-    match set_stored_status(storage, id, status, error, request_context).await {
+) -> Result<Transition, String> {
+    let outcome = set_stored_status(storage, id, status, error, request_context).await;
+    match &outcome {
         Ok(Transition::Moved(_)) => {}
         Ok(Transition::Terminal(raw)) => debug!(
             response_id = %id,
@@ -380,6 +382,7 @@ async fn close(
             "Failed to close the background response record"
         ),
     }
+    outcome
 }
 
 /// [`close`] for the end of a run: retried every `every` within the terminal
@@ -467,7 +470,37 @@ pub(crate) async fn close_before_stream(
     let bytes = to_bytes(body, 1 << 20).await.unwrap_or_default();
     let error = error_object_from(parts.status, &bytes);
     info!(response_id = %id, status = %parts.status, "Background stream failed before it opened");
-    close(storage, id, "failed", Some(error), request_context).await;
+    if close(
+        storage,
+        id,
+        "failed",
+        Some(error.clone()),
+        request_context.clone(),
+    )
+    .await
+    .is_err()
+    {
+        // No run follows that would close the record, and the client is
+        // waiting for this answer: the close is retried in a task of its own
+        // while the store is unreachable.
+        let storage = storage.clone();
+        let id = id.to_string();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the error answer must not wait for the store; the task ends with the close, within the terminal write window"
+        )]
+        let _closing = tokio::spawn(async move {
+            close_retrying(
+                &storage,
+                &id,
+                "failed",
+                Some(error),
+                request_context,
+                STATUS_WATCH,
+            )
+            .await;
+        });
+    }
     Response::from_parts(parts, Body::from(bytes))
 }
 
@@ -1060,7 +1093,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_background_result_that_finds_the_store_unreachable_is_stored_once_it_returns() {
         let flaky = Arc::new(FlakyStorage::new());
         let storage: Arc<dyn ResponseStorage> = flaky.clone();
@@ -1089,7 +1122,49 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn an_error_before_the_stream_opens_outlasts_a_store_outage() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&storage, "resp_1").await;
+        // The store refuses the first close's read and the first retry.
+        flaky.fail_next(2);
+        let answer = close_before_stream(
+            &storage,
+            None,
+            "resp_1",
+            error::bad_request("bad_input", "the request was refused"),
+        )
+        .await;
+        assert_eq!(
+            answer.status(),
+            StatusCode::BAD_REQUEST,
+            "the answer is kept"
+        );
+        // The store may still refuse a read or two: poll without unwrapping.
+        let mut raw = Value::Null;
+        for _ in 0..2000 {
+            if let Ok(Some(stored)) = storage.get_response(&ResponseId::from("resp_1")).await {
+                if stored.raw_response["status"] == "failed" {
+                    raw = stored.raw_response;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            raw["status"], "failed",
+            "the record is closed once the store answers again"
+        );
+        assert_eq!(raw["error"]["code"], "bad_input");
+        assert!(
+            flaky.calls() > 2,
+            "the close was retried: {} calls",
+            flaky.calls()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_background_result_is_not_stored_over_a_record_closed_while_the_store_was_away() {
         let flaky = Arc::new(FlakyStorage::new());
         let storage: Arc<dyn ResponseStorage> = flaky.clone();

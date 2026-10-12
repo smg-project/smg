@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use smg_data_connector::{
     with_request_context, AddedAtSequence, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationStorage, NewConversationItem,
-    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, StoredResponse,
+    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
+    StoredResponse,
 };
 use tracing::{debug, info, warn};
 
@@ -435,7 +436,7 @@ pub async fn persist_conversation_items(
     response_json: &Value,
     original_body: &ResponsesRequest,
     request_context: Option<StorageRequestContext>,
-) -> Result<(), String> {
+) -> Result<(), PersistError> {
     let inner = persist_conversation_items_inner(
         conversation_storage,
         item_storage,
@@ -449,13 +450,57 @@ pub async fn persist_conversation_items(
     }
 }
 
+/// The step of a persist that failed. Only a failed write of the response
+/// record leaves nothing stored: the conversation lookup and the linking of the
+/// turn's items run after it, once, and a caller that retries the whole persist
+/// after they failed would store the record again and link the items twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistStep {
+    /// The request's input or the response could not be turned into a record.
+    Input,
+    /// The response record itself; nothing is stored when it fails.
+    ResponseRecord,
+    /// The lookup of the conversation to link into; the record is stored.
+    ConversationLookup,
+    /// The linking of the turn's items into the conversation; the record is stored.
+    Linking,
+}
+
+/// A failed persist: the step that failed, whether the same persist can
+/// succeed later (a storage error at the record write, as opposed to a record
+/// the store refuses) and the message.
+#[derive(Debug, Clone)]
+pub struct PersistError {
+    pub step: PersistStep,
+    pub retryable: bool,
+    pub message: String,
+}
+
+impl PersistError {
+    fn new(step: PersistStep, retryable: bool, message: impl Into<String>) -> Self {
+        Self {
+            step,
+            retryable,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PersistError {}
+
 async fn persist_conversation_items_inner(
     conversation_storage: Arc<dyn ConversationStorage>,
     item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,
     response_json: &Value,
     original_body: &ResponsesRequest,
-) -> Result<(), String> {
+) -> Result<(), PersistError> {
     // Respect store=false: skip persistence entirely (matches official API behavior)
     if !original_body.store.unwrap_or(true) {
         return Ok(());
@@ -479,12 +524,13 @@ async fn persist_conversation_items_inner(
     let response_id_str = response_json
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Response missing id field".to_string())?
+        .ok_or_else(|| PersistError::new(PersistStep::Input, false, "Response missing id field"))?
         .to_string();
     let response_id = ResponseId::from(response_id_str.as_str());
 
     // Parse and normalize input items from request
-    let input_items = extract_input_items(&original_body.input)?;
+    let input_items = extract_input_items(&original_body.input)
+        .map_err(|e| PersistError::new(PersistStep::Input, false, e))?;
 
     // Cloning the array here is shallow against compacted items — base64
     // image payloads have already been stripped above.
@@ -492,7 +538,9 @@ async fn persist_conversation_items_inner(
         .get("output")
         .and_then(|v| v.as_array())
         .cloned()
-        .ok_or_else(|| "No output array in response".to_string())?;
+        .ok_or_else(|| {
+            PersistError::new(PersistStep::Input, false, "No output array in response")
+        })?;
 
     // Build and store response (consumes `response_json`).
     let mut stored_response = build_stored_response(response_json, original_body);
@@ -502,7 +550,13 @@ async fn persist_conversation_items_inner(
     response_storage
         .store_response(stored_response)
         .await
-        .map_err(|e| format!("Failed to store response: {e}"))?;
+        .map_err(|e| {
+            PersistError::new(
+                PersistStep::ResponseRecord,
+                matches!(e, ResponseStorageError::StorageError(_)),
+                format!("Failed to store response: {e}"),
+            )
+        })?;
 
     // Check if conversation is provided and validate it exists
     let conv_id_opt = if let Some(conv_ref) = &original_body.conversation {
@@ -513,7 +567,13 @@ async fn persist_conversation_items_inner(
                 warn!(conversation_id = %conv_id.0, "Conversation not found, skipping item linking");
                 None
             }
-            Err(e) => return Err(format!("Failed to get conversation: {e}")),
+            Err(e) => {
+                return Err(PersistError::new(
+                    PersistStep::ConversationLookup,
+                    false,
+                    format!("Failed to get conversation: {e}"),
+                ))
+            }
         }
     } else {
         None
@@ -528,7 +588,8 @@ async fn persist_conversation_items_inner(
             &output_items,
             &response_id_str,
         )
-        .await?;
+        .await
+        .map_err(|e| PersistError::new(PersistStep::Linking, false, e))?;
         info!(
             conversation_id = %conv_id.0,
             response_id = %response_id.0,

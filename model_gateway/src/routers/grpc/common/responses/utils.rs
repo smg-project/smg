@@ -20,8 +20,9 @@ use super::background;
 use crate::{
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client, openai_bridge,
-            persistence_utils::persist_conversation_items,
+            mcp_utils::ensure_request_mcp_client,
+            openai_bridge,
+            persistence_utils::{persist_conversation_items, PersistStep},
         },
         error,
     },
@@ -345,8 +346,14 @@ pub(crate) async fn persist_response_if_needed(
     // A background response's terminal write is retried at the status-watch
     // cadence within the terminal write window while the store answers with
     // an error: the result of a run that outlived a store blip is stored once
-    // the store is back. A foreground response is written once, as before:
-    // its client is waiting for the answer.
+    // the store is back. Only the write of the response record is retried:
+    // once it landed, the conversation linking runs once (as before), so a
+    // retry can neither store the record twice nor link the items twice. A
+    // foreground response is written once, as before: its client is waiting
+    // for the answer. A background stream attached through the Harmony paths
+    // receives its terminal event after this persist, so during a store
+    // outage that event can wait for up to the window; the regular streaming
+    // paths emit it first.
     let every = background::STATUS_WATCH;
     let deadline = tokio::time::Instant::now() + background::terminal_write_window(every);
     let mut attempts = 0u32;
@@ -365,7 +372,12 @@ pub(crate) async fn persist_response_if_needed(
                 debug!("Persisted response: {}", response.id);
                 return;
             }
-            Err(e) if background && tokio::time::Instant::now() < deadline => {
+            Err(e)
+                if background
+                    && e.step == PersistStep::ResponseRecord
+                    && e.retryable
+                    && tokio::time::Instant::now() < deadline =>
+            {
                 if attempts == 0 {
                     warn!(
                         response_id = %response.id,
@@ -388,6 +400,19 @@ pub(crate) async fn persist_response_if_needed(
                     );
                     return;
                 }
+            }
+            Err(e)
+                if matches!(
+                    e.step,
+                    PersistStep::ConversationLookup | PersistStep::Linking
+                ) =>
+            {
+                warn!(
+                    response_id = %response.id,
+                    error = %e,
+                    "Response stored; its items were not linked into the conversation"
+                );
+                return;
             }
             Err(e) => {
                 warn!("Failed to persist response: {}", e);
