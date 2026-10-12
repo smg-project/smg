@@ -330,7 +330,9 @@ fn byte_fallback_remainder_after_a_literal_replacement_character_counts_its_byte
     // the batch decode turns the whole run into one replacement character per
     // byte, and the stream, which keeps "\u{FFFD}A", sends one for every byte
     // it has not covered. The literal counts as its three bytes, not as one:
-    // the tail is as long as the run of invalid bytes, whatever its length.
+    // the tail is as long as the run of invalid bytes, whatever its length,
+    // and on either path: up to three invalid bytes the run closes through
+    // the remainder path, from four on through the lost-run path.
     let tokenizer = byte_fallback_full_tokenizer(vec![]);
     for invalid in [1, 3, 4, 8] {
         let mut ids = byte_ids("\u{FFFD}A");
@@ -737,32 +739,6 @@ fn byte_fallback_literal_replacement_characters_are_not_a_lost_run() {
     assert_eq!(batch, format!("{}x", "\u{FFFD}".repeat(6)));
     assert_eq!(deltas.concat(), batch);
     assert_eq!(recoveries, 0);
-}
-
-#[test]
-fn byte_fallback_lost_run_after_a_literal_replacement_character_counts_bytes() {
-    // "\u{FFFD}A" streamed as byte tokens, then invalid bytes, then a regular
-    // token. With fewer than four invalid bytes the run closes through the
-    // remainder path, from four on through the lost-run path; both count the
-    // streamed literal U+FFFD as its three bytes, so the tail has one
-    // replacement character per invalid byte on either path. Both keep
-    // "\u{FFFD}A" and count one recovery.
-    let tokenizer = byte_fallback_full_tokenizer(vec![]);
-    for (invalid, expected_tail) in [(3, 3), (4, 4), (8, 8)] {
-        let mut ids = byte_ids("\u{FFFD}A");
-        ids.extend(vec![0xFF + 2; invalid]);
-        ids.push(1);
-        let (deltas, batch, recoveries) =
-            stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
-        assert_eq!(batch, format!("{}x", "\u{FFFD}".repeat(4 + invalid)));
-        assert_eq!(deltas[0], "\u{FFFD}A", "{invalid} invalid bytes");
-        assert_eq!(
-            deltas.concat(),
-            format!("\u{FFFD}A{}x", "\u{FFFD}".repeat(expected_tail)),
-            "{invalid} invalid bytes"
-        );
-        assert_eq!(recoveries, 1, "{invalid} invalid bytes");
-    }
 }
 
 #[test]
