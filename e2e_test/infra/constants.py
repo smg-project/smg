@@ -79,6 +79,7 @@ ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
 ENV_VLLM_MM_PROCESSOR = "E2E_VLLM_MM_PROCESSOR"  # Worker-lane processor — see get_vllm_mm_processor
+ENV_PARSER = "E2E_PARSER"  # The gateway's --parser for a lane — see get_parser
 ENV_STARTUP_TIMEOUT = (
     "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
 )
@@ -199,6 +200,21 @@ def get_mm_processing() -> str | None:
 
 VLLM_SERVICER_IMPLS = ("python", "rust")
 VLLM_MM_PROCESSORS = ("inprocess", "smg")
+
+
+def get_parser() -> str | None:
+    """The parser a lane starts the gateway with, its ``--parser`` flag.
+
+    Set ``E2E_PARSER=symphony`` to read every chat completion with Symphony for
+    the models its registry knows; ``legacy`` names the per-model parsers.
+    Unset or blank leaves the gateway on its default, legacy.
+    """
+    value = os.environ.get(ENV_PARSER, "").strip().lower()
+    if not value:
+        return None
+    if value not in ("legacy", "symphony"):
+        raise ValueError(f"{ENV_PARSER}={value!r} is not a parser; use legacy or symphony")
+    return value
 
 
 def get_vllm_mm_processor() -> str:

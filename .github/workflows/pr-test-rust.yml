@@ -781,6 +781,48 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
     secrets: inherit
 
+  # The chat cases with the gateway reading through Symphony (--parser symphony):
+  # the same workers and suite as e2e-1gpu-chat, the Symphony path for every
+  # model its registry knows. Runs for a chat or common change as the chat lane
+  # does, and for a Symphony-only change too, since this is the one lane that
+  # exercises a table against a real engine.
+  e2e-1gpu-chat-symphony:
+    name: e2e-1gpu-chat-symphony (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (needs.detect-changes.result == 'success'
+              && (needs.detect-changes.outputs.common == 'true'
+                  || needs.detect-changes.outputs.chat-completions == 'true'
+                  || needs.detect-changes.outputs.symphony-only == 'true')))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sglang
+            timeout: 36
+            test_timeout: 28
+            min_selected: 204
+          - engine: vllm
+            timeout: 32
+            test_timeout: 24
+            min_selected: 202
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: e2e_test/chat_completions
+      min_selected: ${{ matrix.min_selected }}
+      parser: symphony
+    secrets: inherit
+
   # The chat cases against the Rust gRPC servicer (SMG_SGLANG_SERVICER_IMPL=rust,
   # SMG_VLLM_SERVICER_IMPL=rust): the same workers, the Rust request path. A
   # row for SGLang and one for vLLM (the TokenSpeed Rust servicer has no
@@ -1655,7 +1697,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1724,6 +1766,7 @@ jobs:
                 "${{ needs.unit-tests.result }}" =~ $bad || \
                 "${{ needs.cargo-audit.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-symphony.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \

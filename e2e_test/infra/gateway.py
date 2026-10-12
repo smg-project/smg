@@ -17,6 +17,7 @@ from .constants import (
     DEFAULT_HOST,
     DEFAULT_ROUTER_TIMEOUT,
     ENV_SHOW_ROUTER_LOGS,
+    get_parser,
     get_zmq_engine_count,
     host_port,
 )
@@ -465,6 +466,10 @@ class Gateway:
         ]
         if self.log_dir:
             cmd.extend(["--log-dir", self.log_dir])
+        # The lane's parser (E2E_PARSER); unset, the gateway keeps its default.
+        parser = get_parser()
+        if parser:
+            cmd.extend(["--parser", parser])
         return cmd
 
     def _build_cloud_args(self, cloud_backend: str, history_backend: str) -> list[str]:
