@@ -926,6 +926,27 @@ impl ScratchDatabase {
         Ok(rows?.iter().map(|row| row.get::<_, i32>(0)).collect())
     }
 
+    /// The indexes of the database's current schema, by name.
+    async fn indexes(&self) -> Result<Vec<String>, String> {
+        let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("connect to the scratch database: {e}"))?;
+        let mut driver = JoinSet::new();
+        driver.spawn(async move {
+            let _ = connection.await;
+        });
+        let rows = client
+            .query(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() ORDER BY indexname",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("read the indexes: {e}"));
+        drop(client);
+        driver.join_all().await;
+        Ok(rows?.iter().map(|row| row.get::<_, String>(0)).collect())
+    }
+
     async fn drop(self) {
         let _ = self
             .admin(&format!(
@@ -934,6 +955,41 @@ impl ScratchDatabase {
             ))
             .await;
     }
+}
+
+/// Six gateways start together on `scratch` (`auto_migrate` on, as a
+/// deployment that migrates at start-up): the start-up failures, and the
+/// versions the database records afterwards.
+async fn six_gateways_start_together(
+    scratch: &ScratchDatabase,
+) -> (Vec<String>, Result<Vec<i32>, String>) {
+    let mut starts = JoinSet::new();
+    for _ in 0..6 {
+        let url = scratch.url.clone();
+        starts.spawn(async move {
+            let postgres_cfg: PostgresConfig = serde_json::from_value(json!({
+                "db_url": url,
+                "pool_max": 2,
+                "schema": {"auto_migrate": true},
+            }))
+            .map_err(|e| format!("a Postgres config: {e}"))?;
+            create_storage(StorageFactoryConfig {
+                backend: &HistoryBackend::Postgres,
+                oracle: None,
+                postgres: Some(&postgres_cfg),
+                redis: None,
+                hook: None,
+            })
+            .await
+            .map(drop)
+        });
+    }
+    let outcomes = starts.join_all().await;
+    let versions = scratch.versions().await;
+    (
+        outcomes.into_iter().filter_map(Result::err).collect(),
+        versions,
+    )
 }
 
 /// `db_url` with its database name replaced by `name`.
@@ -984,6 +1040,7 @@ async fn a_fresh_database_bootstraps_at_the_latest_version_without_auto_migrate(
     })
     .await;
     let versions = scratch.versions().await;
+    let indexes = scratch.indexes().await;
     let served = match &outcome {
         Ok(bundle) => Some(
             bundle
@@ -1002,6 +1059,13 @@ async fn a_fresh_database_bootstraps_at_the_latest_version_without_auto_migrate(
         .expect("a fresh database must come up without auto_migrate")
         .expect("the fresh store serves");
     assert_eq!(versions.expect("read the versions"), vec![1, 2, 3]);
+    let indexes = indexes.expect("read the indexes");
+    for index in ["conv_item_links_conv_idx", "responses_safety_idx"] {
+        assert!(
+            indexes.iter().any(|name| name == index),
+            "{index} is created by the bootstrap: {indexes:?}"
+        );
+    }
 }
 
 /// Gateways starting together on an empty database all come up: the
@@ -1017,34 +1081,48 @@ async fn gateways_starting_together_on_an_empty_database_all_come_up() {
         let scratch = ScratchDatabase::create(&db_url, &format!("race{round}"))
             .await
             .expect("create a scratch database");
-        let mut starts = JoinSet::new();
-        for _ in 0..6 {
-            let url = scratch.url.clone();
-            starts.spawn(async move {
-                let postgres_cfg: PostgresConfig = serde_json::from_value(json!({
-                    "db_url": url,
-                    "pool_max": 2,
-                    "schema": {"auto_migrate": true},
-                }))
-                .expect("a Postgres config");
-                create_storage(StorageFactoryConfig {
-                    backend: &HistoryBackend::Postgres,
-                    oracle: None,
-                    postgres: Some(&postgres_cfg),
-                    redis: None,
-                    hook: None,
-                })
-                .await
-                .map(drop)
-            });
-        }
-        let outcomes = starts.join_all().await;
-        let versions = scratch.versions().await;
+        let (failures, versions) = six_gateways_start_together(&scratch).await;
         scratch.drop().await;
-        let failures: Vec<String> = outcomes.into_iter().filter_map(Result::err).collect();
         assert!(
             failures.is_empty(),
             "round {round}: {} of 6 starts failed: {failures:?}",
+            failures.len()
+        );
+        assert_eq!(
+            versions.expect("read the versions"),
+            vec![1, 2, 3],
+            "round {round}"
+        );
+    }
+}
+
+/// The bootstrap reads the schema version in a snapshot taken after its lock
+/// wait whatever the server's default isolation: under a `repeatable read`
+/// default a gateway queued behind another's bootstrap would otherwise read
+/// the versions table as it was before that bootstrap and apply the
+/// migrations again to tables that already have their final shape.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn gateways_starting_together_come_up_under_a_repeatable_read_default() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    for round in 0..3 {
+        let scratch = ScratchDatabase::create(&db_url, &format!("rr{round}"))
+            .await
+            .expect("create a scratch database");
+        scratch
+            .admin(&format!(
+                "ALTER DATABASE \"{}\" SET default_transaction_isolation TO 'repeatable read'",
+                scratch.name
+            ))
+            .await
+            .expect("set the database's default isolation");
+        let (failures, versions) = six_gateways_start_together(&scratch).await;
+        scratch.drop().await;
+        assert!(
+            failures.is_empty(),
+            "round {round}: {} of 6 starts failed under a repeatable read default: {failures:?}",
             failures.len()
         );
         assert_eq!(

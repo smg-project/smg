@@ -74,12 +74,24 @@ impl PostgresStore {
                 describe_error(&e)
             )
         })?;
-        let mut tx = client.transaction().await.map_err(|e| {
-            format!(
-                "failed to begin the schema bootstrap: {}",
-                describe_error(&e)
-            )
-        })?;
+        // READ COMMITTED whatever the server's default isolation: the version
+        // rows are read after the lock wait, in a snapshot taken then. Under a
+        // REPEATABLE READ default the snapshot would be the lock statement's
+        // own, taken before the wait, and a gateway queued behind another's
+        // bootstrap would read the versions table as it was before that
+        // bootstrap (the tables there, the versions not) and refuse, or apply
+        // the migrations again.
+        let mut tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to begin the schema bootstrap: {}",
+                    describe_error(&e)
+                )
+            })?;
         tx.execute(
             "SELECT pg_advisory_xact_lock($1)",
             &[&POSTGRES_SCHEMA_LOCK_ID],
@@ -128,9 +140,20 @@ impl PostgresStore {
             .await?;
         }
 
-        // The index last: its column exists once the migrations ran. A table
-        // the operator declared up to date without the column keeps starting
-        // without the index, as before.
+        // The indexes last, so the share lock a `CREATE INDEX IF NOT EXISTS`
+        // takes on its table is not held while the migrations wait for their
+        // own locks: the links index on columns the table always has, then
+        // the safety-identifier index, whose column exists once the
+        // migrations ran. A table the operator declared up to date without
+        // the column keeps starting without that index, as before.
+        tx.batch_execute(&PostgresConversationItemStorage::index_ddl(schema))
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to create the conversation item links index: {}",
+                    describe_error(&e)
+                )
+            })?;
         if let Some(index_ddl) = PostgresResponseStorage::index_ddl(schema) {
             let index = tx.savepoint("response_index").await.map_err(|e| {
                 format!("failed to open the index savepoint: {}", describe_error(&e))
@@ -143,8 +166,9 @@ impl PostgresStore {
                     )
                 })?,
                 Err(e) => {
-                    tracing::debug!(
-                        "deferred response index creation (column may not exist yet): {e}"
+                    tracing::warn!(
+                        "response index not created (the safety_identifier column may be missing): {}",
+                        describe_error(&e)
                     );
                     index.rollback().await.map_err(|e| {
                         format!(
@@ -459,8 +483,9 @@ impl PostgresConversationItemStorage {
         Self { store }
     }
 
-    /// The conversation items and links tables in their current shape, with
-    /// the links index, created by the store's bootstrap (`IF NOT EXISTS`).
+    /// The conversation items and links tables in their current shape,
+    /// created by the store's bootstrap (`IF NOT EXISTS`); the links index is
+    /// `index_ddl`.
     pub(crate) fn table_ddl(schema: &SchemaConfig) -> String {
         let si = &schema.conversation_items;
         let sl = &schema.conversation_item_links;
@@ -501,10 +526,22 @@ impl PostgresConversationItemStorage {
 
         format!(
             "CREATE TABLE IF NOT EXISTS {items_table} ({});\n\
-             CREATE TABLE IF NOT EXISTS {links_table} ({});\n\
-             CREATE INDEX IF NOT EXISTS conv_item_links_conv_idx ON {links_table} ({col_conv_id}, {col_added_at});",
+             CREATE TABLE IF NOT EXISTS {links_table} ({});",
             item_col_defs.join(", "),
             link_col_defs.join(", "),
+        )
+    }
+
+    /// The index on the links table's conversation and time columns, created
+    /// by the bootstrap after the migrations, so the share lock it takes on
+    /// the table is not held while they run.
+    pub(crate) fn index_ddl(schema: &SchemaConfig) -> String {
+        let sl = &schema.conversation_item_links;
+        let links_table = sl.qualified_table(schema.owner.as_deref());
+        format!(
+            "CREATE INDEX IF NOT EXISTS conv_item_links_conv_idx ON {links_table} ({}, {});",
+            sl.col("conversation_id"),
+            sl.col("added_at")
         )
     }
 }
@@ -1545,6 +1582,15 @@ mod tests {
             .skip_columns
             .insert("safety_identifier".to_string());
         assert!(PostgresResponseStorage::index_ddl(&skipped).is_none());
+        // The links index is a statement of its own, run after the migrations.
+        assert_eq!(
+            PostgresConversationItemStorage::index_ddl(&schema),
+            "CREATE INDEX IF NOT EXISTS conv_item_links_conv_idx ON conversation_item_links (conversation_id, added_at);"
+        );
+        assert!(
+            !PostgresConversationItemStorage::table_ddl(&schema).contains("CREATE INDEX"),
+            "the tables' DDL carries no index"
+        );
     }
 
     #[test]
