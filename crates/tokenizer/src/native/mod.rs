@@ -884,10 +884,17 @@ mod tests {
                 &shape, &mut state,
             ));
             let added: Vec<&str> = shape.special.to_vec();
-            let texts: Vec<String> = (0..8)
+            let mut texts: Vec<String> = (0..8)
                 .map(|round| random_text(&mut state, 1 + round * 5, &added))
                 .filter(|text| !shape.nfc || text.nfc().eq(text.chars()))
                 .collect();
+            // Under an NFC shape, one input the direct encoder declines sits
+            // in the middle of the batch: it takes the `tokenizers` path on
+            // its own, and its neighbours stay on the direct path.
+            let declined = "e\u{301}";
+            if shape.nfc {
+                texts.insert(texts.len() / 2, declined.to_string());
+            }
             let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
             let batch = tokenizer.encode_batch(&inputs, false).expect("batch");
             assert_eq!(batch.len(), inputs.len(), "{}", shape.name);
@@ -899,11 +906,19 @@ mod tests {
                     "{}: {input:?}",
                     shape.name
                 );
-                assert!(
-                    matches!(encoding, Encoding::Plain(_)),
-                    "{}: the batch left the direct path for {input:?}",
-                    shape.name
-                );
+                if shape.nfc && *input == declined {
+                    assert!(
+                        matches!(encoding, Encoding::Hf(_)),
+                        "{}: the declined input takes the tokenizers path",
+                        shape.name
+                    );
+                } else {
+                    assert!(
+                        matches!(encoding, Encoding::Plain(_)),
+                        "{}: the batch left the direct path for {input:?}",
+                        shape.name
+                    );
+                }
             }
         }
     }
