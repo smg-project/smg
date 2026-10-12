@@ -212,7 +212,7 @@ fn public_code(error: &ValidationError) -> String {
         | "credit_card"
         | "phone"
         | "non_control_character" => "invalid_value".to_string(),
-        // A rule whose "code" is a sentence ("messages cannot be empty") has
+        // A rule whose "code" is a sentence ("query cannot be empty") has
         // its text in the message already; the code stays an identifier.
         code if code.contains(char::is_whitespace) => "invalid_value".to_string(),
         code => code.to_string(),
