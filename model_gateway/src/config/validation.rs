@@ -388,11 +388,11 @@ impl ConfigValidator {
                 });
             }
             // The canonical key is stored with every response and
-            // conversation, in a 255-character column on the SQL backends.
+            // conversation, in a 255-byte column on the SQL backends.
             if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
-                        "tenant_api_keys tenant_id '{}' is longer than {} characters",
+                        "tenant_api_keys tenant_id '{}' is longer than {} bytes",
                         entry.tenant_id,
                         crate::tenant::MAX_TENANT_ID_LEN
                     ),
