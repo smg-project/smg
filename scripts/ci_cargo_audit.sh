@@ -24,11 +24,14 @@ bin_dir="${CARGO_AUDIT_BIN_DIR:-${RUNNER_TEMP:-${XDG_CACHE_HOME:-$HOME/.cache}}/
 bin="${bin_dir}/cargo-audit"
 archive="${bin_dir}/${name}.tgz"
 mkdir -p "${bin_dir}"
-if [ ! -f "${archive}" ]; then
+# Downloaded whenever the cached archive is missing or does not match the pinned checksum (a
+# download that died partway, a tampered file): a bad archive is replaced, never kept.
+if ! echo "${sha256}  ${archive}" | sha256sum --check --quiet 2>/dev/null; then
+  rm -f "${archive}"
   curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 -o "${archive}" \
     "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv${CARGO_AUDIT_VERSION}/${name}.tgz"
+  echo "${sha256}  ${archive}" | sha256sum --check --quiet
 fi
-echo "${sha256}  ${archive}" | sha256sum --check --quiet
 rm -f "${bin}"
 tar xzf "${archive}" --strip-components=1 -C "${bin_dir}" "${name}/cargo-audit"
 
