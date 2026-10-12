@@ -1403,6 +1403,142 @@ mod tests {
         }
     }
 
+    /// A video batch of the Qwen3-VL family, from the family's processor to the
+    /// vLLM wire with the layout its spec declares for video: validation must
+    /// find the batch's own sizes tensor (`patches_per_video`), and the wire
+    /// must name it, not the image one. The spec once answered every modality
+    /// with the image layout, and every video failed here with
+    /// "missing flat sizes tensor patches_per_image".
+    #[test]
+    fn a_qwen3_vl_video_batch_assembles_with_its_own_sizes_key() {
+        use llm_multimodal::{
+            vision::Qwen3VLProcessor, ModelMetadata, ModelRegistry, PreProcessorConfig, Tokenizer,
+            VideoSource, VisionPreProcessor,
+        };
+
+        struct NoTokenizer;
+        impl Tokenizer for NoTokenizer {
+            fn token_to_id(&self, _token: &str) -> Option<u32> {
+                None
+            }
+            fn id_to_token(&self, _id: u32) -> Option<String> {
+                None
+            }
+            fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+                None
+            }
+        }
+
+        let model_config = serde_json::json!({
+            "model_type": "qwen3_vl",
+            "image_token_id": 151655,
+            "video_token_id": 151656,
+        });
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&ModelMetadata {
+                model_id: "qwen3-vl",
+                tokenizer: &NoTokenizer,
+                config: &model_config,
+            })
+            .expect("the family's spec");
+
+        let config = PreProcessorConfig::from_json(
+            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+                "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
+                "size": {"shortest_edge": 4096, "longest_edge": 25165824}}"#,
+        )
+        .expect("preprocessor config");
+        let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
+        let frames: Vec<image::DynamicImage> = (0..4u8)
+            .map(|t| {
+                image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 64, |x, y| {
+                    image::Rgb([x as u8 * 4, y as u8 * 4, t * 60])
+                }))
+            })
+            .collect();
+        let preprocessed = processor
+            .preprocess_video(&frames, &config)
+            .expect("video preprocess");
+        let rows = preprocessed.encoder_input.shape()[0];
+        let features = preprocessed.encoder_input.shape()[1];
+        let tokens = preprocessed.feature_token_counts[0];
+        assert_eq!(
+            (rows, tokens),
+            (32, 8),
+            "4 frames of 64x64: 2 x 4 x 4 patches, merged 2x2"
+        );
+
+        let intermediate = PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Videos(vec![Arc::new(VideoClip::new(
+                frames,
+                bytes::Bytes::from_static(b"clip"),
+                VideoSource::InlineBytes,
+                "video-hash".to_string(),
+            ))]),
+            bindings: vec![PromptBinding {
+                item_index: 0,
+                prompt_ordinal: 0,
+                structural: PlaceholderRange {
+                    offset: 10,
+                    length: tokens,
+                },
+                patches: vec![],
+            }],
+            placeholder_token_id: Some(151656),
+            field_layouts: spec.encoder_field_layouts_for(Modality::Video),
+            keep_on_cpu_keys: spec.keep_on_cpu_keys_for(Modality::Video),
+            encoder_input_key: spec.encoder_input_key_for(Modality::Video),
+        };
+
+        validate_precomputed_batch(&intermediate)
+            .expect("a video batch validates against the spec's video layout");
+        let assembled = assemble_vllm(
+            intermediate,
+            &VllmAssembly {
+                encoder_dtype: "bfloat16".to_string(),
+                device_normalizes: false,
+                shm_enabled: false,
+                shm_min_bytes: 0,
+            },
+        )
+        .expect("vLLM assembly of a video batch");
+
+        assert_eq!(assembled.modality, common::Modality::Video);
+        assert_eq!(
+            assembled.flat_keys,
+            HashMap::from([("pixel_values".to_string(), "patches_per_video".to_string())])
+        );
+        for key in [
+            "video_grid_thw",
+            "patches_per_video",
+            "video_second_per_grid",
+        ] {
+            assert!(
+                assembled.batched_keys.iter().any(|k| k == key),
+                "{key} is batched"
+            );
+            assert!(
+                assembled.model_specific_tensors.contains_key(key),
+                "{key} is sent"
+            );
+        }
+        assert!(
+            !assembled
+                .batched_keys
+                .iter()
+                .any(|k| k.starts_with("image_")),
+            "no image tensor is announced for a video batch: {:?}",
+            assembled.batched_keys
+        );
+        assert_eq!(
+            assembled.pixel_values_shape,
+            vec![rows as u32, features as u32]
+        );
+        assert_eq!(assembled.mm_placeholders, vec![(10, tokens as u32)]);
+    }
+
     #[test]
     fn assemble_tokenspeed_splits_video_items() {
         let mut model_specific = HashMap::new();
