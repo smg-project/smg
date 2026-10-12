@@ -2764,9 +2764,10 @@ pub enum ProtoStream {
 /// A disaggregated request's decode leg. Its engine loads the prompt's KV
 /// from the prefill leg and reports what it loaded as cached, so every chunk
 /// and complete it yields is restamped with the prefill leg's prefix-cache
-/// hit before the gateway reads it. The wrapper sits outside the worker
-/// tracking, so the decode worker still learns its prefill rate from what its
-/// own engine computed.
+/// hit before the gateway reads it. Decode legs are not tracked today; if one
+/// ever is, the tracking must sit inside this wrapper, so that a
+/// [`PrefillTicket`] reads the engine's own `cached_tokens`, not the
+/// restamped value.
 pub struct DecodeLegStream {
     inner: ProtoStream,
     prefill: PrefillCachedTokens,
@@ -3272,6 +3273,24 @@ impl ProtoStream {
 
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        if let Self::DecodeLeg(leg) = self {
+            // A decode leg's messages are polled in place as a tracked
+            // stream's are, without a boxed future per message; a wrapper
+            // inside the wrapper recurses. The inner stream did its own
+            // bookkeeping and engine-error mapping; only the prompt-side usage
+            // changes here.
+            let item = if matches!(leg.inner, Self::Tracked(_) | Self::DecodeLeg(_)) {
+                Box::pin(leg.inner.next()).await
+            } else {
+                leg.inner.next_untracked().await
+            };
+            return item.map(|result| {
+                result.map(|mut response| {
+                    response.restamp_cached_tokens(&leg.prefill);
+                    response
+                })
+            });
+        }
         let Self::Tracked(tracked) = self else {
             return self.next_untracked().await;
         };
@@ -3334,16 +3353,9 @@ impl ProtoStream {
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
             Self::Tracked(_) => return Box::pin(self.next()).await,
-            // The inner stream (tracked or not) did its own bookkeeping and
-            // engine-error mapping; only the prompt-side usage changes here.
-            Self::DecodeLeg(leg) => {
-                return Box::pin(leg.inner.next()).await.map(|result| {
-                    result.map(|mut response| {
-                        response.restamp_cached_tokens(&leg.prefill);
-                        response
-                    })
-                })
-            }
+            // Reached only with one wrapper inside another: [`Self::next`]
+            // polls a decode leg in place.
+            Self::DecodeLeg(_) => return Box::pin(self.next()).await,
         };
         item.map(reject_engine_error)
     }

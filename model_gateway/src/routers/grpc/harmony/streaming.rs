@@ -703,7 +703,7 @@ impl HarmonyStreamingProcessor {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 debug!("Processing Responses API single stream mode");
-                Self::process_decode_stream(stream, emitter, tx, session, format_registry, 0).await
+                Self::process_decode_stream(stream, emitter, tx, session, format_registry).await
             }
             context::ExecutionResult::PrefillDecode {
                 // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
@@ -743,25 +743,19 @@ impl HarmonyStreamingProcessor {
         format_registry: Option<&FormatRegistry>,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<ResponsesIterationResult, String> {
-        // Phase 1: Drain prefill stream, collecting cached_tokens from Complete messages
-        let mut prefill_cached_tokens_by_index: HashMap<u32, u32> = HashMap::new();
-        drain_prefill(&mut prefill_stream, prefill_guards, false, |complete| {
-            prefill_cached_tokens_by_index.insert(complete.index(), complete.cached_tokens());
-        })
-        .await
-        .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-        let prefill_cached_tokens: u32 = prefill_cached_tokens_by_index.values().sum();
+        // Phase 1: Drain prefill stream. The client's prompt-side usage is the
+        // prefill leg's prefix-cache hit: the decode leg counts the KV it was
+        // handed as cached, so its responses are restamped with the prefill
+        // leg's number before the decode phase reads them.
+        let prefill_cached_tokens =
+            drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {})
+                .await
+                .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
 
         // Phase 2: Process decode stream
-        let result = Self::process_decode_stream(
-            decode_stream,
-            emitter,
-            tx,
-            session,
-            format_registry,
-            prefill_cached_tokens,
-        )
-        .await;
+        let result =
+            Self::process_decode_stream(decode_stream, emitter, tx, session, format_registry).await;
 
         prefill_stream.mark_completed();
         result
@@ -774,7 +768,6 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-        prefill_cached_tokens: u32,
     ) -> Result<ResponsesIterationResult, String> {
         let mut parser =
             HarmonyParserAdapter::new().map_err(|e| format!("Failed to create parser: {e}"))?;
@@ -792,12 +785,13 @@ impl HarmonyStreamingProcessor {
         let mut tool_call_tracking: HashMap<usize, (usize, String, Option<ResponseFormat>)> =
             HashMap::new();
 
-        // Metadata from Complete message; seed cached_tokens from prefill phase (prefill/decode stream)
+        // Metadata from the Complete message (a disaggregated request's decode
+        // leg carries the prefill leg's cache hit, see `ProtoStream::decode_leg`)
         let mut finish_reason: String;
         let mut finalized_analysis: Option<String> = None;
         let mut prompt_tokens: u32 = 0;
         let mut completion_tokens: u32 = 0;
-        let mut cached_tokens: u32 = prefill_cached_tokens;
+        let mut cached_tokens: u32 = 0;
         let mut reasoning_token_count: u32 = 0;
 
         // Process stream
@@ -1035,8 +1029,9 @@ impl HarmonyStreamingProcessor {
                     // Store final metadata
                     finish_reason = complete_wrapper.finish_reason().to_string();
                     prompt_tokens = complete_wrapper.prompt_tokens();
-                    // Combine decode-stream cached_tokens with any prefill cached_tokens
-                    cached_tokens = cached_tokens.saturating_add(complete_wrapper.cached_tokens());
+                    // The prefill leg's hit through a prefill/decode pair, the
+                    // engine's own through a single engine
+                    cached_tokens = complete_wrapper.cached_tokens();
                     // Delta streams keep the count accumulated above;
                     // cumulative streams take it from Complete.
                     if !complete_wrapper.chunk_semantics().is_delta() {
