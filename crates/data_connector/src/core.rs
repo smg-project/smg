@@ -576,13 +576,20 @@ pub trait ResponseStorage: Send + Sync {
 }
 
 /// Whether `response` is the record of a response its client asked not to
-/// store (`store: false` in its object) that reached a terminal status (the
-/// statuses a response does not leave: completed, incomplete, failed,
-/// cancelled) before `cutoff`: at its object's `completed_at` when it carries
-/// one, at the record's creation otherwise.
+/// store (`store: false` in its object): a background run's record, kept for
+/// its polling window only. Such a record is no previous response and its
+/// items are no stored items, as the public API answers for an unstored id.
+pub fn is_unstored(response: &StoredResponse) -> bool {
+    response.raw_response.get("store").and_then(Value::as_bool) == Some(false)
+}
+
+/// Whether `response` is [unstored](is_unstored) and reached a terminal
+/// status (the statuses a response does not leave: completed, incomplete,
+/// failed, cancelled) before `cutoff`: at its object's `completed_at` when it
+/// carries one, at the record's creation otherwise.
 pub fn unstored_terminal_before(response: &StoredResponse, cutoff: DateTime<Utc>) -> bool {
     let raw = &response.raw_response;
-    if raw.get("store").and_then(Value::as_bool) != Some(false) {
+    if !is_unstored(response) {
         return false;
     }
     if !matches!(

@@ -10,8 +10,9 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 use smg_data_connector::{
-    ConversationItemStorage, ConversationStorage, RequestContext as StorageRequestContext,
-    ResponseStorage,
+    is_unstored, ConversationItemStorage, ConversationStorage,
+    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
+    StoredResponse,
 };
 use smg_mcp::{McpOrchestrator, McpServerBinding};
 use tracing::{debug, error, warn};
@@ -356,6 +357,42 @@ impl NotStored {
     }
 }
 
+/// The responses behind a `previous_response_id`, oldest first, or the
+/// refusal every loader answers: `previous_response_not_found` for an id the
+/// store does not know, an empty chain, or a chain ending in a record its
+/// client asked not to store (a background run's record, kept for its
+/// polling window only: a chain built on it would break when it goes, so it
+/// is no previous response, as the public API answers for an unstored id);
+/// `load_previous_response_chain_failed` for a store that failed.
+pub(crate) async fn previous_response_chain(
+    storage: &Arc<dyn ResponseStorage>,
+    prev_id_str: &str,
+) -> Result<Vec<StoredResponse>, Response> {
+    let prev_id = ResponseId::from(prev_id_str);
+    match storage.get_response_chain(&prev_id, None).await {
+        Ok(chain)
+            if !chain.responses.is_empty() && !chain.responses.last().is_some_and(is_unstored) =>
+        {
+            Ok(chain.responses)
+        }
+        Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::bad_request(
+            "previous_response_not_found",
+            format!("Previous response with id '{prev_id_str}' not found."),
+        )),
+        Err(e) => {
+            error!(
+                prev_id = %prev_id_str,
+                error = %e,
+                "Failed to load previous response chain from storage"
+            );
+            Err(error::internal_error(
+                "load_previous_response_chain_failed",
+                format!("Failed to load previous response chain for {prev_id_str}: {e}"),
+            ))
+        }
+    }
+}
+
 /// Whether `request` is a foreground response the client expects stored
 /// (`store` unset or true, not `background`): its persist is part of the
 /// answer, where a background response's outcome is in the record its client
@@ -553,6 +590,35 @@ mod tests {
     /// result is written over the record the client polls and nothing is
     /// linked to the conversation; a foreground `store: false` response
     /// stores nothing at all.
+    /// A chain ending in a record its client asked not to store is no
+    /// previous response (the loaders of both model families and the
+    /// item-reference resolver share the rule); a stored chain is returned,
+    /// an unknown id refused the same way.
+    #[tokio::test]
+    async fn an_unstored_record_is_no_previous_response() {
+        let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        for (id, store) in [("resp_unstored", false), ("resp_stored", true)] {
+            let mut response = StoredResponse::new(None);
+            response.id = ResponseId::from(id);
+            response.raw_response =
+                json!({"id": id, "store": store, "status": "completed", "output": []});
+            storage.store_response(response).await.unwrap();
+        }
+
+        let refused = previous_response_chain(&storage, "resp_unstored")
+            .await
+            .expect_err("an unstored record is no previous response");
+        assert_eq!(refused.status(), http::StatusCode::BAD_REQUEST);
+        let chain = previous_response_chain(&storage, "resp_stored")
+            .await
+            .expect("a stored record is a previous response");
+        assert_eq!(chain.len(), 1);
+        let unknown = previous_response_chain(&storage, "resp_unknown")
+            .await
+            .expect_err("an unknown id is refused");
+        assert_eq!(unknown.status(), http::StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn an_unstored_background_response_finishes_in_its_record_and_the_history_keeps_nothing()
     {

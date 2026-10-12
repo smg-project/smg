@@ -619,6 +619,9 @@ impl ResponseStorage for HookedResponseStorage {
         self.inner.expire_response(response_id, after).await
     }
 
+    /// Delegated without the hooks: the sweep is the store's own housekeeping
+    /// over records whose clients asked for nothing to be kept, and it names no
+    /// record before the store finds them, so no hook runs for its deletions.
     async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
         self.inner.delete_unstored_older_than(cutoff).await
     }

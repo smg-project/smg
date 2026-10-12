@@ -16,9 +16,7 @@ use openai_protocol::{
     },
 };
 use serde_json::Value;
-use smg_data_connector::{
-    self as data_connector, ConversationId, ResponseId, ResponseStorage, ResponseStorageError,
-};
+use smg_data_connector::{self as data_connector, ConversationId, ResponseStorage};
 use smg_mcp::McpToolSession;
 use tracing::{debug, warn};
 
@@ -30,7 +28,9 @@ use crate::{
             persistence_utils::split_stored_message_content,
         },
         error,
-        grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
+        grpc::common::responses::{
+            previous_response_chain, utils::resolve_function_identity, ResponsesContext,
+        },
     },
 };
 
@@ -272,77 +272,45 @@ pub(super) async fn load_conversation_history(
 
     // Handle previous_response_id by loading response chain
     if let Some(ref prev_id_str) = modified_request.previous_response_id {
-        let prev_id = ResponseId::from(prev_id_str.as_str());
-        match ctx
-            .response_storage
-            .get_response_chain(&prev_id, None)
-            .await
-        {
-            Ok(chain) if !chain.responses.is_empty() => {
-                // A response its client asked not to store is kept for its
-                // polling window only (a background run's record): a chain
-                // built on it would break when it goes, so it is no previous
-                // response, as the public API answers for an unstored id.
-                if chain.responses.last().is_some_and(is_unstored) {
-                    return Err(error::bad_request(
-                        "previous_response_not_found",
-                        format!("Previous response with id '{prev_id_str}' not found."),
-                    ));
-                }
-                let mut items = Vec::new();
-                for stored in &chain.responses {
-                    // Convert input items from stored input (which is now a JSON array)
-                    if let Some(input_arr) = stored.input.as_array() {
-                        for item in input_arr {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
-                                Ok(input_item) => {
-                                    items.push(input_item);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize stored input item: {}. Item: {}",
-                                        e, item
-                                    );
-                                }
-                            }
+        let responses = previous_response_chain(&ctx.response_storage, prev_id_str).await?;
+        let mut items = Vec::new();
+        for stored in &responses {
+            // Convert input items from stored input (which is now a JSON array)
+            if let Some(input_arr) = stored.input.as_array() {
+                for item in input_arr {
+                    match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                        Ok(input_item) => {
+                            items.push(input_item);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to deserialize stored input item: {}. Item: {}",
+                                e, item
+                            );
                         }
                     }
+                }
+            }
 
-                    // Convert output items from stored raw_response["output"] (which is a JSON array)
-                    if let Some(output_arr) =
-                        stored.raw_response.get("output").and_then(|v| v.as_array())
-                    {
-                        for item in output_arr {
-                            match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
-                                Ok(output_item) => {
-                                    items.push(output_item);
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to deserialize stored output item: {}. Item: {}",
-                                        e, item
-                                    );
-                                }
-                            }
+            // Convert output items from stored raw_response["output"] (which is a JSON array)
+            if let Some(output_arr) = stored.raw_response.get("output").and_then(|v| v.as_array()) {
+                for item in output_arr {
+                    match serde_json::from_value::<ResponseInputOutputItem>(item.clone()) {
+                        Ok(output_item) => {
+                            items.push(output_item);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to deserialize stored output item: {}. Item: {}",
+                                e, item
+                            );
                         }
                     }
                 }
-                conversation_items = Some(items);
-                modified_request.previous_response_id = None;
-            }
-            Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
-                return Err(error::bad_request(
-                    "previous_response_not_found",
-                    format!("Previous response with id '{prev_id_str}' not found."),
-                ));
-            }
-            Err(e) => {
-                return Err(error::internal_error(
-                    "load_previous_response_chain_failed",
-                    format!("Failed to load previous response chain for {prev_id_str}: {e}"),
-                ));
             }
         }
+        conversation_items = Some(items);
+        modified_request.previous_response_id = None;
     }
 
     // Handle conversation by loading conversation history
@@ -519,7 +487,7 @@ pub(super) async fn resolve_item_references(
             })?
             // The items of a response its client asked not to store are not
             // stored items: its record is kept for its polling window only.
-            .filter(|response| !is_unstored(response));
+            .filter(|response| !data_connector::is_unstored(response));
         let candidate = stored
             .as_ref()
             .and_then(|response| response.raw_response.get("output"))
@@ -555,14 +523,6 @@ pub(super) async fn resolve_item_references(
         }
     }
     Ok(resolved)
-}
-
-/// Whether `stored` is the record of a response its client asked not to
-/// store: a background run's record, kept for its polling window only. Such
-/// a record is no previous response and its items are no stored items, as
-/// the public API answers for an unstored id.
-fn is_unstored(stored: &data_connector::StoredResponse) -> bool {
-    stored.raw_response.get("store").and_then(Value::as_bool) == Some(false)
 }
 
 /// The id an input item carries, for `item_reference` resolution. Every

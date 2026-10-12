@@ -195,6 +195,35 @@ impl PostgresStore {
             }
         }
 
+        if let Some(index_ddl) = PostgresResponseStorage::unstored_index_ddl(schema) {
+            let index = tx.savepoint("unstored_index").await.map_err(|e| {
+                format!(
+                    "failed to open the unstored index savepoint: {}",
+                    describe_error(&e)
+                )
+            })?;
+            match index.batch_execute(&index_ddl).await {
+                Ok(()) => index.commit().await.map_err(|e| {
+                    format!(
+                        "failed to release the unstored index savepoint: {}",
+                        describe_error(&e)
+                    )
+                })?,
+                Err(e) => {
+                    tracing::warn!(
+                        "unstored response index not created (the sweep of unstored background records scans the table): {}",
+                        describe_error(&e)
+                    );
+                    index.rollback().await.map_err(|e| {
+                        format!(
+                            "failed to roll back the unstored index savepoint: {}",
+                            describe_error(&e)
+                        )
+                    })?;
+                }
+            }
+        }
+
         tx.commit().await.map_err(|e| {
             format!(
                 "failed to commit the schema bootstrap: {}",
@@ -1066,6 +1095,22 @@ impl PostgresResponseStorage {
         Some(format!(
             "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
             s.col("safety_identifier")
+        ))
+    }
+
+    /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
+    /// object's status, over the unstored records only, so a sweep reads
+    /// those rows and no other. Its expressions are the sweep's predicate.
+    pub(crate) fn unstored_index_ddl(schema: &SchemaConfig) -> Option<String> {
+        let s = &schema.responses;
+        if s.is_skipped("raw_response") {
+            return None;
+        }
+        let table = s.qualified_table(schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        Some(format!(
+            "CREATE INDEX IF NOT EXISTS responses_unstored_idx ON {table} (({col_raw}::jsonb->>'status')) \
+             WHERE ({col_raw}::jsonb->>'store') = 'false';"
         ))
     }
 

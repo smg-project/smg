@@ -32,9 +32,10 @@ pub(crate) mod versioning;
 // Re-export config types
 // Re-export core types and traits
 pub use core::{
-    AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
-    ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
-    ResponseId, ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
+    is_unstored, AddedAtSequence, Conversation, ConversationId, ConversationItem,
+    ConversationItemId, ConversationItemStorage, ConversationStorage, ListParams, NewConversation,
+    NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError, SortOrder,
+    StoredResponse,
 };
 
 pub use config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};

@@ -12,16 +12,16 @@ use openai_protocol::{
     },
 };
 use serde_json::{from_value, to_string, Value};
-use smg_data_connector::{ResponseId, ResponseStorageError};
 use smg_mcp::McpToolSession;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::execution::ToolResult;
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
-    error,
-    grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
+    grpc::common::responses::{
+        previous_response_chain, utils::resolve_function_identity, ResponsesContext,
+    },
 };
 
 /// Record of a single MCP tool call execution
@@ -205,41 +205,9 @@ pub(super) async fn load_previous_messages(
         return Ok(request);
     };
 
-    let prev_id = ResponseId::from(prev_id_str.as_str());
-
-    // Load response chain from storage
-    let chain = match ctx
-        .response_storage
-        .get_response_chain(&prev_id, None)
-        .await
-    {
-        Ok(chain) => chain,
-        Err(ResponseStorageError::ResponseNotFound(_)) => {
-            return Err(error::bad_request(
-                "previous_response_not_found",
-                format!("Previous response with id '{prev_id_str}' not found."),
-            ));
-        }
-        Err(e) => {
-            error!(
-                function = "load_previous_messages",
-                prev_id = %prev_id_str,
-                error = %e,
-                "Failed to load previous response chain from storage"
-            );
-            return Err(error::internal_error(
-                "load_previous_response_chain_failed",
-                format!("Failed to load previous response chain for {prev_id_str}: {e}"),
-            ));
-        }
-    };
-
-    if chain.responses.is_empty() {
-        return Err(error::bad_request(
-            "previous_response_not_found",
-            format!("Previous response with id '{prev_id_str}' not found."),
-        ));
-    }
+    // The chain behind the id, or the refusal shared with the other loaders
+    // (an unknown id, an empty chain, a record its client asked not to store).
+    let responses = previous_response_chain(&ctx.response_storage, prev_id_str).await?;
 
     // Build conversation history from stored responses
     let mut history_items = Vec::new();
@@ -262,7 +230,7 @@ pub(super) async fn load_previous_messages(
             .collect()
     };
 
-    for stored in &chain.responses {
+    for stored in &responses {
         history_items.extend(deserialize_items(&stored.input, "input"));
         history_items.extend(deserialize_items(
             stored

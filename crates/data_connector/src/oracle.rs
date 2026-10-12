@@ -1239,6 +1239,22 @@ impl OracleResponseStorage {
             )?;
         }
 
+        // The index behind `delete_unstored_older_than`: the object's status
+        // over the unstored records only (NULL, hence absent, for the rest).
+        if !s.is_skipped("raw_response") {
+            let col_raw = s.col("raw_response");
+            let unstored_idx = format!("{}_UNSTORED_IDX", s.table);
+            create_index_if_missing(
+                conn,
+                &s.table,
+                &unstored_idx,
+                &format!(
+                    "CREATE INDEX {unstored_idx} ON {table}({})",
+                    unstored_status_expr(col_raw)
+                ),
+            )?;
+        }
+
         Ok(())
     }
 
@@ -1579,11 +1595,13 @@ impl ResponseStorage for OracleResponseStorage {
                     )
                 };
 
+                // The predicate is the expression the table's unstored index
+                // holds (see the bootstrap), so the sweep reads those rows only.
                 conn.execute(
                     &format!(
-                        "DELETE FROM {table} WHERE JSON_VALUE({col_raw}, '$.store') = 'false' \
-                         AND JSON_VALUE({col_raw}, '$.status') IN ('completed', 'incomplete', 'failed', 'cancelled') \
-                         AND {ended} < :1"
+                        "DELETE FROM {table} WHERE {} IN ('completed', 'incomplete', 'failed', 'cancelled') \
+                         AND {ended} < :1",
+                        unstored_status_expr(col_raw)
                     ),
                     &[&cutoff_secs],
                 )
@@ -1633,6 +1651,14 @@ impl ResponseStorage for OracleResponseStorage {
             as usize;
         Ok(deleted)
     }
+}
+
+/// The status of an unstored response object, NULL for a stored one: the
+/// expression the unstored index holds and the sweep's predicate reads.
+fn unstored_status_expr(col_raw: &str) -> String {
+    format!(
+        "CASE WHEN JSON_VALUE({col_raw}, '$.store') = 'false' THEN JSON_VALUE({col_raw}, '$.status') END"
+    )
 }
 
 fn create_index_if_missing(

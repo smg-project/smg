@@ -1703,8 +1703,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // The records of unstored background responses whose polling window
     // ended with no gateway there to retire them (a stop or a crash inside
     // the window, with a store that outlives the process) are swept now and
-    // once per window. Dropping the JoinHandle detaches the task.
-    let _unstored_sweeper = spawn_unstored_sweeper(app_context.response_storage.clone());
+    // once per window. Nothing to sweep when background mode is off: such
+    // requests run in the foreground and store as any other. Dropping the
+    // JoinHandle detaches the task.
+    let _unstored_sweeper = (config.router_config.max_background_responses > 0)
+        .then(|| spawn_unstored_sweeper(app_context.response_storage.clone()));
 
     // Optional isolated probe listener (additive): when `--health-check-port`
     // is set, serves /liveness, /readiness, /health on that port from a

@@ -11,7 +11,9 @@ use openai_protocol::{
     responses::{ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest},
 };
 use serde_json::Value;
-use smg_data_connector::{ConversationId, ListParams, ResponseId, ResponseStorageError, SortOrder};
+use smg_data_connector::{
+    is_unstored, ConversationId, ListParams, ResponseId, ResponseStorageError, SortOrder,
+};
 use tracing::warn;
 
 use super::super::context::ResponsesComponents;
@@ -53,7 +55,14 @@ pub(crate) async fn load_input_history(
             .get_response_chain(&prev_id, None)
             .await
         {
-            Ok(chain) if !chain.responses.is_empty() => {
+            // A chain ending in a record its client asked not to store (a
+            // background run's record on the shared store, kept for its
+            // polling window only) would break when it goes: no previous
+            // response, as for an unstored id.
+            Ok(chain)
+                if !chain.responses.is_empty()
+                    && !chain.responses.last().is_some_and(is_unstored) =>
+            {
                 existing_mcp_list_tools_labels.extend(chain.responses.iter().flat_map(|stored| {
                     extract_mcp_list_tools_labels(
                         stored.raw_response.get("output").unwrap_or(&Value::Null),

@@ -406,11 +406,14 @@ fn retire_unstored(
             Some(ctx) => with_request_context(ctx, expire).await,
             None => expire.await,
         };
+        // The default answers Ok for a store that keeps no deadline: an error
+        // is a store that keeps them and failed to set one, which leaves this
+        // gateway's timer as the record's only retirement.
         if let Err(e) = expired {
-            debug!(
+            warn!(
                 response_id = %id,
                 error = %e,
-                "The store keeps no deadline for the unstored background response record"
+                "Failed to set the store's deadline on the unstored background response record; only this gateway's timer retires it"
             );
         }
         tokio::time::sleep(UNSTORED_RETENTION).await;
