@@ -354,10 +354,6 @@ pub(crate) async fn convert_proto_chunk_to_openai(
             let index = chunk.index;
             let state = handle.stream_state.get_or_create(index);
 
-            // Mark as not first chunk if we've seen this index before
-            let first_chunk = state.is_first_chunk;
-            state.is_first_chunk = false;
-
             // Track token counts (cumulative values from proto)
             if chunk.prompt_tokens > 0 {
                 state.prompt_tokens = chunk.prompt_tokens;
@@ -427,31 +423,10 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                 return Ok(None);
             }
 
-            // Send first chunk with role
-            if first_chunk {
-                let first_response = ChatCompletionStreamResponse {
-                    id: handle.request_id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created: handle.created,
-                    model: handle.model.clone(),
-                    system_fingerprint: handle.system_fingerprint.clone(),
-                    choices: vec![ChatStreamChoice {
-                        index,
-                        delta: ChatMessageDelta {
-                            role: Some("assistant".to_string()),
-                            content: None,
-                            tool_calls: None,
-                            reasoning_content: None,
-                        },
-                        logprobs: None,
-                        finish_reason: None,
-                        matched_stop: None,
-                    }],
-                    usage: None,
-                };
-                return Ok(Some(first_response));
-            }
-
+            // The first delta of a choice carries the role with the first
+            // text (or the first calls) the decoder released, as every delta
+            // below does: a role-only delta here dropped that text, which the
+            // decoder had already advanced past.
             if let Some((_, tool_call_deltas)) = parse_tool_text(handle, &chunk_text).await {
                 handle.stream_state.get_or_create(index).has_tool_calls = true;
                 let tool_response = ChatCompletionStreamResponse {
@@ -720,7 +695,6 @@ mod tests {
                 initial_prompt_tokens: None,
                 skip_special_tokens: true,
             };
-            handle.stream_state.get_or_create(0).is_first_chunk = false;
             let chunk = proto::GenerateResponse {
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
@@ -768,6 +742,85 @@ mod tests {
             }
         }
     }
+    /// The first chunk of a choice that carries text goes out as one delta
+    /// with the role and that text, on the plain decode path and on the
+    /// stop-decoder path alike; a first chunk the tool parser reads carries
+    /// the role with what the parser released. Nothing the decoder released
+    /// is dropped.
+    #[tokio::test]
+    async fn the_first_chunk_of_a_choice_carries_the_role_and_its_text() {
+        let tokenizer = byte_fallback_tokenizer();
+        for stop in [None, Some(StringOrArray::Array(vec!["NEVER".into()]))] {
+            let mut handle = GrpcResponseConverterHandle {
+                tokenizer: tokenizer.clone(),
+                tool_parser: None,
+                stop,
+                stop_token_ids: None,
+                model: "byte-fallback-test".into(),
+                request_id: "first-delta".into(),
+                created: 0,
+                system_fingerprint: None,
+                tools: None,
+                tool_choice: None,
+                history_tool_calls_count: 0,
+                stream_state: StreamStateManager::new(),
+                initial_prompt_tokens: None,
+                skip_special_tokens: true,
+            };
+            let chunk = proto::GenerateResponse {
+                request_id: String::new(),
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        token_ids: vec![0xC3 + 1, 0xA9 + 1],
+                        completion_tokens: 2,
+                        ..Default::default()
+                    },
+                )),
+            };
+            let first = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .expect("the first chunk's text is sent");
+            let delta = &first.choices[0].delta;
+            assert_eq!(delta.role.as_deref(), Some("assistant"), "{first:?}");
+            assert_eq!(delta.content.as_deref(), Some("é"), "{first:?}");
+        }
+        // A first chunk the tool parser reads: with tools off, the text goes
+        // out as content; with tools on, what the parser released goes out
+        // with the role, as content or as calls, never nothing.
+        let tool_text = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
+        let token_ids: Vec<u32> = tool_text.bytes().map(|byte| u32::from(byte) + 1).collect();
+        for tool_choice in [Some(ToolChoice::Value(ToolChoiceValue::None)), None] {
+            let disabled = tool_choice.is_some();
+            let mut handle = tool_test_handle(tokenizer.clone(), tool_choice);
+            let chunk = proto::GenerateResponse {
+                request_id: String::new(),
+                response: Some(proto::generate_response::Response::Chunk(
+                    proto::GenerateStreamChunk {
+                        token_ids: token_ids.clone(),
+                        completion_tokens: token_ids.len() as u32,
+                        ..Default::default()
+                    },
+                )),
+            };
+            let first = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+                .await
+                .unwrap()
+                .expect("the first chunk is sent");
+            let delta = &first.choices[0].delta;
+            assert_eq!(delta.role.as_deref(), Some("assistant"), "{first:?}");
+            if disabled {
+                assert_eq!(delta.content.as_deref(), Some(tool_text), "{first:?}");
+                assert!(delta.tool_calls.is_none(), "{first:?}");
+            } else {
+                assert!(
+                    delta.content.is_some() || delta.tool_calls.is_some(),
+                    "{first:?}"
+                );
+            }
+        }
+    }
+
     fn tool_test_handle(
         tokenizer: Arc<dyn Tokenizer>,
         tool_choice: Option<ToolChoice>,
@@ -809,7 +862,6 @@ mod tests {
         for tool_choice in [None, Some(ToolChoice::Value(ToolChoiceValue::None))] {
             let disabled = tool_choice.is_some();
             let mut handle = tool_test_handle(tokenizer.clone(), tool_choice);
-            handle.stream_state.get_or_create(0).is_first_chunk = false;
             let chunk = proto::GenerateResponse {
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
@@ -896,9 +948,6 @@ mod tests {
         let tokenizer = byte_fallback_tokenizer();
         let tail = r#""Paris"}}"#;
         let mut handle = tool_test_handle(tokenizer.clone(), None);
-        // Prime the role state directly so the known first-Chunk behavior
-        // does not discard any part of the tool prefix used by this fixture.
-        handle.stream_state.get_or_create(0).is_first_chunk = false;
         let prefix_chunk = proto::GenerateResponse {
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Chunk(
@@ -1013,7 +1062,6 @@ mod tests {
             tokenizer.clone(),
             Some(ToolChoice::Value(ToolChoiceValue::None)),
         );
-        handle.stream_state.get_or_create(0).is_first_chunk = false;
         let mut text = String::new();
         for ids in [vec![257], vec![0xC3 + 1, 0xA9 + 1]] {
             let chunk = proto::GenerateResponse {
@@ -1066,9 +1114,6 @@ mod tests {
             tokenizer.clone(),
             Some(ToolChoice::Value(ToolChoiceValue::None)),
         );
-        for index in [0, 1] {
-            handle.stream_state.get_or_create(index).is_first_chunk = false;
-        }
         for (index, byte, expected) in [(0, b't', "t"), (1, b's', "s")] {
             let chunk = proto::GenerateResponse {
                 response: Some(proto::generate_response::Response::Chunk(
