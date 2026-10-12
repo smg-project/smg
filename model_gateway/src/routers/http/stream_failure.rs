@@ -443,7 +443,6 @@ mod tests {
         assert!(!text.contains("[DONE]"), "{text:?}");
     }
 
-    /// The boundary is read from the last bytes sent, across chunks.
     /// After a partial line the event opens a frame of its own; on a
     /// boundary it is written as it is.
     #[test]
@@ -460,6 +459,7 @@ mod tests {
         assert_eq!(&after_partial[2..], &source.error_event(&cut)[..]);
     }
 
+    /// The boundary is read from the last bytes sent, across chunks.
     #[test]
     fn the_frame_boundary_is_read_from_the_last_bytes_sent() {
         let mut tail = Vec::new();
