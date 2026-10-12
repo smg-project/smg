@@ -364,7 +364,7 @@ struct reconstructs the chronological sequence of related responses.
 `StoredResponse` and `Conversation` carry an optional `tenant`: the identity
 the gateway resolved for the request that stored them (a tenant API key or a
 trusted tenant header, as its canonical key). Every backend persists it (a
-nullable `tenant` column on `responses` and `conversations`, a hash field in
+nullable `tenant` column on `responses`, `conversations` and `conversation_items`, a hash field in
 Redis). The rule, `tenant_scope_allows`, is the same for both record types:
 
 - a record stored under a tenant is served only to a caller of that tenant
@@ -457,7 +457,7 @@ Current core history migrations:
 | 1 | Add `safety_identifier` column to responses |
 | 2 | Remove legacy `user_id` column from responses |
 | 3 | Drop redundant `output`, `metadata`, `instructions`, `tool_calls` columns from responses |
-| 4 | Add the nullable `tenant` column to responses and conversations |
+| 4 | Add the nullable `tenant` column to responses, conversations and conversation items |
 
 #### A database ahead of the build
 
