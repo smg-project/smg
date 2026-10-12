@@ -321,7 +321,8 @@ impl WorkerSelectionStage {
         let demand = VisionDemand::new(
             pixel_media,
             self.decode_leg_needs_vision(&ctx.input.request_type, intermediate, media_refs),
-        );
+        )
+        .with_media_refs(media_refs);
 
         let text = prep.routing_text();
 
@@ -595,7 +596,8 @@ impl WorkerSelectionStage {
                         VisionDemand::new(
                             ctx.routing.needs_vision,
                             ctx.routing.decode_needs_vision,
-                        ),
+                        )
+                        .with_media_refs(media_refs),
                     )
                     .await?;
                 ctx.pd_prefill_guard = Some(guard);
@@ -821,6 +823,11 @@ fn carries_pixel_media(
 struct VisionDemand {
     prefill: bool,
     decode: bool,
+    /// The request forwards media references, which only a worker that
+    /// processes them can take: the prefill leg's refusal check then wants
+    /// a worker with the encoder among those, or the request could never
+    /// pair and a retryable 503 would send the client back for ever.
+    refs: bool,
 }
 
 impl VisionDemand {
@@ -831,7 +838,15 @@ impl VisionDemand {
         Self {
             prefill: pixel_media || decode,
             decode,
+            refs: false,
         }
+    }
+
+    /// The same demand for a request that forwards media references (`refs`,
+    /// the caller's `ACCEPTS_MEDIA_REFS` filter): the prefill leg's refusal
+    /// is judged among the workers that take them.
+    fn with_media_refs(self, refs: bool) -> Self {
+        Self { refs, ..self }
     }
 
     /// The demand on the leg `worker` serves.
@@ -1380,12 +1395,19 @@ impl WorkerSelectionStage {
         // pair with the encoder on both legs that the caller's own predicate
         // admits too; with none the decode pool is used as it is, and
         // dispatch refuses the leg naming the gap, as it does for a pool
-        // with no such worker at all.
+        // with no such worker at all. With media references the worker must
+        // take them too (`VisionDemand::refs`): a pool whose referencing
+        // prefill worker lacks the encoder and whose encoder-bearing one
+        // takes no references can never pair the request, and the verdict
+        // of the unfiltered pool would be a retryable 503 over healthy
+        // workers.
         if demand.prefill
             && !pairs.prefill_pool.is_empty()
             && !pairs.decode_pool.is_empty()
             && pairs.refusal.is_none()
-            && !pair_admitted_by(&pairs, wire, &prefill_vision_capable)
+            && !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
+                prefill_vision_capable(worker) && (!demand.refs || accepts_media_refs(worker))
+            })
         {
             return Err(PdSelectionFailure::NoVisionCapablePrefill);
         }
@@ -3388,7 +3410,8 @@ mod tests {
             VisionDemand::new(true, false),
             VisionDemand {
                 prefill: true,
-                decode: false
+                decode: false,
+                refs: false
             },
             "a single-sample image: the prefill leg takes the pixels, the decode leg is stripped"
         );
@@ -3396,7 +3419,8 @@ mod tests {
             VisionDemand::new(false, true),
             VisionDemand {
                 prefill: true,
-                decode: true
+                decode: true,
+                refs: false
             },
             "what the decode leg cannot run without the encoder, the prefill leg cannot either"
         );
@@ -3594,6 +3618,76 @@ mod tests {
                 .expect("a pair that processes references with the encoder");
             assert_eq!(prefill.url(), "grpc://127.0.0.1:9060");
         }
+    }
+
+    /// With media references the prefill leg must find a worker that takes
+    /// them and has the encoder: a pool whose referencing prefill worker
+    /// lacks the encoder and whose encoder-bearing one takes no references
+    /// is the terminal refusal (not a retryable 503 over healthy workers);
+    /// without references the same pool pairs with the encoder.
+    #[test]
+    fn media_references_with_no_vision_capable_prefill_worker_that_takes_them_are_refused() {
+        const REFS: [(&str, &str); 2] = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        let refs_with = |verdict: &'static str| -> Vec<(&'static str, &'static str)> {
+            let mut labels = REFS.to_vec();
+            labels.push((multimodal::SUPPORTS_VISION_LABEL, verdict));
+            labels
+        };
+        let model_id = "test-model-vision-prefill-refs-refusal";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, labels) in [
+            (
+                "grpc://127.0.0.1:9090",
+                WorkerType::Prefill,
+                refs_with("false"),
+            ),
+            (
+                "grpc://127.0.0.1:9091",
+                WorkerType::Prefill,
+                VISION_ENCODER.to_vec(),
+            ),
+            (
+                "grpc://127.0.0.1:9095",
+                WorkerType::Decode,
+                refs_with("true"),
+            ),
+        ] {
+            worker_registry
+                .register(pd_worker(url, model_id, worker_type, &labels))
+                .unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+
+        let failure = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(ACCEPTS_MEDIA_REFS),
+                    ..Default::default()
+                },
+                None,
+                None,
+                VisionDemand::new(true, true).with_media_refs(true),
+            )
+            .expect_err("no prefill worker that takes references has the encoder");
+        assert!(
+            matches!(failure, PdSelectionFailure::NoVisionCapablePrefill),
+            "the terminal refusal, not the unfiltered pool's verdict"
+        );
+
+        let (prefill, _, _) = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs::default(),
+                None,
+                None,
+                VisionDemand::new(true, true),
+            )
+            .expect("without references the prefill leg pairs with the encoder");
+        assert_eq!(prefill.url(), "grpc://127.0.0.1:9091");
     }
 
     /// A retry re-selects under the demand the first selection recorded:
