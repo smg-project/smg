@@ -386,7 +386,7 @@ async fn sigterm_ends_a_kv_event_subscription_held_open() {
             .await
             .expect("connect to the gRPC worker");
     let mut events = client
-        .subscribe_kv_events(0)
+        .subscribe_kv_events_with_load_records(0)
         .await
         .expect("subscribe to KV events");
     // The subscription is live: it carries a load heartbeat before any event.
