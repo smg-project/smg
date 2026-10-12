@@ -42,7 +42,7 @@ impl RedisStore {
         // first to fire. Left to its defaults the library bounded a response
         // at 500 ms and a connection at 1 s, which failed every call to a
         // store a few hundred milliseconds away.
-        let backstop = config.op_timeout() * 2;
+        let backstop = config.op_timeout().saturating_mul(2);
         let connection = AsyncConnectionConfig::new()
             .set_connection_timeout(Some(backstop))
             .set_response_timeout(Some(backstop));

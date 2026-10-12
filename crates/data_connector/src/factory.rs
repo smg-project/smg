@@ -86,6 +86,13 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             let postgres_cfg = config
                 .postgres
                 .ok_or("Postgres configuration is required when history_backend=postgres")?;
+            // Every entry path (the CLI, the Python bindings, a RouterConfig
+            // built by hand) reaches this point: the config's own checks run
+            // here, so a bound of 0 s or a bad URL is refused by name instead
+            // of failing every call once the gateway is up.
+            postgres_cfg
+                .validate()
+                .map_err(|e| format!("Invalid Postgres configuration: {e}"))?;
 
             let log_db_url = match Url::parse(&postgres_cfg.db_url) {
                 Ok(mut url) => {
@@ -114,6 +121,9 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             let redis_cfg = config
                 .redis
                 .ok_or("Redis configuration is required when history_backend=redis")?;
+            redis_cfg
+                .validate()
+                .map_err(|e| format!("Invalid Redis configuration: {e}"))?;
 
             let log_redis_url = match Url::parse(&redis_cfg.url) {
                 Ok(mut url) => {
@@ -327,6 +337,50 @@ mod tests {
         .err()
         .expect("should fail");
         assert!(err.contains("oracle configuration is required"));
+    }
+
+    /// A store config reaches the factory from every entry path (the CLI, the
+    /// Python bindings, a config built by hand); a bound of 0 s is refused by
+    /// name here, before any connection, instead of failing every store call
+    /// once the gateway is up.
+    #[tokio::test]
+    async fn a_zero_call_bound_is_refused_by_the_factory_before_any_connection() {
+        let postgres_cfg = PostgresConfig {
+            db_url: "postgres://user:pass@localhost:5432/mydb".to_string(),
+            pool_max: 4,
+            op_timeout_secs: 0,
+            schema: None,
+        };
+        let err = create_storage(StorageFactoryConfig {
+            backend: &HistoryBackend::Postgres,
+            oracle: None,
+            postgres: Some(&postgres_cfg),
+            redis: None,
+            hook: None,
+        })
+        .await
+        .err()
+        .expect("a zero bound is refused");
+        assert!(err.contains("op_timeout_secs"), "{err}");
+
+        let redis_cfg = RedisConfig {
+            url: "redis://localhost:6379".to_string(),
+            pool_max: 4,
+            op_timeout_secs: 0,
+            retention_days: Some(1),
+            schema: None,
+        };
+        let err = create_storage(StorageFactoryConfig {
+            backend: &HistoryBackend::Redis,
+            oracle: None,
+            postgres: None,
+            redis: Some(&redis_cfg),
+            hook: None,
+        })
+        .await
+        .err()
+        .expect("a zero bound is refused");
+        assert!(err.contains("op_timeout_secs"), "{err}");
     }
 
     #[tokio::test]

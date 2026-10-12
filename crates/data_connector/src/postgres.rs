@@ -51,7 +51,7 @@ impl PostgresStore {
         // for a pooled connection; creating one; recycling one) at twice that
         // bound: backstops that clean up after a call the wrapper has already
         // answered, never the first to fire.
-        let backstop = config.op_timeout() * 2;
+        let backstop = config.op_timeout().saturating_mul(2);
         if pg_config.get_connect_timeout().is_none() {
             pg_config.connect_timeout(backstop);
         }
