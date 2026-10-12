@@ -18,6 +18,7 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use symphony::adapt;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
@@ -27,6 +28,7 @@ use crate::routers::{
         common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
+        regular::symphony::{content_spans, engine_finish, finished, Assignment, Reader},
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
     },
@@ -78,6 +80,17 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
     ) -> Result<(ChatChoice, u32), String> {
         stop_decoder.reset();
+        if let Some(assignment) = &original_request.symphony {
+            return Self::read_with_symphony(
+                request_id,
+                assignment,
+                complete,
+                index,
+                original_request,
+                tokenizer,
+                stop_decoder,
+            );
+        }
         // Decode tokens
         let outputs = stop_decoder
             .process_tokens(complete.output_ids())
@@ -310,6 +323,80 @@ impl ResponseProcessor {
         Ok((choice, reasoning_tokens))
     }
 
+    /// The choice as Symphony reads it (see `regular::symphony`): the output as
+    /// one delta through the stop decoder, the decoder's last text once decoding
+    /// is finished, the engine's finish, and the message the events fold into.
+    /// The matched stop is set as on the older path, and the logprobs cover the
+    /// tokens of `message.content` only, as the older path's do: the content's
+    /// bytes come from the events, each token's from the reader.
+    fn read_with_symphony(
+        request_id: &str,
+        assignment: &Assignment,
+        complete: &ProtoGenerateComplete,
+        index: usize,
+        original_request: &ChatResponseSpec,
+        tokenizer: &Arc<dyn Tokenizer>,
+        stop_decoder: &mut StopSequenceDecoder,
+    ) -> Result<(ChatChoice, u32), String> {
+        let tools = original_request.tools.as_deref().unwrap_or(&[]);
+        let mut reader = Reader::new(assignment, tools)?;
+        let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
+        // Complete token decoding, including bytes and a partial stop match, as
+        // on the older path; the text it releases is the last token's.
+        let tail = stop_decoder
+            .finish()
+            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
+        utils::warn_detokenize_recoveries(request_id, index as u32, stop_decoder);
+        if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
+            tail
+        {
+            events.extend(reader.tail(&text)?);
+        }
+        // A local stop-decoder match takes precedence over the engine's reason,
+        // as on the older path.
+        let reason = if stopped || stop_decoder.is_stopped() {
+            "stop"
+        } else {
+            complete.finish_reason()
+        };
+        events.extend(reader.end(engine_finish(reason))?);
+        let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
+        let mut choice = adapt::chat::message(index as u32, &events);
+        choice.matched_stop = stop_decoder
+            .matched_stop()
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .or_else(|| complete.matched_stop_json());
+        // The content's tokens alone keep their logprobs, as on the older path: none when
+        // the message has no content (whitespace alone, which `adapt::chat::message` leaves
+        // out of the message).
+        let has_content = choice.message.content.is_some();
+        choice.logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
+            let mut logprobs = utils::convert_proto_to_openai_logprobs(
+                proto_logprobs,
+                tokenizer,
+                original_request.top_logprobs,
+            );
+            if let ChatLogProbs::Detailed {
+                content: Some(items),
+                ..
+            } = &mut logprobs
+            {
+                let keep = if has_content {
+                    content_tokens(reader.token_ends(), &content_spans(&events))
+                } else {
+                    Vec::new()
+                };
+                let mut position = 0;
+                items.retain(|_| {
+                    position += 1;
+                    keep.get(position - 1).copied().unwrap_or(false)
+                });
+            }
+            logprobs
+        });
+        Ok((choice, reasoning_tokens))
+    }
+
     /// Process non-streaming chat response (collects all responses and builds final response)
     pub async fn process_non_streaming_chat_response(
         &self,
@@ -401,7 +488,8 @@ impl ResponseProcessor {
         // detail counter present as the OpenAI API sends it.
         let usage = response_formatting::chat_usage(
             response_formatting::build_usage(&all_responses),
-            reasoning_parser_available.then_some(parsed_reasoning_tokens),
+            (reasoning_parser_available || chat_request.symphony.is_some())
+                .then_some(parsed_reasoning_tokens),
             chat_request.unbilled_prompt_tokens,
         );
 

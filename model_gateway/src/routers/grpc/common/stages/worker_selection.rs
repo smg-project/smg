@@ -2630,6 +2630,7 @@ mod tests {
             root_request_id: None,
             request_id: None,
             cache_trace: None,
+            parser: None,
             attempt: 0,
             ledger: AttemptLedger::default(),
             tried: Vec::new(),
@@ -4402,6 +4403,7 @@ mod tests {
             multimodal: None,
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
         });
         let mut ctx = RequestContext::for_generate(
             Arc::new(request),

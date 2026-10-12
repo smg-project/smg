@@ -41,6 +41,7 @@ use super::{
     utils::ParserResolver,
 };
 use crate::{
+    config::ParserChoice,
     middleware::TenantRequestMeta,
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
@@ -210,6 +211,9 @@ pub(crate) struct SharedComponents {
     /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
     /// of the not-ready 503 of a load in flight.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
+    /// Which parser reads a chat completion's output unless the request's `X-SMG-Parser`
+    /// header says otherwise (see `regular::symphony`).
+    pub parser: ParserChoice,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
@@ -218,6 +222,13 @@ pub(crate) struct SharedComponents {
 pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
+
+    /// The parser for this chat completion. Chat preparation sets the request's choice, from its
+    /// `X-SMG-Parser` header or the configured default; request building then sets the parser that
+    /// reads the response, Symphony when a table takes the request and legacy otherwise, which the
+    /// response reports as `x-smg-parser`. `None` on the other endpoints, which keep the legacy
+    /// parsers.
+    pub parser: Option<ParserChoice>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
@@ -326,6 +337,8 @@ pub(crate) struct DispatchContext {
     /// unlike `root_request_id`, which cache tracing alone fills.
     pub request_id: Option<String>,
     pub cache_trace: Option<String>,
+    /// The parser that read a chat completion, for the response's `x-smg-parser` header.
+    pub parser: Option<ParserChoice>,
     pub attempt: u32,
     /// The request's bookkeeping across attempts: circuit-breaker charges
     /// and the workers whose answer was definitive.
@@ -936,6 +949,7 @@ impl RequestContext {
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
+        let parser = state.parser;
         drop(components);
         let routing = state.routing_snapshot.ok_or_else(|| {
             error!(
@@ -972,6 +986,7 @@ impl RequestContext {
             },
             request_id,
             cache_trace: None,
+            parser,
             attempt: 0,
             ledger: AttemptLedger::default(),
             tried: Vec::new(),

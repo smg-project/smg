@@ -284,7 +284,7 @@ pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
     )
 }
 
-fn dispatch() -> context::DispatchMetadata {
+pub(super) fn dispatch() -> context::DispatchMetadata {
     context::DispatchMetadata {
         request_id: "chatcmpl-eof".to_string(),
         model: "eof-test".to_string(),
@@ -582,7 +582,7 @@ async fn chat_events_with_spec(
     (result, events)
 }
 
-fn chat_text(events: &[Value], index: u32, field: &str) -> String {
+pub(super) fn chat_text(events: &[Value], index: u32, field: &str) -> String {
     events
         .iter()
         .filter_map(|event| {

@@ -4,21 +4,26 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        client::GenerateRequestBuildOptions,
-        common::stages::{helpers, BuildStage},
-        context::{
-            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-            PreparationOutput, RequestContext,
+use crate::{
+    config::ParserChoice,
+    routers::{
+        error,
+        grpc::{
+            client::GenerateRequestBuildOptions,
+            common::stages::{helpers, BuildStage},
+            context::{
+                AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+                PreparationOutput, RequestContext,
+            },
+            multimodal::{
+                assemble_media_refs, assemble_multimodal_data,
+                assemble_multimodal_data_after_encode, assembly_error_response,
+                reserve_multimodal_inflight,
+            },
+            regular::symphony,
+            spec::{ChatResponseSpec, ResponseSpec},
+            utils,
         },
-        multimodal::{
-            assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
-            assembly_error_response, reserve_multimodal_inflight,
-        },
-        spec::{ChatResponseSpec, ResponseSpec},
-        utils,
     },
 };
 
@@ -270,6 +275,21 @@ impl BuildStage for ChatRequestBuildingStage {
         };
 
         let unbilled_prompt_tokens = processed_messages.unbilled_prompt_tokens;
+        // Symphony's assignment, taken while the rendered prompt is still here (see
+        // `regular::symphony`): the response spec carries it to the drivers. The
+        // parser asked for is the one chat preparation chose for this request;
+        // the one that reads the response is Symphony only when a table takes
+        // the request, so the state records that for the response's header.
+        let assignment = symphony::assign(
+            ctx.state.parser.unwrap_or_default(),
+            chat_request.as_ref(),
+            tool_constraints.as_ref(),
+            &processed_messages.text,
+        );
+        ctx.state.parser = Some(match assignment {
+            Some(_) => ParserChoice::Symphony,
+            None => ParserChoice::Legacy,
+        });
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
             &chat_request,
@@ -287,6 +307,7 @@ impl BuildStage for ChatRequestBuildingStage {
         let mut spec = ChatResponseSpec::from(chat_request.as_ref());
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
+        spec.symphony = assignment;
 
         Ok(BuildOutput {
             plan,

@@ -9,12 +9,15 @@ use openai_protocol::{
 use tracing::{debug, error};
 
 use crate::{
+    config::ParserChoice,
     routers::{
         error,
         grpc::{
             common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext},
-            multimodal, utils, ProcessedMessages,
+            multimodal,
+            regular::symphony,
+            utils, ProcessedMessages,
         },
     },
     worker::RoutingPool,
@@ -55,6 +58,13 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
+        // Which parser reads this response: the request's X-SMG-Parser header
+        // when it carries one, else the gateway's --parser flag (see
+        // `regular::symphony`). Decided once here; the constraint below and
+        // request building read the same choice.
+        let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
+            .map_err(|why| error::bad_request("invalid_parser_header", why))?;
+        ctx.state.parser = Some(parser);
         let (token_ids, processed_messages, tool_constraints) =
             prepare_chat_like(ctx, request, self.wire_pools).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {
@@ -343,25 +353,38 @@ pub(crate) async fn prepare_chat_like(
             (constraint_tools.is_empty(), request.tool_choice.as_ref())
         {
             let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
-            ctx.components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components
-                        .parser_resolver
-                        .tool_parser(&request.model)
-                        .as_deref(),
-                    &constraint_tools,
-                    tool_choice,
-                    reasoning,
-                )
-                .map_err(|e| {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
+            // When Symphony reads the response, its table gives the forced call
+            // its tag, so the call comes back in the syntax the table parses (see
+            // `regular::symphony`, which decides both with one predicate); the
+            // older registry decides for every other request. Only the chat
+            // stage chooses a parser: transcription, which shares this
+            // preparation, keeps the legacy parsers.
+            let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
+            let symphony_constraint =
+                symphony::constraint(parser, request, &constraint_tools, reasoning);
+            match symphony_constraint {
+                Some(constraint) => Some(constraint),
+                None => ctx
+                    .components
+                    .tool_parser_factory
+                    .registry()
+                    .generate_tool_constraint(
+                        ctx.components
+                            .parser_resolver
+                            .tool_parser(&request.model)
+                            .as_deref(),
+                        &constraint_tools,
+                        tool_choice,
+                        reasoning,
                     )
-                })?
+                    .map_err(|e| {
+                        error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
+                        error::bad_request(
+                            "invalid_tool_configuration",
+                            format!("Invalid tool configuration: {e}"),
+                        )
+                    })?,
+            }
         } else {
             None
         };

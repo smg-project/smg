@@ -389,6 +389,10 @@ class RouterArgs:
     history_memory_max_responses: int = 10000
     history_memory_max_items: int = 100000
     history_memory_retention_secs: int = 86400
+    # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
+    # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
+    # X-SMG-Parser header overrides it; appended last for the same reason
+    parser: str = "legacy"
 
     @staticmethod
     def add_cli_args(
@@ -1928,6 +1932,15 @@ class RouterArgs:
             default=RouterArgs.disable_tokenizer_autoload,
             help="Disable automatic tokenizer loading at startup. "
             "Use this when tokenizers are not needed (e.g., pure load balancing).",
+        )
+        tokenizer_group.add_argument(
+            f"--{prefix}parser",
+            type=str,
+            default=RouterArgs.parser,
+            choices=["legacy", "symphony"],
+            help="Which parser reads a chat completion's reasoning and tool calls: the per-model "
+            "parsers (legacy, the default) or Symphony for the models its registry knows. "
+            "A request's X-SMG-Parser header overrides it for that request.",
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l0",

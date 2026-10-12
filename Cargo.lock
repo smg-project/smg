@@ -7830,6 +7830,7 @@ dependencies = [
  "smg-mesh",
  "smg-mm-rdma",
  "smg-rl",
+ "smg-symphony",
  "smg-wasm",
  "str0m",
  "tempfile",

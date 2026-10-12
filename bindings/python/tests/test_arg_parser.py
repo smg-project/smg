@@ -1822,6 +1822,7 @@ class TestRouterArgsFieldOrder:
         "history_memory_max_responses",
         "history_memory_max_items",
         "history_memory_retention_secs",
+        "parser",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1962,3 +1963,20 @@ class TestControlPlaneApiKeyEntryErrors:
         assert "s3cr3t" not in text
         assert "sk-live-abc123" not in text
         assert "'bad'" not in text
+
+
+class TestParserFlag:
+    """--parser picks the gateway's chat parser: legacy by default, or symphony."""
+
+    def test_defaults_to_legacy_and_takes_symphony(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        assert RouterArgs.from_cli_args(parser.parse_args([])).parser == "legacy"
+        chosen = RouterArgs.from_cli_args(parser.parse_args(["--parser", "symphony"]))
+        assert chosen.parser == "symphony"
+
+    def test_refuses_an_unknown_parser(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser)
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--parser", "fast"])

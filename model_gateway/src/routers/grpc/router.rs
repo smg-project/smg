@@ -138,6 +138,7 @@ impl GrpcRouter {
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
+            parser: ctx.router_config.parser,
         });
 
         // The admission queue's timeout also bounds how long an accepted

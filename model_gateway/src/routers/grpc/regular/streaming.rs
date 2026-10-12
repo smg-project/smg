@@ -3,7 +3,7 @@
 //! This module contains shared streaming logic for both Regular and PD router.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     sync::Arc,
     time::Instant,
 };
@@ -31,10 +31,12 @@ use openai_protocol::{
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde::Serialize;
 use serde_json::{json, Value};
+use symphony::{adapt, EngineFinish, Event};
 use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
 
+use super::symphony::{engine_finish, finished, reasoning_text_tokens, Reader};
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
@@ -465,7 +467,8 @@ impl StreamingProcessor {
             );
 
         if let Some(usage) = &mut continuous_usage {
-            usage.reasoning_parsed = reasoning_parser_available;
+            usage.reasoning_parsed =
+                reasoning_parser_available || original_request.symphony.is_some();
         }
 
         // If the template supports a thinking toggle and the user enabled it,
@@ -520,6 +523,14 @@ impl StreamingProcessor {
                 model
             );
         }
+
+        // Symphony reads this response when request building assigned it a table
+        // (see `regular::symphony`): one engine per choice in place of both parsers,
+        // seeded with the prompt it replays. The role chunk, the stop decoder, the
+        // finish chunks and the usage are the ones above and below; only the reading
+        // of the tokens differs.
+        let assignment = original_request.symphony.as_ref();
+        let mut readers: HashMap<u32, Reader> = HashMap::new();
 
         // Phase 2: Main streaming loop
         let mut final_indices: Option<Vec<(u32, bool)>> = None;
@@ -617,9 +628,25 @@ impl StreamingProcessor {
                         )
                     });
 
-                    // Process tokens through stop decoder
-                    let (chunk_text, should_stop) =
-                        Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
+                    // Process tokens through stop decoder: Symphony's reader takes
+                    // them with their spans and gives events, the older path the text.
+                    let symphony_events = match assignment {
+                        Some(assignment) => {
+                            let reader = match readers.entry(index) {
+                                Entry::Occupied(reader) => reader.into_mut(),
+                                Entry::Vacant(slot) => slot.insert(Reader::new(
+                                    assignment,
+                                    tools.as_deref().unwrap_or(&[]),
+                                )?),
+                            };
+                            Some(reader.read(stop_decoder, chunk.token_ids())?)
+                        }
+                        None => None,
+                    };
+                    let (chunk_text, should_stop) = match &symphony_events {
+                        Some((_, stopped)) => (String::new(), *stopped),
+                        None => Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?,
+                    };
 
                     if should_stop {
                         // Stop-decoder match takes precedence: pin "stop" even if
@@ -636,6 +663,41 @@ impl StreamingProcessor {
                                 .map(|s| Value::String(s.to_string()))
                         });
                         stopped_indices.insert(index);
+                    }
+
+                    if let Some((events, _)) = symphony_events {
+                        // Recorded before the usage is snapshotted, so a continuous
+                        // usage counts the reasoning text it rides with.
+                        let chunk_reasoning_tokens = reasoning_text_tokens(&events);
+                        if chunk_reasoning_tokens > 0 {
+                            *parsed_reasoning_tokens.entry(index).or_default() +=
+                                chunk_reasoning_tokens;
+                            if let Some(tracker) = &mut continuous_usage {
+                                tracker.record_reasoning(index, chunk_reasoning_tokens);
+                            }
+                        }
+                        let usage = continuous_usage.as_ref().map(|tracker| {
+                            tracker.snapshot(original_request.unbilled_prompt_tokens)
+                        });
+                        let choice_logprobs = chunk.output_logprobs().map(|ref proto_logprobs| {
+                            utils::convert_proto_to_openai_logprobs(
+                                proto_logprobs,
+                                &tokenizer,
+                                original_request.top_logprobs,
+                            )
+                        });
+                        Self::push_events(
+                            tx,
+                            &mut sse_buffer,
+                            &chunk_frame,
+                            index,
+                            &events,
+                            choice_logprobs,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        )
+                        .await?;
+                        continue;
                     }
 
                     if chunk_text.is_empty() {
@@ -706,6 +768,38 @@ impl StreamingProcessor {
                         matched_stops.insert(index, complete.matched_stop_json());
                     }
 
+                    // Symphony ends the choice's output here: the decoder's last
+                    // text, then the engine's finish. The finish chunk is Phase 4's,
+                    // with the matched stop; the `Finish` event gives it the calls
+                    // made, and the usage the reasoning tokens.
+                    if let Some(reader) = readers.get_mut(&index) {
+                        let reason = finish_reasons.get(&index).map_or("stop", String::as_str);
+                        let mut events = match &flushed {
+                            Some(text) => reader.tail(text)?,
+                            None => Vec::new(),
+                        };
+                        events.extend(reader.end(engine_finish(reason))?);
+                        if let Some(finished) = finished(&events) {
+                            has_tool_calls.insert(index, finished.tool_calls > 0);
+                            parsed_reasoning_tokens.insert(index, finished.reasoning_tokens);
+                        }
+                        let usage = continuous_usage.as_ref().map(|tracker| {
+                            tracker.snapshot(original_request.unbilled_prompt_tokens)
+                        });
+                        Self::push_events(
+                            tx,
+                            &mut sse_buffer,
+                            &chunk_frame,
+                            index,
+                            &events,
+                            None,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        )
+                        .await?;
+                        continue;
+                    }
+
                     // Don't break - continue reading all Complete messages for n>1
                     // Text the decoder held for a partial stop match: the
                     // tokens that produced it were counted as held.
@@ -713,6 +807,62 @@ impl StreamingProcessor {
                 }
                 Some(ProtoResponseVariant::None) => continue,
                 None => {
+                    // A choice Symphony reads whose Complete never came: the decoder's
+                    // last text is the reader's, then the output ends as an abort so
+                    // what the engine holds goes out, as the older parsers' flush
+                    // below sends theirs. Those indices are not the loop's below.
+                    let mut unended: Vec<u32> = readers
+                        .iter()
+                        .filter(|(_, reader)| !reader.ended())
+                        .map(|(index, _)| *index)
+                        .collect();
+                    unended.sort_unstable();
+                    for index in unended {
+                        let Some(reader) = readers.get_mut(&index) else {
+                            continue;
+                        };
+                        let mut events = Vec::new();
+                        if let Some(decoder) = stop_decoders.get_mut(&index) {
+                            let tail = decoder.finish().map_err(|e| e.to_string())?;
+                            utils::warn_detokenize_recoveries(request_id, index, decoder);
+                            if decoder.is_stopped() {
+                                stopped_indices.insert(index);
+                                finish_reasons.insert(index, "stop".to_string());
+                                matched_stops.insert(
+                                    index,
+                                    decoder.matched_stop().map(|s| Value::String(s.to_string())),
+                                );
+                            }
+                            if let SequenceDecoderOutput::Text(text)
+                            | SequenceDecoderOutput::StoppedWithText(text) = tail
+                            {
+                                events.extend(reader.tail(&text)?);
+                            }
+                        }
+                        events.extend(reader.end(EngineFinish::Abort)?);
+                        // The `Finish` event says what the Complete frame would have:
+                        // the calls made, for the finish reason, and the reasoning
+                        // tokens, for the usage.
+                        if let Some(finished) = finished(&events) {
+                            has_tool_calls.insert(index, finished.tool_calls > 0);
+                            parsed_reasoning_tokens.insert(index, finished.reasoning_tokens);
+                        }
+                        let usage = continuous_usage.as_ref().map(|tracker| {
+                            tracker.snapshot(original_request.unbilled_prompt_tokens)
+                        });
+                        Self::push_events(
+                            tx,
+                            &mut sse_buffer,
+                            &chunk_frame,
+                            index,
+                            &events,
+                            None,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        )
+                        .await?;
+                    }
+
                     // Finish decoder text before sending EOF to the parsers. A
                     // clean transport EOF does not supply Complete metadata.
                     let indices = final_indices.get_or_insert_with(|| {
@@ -720,6 +870,7 @@ impl StreamingProcessor {
                             .keys()
                             .chain(reasoning_parsers.keys())
                             .copied()
+                            .filter(|index| !readers.contains_key(index))
                             .collect();
                         indices.sort_unstable();
                         indices.dedup();
@@ -989,7 +1140,8 @@ impl StreamingProcessor {
             };
             chat_usage(
                 counts.usage(),
-                reasoning_parser_available.then(|| parsed_reasoning_tokens.values().sum()),
+                (reasoning_parser_available || assignment.is_some())
+                    .then(|| parsed_reasoning_tokens.values().sum()),
                 original_request.unbilled_prompt_tokens,
             )
         });
@@ -1975,6 +2127,40 @@ impl StreamingProcessor {
         frame.write_chunk(buffer, choice, usage, emit_usage_null);
         if buffer.len() >= CHUNK_FLUSH_BYTES {
             tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    /// Write the chunks Symphony's events make for the choice at `index`: the
+    /// delta each event has, the chunk's logprobs on its first text delta. The
+    /// `Finish` event writes nothing here: the finish chunk is the loop's, with
+    /// the matched stop. The opening chunk carried the role, so the deltas do
+    /// not repeat it, as the older path's do not.
+    #[expect(clippy::too_many_arguments)]
+    async fn push_events(
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        frame: &ChatChunkFrame,
+        index: u32,
+        events: &[Event],
+        mut logprobs: Option<ChatLogProbs>,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) -> Result<(), String> {
+        for event in events {
+            let Some(mut choice) = adapt::chat::delta(index, event) else {
+                continue;
+            };
+            if choice.finish_reason.is_some() {
+                continue;
+            }
+            choice.delta.role = None;
+            if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() {
+                choice.logprobs = logprobs.take();
+            }
+            Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
+                .await
+                .map_err(|()| "Failed to send chunk".to_string())?;
         }
         Ok(())
     }
@@ -4092,6 +4278,8 @@ pub(crate) mod eof_tests;
 mod failure_tests;
 #[cfg(test)]
 mod pd_usage_tests;
+#[cfg(test)]
+mod symphony_tests;
 
 #[cfg(test)]
 mod sse_bytes_tests;

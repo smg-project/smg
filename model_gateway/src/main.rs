@@ -30,10 +30,11 @@ use smg::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
         HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
-        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, PdPairingMode,
-        PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
+        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
+        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
+        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
@@ -1350,6 +1351,12 @@ struct CliArgs {
     /// Parser for tool-call interactions
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
+
+    /// Which parser reads a chat completion's reasoning and tool calls: the
+    /// per-model parsers (legacy) or Symphony, for the models its registry knows.
+    /// A request's X-SMG-Parser header overrides it for that request.
+    #[arg(long, default_value = "legacy", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
+    parser: String,
 
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
@@ -2701,6 +2708,7 @@ impl CliArgs {
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
+            .parser(ParserChoice::parse(&self.parser).unwrap_or_default())
             .history_backend(history_backend)
             .memory_config(MemoryConfig {
                 max_responses: self.history_memory_max_responses,

@@ -13,6 +13,7 @@ openai-protocol = { version = "1.15.0", path = "crates/protocols" }
 smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
 reasoning-parser = { version = "1.9.0", path = "crates/reasoning_parser" }
 tool-parser = { version = "1.9.0", path = "crates/tool_parser" }
+smg-symphony = { version = "0.0.1", path = "crates/symphony" }
 wfaas = { version = "1.1.0", path = "crates/workflow" }
 llm-tokenizer = { version = "1.9.0", path = "crates/tokenizer" }
 smg-auth = { version = "1.2.3", path = "crates/auth" }
