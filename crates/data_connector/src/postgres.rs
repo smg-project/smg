@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{ClientWrapper, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde_json::Value;
-use tokio_postgres::{types::ToSql, IsolationLevel, NoTls, Row};
+use tokio_postgres::{error::SqlState, types::ToSql, IsolationLevel, NoTls, Row, Statement};
 
 use crate::{
     common::{
@@ -287,6 +287,37 @@ impl Clone for PostgresStore {
 // the execute. Prepared once and cached on the connection (the pool keeps the
 // cache with the connection), every later call is one round trip, which is
 // what a store a few milliseconds away multiplies by.
+//
+// A cached statement can go stale on its connection: the type of a column it
+// selects altered under it (a migration a newer build runs during a rolling
+// upgrade) makes the server answer every later call with SQLSTATE `0A000`
+// ("cached plan must not change result type"), and a statement the server
+// deallocated answers `26000`. The pool does not notice either (its recycling
+// only checks that the connection is open), so a helper drops such an entry
+// from the connection's cache and makes the call once more on a statement
+// prepared afresh; the connection is whole again for every later call.
+
+/// Whether `error` says the statement the server was handed is stale: its
+/// cached plan no longer fits the table (`0A000`) or it no longer exists on
+/// the server (`26000`).
+fn is_stale_statement(error: &tokio_postgres::Error) -> bool {
+    error.code().is_some_and(is_stale_statement_state)
+}
+
+fn is_stale_statement_state(code: &SqlState) -> bool {
+    *code == SqlState::FEATURE_NOT_SUPPORTED || *code == SqlState::INVALID_SQL_STATEMENT_NAME
+}
+
+/// The statement for `sql` prepared afresh after a stale answer: the entry
+/// goes from the connection's cache (the statement it held is closed on the
+/// server when its last handle goes) and the next prepare fills it again.
+async fn fresh_statement(
+    client: &ClientWrapper,
+    sql: &str,
+) -> Result<Statement, tokio_postgres::Error> {
+    drop(client.statement_cache.remove(sql, &[]));
+    client.prepare_cached(sql).await
+}
 
 /// Runs `sql` as a statement prepared once per connection.
 async fn query_cached(
@@ -295,7 +326,13 @@ async fn query_cached(
     params: &[&(dyn ToSql + Sync)],
 ) -> Result<Vec<Row>, tokio_postgres::Error> {
     let statement = client.prepare_cached(sql).await?;
-    client.query(&statement, params).await
+    match client.query(&statement, params).await {
+        Err(error) if is_stale_statement(&error) => {
+            let statement = fresh_statement(client, sql).await?;
+            client.query(&statement, params).await
+        }
+        result => result,
+    }
 }
 
 /// Runs `sql` as a statement prepared once per connection; one row.
@@ -305,7 +342,13 @@ async fn query_one_cached(
     params: &[&(dyn ToSql + Sync)],
 ) -> Result<Row, tokio_postgres::Error> {
     let statement = client.prepare_cached(sql).await?;
-    client.query_one(&statement, params).await
+    match client.query_one(&statement, params).await {
+        Err(error) if is_stale_statement(&error) => {
+            let statement = fresh_statement(client, sql).await?;
+            client.query_one(&statement, params).await
+        }
+        result => result,
+    }
 }
 
 /// Runs `sql` as a statement prepared once per connection; the rows affected.
@@ -315,7 +358,13 @@ async fn execute_cached(
     params: &[&(dyn ToSql + Sync)],
 ) -> Result<u64, tokio_postgres::Error> {
     let statement = client.prepare_cached(sql).await?;
-    client.execute(&statement, params).await
+    match client.execute(&statement, params).await {
+        Err(error) if is_stale_statement(&error) => {
+            let statement = fresh_statement(client, sql).await?;
+            client.execute(&statement, params).await
+        }
+        result => result,
+    }
 }
 
 /// Name of a JSON value's type, for error messages that must not echo
@@ -1519,13 +1568,9 @@ impl ResponseStorage for PostgresResponseStorage {
         // The statement is prepared once per pooled connection (the cache
         // keeps it), so a store on the upsert path is one round trip.
         let rows = match self.store_path {
-            StorePath::Upsert => {
-                let stmt = client
-                    .prepare_cached(&upsert_sql(&table, &col_names))
-                    .await
-                    .map_err(store_err)?;
-                client.execute(&stmt, &params).await.map_err(store_err)?
-            }
+            StorePath::Upsert => execute_cached(&client, &upsert_sql(&table, &col_names), &params)
+                .await
+                .map_err(store_err)?,
             StorePath::LockedMerge => {
                 // One READ COMMITTED transaction: the statement takes its
                 // snapshot once the lock is held, so it sees the row of every
@@ -1540,11 +1585,20 @@ impl ResponseStorage for PostgresResponseStorage {
                 tx.batch_execute(&lock_sql(store_lock_key(&response_id.0)))
                     .await
                     .map_err(store_err)?;
-                let stmt = tx
-                    .prepare_cached(&locked_merge_sql(&table, &col_names))
+                let sql = locked_merge_sql(&table, &col_names);
+                let stmt = tx.prepare_cached(&sql).await.map_err(store_err)?;
+                // A stale statement fails the transaction (no second try
+                // inside it); its entry goes, so the next store on this
+                // connection prepares the statement afresh.
+                let inserted = tx
+                    .execute(&stmt, &params)
                     .await
+                    .inspect_err(|error| {
+                        if is_stale_statement(error) {
+                            drop(tx.statement_cache.remove(&sql, &[]));
+                        }
+                    })
                     .map_err(store_err)?;
-                let inserted = tx.execute(&stmt, &params).await.map_err(store_err)?;
                 tx.commit().await.map_err(store_err)?;
                 inserted
             }
@@ -1896,5 +1950,22 @@ mod tests {
         // database, so the key of an id must never change.
         assert_eq!(store_lock_key(""), 0xcbf2_9ce4_8422_2325_u64 as i64);
         assert_eq!(store_lock_key("a"), 0xaf63_dc4c_8601_ec8c_u64 as i64);
+    }
+
+    /// The two answers that mean the statement the server was handed is
+    /// stale (its cached plan no longer fits, it no longer exists), and no
+    /// other, make a helper prepare the statement afresh and call again.
+    #[test]
+    fn a_stale_plan_and_a_missing_statement_are_the_stale_states() {
+        assert!(is_stale_statement_state(&SqlState::FEATURE_NOT_SUPPORTED));
+        assert!(is_stale_statement_state(
+            &SqlState::INVALID_SQL_STATEMENT_NAME
+        ));
+        assert!(!is_stale_statement_state(&SqlState::UNIQUE_VIOLATION));
+        assert!(!is_stale_statement_state(
+            &SqlState::IN_FAILED_SQL_TRANSACTION
+        ));
+        assert!(!is_stale_statement_state(&SqlState::UNDEFINED_COLUMN));
+        assert!(!is_stale_statement_state(&SqlState::QUERY_CANCELED));
     }
 }

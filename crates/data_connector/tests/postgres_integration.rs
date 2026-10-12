@@ -1366,6 +1366,93 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
     );
 }
 
+/// A read whose cached statement went stale on its connection is made again
+/// on a fresh one: the type of a column the statement selects is altered
+/// under it (as a migration a newer build runs during a rolling upgrade
+/// does), which the server answers with "cached plan must not change result
+/// type" for the statement the connection cached; the pool keeps handing the
+/// connection out (it is open), so without a fresh statement every later read
+/// on it would fail until the process restarts. A pool of one connection, so
+/// every read takes the one that cached the statement; on a database of its
+/// own, so the altered column stays out of the shared one.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_read_whose_cached_statement_went_stale_is_made_again_on_a_fresh_one() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "stale_statement")
+        .await
+        .expect("create a scratch database");
+    let outcome = async {
+        let postgres_cfg = PostgresConfig {
+            db_url: scratch.url.clone(),
+            pool_max: 1,
+            op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
+            schema: Some(SchemaConfig {
+                auto_migrate: true,
+                ..Default::default()
+            }),
+        };
+        let storage = create_storage(StorageFactoryConfig {
+            backend: &HistoryBackend::Postgres,
+            oracle: None,
+            postgres: Some(&postgres_cfg),
+            redis: None,
+            memory: None,
+            hook: None,
+        })
+        .await
+        .map_err(|e| format!("start on the scratch database: {e}"))?
+        .conversation_storage;
+        let metadata: serde_json::Map<String, serde_json::Value> =
+            [("k".to_string(), json!("v"))].into_iter().collect();
+        let created = storage
+            .create_conversation(NewConversation {
+                id: None,
+                metadata: Some(metadata.clone()),
+                tenant: None,
+            })
+            .await
+            .map_err(|e| format!("create a conversation: {e}"))?;
+        // The first read prepares the statement and caches it on the one
+        // connection of the pool.
+        let first = storage
+            .get_conversation(&created.id)
+            .await
+            .map_err(|e| format!("the first read: {e}"))?;
+        if first.as_ref().and_then(|c| c.metadata.as_ref()) != Some(&metadata) {
+            return Err(format!("the first read answered {first:?}"));
+        }
+        // The type of a column the cached statement selects changes under it.
+        scratch
+            .run("ALTER TABLE conversations ALTER COLUMN metadata TYPE jsonb USING metadata::jsonb")
+            .await?;
+        let mut served = 0;
+        let mut failures = Vec::new();
+        for _ in 0..20 {
+            match storage.get_conversation(&created.id).await {
+                Ok(Some(conversation)) if conversation.metadata.as_ref() == Some(&metadata) => {
+                    served += 1;
+                }
+                Ok(other) => failures.push(format!("{other:?}")),
+                Err(e) => failures.push(e.to_string()),
+            }
+        }
+        Ok::<_, String>((served, failures))
+    }
+    .await;
+    scratch.drop().await;
+    let (served, failures) = outcome.expect("the reads over the altered column");
+    assert_eq!(
+        served,
+        20,
+        "reads after a selected column's type changed under the cached statement: \
+         {served}/20 served; first failure: {:?}",
+        failures.first()
+    );
+}
+
 /// A database whose schema version is ahead of the migrations this build
 /// knows is refused at start-up with a message that says so (an older
 /// gateway behind a store a newer build migrated forward would otherwise
