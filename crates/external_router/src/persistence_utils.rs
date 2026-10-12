@@ -467,8 +467,10 @@ pub enum PersistStep {
 }
 
 /// A failed persist: the step that failed, whether the same persist can
-/// succeed later (a storage error at the record write, as opposed to a record
-/// the store refuses) and the message.
+/// succeed later and the message. Retryable is a storage error at the record
+/// write: an unreachable store, and also a write a storage hook rejected, which
+/// the store reports the same way; a record the input itself makes unstorable
+/// (no id, no output) is not retried.
 #[derive(Debug, Clone)]
 pub struct PersistError {
     pub step: PersistStep,

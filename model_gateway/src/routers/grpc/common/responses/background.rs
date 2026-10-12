@@ -1141,10 +1141,11 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "the answer is kept"
         );
-        // The store may still refuse a read or two: poll without unwrapping.
+        // Poll the store underneath the fault injection, so the test's own
+        // reads do not use up the failures meant for the close and its retry.
         let mut raw = Value::Null;
         for _ in 0..2000 {
-            if let Ok(Some(stored)) = storage.get_response(&ResponseId::from("resp_1")).await {
+            if let Ok(Some(stored)) = flaky.inner.get_response(&ResponseId::from("resp_1")).await {
                 if stored.raw_response["status"] == "failed" {
                     raw = stored.raw_response;
                     break;
@@ -1157,6 +1158,11 @@ mod tests {
             "the record is closed once the store answers again"
         );
         assert_eq!(raw["error"]["code"], "bad_input");
+        assert_eq!(
+            flaky.failures_left.load(Ordering::SeqCst),
+            0,
+            "the close's first read and its first retry met the injected failures"
+        );
         assert!(
             flaky.calls() > 2,
             "the close was retried: {} calls",
