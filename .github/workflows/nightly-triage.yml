@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WATCHED_WORKFLOWS: nightly-bfcl.yml nightly-tau2.yml nightly-docker.yml nightly-engine-docker.yml nightly-pd.yml
+  WATCHED_WORKFLOWS: nightly-bfcl.yml nightly-tau2.yml nightly-docker.yml nightly-engine-docker.yml nightly-pd.yml cargo-audit-nightly.yml
 
 jobs:
   collect:

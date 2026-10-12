@@ -17,15 +17,20 @@ case "$(uname -m)" in
 esac
 
 name="cargo-audit-${target}-v${CARGO_AUDIT_VERSION}"
-bin_dir="${CARGO_AUDIT_BIN_DIR:-${RUNNER_TEMP:-/tmp}/cargo-audit-${CARGO_AUDIT_VERSION}}"
+# The archive is kept in a per-user directory (never a shared /tmp), checked against the pinned
+# checksum and extracted afresh on every run: a binary left there by anyone or by an interrupted
+# extraction is never run as it is.
+bin_dir="${CARGO_AUDIT_BIN_DIR:-${RUNNER_TEMP:-${XDG_CACHE_HOME:-$HOME/.cache}}/cargo-audit-${CARGO_AUDIT_VERSION}}"
 bin="${bin_dir}/cargo-audit"
-if [ ! -x "${bin}" ]; then
-  mkdir -p "${bin_dir}"
-  curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 -o "${bin_dir}/${name}.tgz" \
+archive="${bin_dir}/${name}.tgz"
+mkdir -p "${bin_dir}"
+if [ ! -f "${archive}" ]; then
+  curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 -o "${archive}" \
     "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv${CARGO_AUDIT_VERSION}/${name}.tgz"
-  echo "${sha256}  ${bin_dir}/${name}.tgz" | sha256sum --check --quiet
-  tar xzf "${bin_dir}/${name}.tgz" --strip-components=1 -C "${bin_dir}" "${name}/cargo-audit"
 fi
+echo "${sha256}  ${archive}" | sha256sum --check --quiet
+rm -f "${bin}"
+tar xzf "${archive}" --strip-components=1 -C "${bin_dir}" "${name}/cargo-audit"
 
 "${bin}" --version
 lockfile="${1:-Cargo.lock}"

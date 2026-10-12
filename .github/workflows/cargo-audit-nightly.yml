@@ -1,9 +1,11 @@
 name: Cargo Audit Nightly
 
 # Audits main's Cargo.lock against the RustSec advisory database once a day.
-# The cargo-audit job of PR Test (SMG) runs only when a pull request changes
-# the dependency graph, so an advisory published after the last lockfile
-# change surfaces here first. Same script, same ignore list (.cargo/audit.toml).
+# The cargo-audit job of PR Test (SMG) runs on a pull request that changes the
+# dependency graph and on every push to main, so an advisory published after
+# the last change to main surfaces here first. Same script, same ignore list
+# (.cargo/audit.toml); a red run reaches the nightly triage issue
+# (nightly-triage.yml watches this workflow).
 
 on:
   schedule:
