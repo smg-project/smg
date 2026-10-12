@@ -46,6 +46,6 @@ async fn the_default_configuration_keeps_a_silent_chat_stream_alive_within_the_p
         arrivals
             .iter()
             .all(|arrival| arrival.text() == ": ping\n\n"),
-        "only keep-alives while the engine is silent: {arrivals:#?}"
+        "only keep-alive frames while the engine is silent: {arrivals:#?}"
     );
 }

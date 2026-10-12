@@ -118,7 +118,7 @@ async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_sile
         let during = keep_alives(silence, endpoint.keep_alive);
         assert!(
             (2..=4).contains(&during.len()),
-            "{}: {} keep-alives during a {SILENCE:?} silence at a 1 s interval: {arrivals:#?}",
+            "{}: {} keep-alive frames during a {SILENCE:?} silence at a 1 s interval: {arrivals:#?}",
             endpoint.path,
             during.len()
         );
