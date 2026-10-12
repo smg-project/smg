@@ -1478,8 +1478,8 @@ mod tests {
 
     #[test]
     fn test_clamp_on_small_pools_leaves_every_class_headroom() {
-        // The built-in floors on a pool of 4 (the issue's bed: two workers
-        // of two slots... or one of four): desired is System 4, Interactive 4
+        // The built-in floors on a pool of 4 (the issue's bed before its
+        // second worker was counted): desired is System 4, Interactive 4
         // (both capped at capacity), Default ceil(0.4)=1, Bulk 0 — Σ 9. The
         // old priority-ordered fill reserved all four for System, which
         // carries no traffic, and every other class was admitted only by the

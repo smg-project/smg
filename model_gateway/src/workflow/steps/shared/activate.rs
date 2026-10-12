@@ -55,7 +55,13 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         let mut activated = 0;
         for worker in workers {
             if let Some(status) = activation_status(worker) {
-                match registry.get_id_by_url(worker.url()) {
+                // Only the worker this workflow registered: an upsert of the
+                // same URL that raced it (discovery beside an API call) must
+                // not have its own worker flipped from here.
+                match registry
+                    .get_id_by_url(worker.url())
+                    .filter(|id| registry.get(id).is_some_and(|w| Arc::ptr_eq(&w, worker)))
+                {
                     Some(worker_id) => {
                         registry.transition_status(&worker_id, status);
                     }
