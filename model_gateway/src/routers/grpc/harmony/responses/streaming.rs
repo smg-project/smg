@@ -482,8 +482,9 @@ async fn execute_mcp_tool_loop_streaming(
                     Some(error) => emitter.emit_failed(Some(&usage_json), error),
                     None => emitter.emit_completed(Some(&usage_json)),
                 };
-                emitter.send_event_best_effort(&event, tx).await;
-                if not_stored.is_some() {
+                // Counted only once the terminal reached the client, as emit_terminal counts.
+                let delivered = emitter.send_event_best_effort(&event, tx).await;
+                if delivered && not_stored.is_some() {
                     Metrics::record_responses_stream_failure(
                         &original_request.model,
                         failure_reason(not_stored.as_ref()),
@@ -597,8 +598,9 @@ async fn execute_without_mcp_streaming(
         Some(error) => emitter.emit_failed(Some(&usage_json), error),
         None => emitter.emit_completed(Some(&usage_json)),
     };
-    emitter.send_event_best_effort(&event, tx).await;
-    if not_stored.is_some() {
+    // Counted only once the terminal reached the client, as emit_terminal counts.
+    let delivered = emitter.send_event_best_effort(&event, tx).await;
+    if delivered && not_stored.is_some() {
         Metrics::record_responses_stream_failure(
             &original_request.model,
             failure_reason(not_stored.as_ref()),

@@ -146,14 +146,11 @@ async fn responses_result_with_finishes(
     context.worker_registry.register(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
-    // The regular MCP streaming path does not currently implement persistence.
-    // Exercise real storage for both non-streaming and non-MCP streaming paths.
-    let check_persistence = !stream
-        || !tools
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool["type"] == "mcp");
+    // Every path persists its final object, the regular MCP stream included
+    // (its final object is read before the terminal event): exercise real
+    // storage on all of them, so a stored status that disagrees with the wire
+    // (a failed tool loop stored as completed) is caught here.
+    let check_persistence = true;
     let request = serde_json::from_value(json!({
         "model": MODEL, "input": "Hello", "stream": stream, "store": check_persistence,
         "max_output_tokens": 16, "tools": tools, "max_tool_calls": max_tool_calls,

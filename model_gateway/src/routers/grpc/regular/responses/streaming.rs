@@ -1039,6 +1039,10 @@ async fn execute_tool_loop_streaming_internal(
     let mut final_response = emitter.finalize(None);
     final_response.usage = state.usage.clone().map(ResponsesUsage::Modern);
     if let Some(error) = terminal_error.clone() {
+        // The emitter learns of the failure from the terminal event, which
+        // now follows the final object: the stored record says failed itself.
+        final_response.status = ResponseStatus::Failed;
+        final_response.incomplete_details = None;
         final_response.error = Some(error);
     }
     let persist = persist_response_if_needed(
