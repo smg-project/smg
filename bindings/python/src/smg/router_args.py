@@ -1248,7 +1248,8 @@ class RouterArgs:
                 " once; a request that fits waits briefly for room, then gets"
                 " 429, and one larger than the whole budget gets 413 straight"
                 " away. A waiting request still holds its media, so size memory"
-                " for about twice this value. Zero is refused, not read as unset"
+                " for about twice this value. Counted in whole KiB: a value under 1024 (one"
+                " 1 KiB unit, zero included) is refused, not read as unset"
             ),
         )
         parser.add_argument(

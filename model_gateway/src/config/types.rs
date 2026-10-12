@@ -259,7 +259,8 @@ pub struct RouterConfig {
     /// larger than the whole budget gets 413 straight away. A request waiting
     /// for room still holds its media, and the queue is capped at one budget
     /// as well, so size memory for about twice this value. Unset leaves it
-    /// unbounded; zero is refused rather than read as unset.
+    /// unbounded; counted in whole KiB, so a value under 1024 (one 1 KiB unit,
+    /// zero included) is refused rather than read as unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_max_inflight_bytes: Option<usize>,
     /// Per-request image-count limit applied to every model, replacing each

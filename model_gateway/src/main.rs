@@ -777,7 +777,8 @@ struct CliArgs {
     /// at once; a request that fits waits briefly, then gets 429, and one
     /// larger than the whole budget gets 413 straight away. A waiting request
     /// still holds its media, so size memory for about twice this value.
-    /// Unset: unbounded. Zero is refused rather than read as unset.
+    /// Unset: unbounded. Counted in whole KiB: a value under 1024 (one 1 KiB
+    /// unit, zero included) is refused rather than read as unset.
     #[arg(long, help_heading = "Multimodal")]
     multimodal_max_inflight_bytes: Option<usize>,
 

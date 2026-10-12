@@ -229,7 +229,7 @@ impl RedisConfig {
         // written; persistent records are spelled by leaving the retention unset.
         if self.retention_days == Some(0) {
             return Err(
-                "retention_days must be at least 1 (unset it for persistent records)".to_string(),
+                "retention_days must be at least 1; persistent records are spelled -1 on the command line and in Python (unset in Rust)".to_string(),
             );
         }
         Ok(())
