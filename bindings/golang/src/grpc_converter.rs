@@ -427,7 +427,9 @@ pub(crate) async fn convert_proto_chunk_to_openai(
             // text (or the first calls) the decoder released, as every delta
             // below does: a role-only delta here dropped that text, which the
             // decoder had already advanced past.
-            if let Some((_, tool_call_deltas)) = parse_tool_text(handle, &chunk_text).await {
+            if let Some((normal_text, tool_call_deltas)) =
+                parse_tool_text(handle, &chunk_text).await
+            {
                 handle.stream_state.get_or_create(index).has_tool_calls = true;
                 let tool_response = ChatCompletionStreamResponse {
                     id: handle.request_id.clone(),
@@ -439,7 +441,11 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                         index,
                         delta: ChatMessageDelta {
                             role: Some("assistant".to_string()),
-                            content: None,
+                            // The text the parser released with the calls (a
+                            // value that is not a declared call, a marker
+                            // prefix) goes out beside them, as at Complete;
+                            // the decoder has advanced past it already.
+                            content: (!normal_text.is_empty()).then_some(normal_text),
                             tool_calls: Some(tool_call_deltas),
                             reasoning_content: None,
                         },
@@ -1151,5 +1157,80 @@ mod tests {
             assert!(response.choices[0].delta.content.is_none(), "{response:?}");
             assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_chunk_tool_call_delta_carries_the_text_released_with_it() {
+        let tokenizer = byte_fallback_tokenizer();
+        // One chunk holds a value that is not a declared call and the declared
+        // call after it: the parser releases the first as text and the second
+        // as deltas in one result, and the client gets both together.
+        let released = r#"{"note":"checking"} "#;
+        let call = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
+        let token_ids: Vec<u32> = format!("{released}{call}")
+            .bytes()
+            .map(|byte| u32::from(byte) + 1)
+            .collect();
+        let completion_tokens = token_ids.len() as u32;
+        let mut handle = tool_test_handle(tokenizer.clone(), None);
+        let chunk = proto::GenerateResponse {
+            response: Some(proto::generate_response::Response::Chunk(
+                proto::GenerateStreamChunk {
+                    token_ids: token_ids.clone(),
+                    prompt_tokens: 7,
+                    completion_tokens,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let streamed = convert_proto_chunk_to_openai(chunk, &mut handle, &tokenizer)
+            .await
+            .unwrap()
+            .unwrap();
+        let delta = &streamed.choices[0].delta;
+        assert_eq!(delta.role.as_deref(), Some("assistant"));
+        assert_eq!(delta.content.as_deref(), Some(released), "{streamed:?}");
+        let calls = delta.tool_calls.clone().unwrap_or_default();
+        assert!(
+            !calls.is_empty() && calls.iter().all(|call| call.index == 0),
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls[0].function.as_ref().unwrap().name.as_deref(),
+            Some("get_weather")
+        );
+        let arguments: String = calls
+            .iter()
+            .filter_map(|call| {
+                call.function
+                    .as_ref()
+                    .and_then(|function| function.arguments.as_deref())
+            })
+            .collect();
+        let arguments: Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(arguments, serde_json::json!({"city":"Paris"}));
+
+        // Complete repeats neither the text nor the call.
+        let complete = proto::GenerateResponse {
+            response: Some(proto::generate_response::Response::Complete(
+                proto::GenerateComplete {
+                    output_ids: token_ids,
+                    prompt_tokens: 7,
+                    completion_tokens,
+                    finish_reason: "stop".into(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        let response = convert_proto_chunk_to_openai(complete, &mut handle, &tokenizer)
+            .await
+            .unwrap()
+            .unwrap();
+        let choice = &response.choices[0];
+        assert!(choice.delta.content.is_none(), "{response:?}");
+        assert!(choice.delta.tool_calls.is_none(), "{response:?}");
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
     }
 }
