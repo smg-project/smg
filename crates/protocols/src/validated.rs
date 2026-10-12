@@ -511,7 +511,7 @@ mod tests {
     #[tokio::test]
     async fn rejections_carry_their_code_as_an_extension() {
         for (body, code) in [
-            (r#"{"value":0.5,"name":"x","tier":"vi"#, "json_parse_error"),
+            (r#"{"value":0.5,"name":"x","tier":"vi"#, "invalid_json"),
             (r#"{"value":1.5,"name":"x"}"#, "decimal_above_max_value"),
         ] {
             let request = Request::builder()
