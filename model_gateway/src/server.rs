@@ -72,6 +72,7 @@ use crate::{
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
+        admin_json::AdminJson,
         manager::{WorkerManager, WorkerManagerConfig},
         ConnectionMode,
     },
@@ -770,7 +771,7 @@ async fn get_loads(
 
 async fn create_worker(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<WorkerSpec>,
+    AdminJson(config): AdminJson<WorkerSpec>,
 ) -> Response {
     match state.context.worker_service.create_worker(config).await {
         Ok(result) => result.into_response(),
@@ -829,7 +830,7 @@ async fn delete_worker(
 async fn update_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
-    Json(update): Json<WorkerUpdateRequest>,
+    AdminJson(update): AdminJson<WorkerUpdateRequest>,
 ) -> Response {
     match state
         .context
@@ -845,7 +846,7 @@ async fn update_worker(
 async fn replace_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
-    Json(config): Json<WorkerSpec>,
+    AdminJson(config): AdminJson<WorkerSpec>,
 ) -> Response {
     match state
         .context
