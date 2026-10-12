@@ -18,6 +18,7 @@ Usage (from the repository root):
     python crates/multimodal/scripts/generate_qwen3_vl_video_golden.py
 """
 
+import math
 import argparse
 import json
 from pathlib import Path
@@ -62,10 +63,21 @@ def decode(path: Path) -> tuple[list[np.ndarray], float]:
 
 
 def sampled_indices(total: int, fps: float) -> list[int]:
-    duration = total / fps if fps > 0 else 0.0
-    count = int(round(duration * SAMPLE_FPS))
-    count = min(max(count, MIN_FRAMES), MAX_FRAMES, total)
-    return [int(index) for index in np.linspace(0, total - 1, count)]
+    """The frames the media connector samples (`even_frame_indices` /
+    `spread_evenly` in `src/media.rs`), step for step: the count is the clip's
+    duration times the sample rate, rounded half away from zero as `f64::round`
+    does (Python's `round` rounds half to even), `MAX_FRAMES` when the rate is
+    unknown, clamped to `[MIN_FRAMES, MAX_FRAMES]` and NOT capped at the clip's
+    frame count (a short clip repeats frames); the indices are
+    `floor(i * (total - 1) / (count - 1))`."""
+    if fps > 0:
+        count = int(math.floor(total / fps * SAMPLE_FPS + 0.5))
+    else:
+        count = MAX_FRAMES
+    count = min(max(count, MIN_FRAMES), MAX_FRAMES)
+    if count <= 1:
+        return [0]
+    return [int(math.floor(i * (total - 1) / (count - 1))) for i in range(count)]
 
 
 def main() -> None:
