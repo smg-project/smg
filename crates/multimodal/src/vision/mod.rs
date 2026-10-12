@@ -33,6 +33,7 @@
 //! ```
 
 pub mod execution;
+pub(crate) mod orientation;
 pub mod preprocessor_config;
 pub mod processor;
 pub mod processors;

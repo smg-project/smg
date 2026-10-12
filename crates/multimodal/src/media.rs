@@ -29,7 +29,7 @@ use url::Url;
 use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
-    vision::transforms::resize_catmull_rom_rgb,
+    vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
 };
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -4728,17 +4728,15 @@ pub(crate) fn decode_image_bytes(
     // The orientation tag is applied the way the engine's own loader applies
     // it, so a photo stored sideways reaches the model upright on both paths.
     let mut image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
-        Some(mut image) => {
+        Some(image) => {
             // libjpeg-turbo yields pixels only; the tag comes from the header.
-            image.apply_orientation(jpeg_orientation(bytes));
-            image
+            oriented(image, jpeg_orientation(bytes))
         }
         None => match crate::webp_native::decode_webp(bytes) {
-            Some(mut image) => {
+            Some(image) => {
                 // libwebp yields pixels only; the tag comes from the file's
                 // metadata chunk, read as the fallback decoder reads it.
-                image.apply_orientation(webp_orientation(bytes));
-                image
+                oriented(image, webp_orientation(bytes))
             }
             None => {
                 let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -4757,9 +4755,8 @@ pub(crate) fn decode_image_bytes(
                 let orientation = decoder
                     .orientation()
                     .unwrap_or(image::metadata::Orientation::NoTransforms);
-                let mut image = image::DynamicImage::from_decoder(decoder)?;
-                image.apply_orientation(orientation);
-                image
+                let image = image::DynamicImage::from_decoder(decoder)?;
+                oriented(image, orientation)
             }
         },
     };
