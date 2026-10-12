@@ -338,6 +338,43 @@ def test_a_closed_multiplexed_stream_aborts_a_sub_request_whose_output_was_not_r
     asyncio.run(scenario())
 
 
+def test_a_failing_sub_request_handler_aborts_its_running_sibling(manager):
+    """One sub-request's dispatch fails while the other waits on the scheduler:
+    the failure leaves the multiplex loop through its ``finally``, which aborts
+    the sibling still running (before, it kept generating)."""
+    sent = manager.sent
+
+    def dispatch(obj):
+        if getattr(obj, "rid", None) == "r-fail-0":
+            raise RuntimeError("scheduler socket closed")
+        sent.append(obj)
+
+    manager.send_to_scheduler = SimpleNamespace(send_pyobj=dispatch)
+
+    async def scenario():
+        got: list = []
+
+        async def consume():
+            async for item in manager.generate_request(_multi(True, 2), "r-fail", None):
+                got.append(item)
+
+        task = asyncio.create_task(consume())
+        await _settle()
+        assert [m.rid for m in manager.sent] == ["r-fail-prefix"]
+        _finished(manager, "r-fail-prefix")
+        with pytest.raises(RuntimeError, match="socket closed"):
+            await task
+        await _settle()
+        assert got == []
+        assert [m.rid for m in manager.sent][:2] == ["r-fail-prefix", "r-fail-1"], (
+            "the sibling was dispatched; the failing one never reached the scheduler"
+        )
+        assert _aborts(manager, 2) == ["r-fail-1"], "the running sibling is aborted"
+        _all_ended(manager, 3)
+
+    asyncio.run(scenario())
+
+
 def test_client_cancel_of_a_non_streaming_n3_request_aborts_only_the_running_sub_request(manager):
     """The non-streaming path runs the sub-requests one after another: a cancel
     reaches the one in flight through its own handler, and the ones not yet

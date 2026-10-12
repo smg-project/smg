@@ -445,8 +445,10 @@ class GrpcRequestManager:
                 # the handler aborted and cleaned up the request itself
                 pass
             elif task is not None and task.exception() is not None:
-                # the handler failed on its own and cleaned up on the way out
-                # (the exception is retrieved here, so the loop does not log it)
+                # the handler finished or failed on its own and cleaned up on the
+                # way out (StopAsyncIteration when the loop had not consumed its
+                # end yet; the exception is retrieved here, so the loop does not
+                # log it)
                 pass
             elif request_id in self.rid_to_state:
                 await self.abort_request(request_id)
