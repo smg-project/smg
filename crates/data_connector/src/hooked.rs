@@ -611,6 +611,18 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    async fn expire_response(
+        &self,
+        response_id: &ResponseId,
+        after: std::time::Duration,
+    ) -> ResponseResult<()> {
+        self.inner.expire_response(response_id, after).await
+    }
+
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        self.inner.delete_unstored_older_than(cutoff).await
+    }
+
     async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
         let payload = serde_json::json!({ "identifier": identifier });
         let extra = run_before(

@@ -1037,6 +1037,37 @@ impl ResponseStorage for RedisResponseStorage {
         Ok(())
     }
 
+    async fn expire_response(
+        &self,
+        response_id: &ResponseId,
+        after: std::time::Duration,
+    ) -> ResponseResult<()> {
+        let key = self.response_key(response_id.0.as_str());
+        let mut conn = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+
+        // The record and the output-item keys pointing at it go together;
+        // the identifier index tolerates a member whose record is gone.
+        let mut keys = self
+            .output_item_keys_of_many(&mut conn, std::slice::from_ref(&key))
+            .await?;
+        keys.push(key);
+        let seconds = i64::try_from(after.as_secs().max(1)).unwrap_or(i64::MAX);
+        let mut pipe = redis::pipe();
+        for key in &keys {
+            pipe.expire(key, seconds);
+        }
+        let _: () = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
     async fn list_identifier_responses(
         &self,
         identifier: &str,

@@ -1535,6 +1535,45 @@ impl ResponseStorage for PostgresResponseStorage {
         Ok(out)
     }
 
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        let s = &self.store.schema.responses;
+
+        // The object (its `store`, `status` and `completed_at`) is what the
+        // query reads; without the column there is nothing to read.
+        if s.is_skipped("raw_response") {
+            return Ok(0);
+        }
+
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        let ended = if s.is_skipped("created_at") {
+            format!("({col_raw}::jsonb->>'completed_at')::bigint")
+        } else {
+            format!(
+                "COALESCE(({col_raw}::jsonb->>'completed_at')::bigint, EXTRACT(EPOCH FROM {})::bigint)",
+                s.col("created_at")
+            )
+        };
+        let sql = format!(
+            "DELETE FROM {table} WHERE {col_raw}::jsonb->>'store' = 'false' \
+             AND {col_raw}::jsonb->>'status' IN ('completed', 'incomplete', 'failed', 'cancelled') \
+             AND {ended} < $1"
+        );
+
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let cutoff_secs: i64 = cutoff.timestamp();
+        let rows_deleted = client
+            .execute(&sql, &[&cutoff_secs])
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        Ok(rows_deleted as usize)
+    }
+
     async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
         let s = &self.store.schema.responses;
 

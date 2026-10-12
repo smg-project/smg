@@ -1551,6 +1551,54 @@ impl ResponseStorage for OracleResponseStorage {
             .map_err(ResponseStorageError::StorageError)
     }
 
+    async fn delete_unstored_older_than(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, ResponseStorageError> {
+        let schema = self.store.schema.clone();
+        // The object (its `store`, `status` and `completed_at`) is what the
+        // query reads; without the column there is nothing to read.
+        if schema.responses.is_skipped("raw_response") {
+            return Ok(0);
+        }
+        let cutoff_secs: i64 = cutoff.timestamp();
+
+        let affected = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                let table = s.qualified_table(schema.owner.as_deref());
+                let col_raw = s.col("raw_response");
+                let ended = if s.is_skipped("created_at") {
+                    format!("TO_NUMBER(JSON_VALUE({col_raw}, '$.completed_at'))")
+                } else {
+                    format!(
+                        "COALESCE(TO_NUMBER(JSON_VALUE({col_raw}, '$.completed_at')), \
+                         ROUND((CAST({} AS DATE) - DATE '1970-01-01') * 86400))",
+                        s.col("created_at")
+                    )
+                };
+
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE JSON_VALUE({col_raw}, '$.store') = 'false' \
+                         AND JSON_VALUE({col_raw}, '$.status') IN ('completed', 'incomplete', 'failed', 'cancelled') \
+                         AND {ended} < :1"
+                    ),
+                    &[&cutoff_secs],
+                )
+                .map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::StorageError)?;
+
+        let deleted = affected
+            .row_count()
+            .map_err(|e| ResponseStorageError::StorageError(map_oracle_error(e)))?
+            as usize;
+        Ok(deleted)
+    }
+
     async fn delete_identifier_responses(
         &self,
         identifier: &str,

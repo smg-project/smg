@@ -549,6 +549,53 @@ pub trait ResponseStorage: Send + Sync {
 
     /// Delete all responses for a safety identifier
     async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize>;
+
+    /// Ask the store to drop the response under `response_id` on its own
+    /// once `after` has passed, where the store can keep such a deadline (a
+    /// key with a time to live). The default keeps none: the gateway's own
+    /// timer deletes the record while it runs, and a store without deadlines
+    /// answers through [`Self::delete_unstored_older_than`].
+    async fn expire_response(
+        &self,
+        response_id: &ResponseId,
+        after: std::time::Duration,
+    ) -> ResponseResult<()> {
+        let _ = (response_id, after);
+        Ok(())
+    }
+
+    /// Delete the records whose object says `store: false` and that reached a
+    /// terminal status before `cutoff` (see [`unstored_terminal_before`]):
+    /// what a gateway that stopped inside such a record's polling window, or
+    /// died, left behind in a store that outlives it. The default deletes
+    /// nothing: a store without a query over the stored object answers 0.
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        let _ = cutoff;
+        Ok(0)
+    }
+}
+
+/// Whether `response` is the record of a response its client asked not to
+/// store (`store: false` in its object) that reached a terminal status (the
+/// statuses a response does not leave: completed, incomplete, failed,
+/// cancelled) before `cutoff`: at its object's `completed_at` when it carries
+/// one, at the record's creation otherwise.
+pub fn unstored_terminal_before(response: &StoredResponse, cutoff: DateTime<Utc>) -> bool {
+    let raw = &response.raw_response;
+    if raw.get("store").and_then(Value::as_bool) != Some(false) {
+        return false;
+    }
+    if !matches!(
+        raw.get("status").and_then(Value::as_str),
+        Some("completed" | "incomplete" | "failed" | "cancelled")
+    ) {
+        return false;
+    }
+    let ended = raw
+        .get("completed_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| response.created_at.timestamp());
+    ended < cutoff.timestamp()
 }
 
 impl Default for StoredResponse {

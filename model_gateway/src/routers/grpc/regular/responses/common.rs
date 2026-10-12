@@ -279,6 +279,16 @@ pub(super) async fn load_conversation_history(
             .await
         {
             Ok(chain) if !chain.responses.is_empty() => {
+                // A response its client asked not to store is kept for its
+                // polling window only (a background run's record): a chain
+                // built on it would break when it goes, so it is no previous
+                // response, as the public API answers for an unstored id.
+                if chain.responses.last().is_some_and(is_unstored) {
+                    return Err(error::bad_request(
+                        "previous_response_not_found",
+                        format!("Previous response with id '{prev_id_str}' not found."),
+                    ));
+                }
                 let mut items = Vec::new();
                 for stored in &chain.responses {
                     // Convert input items from stored input (which is now a JSON array)
@@ -506,7 +516,10 @@ pub(super) async fn resolve_item_references(
                     "resolve_item_reference_failed",
                     format!("Failed to resolve item '{id}': {e}"),
                 )
-            })?;
+            })?
+            // The items of a response its client asked not to store are not
+            // stored items: its record is kept for its polling window only.
+            .filter(|response| !is_unstored(response));
         let candidate = stored
             .as_ref()
             .and_then(|response| response.raw_response.get("output"))
@@ -542,6 +555,14 @@ pub(super) async fn resolve_item_references(
         }
     }
     Ok(resolved)
+}
+
+/// Whether `stored` is the record of a response its client asked not to
+/// store: a background run's record, kept for its polling window only. Such
+/// a record is no previous response and its items are no stored items, as
+/// the public API answers for an unstored id.
+fn is_unstored(stored: &data_connector::StoredResponse) -> bool {
+    stored.raw_response.get("store").and_then(Value::as_bool) == Some(false)
 }
 
 /// The id an input item carries, for `item_reference` resolution. Every
@@ -749,6 +770,20 @@ mod usage_tests {
             }
             other => panic!("expected the stored message, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn an_item_reference_to_an_unstored_response_is_not_found() {
+        let storage = data_connector::MemoryResponseStorage::new();
+        let mut unstored = stored_response_with_message("msg_unstored", "a background answer");
+        unstored.raw_response["store"] = json!(false);
+        storage.store_response(unstored).await.unwrap();
+
+        let refused = resolve_item_references(&storage, vec![reference("msg_unstored")])
+            .await
+            .expect_err("an unstored response's item is no stored item");
+
+        assert_eq!(refused.status(), http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

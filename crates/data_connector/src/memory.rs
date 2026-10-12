@@ -481,6 +481,26 @@ impl ResponseStorage for MemoryResponseStorage {
         }
     }
 
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        let mut store = self.store.write();
+        let expired: Vec<ResponseId> = store
+            .responses
+            .iter()
+            .filter(|(_, response)| unstored_terminal_before(response, cutoff))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired {
+            if let Some(response) = store.responses.remove(id) {
+                if let Some(ref safety_identifier) = response.safety_identifier {
+                    if let Some(ids) = store.identifier_index.get_mut(safety_identifier) {
+                        ids.retain(|kept| kept != id);
+                    }
+                }
+            }
+        }
+        Ok(expired.len())
+    }
+
     async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
         let mut store = self.store.write();
 
@@ -679,6 +699,68 @@ mod tests {
     // ========================================================================
     // Response Tests
     // ========================================================================
+
+    #[tokio::test]
+    async fn unstored_terminal_records_past_the_cutoff_are_deleted_and_the_rest_kept() {
+        let store = MemoryResponseStorage::new();
+        let cutoff = Utc::now();
+        let past = cutoff.timestamp() - 60;
+        let later = cutoff.timestamp() + 60;
+        for (id, raw) in [
+            (
+                "resp_old_unstored",
+                json!({"status": "completed", "store": false, "completed_at": past}),
+            ),
+            (
+                "resp_fresh_unstored",
+                json!({"status": "failed", "store": false, "completed_at": later}),
+            ),
+            (
+                "resp_old_stored",
+                json!({"status": "completed", "store": true, "completed_at": past}),
+            ),
+            (
+                "resp_running_unstored",
+                json!({"status": "in_progress", "store": false}),
+            ),
+        ] {
+            let mut response = StoredResponse::new(None);
+            response.id = ResponseId::from(id);
+            response.safety_identifier = Some("user-1".to_string());
+            response.raw_response = raw;
+            store.store_response(response).await.unwrap();
+        }
+
+        assert_eq!(store.delete_unstored_older_than(cutoff).await.unwrap(), 1);
+
+        assert!(store
+            .get_response(&ResponseId::from("resp_old_unstored"))
+            .await
+            .unwrap()
+            .is_none());
+        for kept in [
+            "resp_fresh_unstored",
+            "resp_old_stored",
+            "resp_running_unstored",
+        ] {
+            assert!(
+                store
+                    .get_response(&ResponseId::from(kept))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{kept}"
+            );
+        }
+        // The identifier index lost the one entry with the record.
+        let listed = store
+            .list_identifier_responses("user-1", None)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 3);
+        // A second pass finds nothing left to do.
+        assert_eq!(store.delete_unstored_older_than(cutoff).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn test_store_with_custom_id() {
