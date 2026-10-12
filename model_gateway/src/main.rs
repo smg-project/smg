@@ -1212,9 +1212,9 @@ struct CliArgs {
     // ==================== Tokenizer ====================
     /// Model path for loading tokenizer (HuggingFace ID, fetched lazily, or a
     /// local path: one that exists must hold a tokenizer layout; one that
-    /// does not is refused in HTTP connection mode and left to the worker's
-    /// tokenizer in gRPC mode); not read as a tokenizer source beside
-    /// --tokenizer-path
+    /// does not is left to the worker's tokenizer where a gRPC worker can
+    /// still register, refused otherwise); not read as a tokenizer source
+    /// beside --tokenizer-path
     #[arg(long, alias = "model", help_heading = "Tokenizer")]
     model_path: Option<String>,
 

@@ -60,6 +60,41 @@ fn names_a_local_path(source: &str) -> bool {
         || Path::new(source).exists()
 }
 
+/// Whether a gRPC worker can still bring the tokenizer when the local source
+/// is missing: the connection mode is gRPC; IGW mode takes registrations at
+/// run time (`POST /workers` with `grpc://` URLs); a discovery provider adds
+/// workers later (bare `host:port` URLs whose mode is probed when they
+/// register); or a start-up URL names a gRPC worker itself. The connection
+/// mode alone misses the middle two: it follows the start-up URLs only.
+fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
+    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+        || config.enable_igw
+        || config.discovery.is_some()
+    {
+        return true;
+    }
+    let grpc = |url: &str| url.starts_with("grpc://") || url.starts_with("grpcs://");
+    match &config.mode {
+        RoutingMode::Regular { worker_urls } => worker_urls.iter().any(|url| grpc(url)),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        }
+        | RoutingMode::EncodePrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => {
+            prefill_urls.iter().any(|(url, _)| grpc(url)) || decode_urls.iter().any(|url| grpc(url))
+        }
+        // External providers: no worker of ours registers.
+        RoutingMode::OpenAI { .. } | RoutingMode::Anthropic { .. } | RoutingMode::Gemini { .. } => {
+            false
+        }
+    }
+}
+
 /// Why a local tokenizer source cannot serve.
 #[derive(Debug, PartialEq, Eq)]
 enum SourceProblem {
@@ -1498,15 +1533,15 @@ impl ConfigValidator {
     /// separator, or present on disk; anything else is a hub id the loader
     /// fetches lazily, as before), and `chat_template` always. A path that
     /// exists must be readable, a directory must hold a layout the loader
-    /// knows, a file must not be empty. A path that does not exist is a
-    /// configuration error in HTTP connection mode; in gRPC mode the gateway
-    /// loads the tokenizer from the first worker that registers when the
-    /// local load fails, and a model path that exists on the worker hosts
-    /// only is a supported layout, so it is left to that fallback. The load
-    /// itself stays where it was, a background job at start-up and at worker
-    /// registration: this is the part of it that can be known before
-    /// serving. With autoload disabled the paths are never read and are not
-    /// checked.
+    /// knows, a file must not be empty. A path that does not exist is left
+    /// alone when a gRPC worker can still register (the gateway then loads
+    /// the tokenizer from the first one, and a model path that exists on the
+    /// worker hosts only is a supported layout; see
+    /// [`a_grpc_worker_may_register`]) and is a configuration error when
+    /// none can. The load itself stays where it was, a background job at
+    /// start-up and at worker registration: this is the part of it that can
+    /// be known before serving. With autoload disabled the paths are never
+    /// read and are not checked.
     fn validate_tokenizer_sources(config: &RouterConfig) -> ConfigResult<()> {
         if config.disable_tokenizer_autoload {
             return Ok(());
@@ -1518,8 +1553,7 @@ impl ConfigValidator {
         if let Some(source) = source.filter(|source| names_a_local_path(source)) {
             match local_tokenizer_source_error(Path::new(source)) {
                 Ok(()) => {}
-                Err(SourceProblem::Missing)
-                    if config.connection_mode == crate::worker::ConnectionMode::Grpc => {}
+                Err(SourceProblem::Missing) if a_grpc_worker_may_register(config) => {}
                 Err(problem) => {
                     return Err(ConfigError::InvalidValue {
                         field: field.to_string(),
@@ -3059,10 +3093,60 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
-    /// In gRPC connection mode a source that does not exist on this host is
-    /// left to the worker fallback (the tokenizer fetched from the first
-    /// worker that registers); one that exists and cannot serve is refused
-    /// there too, and a missing one is refused in HTTP mode.
+    /// A source that does not exist on this host is left to the worker
+    /// fallback wherever a gRPC worker can still register: gRPC start-up
+    /// URLs, IGW mode, a discovery provider; it is refused where none can
+    /// (http URLs only, no IGW, no discovery), and one that exists and cannot
+    /// serve is refused everywhere.
+    #[test]
+    fn a_missing_source_is_left_to_the_worker_fallback_where_a_grpc_worker_may_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("{}/models/on-the-worker", dir.path().to_str().unwrap());
+        let regular = |urls: &[&str]| RoutingMode::Regular {
+            worker_urls: urls.iter().map(|u| u.to_string()).collect(),
+        };
+        let with =
+            |mode: RoutingMode, igw: bool, discovery: Option<DiscoveryConfig>| RouterConfig {
+                mode,
+                enable_igw: igw,
+                discovery,
+                model_path: Some(missing.clone()),
+                ..Default::default()
+            };
+        let discovery = DiscoveryConfig::File(FileDiscoveryConfig {
+            path: dir.path().join("workers.json"),
+            check_interval_secs: 5,
+        });
+        for (name, config) in [
+            ("igw", with(regular(&[]), true, None)),
+            ("discovery", with(regular(&[]), false, Some(discovery))),
+            (
+                "a grpcs url",
+                with(regular(&["grpcs://b:50051"]), false, None),
+            ),
+            (
+                "a grpc url beside an http one",
+                with(regular(&["http://a:8000", "grpc://b:50051"]), false, None),
+            ),
+        ] {
+            assert!(ConfigValidator::validate(&config).is_ok(), "{name}");
+        }
+        for (name, config) in [
+            (
+                "explicit http urls only",
+                with(regular(&["http://a:8000", "https://b:8443"]), false, None),
+            ),
+            (
+                "no urls, no igw, no discovery",
+                with(regular(&[]), false, None),
+            ),
+        ] {
+            let (value, reason) = refused_source(&config, "model_path");
+            assert_eq!(value, missing, "{name}");
+            assert!(reason.contains("does not exist"), "{name}: {reason}");
+        }
+    }
+
     #[test]
     fn a_missing_source_is_left_to_the_worker_fallback_in_grpc_mode() {
         let dir = tempfile::tempdir().unwrap();

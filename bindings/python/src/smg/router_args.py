@@ -1821,8 +1821,10 @@ class RouterArgs:
             help=(
                 "Model path for loading tokenizer (HuggingFace model ID, fetched lazily, or a"
                 " local path: one that exists must hold a tokenizer layout; one that does not"
-                " is refused in HTTP connection mode and left to the worker's tokenizer in"
-                " gRPC mode). Not read as a tokenizer source when tokenizer_path is set."
+                " is left to the worker's tokenizer where a gRPC worker can still register"
+                " (gRPC worker URLs, IGW mode, worker discovery)"
+                " and refused otherwise). Not read as a tokenizer source when tokenizer_path"
+                " is set."
             ),
         )
         tokenizer_group.add_argument(

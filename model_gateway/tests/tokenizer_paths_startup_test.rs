@@ -90,42 +90,29 @@ fn tokenizer_dir(dir: &Path) -> String {
     tok.to_str().expect("a UTF-8 path").to_string()
 }
 
-/// A missing path, a directory without a tokenizer file, a missing and an
-/// empty chat template: each refused before anything listens, with the
-/// field and the path in the error, no panic.
+/// A directory without a tokenizer file, a missing and an empty chat
+/// template: each refused before anything listens, with the field and the
+/// path in the error, no panic. (A missing source is left to the worker
+/// fallback under IGW mode, which the launcher uses; see the serving cases.)
 #[test]
 fn an_unreadable_tokenizer_source_refuses_to_start() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let tok = tokenizer_dir(dir.path());
-    let missing = dir.path().join("missing");
     let empty_dir = dir.path().join("empty-dir");
     fs::create_dir(&empty_dir).expect("the empty directory");
     let missing_template = dir.path().join("missing.jinja");
     let empty_template = dir.path().join("empty.jinja");
     fs::write(&empty_template, "").expect("the empty template");
-    let missing = missing.to_str().expect("a UTF-8 path");
     let empty_dir = empty_dir.to_str().expect("a UTF-8 path");
     let missing_template = missing_template.to_str().expect("a UTF-8 path");
     let empty_template = empty_template.to_str().expect("a UTF-8 path");
 
-    let cases: [(&str, Vec<&str>, &str, &str); 5] = [
-        (
-            "tokenizer-missing",
-            vec!["--tokenizer-path", missing],
-            "tokenizer_path",
-            missing,
-        ),
+    let cases: [(&str, Vec<&str>, &str, &str); 3] = [
         (
             "tokenizer-empty-dir",
             vec!["--tokenizer-path", empty_dir],
             "tokenizer_path",
             empty_dir,
-        ),
-        (
-            "model-missing",
-            vec!["--model-path", missing],
-            "model_path",
-            missing,
         ),
         (
             "chat-template-missing",
@@ -183,7 +170,7 @@ fn a_present_tokenizer_source_or_a_hub_id_serves() {
     let template = template.to_str().expect("a UTF-8 path");
     let on_the_worker = dir.path().join("models").join("on-the-worker");
     let on_the_worker = on_the_worker.to_str().expect("a UTF-8 path");
-    let cases: [(&str, Vec<&str>); 3] = [
+    let cases: [(&str, Vec<&str>); 5] = [
         (
             "local-layout",
             vec!["--tokenizer-path", &tok, "--chat-template", template],
@@ -200,6 +187,14 @@ fn a_present_tokenizer_source_or_a_hub_id_serves() {
                 "--model-path",
                 on_the_worker,
             ],
+        ),
+        // IGW mode (the launcher's shape) takes gRPC registrations at run
+        // time, so a missing source, model path or explicit tokenizer path,
+        // is left to the worker fallback too.
+        ("igw-model-missing", vec!["--model-path", on_the_worker]),
+        (
+            "igw-tokenizer-missing",
+            vec!["--tokenizer-path", on_the_worker],
         ),
     ];
     for (name, args) in cases {
