@@ -441,16 +441,16 @@ class GrpcRequestManager:
             await asyncio.wait(pending)
         for generator, request_id in live.items():
             task = task_of.get(generator)
-            if task is not None and task.cancelled():
-                # the handler aborted and cleaned up the request itself
+            if task is not None and not task.cancelled() and task.exception() is not None:
+                # the handler finished or failed on its own (StopAsyncIteration
+                # when the loop had not consumed its end yet); the exception is
+                # retrieved here, so the loop does not log it
                 pass
-            elif task is not None and task.exception() is not None:
-                # the handler finished or failed on its own and cleaned up on the
-                # way out (StopAsyncIteration when the loop had not consumed its
-                # end yet; the exception is retrieved here, so the loop does not
-                # log it)
-                pass
-            elif request_id in self.rid_to_state:
+            # The request's own state decides: a handler that took the cancel
+            # removed it on its abort path; a handler whose fresh ``__anext__``
+            # task was cancelled before it resumed never saw the cancel, and
+            # its request is still registered, so it is aborted here.
+            if request_id in self.rid_to_state:
                 await self.abort_request(request_id)
             await generator.aclose()
 
