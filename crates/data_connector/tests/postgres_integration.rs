@@ -1217,6 +1217,7 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
     let response_id = resp.store_response(stored).await.expect("store response");
     let conversation = conv
         .create_conversation(NewConversation {
+            tenant: None,
             id: None,
             metadata: None,
         })
@@ -1224,6 +1225,7 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
         .expect("create conversation");
     let second = conv
         .create_conversation(NewConversation {
+            tenant: None,
             id: None,
             metadata: None,
         })
@@ -1231,6 +1233,7 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
         .expect("create a second conversation");
     let item = items
         .create_item(NewConversationItem {
+            tenant: None,
             id: None,
             response_id: None,
             item_type: "message".to_string(),
@@ -1311,6 +1314,7 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
             let conv = conv.clone();
             Box::pin(async move {
                 conv.create_conversation(NewConversation {
+                    tenant: None,
                     id: None,
                     metadata: None,
                 })
