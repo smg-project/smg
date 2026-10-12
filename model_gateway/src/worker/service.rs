@@ -36,9 +36,9 @@ fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
 /// worker but a mistake or a probe, and every log line and metric label
 /// derived from the URL would carry them.
 const MAX_WORKER_URL_BYTES: usize = 2048;
-/// Most labels one worker carries; an engine reports a few dozen.
-/// Most labels a worker carries; held at registration, at the admin check of a
-/// PATCH and again where the PATCH merges into the worker.
+/// Most labels a worker carries (an engine reports a few dozen); held at
+/// registration, at the admin check of a PATCH and again where the PATCH
+/// merges into the worker.
 pub(crate) const MAX_WORKER_LABELS: usize = 128;
 const MAX_LABEL_KEY_BYTES: usize = 128;
 const MAX_LABEL_VALUE_BYTES: usize = 4096;
