@@ -1718,11 +1718,9 @@ class TestRouterArgsFieldOrder:
         "oracle_pool_timeout_secs",
         "postgres_db_url",
         "postgres_pool_max",
-        "postgres_op_timeout_secs",
         "redis_url",
         "redis_pool_max",
         "redis_retention_days",
-        "redis_op_timeout_secs",
         "schema_config",
         "client_cert_path",
         "client_key_path",
@@ -1819,6 +1817,8 @@ class TestRouterArgsFieldOrder:
         "mm_allowed_media_domains",
         "mm_allow_private_media_hosts",
         "sse_keepalive_secs",
+        "postgres_op_timeout_secs",
+        "redis_op_timeout_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1884,6 +1884,8 @@ class TestRouterArgsFieldOrder:
             "header_read_timeout_secs",
             "idle_connection_timeout_secs",
             "sse_keepalive_secs",
+            "postgres_op_timeout_secs",
+            "redis_op_timeout_secs",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

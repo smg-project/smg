@@ -192,11 +192,9 @@ class RouterArgs:
     oracle_pool_timeout_secs: int = 30
     postgres_db_url: str | None = None
     postgres_pool_max: int = 16
-    postgres_op_timeout_secs: int = 5
     redis_url: str | None = None
     redis_pool_max: int = 16
     redis_retention_days: int = 30
-    redis_op_timeout_secs: int = 5
     schema_config: str | None = None
     # mTLS configuration for worker communication
     client_cert_path: str | None = None
@@ -364,6 +362,10 @@ class RouterArgs:
     # Seconds of upstream silence after which an open SSE stream carries a
     # keep-alive frame; 0 sends none; appended last for the same reason
     sse_keepalive_secs: int = 15
+    # The bound on one history-store call (pool wait, connect and the
+    # operation included); appended last for positional callers
+    postgres_op_timeout_secs: int = 5
+    redis_op_timeout_secs: int = 5
 
     @staticmethod
     def add_cli_args(
