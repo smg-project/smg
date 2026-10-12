@@ -34,6 +34,7 @@ use crate::{
         execution::{scope as parallel_scope, task_count},
         preprocessor_config::PreProcessorConfig,
         processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
+        rgb_runs,
         transforms::{
             par_threads, pil_to_filter, resize, resize_bicubic_torch_aa,
             resize_bicubic_torch_aa_rgb, resize_rgb_bytes, rgb_bytes, round_half_to_even,
@@ -960,32 +961,34 @@ impl QwenVLProcessorBase {
         band: &mut [u8],
     ) {
         let block_out = merge_size * merge_size * 3 * frames.len() * patch_size * patch_size;
+        // One sub-patch's channel block: `[temporal, patch_h, patch_w]`.
+        let channel = frames.len() * patch_size * patch_size;
+        let vector = rgb_runs::vector_runs();
         for (bi, chunk) in band.chunks_mut(block_out).enumerate() {
             let blk = block_start + bi;
             let pr = blk / pc_blocks;
             let pc = blk % pc_blocks;
             let y0 = pr * merged_patch;
             let x0 = pc * merged_patch;
-            let mut o = 0usize;
 
             for mh in 0..merge_size {
                 for mw in 0..merge_size {
-                    for c in 0..3 {
-                        for frame in frames {
-                            let raw = frame.data.as_ref();
-                            for py in 0..patch_size {
-                                let row =
-                                    (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
-                                let source_start = row * 3;
-                                let source_end = (row + patch_size) * 3;
-                                for (dst, pixel) in chunk[o..o + patch_size]
-                                    .iter_mut()
-                                    .zip(raw[source_start..source_end].as_chunks::<3>().0.iter())
-                                {
-                                    *dst = pixel[c];
-                                }
-                                o += patch_size;
-                            }
+                    let base = (mh * merge_size + mw) * 3 * channel;
+                    let (red, rest) = chunk[base..base + 3 * channel].split_at_mut(channel);
+                    let (green, blue) = rest.split_at_mut(channel);
+                    for (tp, frame) in frames.iter().enumerate() {
+                        let raw = frame.data.as_ref();
+                        for py in 0..patch_size {
+                            let row = (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
+                            let pixels = &raw[row * 3..(row + patch_size) * 3];
+                            let at = tp * patch_size * patch_size + py * patch_size;
+                            rgb_runs::split_rgb_run(
+                                pixels,
+                                &mut red[at..at + patch_size],
+                                &mut green[at..at + patch_size],
+                                &mut blue[at..at + patch_size],
+                                vector,
+                            );
                         }
                     }
                 }
@@ -1066,28 +1069,36 @@ impl QwenVLProcessorBase {
         band: &mut [u8],
     ) {
         let block_out = merge_size * merge_size * 3 * temporal_patch_size * patch_size * patch_size;
+        // One sub-patch's channel block: `[temporal, patch_h, patch_w]`.
+        let channel = temporal_patch_size * patch_size * patch_size;
+        let vector = rgb_runs::vector_runs();
         for (bi, chunk) in band.chunks_mut(block_out).enumerate() {
             let blk = block_start + bi;
             let pr = blk / pc_blocks;
             let pc = blk % pc_blocks;
             let y0 = pr * merged_patch;
             let x0 = pc * merged_patch;
-            let mut o = 0usize;
 
             for mh in 0..merge_size {
                 for mw in 0..merge_size {
-                    for c in 0..3 {
-                        for _tp in 0..temporal_patch_size {
-                            for py in 0..patch_size {
-                                let row =
-                                    (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
-                                let mut src_idx = row * 3 + c;
-                                for dst in &mut chunk[o..o + patch_size] {
-                                    *dst = raw[src_idx];
-                                    src_idx += 3;
-                                }
-                                o += patch_size;
-                            }
+                    // The sub-patch's three channel blocks, written row by
+                    // row from the source row's three channel runs; the
+                    // temporal copies repeat the row.
+                    let base = (mh * merge_size + mw) * 3 * channel;
+                    let (red, rest) = chunk[base..base + 3 * channel].split_at_mut(channel);
+                    let (green, blue) = rest.split_at_mut(channel);
+                    for py in 0..patch_size {
+                        let row = (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
+                        let pixels = &raw[row * 3..(row + patch_size) * 3];
+                        for tp in 0..temporal_patch_size {
+                            let at = tp * patch_size * patch_size + py * patch_size;
+                            rgb_runs::split_rgb_run(
+                                pixels,
+                                &mut red[at..at + patch_size],
+                                &mut green[at..at + patch_size],
+                                &mut blue[at..at + patch_size],
+                                vector,
+                            );
                         }
                     }
                 }

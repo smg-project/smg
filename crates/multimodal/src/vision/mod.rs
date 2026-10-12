@@ -36,6 +36,7 @@ pub mod execution;
 pub mod preprocessor_config;
 pub mod processor;
 pub mod processors;
+pub(crate) mod rgb_runs;
 pub(crate) mod scratch;
 pub mod transforms;
 
