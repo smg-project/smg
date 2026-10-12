@@ -101,7 +101,7 @@ fn item_already_in_conversation() -> Response {
 fn item_id_above_max_length(id: &str) -> Response {
     bad_request_structured(json!({
         "message": format!(
-            "Item id must be at most {MAX_ITEM_ID_LENGTH} characters long, got {}",
+            "Item id must be at most {MAX_ITEM_ID_LENGTH} bytes long, got {}",
             id.len()
         ),
         "type": "invalid_request_error",
@@ -339,6 +339,16 @@ pub async fn create_conversation_items(
         return bad_request(format!(
             "Cannot add more than {MAX_ITEMS_PER_REQUEST} items at a time"
         ));
+    }
+
+    // Bounded before any store is asked, for the whole batch: the stores' id columns are
+    // this wide, and a later item's over-long id must not leave earlier items behind.
+    if let Some(id_str) = items_array
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .find(|id| id.len() > MAX_ITEM_ID_LENGTH)
+    {
+        return item_id_above_max_length(id_str);
     }
 
     let mut created_items = Vec::new();
@@ -775,6 +785,31 @@ mod tests {
         assert!(
             message.contains("64"),
             "the message names the bound: {json}"
+        );
+
+        // The bound holds for the whole batch before any store is asked: an over-long
+        // id on the second item leaves the first item unstored and unlinked.
+        let batch = json!({"items": [
+            {"type": "message", "role": "user", "content": "first"},
+            {"type": "message", "role": "user", "content": "second", "id": over}
+        ]});
+        let response =
+            create_conversation_items(&conversation_storage, &item_storage, &conv_id, batch).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let listed = item_storage
+            .list_items(
+                &ConversationId::from(conv_id.as_str()),
+                ListParams {
+                    limit: 10,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "nothing is stored for a refused batch: {listed:?}"
         );
         let over_id = ConversationItemId::from(over.as_str());
         assert!(
