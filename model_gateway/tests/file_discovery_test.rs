@@ -401,7 +401,8 @@ async fn a_manifest_created_after_startup_is_read_when_it_appears() {
 
 /// A directory removed and recreated under the manifest, as a deploy tool or
 /// a sidecar may do, is watched again: with no tick due for an hour, the
-/// manifest written into the new directory still applies.
+/// manifest written into the new directory applies, and so does a later edit,
+/// which only the new watch can report.
 #[tokio::test]
 async fn a_recreated_directory_is_watched_again() {
     let root = tempfile::tempdir().unwrap();
@@ -420,18 +421,26 @@ async fn a_recreated_directory_is_watched_again() {
     .await;
 
     std::fs::remove_dir_all(&dir).unwrap();
-    // Past the settle window, so the provider has re-watched the path (and
-    // found it missing) before the directory returns.
+    // Gone for longer than the settle window, so the provider's first try to
+    // watch it again finds nothing, and it keeps retrying.
     tokio::time::sleep(Duration::from_millis(500)).await;
     std::fs::create_dir(&dir).unwrap();
-    // Let a re-watch of the recreated directory start before the write.
-    tokio::time::sleep(Duration::from_millis(500)).await;
     write_manifest(&path, &manifest(&[port_a, port_b]));
+    // Usually written before a retry succeeds, and read by the read that
+    // follows it.
     wait_for(
         &app_context,
         "the manifest in the new directory read",
         |urls| has_url(urls, port_a) && has_url(urls, port_b),
     )
+    .await;
+
+    // The new watch is in place by now, and with no tick due, it is the only
+    // way this edit can arrive.
+    write_manifest(&path, &manifest(&[port_b]));
+    wait_for(&app_context, "an edit the new watch reports", |urls| {
+        !has_url(urls, port_a) && has_url(urls, port_b)
+    })
     .await;
 
     handle.abort();

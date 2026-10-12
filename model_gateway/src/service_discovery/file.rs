@@ -297,9 +297,9 @@ async fn read_manifest(config: &FileProviderConfig) -> Result<DesiredState, Mani
 /// as a handful of events within a few milliseconds.
 const SETTLE: Duration = Duration::from_millis(200);
 
-/// How often an unwatched manifest's directory is tried again. Trying is one
-/// system call, and a directory that a deploy tool recreates is back within
-/// about this long.
+/// How often an unwatched manifest's directory is tried again. A try on a
+/// directory that is still missing is one `stat`, and a directory that a
+/// deploy tool recreates is back within about this long.
 const REWATCH: Duration = Duration::from_secs(1);
 
 /// A watch on the manifest's directory. Dropping it stops the watch.
@@ -332,6 +332,13 @@ fn watch_manifest(path: &Path, wake: mpsc::Sender<()>) -> notify::Result<Manifes
     // Watched by its absolute path, which is how inotify names the directory
     // in an event about the directory itself. FSEvents names it resolved.
     let dir = std::path::absolute(dir).map_err(notify::Error::io)?;
+    // Checked before building the watcher, which on Linux starts an inotify
+    // instance and a thread even when the watch then fails.
+    match std::fs::metadata(&dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Err(notify::Error::generic("not a directory").add_path(dir)),
+        Err(error) => return Err(notify::Error::io(error).add_path(dir)),
+    }
     let dir_names: Vec<PathBuf> = [Some(dir.clone()), dir.canonicalize().ok()]
         .into_iter()
         .flatten()
@@ -917,11 +924,26 @@ mod tests {
     }
 
     /// The directory must exist to be watched; until it does, the provider
-    /// polls, and retries the watch every second.
+    /// polls, and retries the watch every second. The `stat` that refuses it
+    /// names the cause and the path.
     #[test]
     fn a_missing_directory_cannot_be_watched() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::channel(1);
-        assert!(watch_manifest(&dir.path().join("absent/workers.json"), tx).is_err());
+        let Err(error) = watch_manifest(&dir.path().join("absent/workers.json"), tx.clone()) else {
+            panic!("watched a missing directory");
+        };
+        assert!(
+            matches!(&error.kind, notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "{error}"
+        );
+        assert!(
+            error.paths.iter().any(|path| path.ends_with("absent")),
+            "{error}"
+        );
+
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "").unwrap();
+        assert!(watch_manifest(&file.join("workers.json"), tx).is_err());
     }
 }
