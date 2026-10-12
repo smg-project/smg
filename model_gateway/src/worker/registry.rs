@@ -2370,16 +2370,15 @@ impl WorkerRegistry {
         worker.note_admitted();
         // A worker promoted to Ready does not wait out its circuit breaker's
         // timeout: the failures that opened the breaker belong to the outage
-        // its probes just saw end. The breaker goes half-open now, so the
-        // worker takes traffic at once, closes on the usual success threshold
-        // and reopens on the first failure if the engine is not back after
-        // all. A flapping engine gets one trial per promotion, and the next
-        // promotion costs it a full demotion first.
-        if worker.circuit_breaker_try_half_open() {
-            tracing::info!(
-                worker_url = %worker.url(),
-                "Circuit breaker put on trial: the worker's health returned"
-            );
+        // its probes just saw end. An open breaker goes half-open now, so
+        // the worker takes traffic at once, closes on the usual success
+        // threshold and reopens on the first failure if the engine is not
+        // back after all; a breaker the outage left closed forgets the
+        // failure streak it banked, so the first failure after the return
+        // does not open it on the outage's account. A flapping engine gets
+        // one trial per promotion, and the next promotion costs it a full
+        // demotion first. The breaker logs the transition itself.
+        if worker.readmit_circuit_breaker() {
             Metrics::record_worker_cb_health_readmission(worker.url());
         }
     }
@@ -2646,6 +2645,50 @@ mod tests {
                 })
                 .build(),
         )
+    }
+
+    /// The outage ended before the breaker opened (fewer failures than the
+    /// threshold): the promotion forgets that streak, on either path, so the
+    /// first failure after the return does not open the breaker on the
+    /// outage's account.
+    #[test]
+    fn a_promotion_to_ready_forgets_the_failure_streak_of_a_closed_breaker() {
+        for by_probe in [true, false] {
+            let registry = WorkerRegistry::new();
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://worker:8080")
+                    .worker_type(WorkerType::Regular)
+                    .health_config(no_health_check())
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 5,
+                        success_threshold: 1,
+                        timeout_duration: std::time::Duration::from_secs(3600),
+                        window_duration: std::time::Duration::from_secs(3600),
+                    })
+                    .build(),
+            );
+            let worker_id = registry.register(worker.clone()).unwrap();
+            for _ in 0..4 {
+                worker.record_outcome(503);
+            }
+            assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+            registry.transition_status(&worker_id, WorkerStatus::NotReady);
+
+            if by_probe {
+                registry.apply_if_revision(&worker_id, worker.revision(), |_| {
+                    ((), Some(WorkerStatus::Ready))
+                });
+            } else {
+                registry.transition_status(&worker_id, WorkerStatus::Ready);
+            }
+            worker.record_outcome(503);
+            assert_eq!(
+                worker.circuit_breaker_state(),
+                CircuitState::Closed,
+                "by_probe={by_probe}: the outage's four failures are forgotten"
+            );
+            assert!(worker.is_available(), "by_probe={by_probe}");
+        }
     }
 
     /// The two promotion paths, `apply_if_revision` (the health probes) and
