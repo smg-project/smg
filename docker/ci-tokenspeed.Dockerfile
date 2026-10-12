@@ -22,7 +22,7 @@
 # Built by ci-tokenspeed-image.yml using the published nightly version date.
 # CUDA tooling supports runtime JIT; wheel installation needs no GPU.
 
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 FROM ${BASE_IMAGE}
 
 WORKDIR /opt/smg-ci

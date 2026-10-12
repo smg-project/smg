@@ -3,6 +3,10 @@ members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crat
     "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
 resolver = "2"
 
+[workspace.package]
+# The oldest toolchain the workspace builds with; rust-toolchain.toml pins the same release.
+rust-version = "1.98"
+
 [workspace.dependencies]
 # Internal workspace crates
 openai-protocol = { version = "1.15.0", path = "crates/protocols" }

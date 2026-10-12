@@ -1,0 +1,8 @@
+# The toolchain the repository builds and tests with. CI installs this release
+# (scripts/ci_install_rust.sh), the image build picks it up through rustup
+# (docker/Dockerfile), a contributor gets it on the first `cargo` call in the
+# checkout. Bump it together with `rust-version` in Cargo.toml. rustfmt runs
+# on nightly (`cargo +nightly fmt`), which this pin does not affect.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

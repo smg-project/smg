@@ -1,5 +1,5 @@
 ######################## FFMPEG IMAGE ########################
-FROM ubuntu:24.04 AS ffmpeg-image
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS ffmpeg-image
 
 # TODO: Add a scheduled updater for these source-built media dependencies.
 # Version and SHA256 must be updated together.
@@ -95,7 +95,7 @@ ENV LD_LIBRARY_PATH="${OPENCV_PREFIX}/lib:${FFMPEG_PREFIX}/lib"
 ENV PKG_CONFIG_PATH="${OPENCV_PREFIX}/lib/pkgconfig:${FFMPEG_PREFIX}/lib/pkgconfig"
 
 ######################## BASE IMAGE ##########################
-FROM ubuntu:24.04 AS base
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 AS base
 
 ARG PYTHON_VERSION=3.12
 
@@ -145,15 +145,19 @@ RUN apt update -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt clean
 
-# install rustup from rustup.rs
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version && protoc --version
+# install rustup from rustup.rs; no default toolchain: the repository's
+# rust-toolchain.toml selects the release once the source is in place
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
 
 # copy source code
 COPY --from=local_src /src /opt/smg
 
 # working directory
 WORKDIR /opt/smg
+
+# install the pinned toolchain (rust-toolchain.toml)
+RUN rustup toolchain install \
+    && rustc --version && cargo --version && protoc --version
 
 # install maturin and build the wheel with vendored OpenSSL
 RUN uv pip install maturin \
