@@ -130,11 +130,13 @@ fn shown_key(key: &str) -> String {
 /// The labels a PATCH would leave on the worker: the request's merged into
 /// the existing ones (`UpdateWorkerPropertiesStep` keeps every key it does not
 /// name), held to the same cap as a registration, so repeated updates cannot
-/// grow a worker past it. This is the early check against the labels the
-/// worker has when the request arrives, for a clear 400; the merge runs later
-/// in the queued job, where `UpdateWorkerPropertiesStep` holds the cap again
-/// over the labels it actually merges, so PATCHes queued together cannot
-/// pass it between them.
+/// grow a worker past it; an update that adds no key (a rewrite of keys the
+/// worker has) passes, so a worker over the cap through the labels discovered
+/// at registration can still be updated. This is the early check against the
+/// labels the worker has when the request arrives, for a clear 400; the merge
+/// runs later in the queued job, where `UpdateWorkerPropertiesStep` holds the
+/// cap again, under the same condition, over the labels it actually merges,
+/// so PATCHes queued together cannot pass it between them.
 fn validate_merged_labels(
     existing: &HashMap<String, String>,
     update: &HashMap<String, String>,
@@ -144,7 +146,7 @@ fn validate_merged_labels(
         .filter(|key| !existing.contains_key(*key))
         .count();
     let merged = existing.len() + added;
-    if merged > MAX_WORKER_LABELS {
+    if added > 0 && merged > MAX_WORKER_LABELS {
         return Err(bad_request(format!(
             "{merged} labels on the worker after this update ({} now, {added} new); at most \
              {MAX_WORKER_LABELS} are accepted",
@@ -1039,6 +1041,44 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+    }
+
+    /// A worker over the cap through the labels discovered at registration
+    /// still takes an update that adds no key through the endpoint: a rewrite
+    /// of keys it has reaches the queue, a new key is refused by name.
+    #[tokio::test]
+    async fn update_worker_over_the_cap_takes_a_rewrite_through_the_endpoint() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let over: HashMap<String, String> = (0..MAX_WORKER_LABELS + 20)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let worker = BasicWorkerBuilder::new("grpc://10.0.0.7:8000")
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .labels(over)
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+        let id = registry.reserve_id_for_url("grpc://10.0.0.7:8000");
+        let service = make_service(Arc::clone(&registry));
+        let rewrite: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k3": "w"}})).expect("an update");
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), rewrite)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+        let adds: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k_new": "v"}})).expect("an update");
+        let err = service
+            .update_worker(id.as_str(), adds)
+            .await
+            .expect_err("a new key on a worker over the cap");
+        assert!(
+            matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("149 labels on the worker") && message.contains("1 new")),
+            "{err}"
+        );
     }
 
     /// A rejected key is not echoed whole: a key the size of the payload
