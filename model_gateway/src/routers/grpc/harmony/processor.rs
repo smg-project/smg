@@ -41,15 +41,15 @@ pub(super) fn chat_usage(
 }
 
 /// The usage of one Responses API iteration: the engine's counters with the
-/// reasoning tokens the Harmony parser counted; the same object whether the
-/// iteration streamed or not.
+/// reasoning tokens the Harmony parser counted, under the chat path's rule
+/// (the details are always reported, zero included; an engine that counts
+/// reasoning itself is not overruled); the same object whether the iteration
+/// streamed or not.
 pub(super) fn iteration_usage(
     counts: response_formatting::TokenCounts,
     parsed_reasoning_tokens: u32,
 ) -> Usage {
-    counts
-        .usage()
-        .with_reasoning_tokens(parsed_reasoning_tokens)
+    response_formatting::with_parsed_reasoning_tokens(counts.usage(), Some(parsed_reasoning_tokens))
 }
 
 /// Processor for non-streaming Harmony responses
@@ -438,7 +438,7 @@ impl HarmonyResponseProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::retain_final_text_tokens;
+    use super::*;
 
     #[test]
     fn retain_keeps_the_final_text_tokens_up_to_the_content() {
@@ -455,5 +455,39 @@ mod tests {
         let mut items: Vec<usize> = (0..tokens.len()).collect();
         retain_final_text_tokens(&mut items, &tokens, 0);
         assert!(items.is_empty());
+    }
+
+    fn counts(reasoning: u32) -> response_formatting::TokenCounts {
+        response_formatting::TokenCounts {
+            prompt: 10,
+            completion: 5,
+            cached: 0,
+            reasoning,
+            spec_accepted: 0,
+            spec_drafted: 0,
+        }
+    }
+
+    fn reasoning_of(usage: &Usage) -> Option<u32> {
+        usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+    }
+
+    #[test]
+    fn both_helpers_resolve_the_reasoning_count_the_same_way() {
+        // The engine reported none: the parser's count is used, zero included.
+        for parsed in [0, 3] {
+            assert_eq!(reasoning_of(&chat_usage(counts(0), parsed)), Some(parsed));
+            assert_eq!(
+                reasoning_of(&iteration_usage(counts(0), parsed)),
+                Some(parsed)
+            );
+        }
+        // The engine counted reasoning itself: its count stands on both paths.
+        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(7));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(7));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 0)), Some(7));
     }
 }

@@ -96,7 +96,7 @@ pub(crate) fn chat_usage(
 /// for the request, `None` when it did not run. Like an engine with a
 /// reasoning parser, the details are then always reported, zero included; an
 /// engine that counts reasoning itself is not overruled, whatever its count.
-fn with_parsed_reasoning_tokens(mut usage: Usage, parsed: Option<u32>) -> Usage {
+pub(crate) fn with_parsed_reasoning_tokens(mut usage: Usage, parsed: Option<u32>) -> Usage {
     if let Some(parsed) = parsed {
         let details = usage.completion_tokens_details.get_or_insert_default();
         details.reasoning_tokens.get_or_insert(parsed);
