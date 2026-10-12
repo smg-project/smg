@@ -62,6 +62,7 @@ dashmap.workspace = true
 futures.workspace = true
 http.workspace = true
 lru.workspace = true
+notify.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 prost-types.workspace = true

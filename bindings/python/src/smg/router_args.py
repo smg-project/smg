@@ -340,7 +340,7 @@ class RouterArgs:
     # appended last for the same reason
     tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
     # File discovery (discovery_provider="file"): the JSON manifest, and how
-    # often to reread it (None = 30s).
+    # often to reread it besides on every change (None = 30s).
     discovery_file: str | None = None
     discovery_check_interval_secs: int | None = None
     # Most Responses API requests with background: true in flight at once;
@@ -1403,7 +1403,10 @@ class RouterArgs:
             f"--{prefix}discovery-check-interval-secs",
             type=int,
             default=None,
-            help="Seconds between rereads of the --discovery-file manifest (default: 30)",
+            help=(
+                "Seconds between periodic rereads of the --discovery-file manifest,"
+                " which is also reread as soon as it changes (default: 30)"
+            ),
         )
         k8s_group.add_argument(
             f"--{prefix}selector",

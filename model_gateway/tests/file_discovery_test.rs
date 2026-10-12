@@ -20,6 +20,9 @@ use tokio::task::JoinHandle;
 
 /// Short enough that a test sees several rereads a second.
 const REREAD: Duration = Duration::from_millis(200);
+/// Far longer than any test: the startup read is the only reread a tick
+/// gives, so anything read later was read because the watcher saw it change.
+const NO_REREAD: Duration = Duration::from_secs(3600);
 const CONVERGE: Duration = Duration::from_secs(15);
 
 async fn test_context() -> Arc<AppContext> {
@@ -66,9 +69,17 @@ fn manifest(ports: &[u16]) -> String {
 }
 
 async fn start_file_discovery(path: &Path, app_context: &Arc<AppContext>) -> JoinHandle<()> {
+    start_file_discovery_every(path, REREAD, app_context).await
+}
+
+async fn start_file_discovery_every(
+    path: &Path,
+    interval: Duration,
+    app_context: &Arc<AppContext>,
+) -> JoinHandle<()> {
     let config = FileProviderConfig::new(
         path.to_path_buf(),
-        REREAD,
+        interval,
         &RoutingMode::Regular {
             worker_urls: vec![],
         },
@@ -325,6 +336,100 @@ async fn an_in_place_edit_updates_the_worker_in_place() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    handle.abort();
+}
+
+/// A change is read as it happens, not on the next tick: with no tick due for
+/// an hour, an atomic replace and an in-place rewrite each apply at once.
+#[tokio::test]
+async fn a_change_is_read_without_waiting_for_the_reread() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workers.json");
+    let app_context = test_context().await;
+    let (_engine_a, port_a) = start_mock_engine().await;
+    let (_engine_b, port_b) = start_mock_engine().await;
+
+    write_manifest(&path, &manifest(&[port_a]));
+    let handle = start_file_discovery_every(&path, NO_REREAD, &app_context).await;
+    wait_for(&app_context, "the startup read registering a", |urls| {
+        has_url(urls, port_a)
+    })
+    .await;
+
+    // A writer renaming a complete file over the manifest.
+    write_manifest(&path, &manifest(&[port_a, port_b]));
+    wait_for(&app_context, "the renamed manifest adding b", |urls| {
+        has_url(urls, port_a) && has_url(urls, port_b)
+    })
+    .await;
+
+    // An editor writing the manifest in place.
+    std::fs::write(&path, manifest(&[port_b])).unwrap();
+    wait_for(&app_context, "the rewritten manifest removing a", |urls| {
+        !has_url(urls, port_a) && has_url(urls, port_b)
+    })
+    .await;
+
+    handle.abort();
+}
+
+/// A manifest that a writer creates after the gateway started is read when it
+/// appears, not a tick later.
+#[tokio::test]
+async fn a_manifest_created_after_startup_is_read_when_it_appears() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workers.json");
+    let app_context = test_context().await;
+    let (_engine, port) = start_mock_engine().await;
+
+    let handle = start_file_discovery_every(&path, NO_REREAD, &app_context).await;
+    // Past the startup read, which found no manifest.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(app_context.worker_registry.get_all_urls().is_empty());
+
+    write_manifest(&path, &manifest(&[port]));
+    wait_for(
+        &app_context,
+        "the new manifest's worker registered",
+        |urls| has_url(urls, port),
+    )
+    .await;
+
+    handle.abort();
+}
+
+/// The watch sees only the manifest's own directory. A manifest that is a
+/// symlink into another directory changes without an event there, and the
+/// tick still reads that change.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_change_the_watch_cannot_see_is_read_on_the_next_tick() {
+    use std::os::unix::fs::symlink;
+
+    let watched = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let target = elsewhere.path().join("workers.json");
+    let path = watched.path().join("workers.json");
+    symlink(&target, &path).unwrap();
+    let app_context = test_context().await;
+    let (_engine_a, port_a) = start_mock_engine().await;
+    let (_engine_b, port_b) = start_mock_engine().await;
+
+    write_manifest(&target, &manifest(&[port_a]));
+    let handle = start_file_discovery(&path, &app_context).await;
+    wait_for(&app_context, "a registered through the symlink", |urls| {
+        has_url(urls, port_a)
+    })
+    .await;
+
+    write_manifest(&target, &manifest(&[port_a, port_b]));
+    wait_for(
+        &app_context,
+        "the next tick reading the new target",
+        |urls| has_url(urls, port_a) && has_url(urls, port_b),
+    )
+    .await;
 
     handle.abort();
 }

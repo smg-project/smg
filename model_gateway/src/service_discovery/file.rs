@@ -1,10 +1,11 @@
 //! File worker discovery: the workers listed in a JSON manifest on disk.
 //!
-//! The manifest is reread in full on every tick. A read that succeeds replaces
-//! the last good snapshot; one that fails is reported and leaves that snapshot
-//! in place, so a half-written or broken file never removes a worker. Every
-//! tick then reconciles the last good snapshot through the shared reconciler,
-//! which retries whatever an earlier pass left undone.
+//! The manifest is reread in full whenever it changes, and on every tick in
+//! case a change went unreported. A read that succeeds replaces the last good
+//! snapshot; one that fails is reported and leaves that snapshot in place, so a
+//! half-written or broken file never removes a worker. Every read then
+//! reconciles the last good snapshot through the shared reconciler, which
+//! retries whatever an earlier pass left undone.
 //!
 //! ```json
 //! {
@@ -29,14 +30,16 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
+    ffi::OsStr,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openai_protocol::worker::WorkerType;
 use serde::Deserialize;
-use tokio::{task, time};
+use tokio::{sync::mpsc, task, time};
 use tracing::{info, warn};
 
 use super::{
@@ -286,14 +289,104 @@ async fn read_manifest(config: &FileProviderConfig) -> Result<DesiredState, Mani
     Ok(DesiredState::from_workers(workers))
 }
 
-/// Read the manifest now and on every tick after, reconciling the last good
-/// snapshot each time.
+/// How long a burst of filesystem events is left to settle before the one
+/// reread it causes. A writer's rename, or an editor's several writes, arrive
+/// as a handful of events within a few milliseconds.
+const SETTLE: Duration = Duration::from_millis(200);
+
+/// Watch the manifest's directory and send on `wake` whenever the manifest may
+/// have changed.
+///
+/// The directory rather than the file: a writer that renames a new file over
+/// the manifest replaces its inode, and a watch on the old inode never
+/// reports it. A send that finds the channel full is dropped, because a wake
+/// is already pending and the reread it causes reads the latest file.
+fn watch_manifest(path: &Path, wake: mpsc::Sender<()>) -> notify::Result<RecommendedWatcher> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let name = path.file_name().map(OsStr::to_os_string);
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+        // A failed or overflowing watch may have dropped a change, so it
+        // rereads too.
+        if event.map_or(true, |event| concerns_manifest(&event, name.as_deref())) {
+            let _ = wake.try_send(());
+        }
+    })?;
+    watcher.watch(dir, RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+
+/// Whether an event in the manifest's directory may have changed the manifest.
+fn concerns_manifest(event: &Event, name: Option<&OsStr>) -> bool {
+    if event.need_rescan() {
+        return true;
+    }
+    // Reads change nothing, and the provider's own reread is one of them.
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
+    event.paths.iter().any(|path| {
+        path.file_name().is_some_and(|file| {
+            // Kubernetes updates a mounted ConfigMap or Secret by swapping a
+            // `..data` symlink beside the file, never touching the file's name.
+            Some(file) == name || file.as_encoded_bytes().starts_with(b"..data")
+        })
+    })
+}
+
+/// Start watching, or say why the provider is polling only. Polling alone is
+/// still correct: the tick rereads whatever the watch would have reported.
+fn start_watch(
+    config: &FileProviderConfig,
+    wake: &mpsc::Sender<()>,
+    warned: &mut bool,
+) -> Option<RecommendedWatcher> {
+    match watch_manifest(&config.path, wake.clone()) {
+        Ok(watcher) => {
+            if *warned {
+                info!(
+                    "Watching discovery manifest {} for changes",
+                    config.path.display()
+                );
+            }
+            Some(watcher)
+        }
+        Err(error) => {
+            if !*warned {
+                warn!(
+                    "Cannot watch discovery manifest {} ({error}); rereading every {}s only, and retrying the watch",
+                    config.path.display(),
+                    config.check_interval.as_secs_f64()
+                );
+                *warned = true;
+            }
+            None
+        }
+    }
+}
+
+/// Let a burst of events settle, then take every wake it sent as one.
+async fn settle(wake: &mut mpsc::Receiver<()>) {
+    time::sleep(SETTLE).await;
+    while wake.try_recv().is_ok() {}
+}
+
+/// Read the manifest now, whenever it changes, and on every tick, reconciling
+/// the last good snapshot each time.
+///
+/// A change is read as soon as it settles. The tick stays, for two reasons: a
+/// change notification can be lost, or never come at all (a manifest behind a
+/// symlink into another directory, a network filesystem); and every reconcile
+/// retries what an earlier one left undone, such as an engine that was not yet
+/// listening when its record first appeared.
 pub(super) fn start_file_discovery(
     config: FileProviderConfig,
     app_context: Arc<AppContext>,
 ) -> task::JoinHandle<()> {
     info!(
-        "Starting file service discovery | manifest: {} | reread every {}s",
+        "Starting file service discovery | manifest: {} | reread on change and every {}s",
         config.path.display(),
         config.check_interval.as_secs_f64()
     );
@@ -304,11 +397,23 @@ pub(super) fn start_file_discovery(
     )]
     let handle = task::spawn(async move {
         let kind = DiscoveryKind::File;
+        let (wake_tx, mut wake_rx) = mpsc::channel(1);
+        let mut warned = false;
+        // Dropping the watcher stops it, so it lives as long as this loop.
+        let mut watcher = start_watch(&config, &wake_tx, &mut warned);
         let mut last_good: Option<DesiredState> = None;
         let mut interval = time::interval(config.check_interval);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {
+                    // The directory may not have existed yet.
+                    if watcher.is_none() {
+                        watcher = start_watch(&config, &wake_tx, &mut warned);
+                    }
+                }
+                Some(()) = wake_rx.recv() => settle(&mut wake_rx).await,
+            }
             let started_at = time::Instant::now();
             match read_manifest(&config).await {
                 Ok(desired) => {
@@ -567,5 +672,133 @@ mod tests {
             err.metric_reason(),
             metrics_labels::SNAPSHOT_ERROR_UNREADABLE
         );
+    }
+
+    fn event(kind: EventKind, paths: &[&str]) -> Event {
+        paths
+            .iter()
+            .fold(Event::new(kind), |event, path| event.add_path(path.into()))
+    }
+
+    /// Which events in the manifest's directory cause a reread.
+    #[test]
+    fn only_a_change_to_the_manifest_wakes_the_provider() {
+        use notify::event::{
+            AccessKind, CreateKind, DataChange, Flag, ModifyKind, RemoveKind, RenameMode,
+        };
+
+        let name = Some(OsStr::new("workers.json"));
+        let wakes = [
+            // A writer renaming its temporary file over the manifest.
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                &["/run/smg/workers.json.tmp", "/run/smg/workers.json"],
+            ),
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                &["/run/smg/workers.json"],
+            ),
+            // Written in place, created late, or deleted.
+            event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                &["/run/smg/workers.json"],
+            ),
+            event(
+                EventKind::Create(CreateKind::File),
+                &["/run/smg/workers.json"],
+            ),
+            event(
+                EventKind::Remove(RemoveKind::File),
+                &["/run/smg/workers.json"],
+            ),
+            // Kubernetes swapping a ConfigMap's `..data` symlink.
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                &["/etc/smg/..data"],
+            ),
+            event(EventKind::Create(CreateKind::Any), &["/etc/smg/..data_tmp"]),
+            // The watch dropped events; anything may have changed.
+            event(EventKind::Other, &[]).set_flag(Flag::Rescan),
+        ];
+        for event in &wakes {
+            assert!(concerns_manifest(event, name), "{event:?} should wake");
+        }
+
+        let ignored = [
+            // The provider's own read.
+            event(
+                EventKind::Access(AccessKind::Read),
+                &["/run/smg/workers.json"],
+            ),
+            event(
+                EventKind::Access(AccessKind::Any),
+                &["/run/smg/workers.json"],
+            ),
+            // Another file in the same directory, including the writer's
+            // temporary file before its rename.
+            event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                &["/run/smg/workers.json.tmp"],
+            ),
+            event(
+                EventKind::Create(CreateKind::File),
+                &["/run/smg/other.json"],
+            ),
+        ];
+        for event in &ignored {
+            assert!(!concerns_manifest(event, name), "{event:?} should not wake");
+        }
+    }
+
+    async fn woken(wake: &mut mpsc::Receiver<()>, within: Duration) -> bool {
+        time::timeout(within, wake.recv()).await.is_ok()
+    }
+
+    /// The real watcher: a rename over the manifest wakes the provider, a burst
+    /// of writes settles into one wake, and another file in the directory does
+    /// not wake it.
+    #[tokio::test]
+    async fn the_watcher_reports_the_manifest_and_only_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.json");
+        let (tx, mut rx) = mpsc::channel(1);
+        let _watcher = watch_manifest(&path, tx).unwrap();
+
+        let staged = dir.path().join("workers.json.staged");
+        std::fs::write(&staged, manifest("")).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
+        assert!(
+            woken(&mut rx, Duration::from_secs(10)).await,
+            "rename not seen"
+        );
+        settle(&mut rx).await;
+
+        for _ in 0..20 {
+            std::fs::write(&path, manifest("")).unwrap();
+        }
+        assert!(
+            woken(&mut rx, Duration::from_secs(10)).await,
+            "writes not seen"
+        );
+        settle(&mut rx).await;
+        assert!(rx.try_recv().is_err(), "the burst woke the provider twice");
+
+        // Let any late event from the burst arrive and be drained first.
+        time::sleep(Duration::from_secs(1)).await;
+        while rx.try_recv().is_ok() {}
+        std::fs::write(dir.path().join("other.json"), "{}").unwrap();
+        assert!(
+            !woken(&mut rx, Duration::from_secs(1)).await,
+            "another file woke the provider"
+        );
+    }
+
+    /// The directory must exist to be watched; until it does, the provider
+    /// polls, and the tick retries the watch.
+    #[test]
+    fn a_missing_directory_cannot_be_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(watch_manifest(&dir.path().join("absent/workers.json"), tx).is_err());
     }
 }

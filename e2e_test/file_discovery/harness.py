@@ -20,6 +20,9 @@ MODEL = "file-e2e-model"
 # Rereads, health checks and removals all run on one-second clocks here, so
 # convergence is a few seconds; this bounds a scenario that never converges.
 CONVERGE = 60.0
+# A periodic reread no test outlives: under it, only the startup read and
+# the watcher read the manifest.
+NO_REREAD_SECS = 3600
 
 
 def binary(env: str, default: str) -> Path:
@@ -128,12 +131,21 @@ class Manifest:
     def __init__(self, path: Path):
         self.path = path
 
+    @staticmethod
+    def document(workers: list[dict]) -> str:
+        return json.dumps({"version": 1, "workers": workers})
+
     def write(self, workers: list[dict]) -> None:
         """Replace the manifest as writers should: a temporary file beside
         it, renamed over it."""
         staged = self.path.with_suffix(".staged")
-        staged.write_text(json.dumps({"version": 1, "workers": workers}))
+        staged.write_text(self.document(workers))
         staged.replace(self.path)
+
+    def rewrite_in_place(self, workers: list[dict]) -> None:
+        """Overwrite the manifest itself, as an editor does."""
+        with open(self.path, "w") as manifest:
+            manifest.write(self.document(workers))
 
 
 class Gateway:
@@ -145,7 +157,7 @@ class Gateway:
         self.proc: subprocess.Popen | None = None
         self.base_url = ""
 
-    def start(self, *extra_args: str) -> None:
+    def start(self, *extra_args: str, check_interval_secs: int = 1) -> None:
         port = free_port()
         self.base_url = f"http://127.0.0.1:{port}"
         log = open(self.log_path, "a")
@@ -163,7 +175,7 @@ class Gateway:
                 "--discovery-file",
                 str(self.manifest.path),
                 "--discovery-check-interval-secs",
-                "1",
+                str(check_interval_secs),
                 "--policy",
                 "round_robin",
                 "--health-check-interval-secs",
@@ -197,9 +209,9 @@ class Gateway:
             self.proc.kill()
             self.proc.wait(timeout=10)
 
-    def restart(self, *extra_args: str) -> None:
+    def restart(self, *extra_args: str, check_interval_secs: int = 1) -> None:
         self.stop()
-        self.start(*extra_args)
+        self.start(*extra_args, check_interval_secs=check_interval_secs)
 
     def log_tail(self, lines: int = 40) -> str:
         return "\n".join(self.log_path.read_text().splitlines()[-lines:])
@@ -215,8 +227,13 @@ class Gateway:
             return None
         return payload.get("workers", payload if isinstance(payload, list) else [])
 
-    def wait_for(self, what: str, predicate: Callable[[list[dict]], bool]) -> list[dict]:
-        deadline = time.monotonic() + CONVERGE
+    def wait_for(
+        self,
+        what: str,
+        predicate: Callable[[list[dict]], bool],
+        within: float = CONVERGE,
+    ) -> list[dict]:
+        deadline = time.monotonic() + within
         while time.monotonic() < deadline:
             workers = self.workers()
             if workers is not None and predicate(workers):
@@ -226,8 +243,10 @@ class Gateway:
             f"timed out waiting for {what}; workers: {self.workers()}\n{self.log_tail()}"
         )
 
-    def wait_for_urls(self, expected: set[str], what: str) -> list[dict]:
-        return self.wait_for(what, lambda workers: {w["url"] for w in workers} == expected)
+    def wait_for_urls(self, expected: set[str], what: str, within: float = CONVERGE) -> list[dict]:
+        return self.wait_for(
+            what, lambda workers: {w["url"] for w in workers} == expected, within=within
+        )
 
     def chat(self) -> requests.Response:
         return requests.post(

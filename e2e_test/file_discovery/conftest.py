@@ -1,8 +1,9 @@
 """Fixtures for the host-process file-discovery e2e.
 
 Each test drives the real smg binary against engines on this host and edits
-the manifest file directly, so a change reaches the gateway on its next
-reread. No cluster is involved: the in-cluster ConfigMap path is covered by
+the manifest file directly, so a change reaches the gateway when its watch
+sees the file change, or on its next periodic reread. No cluster is
+involved: the in-cluster ConfigMap path is covered by
 e2e_test/kind_discovery/test_file_discovery_in_cluster.py.
 
 Engines are either in-process fakes, whose health a test flips directly and

@@ -1444,7 +1444,8 @@ impl Default for KubernetesDiscoveryConfig {
     }
 }
 
-/// How often the file-discovery manifest is reread when no interval is given.
+/// How often the file-discovery manifest is reread, changed or not, when no
+/// interval is given.
 pub const DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
 
 fn default_file_discovery_check_interval_secs() -> u64 {
@@ -1453,8 +1454,9 @@ fn default_file_discovery_check_interval_secs() -> u64 {
 
 /// File worker discovery: the workers listed in a JSON manifest on disk.
 ///
-/// The manifest is reread in full every `check_interval_secs`, and may be
-/// absent at startup: discovery keeps retrying until a writer creates it.
+/// The manifest is reread in full whenever it changes, and every
+/// `check_interval_secs` in case a change went unreported. It may be absent at
+/// startup: discovery reads it once a writer creates it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDiscoveryConfig {
     pub path: PathBuf,

@@ -866,7 +866,8 @@ struct CliArgs {
     #[arg(long, help_heading = "Service Discovery (File)")]
     discovery_file: Option<PathBuf>,
 
-    /// Seconds between rereads of the `--discovery-file` manifest (default: 30)
+    /// Seconds between periodic rereads of the `--discovery-file` manifest,
+    /// which is also reread as soon as it changes (default: 30)
     #[arg(long, help_heading = "Service Discovery (File)")]
     discovery_check_interval_secs: Option<u64>,
 

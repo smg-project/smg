@@ -5,6 +5,9 @@ ServiceAccount token, so everything it registers comes from the file. The
 test publishes and edits the manifest the way an operator would, with
 `kubectl apply`; the kubelet projects each update into the Pod by atomically
 swapping the mounted files, the kind of replacement file discovery expects.
+
+The gateway's periodic reread is an hour apart (file_in_cluster.yaml), so
+every update below is read because the gateway's watch saw the swap.
 """
 
 from __future__ import annotations
