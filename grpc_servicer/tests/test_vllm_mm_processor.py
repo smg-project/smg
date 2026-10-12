@@ -684,6 +684,7 @@ class TestFetchErrorClassification:
         p._connector = self._Connector(exc)
         p._video_processor = None
         p._caller_error = self._CallerError
+        p._data_url_first_semicolon = False
         return p
 
     def test_transport_failures_are_retryable(self):
@@ -698,6 +699,83 @@ class TestFetchErrorClassification:
         p = self.processor(self._CallerError("415 Unsupported Media Type"))
         with pytest.raises(self._CallerError, match="^415 Unsupported Media Type$"):
             run(p._fetch(0, _Item("image", "https://a/1.png")))
+
+    def test_a_reference_form_the_fetcher_does_not_take_is_the_callers_fault(self):
+        """A data URL that is not base64: the fetcher refuses it as not
+        implemented, which no other worker would take either, so it leaves as
+        the caller's error (INVALID_ARGUMENT, no retry), not as unavailable."""
+        p = self.processor(NotImplementedError("Only base64 data URLs are supported for now."))
+        with pytest.raises(
+            ValueError, match="^media_refs\\[0\\]: Only base64 data URLs are supported for now\\.$"
+        ):
+            run(p._fetch(0, _Item("image", "data:image/jpeg,%FF%D8%FF%E0garbage")))
+
+    def test_a_not_implemented_failure_on_a_remote_reference_stays_retryable(self):
+        """Only a data URL turns the fetcher's "not implemented" into the caller's
+        error: on a remote reference it is the worker's (a loader it lacks) and
+        stays retryable, with the fetch-failed warning."""
+        p = self.processor(NotImplementedError("load_bytes is not implemented"))
+        with pytest.raises(
+            mm_processor.MmProcessorUnavailable,
+            match="^media_refs\\[0\\]: fetch failed: load_bytes is not implemented$",
+        ):
+            run(p._fetch(0, _Item("image", "https://a/1.png")))
+
+    def test_a_not_implemented_failure_on_a_base64_data_url_stays_retryable(self):
+        """A well-formed base64 data URL passes the fetcher's encoding check; a
+        "not implemented" after that is a loader the worker lacks, the worker's
+        fault, and stays retryable like the same failure on a remote reference."""
+        p = self.processor(NotImplementedError())
+        with pytest.raises(
+            mm_processor.MmProcessorUnavailable, match="^media_refs\\[0\\]: fetch failed: $"
+        ):
+            run(p._fetch(0, _Item("image", "data:image/png;base64,iVBORw0KGgo=")))
+
+    def test_the_unencoded_data_url_check_mirrors_the_fetchers(self):
+        check = mm_processor._is_unencoded_data_url
+        for unencoded in [
+            "data:image/jpeg,%FF%D8%FF%E0garbage",
+            "data:,plain",
+            "data:image/png;charset=utf-8,abc",
+            "DATA:image/jpeg;BASE64x,abc",
+        ]:
+            assert check(unencoded, first_semicolon=False), unencoded
+            assert check(unencoded, first_semicolon=True), unencoded
+        for other in [
+            "data:image/png;base64,iVBORw0KGgo=",
+            "data:video/mp4;base64,AAAA",
+            "data:image/png;base64",
+            "https://a/1.png",
+            "file:///tmp/a.png",
+        ]:
+            assert not check(other, first_semicolon=False), other
+            assert not check(other, first_semicolon=True), other
+        # An RFC 2397 parameter before ;base64: taken from 0.27.0 on, refused
+        # before it, and the check says so for each.
+        for parameterised in [
+            "data:image/png;charset=utf-8;base64,iVBORw0KGgo=",
+            "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=",
+        ]:
+            assert not check(parameterised, first_semicolon=False), parameterised
+            assert check(parameterised, first_semicolon=True), parameterised
+
+    def test_the_fetchers_data_url_reading_follows_its_version(self):
+        split_first = mm_processor._fetcher_splits_data_url_at_first_semicolon
+        for before in ["0.20.0", "0.26.9", "0.26.9.post1"]:
+            assert split_first(before), before
+        for after in ["0.27.0", "0.27.1rc1", "0.31.0", "1.0.0"]:
+            assert not split_first(after), after
+        assert split_first("unknown"), "an unparsed version takes the stricter reading"
+
+    def test_a_parameterised_base64_data_url_an_older_fetcher_refuses_is_the_callers_fault(self):
+        """Before 0.27.0 the fetcher refuses a base64 data URL that carries an
+        RFC 2397 parameter as not implemented; on that release the refusal is
+        read as the caller's, like any other form the fetcher does not take,
+        so the request is not retried into the same refusal."""
+        p = self.processor(NotImplementedError("Only base64 data URLs are supported for now."))
+        p._data_url_first_semicolon = True
+        with pytest.raises(ValueError, match="^media_refs\\[0\\]: Only base64 data URLs"):
+            run(p._fetch(0, _Item("image", "data:image/png;charset=utf-8;base64,iVBORw0KGgo=")))
 
     def test_value_errors_pass_through(self):
         p = self.processor(ValueError("domain not allowed"))
@@ -747,6 +825,7 @@ class TestProcess:
         p._max_item_bytes = mm_processor.DEFAULT_MAX_ITEM_BYTES
         p._item_limits = dict.fromkeys(("image", "video", "audio"), max_items)
         p._caller_error = self._CallerError
+        p._data_url_first_semicolon = False
         return p
 
     def test_item_cap_rejects_before_any_fetch(self):
@@ -765,6 +844,14 @@ class TestProcess:
         p = self.processor(self._Renderer(), fetch_exc=TimeoutError("origin timed out"))
         with pytest.raises(mm_processor.MmProcessorUnavailable, match="fetch failed"):
             run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
+
+    def test_a_non_base64_data_url_is_the_callers_fault_and_not_retried(self):
+        p = self.processor(
+            self._Renderer(),
+            fetch_exc=NotImplementedError("Only base64 data URLs are supported for now."),
+        )
+        with pytest.raises(ValueError, match="Only base64 data URLs are supported for now"):
+            run(p.process([1, 2, 3], None, [_Item("image", "data:image/jpeg,%FF%D8garbage")], 0.0))
 
     def test_fetched_media_reaches_the_renderer_uncached(self):
         renderer = self._Renderer()

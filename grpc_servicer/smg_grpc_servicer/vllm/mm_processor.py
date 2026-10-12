@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Iterable, Mapping, MutableMapping, Sequence
@@ -233,6 +234,34 @@ def _require_inprocess_apis(engine) -> None:
         )
 
 
+def _fetcher_splits_data_url_at_first_semicolon(version: str) -> bool:
+    """Whether the engine's fetcher of ``version`` reads a data URL's encoding
+    as the segment after the first ';' of its media-type part (releases before
+    0.27.0) rather than after the last one (0.27.0 on, which accepts RFC 2397
+    parameters before ``;base64``). ``True`` when the version does not parse:
+    the stricter reading."""
+    parts = re.findall(r"\d+", version)
+    if len(parts) < 2:
+        return True
+    return (int(parts[0]), int(parts[1])) < (0, 27)
+
+
+def _is_unencoded_data_url(url: str, *, first_semicolon: bool) -> bool:
+    """A data URL the engine's fetcher refuses as not implemented: one whose
+    payload it does not read as base64. Mirrors the installed fetcher's own
+    check (see :func:`_fetcher_splits_data_url_at_first_semicolon`), so the arm
+    that reads that refusal as the caller's matches exactly the case it is
+    meant for on the version that runs."""
+    if url[:5].lower() != "data:":
+        return False
+    spec, sep, _ = url[5:].partition(",")
+    if first_semicolon:
+        _, semi, encoding = spec.partition(";")
+    else:
+        _, semi, encoding = spec.rpartition(";")
+    return bool(sep) and (not semi or encoding != "base64")
+
+
 class InProcessMediaProcessor:
     """Fetch with vLLM's MediaConnector and process with the engine's own renderer."""
 
@@ -248,6 +277,14 @@ class InProcessMediaProcessor:
         max_video_frames: int = DEFAULT_MAX_VIDEO_FRAMES,
     ) -> None:
         _require_inprocess_apis(engine)
+        import vllm
+
+        # The fetcher's reading of a data URL's encoding changed in 0.27.0;
+        # the arm in _fetch that reads its refusal as the caller's follows the
+        # installed release.
+        self._data_url_first_semicolon = _fetcher_splits_data_url_at_first_semicolon(
+            vllm.__version__
+        )
         from vllm import envs
         from vllm.exceptions import VLLMClientError
         from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY
@@ -320,9 +357,13 @@ class InProcessMediaProcessor:
     async def _fetch(self, index: int, item):
         """Fetch one item, keeping the fetcher's own verdict on whose fault it is.
 
-        A bad URL or unusable media is the caller's and terminal. A timeout, a
-        refused connection or an origin 5xx is not: the same request can
-        succeed elsewhere or later, so it leaves here as retryable.
+        A bad URL or unusable media is the caller's and terminal, and so is a
+        data URL in a form the fetcher does not take (one that is not base64,
+        which it refuses as not implemented): no other worker takes it either.
+        A timeout, a refused connection, an origin 5xx or a loader the worker
+        lacks (whatever the reference, a base64 data URL included) is not: the
+        same request can succeed elsewhere or later, so it leaves here as
+        retryable.
         """
         try:
             if item.modality == "image":
@@ -336,6 +377,15 @@ class InProcessMediaProcessor:
         except (self._caller_error, ValueError):
             raise
         except Exception as e:
+            # The fetcher refuses a non-base64 data URL as not implemented: no
+            # worker takes that form, so it is the caller's and terminal. A
+            # "not implemented" on any other reference, a base64 data URL
+            # included, is the worker's (a loader it lacks), and stays
+            # retryable like every other failure.
+            if isinstance(e, NotImplementedError) and _is_unencoded_data_url(
+                item.url, first_semicolon=self._data_url_first_semicolon
+            ):
+                raise ValueError(f"media_refs[{index}]: {e}") from e
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
             raise MmProcessorUnavailable(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")
