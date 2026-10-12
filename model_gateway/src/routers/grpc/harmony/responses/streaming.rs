@@ -435,9 +435,23 @@ async fn execute_mcp_tool_loop_streaming(
                         "Function tool calls present - exiting MCP loop and emitting completion"
                     );
 
-                    // Function tool calls were already emitted during streaming processing
-                    // Just emit response.completed with the usage the
-                    // non-streamed response carries
+                    // Function tool calls were already emitted during streaming
+                    // processing. The final object is stored as the completed
+                    // exit stores its own (before the terminal drains the items):
+                    // the client runs the calls and continues with this id as
+                    // `previous_response_id`, and a background response is
+                    // polled from this record. Then response.completed with the
+                    // usage the non-streamed response carries.
+                    let final_response = emitter.finalize(Some(usage.clone()));
+                    persist_response_if_needed(
+                        ctx.conversation_storage.clone(),
+                        ctx.conversation_item_storage.clone(),
+                        ctx.response_storage.clone(),
+                        &final_response,
+                        original_request,
+                        ctx.request_context.clone(),
+                    )
+                    .await;
                     let usage_json = json!(ResponseUsage::from(&usage));
                     let event = emitter.emit_completed(Some(&usage_json));
                     emitter.send_event_best_effort(&event, tx).await;
