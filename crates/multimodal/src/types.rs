@@ -780,19 +780,25 @@ mod tests {
         const CHILD: &str = "SMG_CAPPED_DECODE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             // Isolate the process-wide pool and bound a deadlock regression.
+            let directory = tempfile::tempdir().expect("completion directory");
+            let completed = directory.path().join("completed");
+            let name = format!(
+                "{}::capped_decode_does_not_wait_for_its_own_pool",
+                module_path!().split_once("::").expect("crate path").1,
+            );
             let mut child = Command::new(std::env::current_exe().expect("test binary"))
-                .args([
-                    "--exact",
-                    "types::tests::capped_decode_does_not_wait_for_its_own_pool",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
+                .args(["--exact", name.as_str(), "--nocapture"])
+                .env(CHILD, &completed)
                 .spawn()
                 .expect("start child");
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 if let Some(status) = child.try_wait().expect("child status") {
                     assert!(status.success(), "shared capped decode failed: {status}");
+                    assert!(
+                        completed.is_file(),
+                        "child did not complete the regression test"
+                    );
                     return;
                 }
                 if Instant::now() >= deadline {
@@ -850,6 +856,11 @@ mod tests {
             });
             assert_eq!(initializer.join().expect("initializer").height(), 504);
         });
+        std::fs::write(
+            std::env::var_os(CHILD).expect("completion path"),
+            b"completed",
+        )
+        .expect("record completed regression test");
     }
 
     #[test]
