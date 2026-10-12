@@ -1109,7 +1109,7 @@ async fn a_fresh_database_bootstraps_at_the_latest_version_without_auto_migrate(
     served
         .expect("a fresh database must come up without auto_migrate")
         .expect("the fresh store serves");
-    assert_eq!(versions.expect("read the versions"), vec![1, 2, 3]);
+    assert_eq!(versions.expect("read the versions"), vec![1, 2, 3, 4]);
     let indexes = indexes.expect("read the indexes");
     for index in ["conv_item_links_conv_idx", "responses_safety_idx"] {
         assert!(
@@ -1141,7 +1141,7 @@ async fn gateways_starting_together_on_an_empty_database_all_come_up() {
         );
         assert_eq!(
             versions.expect("read the versions"),
-            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
             "round {round}"
         );
     }
@@ -1181,7 +1181,7 @@ async fn gateways_starting_together_come_up_under_a_repeatable_read_default() {
         );
         assert_eq!(
             versions.expect("read the versions"),
-            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
             "round {round}"
         );
     }
