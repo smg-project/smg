@@ -372,7 +372,11 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_pd_bootstrap_failures_total",
-        "PD bootstrap failures: the HTTP router's injection failures (unlabelled); by leg and phase, a bootstrap port that refused the registration probe (probe) and the rendezvous failures the engines report on the gRPC path (bootstrap, transfer)"
+        "PD bootstrap injection failures"
+    );
+    describe_counter!(
+        "smg_pd_rendezvous_failures_total",
+        "PD rendezvous failures by leg (the worker type of the leg that failed) and phase: a bootstrap port that refused the registration probe (probe), and the failures the engines report on the gRPC path when the legs never met (bootstrap) or the KV handoff after they met failed (transfer)"
     );
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",
@@ -1717,12 +1721,14 @@ impl Metrics {
         counter!("smg_pd_bootstrap_failures_total").increment(1);
     }
 
-    /// Record a PD bootstrap failure by `leg` (the worker type of the leg
+    /// Record a PD rendezvous failure by `leg` (the worker type of the leg
     /// that failed) and `phase` (`probe` at registration; `bootstrap` or
-    /// `transfer` as the engine reported it).
-    pub fn record_pd_bootstrap_failure_for(leg: &'static str, phase: &'static str) {
+    /// `transfer` as the engine reported it). Its own family: the injection
+    /// failures above keep their unlabelled series, so a bare selector on
+    /// it still reads them alone.
+    pub fn record_pd_rendezvous_failure(leg: &'static str, phase: &'static str) {
         counter!(
-            "smg_pd_bootstrap_failures_total",
+            "smg_pd_rendezvous_failures_total",
             "leg" => leg,
             "phase" => phase
         )
@@ -3447,28 +3453,26 @@ mod tests {
     }
 
     #[test]
-    fn test_record_pd_bootstrap_failure_by_leg_and_phase() {
+    fn test_record_pd_rendezvous_failure_by_leg_and_phase() {
         let (rendered, ()) = with_test_recorder(|| {
             Metrics::record_pd_bootstrap_failure();
-            Metrics::record_pd_bootstrap_failure_for(metrics_labels::WORKER_PREFILL, "probe");
-            Metrics::record_pd_bootstrap_failure_for(metrics_labels::WORKER_DECODE, "bootstrap");
-            Metrics::record_pd_bootstrap_failure_for(metrics_labels::WORKER_DECODE, "bootstrap");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_PREFILL, "probe");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_DECODE, "bootstrap");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_DECODE, "bootstrap");
         });
-        // One family: the unlabelled injection series and the labelled ones.
+        // Two families: the injection series keeps its unlabelled shape, and
+        // the labelled rendezvous counts never join it.
         assert!(
             rendered.contains("smg_pd_bootstrap_failures_total 1"),
             "{rendered}"
         );
-        assert_eq!(
-            rendered
-                .matches("# TYPE smg_pd_bootstrap_failures_total")
-                .count(),
-            1,
+        assert!(
+            !rendered.contains("smg_pd_bootstrap_failures_total{"),
             "{rendered}"
         );
         let labelled: Vec<&str> = rendered
             .lines()
-            .filter(|line| line.starts_with("smg_pd_bootstrap_failures_total{"))
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
             .collect();
         assert_eq!(labelled.len(), 2, "{rendered}");
         assert!(

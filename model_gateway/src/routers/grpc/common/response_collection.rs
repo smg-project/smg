@@ -12,9 +12,7 @@ use crate::{
         error,
         grpc::{
             context::ExecutionResult,
-            proto_wrapper::{
-                FanoutChild, ProtoGenerateComplete, ProtoResponseVariant, ProtoStream,
-            },
+            proto_wrapper::{FanoutChild, ProtoGenerateComplete, ProtoResponseVariant},
             utils::{account_pd_leg_failure, tonic_ext::TonicStatusExt},
         },
     },
@@ -36,7 +34,7 @@ pub(crate) async fn drain_prefill<S: FanoutChild>(
     let single_dispatch = remaining == 1;
     while let Some(response) = stream.next_item().await {
         // A prefill leg the engine retires with its rendezvous verdict is
-        // counted under the bootstrap family before the failure propagates.
+        // counted under the rendezvous family before the failure propagates.
         let response = response
             .inspect_err(|status| account_pd_leg_failure(metrics_labels::WORKER_PREFILL, status))?;
         if let ProtoResponseVariant::Complete(complete) = response.into_response() {
@@ -81,7 +79,7 @@ pub(crate) async fn collect_responses(
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let all_responses = match execution_result {
         ExecutionResult::Single { mut stream } => {
-            let responses = collect_stream_responses(&mut stream, "Single").await?;
+            let responses = collect_stream_responses(&mut stream, "Single", None).await?;
             stream.mark_completed();
             responses
         }
@@ -106,8 +104,12 @@ pub(crate) async fn collect_responses(
 
             // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
-            let mut decode_responses =
-                collect_stream_responses(&mut decode_stream, "Decode").await?;
+            let mut decode_responses = collect_stream_responses(
+                &mut decode_stream,
+                "Decode",
+                Some(metrics_labels::WORKER_DECODE),
+            )
+            .await?;
 
             // Mark both streams as completed now that both succeeded
             prefill.mark_completed();
@@ -171,13 +173,17 @@ fn merge_prefill_logprobs(
 }
 
 /// Collect all complete responses from a gRPC stream, discarding chunks.
-async fn collect_stream_responses(
-    stream: &mut ProtoStream,
+/// `leg` names the disaggregated leg the stream belongs to, whose rendezvous
+/// failures are counted before they become the client's answer; a single
+/// worker's stream has none.
+async fn collect_stream_responses<S: FanoutChild>(
+    stream: &mut S,
     worker_name: &str,
+    leg: Option<&'static str>,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
 
-    while let Some(response) = stream.next().await {
+    while let Some(response) = stream.next_item().await {
         match response {
             Ok(gen_response) => {
                 match gen_response.into_response() {
@@ -193,6 +199,9 @@ async fn collect_stream_responses(
                 }
             }
             Err(e) => {
+                if let Some(leg) = leg {
+                    account_pd_leg_failure(leg, &e);
+                }
                 trace_error!(function = "collect_stream_responses", worker = %worker_name, grpc_code = ?e.code(), error = ?e, "Worker stream error");
                 // Don't mark as completed - let Drop send abort for error cases
                 return Err(e.to_http_error(
@@ -270,11 +279,53 @@ mod tests {
         let rendered = handle.render();
         assert!(
             rendered.lines().any(|line| {
-                line.starts_with("smg_pd_bootstrap_failures_total{")
+                line.starts_with("smg_pd_rendezvous_failures_total{")
                     && line.contains(r#"leg="prefill""#)
                     && line.contains(r#"phase="bootstrap""#)
                     && line.ends_with(" 1")
             }),
+            "{rendered}"
+        );
+    }
+
+    /// The decode leg of a non-streamed request (every unary chat,
+    /// completion, generate and Harmony request collects it here) that the
+    /// engine retired at its handshake is counted, as the streaming path's
+    /// decode leg is; a single worker's stream ending the same way is not a
+    /// rendezvous failure.
+    #[tokio::test]
+    async fn a_decode_leg_retired_at_its_handshake_is_counted_while_collecting() {
+        let status = tonic::Status::internal(
+            "Decode handshake failed for request rank=0 req.rid='r2' req.bootstrap_room=42 \
+             with exception KVTransferError(bootstrap_room=42): Request 42 timed out after \
+             120.0s in KVPoll.Bootstrapping",
+        );
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (decode, single) = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            (
+                collect_stream_responses(
+                    &mut FailingStream(Some(status.clone())),
+                    "Decode",
+                    Some(metrics_labels::WORKER_DECODE),
+                )
+                .await,
+                collect_stream_responses(&mut FailingStream(Some(status)), "Single", None).await,
+            )
+        };
+        assert!(decode.is_err(), "the failure becomes the answer");
+        assert!(single.is_err(), "the failure becomes the answer");
+        let rendered = handle.render();
+        let counted: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(counted.len(), 1, "{rendered}");
+        assert!(
+            counted[0].contains(r#"leg="decode""#)
+                && counted[0].contains(r#"phase="bootstrap""#)
+                && counted[0].ends_with(" 1"),
             "{rendered}"
         );
     }

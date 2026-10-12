@@ -15,7 +15,7 @@ use super::discover_dp::DpInfo;
 use crate::{
     routers::grpc::{multimodal::SUPPORTS_VISION_LABEL, zmq_client::zmq_handshake_address},
     worker::{
-        bootstrap_probe, circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
+        circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
         Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
@@ -297,13 +297,6 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             connection_mode,
             labels.len()
         );
-
-        // The rendezvous port a disaggregated leg advertises is probed once
-        // per registration (DP ranks share it), off the registration path:
-        // the leg registers whatever the probe finds.
-        if let Some(worker) = workers.first() {
-            bootstrap_probe::spawn_bootstrap_port_probe(worker.as_ref());
-        }
 
         context.data.actual_workers = Some(workers);
         context.data.final_labels = labels;
@@ -898,80 +891,136 @@ mod tests {
         assert_eq!(spec.dp_size, None);
     }
 
-    /// A prefill leg registered with a bootstrap port nothing listens on
-    /// still registers; the port is probed off the registration path, and
-    /// the failed probe is counted (and logged) before the leg takes
-    /// traffic. A leg without a bootstrap port is not probed.
-    #[tokio::test]
-    async fn a_prefill_leg_with_a_closed_bootstrap_port_registers_and_its_probe_is_counted() {
-        use std::net::TcpListener;
+    /// A loopback port nothing listens on.
+    fn closed_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("address").port()
+    }
 
+    /// A registration context for a prefill leg at a loopback URL.
+    fn prefill_leg_context(
+        bootstrap_port: Option<u16>,
+        registration_mode: WorkerRegistrationMode,
+    ) -> WorkflowContext<WorkerWorkflowData> {
         use openai_protocol::worker::WorkerModels;
         use wfaas::WorkflowInstanceId;
 
         use crate::workflow::steps::create_worker_workflow_data;
 
-        let closed_port = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().expect("address").port()
-        };
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _guard = metrics::set_default_local_recorder(&recorder);
+        let mut spec = WorkerSpec::new("http://127.0.0.1:18000");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.worker_type = WorkerType::Prefill;
+        spec.bootstrap_port = bootstrap_port;
+        let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
 
-        let run = |bootstrap_port: Option<u16>| async move {
-            let mut spec = WorkerSpec::new("http://127.0.0.1:18000");
-            spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
-            spec.worker_type = WorkerType::Prefill;
-            spec.bootstrap_port = bootstrap_port;
-            let mut data = create_worker_workflow_data(
-                spec,
-                WorkerRegistrationMode::Upsert,
-                make_app_context(),
-            );
-            data.worker_kind = Some(WorkerKind::Local);
-            data.connection_mode = Some(ConnectionMode::Http);
-            data.http_client_handle = Some(Arc::new(crate::http_client::client()));
-            let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
-            assert_eq!(
-                CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
-                StepResult::Success
-            );
-            let worker = Arc::clone(&ctx.data.actual_workers.as_ref().unwrap()[0]);
-            assert_eq!(worker.bootstrap_port(), bootstrap_port);
-            assert_eq!(worker.bootstrap_host(), "127.0.0.1");
-        };
-
-        // Without a bootstrap port nothing is probed, so nothing is counted.
-        run(None).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !handle.render().contains("smg_pd_bootstrap_failures_total"),
-            "{}",
-            handle.render()
-        );
-
-        run(Some(closed_port)).await;
+    /// The probe's count once it lands: the probe runs off the path, within
+    /// its own timeout.
+    async fn wait_for_probe_count(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+    ) -> String {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let counted = loop {
+        loop {
             let rendered = handle.render();
             if let Some(line) = rendered
                 .lines()
-                .find(|line| line.starts_with("smg_pd_bootstrap_failures_total{"))
+                .find(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
             {
-                break line.to_string();
+                return line.to_string();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the failed probe is counted within its timeout:\n{rendered}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        }
+    }
+
+    /// This step builds a prefill leg with the bootstrap port and host its
+    /// spec carries and probes nothing: the port is probed once the leg is
+    /// registered (the register step), so a workflow that fails between the
+    /// two is not reported as a registered leg with a dead port.
+    #[tokio::test]
+    async fn a_prefill_legs_bootstrap_port_is_probed_once_the_leg_is_registered() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        let closed_port = closed_loopback_port();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut ctx = prefill_leg_context(Some(closed_port), WorkerRegistrationMode::Upsert);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let worker = Arc::clone(&ctx.data.actual_workers.as_ref().unwrap()[0]);
+        assert_eq!(worker.bootstrap_port(), Some(closed_port));
+        assert_eq!(worker.bootstrap_host(), "127.0.0.1");
+        // Built, not registered: nothing is probed yet.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.render().contains("smg_pd_rendezvous_failures_total"),
+            "{}",
+            handle.render()
+        );
+
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let counted = wait_for_probe_count(&handle).await;
         assert!(
             counted.contains(r#"leg="prefill""#)
                 && counted.contains(r#"phase="probe""#)
                 && counted.ends_with(" 1"),
             "{counted}"
+        );
+    }
+
+    /// A leg whose registration the register step refuses never joined the
+    /// registry, so its port is not probed and no probe failure is counted
+    /// for it; a leg without a bootstrap port is not probed either.
+    #[tokio::test]
+    async fn a_leg_the_registry_refuses_or_one_without_a_bootstrap_port_is_not_probed() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        let closed_port = closed_loopback_port();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // The replacement of a worker the registry no longer holds is refused.
+        let refused = WorkerRegistrationMode::ReplaceById {
+            worker_id: "worker-gone".to_string(),
+            expected_revision: 0,
+        };
+        let mut ctx = prefill_leg_context(Some(closed_port), refused);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
+
+        let mut ctx = prefill_leg_context(None, WorkerRegistrationMode::Upsert);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.render().contains("smg_pd_rendezvous_failures_total"),
+            "{}",
+            handle.render()
         );
     }
 

@@ -5,9 +5,9 @@
 //! before the KV handoff. The gateway itself never connects to it on the
 //! request path, so a port nothing listens on used to be found only by the
 //! engines, one request at a time, after their own bootstrap deadline. This
-//! probe connects once at registration, off the registration path: the leg
-//! registers either way, and a port that does not accept the connection is
-//! named in one WARN and counted.
+//! probe connects once, after the leg has been registered, off the
+//! registration path: the leg serves either way, and a port that does not
+//! accept the connection is named in one WARN and counted.
 
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use crate::observability::metrics::Metrics;
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The `phase` label a failed probe counts under in
-/// `smg_pd_bootstrap_failures_total`.
+/// `smg_pd_rendezvous_failures_total`.
 pub(crate) const PROBE_PHASE: &str = "probe";
 
 /// Connect to `host:port` once, within `timeout`. `Ok` when the port accepted
@@ -65,7 +65,7 @@ pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
 
 /// Run the probe and report its verdict: a port that did not accept the
 /// connection is one WARN naming the worker, the port and the error, and one
-/// count under `smg_pd_bootstrap_failures_total{leg, phase="probe"}`; a port
+/// count under `smg_pd_rendezvous_failures_total{leg, phase="probe"}`; a port
 /// that did is a DEBUG line. Returns whether the port accepted.
 pub(crate) async fn report_bootstrap_port_probe(
     url: &str,
@@ -94,7 +94,7 @@ pub(crate) async fn report_bootstrap_port_probe(
                 "Bootstrap port did not accept a connection at registration: the leg is \
                  registered, but its disaggregated partners cannot rendezvous there"
             );
-            Metrics::record_pd_bootstrap_failure_for(leg, PROBE_PHASE);
+            Metrics::record_pd_rendezvous_failure(leg, PROBE_PHASE);
             false
         }
     }
@@ -139,7 +139,7 @@ mod tests {
         };
         assert!(accepted);
         assert!(
-            !handle.render().contains("smg_pd_bootstrap_failures_total"),
+            !handle.render().contains("smg_pd_rendezvous_failures_total"),
             "{}",
             handle.render()
         );
@@ -169,7 +169,7 @@ mod tests {
         let rendered = handle.render();
         let line = rendered
             .lines()
-            .find(|line| line.starts_with("smg_pd_bootstrap_failures_total{"))
+            .find(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
             .unwrap_or_else(|| panic!("the failed probe is counted:\n{rendered}"));
         assert!(
             line.contains(r#"leg="prefill""#)

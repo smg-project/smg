@@ -1086,7 +1086,7 @@ async fn dispatch_pd_legs(
 }
 
 /// Log, count and translate one leg's dispatch failure into the client answer.
-/// A failure that names the rendezvous counts under the bootstrap family too.
+/// A failure that names the rendezvous counts under the rendezvous family too.
 fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
     Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
     account_pd_leg_failure(leg.name(), error);
@@ -1660,7 +1660,7 @@ mod tests {
     }
 
     /// A leg whose dispatch fails with the engine's rendezvous verdict is
-    /// counted under the bootstrap family, by leg and phase; any other
+    /// counted under the rendezvous family, by leg and phase; any other
     /// dispatch failure of a leg is not.
     #[test]
     fn a_leg_that_fails_its_rendezvous_at_dispatch_is_counted() {
@@ -1685,7 +1685,7 @@ mod tests {
         let rendered = handle.render();
         let counted: Vec<&str> = rendered
             .lines()
-            .filter(|line| line.starts_with("smg_pd_bootstrap_failures_total{"))
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
             .collect();
         assert_eq!(counted.len(), 1, "{rendered}");
         assert!(

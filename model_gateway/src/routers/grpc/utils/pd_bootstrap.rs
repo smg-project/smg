@@ -4,7 +4,7 @@
 //! a leg that cannot (the port is closed, the partner never arrived, the
 //! handoff broke) is retired by its engine with a message that names the
 //! phase it died in. Those failures count under
-//! `smg_pd_bootstrap_failures_total{leg, phase}`, next to the registration
+//! `smg_pd_rendezvous_failures_total{leg, phase}`, next to the registration
 //! probe's, so a dead rendezvous port shows as a rate at the gateway and not
 //! only as late client errors.
 
@@ -63,11 +63,11 @@ impl RendezvousPhase {
 }
 
 /// Count `status`, the failure of the `leg` of a disaggregated request, under
-/// the bootstrap-failure family when it names the rendezvous. Any other
+/// the rendezvous family when it names a phase of it. Any other
 /// failure of the leg is left to its own accounting.
 pub(crate) fn account_pd_leg_failure(leg: &'static str, status: &tonic::Status) {
     if let Some(phase) = RendezvousPhase::of(status) {
-        Metrics::record_pd_bootstrap_failure_for(leg, phase.label());
+        Metrics::record_pd_rendezvous_failure(leg, phase.label());
     }
 }
 
@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn a_leg_failure_that_names_the_rendezvous_is_counted_under_the_bootstrap_family() {
+    fn a_leg_failure_that_names_the_rendezvous_is_counted_under_the_rendezvous_family() {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
@@ -183,7 +183,7 @@ mod tests {
         let rendered = handle.render();
         let counted: Vec<&str> = rendered
             .lines()
-            .filter(|line| line.starts_with("smg_pd_bootstrap_failures_total{"))
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
             .collect();
         assert_eq!(counted.len(), 2, "{rendered}");
         assert!(

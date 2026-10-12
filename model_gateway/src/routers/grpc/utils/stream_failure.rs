@@ -321,7 +321,7 @@ impl StreamSource {
             worker.record_outcome(sample);
         }
         // The decode leg of a disaggregated pair the engine retired with its
-        // rendezvous verdict counts under the bootstrap family too; the
+        // rendezvous verdict counts under the rendezvous family too; the
         // prefill leg's failure is counted where its stream is drained.
         if matches!(leg, UpstreamLeg::Answer) && worker_type == metrics_labels::WORKER_DECODE {
             account_pd_leg_failure(worker_type, status);
@@ -709,11 +709,11 @@ mod tests {
     }
 
     /// The decode leg of a disaggregated pair the engine retired at its
-    /// handshake is counted under the bootstrap family; the prefill leg's
+    /// handshake is counted under the rendezvous family; the prefill leg's
     /// stream is counted where it is drained, and the same status from a
     /// regular worker is not a rendezvous failure.
     #[test]
-    fn a_decode_leg_retired_at_its_handshake_is_counted_as_a_bootstrap_failure() {
+    fn a_decode_leg_retired_at_its_handshake_is_counted_as_a_rendezvous_failure() {
         let status = tonic::Status::internal(
             "Decode handshake failed for request rank=0 req.rid='r2' req.bootstrap_room=42 with \
              exception KVTransferError(bootstrap_room=42): Request 42 timed out after 120.0s in \
@@ -735,7 +735,7 @@ mod tests {
         let rendered = recorder.handle().render();
         let line = sample(
             &rendered,
-            "smg_pd_bootstrap_failures_total",
+            "smg_pd_rendezvous_failures_total",
             &["leg=\"decode\"", "phase=\"bootstrap\""],
         )
         .unwrap_or_else(|| panic!("the handshake failure is counted:\n{rendered}"));
@@ -750,14 +750,16 @@ mod tests {
             !recorder
                 .handle()
                 .render()
-                .contains("smg_pd_bootstrap_failures_total{"),
+                .contains("smg_pd_rendezvous_failures_total{"),
             "{}",
             recorder.handle().render()
         );
 
         let (_worker, handle) = account_on_a_fresh_worker(status);
         assert!(
-            !handle.render().contains("smg_pd_bootstrap_failures_total{"),
+            !handle
+                .render()
+                .contains("smg_pd_rendezvous_failures_total{"),
             "{}",
             handle.render()
         );
