@@ -22,9 +22,9 @@ use smg::{
 
 // The gateway binary runs on jemalloc (see `src/main.rs`). The benchmark links
 // the same allocator so that its numbers describe the binary that ships rather
-// than the system allocator: the two differ by up to 2x on a full decode of a
-// large vocabulary, which the allocator's placement of the vocabulary tables
-// decides, not the tokenizer code.
+// than the system allocator: the request path allocates on every JSON
+// (de)serialization and bootstrap injection, so the allocator shows up
+// directly in these timings.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
