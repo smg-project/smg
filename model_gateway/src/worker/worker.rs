@@ -646,10 +646,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// successful contact, instead of at its next scheduled probe.
     fn signal_connected(&self) {}
 
-    /// Close the circuit breaker: the worker has returned (a liveness veto
-    /// cleared by a contact, or health promoted it back to Ready) and the
-    /// failures that opened it belong to the outage. It reopens on fresh
-    /// failures like any closed breaker.
+    /// Close the circuit breaker: a liveness veto was cleared by a contact,
+    /// so the failures that opened it belong to the outage. It reopens on
+    /// fresh failures like any closed breaker. A health promotion goes
+    /// through [`Self::readmit_circuit_breaker`] instead: an open breaker is
+    /// put on trial, not closed.
     fn reset_circuit_breaker(&self) {}
 
     /// The worker's health returned: put its open circuit breaker on trial
