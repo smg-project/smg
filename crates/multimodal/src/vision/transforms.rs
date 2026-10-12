@@ -462,7 +462,7 @@ const PIL_BICUBIC_SUPPORT: f64 = 2.0;
 const PIL_LANCZOS_SUPPORT: f64 = 3.0;
 
 #[derive(Clone, Copy)]
-enum PilResizeFilter {
+pub(super) enum PilResizeFilter {
     Bicubic,
     Lanczos,
 }
@@ -564,7 +564,7 @@ fn pil_normalized_weights(
 
 /// How a normalized kernel is turned into integer taps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KernelQuantization {
+pub(super) enum KernelQuantization {
     /// Pillow's `normalize_coeffs_8bpc`: a fixed 22-bit scale.
     Pillow,
     /// PyTorch's `uint8` resampler (`interpolate(.., antialias=True)` on a
@@ -577,14 +577,14 @@ enum KernelQuantization {
 /// One axis of a separable resample in fixed point: per output index the
 /// source bounds `(start, count)` and the integer taps, plus the shift that
 /// undoes their scale.
-struct FixedKernel {
-    bounds: Vec<(usize, usize)>,
-    taps: Vec<Vec<i64>>,
-    precision: u32,
+pub(super) struct FixedKernel {
+    pub(super) bounds: Vec<(usize, usize)>,
+    pub(super) taps: Vec<Vec<i64>>,
+    pub(super) precision: u32,
 }
 
 impl FixedKernel {
-    fn new(
+    pub(super) fn new(
         in_size: usize,
         out_size: usize,
         filter: PilResizeFilter,
@@ -1085,6 +1085,8 @@ fn resize_pil_bytes(
 /// keeps the largest weight below 2^15, not at a fixed 22 bits
 /// ([`KernelQuantization::TorchUint8`]). The two differ by up to two levels on
 /// a fraction of the pixels, which an engine fed by such a processor sees.
+/// The passes run in [`super::torch_resample`]: 16-bit taps, 32-bit sums, on
+/// the vector unit where there is one.
 pub fn resize_bicubic_torch_aa_rgb(
     data: &[u8],
     width: u32,
@@ -1105,15 +1107,13 @@ pub fn resize_bicubic_torch_aa_rgb(
             "torch bicubic RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
         )));
     }
-    let output = resize_pil_bytes(
+    let output = super::torch_resample::resize_rgb(
         data,
-        width,
-        height,
-        out_w,
-        out_h,
-        true,
+        in_w,
+        in_h,
+        out_w as usize,
+        out_h as usize,
         PilResizeFilter::Bicubic,
-        KernelQuantization::TorchUint8,
     );
     RgbImage::from_raw(out_w, out_h, output).ok_or_else(|| {
         TransformError::ShapeError(format!(
@@ -1125,17 +1125,14 @@ pub fn resize_bicubic_torch_aa_rgb(
 /// The torchvision `uint8` BICUBIC resize of [`resize_bicubic_torch_aa_rgb`]
 /// for a decoded image.
 pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes(
-        rgb.as_raw(),
+    let (in_w, in_h, data) = rgb_bytes(image);
+    let output = super::torch_resample::resize_rgb(
+        &data,
         in_w,
         in_h,
-        out_w,
-        out_h,
-        false,
+        out_w as usize,
+        out_h as usize,
         PilResizeFilter::Bicubic,
-        KernelQuantization::TorchUint8,
     );
     #[expect(
         clippy::expect_used,
