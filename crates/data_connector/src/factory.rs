@@ -74,12 +74,31 @@ fn contact_error(backend: &str, store: &str, bound: Duration, err: StoreContactE
     }
 }
 
-/// The URL with its password masked, for log and error text.
+/// The URL with its password masked, for log and error text: the userinfo
+/// password and a `password` query pair alike (the Postgres driver reads the
+/// latter too).
 fn redacted(url: &str) -> String {
     match Url::parse(url) {
         Ok(mut parsed) => {
             if parsed.password().is_some() {
                 let _ = parsed.set_password(Some("****"));
+            }
+            if parsed
+                .query_pairs()
+                .any(|(key, _)| key.eq_ignore_ascii_case("password"))
+            {
+                let pairs: Vec<(String, String)> = parsed
+                    .query_pairs()
+                    .map(|(key, value)| {
+                        let value = if key.eq_ignore_ascii_case("password") {
+                            "****".to_string()
+                        } else {
+                            value.into_owned()
+                        };
+                        (key.into_owned(), value)
+                    })
+                    .collect();
+                parsed.query_pairs_mut().clear().extend_pairs(pairs);
             }
             parsed.to_string()
         }
@@ -322,14 +341,40 @@ mod tests {
         PostgresConfig {
             db_url: format!("postgres://u:s3cr3t@127.0.0.1:{port}/db"),
             pool_max: 1,
+            // Well past the start-up bound: the pool's own backstop (twice the
+            // store-call bound) must not race the start-up contact's verdict,
+            // which is what these tests are about.
+            op_timeout_secs: 30,
             schema: None,
         }
+    }
+
+    #[test]
+    fn redacted_masks_the_password_in_the_userinfo_and_in_the_query() {
+        assert_eq!(
+            redacted("postgres://u:s3cr3t@h:5432/db"),
+            "postgres://u:****@h:5432/db"
+        );
+        assert_eq!(
+            redacted("postgres://u@h/db?password=s3cr3t&sslmode=require"),
+            "postgres://u@h/db?password=****&sslmode=require"
+        );
+        assert_eq!(
+            redacted("postgres://u:s3cr3t@h/db?Password=s3cr3t"),
+            "postgres://u:****@h/db?Password=****"
+        );
+        assert_eq!(
+            redacted("redis://:s3cr3t@h:6379/0"),
+            "redis://:****@h:6379/0"
+        );
+        assert_eq!(redacted("not a url"), "<redacted>");
     }
 
     fn redis_config(port: u16) -> RedisConfig {
         RedisConfig {
             url: format!("redis://:s3cr3t@127.0.0.1:{port}/0"),
             pool_max: 1,
+            op_timeout_secs: 5,
             schema: None,
             retention_days: None,
         }
@@ -393,7 +438,16 @@ mod tests {
         let err = verdict
             .err()
             .expect("a store that never answers is refused at start-up");
-        assert!(err.contains("Redis history backend"), "{err}");
+        // The client library bounds its own connect (about a second) inside
+        // the start-up bound, so the verdict usually names the store as
+        // unreachable with the library's timeout as the cause; the outer
+        // bound is the ceiling either way.
+        assert!(
+            err.contains("Redis history backend")
+                && (err.contains("is unreachable at start-up")
+                    || err.contains("did not answer within the start-up bound of 10 s")),
+            "{err}"
+        );
         assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
         assert!(
             started.elapsed() <= STARTUP_CONTACT_TIMEOUT + Duration::from_secs(5),

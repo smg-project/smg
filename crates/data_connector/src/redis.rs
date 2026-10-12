@@ -1165,7 +1165,7 @@ impl ResponseStorage for RedisResponseStorage {
     async fn expire_response(
         &self,
         response_id: &ResponseId,
-        after: std::time::Duration,
+        after: Duration,
     ) -> ResponseResult<()> {
         let key = self.response_key(response_id.0.as_str());
         let mut conn = self

@@ -407,7 +407,10 @@ trip (`SELECT 1` / `PING`) within `STARTUP_CONTACT_TIMEOUT` (10 s). A store that
 refuses the connection, or that accepts it and never answers, is a named error
 (the backend, the URL with its password masked, the bound) and the gateway exits
 before it binds its API port: it does not start without a history backend it
-cannot reach, for either backend alike. Oracle's contact is bounded by its own
+cannot reach, for either backend alike. The Redis client library bounds its own
+connect (about a second) inside that bound, so a Redis that never answers is
+usually reported as unreachable with the library's timeout as the cause; the
+start-up bound is the ceiling. Oracle's contact is bounded by its own
 `pool_timeout_secs`.
 
 ## Database Schema
