@@ -19,7 +19,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use axum::{extract::Request, http::HeaderValue, response::Response};
+use axum::{
+    extract::Request,
+    http::{HeaderName, HeaderValue},
+    response::Response,
+};
 use rand::RngExt;
 // Re-export RequestId from auth crate for backward compatibility
 pub use smg_auth::RequestId;
@@ -79,13 +83,21 @@ pub(super) fn generate_request_id(path: &str) -> String {
 /// Tower Layer for request ID middleware
 #[derive(Clone)]
 pub struct RequestIdLayer {
-    headers: Arc<Vec<String>>,
+    headers: Arc<Vec<HeaderName>>,
 }
 
 impl RequestIdLayer {
+    /// `headers`: the request headers consulted for an inbound id, in order.
+    /// They are parsed once here; a name that does not parse could never
+    /// match a request and is skipped.
     pub fn new(headers: Vec<String>) -> Self {
         Self {
-            headers: Arc::new(headers),
+            headers: Arc::new(
+                headers
+                    .iter()
+                    .filter_map(|name| HeaderName::try_from(name.as_str()).ok())
+                    .collect(),
+            ),
         }
     }
 }
@@ -105,7 +117,17 @@ impl<S> Layer<S> for RequestIdLayer {
 #[derive(Clone)]
 pub struct RequestIdMiddleware<S> {
     inner: S,
-    headers: Arc<Vec<String>>,
+    headers: Arc<Vec<HeaderName>>,
+}
+
+/// A generated id for a request to `path`, with the header value that
+/// carries it (the generated ids are alphanumeric, so the value always
+/// builds; the fallback is never reached).
+fn fresh_id(path: &str) -> (String, HeaderValue) {
+    let id = generate_request_id(path);
+    let value = HeaderValue::from_str(&id)
+        .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id"));
+    (id, value)
 }
 
 impl<S> Service<Request> for RequestIdMiddleware<S>
@@ -125,21 +147,21 @@ where
     fn call(&mut self, mut req: Request) -> Self::Future {
         let headers = self.headers.clone();
 
-        // The first configured header that is present decides: its value when
-        // the gateway honours it, else a fresh id. The dropped value is
-        // neither echoed nor logged, and the header is rewritten to the fresh
-        // id: the HTTP routers forward request-id headers to the worker, and
-        // the worker's log and response id should name the same request as
-        // the gateway's.
+        // The first configured header that is present decides, by its first
+        // value: that value when the gateway honours it, else a fresh id. A
+        // dropped value is neither echoed nor logged, and the header is
+        // rewritten to carry the chosen id as its only value: the HTTP routers
+        // forward request-id headers to the worker, and the worker's log and
+        // response id should name the same request as the gateway's.
         let inbound = headers.iter().find_map(|header_name| {
             req.headers()
                 .get(header_name)
                 .map(|header_value| (header_name, header_value))
         });
-        let request_id = match inbound {
+        let (request_id, header_value) = match inbound {
             Some((header_name, header_value)) => {
-                let chosen = match header_value.to_str() {
-                    Ok(value) if is_acceptable_inbound_id(value) => value.to_string(),
+                let (id, value) = match header_value.to_str() {
+                    Ok(id) if is_acceptable_inbound_id(id) => (id.to_owned(), header_value.clone()),
                     _ => {
                         tracing::debug!(
                             target: "smg::request",
@@ -148,32 +170,17 @@ where
                             max = MAX_INBOUND_REQUEST_ID_LEN,
                             "inbound request id dropped: not visible ASCII within the length bound; a fresh id is used"
                         );
-                        generate_request_id(req.uri().path())
+                        fresh_id(req.uri().path())
                     }
                 };
-                // From here the request carries exactly one value under that
-                // header, the chosen id: a repeated header forwards every
-                // value, and a dropped or unchecked one must go no further.
-                // A configured name the header map cannot rebuild could not
-                // have matched a request; the header is removed then.
-                match (
-                    http::HeaderName::try_from(header_name.as_str()),
-                    HeaderValue::from_str(&chosen),
-                ) {
-                    (Ok(name), Ok(value)) => {
-                        req.headers_mut().insert(name, value);
-                    }
-                    _ => {
-                        req.headers_mut().remove(header_name.as_str());
-                    }
-                }
-                chosen
+                req.headers_mut().insert(header_name, value.clone());
+                (id, value)
             }
-            None => generate_request_id(req.uri().path()),
+            None => fresh_id(req.uri().path()),
         };
 
         // Insert request ID into request extensions for other middleware/handlers to use
-        req.extensions_mut().insert(RequestId(request_id.clone()));
+        req.extensions_mut().insert(RequestId(request_id));
 
         // Call the inner service
         let future = self.inner.call(req);
@@ -181,12 +188,8 @@ where
         Box::pin(async move {
             let mut response = future.await?;
 
-            // Add request ID to response headers
-            response.headers_mut().insert(
-                "x-request-id",
-                HeaderValue::from_str(&request_id)
-                    .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id")),
-            );
+            // The id the gateway chose, echoed to the client.
+            response.headers_mut().insert("x-request-id", header_value);
 
             Ok(response)
         })
@@ -236,11 +239,17 @@ mod tests {
         }
     }
 
-    /// The id the handler found in the request extensions and the
-    /// `x-request-id` header it received (`-` when absent) come back as the
-    /// body, `extension|header`; the layer echoes the id it chose in
+    /// The id the handler found in the request extensions, the first
+    /// `x-request-id` header value it received (`-` when absent) and how many
+    /// values of that header it received come back as the body,
+    /// `extension|header|count`; the layer echoes the id it chose in
     /// `x-request-id`.
     fn app() -> Router {
+        app_with(vec!["x-request-id".into(), "x-correlation-id".into()])
+    }
+
+    /// [`app`] with its own list of configured request-id headers.
+    fn app_with(names: Vec<String>) -> Router {
         Router::new()
             .route(
                 "/v1/chat/completions",
@@ -259,10 +268,7 @@ mod tests {
                     format!("{extension}|{header}|{count}")
                 }),
             )
-            .layer(RequestIdLayer::new(vec![
-                "x-request-id".into(),
-                "x-correlation-id".into(),
-            ]))
+            .layer(RequestIdLayer::new(names))
     }
 
     /// (the echoed `x-request-id`, the id the handler saw in the extensions,
@@ -387,5 +393,23 @@ mod tests {
             (echoed.as_str(), 1),
             "one value, the fresh id"
         );
+    }
+
+    /// A configured name that does not parse could never match a request;
+    /// it is skipped and the next configured header is consulted.
+    #[tokio::test]
+    async fn a_configured_name_that_does_not_parse_is_skipped() {
+        let app = app_with(vec!["bad name".into(), "x-request-id".into()]);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/chat/completions")
+                    .header("x-request-id", "ok-1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.headers()["x-request-id"], "ok-1");
     }
 }
