@@ -1817,6 +1817,10 @@ impl ResponseStorage for PostgresResponseStorage {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    use super::*;
+
     /// The sweep's statement reads `store` and `status` through the very
     /// expressions its index is built on (a drift between the two would leave
     /// the planner without the index, and the sweep scanning the table), and
@@ -1847,10 +1851,6 @@ mod tests {
             "{lookup}"
         );
     }
-
-    use serde_json::json;
-
-    use super::*;
 
     #[test]
     fn parse_metadata_none_returns_ok_none() {
