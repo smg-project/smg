@@ -122,11 +122,14 @@ pub(crate) fn non_public_address_class(address: IpAddr) -> Option<&'static str> 
 /// The IPv4 address an IPv6 address carries and leads to, in the forms a
 /// translator or a relay turns into an IPv4 connection: IPv4-mapped
 /// (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`; `::` and `::1` are
-/// addresses of their own), NAT64 (the well-known prefix `64:ff9b::/96` and
-/// the local-use `64:ff9b:1::/48`, the IPv4 address in the low 32 bits as
-/// the well-known prefix and the usual local-use deployment carry it; a
-/// local-use deployment that embeds it higher reads as `0.0.0.0/8` here and
-/// is refused) and 6to4 (`2002::/16`, the IPv4 address in the next 32 bits).
+/// addresses of their own), NAT64 on the well-known prefix `64:ff9b::/96`
+/// and on the local-use `64:ff9b:1::/48` carved as a /96 (the IPv4 address
+/// in the low 32 bits, nothing between the prefix and it), and 6to4
+/// (`2002::/16`, the IPv4 address in the next 32 bits). The local-use prefix
+/// carved any other way (RFC 6052's /48, /56 and /64 layouts put the IPv4
+/// address higher, where the address alone does not say) carries no readable
+/// address here: [`non_public_address_class`] refuses it outright rather
+/// than read the low bits as a public address.
 fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(mapped) = address.to_ipv4_mapped() {
         return Some(mapped);
@@ -136,10 +139,16 @@ fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
         [0, 0, 0, 0, 0, 0, 0, 0 | 1] => None,
         [0, 0, 0, 0, 0, 0, high, low] => Some(low_32(high, low)),
         [0x64, 0xff9b, 0, 0, 0, 0, high, low] => Some(low_32(high, low)),
-        [0x64, 0xff9b, 1, _, _, _, high, low] => Some(low_32(high, low)),
+        [0x64, 0xff9b, 1, _, 0, 0, high, low] => Some(low_32(high, low)),
         [0x2002, high, low, ..] => Some(low_32(high, low)),
         _ => None,
     }
+}
+
+/// Whether the address is in the local-use NAT64 prefix `64:ff9b:1::/48`
+/// carved in a layout [`embedded_ipv4`] cannot read.
+fn is_nat64_local_use_with_an_unreadable_layout(address: Ipv6Addr) -> bool {
+    matches!(address.segments(), [0x64, 0xff9b, 1, ..]) && embedded_ipv4(address).is_none()
 }
 
 fn ipv4_class(address: Ipv4Addr) -> Option<&'static str> {
@@ -185,6 +194,10 @@ fn ipv6_class(address: Ipv6Addr) -> Option<&'static str> {
         Some("link-local")
     } else if address.is_multicast() {
         Some("multicast")
+    } else if is_nat64_local_use_with_an_unreadable_layout(address) {
+        // The translator connects to an IPv4 address this side cannot read:
+        // refused, rather than taken for a public one.
+        Some("NAT64 local-use with an unreadable layout")
     } else {
         None
     }
@@ -416,6 +429,27 @@ mod tests {
             ("64:ff9b::7f00:1", "loopback"),
             ("64:ff9b:1::a00:5", "private"),
             ("64:ff9b:1:abcd::c0a8:101", "private"),
+            // The local-use prefix in a /64 or /48 layout: the IPv4 address
+            // sits where the address alone does not say, so it is refused
+            // whatever the low bits look like (10.0.0.1 and 127.0.0.1 in the
+            // /64 layout read 1.0.0.0 from the low bits; a public address in
+            // that layout is refused too).
+            (
+                "64:ff9b:1:1:a:0:100:0",
+                "NAT64 local-use with an unreadable layout",
+            ),
+            (
+                "64:ff9b:1:1:7f:0:100:0",
+                "NAT64 local-use with an unreadable layout",
+            ),
+            (
+                "64:ff9b:1:1:5d:b8d8:2200:0",
+                "NAT64 local-use with an unreadable layout",
+            ),
+            (
+                "64:ff9b:1:a00:1:0:0:0",
+                "NAT64 local-use with an unreadable layout",
+            ),
             ("2002:a00:5::", "private"),
             ("2002:7f00:1::1", "loopback"),
             ("2002:a9fe:a9fe::", "link-local"),
