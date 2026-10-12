@@ -167,12 +167,23 @@ RUN uv pip install maturin \
 FROM base AS router-image
 ARG TARGETARCH
 
+# libjpeg-turbo for the media pipeline: the gateway loads libturbojpeg.so.0 at
+# run time when it is present and decodes JPEGs with it, the pixels an engine
+# that decodes with Pillow sees; without it the pure-Rust decoder's pixels
+# differ by a few levels. The runtime package only, in one small layer.
+RUN apt update -y \
+    && apt install -y --no-install-recommends libturbojpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt clean
+
 # Copy the built package from the build image
 COPY --from=build-image /opt/smg/bindings/python/dist/*.whl dist/
 
-# Install the package and verify arm64's allocator configuration. BuildKit
+# Install the package, verify the JPEG decoder library resolves by the name
+# the gateway loads, and verify arm64's allocator configuration. BuildKit
 # supplies TARGETARCH separately for each platform in a multi-arch build.
 RUN uv pip install --force-reinstall dist/*.whl \
+    && python3 -c 'import ctypes; ctypes.CDLL("libturbojpeg.so.0")' \
     && if [ "${TARGETARCH}" = "arm64" ]; then \
          jemalloc_stats="$(_RJEM_MALLOC_CONF=stats_print:true python3 -c 'from smg import smg_rs' 2>&1)" \
          && printf '%s\n' "${jemalloc_stats}" | grep -F "Page size: 65536"; \
