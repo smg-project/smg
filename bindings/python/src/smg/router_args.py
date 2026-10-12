@@ -352,6 +352,20 @@ class RouterArgs:
     # keep-alive connection may sit with no request in flight (0 disables)
     header_read_timeout_secs: int = 30
     idle_connection_timeout_secs: int = 90
+    # Hosts the router fetches client-supplied media URLs from when it processes
+    # media itself (every redirect hop included); None allows any host the
+    # address policy passes
+    mm_allowed_media_domains: list[str] | None = None
+    # Allow media URLs on loopback, link-local or private addresses (an internal
+    # media origin); False falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS
+    mm_allow_private_media_hosts: bool = False
+    # Seconds of upstream silence after which an open SSE stream carries a
+    # keep-alive frame; 0 sends none; appended last for the same reason
+    sse_keepalive_secs: int = 15
+    # The bound on one history-store call (pool wait, connect and the
+    # operation included); appended last for positional callers
+    postgres_op_timeout_secs: int = 5
+    redis_op_timeout_secs: int = 5
 
     @staticmethod
     def add_cli_args(
@@ -647,8 +661,13 @@ class RouterArgs:
             type=int,
             default=RouterArgs.balance_abs_threshold,
             help=(
-                "Spill gate, absolute part. Balancing is triggered if"
-                " `(max_load - min_load) > abs_threshold` and the relative threshold is also met."
+                "Spill gate, absolute part: a matched worker is skipped for the least-loaded one"
+                " when its load exceeds the healthy-fleet mean by this many requests AND by the"
+                " relative threshold. The margin is capped at the in-flight count's natural swing"
+                " at the pool's current mean (two standard deviations, never under four unless"
+                " this value is lower), so a small pool can spill at all. With the bucket policy"
+                " the pair keeps its own rule: balancing when (max_load - min_load) exceeds this"
+                " value and max_load exceeds min_load times the relative threshold."
             ),
         )
         routing_group.add_argument(
@@ -657,8 +676,8 @@ class RouterArgs:
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help=(
-                "Spill gate, relative part. Balancing is triggered if"
-                " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
+                "Spill gate, relative part: a matched worker is skipped when its load exceeds"
+                " this multiple of the healthy-fleet mean AND the absolute threshold is also met."
             ),
         )
         routing_group.add_argument(
@@ -1014,6 +1033,19 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}sse-keepalive-secs",
+            type=_non_negative_int,
+            default=RouterArgs.sse_keepalive_secs,
+            help=(
+                "Seconds of upstream silence after which an open SSE stream"
+                " carries a keep-alive frame (an SSE comment on the"
+                " OpenAI-shaped endpoints, the ping event on /v1/messages), so"
+                " an idle-timeout proxy does not cut a stream that is waiting"
+                " on a long prefill. Nothing is sent while frames flow."
+                " 0 sends none"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}dp-aware",
             action="store_true",
             help="Enable data parallelism aware schedule",
@@ -1228,9 +1260,11 @@ class RouterArgs:
             help=(
                 "Where media for vLLM gRPC workers is fetched and preprocessed: auto"
                 " (worker when the model spec and the worker both allow it, else"
-                " router), router (always the gateway), worker (always the engine;"
-                " models without worker expansion are rejected). Falls back to"
-                " SMG_MM_PROCESSING, then auto"
+                " router), router (always the gateway), worker (the engine, except"
+                " that a request whose items carry per-item hints"
+                " (max_long_side_pixel, fps) is preprocessed by the gateway, which"
+                " applies them; models without worker expansion are rejected)."
+                " Falls back to SMG_MM_PROCESSING, then auto"
             ),
         )
         parser.add_argument(
@@ -1250,6 +1284,26 @@ class RouterArgs:
                 "Serve cached pixels over RDMA instead of inline bytes (the legacy"
                 " switch; --multimodal-tensor-transport rdma is the first-class one)."
                 " Falls back to SMG_MM_PIXEL_RDMA"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-allowed-media-domains",
+            type=lambda value: [host.strip() for host in value.split(",") if host.strip()],
+            default=RouterArgs.mm_allowed_media_domains,
+            help=(
+                "Hosts the router fetches client-supplied media URLs from when it"
+                " processes media itself, comma-separated; a redirect to any other"
+                " host is refused. Unset allows any host the address policy passes"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-allow-private-media-hosts",
+            action="store_true",
+            default=RouterArgs.mm_allow_private_media_hosts,
+            help=(
+                "Allow client-supplied media URLs that name or resolve to a loopback,"
+                " link-local or private address (an internal media origin); by default"
+                " such URLs are refused. Falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
             ),
         )
         parser.add_argument(
@@ -1284,7 +1338,9 @@ class RouterArgs:
             type=str,
             default=None,
             help=(
-                "Directory to store log files. If not specified, logs are only output to console."
+                "Directory for the log files, created at start-up when missing (under a"
+                " writable directory); an existing path must be a writable directory. If not"
+                " specified, logs are only output to console."
             ),
         )
         logging_group.add_argument(
@@ -1525,15 +1581,27 @@ class RouterArgs:
                 " for this many seconds; an open streaming response counts as in"
                 " flight. The bound starts with the connection's first request (a"
                 " connection that never sends one is bounded by"
-                " --header-read-timeout-secs alone). 0 keeps idle connections open"
-                " until the client closes them"
+                " --header-read-timeout-secs alone). Keep it above the idle"
+                " timeout of any proxy or load balancer in front of the gateway,"
+                " so that side closes an idle connection first; otherwise a"
+                " request can be sent on a connection the gateway is closing and"
+                " fail with a reset. A connection the proxy opened ahead of time"
+                " and never used is bounded by --header-read-timeout-secs"
+                " instead: keep the proxy's idle timeout under that too, or do"
+                " not pre-open. 0 keeps idle connections open until the client"
+                " closes them"
             ),
         )
         request_group.add_argument(
             f"--{prefix}trust-tenant-header",
             action="store_true",
             default=False,
-            help="Trust an upstream-provided tenant header for canonical tenant resolution.",
+            help=(
+                "Trust an upstream-provided tenant header for canonical tenant resolution."
+                " Stored responses and conversations are scoped to the tenant that created"
+                " them: another tenant's id answers 404; records stored without a tenant"
+                " identity stay readable by every caller."
+            ),
         )
         request_group.add_argument(
             f"--{prefix}tenant-header-name",
@@ -1730,25 +1798,34 @@ class RouterArgs:
             f"--{prefix}health-failure-threshold",
             type=int,
             default=RouterArgs.health_failure_threshold,
-            help=("Number of consecutive health check failures before marking worker unhealthy"),
+            help=(
+                "Number of consecutive health check failures before marking worker unhealthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-success-threshold",
             type=int,
             default=RouterArgs.health_success_threshold,
-            help=("Number of consecutive health check successes before marking worker healthy"),
+            help=(
+                "Number of consecutive health check successes before marking worker healthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-timeout-secs",
             type=int,
             default=RouterArgs.health_check_timeout_secs,
-            help="Timeout in seconds for health check requests",
+            help="Timeout in seconds for health check requests (at least 1)",
         )
         health_group.add_argument(
             f"--{prefix}health-check-interval-secs",
             type=int,
             default=RouterArgs.health_check_interval_secs,
-            help="Interval in seconds between runtime health checks",
+            help=(
+                "Interval in seconds between runtime health checks (at least 1;"
+                f" --{prefix}disable-health-check turns probing off)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-endpoint",
@@ -1969,6 +2046,13 @@ class RouterArgs:
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
         )
+        postgres_group.add_argument(
+            f"--{prefix}postgres-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("POSTGRES_OP_TIMEOUT_SECS", RouterArgs.postgres_op_timeout_secs)),
+            help="Bound in seconds on each call to the PostgreSQL store (pool wait, connect and the statement); "
+            "a call past it is answered 503 storage_unavailable (default: 5, env: POSTGRES_OP_TIMEOUT_SECS)",
+        )
 
         # Redis configuration
         redis_group.add_argument(
@@ -1989,13 +2073,23 @@ class RouterArgs:
             default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
             help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
         )
+        redis_group.add_argument(
+            f"--{prefix}redis-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("REDIS_OP_TIMEOUT_SECS", RouterArgs.redis_op_timeout_secs)),
+            help="Bound in seconds on each call to the Redis store (pool wait, connect and the command; replaces the "
+            "client library's 500 ms / 1 s defaults); a call past it is answered 503 storage_unavailable "
+            "(default: 5, env: REDIS_OP_TIMEOUT_SECS)",
+        )
 
         # Schema configuration
         backend_group.add_argument(
             f"--{prefix}schema-config",
             type=str,
             default=None,
-            help="Path to a YAML schema config file for storage table/column remapping",
+            help="Path to a YAML schema config file for storage table/column remapping; "
+            "auto_migrate: true in it applies pending schema migrations at start-up "
+            "(the environment variable DB_AUTO_MIGRATE=true does the same without a file)",
         )
 
         # TLS/mTLS configuration
@@ -2070,7 +2164,9 @@ class RouterArgs:
             help=(
                 "Per-tenant API keys for serving-path auth (format: tenant_id:key,"
                 " repeatable). Layers on top of --api-key, each resolving to its own"
-                " tenant identity."
+                " tenant identity. Stored responses and conversations are scoped to the"
+                " tenant that created them: another tenant's id answers 404; records"
+                " stored without a tenant identity stay readable by every caller."
             ),
         )
         auth_group.add_argument(
@@ -2461,13 +2557,13 @@ class RouterArgs:
         for key_str in api_keys_list:
             parts = key_str.split(":", 3)  # Split into at most 4 parts
             if len(parts) != 4:
-                raise ValueError(
-                    f"Invalid API key format: '{key_str}'. Expected 'id:name:role:key'"
-                )
+                # The entry is not shown: it carries the credential.
+                raise ValueError("Invalid control-plane API key entry: expected 'id:name:role:key'")
             key_id, name, role, key = parts
             role_lower = role.lower()
             if role_lower not in ("admin", "user"):
-                raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
+                # Nor the role field: with the fields out of order it is the credential.
+                raise ValueError("Invalid control-plane API key role: must be 'admin' or 'user'")
             parsed_keys.append((key_id, name, key, role_lower))
         return parsed_keys
 

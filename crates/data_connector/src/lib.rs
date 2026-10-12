@@ -12,6 +12,7 @@
 //! - Postgres
 //! - Redis
 
+mod bounded;
 mod common;
 pub mod config;
 pub mod context;
@@ -32,9 +33,10 @@ pub(crate) mod versioning;
 // Re-export config types
 // Re-export core types and traits
 pub use core::{
-    AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
-    ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
-    ResponseId, ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
+    is_unstored, tenant_scope_allows, visible_chain, AddedAtSequence, Conversation, ConversationId,
+    ConversationItem, ConversationItemId, ConversationItemStorage, ConversationStorage, ListParams,
+    NewConversation, NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError,
+    SortOrder, StorageFailure, StoredResponse,
 };
 
 pub use config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};

@@ -150,7 +150,11 @@ pub struct CacheAwareConfig {
     /// mean by this many requests AND by `balance_rel_threshold`. Requiring
     /// both keeps the gate quiet on steady-state variance at low means
     /// (absolute) without going blind to a deep queue at high means
-    /// (relative).
+    /// (relative). The margin is capped at the in-flight count's natural
+    /// swing at the pool's current mean (two standard deviations, never
+    /// under four requests unless this value is lower), so a pool whose
+    /// per-worker in-flight count
+    /// stays below this value can still spill.
     pub balance_abs_threshold: usize,
     /// Relative load margin (multiple of the healthy-fleet mean) for the
     /// per-request candidate gate; fires only together with

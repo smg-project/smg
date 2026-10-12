@@ -306,7 +306,8 @@ mod tests {
         let slots = call["elements"][3]["elements"]
             .as_array()
             .expect("four slots");
-        // The `$ref` lends its target's type, and the definitions travel with the schema.
+        // The `$ref` lends its target's type, and the definition it reaches travels with the
+        // schema; the unreached one does not.
         assert_eq!(
             slots[0]["elements"][0]["value"],
             "<|open|>argument key=\"count\" type=\"number\"<|sep|>"
@@ -315,7 +316,7 @@ mod tests {
             slots[0]["elements"][1]["json_schema"],
             value!({
                 "$ref": "#/$defs/Count",
-                "$defs": {"Count": {"type": "integer"}, "Unused": {"type": "string"}},
+                "$defs": {"Count": {"type": "integer"}},
             })
         );
         // A pointer at nothing, no type, or a pointer to the root (the property's own document once

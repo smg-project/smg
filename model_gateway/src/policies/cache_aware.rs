@@ -56,8 +56,10 @@
     Configuration Parameters:
     ------------------------
     cache_threshold:         Min prefix match ratio for highest-match routing (0.0-1.0)
-    balance_abs_threshold:   Absolute load diff threshold for imbalance detection
-    balance_rel_threshold:   Relative load ratio threshold for imbalance detection
+    balance_abs_threshold:   Absolute margin of the spill gate (requests above the fleet mean); capped at
+                             the in-flight count's natural swing at the pool's mean, never under four
+                             unless the configured value itself is lower (0: the relative part alone)
+    balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
     max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
                              shared across all workers; enforced by eviction
@@ -138,6 +140,14 @@ const POOL_TABLE_REFRESH_MS: u64 = 1_000;
 /// Pool tables kept at once: one per routing pool the policy sees (a model's
 /// regular pool, the PD legs' pools); past this the oldest goes.
 const POOL_TABLES_KEPT: usize = 8;
+
+/// The floor of the swing-sized absolute margin of the spill gate: with a
+/// configured `balance_abs_threshold` of at least this, a worker at most this
+/// many requests above the fleet mean is never over the gate, so a handful of
+/// requests on an otherwise idle fleet keep their cache affinity; a lower
+/// configured value lowers the margin below it (see
+/// [`CacheAwarePolicy::absolute_margin`]).
+const MIN_ABSOLUTE_MARGIN: f64 = 4.0;
 
 /// Cache-aware routing policy
 ///
@@ -1787,25 +1797,48 @@ impl CacheAwarePolicy {
 
     /// The count-pressure gate's comparison alone, with no trace record: a
     /// worker holding more than `balance_rel_threshold` times the mean load
-    /// AND `balance_abs_threshold` requests above it is over the gate. The
-    /// affinity path records its decision through
+    /// AND the absolute margin ([`Self::absolute_margin`]) above it is over
+    /// the gate. The affinity path records its decision through
     /// [`Self::candidate_requires_spill`]; the warm-up slice checks its
     /// candidates here, so a thin-overlap miss writes no gate entries for
     /// workers it did not pick.
     fn over_count_pressure_gate(&self, load: f64, avg_load: f64) -> bool {
         load > avg_load * f64::from(self.config.balance_rel_threshold)
-            && load > avg_load + self.config.balance_abs_threshold as f64
+            && load > avg_load + self.absolute_margin(avg_load)
+    }
+
+    /// The gate's absolute margin at `avg_load`: `balance_abs_threshold`
+    /// requests above the mean, capped at the in-flight count's natural
+    /// swing at this mean (two standard deviations of a Poisson count,
+    /// `2 * sqrt(avg_load)`, rounded up to whole requests) and never under
+    /// [`MIN_ABSOLUTE_MARGIN`] unless the configured value is lower still
+    /// (0 leaves the relative margin to decide alone). A fixed absolute margin sized for a large
+    /// pool cannot clear in a pool whose per-worker in-flight count stays
+    /// below it (two workers at 32 in flight: the busier one would need 80
+    /// at a margin of 64), so cache affinity there was never balanced at
+    /// all, whatever the skew. Sized to the swing, the margin still tells
+    /// steady-state variance from pressure at every mean: a worker two
+    /// standard deviations above the fleet is not noise (a mean of 16: eight
+    /// requests; a mean of 4: four), the configured value caps it, and the
+    /// floor keeps a handful of requests on an otherwise idle fleet from
+    /// counting as pressure. The margin is not tied to the relative one, so
+    /// a tight relative threshold (1.1) does not turn one idle worker in a
+    /// loaded fleet into a spill of every busy holder.
+    fn absolute_margin(&self, avg_load: f64) -> f64 {
+        let configured = self.config.balance_abs_threshold as f64;
+        let swing = (2.0 * avg_load.sqrt()).ceil();
+        configured.min(swing.max(MIN_ABSOLUTE_MARGIN))
     }
 
     /// Per-request count-pressure predicate: over
-    /// `balance_rel_threshold` times the healthy-fleet mean load AND
-    /// `balance_abs_threshold` requests above it, the request spills to the
-    /// expected-wait worker instead. Affinity paths insert for the spill
-    /// target, so a prefix whose home saturates gains an additional tenant —
-    /// hot prefixes replicate instead of queueing behind one engine. Both
-    /// margins must clear so the gate neither fires on steady-state variance
-    /// (relative alone would, at low means) nor stays blind to a deep queue
-    /// (absolute alone would, at high means).
+    /// `balance_rel_threshold` times the healthy-fleet mean load AND the
+    /// absolute margin above it, the request spills to the expected-wait
+    /// worker instead. Affinity paths insert for the spill target, so a
+    /// prefix whose home saturates gains an additional tenant — hot prefixes
+    /// replicate instead of queueing behind one engine. Both margins must
+    /// clear so the gate neither fires on steady-state variance (relative
+    /// alone would, at low means) nor stays blind to a deep queue (absolute
+    /// alone would, at high means).
     fn candidate_requires_spill(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1818,7 +1851,8 @@ impl CacheAwarePolicy {
             cache_trace::gate(serde_json::json!({
                 "worker": workers[selected].url(), "load": load, "average_load": avg_load,
                 "relative_threshold": self.config.balance_rel_threshold,
-                "absolute_threshold": self.config.balance_abs_threshold, "spill": spill,
+                "absolute_threshold": self.config.balance_abs_threshold,
+                "absolute_margin": self.absolute_margin(avg_load), "spill": spill,
             }));
         }
         spill
@@ -1838,7 +1872,7 @@ impl CacheAwarePolicy {
     /// settled fleet pays nothing here. Each candidate is checked live before
     /// the pick: still eligible, still warming, and under the count-pressure
     /// gate an affinity pick obeys (`balance_rel_threshold` times the mean
-    /// in-flight and `balance_abs_threshold` above it), so a thin worker that
+    /// in-flight and the absolute margin above it), so a thin worker that
     /// cannot admit what it is sent (an in-transit backlog, a throttled
     /// admission) is not fed one miss in `1 / share` while the rest of the
     /// pool idles. The pick is credited through the expected-wait selector
@@ -4651,38 +4685,124 @@ mod tests {
         );
     }
 
-    #[test]
-    fn candidate_gate_requires_both_margins() {
-        // w1 load 10 vs avg 5: over the relative margin (10 > 5 * 1.1) but
-        // under the absolute one (10 < 5 + 32) — affinity holds.
-        let policy = CacheAwarePolicy::with_config(test_config());
+    /// The affinity pick of a two-worker pool whose prefix lives on w1, with
+    /// `w1_load` and `w2_load` requests in flight.
+    fn affinity_pick(config: CacheAwareConfig, w1_load: usize, w2_load: usize) -> usize {
+        let policy = CacheAwarePolicy::with_config(config);
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let tokens: Vec<u32> = (0..32).collect();
         seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
-        for _ in 0..10 {
+        for _ in 0..w1_load {
             workers[0].increment_load();
+        }
+        for _ in 0..w2_load {
+            workers[1].increment_load();
         }
         let info = SelectWorkerInfo {
             tokens: Some(&tokens),
             ..Default::default()
         };
-        assert_eq!(policy.select_worker(&workers, &info).unwrap(), 0);
+        policy.select_worker(&workers, &info).unwrap()
+    }
 
-        // Same loads with a small absolute margin (10 > 5 + 2): spill.
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
-            balance_abs_threshold: 2,
+    #[test]
+    fn candidate_gate_requires_both_margins() {
+        // w1 load 7 vs avg 5: over the relative margin (7 > 5 * 1.1) but not
+        // the absolute one (the swing at a mean of 5 is five: 7 is not
+        // > 5 + 5) — affinity holds.
+        assert_eq!(affinity_pick(test_config(), 7, 3), 0);
+        // w1 load 12 vs avg 6: both margins clear (12 > 6.6, 12 > 6 + 5):
+        // spill.
+        assert_eq!(affinity_pick(test_config(), 12, 0), 1);
+        // An absolute threshold under the floor lowers it: with none at all
+        // the relative margin decides alone, and 7 vs avg 5 spills.
+        let rel_only = CacheAwareConfig {
+            balance_abs_threshold: 0,
             ..test_config()
-        });
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
-        for _ in 0..10 {
-            workers[0].increment_load();
-        }
-        let info = SelectWorkerInfo {
-            tokens: Some(&tokens),
-            ..Default::default()
         };
-        assert_eq!(policy.select_worker(&workers, &info).unwrap(), 1);
+        assert_eq!(affinity_pick(rel_only, 7, 3), 1);
+    }
+
+    /// The launcher's defaults: a 64-request absolute margin and 1.5 times
+    /// the mean.
+    fn launcher_defaults() -> CacheAwareConfig {
+        CacheAwareConfig {
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            ..test_config()
+        }
+    }
+
+    #[test]
+    fn a_small_pool_spills_a_worker_holding_the_relative_margin_more_than_its_peer() {
+        // Two workers, 32 in flight. A 25/7 skew (the busier worker at 1.56
+        // times the mean) is over the gate: 25 > 1.5 * 16 and 25 > 16 + 8.
+        // Under a fixed 64-request margin the busier worker would have needed
+        // 81 in flight, more than the pool holds, so this never spilled.
+        assert_eq!(affinity_pick(launcher_defaults(), 25, 7), 1);
+        // A 19/13 skew (1.19 times the mean) is under the relative margin:
+        // affinity holds, as it should at this scale.
+        assert_eq!(affinity_pick(launcher_defaults(), 19, 13), 0);
+    }
+
+    #[test]
+    fn the_absolute_margin_is_capped_at_the_counts_swing_and_floored_at_four() {
+        let policy = CacheAwarePolicy::with_config(launcher_defaults());
+        // (mean, margin): the floor up to a mean of 4, two standard
+        // deviations of the count above it, the configured 64 from a mean
+        // of 1,024 on.
+        for (avg_load, margin) in [
+            (0.0, 4.0),
+            (1.0, 4.0),
+            (4.0, 4.0),
+            (5.0, 5.0),
+            (16.0, 8.0),
+            (64.0, 16.0),
+            (128.0, 23.0),
+            (400.0, 40.0),
+            (1024.0, 64.0),
+            (2000.0, 64.0),
+        ] {
+            assert_eq!(policy.absolute_margin(avg_load), margin, "mean {avg_load}");
+        }
+        // No absolute threshold at all keeps the gate relative-only.
+        let rel_only = CacheAwarePolicy::with_config(CacheAwareConfig {
+            balance_abs_threshold: 0,
+            ..launcher_defaults()
+        });
+        assert_eq!(rel_only.absolute_margin(16.0), 0.0);
+    }
+
+    #[test]
+    fn the_gate_opens_at_the_load_the_pools_mean_sets() {
+        let policy = CacheAwarePolicy::with_config(launcher_defaults());
+        // Pools of 2, 8 and 29 workers at 4, 8, 32 and 128 requests in
+        // flight: the smallest in-flight count one worker must hold for the
+        // gate to open (None: more than the pool holds). A fixed 64-request
+        // margin opened only for a worker holding 81 of 128 on 8 workers and
+        // 69 of 128 on 29.
+        for (workers, in_flight, opens_at) in [
+            (2, 4, None),
+            (2, 8, None),
+            (2, 32, Some(25)),
+            (2, 128, Some(97)),
+            (8, 4, None),
+            (8, 8, Some(6)),
+            (8, 32, Some(9)),
+            (8, 128, Some(25)),
+            (29, 4, None),
+            (29, 8, Some(5)),
+            (29, 32, Some(6)),
+            (29, 128, Some(10)),
+        ] {
+            let avg_load = f64::from(in_flight) / f64::from(workers);
+            let first = (0..=in_flight)
+                .find(|&load| policy.over_count_pressure_gate(f64::from(load), avg_load));
+            assert_eq!(first, opens_at, "{workers} workers, {in_flight} in flight");
+        }
+        // At high means the relative margin decides, with either rule.
+        assert!(!policy.over_count_pressure_gate(290.0, 200.0));
+        assert!(policy.over_count_pressure_gate(301.0, 200.0));
     }
 
     #[test]

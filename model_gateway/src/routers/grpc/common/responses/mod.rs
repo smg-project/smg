@@ -7,12 +7,15 @@ pub(crate) mod streaming;
 pub(crate) mod utils;
 
 // Re-export commonly used items
-pub(crate) use background::{BackgroundResponses, BackgroundStream};
+pub(crate) use background::{spawn_unstored_sweeper, BackgroundResponses, BackgroundStream};
 pub(crate) use context::ResponsesContext;
 pub(crate) use streaming::{
     await_stream_startup, build_sse_response, build_sse_response_from_stream,
     signal_stream_startup, stream_startup_channel, StreamStartupSender,
 };
-pub(crate) use utils::{ensure_mcp_connection, persist_response_if_needed};
+pub(crate) use utils::{
+    ensure_mcp_connection, persist_response_if_needed, previous_response_chain, stored_foreground,
+    NotStored,
+};
 
 pub(crate) use crate::routers::common::mcp_utils::collect_user_function_names;

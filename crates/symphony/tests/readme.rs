@@ -6,14 +6,9 @@
 
 use std::{fmt::Write as _, fs, path::PathBuf};
 
-use symphony::{
-    formats::{
-        deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5,
-        ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
-    },
-    tagged::{Placement, Spelling},
-    CallSyntax, Format,
-};
+use openai_protocol::common::{Function, Tool};
+use serde_json::json;
+use symphony::formats::{groups, table_for, Table};
 
 /// The switch that writes the table into the README instead of checking it.
 const WRITE_ENV: &str = "SYMPHONY_WRITE_README";
@@ -39,7 +34,8 @@ struct Group {
     /// (`crates/tool_parser`, `crates/reasoning_parser`, read at main 0d0808f2); none is
     /// passthrough, the output read as content.
     smg: (Option<&'static str>, Option<&'static str>),
-    /// The table under `formats` that reads the group's output, once one is written.
+    /// The table under `formats` that reads the group's output, once one is written; the
+    /// registry under `formats` must say the same for the primary and every `also`.
     table: Option<Table>,
     /// The parse cases bellwether's main holds for the group, once its set is recorded.
     set: Option<u32>,
@@ -47,75 +43,15 @@ struct Group {
     status: Status,
 }
 
-/// A table under `formats`, by the function that builds it.
-#[derive(Clone, Copy)]
-enum Table {
-    Qwen3,
-    Qwen3Tagged,
-    /// [`qwen3`] with the tagged syntax and the value between the tags directly: MiMo.
-    Qwen3TaggedDirect,
-    Qwen2_5,
-    DeepSeekV4_1,
-    SeedOss,
-    Hy4,
-    Ling,
-    IQuest,
-    Olmo3,
-    Lfm2_5,
-    Xlam,
-    MinimaxM2,
-    MinimaxM3,
-    KimiK3,
-    Glm,
-    Glm4,
-    K2Horizon,
-    Inkling,
-    MiniCpm5,
-    Dots3,
-    Gemma4,
-    Plain,
-}
-
-impl Table {
-    /// The table, built; a name in [`GROUPS`] that the crate does not have fails to compile.
-    fn format(self) -> Format {
-        match self {
-            Self::Qwen3 => qwen3(CallSyntax::Json),
-            Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            Self::Qwen3TaggedDirect => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
-            Self::Qwen2_5 => qwen2_5(),
-            Self::DeepSeekV4_1 => deepseek_v4_1(),
-            Self::SeedOss => seed_oss(),
-            Self::Hy4 => hy4(),
-            Self::Ling => ling(),
-            Self::IQuest => iquest(),
-            Self::Olmo3 => olmo3(),
-            Self::Lfm2_5 => lfm2_5(),
-            Self::Xlam => xlam(),
-            Self::MinimaxM2 => minimax_m2(),
-            Self::MinimaxM3 => minimax_m3(),
-            Self::KimiK3 => kimi_k3(),
-            Self::Glm => glm(),
-            Self::Glm4 => glm4(),
-            Self::Inkling => inkling(),
-            Self::MiniCpm5 => minicpm5(),
-            Self::Dots3 => dots3(),
-            Self::Gemma4 => gemma4(),
-            Self::K2Horizon => k2_horizon(),
-            Self::Plain => plain(),
-        }
-    }
-
-    /// How the README names it: the function, and the call syntax where the function takes one.
-    fn cell(self) -> String {
-        match self {
-            Self::Qwen3Tagged => format!("`{}`, tagged calls", self.format().name()),
-            Self::Qwen3TaggedDirect => format!(
-                "`{}`, tagged calls, the value between the tags",
-                self.format().name()
-            ),
-            other => format!("`{}`", other.format().name()),
-        }
+/// How the README names a table: the function, and the call syntax where the function takes one.
+fn table_cell(table: Table) -> String {
+    match table {
+        Table::Qwen3Tagged => format!("`{}`, tagged calls", table.format().name()),
+        Table::Qwen3TaggedDirect => format!(
+            "`{}`, tagged calls, the value between the tags",
+            table.format().name()
+        ),
+        other => format!("`{}`", other.format().name()),
     }
 }
 
@@ -997,7 +933,7 @@ fn render() -> String {
             slug = group.slug,
             model = group.model,
             also = group.also.join(", "),
-            table = group.table.map_or_else(|| "—".to_string(), Table::cell),
+            table = group.table.map_or_else(|| "—".to_string(), table_cell),
             set = group.set.map_or_else(|| "—".to_string(), count),
             status = group.status.cell(),
         );
@@ -1007,6 +943,110 @@ fn render() -> String {
 
 fn readme_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md")
+}
+
+/// The variable naming a directory to write every table's structural tag into, as a request
+/// carries it, one file per table and request shape (`<Table>-required|optional-closed|open.json`),
+/// the directory's earlier files of those names removed first; `tools/compile_structural_tags.py`
+/// compiles them with xgrammar, the engines' grammar library.
+const WRITE_TAGS_ENV: &str = "SYMPHONY_WRITE_TAGS";
+/// How the written files end, one per request shape: what a run removes before it writes.
+const TAG_FILE_ENDINGS: [&str; 4] = [
+    "-required-closed.json",
+    "-optional-closed.json",
+    "-required-open.json",
+    "-optional-open.json",
+];
+
+/// Tools whose schemas reach every value shape the grammars write: a required string, a number
+/// with a bound, a string enum, a boolean, `null`, a list of strings, an object with properties, a
+/// reference to a definition holding an enum, a property that pins no type, and a tool without
+/// properties.
+fn tag_tools() -> Vec<Tool> {
+    let tool = |name: &str, parameters: serde_json::Value| Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters,
+            strict: None,
+            extra: Default::default(),
+        },
+    };
+    vec![
+        tool(
+            "get_weather",
+            json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer", "minimum": 1},
+                    "units": {"type": "string", "enum": ["c", "f"]},
+                    "detailed": {"type": "boolean"},
+                    "nothing": {"type": "null"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "options": {"type": "object", "properties": {
+                        "limit": {"type": "number"},
+                        "verbose": {"type": "boolean"},
+                    }},
+                    "scale": {"$ref": "#/$defs/Scale"},
+                    "anything": {},
+                },
+                "required": ["city", "days"],
+                "$defs": {"Scale": {"type": "string", "enum": ["small", "large"]}},
+            }),
+        ),
+        tool("ping", json!({"type": "object"})),
+    ]
+}
+
+#[test]
+fn every_tables_structural_tag_is_written_when_asked() {
+    let Ok(directory) = std::env::var(WRITE_TAGS_ENV) else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory).expect("the directory");
+    // Only this run's tags: a payload an earlier run left for a table or a shape that no longer
+    // derives one would be compiled as if it were current. Only files named as this test names
+    // them go, so a directory holding anything else keeps it.
+    for entry in fs::read_dir(&directory).expect("the directory's entries") {
+        let path = entry.expect("an entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if TAG_FILE_ENDINGS.iter().any(|ending| name.ends_with(ending)) {
+            fs::remove_file(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+        }
+    }
+    let tools = tag_tools();
+    let mut seen: Vec<String> = Vec::new();
+    let mut written = 0;
+    for table in GROUPS.iter().filter_map(|group| group.table) {
+        let name = format!("{table:?}");
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.push(name.clone());
+        for (at_least_one, reasoning_open) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let Some(grammar) = table.format().grammar(&tools, at_least_one, reasoning_open) else {
+                continue;
+            };
+            let file = format!(
+                "{name}-{}-{}.json",
+                if at_least_one { "required" } else { "optional" },
+                if reasoning_open { "open" } else { "closed" }
+            );
+            let payload =
+                serde_json::to_string_pretty(&grammar.payload()).expect("the payload as JSON");
+            fs::write(directory.join(&file), payload).unwrap_or_else(|why| panic!("{file}: {why}"));
+            written += 1;
+        }
+    }
+    assert!(written > 0, "no table wrote a tag");
 }
 
 #[test]
@@ -1027,6 +1067,38 @@ fn the_readme_models_table_is_what_groups_says() {
         "README.md's models table is not what GROUPS says; run `{WRITE_ENV}=1 cargo test -p \
          smg-symphony --test readme` to write it, or replace everything between the markers with:\n\
          {expected}"
+    );
+}
+
+#[test]
+fn the_registry_reads_every_group_with_a_table_and_no_other() {
+    for group in GROUPS {
+        assert_eq!(table_for(group.model), group.table, "{}", group.slug);
+        let organisation = group.model.split('/').next().expect("an organisation");
+        for also in group.also {
+            assert_eq!(
+                table_for(&format!("{organisation}/{also}")),
+                group.table,
+                "{}: {also}",
+                group.slug
+            );
+        }
+    }
+    // And the other way: every group the registry knows is a group here, with the same
+    // checkpoints and table, so neither list gains an entry the other lacks.
+    let mut registered = 0;
+    for (model, also, table) in groups() {
+        let group = GROUPS
+            .iter()
+            .find(|group| group.model == model)
+            .unwrap_or_else(|| panic!("{model}: in the registry, not in the README"));
+        assert_eq!(group.also, also, "{model}");
+        assert_eq!(group.table, Some(table), "{model}");
+        registered += 1;
+    }
+    assert_eq!(
+        registered,
+        GROUPS.iter().filter(|group| group.table.is_some()).count()
     );
 }
 

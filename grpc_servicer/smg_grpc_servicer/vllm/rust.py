@@ -50,18 +50,21 @@ from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port
-from smg_grpc_servicer.rust_lifecycle import (
+
+# The lifecycle's defaults, re-exported: this launcher's own documented defaults.
+from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
     EngineProcessGroup,
+    ServicerConfigError,
     default_socket_dir,
     free_port,
+    read_launcher_knobs,
     resolve_tokenizer_dir,
     supervise,
 )
-from smg_grpc_servicer.rust_lifecycle import env_float as _env_float
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     engine_reasoning_parser,
@@ -486,6 +489,15 @@ async def serve_rust(args: argparse.Namespace) -> int:
     both. ``args`` is the upstream launcher's namespace (``--host``/``--port``
     plus ``AsyncEngineArgs``, and the frontend fields under ``vllm serve``).
     Returns the process exit code."""
+    # The launcher's own knobs first, validated together: a bad value is a
+    # named error before any engine work and before the port is bound.
+    knobs = read_launcher_knobs(
+        handshake_port_env=HANDSHAKE_PORT_ENV,
+        drain_secs_env=DRAIN_SECS_ENV,
+        startup_timeout_secs_env=STARTUP_TIMEOUT_SECS_ENV,
+        startup_ceiling_secs_env=STARTUP_CEILING_SECS_ENV,
+        socket_dir=default_socket_dir(),
+    )
     from smg.servicer import VllmGrpcServer, init_servicer_tracing
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.usage.usage_lib import UsageContext
@@ -521,8 +533,8 @@ async def serve_rust(args: argparse.Namespace) -> int:
         or getattr(model_config, "revision", None),
     )
     data_parallel_size = info["data_parallel_size"]
-    handshake_port = _env_int(HANDSHAKE_PORT_ENV) or free_port()
-    socket_dir = default_socket_dir()
+    handshake_port = knobs.handshake_port or free_port()
+    socket_dir = knobs.socket_dir
     # Worker-side media processing, from the same `--mm-*` settings (flags
     # when the launcher has them, else the environment) as the Python servicer:
     # the Python processors behind a bridge, or smg's own pipeline in Rust.
@@ -543,8 +555,8 @@ async def serve_rust(args: argparse.Namespace) -> int:
     )
 
     init_servicer_tracing()
-    startup_timeout_secs = _env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
-    startup_ceiling_secs = _env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
+    startup_timeout_secs = knobs.startup_timeout_secs
+    startup_ceiling_secs = knobs.startup_ceiling_secs
     server = VllmGrpcServer(
         # `vllm serve` leaves host unset and upstream binds all interfaces then.
         bind_address=host_port(getattr(args, "host", None) or "0.0.0.0", args.port),
@@ -589,9 +601,7 @@ async def serve_rust(args: argparse.Namespace) -> int:
     logger.info("Launched the headless engine (pid %s)", engine.pid)
     if media is not None:
         media.start_warmup()
-    return await supervise(
-        server, engine, drain_secs=_env_float(DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS)
-    )
+    return await supervise(server, engine, drain_secs=knobs.drain_secs)
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +624,7 @@ def resolve_servicer_impl(
         value = source.get(SERVICER_IMPL_ENV) or "python"
     value = str(value).strip().lower()
     if value not in IMPLS:
-        raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
+        raise ServicerConfigError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
     if args is not None and isinstance(source, MutableMapping):
         source[SERVICER_IMPL_ENV] = value
     return value
@@ -736,11 +746,6 @@ def require_upstream_hook() -> None:
             "serve_grpc. This installation's launcher does neither, so its workers would "
             "run the Python servicer; see grpc_servicer/README.md or select python."
         )
-
-
-def _env_int(name: str) -> int | None:
-    value = os.environ.get(name)
-    return int(value) if value else None
 
 
 def configure_logging() -> None:

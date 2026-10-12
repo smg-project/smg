@@ -63,7 +63,15 @@
 //!   configured threshold or, if longer, the time the engine may still need
 //!   to prefill what is in flight ([`Worker::prefill_backlog`]): a batch that
 //!   is all in prefill streams nothing and is not wedged. A zero threshold
-//!   turns the rule off.
+//!   turns the rule off. The same bound, read per request, caps how long a
+//!   disaggregated prefill leg may stay silent ([`prefill_leg_bound`]): a
+//!   leg is not part of any pile, so its request is what fails, over to
+//!   another prefill worker when one is available. A leg past its bound is
+//!   given up on only while its worker has answered nothing within the
+//!   bound ([`prefill_leg_reprieve`]): a worker that keeps answering other
+//!   legs is backed up (on the parallel dispatch shape a leg's first
+//!   response also waits for the decode side), not frozen, and its leg
+//!   waits on.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -119,9 +127,56 @@ const WEDGE_BOUND_CAP: Duration = Duration::from_secs(120);
 /// the engine may still need before the first token of its in-flight prompts
 /// is due, whichever is longer.
 fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
-    wedge
-        .max(worker.prefill_backlog())
-        .min(wedge.max(WEDGE_BOUND_CAP))
+    bound_over(wedge, worker.prefill_backlog())
+}
+
+/// The wedge rule's bound over an `eta` the engine may still need: the
+/// configured threshold or the ETA, whichever is longer, capped.
+fn bound_over(wedge: Duration, eta: Duration) -> Duration {
+    wedge.max(eta).min(wedge.max(WEDGE_BOUND_CAP))
+}
+
+/// How long a disaggregated prefill leg of `prompt_tokens` dispatched to
+/// `worker` now may produce nothing before its request gives up on it: the
+/// wedge rule's bound, with the leg's own prompt behind what the worker is
+/// already prefilling ([`Worker::prefill_eta`]), so a long prompt on a busy
+/// worker gets the time its measured rate says it needs, a short one the
+/// configured threshold, and nothing more than the cap. A PD leg joins no
+/// pile and is never vetoed by one; the request is what the bound ends.
+/// `None` when the rule is off (a zero threshold).
+pub(crate) fn prefill_leg_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
+    let (_, wedge, _) = thresholds();
+    prefill_leg_bound_with(worker, prompt_tokens, wedge)
+}
+
+/// [`prefill_leg_bound`] at the given wedge threshold.
+fn prefill_leg_bound_with(
+    worker: &Arc<dyn Worker>,
+    prompt_tokens: u64,
+    wedge: Duration,
+) -> Option<Duration> {
+    (!wedge.is_zero()).then(|| bound_over(wedge, worker.prefill_eta(prompt_tokens)))
+}
+
+/// Whether a prefill leg past its own bound waits on, and how much longer.
+/// A leg is given up on only when its worker is silent as a whole, with no
+/// first response on any prompt within the bound, as the pile rule judges
+/// a worker by its pile and not by one request. A worker that answered
+/// another leg a moment ago is backed up, not frozen (on the parallel
+/// dispatch shape a leg's first response also waits for the decode side to
+/// admit it), so the leg waits until a bound has passed since that answer.
+/// `None` when the worker has answered nothing within the bound, or ever:
+/// the verdict.
+pub(crate) fn prefill_leg_reprieve(worker: &Arc<dyn Worker>, bound: Duration) -> Option<Duration> {
+    reprieve(worker.prefill_answered_ago(), bound)
+}
+
+/// [`prefill_leg_reprieve`] for a worker whose latest first response was
+/// `answered_ago` (`None`: never).
+fn reprieve(answered_ago: Option<Duration>, bound: Duration) -> Option<Duration> {
+    bound
+        .checked_sub(answered_ago?)
+        .filter(|left| !left.is_zero())
 }
 
 static THRESHOLDS: OnceLock<(Duration, Duration, Duration)> = OnceLock::new();
@@ -759,6 +814,82 @@ mod tests {
         assert!(wedged_by_queue(8, 8, 8, silent, bound), "standing queue");
         assert!(wedged_by_pile(8, 8, silent, bound), "deep pile");
         assert!(!wedged_by_pile(8, 8, Duration::from_millis(2_900), bound));
+    }
+
+    #[test]
+    fn a_prefill_legs_bound_follows_its_prompt_the_workers_rate_and_the_cap() {
+        // A disaggregated prefill leg is bounded like the pile rule bounds a
+        // worker: the threshold for a short prompt on an idle worker, the
+        // prefill time its prompt needs behind what is already pending at
+        // the worker's rate (the cold prior of 10k tokens/s until one is
+        // measured), never more than the cap.
+        let w = worker();
+        assert_eq!(
+            prefill_leg_bound_with(&w, 256, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE),
+            "26 ms of prefill is inside the threshold"
+        );
+        assert_eq!(
+            prefill_leg_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            Some(Duration::from_millis(3_276)),
+            "a 32k prompt on a cold worker"
+        );
+        w.note_prefill_started(8 * 32_768, true);
+        assert_eq!(
+            prefill_leg_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            Some(Duration::from_millis(29_491)),
+            "behind eight pending 32k prompts"
+        );
+        w.note_prefill_ended(8 * 32_768, true, Some(0));
+        assert_eq!(
+            prefill_leg_bound_with(&w, 100_000_000, DEFAULT_WEDGE),
+            Some(WEDGE_BOUND_CAP),
+            "capped"
+        );
+        assert_eq!(
+            prefill_leg_bound_with(&w, 100_000_000, Duration::from_secs(600)),
+            Some(Duration::from_secs(600)),
+            "a longer configured threshold stands"
+        );
+        assert_eq!(
+            prefill_leg_bound_with(&w, 32_768, Duration::ZERO),
+            None,
+            "a zero threshold turns the bound off"
+        );
+    }
+
+    #[test]
+    fn a_prefill_leg_past_its_bound_waits_on_while_its_worker_answers_other_legs() {
+        // The verdict is on the worker, not the leg: a worker that has
+        // answered nothing (ever, or within the bound) is silent and the leg
+        // is given up on; one that answered another leg a moment ago is
+        // backed up, and the leg waits until a bound has passed since that
+        // answer.
+        let bound = DEFAULT_WEDGE;
+        assert_eq!(reprieve(None, bound), None, "never answered: silent");
+        assert_eq!(
+            reprieve(Some(Duration::from_millis(600)), bound),
+            Some(Duration::from_millis(2_400)),
+            "answered 0.6 s ago: the leg waits the rest of a bound"
+        );
+        assert_eq!(
+            reprieve(Some(bound), bound),
+            None,
+            "a bound has passed since the latest answer"
+        );
+        assert_eq!(reprieve(Some(Duration::from_secs(10)), bound), None);
+        let w = worker();
+        assert_eq!(
+            prefill_leg_reprieve(&w, bound),
+            None,
+            "a fresh worker has answered nothing"
+        );
+        w.note_prefill_started(256, true);
+        w.note_prefill_ended(256, true, Some(0));
+        assert!(
+            prefill_leg_reprieve(&w, bound).is_some_and(|left| left > Duration::from_secs(2)),
+            "answered just now: a bound's reprieve, less the moment since"
+        );
     }
 
     #[test]

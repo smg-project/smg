@@ -20,6 +20,15 @@ use smg::{
     worker::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType},
 };
 
+// The gateway binary runs on jemalloc (see `src/main.rs`). The benchmark links
+// the same allocator so that its numbers describe the binary that ships rather
+// than the system allocator: the request path allocates on every JSON
+// (de)serialization and bootstrap injection, so the allocator shows up
+// directly in these timings.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn create_test_worker() -> BasicWorker {
     BasicWorkerBuilder::new("http://test-server:8000")
         .worker_type(WorkerType::Prefill)

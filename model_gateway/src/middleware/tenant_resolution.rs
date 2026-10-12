@@ -20,7 +20,11 @@ use axum::{
 use super::request_id::RequestId;
 use crate::{
     config::{RouterConfig, TenantResolutionConfig},
-    tenant::{canonical_tenant_key, DataPlaneCaller, RouteRequestMeta, TenantIdentity, TenantKey},
+    routers::error,
+    tenant::{
+        canonical_tenant_key, DataPlaneCaller, RouteRequestMeta, TenantIdentity, TenantKey,
+        MAX_TENANT_ID_LEN,
+    },
 };
 
 /// When the gateway took the request in: stamped on the route request meta as
@@ -98,21 +102,39 @@ impl TenantResolutionState {
     }
 }
 
-fn resolve_raw_tenant_key(state: &TenantResolutionState, request: &Request<Body>) -> TenantKey {
+/// The caller's tenant key, or the 400 a trusted tenant header earns when its
+/// value is longer than [`MAX_TENANT_ID_LEN`] (the key is stored with every
+/// response and conversation; a longer one would fail on the SQL backends
+/// only, and silently dropping it would leave the request without a tenant).
+fn resolve_raw_tenant_key(
+    state: &TenantResolutionState,
+    request: &Request<Body>,
+) -> Result<TenantKey, Response> {
     if let Some(caller) = request.extensions().get::<DataPlaneCaller>() {
-        return caller.tenant_key().clone();
+        return Ok(caller.tenant_key().clone());
     }
     if state.trust_tenant_header {
         if let Some(tenant_id) = extract_trusted_tenant_id(state, request.headers()) {
-            return canonical_tenant_key(TenantIdentity::Header(Arc::from(tenant_id)));
+            if tenant_id.len() > MAX_TENANT_ID_LEN {
+                return Err(error::bad_request(
+                    "invalid_tenant_header",
+                    format!(
+                        "The {} header value is longer than {MAX_TENANT_ID_LEN} characters",
+                        state.trusted_tenant_header_name
+                    ),
+                ));
+            }
+            return Ok(canonical_tenant_key(TenantIdentity::Header(Arc::from(
+                tenant_id,
+            ))));
         }
     }
 
     if let Some(ConnectInfo(addr)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return canonical_tenant_key(TenantIdentity::IpAddress(addr.ip()));
+        return Ok(canonical_tenant_key(TenantIdentity::IpAddress(addr.ip())));
     }
 
-    canonical_tenant_key(TenantIdentity::Anonymous)
+    Ok(canonical_tenant_key(TenantIdentity::Anonymous))
 }
 
 fn extract_trusted_tenant_id<'a>(
@@ -126,18 +148,20 @@ fn extract_trusted_tenant_id<'a>(
         .filter(|value| !value.is_empty())
 }
 
+/// The request's route meta, or the answer a request with an unusable tenant
+/// header gets (see [`resolve_raw_tenant_key`]).
 pub fn resolve_route_request_meta(
     state: &TenantResolutionState,
     request: &Request<Body>,
-) -> RouteRequestMeta {
-    let meta = RouteRequestMeta::new(resolve_raw_tenant_key(state, request))
+) -> Result<RouteRequestMeta, Response> {
+    let meta = RouteRequestMeta::new(resolve_raw_tenant_key(state, request)?)
         .with_extension(AcceptedAt::now());
     // Carry the middleware request id so backend request ids derive from it
     // (RequestIdLayer runs outside this middleware).
-    match request.extensions().get::<RequestId>() {
+    Ok(match request.extensions().get::<RequestId>() {
         Some(request_id) => meta.with_extension(request_id.clone()),
         None => meta,
-    }
+    })
 }
 
 pub async fn route_request_meta_middleware(
@@ -145,7 +169,10 @@ pub async fn route_request_meta_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let request_meta = resolve_route_request_meta(&state, &request);
+    let request_meta = match resolve_route_request_meta(&state, &request) {
+        Ok(request_meta) => request_meta,
+        Err(response) => return response,
+    };
     request.extensions_mut().insert(request_meta);
     next.run(request).await
 }
@@ -200,7 +227,7 @@ mod tests {
             .extensions_mut()
             .insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
 
-        let request_meta = resolve_route_request_meta(&state, &request);
+        let request_meta = resolve_route_request_meta(&state, &request).expect("a tenant resolves");
         assert_eq!(request_meta.tenant_key().as_str(), "auth:b3c2");
     }
 
@@ -221,8 +248,48 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let request_meta = resolve_route_request_meta(&state, &request);
+        let request_meta = resolve_route_request_meta(&state, &request).expect("a tenant resolves");
         assert_eq!(request_meta.tenant_key().as_str(), "header:team-red");
+    }
+
+    /// A trusted tenant header longer than the bound is refused with 400
+    /// rather than stored, dropped or truncated.
+    #[tokio::test]
+    async fn an_over_long_trusted_tenant_header_is_refused() {
+        let mut config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        config.tenant_resolution.trust_tenant_header = true;
+        let state = TenantResolutionState::new(&config).unwrap();
+        let longest = "t".repeat(MAX_TENANT_ID_LEN);
+        let request = Request::builder()
+            .uri("/")
+            .header(DEFAULT_TENANT_HEADER_NAME, longest.as_str())
+            .body(Body::empty())
+            .unwrap();
+        let meta = resolve_route_request_meta(&state, &request).expect("at the bound");
+        assert_eq!(meta.tenant_key().as_str(), format!("header:{longest}"));
+
+        let request = Request::builder()
+            .uri("/")
+            .header(
+                DEFAULT_TENANT_HEADER_NAME,
+                "t".repeat(MAX_TENANT_ID_LEN + 1),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let refused = resolve_route_request_meta(&state, &request).expect_err("over the bound");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            refused
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "invalid_tenant_header"
+        );
     }
 
     #[tokio::test]
@@ -233,7 +300,7 @@ mod tests {
             "203.0.113.42:443".parse::<SocketAddr>().unwrap(),
         ));
 
-        let request_meta = resolve_route_request_meta(&state, &request);
+        let request_meta = resolve_route_request_meta(&state, &request).expect("a tenant resolves");
         assert_eq!(request_meta.tenant_key().as_str(), "ip:203.0.113.42");
     }
 
@@ -245,7 +312,7 @@ mod tests {
             .extensions_mut()
             .insert(RequestId("chatcmpl-abc123".to_string()));
 
-        let request_meta = resolve_route_request_meta(&state, &request);
+        let request_meta = resolve_route_request_meta(&state, &request).expect("a tenant resolves");
         assert_eq!(
             request_meta
                 .extension::<RequestId>()
@@ -260,7 +327,7 @@ mod tests {
         let before = Instant::now();
         let request = Request::builder().uri("/").body(Body::empty()).unwrap();
 
-        let request_meta = resolve_route_request_meta(&state, &request);
+        let request_meta = resolve_route_request_meta(&state, &request).expect("a tenant resolves");
         let accepted = request_meta
             .extension::<AcceptedAt>()
             .expect("the meta carries when the gateway accepted the request");
@@ -313,7 +380,7 @@ mod tests {
         let state = resolution_state();
         let request = Request::builder().uri("/").body(Body::empty()).unwrap();
 
-        let request_meta = resolve_route_request_meta(&state, &request);
+        let request_meta = resolve_route_request_meta(&state, &request).expect("a tenant resolves");
         assert_eq!(request_meta.tenant_key().as_str(), "anonymous");
     }
 

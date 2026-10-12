@@ -142,7 +142,7 @@ pub(super) fn complete_with_prompt(
 
 /// The mock server accepts the client connection. This test supplies the
 /// response frames and controls EOF.
-pub(super) async fn scripted_stream(
+pub(crate) async fn scripted_stream(
     responses: Vec<proto::GenerateResponse>,
     grpc_status: &'static str,
 ) -> (ProtoStream, JoinHandle<()>) {
@@ -1614,6 +1614,64 @@ async fn chat_stream_keeps_logprobs_on_reasoning_deltas() {
         }
     }
     assert!(with_text >= 2, "{events:?}");
+}
+
+/// A unary response's logprobs cover its content's tokens, as the content
+/// deltas of a stream do: not the reasoning, its delimiters, or the tokens
+/// after a stop sequence.
+#[tokio::test]
+async fn chat_unary_logprobs_cover_the_content_only() {
+    let text = "<think>why</think>okSTOPmore";
+    let token_ids: Vec<u32> = text.chars().map(u32::from).collect();
+    let mut last = complete(0, "stop");
+    if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+        complete.output_logprobs = Some(proto::OutputLogProbs {
+            token_logprobs: (0..token_ids.len()).map(|i| -(i as f32)).collect(),
+            token_ids: token_ids.clone(),
+            top_logprobs: Vec::new(),
+        });
+        complete.output_ids = token_ids;
+    }
+    let (stream, server) = scripted_stream(vec![last], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let stop = Some(StringOrArray::String("STOP".to_string()));
+    let mut decoder =
+        utils::create_stop_decoder(&tokenizer, stop.as_ref(), None, false, false, false);
+    let response = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::new(
+            Arc::new(WorkerRegistry::new()),
+            None,
+            Some("qwen3".to_string()),
+        ),
+    )
+    .process_non_streaming_chat_response(
+        context::ExecutionResult::Single { stream },
+        chat_spec(false),
+        dispatch(),
+        tokenizer,
+        &mut decoder,
+        false,
+    )
+    .await
+    .unwrap_or_else(|response| panic!("{}", response.status()));
+    server.abort();
+    let choice = &serde_json::to_value(response).unwrap()["choices"][0];
+    assert_eq!(choice["message"]["reasoning_content"], "why");
+    assert_eq!(choice["message"]["content"], "ok");
+    let logprobs: Vec<(&str, f64)> = choice["logprobs"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["token"].as_str().unwrap(),
+                item["logprob"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(logprobs, [("o", -18.0), ("k", -19.0)]);
 }
 
 #[tokio::test]

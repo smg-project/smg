@@ -6,6 +6,10 @@ use tracing::info;
 use url::Url;
 
 use crate::{
+    bounded::{
+        BoundedConversationItemStorage, BoundedConversationStorage, BoundedResponseStorage,
+        CallBound,
+    },
     config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig},
     core::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     hooked::{HookedConversationItemStorage, HookedConversationStorage, HookedResponseStorage},
@@ -82,6 +86,14 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             let postgres_cfg = config
                 .postgres
                 .ok_or("Postgres configuration is required when history_backend=postgres")?;
+            // Every entry path (the CLI, the Python bindings, a RouterConfig
+            // built by hand) reaches this point: the numeric bounds are checked
+            // here, so a bound of 0 s is refused by name instead of failing
+            // every call once the gateway is up. The connection string is left
+            // to the driver (the CLI's `validate()` checks its URL shape).
+            postgres_cfg
+                .validate_bounds()
+                .map_err(|e| format!("Invalid Postgres configuration: {e}"))?;
 
             let log_db_url = match Url::parse(&postgres_cfg.db_url) {
                 Ok(mut url) => {
@@ -94,11 +106,14 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             };
 
             info!(
-                "Initializing data connector: Postgres (db_url: {}, pool_max: {})",
-                log_db_url, postgres_cfg.pool_max
+                "Initializing data connector: Postgres (db_url: {}, pool_max: {}, op_timeout_secs: {})",
+                log_db_url, postgres_cfg.pool_max, postgres_cfg.op_timeout_secs
             );
 
-            let storages = create_postgres_storage(postgres_cfg).await?;
+            let storages = bounded(
+                create_postgres_storage(postgres_cfg).await?,
+                CallBound::new("postgres", postgres_cfg.op_timeout()),
+            );
 
             info!("Data connector initialized successfully: Postgres");
             storages
@@ -107,6 +122,11 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             let redis_cfg = config
                 .redis
                 .ok_or("Redis configuration is required when history_backend=redis")?;
+            // The same numeric bounds as the Postgres path; the URL is the
+            // driver's (a socket path included).
+            redis_cfg
+                .validate_bounds()
+                .map_err(|e| format!("Invalid Redis configuration: {e}"))?;
 
             let log_redis_url = match Url::parse(&redis_cfg.url) {
                 Ok(mut url) => {
@@ -119,11 +139,14 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             };
 
             info!(
-                "Initializing data connector: Redis (url: {}, pool_max: {})",
-                log_redis_url, redis_cfg.pool_max
+                "Initializing data connector: Redis (url: {}, pool_max: {}, op_timeout_secs: {})",
+                log_redis_url, redis_cfg.pool_max, redis_cfg.op_timeout_secs
             );
 
-            let storages = create_redis_storage(redis_cfg)?;
+            let storages = bounded(
+                create_redis_storage(redis_cfg)?,
+                CallBound::new("redis", redis_cfg.op_timeout()),
+            );
 
             info!("Data connector initialized successfully: Redis");
             storages
@@ -152,6 +175,23 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
     }
 }
 
+/// Every call to a remote store under the backend's call bound (see the
+/// `bounded` module); the hook wrappers go around these, so a hook's own time
+/// does not count against the bound.
+fn bounded(bundle: StorageBundle, bound: CallBound) -> StorageBundle {
+    StorageBundle {
+        response_storage: Arc::new(BoundedResponseStorage::new(bundle.response_storage, bound)),
+        conversation_storage: Arc::new(BoundedConversationStorage::new(
+            bundle.conversation_storage,
+            bound,
+        )),
+        conversation_item_storage: Arc::new(BoundedConversationItemStorage::new(
+            bundle.conversation_item_storage,
+            bound,
+        )),
+    }
+}
+
 /// Create Oracle storage backends with a single shared connection pool.
 fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, String> {
     use crate::oracle::OracleStore;
@@ -174,24 +214,18 @@ fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, Str
 
 async fn create_postgres_storage(postgres_cfg: &PostgresConfig) -> Result<StorageBundle, String> {
     let store = PostgresStore::new(postgres_cfg.clone())?;
+    // The tables, the schema version and the indexes: once per database, in
+    // one transaction under the schema lock, so gateways starting together
+    // take turns and a fresh database starts at the latest version.
+    store
+        .bootstrap()
+        .await
+        .map_err(|err| format!("failed to initialize the Postgres schema: {err}"))?;
     let postgres_resp = PostgresResponseStorage::new(store.clone())
         .await
         .map_err(|err| format!("failed to initialize Postgres response storage: {err}"))?;
-    let postgres_conv = PostgresConversationStorage::new(store.clone())
-        .await
-        .map_err(|err| format!("failed to initialize Postgres conversation storage: {err}"))?;
-    let postgres_item = PostgresConversationItemStorage::new(store.clone())
-        .await
-        .map_err(|err| format!("failed to initialize Postgres conversation item storage: {err}"))?;
-
-    // Run versioned migrations after all tables are created
-    let applied = store.run_migrations().await?;
-
-    // Re-create indexes that were deferred during init because
-    // migration-added columns did not yet exist.
-    if !applied.is_empty() {
-        store.ensure_response_indexes().await?;
-    }
+    let postgres_conv = PostgresConversationStorage::new(store.clone());
+    let postgres_item = PostgresConversationItemStorage::new(store);
 
     Ok(StorageBundle {
         response_storage: Arc::new(postgres_resp),
@@ -246,6 +280,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: None,
                 metadata: None,
+                tenant: None,
             })
             .await
             .unwrap();
@@ -263,6 +298,7 @@ mod tests {
                 role: Some("user".to_string()),
                 content: json!([]),
                 status: Some("completed".to_string()),
+                tenant: None,
             })
             .await
             .unwrap();
@@ -306,6 +342,50 @@ mod tests {
         .err()
         .expect("should fail");
         assert!(err.contains("oracle configuration is required"));
+    }
+
+    /// A store config reaches the factory from every entry path (the CLI, the
+    /// Python bindings, a config built by hand); a bound of 0 s is refused by
+    /// name here, before any connection, instead of failing every store call
+    /// once the gateway is up.
+    #[tokio::test]
+    async fn a_zero_call_bound_is_refused_by_the_factory_before_any_connection() {
+        let postgres_cfg = PostgresConfig {
+            db_url: "postgres://user:pass@localhost:5432/mydb".to_string(),
+            pool_max: 4,
+            op_timeout_secs: 0,
+            schema: None,
+        };
+        let err = create_storage(StorageFactoryConfig {
+            backend: &HistoryBackend::Postgres,
+            oracle: None,
+            postgres: Some(&postgres_cfg),
+            redis: None,
+            hook: None,
+        })
+        .await
+        .err()
+        .expect("a zero bound is refused");
+        assert!(err.contains("op_timeout_secs"), "{err}");
+
+        let redis_cfg = RedisConfig {
+            url: "redis://localhost:6379".to_string(),
+            pool_max: 4,
+            op_timeout_secs: 0,
+            retention_days: Some(1),
+            schema: None,
+        };
+        let err = create_storage(StorageFactoryConfig {
+            backend: &HistoryBackend::Redis,
+            oracle: None,
+            postgres: None,
+            redis: Some(&redis_cfg),
+            hook: None,
+        })
+        .await
+        .err()
+        .expect("a zero bound is refused");
+        assert!(err.contains("op_timeout_secs"), "{err}");
     }
 
     #[tokio::test]
@@ -398,6 +478,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: None,
                 metadata: None,
+                tenant: None,
             })
             .await
             .unwrap();
@@ -415,6 +496,7 @@ mod tests {
                 role: Some("user".to_string()),
                 content: json!([]),
                 status: Some("completed".to_string()),
+                tenant: None,
             })
             .await
             .unwrap();

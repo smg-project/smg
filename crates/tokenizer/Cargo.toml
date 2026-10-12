@@ -72,3 +72,7 @@ workspace = true
 [[bench]]
 name = "encode_cost"
 harness = false
+
+[[bench]]
+name = "byte_fallback_invalid_run"
+harness = false

@@ -4,12 +4,14 @@ use std::{str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{ClientWrapper, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde_json::Value;
-use tokio_postgres::{IsolationLevel, NoTls, Row};
+use tokio_postgres::{types::ToSql, IsolationLevel, NoTls, Row};
 
 use crate::{
-    common::{build_response_select_base, extra_column_defs, resolve_extra_column_values},
+    common::{
+        build_response_select_base, describe_error, extra_column_defs, resolve_extra_column_values,
+    },
     config::PostgresConfig,
     context::current_extra_columns,
     core::{
@@ -21,6 +23,11 @@ use crate::{
     },
     postgres_migrations::POSTGRES_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
+    versioning::{
+        postgres_create_versions_table, postgres_current_version, postgres_table_exists,
+        run_postgres_migrations, schema_ahead_check, stamp_postgres_versions,
+        POSTGRES_SCHEMA_LOCK_ID, VERSIONS_TABLE,
+    },
 };
 
 // ── Store ────────────────────────────────────────────────────────────────
@@ -36,58 +43,212 @@ impl PostgresStore {
         schema.validate()?;
         let schema = Arc::new(schema);
 
-        let pg_config = tokio_postgres::Config::from_str(config.db_url.as_str())
+        let mut pg_config = tokio_postgres::Config::from_str(config.db_url.as_str())
             .map_err(|e| format!("Invalid PostgreSQL connection URL: {e}"))?;
+        // Each call as a whole is bounded by the `bounded` wrappers the
+        // factory installs. The pool and the driver bound their own steps
+        // (connecting, unless the URL sets its own `connect_timeout`; waiting
+        // for a pooled connection; creating one; recycling one) at twice that
+        // bound: backstops that clean up after a call the wrapper has already
+        // answered, never the first to fire.
+        let backstop = config.op_timeout().saturating_mul(2);
+        if pg_config.get_connect_timeout().is_none() {
+            pg_config.connect_timeout(backstop);
+        }
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
         let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
         let pool = Pool::builder(mgr)
             .max_size(config.pool_max)
+            .wait_timeout(Some(backstop))
+            .create_timeout(Some(backstop))
+            .recycle_timeout(Some(backstop))
+            .runtime(Runtime::Tokio1)
             .build()
             .map_err(|e| format!("Failed to build PostgreSQL connection pool: {e}"))?;
 
         Ok(Self { pool, schema })
     }
 
-    /// Run versioned schema migrations after tables have been created.
-    pub(crate) async fn run_migrations(&self) -> Result<Vec<u32>, String> {
-        let mut client = self
-            .pool
-            .get()
+    /// Brings the database to the schema this build expects, once per
+    /// database and in turn across gateways: one transaction under the schema
+    /// advisory lock creates the versions table, refuses a database whose
+    /// recorded version is ahead of the migrations this build knows (before
+    /// any history table is touched, see `schema_ahead_check`), creates the
+    /// history tables (`IF NOT EXISTS`), records every migration as applied
+    /// when the responses table did not exist before (a first start creates
+    /// the tables in their final shape, so nothing is pending and no
+    /// `auto_migrate` is needed), applies the pending migrations otherwise
+    /// (or refuses when `auto_migrate` is off), and creates the indexes
+    /// last, once the columns they cover exist. Gateways starting together
+    /// on an empty database all come up: the next one waits for the first's
+    /// commit and finds the schema in place.
+    pub(crate) async fn bootstrap(&self) -> Result<(), String> {
+        let mut client = self.pool.get().await.map_err(|e| {
+            format!(
+                "failed to get a connection for the schema bootstrap: {}",
+                describe_error(&e)
+            )
+        })?;
+        // READ COMMITTED whatever the server's default isolation: the version
+        // rows are read after the lock wait, in a snapshot taken then. Under a
+        // REPEATABLE READ default the snapshot would be the lock statement's
+        // own, taken before the wait, and a gateway queued behind another's
+        // bootstrap would read the versions table as it was before that
+        // bootstrap (the tables there, the versions not) and refuse, or apply
+        // the migrations again.
+        let mut tx = client
+            .build_transaction()
+            .isolation_level(IsolationLevel::ReadCommitted)
+            .start()
             .await
-            .map_err(|e| format!("failed to get connection for migrations: {e}"))?;
-        crate::versioning::run_postgres_migrations(
-            &mut client,
-            &self.schema,
-            &POSTGRES_HISTORY_MIGRATIONS,
-            self.schema.version,
-            self.schema.auto_migrate,
+            .map_err(|e| {
+                format!(
+                    "failed to begin the schema bootstrap: {}",
+                    describe_error(&e)
+                )
+            })?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&POSTGRES_SCHEMA_LOCK_ID],
         )
         .await
-    }
+        .map_err(|e| format!("failed to acquire the schema lock: {}", describe_error(&e)))?;
+        tx.batch_execute(&postgres_create_versions_table())
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to create {VERSIONS_TABLE} table: {}",
+                    describe_error(&e)
+                )
+            })?;
 
-    /// Create indexes that may have been deferred during init because
-    /// migration-added columns did not yet exist.
-    pub(crate) async fn ensure_response_indexes(&self) -> Result<(), String> {
-        let s = &self.schema.responses;
-        if s.is_skipped("safety_identifier") {
-            return Ok(());
+        let schema = &self.schema;
+        // The store's version against this build's migrations first, before
+        // any table is touched: a store a newer build migrated forward is
+        // refused here whatever the responses table looks like (a table that
+        // a newer migration renamed or dropped would otherwise read as a
+        // fresh database and be re-created in its legacy shape).
+        let current = postgres_current_version(&*tx).await?;
+        schema_ahead_check(
+            "postgres",
+            current,
+            &POSTGRES_HISTORY_MIGRATIONS,
+            schema.version,
+        )?;
+        let responses_table = schema.responses.qualified_table(schema.owner.as_deref());
+        let fresh = !postgres_table_exists(&tx, &responses_table).await?;
+        for ddl in [
+            PostgresConversationStorage::table_ddl(schema),
+            PostgresConversationItemStorage::table_ddl(schema),
+            PostgresResponseStorage::table_ddl(schema),
+        ] {
+            tx.batch_execute(&ddl).await.map_err(|e| {
+                format!(
+                    "failed to create the history tables: {}",
+                    describe_error(&e)
+                )
+            })?;
         }
-        let table = s.qualified_table(self.schema.owner.as_deref());
-        let col = s.col("safety_identifier");
-        let idx_ddl =
-            format!("CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({col});");
-        let client = self
-            .pool
-            .get()
+
+        if fresh {
+            stamp_postgres_versions(&tx, &POSTGRES_HISTORY_MIGRATIONS).await?;
+            tracing::info!(
+                schema_version = POSTGRES_HISTORY_MIGRATIONS.last().map_or(0, |m| m.version),
+                "fresh database: history tables created at the latest schema version"
+            );
+            // The unstored-record index is built here, on the table just created
+            // and still empty: on a populated table the build would hold a share
+            // lock on it inside this transaction, blocking every replica's writes
+            // and the other gateways waiting on the schema lock. An existing
+            // table gets it from its operator, concurrently (see the release
+            // note); the sweep works without it, as a scan.
+            if let Some(index_ddl) = PostgresResponseStorage::unstored_index_ddl(schema) {
+                let index = tx.savepoint("unstored_index").await.map_err(|e| {
+                    format!(
+                        "failed to open the unstored index savepoint: {}",
+                        describe_error(&e)
+                    )
+                })?;
+                match index.batch_execute(&index_ddl).await {
+                    Ok(()) => index.commit().await.map_err(|e| {
+                        format!(
+                            "failed to release the unstored index savepoint: {}",
+                            describe_error(&e)
+                        )
+                    })?,
+                    Err(e) => {
+                        tracing::warn!(
+                            "unstored response index not created (the sweep of unstored background records scans the table): {}",
+                            describe_error(&e)
+                        );
+                        index.rollback().await.map_err(|e| {
+                            format!(
+                                "failed to roll back the unstored index savepoint: {}",
+                                describe_error(&e)
+                            )
+                        })?;
+                    }
+                }
+            }
+        } else {
+            run_postgres_migrations(
+                &tx,
+                schema,
+                &POSTGRES_HISTORY_MIGRATIONS,
+                schema.version,
+                schema.auto_migrate,
+            )
+            .await?;
+        }
+
+        // The indexes last, so the share lock a `CREATE INDEX IF NOT EXISTS`
+        // takes on its table is not held while the migrations wait for their
+        // own locks: the links index on columns the table always has, then
+        // the safety-identifier index, whose column exists once the
+        // migrations ran. A table the operator declared up to date without
+        // the column keeps starting without that index, as before.
+        tx.batch_execute(&PostgresConversationItemStorage::index_ddl(schema))
             .await
-            .map_err(|e| format!("failed to get connection for index creation: {e}"))?;
-        client
-            .batch_execute(&idx_ddl)
-            .await
-            .map_err(|e| format!("failed to create response index: {e}"))?;
-        Ok(())
+            .map_err(|e| {
+                format!(
+                    "failed to create the conversation item links index: {}",
+                    describe_error(&e)
+                )
+            })?;
+        if let Some(index_ddl) = PostgresResponseStorage::index_ddl(schema) {
+            let index = tx.savepoint("response_index").await.map_err(|e| {
+                format!("failed to open the index savepoint: {}", describe_error(&e))
+            })?;
+            match index.batch_execute(&index_ddl).await {
+                Ok(()) => index.commit().await.map_err(|e| {
+                    format!(
+                        "failed to release the index savepoint: {}",
+                        describe_error(&e)
+                    )
+                })?,
+                Err(e) => {
+                    tracing::warn!(
+                        "response index not created (the safety_identifier column may be missing): {}",
+                        describe_error(&e)
+                    );
+                    index.rollback().await.map_err(|e| {
+                        format!(
+                            "failed to roll back the index savepoint: {}",
+                            describe_error(&e)
+                        )
+                    })?;
+                }
+            }
+        }
+
+        tx.commit().await.map_err(|e| {
+            format!(
+                "failed to commit the schema bootstrap: {}",
+                describe_error(&e)
+            )
+        })
     }
 }
 
@@ -98,6 +259,43 @@ impl Clone for PostgresStore {
             schema: self.schema.clone(),
         }
     }
+}
+
+// ── Cached statements ────────────────────────────────────────────────────
+//
+// A statement passed as text costs two round trips per call: the parse and
+// the execute. Prepared once and cached on the connection (the pool keeps the
+// cache with the connection), every later call is one round trip, which is
+// what a store a few milliseconds away multiplies by.
+
+/// Runs `sql` as a statement prepared once per connection.
+async fn query_cached(
+    client: &ClientWrapper,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Vec<Row>, tokio_postgres::Error> {
+    let statement = client.prepare_cached(sql).await?;
+    client.query(&statement, params).await
+}
+
+/// Runs `sql` as a statement prepared once per connection; one row.
+async fn query_one_cached(
+    client: &ClientWrapper,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Row, tokio_postgres::Error> {
+    let statement = client.prepare_cached(sql).await?;
+    client.query_one(&statement, params).await
+}
+
+/// Runs `sql` as a statement prepared once per connection; the rows affected.
+async fn execute_cached(
+    client: &ClientWrapper,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<u64, tokio_postgres::Error> {
+    let statement = client.prepare_cached(sql).await?;
+    client.execute(&statement, params).await
 }
 
 /// Name of a JSON value's type, for error messages that must not echo
@@ -118,9 +316,15 @@ pub(super) struct PostgresConversationStorage {
 }
 
 impl PostgresConversationStorage {
-    pub async fn new(store: PostgresStore) -> Result<Self, ConversationStorageError> {
-        let s = &store.schema.conversations;
-        let table = s.qualified_table(store.schema.owner.as_deref());
+    pub fn new(store: PostgresStore) -> Self {
+        Self { store }
+    }
+
+    /// The conversations table in its current shape, created by the store's
+    /// bootstrap (`IF NOT EXISTS`).
+    pub(crate) fn table_ddl(schema: &SchemaConfig) -> String {
+        let s = &schema.conversations;
+        let table = s.qualified_table(schema.owner.as_deref());
 
         let mut col_defs = vec![format!("{} VARCHAR(64) PRIMARY KEY", s.col("id"))];
         if !s.is_skipped("created_at") {
@@ -129,23 +333,15 @@ impl PostgresConversationStorage {
         if !s.is_skipped("metadata") {
             col_defs.push(format!("{} JSON", s.col("metadata")));
         }
+        if !s.is_skipped("tenant") {
+            col_defs.push(format!("{} VARCHAR(255)", s.col("tenant")));
+        }
         col_defs.extend(extra_column_defs(s));
 
-        let ddl = format!(
+        format!(
             "CREATE TABLE IF NOT EXISTS {table} ({});",
             col_defs.join(", ")
-        );
-
-        let client = store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-        client
-            .batch_execute(&ddl)
-            .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-        Ok(Self { store })
+        )
     }
 
     /// Postgres stores metadata as a native `JSON` column, so it round-trips as
@@ -187,7 +383,7 @@ impl ConversationStorage for PostgresConversationStorage {
         let table = s.qualified_table(self.store.schema.owner.as_deref());
 
         let mut col_names: Vec<&str> = vec![s.col("id")];
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id_str];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id_str];
         if !s.is_skipped("created_at") {
             col_names.push(s.col("created_at"));
             params.push(&created_at);
@@ -195,6 +391,10 @@ impl ConversationStorage for PostgresConversationStorage {
         if !s.is_skipped("metadata") {
             col_names.push(s.col("metadata"));
             params.push(&metadata_value);
+        }
+        if !s.is_skipped("tenant") {
+            col_names.push(s.col("tenant"));
+            params.push(&conversation.tenant);
         }
 
         // Append extra columns from hooks or defaults
@@ -219,11 +419,10 @@ impl ConversationStorage for PostgresConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-        client
-            .execute(&sql, &params)
+            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+        execute_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
         Ok(conversation)
     }
 
@@ -242,6 +441,9 @@ impl ConversationStorage for PostgresConversationStorage {
         if !s.is_skipped("metadata") {
             select_cols.push(s.col("metadata").to_string());
         }
+        if !s.is_skipped("tenant") {
+            select_cols.push(s.col("tenant").to_string());
+        }
 
         let sql = format!(
             "SELECT {} FROM {table} WHERE {col_id} = $1",
@@ -253,11 +455,10 @@ impl ConversationStorage for PostgresConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-        let rows = client
-            .query(&sql, &[&id.0.as_str()])
+            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+        let rows = query_cached(&client, &sql, &[&id.0.as_str()])
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -280,10 +481,16 @@ impl ConversationStorage for PostgresConversationStorage {
             })?
         };
         let metadata = Self::parse_metadata(metadata_json)?;
+        let tenant: Option<String> = if s.is_skipped("tenant") {
+            None
+        } else {
+            row.get(s.col("tenant"))
+        };
         Ok(Some(Conversation::with_parts(
             ConversationId(id_str),
             created_at,
             metadata,
+            tenant,
         )))
     }
 
@@ -292,71 +499,42 @@ impl ConversationStorage for PostgresConversationStorage {
         id: &ConversationId,
         metadata: Option<ConversationMetadata>,
     ) -> Result<Option<Conversation>, ConversationStorageError> {
+        // The row as stored (its creation time and its tenant come back as
+        // they are), then the one column the update moves.
+        let Some(current) = self.get_conversation(id).await? else {
+            return Ok(None);
+        };
         let s = &self.store.schema.conversations;
+        if s.is_skipped("metadata") {
+            return Ok(Some(Conversation {
+                metadata,
+                ..current
+            }));
+        }
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_id = s.col("id");
+        let col_meta = s.col("metadata");
 
+        // Bind the JSON column as `Value`, not a serialized `String` (see
+        // `create_conversation` for why `tokio-postgres` requires this).
+        let metadata_value: Option<Value> = metadata.clone().map(Value::Object);
         let client = self
             .store
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-
-        if s.is_skipped("metadata") {
-            // Nothing to update — just verify the row exists
-            let sql = format!("SELECT 1 FROM {table} WHERE {col_id} = $1");
-            let rows = client
-                .query(&sql, &[&id.0.as_str()])
-                .await
-                .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-            if rows.is_empty() {
-                return Ok(None);
-            }
-            let created_at = Utc::now();
-            return Ok(Some(Conversation::with_parts(
-                ConversationId(id.0.clone()),
-                created_at,
-                metadata,
-            )));
+            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+        let sql = format!("UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2");
+        let rows_affected = execute_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
+            .await
+            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+        if rows_affected == 0 {
+            return Ok(None);
         }
-
-        // Bind the JSON column as `Value`, not a serialized `String` (see
-        // `create_conversation` for why `tokio-postgres` requires this).
-        let metadata_value: Option<Value> = metadata.clone().map(Value::Object);
-        let col_meta = s.col("metadata");
-
-        let (_, created_at) = if s.is_skipped("created_at") {
-            let sql = format!("UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2");
-            let rows_affected = client
-                .execute(&sql, &[&metadata_value, &id.0.as_str()])
-                .await
-                .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-            if rows_affected == 0 {
-                return Ok(None);
-            }
-            (sql, Utc::now())
-        } else {
-            let col_created = s.col("created_at");
-            let sql = format!(
-                "UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2 RETURNING {col_created}"
-            );
-            let rows = client
-                .query(&sql, &[&metadata_value, &id.0.as_str()])
-                .await
-                .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-            if rows.is_empty() {
-                return Ok(None);
-            }
-            let created_at: DateTime<Utc> = rows[0].get(col_created);
-            (sql, created_at)
-        };
-
-        Ok(Some(Conversation::with_parts(
-            ConversationId(id.0.clone()),
-            created_at,
+        Ok(Some(Conversation {
             metadata,
-        )))
+            ..current
+        }))
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
@@ -369,14 +547,14 @@ impl ConversationStorage for PostgresConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
-        let rows_deleted = client
-            .execute(
-                &format!("DELETE FROM {table} WHERE {col_id} = $1"),
-                &[&id.0.as_str()],
-            )
-            .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+        let rows_deleted = execute_cached(
+            &client,
+            &format!("DELETE FROM {table} WHERE {col_id} = $1"),
+            &[&id.0.as_str()],
+        )
+        .await
+        .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
         Ok(rows_deleted > 0)
     }
 }
@@ -386,8 +564,14 @@ pub(super) struct PostgresConversationItemStorage {
 }
 
 impl PostgresConversationItemStorage {
-    pub async fn new(store: PostgresStore) -> Result<Self, ConversationItemStorageError> {
-        let schema = &store.schema;
+    pub fn new(store: PostgresStore) -> Self {
+        Self { store }
+    }
+
+    /// The conversation items and links tables in their current shape,
+    /// created by the store's bootstrap (`IF NOT EXISTS`); the links index is
+    /// `index_ddl`.
+    pub(crate) fn table_ddl(schema: &SchemaConfig) -> String {
         let si = &schema.conversation_items;
         let sl = &schema.conversation_item_links;
         let items_table = si.qualified_table(schema.owner.as_deref());
@@ -395,13 +579,14 @@ impl PostgresConversationItemStorage {
 
         // ── conversation_items DDL ──
         let mut item_col_defs = vec![format!("{} VARCHAR(64) PRIMARY KEY", si.col("id"))];
-        let item_core_cols: [(&str, &str); 6] = [
+        let item_core_cols: [(&str, &str); 7] = [
             ("response_id", "VARCHAR(64)"),
             ("item_type", "VARCHAR(32) NOT NULL"),
             ("role", "VARCHAR(32)"),
             ("content", "JSON"),
             ("status", "VARCHAR(32)"),
             ("created_at", "TIMESTAMPTZ"),
+            ("tenant", "VARCHAR(255)"),
         ];
         for (logical, sql_type) in &item_core_cols {
             if !si.is_skipped(logical) {
@@ -425,24 +610,25 @@ impl PostgresConversationItemStorage {
             "CONSTRAINT pk_conv_item_link PRIMARY KEY ({col_conv_id}, {col_item_id})"
         ));
 
-        let ddl = format!(
+        format!(
             "CREATE TABLE IF NOT EXISTS {items_table} ({});\n\
-             CREATE TABLE IF NOT EXISTS {links_table} ({});\n\
-             CREATE INDEX IF NOT EXISTS conv_item_links_conv_idx ON {links_table} ({col_conv_id}, {col_added_at});",
+             CREATE TABLE IF NOT EXISTS {links_table} ({});",
             item_col_defs.join(", "),
             link_col_defs.join(", "),
-        );
+        )
+    }
 
-        let client = store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-        client
-            .batch_execute(&ddl)
-            .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-        Ok(Self { store })
+    /// The index on the links table's conversation and time columns, created
+    /// by the bootstrap after the migrations, so the share lock it takes on
+    /// the table is not held while they run.
+    pub(crate) fn index_ddl(schema: &SchemaConfig) -> String {
+        let sl = &schema.conversation_item_links;
+        let links_table = sl.qualified_table(schema.owner.as_deref());
+        format!(
+            "CREATE INDEX IF NOT EXISTS conv_item_links_conv_idx ON {links_table} ({}, {});",
+            sl.col("conversation_id"),
+            sl.col("added_at")
+        )
     }
 }
 
@@ -459,6 +645,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             role,
             content,
             status,
+            tenant,
         } = item;
         let id = opt_id.unwrap_or_else(|| make_item_id(&item_type));
         let created_at = Utc::now();
@@ -468,7 +655,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
 
         // Build dynamic column/param lists, respecting skip_columns
         let mut col_names: Vec<&str> = vec![si.col("id")];
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id.0];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id.0];
         if !si.is_skipped("response_id") {
             col_names.push(si.col("response_id"));
             params.push(&response_id);
@@ -496,6 +683,10 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             col_names.push(si.col("created_at"));
             params.push(&created_at);
         }
+        if !si.is_skipped("tenant") {
+            col_names.push(si.col("tenant"));
+            params.push(&tenant);
+        }
 
         // Append extra columns from hooks or defaults
         let hook_extra = current_extra_columns().unwrap_or_default();
@@ -519,11 +710,10 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-        client
-            .execute(&sql, &params)
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        execute_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         Ok(ConversationItem {
             id,
             response_id,
@@ -532,6 +722,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             content,
             status,
             created_at,
+            tenant,
         })
     }
 
@@ -549,8 +740,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             sl.col("item_id"),
             sl.col("added_at"),
         ];
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            vec![&conversation_id.0, &item_id.0, &added_at];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&conversation_id.0, &item_id.0, &added_at];
 
         // Append extra columns from hooks or defaults
         let hook_extra = current_extra_columns().unwrap_or_default();
@@ -574,11 +764,10 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-        client
-            .execute(&sql, &params)
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        execute_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         Ok(())
     }
 
@@ -602,30 +791,28 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
         let limit: i64 = params.limit as i64;
         let order_desc = matches!(params.order, SortOrder::Desc);
 
-        let after_key: Option<(DateTime<Utc>, String)> = if let Some(ref aid) = params.after {
-            let client = self
-                .store
-                .pool
-                .get()
-                .await
-                .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-            let cursor_sql = format!(
+        let after_key: Option<(DateTime<Utc>, String)> =
+            if let Some(ref aid) = params.after {
+                let client =
+                    self.store.pool.get().await.map_err(|e| {
+                        ConversationItemStorageError::StorageError(describe_error(&e))
+                    })?;
+                let cursor_sql = format!(
                 "SELECT {l_added_at} FROM {links_table} WHERE {l_conv_id} = $1 AND {l_item_id} = $2"
             );
-            let rows = client
-                .query(&cursor_sql, &[&cid, &aid.as_str()])
-                .await
-                .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-            if rows.is_empty() {
-                None
+                let rows = query_cached(&client, &cursor_sql, &[&cid, &aid.as_str()])
+                    .await
+                    .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+                if rows.is_empty() {
+                    None
+                } else {
+                    let row = &rows[0];
+                    let ts: DateTime<Utc> = row.get(0);
+                    Some((ts, aid.clone()))
+                }
             } else {
-                let row = &rows[0];
-                let ts: DateTime<Utc> = row.get(0);
-                Some((ts, aid.clone()))
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         // Build select columns from items table (prefixed with i.), respecting skip_columns
         let mut select_cols = vec![format!("i.{}", si.col("id"))];
@@ -636,6 +823,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             "content",
             "status",
             "created_at",
+            "tenant",
         ] {
             if !si.is_skipped(field) {
                 select_cols.push(format!("i.{}", si.col(field)));
@@ -677,17 +865,15 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         let rows = if let Some((ts, iid)) = &after_key {
-            client
-                .query(&sql, &[&cid, ts, iid, &limit])
+            query_cached(&client, &sql, &[&cid, ts, iid, &limit])
                 .await
-                .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?
+                .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?
         } else {
-            client
-                .query(&sql, &[&cid, &limit])
+            query_cached(&client, &sql, &[&cid, &limit])
                 .await
-                .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?
+                .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?
         };
 
         let mut out = Vec::new();
@@ -713,6 +899,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             "content",
             "status",
             "created_at",
+            "tenant",
         ] {
             if !si.is_skipped(field) {
                 select_cols.push(si.col(field).to_string());
@@ -729,11 +916,10 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-        let rows = client
-            .query(&sql, &[&item_id.0.as_str()])
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        let rows = query_cached(&client, &sql, &[&item_id.0.as_str()])
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         if rows.is_empty() {
             Ok(None)
         } else {
@@ -758,11 +944,14 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-        let row = client
-            .query_one(&sql, &[&conversation_id.0.as_str(), &item_id.0.as_str()])
-            .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        let row = query_one_cached(
+            &client,
+            &sql,
+            &[&conversation_id.0.as_str(), &item_id.0.as_str()],
+        )
+        .await
+        .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
@@ -784,11 +973,14 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
-        client
-            .execute(&sql, &[&conversation_id.0.as_str(), &item_id.0.as_str()])
-            .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        execute_cached(
+            &client,
+            &sql,
+            &[&conversation_id.0.as_str(), &item_id.0.as_str()],
+        )
+        .await
+        .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         Ok(())
     }
 }
@@ -839,6 +1031,11 @@ fn build_item_from_row(
     } else {
         row.get(si.col("created_at"))
     };
+    let tenant: Option<String> = if si.is_skipped("tenant") {
+        None
+    } else {
+        row.get(si.col("tenant"))
+    };
 
     Ok(ConversationItem {
         id: ConversationItemId(id),
@@ -848,6 +1045,7 @@ fn build_item_from_row(
         content,
         status,
         created_at,
+        tenant,
     })
 }
 
@@ -858,14 +1056,36 @@ pub(super) struct PostgresResponseStorage {
 }
 
 impl PostgresResponseStorage {
+    /// The store over tables the bootstrap created; reads how the responses
+    /// table takes a store (one statement under a unique id, or a locked
+    /// merge).
     pub async fn new(store: PostgresStore) -> Result<Self, ResponseStorageError> {
         let schema = &store.schema;
+        let s = &schema.responses;
+        let table = s.qualified_table(schema.owner.as_deref());
+        let client = store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+        let store_path = store_path_for(&client, &table, s.col("id")).await;
+        let select_base = build_response_select_base(&store.schema);
+        Ok(Self {
+            store,
+            select_base,
+            store_path,
+        })
+    }
+
+    /// The responses table in its current shape, created by the store's
+    /// bootstrap (`IF NOT EXISTS`).
+    pub(crate) fn table_ddl(schema: &SchemaConfig) -> String {
         let s = &schema.responses;
         let table = s.qualified_table(schema.owner.as_deref());
 
         // Build DDL column definitions, filtering out skip_columns and appending extras
         let mut col_defs = vec![format!("{} VARCHAR(64) PRIMARY KEY", s.col("id"))];
-        let core_cols: [(&str, &str); 7] = [
+        let core_cols: [(&str, &str); 8] = [
             ("conversation_id", "VARCHAR(64)"),
             ("previous_response_id", "VARCHAR(64)"),
             ("input", "JSON"),
@@ -873,6 +1093,7 @@ impl PostgresResponseStorage {
             ("safety_identifier", "VARCHAR(128)"),
             ("model", "VARCHAR(128)"),
             ("raw_response", "JSON"),
+            ("tenant", "VARCHAR(255)"),
         ];
         for (logical, sql_type) in &core_cols {
             if !s.is_skipped(logical) {
@@ -881,41 +1102,41 @@ impl PostgresResponseStorage {
         }
         col_defs.extend(extra_column_defs(s));
 
-        let table_ddl = format!(
+        format!(
             "CREATE TABLE IF NOT EXISTS {table} ({});",
             col_defs.join(", "),
-        );
+        )
+    }
 
-        let client = store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        client
-            .batch_execute(&table_ddl)
-            .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-
-        // Index creation is separate so legacy tables missing migrated
-        // columns (e.g. safety_identifier) don't block startup. Indexes
-        // are retried after migrations via ensure_response_indexes().
-        if !s.is_skipped("safety_identifier") {
-            let idx_ddl = format!(
-                "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
-                s.col("safety_identifier")
-            );
-            if let Err(e) = client.batch_execute(&idx_ddl).await {
-                tracing::debug!("deferred response index creation (column may not exist yet): {e}");
-            }
+    /// The index on the safety identifier, created by the bootstrap after
+    /// the migrations (a legacy table gains the column in v1), unless the
+    /// column is skipped.
+    pub(crate) fn index_ddl(schema: &SchemaConfig) -> Option<String> {
+        let s = &schema.responses;
+        if s.is_skipped("safety_identifier") {
+            return None;
         }
+        let table = s.qualified_table(schema.owner.as_deref());
+        Some(format!(
+            "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
+            s.col("safety_identifier")
+        ))
+    }
 
-        let store_path = store_path_for(&client, &table, s.col("id")).await;
-        let select_base = build_response_select_base(&store.schema);
-        Ok(Self {
-            store,
-            select_base,
-            store_path,
-        })
+    /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
+    /// object's status, over the unstored records only, so a sweep reads
+    /// those rows and no other. Its expressions are the sweep's predicate.
+    pub(crate) fn unstored_index_ddl(schema: &SchemaConfig) -> Option<String> {
+        let s = &schema.responses;
+        if s.is_skipped("raw_response") {
+            return None;
+        }
+        let table = s.qualified_table(schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        Some(format!(
+            "CREATE INDEX IF NOT EXISTS responses_unstored_idx ON {table} (({col_raw}::jsonb->>'status')) \
+             WHERE ({col_raw}::jsonb->>'store') = 'false';"
+        ))
     }
 
     pub fn build_response_from_row(
@@ -972,6 +1193,12 @@ impl PostgresResponseStorage {
             })?
         };
 
+        let tenant: Option<String> = if s.is_skipped("tenant") {
+            None
+        } else {
+            row.get(s.col("tenant"))
+        };
+
         let previous_response_id = previous.map(ResponseId);
         let raw_response = raw_response_json.unwrap_or(Value::Null);
         let input = input_json.unwrap_or_else(|| Value::Array(Vec::new()));
@@ -985,8 +1212,22 @@ impl PostgresResponseStorage {
             model,
             conversation_id,
             raw_response,
+            tenant,
         })
     }
+}
+
+/// The condition of the tenant scope on the rows of a query, with the
+/// caller's tenant bound as `$param`: the rows stored under no tenant and
+/// those stored under the caller's (see
+/// [`tenant_scope_allows`](crate::core::tenant_scope_allows)). `None` when
+/// the schema skips the column: every row is served then, as before.
+fn tenant_scope_sql(s: &crate::schema::TableConfig, param: usize) -> Option<String> {
+    if s.is_skipped("tenant") {
+        return None;
+    }
+    let col = s.col("tenant");
+    Some(format!(" AND ({col} IS NULL OR {col} = ${param})"))
 }
 
 /// The query behind [`ResponseStorage::find_response_by_output_item`]:
@@ -1171,6 +1412,7 @@ impl ResponseStorage for PostgresResponseStorage {
             model,
             conversation_id,
             raw_response,
+            tenant,
         } = response;
         let previous_id = previous_response_id.map(|r| r.0);
 
@@ -1179,7 +1421,7 @@ impl ResponseStorage for PostgresResponseStorage {
 
         // Build dynamic column/param lists, skipping configured skip_columns
         let mut col_names: Vec<&str> = vec![s.col("id")];
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&response_id.0];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&response_id.0];
 
         if !s.is_skipped("conversation_id") {
             col_names.push(s.col("conversation_id"));
@@ -1209,6 +1451,10 @@ impl ResponseStorage for PostgresResponseStorage {
             col_names.push(s.col("raw_response"));
             params.push(&raw_response);
         }
+        if !s.is_skipped("tenant") {
+            col_names.push(s.col("tenant"));
+            params.push(&tenant);
+        }
 
         // Append extra columns from hooks or defaults
         let hook_extra = current_extra_columns().unwrap_or_default();
@@ -1223,9 +1469,9 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         let store_err =
-            |e: tokio_postgres::Error| ResponseStorageError::StorageError(e.to_string());
+            |e: tokio_postgres::Error| ResponseStorageError::StorageError(describe_error(&e));
         // The statement is prepared once per pooled connection (the cache
         // keeps it), so a store on the upsert path is one round trip.
         let rows = match self.store_path {
@@ -1279,11 +1525,10 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        let rows = client
-            .query(&sql, &[&response_id.0.as_str()])
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+        let rows = query_cached(&client, &sql, &[&response_id.0.as_str()])
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -1303,11 +1548,10 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        let rows = client
-            .query(&sql, &[&item_id])
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+        let rows = query_cached(&client, &sql, &[&item_id])
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         match rows.first() {
             Some(row) => Self::build_response_from_row(row, &self.store.schema).map(Some),
             None => Ok(None),
@@ -1324,20 +1568,21 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        client
-            .execute(
-                &format!("DELETE FROM {table} WHERE {col_id} = $1"),
-                &[&response_id.0.as_str()],
-            )
-            .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+        execute_cached(
+            &client,
+            &format!("DELETE FROM {table} WHERE {col_id} = $1"),
+            &[&response_id.0.as_str()],
+        )
+        .await
+        .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         Ok(())
     }
 
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
         let s = &self.store.schema.responses;
@@ -1348,36 +1593,31 @@ impl ResponseStorage for PostgresResponseStorage {
         }
 
         let col_safety = s.col("safety_identifier");
+        let limit_i64: Option<i64> = limit.map(|l| l as i64);
 
-        let order_clause = if s.is_skipped("created_at") {
-            String::new()
-        } else {
-            format!(" ORDER BY {} DESC", s.col("created_at"))
-        };
+        let mut sql = format!("{} WHERE {col_safety} = $1", self.select_base);
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&identifier];
+        if let Some(scope) = tenant_scope_sql(s, params.len() + 1) {
+            sql.push_str(&scope);
+            params.push(&tenant);
+        }
+        if !s.is_skipped("created_at") {
+            sql.push_str(&format!(" ORDER BY {} DESC", s.col("created_at")));
+        }
+        if let Some(limit) = &limit_i64 {
+            sql.push_str(&format!(" LIMIT ${}", params.len() + 1));
+            params.push(limit);
+        }
 
         let client = self
             .store
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        let rows = if let Some(l) = limit {
-            let l_i64: i64 = l as i64;
-            let sql = format!(
-                "{} WHERE {col_safety} = $1{order_clause} LIMIT $2",
-                self.select_base,
-            );
-            client
-                .query(&sql, &[&identifier, &l_i64])
-                .await
-                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?
-        } else {
-            let sql = format!("{} WHERE {col_safety} = $1{order_clause}", self.select_base,);
-            client
-                .query(&sql, &[&identifier])
-                .await
-                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?
-        };
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+        let rows = query_cached(&client, &sql, &params)
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
 
         let schema = &self.store.schema;
         let mut out = Vec::with_capacity(rows.len());
@@ -1388,7 +1628,50 @@ impl ResponseStorage for PostgresResponseStorage {
         Ok(out)
     }
 
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        let s = &self.store.schema.responses;
+
+        // The object (its `store`, `status` and `completed_at`) is what the
+        // query reads; without the column there is nothing to read.
+        if s.is_skipped("raw_response") {
+            return Ok(0);
+        }
+
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        let ended = if s.is_skipped("created_at") {
+            format!("({col_raw}::jsonb->>'completed_at')::bigint")
+        } else {
+            format!(
+                "COALESCE(({col_raw}::jsonb->>'completed_at')::bigint, EXTRACT(EPOCH FROM {})::bigint)",
+                s.col("created_at")
+            )
+        };
+        let sql = format!(
+            "DELETE FROM {table} WHERE {col_raw}::jsonb->>'store' = 'false' \
+             AND {col_raw}::jsonb->>'status' IN ('completed', 'incomplete', 'failed', 'cancelled') \
+             AND {ended} < $1"
+        );
+
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let cutoff_secs: i64 = cutoff.timestamp();
+        let rows_deleted = client
+            .execute(&sql, &[&cutoff_secs])
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        Ok(rows_deleted as usize)
+    }
+
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
         let s = &self.store.schema.responses;
 
         // safety_identifier must exist to filter by it
@@ -1399,18 +1682,22 @@ impl ResponseStorage for PostgresResponseStorage {
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_safety = s.col("safety_identifier");
 
-        let sql = format!("DELETE FROM {table} WHERE {col_safety} = $1");
+        let mut sql = format!("DELETE FROM {table} WHERE {col_safety} = $1");
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&identifier];
+        if let Some(scope) = tenant_scope_sql(s, params.len() + 1) {
+            sql.push_str(&scope);
+            params.push(&tenant);
+        }
 
         let client = self
             .store
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        let rows_deleted = client
-            .execute(&sql, &[&identifier])
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+        let rows_deleted = execute_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         Ok(rows_deleted as usize)
     }
 }
@@ -1449,6 +1736,45 @@ mod tests {
     fn parse_metadata_non_object_is_error() {
         assert!(PostgresConversationStorage::parse_metadata(Some(json!("not an object"))).is_err());
     }
+    /// The bootstrap creates every table `IF NOT EXISTS`, in the schema's
+    /// names, and the index on its own so a legacy table can gain the column
+    /// first.
+    #[test]
+    fn bootstrap_ddl_creates_the_tables_if_they_do_not_exist() {
+        let schema = SchemaConfig::default();
+        for ddl in [
+            PostgresConversationStorage::table_ddl(&schema),
+            PostgresConversationItemStorage::table_ddl(&schema),
+            PostgresResponseStorage::table_ddl(&schema),
+        ] {
+            assert!(ddl.starts_with("CREATE TABLE IF NOT EXISTS "), "{ddl}");
+        }
+        assert!(
+            PostgresResponseStorage::table_ddl(&schema).contains("safety_identifier VARCHAR(128)")
+        );
+        assert_eq!(
+            PostgresResponseStorage::index_ddl(&schema).as_deref(),
+            Some(
+                "CREATE INDEX IF NOT EXISTS responses_safety_idx ON responses (safety_identifier);"
+            )
+        );
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("safety_identifier".to_string());
+        assert!(PostgresResponseStorage::index_ddl(&skipped).is_none());
+        // The links index is a statement of its own, run after the migrations.
+        assert_eq!(
+            PostgresConversationItemStorage::index_ddl(&schema),
+            "CREATE INDEX IF NOT EXISTS conv_item_links_conv_idx ON conversation_item_links (conversation_id, added_at);"
+        );
+        assert!(
+            !PostgresConversationItemStorage::table_ddl(&schema).contains("CREATE INDEX"),
+            "the tables' DDL carries no index"
+        );
+    }
+
     #[test]
     fn upsert_sql_replaces_the_row_under_its_id_in_one_statement() {
         let sql = upsert_sql("responses", &["id", "input", "raw_response"]);
@@ -1485,6 +1811,18 @@ mod tests {
              INSERT INTO r (response_key) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM upd)"
         );
         assert_eq!(lock_sql(-42), "SELECT pg_advisory_xact_lock(-42)");
+    }
+
+    #[test]
+    fn the_tenant_scope_condition_serves_untenanted_rows_and_the_callers_own() {
+        let s = crate::schema::TableConfig::with_table("responses");
+        assert_eq!(
+            tenant_scope_sql(&s, 2).as_deref(),
+            Some(" AND (tenant IS NULL OR tenant = $2)")
+        );
+        let mut skipped = crate::schema::TableConfig::with_table("responses");
+        skipped.skip_columns.insert("tenant".to_string());
+        assert_eq!(tenant_scope_sql(&skipped, 2), None);
     }
 
     #[test]

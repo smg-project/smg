@@ -1,50 +1,87 @@
 {
-  "generator": "generate_qwen_preprocess_fingerprints.py",
-  "pillow": "12.2.0",
-  "transformers": "4.57.1",
   "cases": [
     {
-      "model": "qwen2_vl",
-      "width": 37,
+      "fnv1a_patch_u8": "afa7647b6318e349",
+      "grid_thw": [
+        1,
+        26,
+        42
+      ],
       "height": 23,
-      "shape": [1092, 1176],
-      "grid_thw": [1, 26, 42],
-      "fnv1a_patch_u8": "783a9142f0cbefb9"
-    },
-    {
       "model": "qwen2_vl",
-      "width": 259,
-      "height": 194,
-      "shape": [1064, 1176],
-      "grid_thw": [1, 28, 38],
-      "fnv1a_patch_u8": "6081ce380d38da91"
+      "shape": [
+        1092,
+        1176
+      ],
+      "width": 37
     },
     {
-      "model": "qwen3_vl",
-      "width": 37,
+      "fnv1a_patch_u8": "ca6398fbbed2e061",
+      "grid_thw": [
+        1,
+        28,
+        38
+      ],
+      "height": 194,
+      "model": "qwen2_vl",
+      "shape": [
+        1064,
+        1176
+      ],
+      "width": 259
+    },
+    {
+      "fnv1a_patch_u8": "f2e4e72dc5845799",
+      "grid_thw": [
+        1,
+        14,
+        22
+      ],
       "height": 23,
-      "shape": [308, 1536],
-      "grid_thw": [1, 14, 22],
-      "fnv1a_patch_u8": "ea0821a9c7700bad"
+      "model": "qwen3_vl",
+      "shape": [
+        308,
+        1536
+      ],
+      "width": 37
     },
     {
-      "model": "qwen3_vl",
-      "width": 259,
+      "fnv1a_patch_u8": "eee5ca770210e309",
+      "grid_thw": [
+        1,
+        14,
+        20
+      ],
       "height": 194,
-      "shape": [280, 1536],
-      "grid_thw": [1, 14, 20],
-      "fnv1a_patch_u8": "45f7361bfce1b071"
+      "model": "qwen3_vl",
+      "shape": [
+        280,
+        1536
+      ],
+      "width": 259
     }
   ],
+  "generator": "generate_qwen_preprocess_fingerprints.py",
+  "pillow": "12.3.0",
+  "torch": "2.13.0+cu130",
+  "torchvision": "0.28.0+cu130",
+  "transformers": "5.17.0",
   "video_cases": [
     {
-      "model": "qwen3_vl",
-      "width": 37,
-      "height": 35,
+      "fnv1a_patch_u8": "7342b176131a47d5",
       "frame_count": 3,
-      "shape": [8, 1536],
-      "grid_thw": [2, 2, 2],
-      "fnv1a_patch_u8": "c862984777479f6d"
+      "grid_thw": [
+        2,
+        2,
+        2
+      ],
+      "height": 35,
+      "model": "qwen3_vl",
+      "shape": [
+        8,
+        1536
+      ],
+      "width": 37
     }
   ]
 }

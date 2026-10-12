@@ -1,10 +1,52 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::Path,
+};
 
 use axum::http::HeaderName;
 use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::{middleware::scheduler, policies::cost as selection_cost};
+
+/// Each listener needs its own port. `listeners` are `(field, flag, port)`
+/// in configuration order; the first two on one port are refused under the
+/// later listener's field, naming both flags.
+fn validate_distinct_listener_ports(listeners: &[(&str, &str, u16)]) -> ConfigResult<()> {
+    for (i, (field, flag, port)) in listeners.iter().enumerate() {
+        if let Some((_, other_flag, _)) = listeners[..i].iter().find(|(_, _, p)| p == port) {
+            return Err(ConfigError::InvalidValue {
+                field: (*field).to_string(),
+                value: port.to_string(),
+                reason: format!(
+                    "{flag} and {other_flag} are both {port}; each listener needs its own port"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The mesh listener's port against the HTTP, metrics and probe ports. The
+/// mesh configuration lives beside the router configuration, out of
+/// [`ConfigValidator`]'s sight, so `server::startup` runs this check: it is
+/// the one place every way of building the server configuration (the CLI,
+/// the Python binding, a library caller) passes through.
+pub fn validate_mesh_listener_port(
+    mesh_port: u16,
+    port: u16,
+    metrics_port: Option<u16>,
+    health_check_port: Option<u16>,
+) -> ConfigResult<()> {
+    let listeners = [
+        Some(("port", "--port", port)),
+        metrics_port.map(|port| ("metrics.port", "--prometheus-port", port)),
+        health_check_port.map(|port| ("health_check_port", "--health-check-port", port)),
+        Some(("mesh_port", "--mesh-port", mesh_port)),
+    ];
+    let listeners: Vec<_> = listeners.into_iter().flatten().collect();
+    validate_distinct_listener_ports(&listeners)
+}
 
 /// Validate a user-supplied mesh server name. The name keys rate-limit
 /// shards as `rl:{counter}:{name}`, so an empty name or one containing the
@@ -123,6 +165,7 @@ impl ConfigValidator {
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
+        Self::validate_log_dir(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
@@ -149,6 +192,7 @@ impl ConfigValidator {
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
+        Self::validate_health_check(&config.health_check)?;
 
         if config.history_backend == HistoryBackend::Oracle {
             if config.oracle.is_none() {
@@ -340,6 +384,17 @@ impl ConfigValidator {
                     reason: format!(
                         "tenant_api_keys tenant_id '{}' must not have surrounding whitespace",
                         entry.tenant_id
+                    ),
+                });
+            }
+            // The canonical key is stored with every response and
+            // conversation, in a 255-byte column on the SQL backends.
+            if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "tenant_api_keys tenant_id '{}' is longer than {} bytes",
+                        entry.tenant_id,
+                        crate::tenant::MAX_TENANT_ID_LEN
                     ),
                 });
             }
@@ -839,6 +894,23 @@ impl ConfigValidator {
             });
         }
 
+        // Each listener needs its own port. Two of them on one port used to
+        // bind the first, answer, and die at the second bind with a raw
+        // AddrInUse that named no flag: a partial start an operator's
+        // monitoring saw come up and vanish.
+        let listeners = [
+            Some(("port", "--port", config.port)),
+            config
+                .metrics
+                .as_ref()
+                .map(|metrics| ("metrics.port", "--prometheus-port", metrics.port)),
+            config
+                .health_check_port
+                .map(|port| ("health_check_port", "--health-check-port", port)),
+        ];
+        let listeners: Vec<_> = listeners.into_iter().flatten().collect();
+        validate_distinct_listener_ports(&listeners)?;
+
         if config.max_payload_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_payload_size".to_string(),
@@ -959,6 +1031,84 @@ impl ConfigValidator {
         }
 
         Ok(())
+    }
+
+    /// `log_dir` names the directory the file log appender writes to, so it
+    /// is checked before anything binds: a path that exists must be a
+    /// directory the gateway can write; one that does not exist must sit
+    /// under a directory the gateway can write (its nearest existing
+    /// ancestor), where logging start-up creates it, as it always did.
+    /// Anything else is a configuration error naming the path and the
+    /// reason, where the appender used to panic (an existing file) or the
+    /// gateway started without any log output at all (a path it could not
+    /// create). Nothing is created here: `validate()` is also run by
+    /// callers that build or check a configuration without starting the
+    /// gateway, and leaves no directory behind on their host.
+    fn validate_log_dir(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(log_dir) = config.log_dir.as_deref() else {
+            return Ok(());
+        };
+        let invalid = |reason: String| ConfigError::InvalidValue {
+            field: "log_dir".to_string(),
+            value: log_dir.to_string(),
+            reason,
+        };
+        if log_dir.trim().is_empty() {
+            return Err(invalid("must name a directory".to_string()));
+        }
+        let path = Path::new(log_dir);
+        let (probed, missing) = match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => (path, false),
+            Ok(_) => return Err(invalid("exists and is not a directory".to_string())),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // Logging start-up creates the missing part under the nearest
+                // existing ancestor, which must therefore be a directory the
+                // gateway can write; a file in the way is named, which
+                // explains the failure better than the OS error for the leaf.
+                let ancestor = path
+                    .ancestors()
+                    .skip(1)
+                    // A relative path's last ancestor is "", which is the
+                    // current directory but does not stat.
+                    .map(|ancestor| {
+                        if ancestor.as_os_str().is_empty() {
+                            Path::new(".")
+                        } else {
+                            ancestor
+                        }
+                    })
+                    .find(|ancestor| ancestor.exists())
+                    .ok_or_else(|| {
+                        invalid("cannot be created: no existing ancestor".to_string())
+                    })?;
+                if !ancestor.is_dir() {
+                    return Err(invalid(format!(
+                        "cannot be created: {} is not a directory",
+                        ancestor.display()
+                    )));
+                }
+                (ancestor, true)
+            }
+            Err(error) => return Err(invalid(format!("cannot be read: {error}"))),
+        };
+        // The appender opens a file for writing in this directory (or creates
+        // the directory under the ancestor); an unnamed temporary file is the
+        // same permission check with nothing left behind.
+        tempfile::tempfile_in(probed).map(drop).map_err(|error| {
+            if missing {
+                invalid(format!(
+                    "cannot be created: {} is not writable: {error}",
+                    probed.display()
+                ))
+            } else {
+                invalid(format!("is not writable: {error}"))
+            }
+        })
     }
 
     fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
@@ -1268,6 +1418,50 @@ impl ConfigValidator {
                 value: cb.window_duration_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
+        }
+        Ok(())
+    }
+
+    /// The worker health checker's knobs: the interval and the timeout are
+    /// periods in whole seconds, the thresholds counts of consecutive
+    /// probes, and none of them means anything at 0. An interval of 0 made
+    /// the checker a busy loop (thousands of probes per second against every
+    /// worker, one core at 100 %); a timeout of 0 times every probe out at
+    /// once; a threshold of 0 flips a worker's state without a probe. The
+    /// interval is refused with probing disabled too: the checker's loop
+    /// still sleeps on it between connect signals.
+    fn validate_health_check(health_check: &HealthCheckConfig) -> ConfigResult<()> {
+        let knobs = [
+            (
+                "health_check.check_interval_secs",
+                health_check.check_interval_secs,
+                "--health-check-interval-secs 0 would probe every worker in a busy loop; \
+                 --disable-health-check turns probing off",
+            ),
+            (
+                "health_check.timeout_secs",
+                health_check.timeout_secs,
+                "--health-check-timeout-secs 0 would time every probe out at once",
+            ),
+            (
+                "health_check.failure_threshold",
+                u64::from(health_check.failure_threshold),
+                "--health-failure-threshold 0 would fail a worker without a probe",
+            ),
+            (
+                "health_check.success_threshold",
+                u64::from(health_check.success_threshold),
+                "--health-success-threshold 0 would pass a worker without a probe",
+            ),
+        ];
+        for (field, value, consequence) in knobs {
+            if value == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: format!("Must be >= 1 ({consequence})"),
+                });
+            }
         }
         Ok(())
     }
@@ -1735,6 +1929,151 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn log_dir_config(log_dir: &str) -> RouterConfig {
+        RouterConfig {
+            log_dir: Some(log_dir.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The `(value, reason)` of the `log_dir` error a configuration is
+    /// refused with.
+    fn refused_log_dir(config: &RouterConfig) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == "log_dir" => (value, reason),
+            other => panic!("expected a log_dir error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_log_dir_that_is_a_file_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let file = file.to_str().unwrap();
+        let (value, reason) = refused_log_dir(&log_dir_config(file));
+        assert_eq!(value, file);
+        assert!(reason.contains("not a directory"), "{reason}");
+    }
+
+    #[test]
+    fn a_log_dir_that_cannot_be_created_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let under_a_file = file.join("logs");
+        let file = file.to_str().unwrap();
+        let under = under_a_file.to_str().unwrap();
+        let (value, reason) = refused_log_dir(&log_dir_config(under));
+        assert_eq!(value, under);
+        assert!(
+            reason.contains("cannot be created") && reason.contains(file),
+            "the reason names the file in the way: {reason}"
+        );
+        assert!(!under_a_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_dir_the_gateway_cannot_write_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let writable = std::fs::metadata(&locked).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(&locked, read_only).unwrap();
+        // A privileged process writes regardless of the mode: nothing to test.
+        let privileged = std::fs::File::create(locked.join("probe")).is_ok();
+        let verdict = ConfigValidator::validate(&log_dir_config(locked.to_str().unwrap()));
+        std::fs::set_permissions(&locked, writable).unwrap();
+        if privileged {
+            return;
+        }
+        match verdict {
+            Err(ConfigError::InvalidValue { field, reason, .. }) if field == "log_dir" => {
+                assert!(reason.contains("not writable"), "{reason}");
+            }
+            other => panic!("expected a log_dir error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_log_dir_under_a_writable_directory_is_accepted_and_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("created").join("logs");
+        assert!(ConfigValidator::validate(&log_dir_config(fresh.to_str().unwrap())).is_ok());
+        assert!(
+            !fresh.exists() && !dir.path().join("created").exists(),
+            "validation leaves no directory behind; logging start-up creates it"
+        );
+        assert!(ConfigValidator::validate(&log_dir_config(dir.path().to_str().unwrap())).is_ok());
+        assert!(ConfigValidator::validate(&RouterConfig::default()).is_ok());
+    }
+
+    /// A relative `--log-dir` (a systemd `WorkingDirectory=`, a container
+    /// `WORKDIR`, a local run) that does not exist yet is accepted: its
+    /// nearest existing ancestor is the working directory, which the walk
+    /// reaches as "" and must read as ".". Nothing is created.
+    #[test]
+    fn a_missing_relative_log_dir_under_the_working_directory_is_accepted() {
+        let leaf = format!(
+            "log-dir-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        for relative in [leaf.clone(), format!("{leaf}/run/logs")] {
+            assert!(
+                ConfigValidator::validate(&log_dir_config(&relative)).is_ok(),
+                "{relative}"
+            );
+            assert!(
+                !Path::new(&leaf).exists(),
+                "{relative}: created by the validation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_log_dir_under_a_directory_the_gateway_cannot_write_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let writable = std::fs::metadata(&locked).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(&locked, read_only).unwrap();
+        let privileged = std::fs::File::create(locked.join("probe")).is_ok();
+        let under = locked.join("gateway").join("logs");
+        let verdict = ConfigValidator::validate(&log_dir_config(under.to_str().unwrap()));
+        std::fs::set_permissions(&locked, writable).unwrap();
+        if privileged {
+            return;
+        }
+        match verdict {
+            Err(ConfigError::InvalidValue { field, reason, .. }) if field == "log_dir" => {
+                assert!(
+                    reason.contains("cannot be created")
+                        && reason.contains(locked.to_str().unwrap())
+                        && reason.contains("not writable"),
+                    "the reason names the ancestor: {reason}"
+                );
+            }
+            other => panic!("expected a log_dir error, got {other:?}"),
+        }
+        assert!(!under.exists());
     }
 
     #[test]
@@ -2775,6 +3114,83 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Two listeners on one port are refused naming both flags; distinct
+    /// ports pass.
+    #[test]
+    fn equal_listener_ports_are_rejected() {
+        let listeners = |port: u16, metrics_port: u16, probe_port: Option<u16>| RouterConfig {
+            port,
+            metrics: Some(MetricsConfig {
+                port: metrics_port,
+                host: "127.0.0.1".to_string(),
+            }),
+            health_check_port: probe_port,
+            ..Default::default()
+        };
+        let refused = |config: &RouterConfig| match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => (field, value, reason),
+            other => panic!("expected an InvalidValue, got {other:?}"),
+        };
+
+        let (field, value, reason) = refused(&listeners(30001, 30001, None));
+        assert_eq!((field.as_str(), value.as_str()), ("metrics.port", "30001"));
+        assert!(
+            reason.contains("--prometheus-port") && reason.contains("--port"),
+            "{reason}"
+        );
+
+        let (field, _, reason) = refused(&listeners(30001, 30002, Some(30001)));
+        assert_eq!(field, "health_check_port");
+        assert!(
+            reason.contains("--health-check-port") && reason.contains("--port"),
+            "{reason}"
+        );
+
+        let (field, _, reason) = refused(&listeners(30001, 30002, Some(30002)));
+        assert_eq!(field, "health_check_port");
+        assert!(
+            reason.contains("--health-check-port") && reason.contains("--prometheus-port"),
+            "{reason}"
+        );
+
+        assert!(ConfigValidator::validate(&listeners(30001, 30002, Some(30003))).is_ok());
+    }
+
+    /// The mesh listener cannot share a port with the HTTP, metrics or probe
+    /// listener: refused under the mesh port's field, naming both flags. The
+    /// check runs in `server::startup`, so it holds for every way the server
+    /// configuration is built.
+    #[test]
+    fn mesh_port_equal_to_another_listener_is_rejected() {
+        for (flag, taken) in [
+            ("--port", 30001),
+            ("--prometheus-port", 30002),
+            ("--health-check-port", 30003),
+        ] {
+            match validate_mesh_listener_port(taken, 30001, Some(30002), Some(30003)) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "mesh_port");
+                    assert_eq!(value, taken.to_string());
+                    assert!(
+                        reason.contains("--mesh-port") && reason.contains(flag),
+                        "{reason}"
+                    );
+                }
+                other => panic!("--mesh-port equal to {flag} must be rejected, got {other:?}"),
+            }
+        }
+        assert!(validate_mesh_listener_port(30004, 30001, Some(30002), Some(30003)).is_ok());
+        assert!(validate_mesh_listener_port(30002, 30001, None, None).is_ok());
+    }
+
     #[test]
     fn test_reject_health_check_port_zero() {
         let mut config = RouterConfig::new(
@@ -2796,6 +3212,89 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// Every health-check knob at 0 is refused naming the field; the smallest
+    /// values pass; a zero interval is refused with probing disabled too.
+    #[test]
+    fn zero_health_check_knobs_are_rejected() {
+        let zeroed = [
+            (
+                "health_check.check_interval_secs",
+                HealthCheckConfig {
+                    check_interval_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.timeout_secs",
+                HealthCheckConfig {
+                    timeout_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.failure_threshold",
+                HealthCheckConfig {
+                    failure_threshold: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.success_threshold",
+                HealthCheckConfig {
+                    success_threshold: 0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, health_check) in zeroed {
+            let config = RouterConfig {
+                health_check,
+                ..Default::default()
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, name);
+                    assert_eq!(value, "0");
+                    assert!(reason.starts_with("Must be >= 1"), "{name}: {reason}");
+                }
+                other => panic!("{name}: expected an InvalidValue, got {other:?}"),
+            }
+        }
+
+        let smallest = RouterConfig {
+            health_check: HealthCheckConfig {
+                check_interval_secs: 1,
+                timeout_secs: 1,
+                failure_threshold: 1,
+                success_threshold: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&smallest).is_ok());
+        assert!(ConfigValidator::validate(&RouterConfig::default()).is_ok());
+
+        let disabled_but_zero = RouterConfig {
+            health_check: HealthCheckConfig {
+                check_interval_secs: 0,
+                disable_health_check: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                ConfigValidator::validate(&disabled_but_zero),
+                Err(ConfigError::InvalidValue { ref field, .. }) if field == "health_check.check_interval_secs"
+            ),
+            "the checker's loop sleeps on the interval with probing disabled too"
+        );
     }
 
     /// The CLI parsers reject these, but TOML/JSON and the Python bindings

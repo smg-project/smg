@@ -38,6 +38,18 @@ impl From<&str> for TenantKey {
     }
 }
 
+/// The tenant a stored response or conversation is scoped to for the caller
+/// `meta` describes: the identity the gateway can vouch for (the tenant of a
+/// data-plane API key, `auth:<tenant>`; a trusted tenant header,
+/// `header:<tenant>`), as its canonical key. A caller known by its address
+/// only (`ip:<address>`), or anonymous, is no tenant: its records are stored
+/// without one and served as before there were tenants.
+#[must_use]
+pub fn storage_tenant(meta: &RouteRequestMeta) -> Option<String> {
+    let key = meta.tenant_key().as_str();
+    (key.starts_with("auth:") || key.starts_with("header:")).then(|| key.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct RouteRequestMeta {
     pub tenant_key: TenantKey,

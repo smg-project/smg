@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -7,6 +9,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use smg_data_connector::StorageFailure;
 
 #[derive(Serialize)]
 struct ErrorResponse<'a> {
@@ -69,6 +72,22 @@ pub fn gateway_timeout(code: impl Into<String>, message: impl Into<String>) -> R
 
 pub fn method_not_allowed(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::METHOD_NOT_ALLOWED, code, message)
+}
+
+/// The answer to a failed history store call. A call that exceeded the
+/// store's bound (`op_timeout_secs`) is a `503 storage_unavailable`: the store
+/// is not answering for now and the client may retry. Any other failure keeps
+/// the endpoint's own 500 `code`. `context` opens the message.
+pub fn storage_failure(
+    code: &str,
+    context: impl Display,
+    error: &(impl StorageFailure + Display),
+) -> Response {
+    if error.timed_out() {
+        service_unavailable("storage_unavailable", format!("{context}: {error}"))
+    } else {
+        internal_error(code, format!("{context}: {error}"))
+    }
 }
 
 pub fn create_error(
@@ -221,6 +240,46 @@ mod tests {
             assert!(
                 json["error"].get("param").is_some_and(Value::is_null),
                 "{status}: param must be present and null, got {json}"
+            );
+        }
+    }
+
+    /// A store call that exceeded its bound is answered 503 `storage_unavailable`
+    /// (a `server_error`), any other store failure with the endpoint's own 500
+    /// code; the message opens with the endpoint's context.
+    #[tokio::test]
+    async fn a_timed_out_store_call_is_answered_as_unavailable() {
+        use smg_data_connector::ResponseStorageError;
+
+        for (error, status, code) in [
+            (
+                ResponseStorageError::Timeout(
+                    "the postgres get_response call exceeded its bound of 5 s".to_string(),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+            ),
+            (
+                ResponseStorageError::StorageError("db error".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+            ),
+        ] {
+            let response = storage_failure("storage_error", "Failed to get response", &error);
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(HEADER_X_SMG_ERROR_CODE).unwrap(),
+                code
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], "server_error");
+            assert_eq!(json["error"]["code"], code);
+            assert_eq!(
+                json["error"]["message"],
+                format!("Failed to get response: {error}")
             );
         }
     }

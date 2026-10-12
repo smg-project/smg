@@ -57,6 +57,9 @@ pub struct HuggingFaceTokenizer {
     /// shape (see `native`); `None` keeps every encode in `tokenizers`.
     native: Option<NativeEncoder>,
     has_byte_fallback: bool,
+    /// The byte each `<0xHH>` token stands for, indexed by id (see
+    /// [`byte_fallback_values`]); empty unless the decoder has ByteFallback.
+    byte_fallback_values: Vec<Option<u8>>,
 }
 
 fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
@@ -65,6 +68,35 @@ fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
         DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_fallback),
         _ => false,
     }
+}
+
+/// The byte each `<0xHH>` token of a ByteFallback vocabulary stands for,
+/// indexed by id: the streaming step reads it per token, so it is a table
+/// rather than a vocabulary lookup and a parse. Empty for other vocabularies.
+fn byte_fallback_values(
+    reverse_vocab: &HashMap<TokenIdType, String>,
+    has_byte_fallback: bool,
+) -> Vec<Option<u8>> {
+    if !has_byte_fallback {
+        return Vec::new();
+    }
+    let len = reverse_vocab
+        .keys()
+        .filter_map(|&id| usize::try_from(id).ok())
+        .map(|id| id + 1)
+        .max()
+        .unwrap_or(0);
+    let mut values = vec![None; len];
+    for (&id, token) in reverse_vocab {
+        if token.len() == 6 && token.starts_with("<0x") && token.ends_with('>') {
+            if let (Ok(index), Ok(byte)) =
+                (usize::try_from(id), u8::from_str_radix(&token[3..5], 16))
+            {
+                values[index] = Some(byte);
+            }
+        }
+    }
+    values
 }
 
 pub(crate) const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -304,6 +336,7 @@ impl HuggingFaceTokenizer {
         let native = NativeEncoder::from_tokenizer(&tokenizer);
         Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
+        let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             native,
@@ -315,7 +348,29 @@ impl HuggingFaceTokenizer {
             eos_token_ids,
             renderer,
             has_byte_fallback,
+            byte_fallback_values,
         })
+    }
+
+    /// The byte a ByteFallback byte token (`<0xHH>`) stands for.
+    fn byte_fallback_value(&self, token_id: TokenIdType) -> Option<u8> {
+        usize::try_from(token_id)
+            .ok()
+            .and_then(|index| self.byte_fallback_values.get(index).copied().flatten())
+    }
+
+    /// Whether the window is a lost byte run: every id a byte token rendered
+    /// as its own replacement character (a valid run renders fewer characters
+    /// than it has ids, a literal U+FFFD is three ids for one), nothing
+    /// pending. The cheap conditions come first: on a valid run this is one
+    /// `ends_with`.
+    fn tainted_run(&self, ids: &[TokenIdType], prefix: &str, prefix_index: usize) -> bool {
+        prefix.ends_with('\u{FFFD}')
+            && prefix_index == ids.len()
+            && prefix_index > 0
+            && prefix.len() == prefix_index * '\u{FFFD}'.len_utf8()
+            && prefix.chars().all(|c| c == '\u{FFFD}')
+            && self.byte_fallback_value(ids[prefix_index - 1]).is_some()
     }
 
     fn byte_fallback_piece(&self, token_id: TokenIdType, skip_special_tokens: bool) -> bool {
@@ -439,6 +494,7 @@ impl HuggingFaceTokenizer {
             .collect();
 
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
+        let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             native,
@@ -450,6 +506,7 @@ impl HuggingFaceTokenizer {
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
             has_byte_fallback,
+            byte_fallback_values,
         }
     }
 
@@ -593,6 +650,19 @@ impl Encoder for HuggingFaceTokenizer {
     }
 
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        // A batch takes the path a single input takes: the direct encoder when
+        // the vocabulary has one (an input it declines goes through the
+        // `tokenizers` path on its own), so a batch never runs on the model
+        // whose word cache the direct encoder replaced. The loop is serial on
+        // the calling thread (the `tokenizers` batch fanned out with rayon):
+        // the gateway reaches a batch through `CachedTokenizer::encode_batch`,
+        // which fans out over `encode` itself.
+        if self.native.is_some() {
+            return inputs
+                .iter()
+                .map(|input| self.encode(input, add_special_tokens))
+                .collect();
+        }
         self.tokenizer
             .encode_batch(inputs.to_vec(), add_special_tokens)
             .map_err(|e| Error::msg(format!("Batch encoding failed: {e}")))
@@ -645,7 +715,9 @@ impl HuggingFaceTokenizer {
             Some("") => return Ok(DecodeStep::default()),
             Some(rest) => (rest.to_string(), false),
             None => {
-                let (rest, byte_run) = remainder_after_rewrite(&string, prefix);
+                let run_start =
+                    self.streamed_run_start(ids, *prefix_index, skip_special_tokens, prefix)?;
+                let (rest, byte_run) = remainder_after_rewrite(&string, prefix, run_start);
                 debug!(
                     ?token_id,
                     emitted = prefix.len(),
@@ -671,18 +743,29 @@ impl HuggingFaceTokenizer {
 }
 
 /// The part of `decoded` that follows what `emitted` already covers, when the
-/// decoder chain rewrote `emitted`. The common character prefix is skipped;
-/// beyond it, a ByteFallback run collapsed by an invalid byte decodes to one
-/// replacement character per byte, so one such character is skipped for every
-/// byte of the emitted characters (the second value says that applied).
-/// Nothing already emitted is retracted: a reader sees the emitted text, then
-/// the remainder as the batch decode would end.
-fn remainder_after_rewrite(decoded: &str, emitted: &str) -> (String, bool) {
+/// decoder chain rewrote `emitted`. The common character prefix is skipped, up
+/// to `run_start`, where the text streamed from the open ByteFallback run
+/// begins in `emitted`; beyond it, a run collapsed by an invalid byte decodes
+/// to one replacement character per byte, so one such character is skipped
+/// for every byte of the emitted characters (the second value says that
+/// applied). The run's own characters are never matched by equality: a
+/// literal U+FFFD streamed from the run stands for its three bytes, and the
+/// collapsed run holds three replacement characters for it, not one. Nothing
+/// already emitted is retracted: a reader sees the emitted text, then the
+/// remainder as the batch decode would end.
+///
+/// Cold: it runs only when the decode no longer starts with the emitted text
+/// (an invalid byte collapsed a run), never on the step's regular path, and
+/// it is kept out of that path's text.
+#[cold]
+#[inline(never)]
+fn remainder_after_rewrite(decoded: &str, emitted: &str, run_start: usize) -> (String, bool) {
     let common = decoded
         .char_indices()
         .zip(emitted.chars())
         .find(|((_, a), b)| a != b)
-        .map_or_else(|| decoded.len().min(emitted.len()), |((index, _), _)| index);
+        .map_or_else(|| decoded.len().min(emitted.len()), |((index, _), _)| index)
+        .min(run_start);
     let rewritten_bytes = emitted.len() - common;
     let rest = &decoded[common..];
     let replacement_run = rest.chars().take_while(|&c| c == '\u{FFFD}').count();
@@ -695,6 +778,46 @@ fn remainder_after_rewrite(decoded: &str, emitted: &str) -> (String, bool) {
 }
 
 impl HuggingFaceTokenizer {
+    /// Where the text streamed from the open ByteFallback run begins in
+    /// `prefix`, the emitted text of `ids[..prefix_index]`: the length of the
+    /// text the ids before the run's first byte piece decode to; `prefix.len()`
+    /// when the emitted ids end in no byte piece, or the vocabulary has none.
+    /// Cold, like [`remainder_after_rewrite`], which both of its callers (the
+    /// step and the end-of-input path) call right after it, on the rewrite path only.
+    #[cold]
+    #[inline(never)]
+    fn streamed_run_start(
+        &self,
+        ids: &[TokenIdType],
+        prefix_index: usize,
+        skip_special_tokens: bool,
+        prefix: &str,
+    ) -> Result<usize> {
+        if !self.has_byte_fallback {
+            return Ok(prefix.len());
+        }
+        let emitted = &ids[..prefix_index.min(ids.len())];
+        let stable_end = emitted
+            .iter()
+            .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
+            .map_or(0, |index| index + 1);
+        if stable_end == emitted.len() {
+            return Ok(prefix.len());
+        }
+        // The start is used as a byte index into the emitted text and into the
+        // decode it is aligned with: it has to be a boundary of both, which
+        // holds when the stable text is a prefix of the emitted text. A decoder
+        // step that spans the boundary (a `Replace` after the fuse) breaks
+        // that, and the alignment then covers the whole emitted text, as it
+        // did before the run's start was known.
+        let stable = self.decode(&emitted[..stable_end], skip_special_tokens)?;
+        Ok(if prefix.starts_with(stable.as_str()) {
+            stable.len()
+        } else {
+            prefix.len()
+        })
+    }
+
     /// The client-visible step (see [`Decoder::decode_step`]): a seeded
     /// sequence's prompt is decode context, never emitted; a ByteFallback run
     /// streams each complete character as it closes; `eager` is the
@@ -712,6 +835,11 @@ impl HuggingFaceTokenizer {
         eager: bool,
         count: bool,
     ) -> Result<DecodeStep> {
+        // Pending byte tokens from which a ByteFallback run can be lost: a
+        // valid character has at most four bytes, a complete one streams at once.
+        const LOST_RUN_BYTES: usize = 4;
+        // Ids a lost run's window keeps: at most four and the latest byte.
+        const TAINTED_WINDOW: usize = LOST_RUN_BYTES + 1;
         // A seeded sequence (every id so far is seed, nothing pending): its prompt
         // text is context, never emitted. With pending ids behind the prefix
         // (a skipped special token followed by an open byte run) the step
@@ -742,14 +870,93 @@ impl HuggingFaceTokenizer {
                 *prefix = prefill;
             }
         }
-        self.step_decode_lenient(
+        if self.has_byte_fallback
+            && !eager
+            && self.tainted_run(ids, prefix, *prefix_index)
+            && self.byte_fallback_value(token_id).is_some()
+        {
+            // A run that cannot become valid any more renders as one
+            // replacement character per byte whatever follows: stream that
+            // character now, without a decode. The window keeps the bytes that
+            // made the run lost (its first ids) and the latest byte: its decode
+            // stays one replacement character per id whatever follows, and
+            // the window stays a handful of ids.
+            if ids.len() >= TAINTED_WINDOW {
+                ids.pop();
+                prefix.pop();
+            }
+            ids.push(token_id);
+            prefix.push('\u{FFFD}');
+            *prefix_index = ids.len();
+            return Ok(DecodeStep {
+                text: Some('\u{FFFD}'.to_string()),
+                prefix_mismatch: false,
+            });
+        }
+        let step = self.step_decode_lenient(
             vec![token_id],
             skip_special_tokens,
             ids,
             prefix,
             prefix_index,
             count,
-        )
+        )?;
+        if step.text.is_none() && self.has_byte_fallback && !eager {
+            // Held. A valid character has at most four bytes and a complete
+            // one streams at once, so four pending byte tokens are a run that
+            // cannot become valid any more, unless they hold a literal U+FFFD
+            // (`EF BF BD`: a valid character whose decode ends in the
+            // replacement character, so the step holds it): the pending bytes
+            // must also fail UTF-8 at a definite position. A valid run reaches
+            // four pending bytes only through such a literal, so on a valid
+            // run this is one comparison per held step. A lost run's decoder
+            // renders every byte of it as a replacement character: stream
+            // those for the pending bytes now (the characters already sent
+            // stay as sent).
+            let pending = ids.len() - *prefix_index;
+            if pending >= LOST_RUN_BYTES {
+                let bytes: Option<Vec<u8>> = ids[*prefix_index..]
+                    .iter()
+                    .map(|&id| self.byte_fallback_value(id))
+                    .collect();
+                let lost = bytes.as_deref().and_then(|bytes| {
+                    let error = std::str::from_utf8(bytes).err()?;
+                    Some((error.valid_up_to(), error.error_len()?))
+                });
+                if let Some((valid_up_to, error_len)) = lost {
+                    // The batch decode rewrites characters already sent only
+                    // when they belong to this run (the emitted text ends in a
+                    // byte token): that rewrite is the recovery the totals
+                    // count, and only the reporting step counts it.
+                    let rewritten = *prefix_index > 0
+                        && self.byte_fallback_value(ids[*prefix_index - 1]).is_some();
+                    if rewritten {
+                        debug!(
+                            token_id,
+                            emitted = prefix.len(),
+                            pending,
+                            "an invalid byte collapsed a byte run already streamed; streaming its replacement characters"
+                        );
+                    }
+                    let replacements: String = "\u{FFFD}".repeat(pending);
+                    // The window keeps the invalid sequence and the byte that
+                    // proved it so (at most four ids): their decode is one
+                    // replacement character per id whatever bytes follow.
+                    ids.drain(..*prefix_index + valid_up_to);
+                    ids.truncate(error_len + 1);
+                    *prefix = "\u{FFFD}".repeat(ids.len());
+                    *prefix_index = ids.len();
+                    if rewritten && count {
+                        crate::decode_activity::note_prefix_mismatch(true);
+                    }
+                    return Ok(DecodeStep {
+                        text: Some(replacements),
+                        prefix_mismatch: rewritten,
+                    });
+                }
+            }
+        }
+        Ok(step)
     }
 }
 
@@ -872,7 +1079,9 @@ impl Decoder for HuggingFaceTokenizer {
         let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
-                let (pending, byte_run) = remainder_after_rewrite(&decoded, prefix);
+                let run_start =
+                    self.streamed_run_start(ids, *prefix_index, skip_special_tokens, prefix)?;
+                let (pending, byte_run) = remainder_after_rewrite(&decoded, prefix, run_start);
                 debug!(
                     emitted = prefix.len(),
                     decoded = decoded.len(),

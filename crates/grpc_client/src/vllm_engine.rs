@@ -535,7 +535,7 @@ impl VllmEngineClient {
             None => vec![],
         };
 
-        let logprobs = request.logprobs.map(|v| v.min(5) as i32);
+        let logprobs = request.logprobs.map(|v| v.min(20) as i32);
 
         let constraint = Self::build_single_constraint_from_completion(request)?;
 
@@ -977,6 +977,21 @@ mod tests {
         let huge_params = VllmEngineClient::build_grpc_sampling_params_from_completion(&huge)
             .expect("build sampling params");
         assert_eq!(huge_params.seed, Some(i32::MAX));
+    }
+
+    #[test]
+    fn test_completion_sampling_params_pass_up_to_20_logprobs() {
+        // `logprobs` on /v1/completions goes up to 20, as chat's
+        // `top_logprobs`, and the backend gets the count as asked.
+        for (logprobs, expected) in [(0, 0), (5, 5), (20, 20)] {
+            let request = CompletionRequest {
+                logprobs: Some(logprobs),
+                ..minimal_completion_request()
+            };
+            let params = VllmEngineClient::build_grpc_sampling_params_from_completion(&request)
+                .expect("build sampling params");
+            assert_eq!(params.logprobs, Some(expected));
+        }
     }
 
     #[test]

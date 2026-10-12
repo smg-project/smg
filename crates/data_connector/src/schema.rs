@@ -281,7 +281,7 @@ fn primary_key_columns_for(_label: &str) -> &'static [&'static str] {
 /// `extra_columns` that would shadow built-in fields.
 fn core_columns_for(label: &str) -> &'static [&'static str] {
     match label {
-        "conversations" => &["id", "created_at", "metadata"],
+        "conversations" => &["id", "created_at", "metadata", "tenant"],
         "responses" => &[
             "id",
             "conversation_id",
@@ -291,6 +291,7 @@ fn core_columns_for(label: &str) -> &'static [&'static str] {
             "safety_identifier",
             "model",
             "raw_response",
+            "tenant",
         ],
         "conversation_items" => &[
             "id",
@@ -300,6 +301,7 @@ fn core_columns_for(label: &str) -> &'static [&'static str] {
             "content",
             "status",
             "created_at",
+            "tenant",
         ],
         "conversation_item_links" => &["conversation_id", "item_id", "added_at"],
         _ => &[],

@@ -16,8 +16,12 @@ use std::collections::HashSet;
 
 use validator::ValidationError;
 
-use crate::messages::{
-    CreateMessageRequest, InputContent, InputContentBlock, InputMessage, Role, ThinkingConfig, Tool,
+use crate::{
+    common::invalid,
+    messages::{
+        CreateMessageRequest, InputContent, InputContentBlock, InputMessage, Role, ThinkingConfig,
+        Tool,
+    },
 };
 
 /// Fields of a custom tool definition the public API accepts that the typed
@@ -37,12 +41,6 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
     validate_stop_sequences(req.stop_sequences.as_deref())?;
     validate_tools(req.tools.as_deref())?;
     validate_thinking(req)
-}
-
-fn invalid(code: &'static str, message: String) -> ValidationError {
-    let mut e = ValidationError::new(code);
-    e.message = Some(message.into());
-    e
 }
 
 /// `temperature` and `top_p` take the public API's range, 0 to 1.

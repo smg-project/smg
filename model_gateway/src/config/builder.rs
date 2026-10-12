@@ -247,6 +247,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn sse_keepalive_secs(mut self, secs: u64) -> Self {
+        self.config.sse_keepalive_secs = secs;
+        self
+    }
+
     pub fn worker_startup_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.worker_startup_timeout_secs = timeout;
         self
@@ -397,6 +402,21 @@ impl RouterConfigBuilder {
     /// Serve cached pixels over RDMA (legacy switch for the RDMA lane).
     pub fn mm_pixel_rdma(mut self, enabled: bool) -> Self {
         self.config.mm_pixel_rdma = enabled;
+        self
+    }
+
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name (every redirect hop included); `None` is any host
+    /// the address policy passes.
+    pub fn mm_allowed_media_domains(mut self, domains: Option<Vec<String>>) -> Self {
+        self.config.mm_allowed_media_domains = domains;
+        self
+    }
+
+    /// Allow client-supplied media URLs on loopback, link-local or private
+    /// addresses (a deployment whose media origin is internal).
+    pub fn mm_allow_private_media_hosts(mut self, allowed: bool) -> Self {
+        self.config.mm_allow_private_media_hosts = allowed;
         self
     }
 

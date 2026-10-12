@@ -3,6 +3,12 @@
 use std::{net::IpAddr, sync::Arc};
 
 pub const DEFAULT_TENANT_HEADER_NAME: &str = "x-smg-tenant-id";
+
+/// The longest tenant id accepted from a trusted header or a tenant API key:
+/// the canonical key built from it (`header:<id>`, `auth:<id>`) is stored
+/// with every response and conversation, in a 255-byte column on the
+/// SQL backends.
+pub const MAX_TENANT_ID_LEN: usize = 200;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -28,7 +34,7 @@ impl TenantIdentity {
     }
 }
 
-pub use smg_external_router::tenant::{RouteRequestMeta, TenantKey};
+pub use smg_external_router::tenant::{storage_tenant, RouteRequestMeta, TenantKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataPlaneCaller {
@@ -169,6 +175,28 @@ mod tests {
         // Unknown prefix.
         assert!(!is_canonical_serving_tenant_key("tenant:team-red"));
         assert!(!is_canonical_serving_tenant_key(""));
+    }
+
+    /// Stored records are scoped to the identities the gateway vouches for;
+    /// an address or an anonymous caller is no tenant.
+    #[test]
+    fn storage_tenant_is_the_canonical_key_of_a_vouched_identity_only() {
+        let tenant_of = |identity: TenantIdentity| {
+            storage_tenant(&RouteRequestMeta::new(canonical_tenant_key(identity)))
+        };
+        assert_eq!(
+            tenant_of(TenantIdentity::Authenticated(Arc::from("team-red"))).as_deref(),
+            Some("auth:team-red")
+        );
+        assert_eq!(
+            tenant_of(TenantIdentity::Header(Arc::from("team-red"))).as_deref(),
+            Some("header:team-red")
+        );
+        assert_eq!(
+            tenant_of(TenantIdentity::IpAddress("127.0.0.1".parse().unwrap())),
+            None
+        );
+        assert_eq!(tenant_of(TenantIdentity::Anonymous), None);
     }
 
     #[test]

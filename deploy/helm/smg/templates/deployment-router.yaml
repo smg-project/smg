@@ -42,6 +42,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "smg.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ add (int .Values.router.shutdownGracePeriodSeconds) (int .Values.router.terminationGraceMarginSeconds) }}
       containers:
         - name: router
           image: "{{ include "smg.routerImage" . }}"
@@ -66,13 +67,13 @@ spec:
           {{- end }}
           livenessProbe:
             httpGet:
-              path: /health
+              path: {{ .Values.router.livenessProbe.path }}
               port: http
             initialDelaySeconds: {{ .Values.router.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.router.livenessProbe.periodSeconds }}
           readinessProbe:
             httpGet:
-              path: /health
+              path: {{ .Values.router.readinessProbe.path }}
               port: http
             initialDelaySeconds: {{ .Values.router.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.router.readinessProbe.periodSeconds }}

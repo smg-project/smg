@@ -7,7 +7,8 @@
 //! # Processing Pipeline
 //!
 //! 1. Validate aspect ratio (must be < 200:1)
-//! 2. Smart resize to fit within min/max pixel bounds
+//! 2. Smart resize to fit within min/max pixel bounds (bicubic, with the
+//!    torchvision `uint8` kernel of the reference processors)
 //! 3. Align dimensions to (patch_size * merge_size) boundary
 //! 4. Convert to tensor and normalize
 //! 5. Reshape into patches for the vision encoder
@@ -34,8 +35,9 @@ use crate::{
         preprocessor_config::PreProcessorConfig,
         processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
         transforms::{
-            par_threads, pil_to_filter, resize, resize_bicubic_pil, resize_bicubic_pil_rgb,
-            resize_rgb_bytes, rgb_bytes, round_half_to_even, TransformError,
+            par_threads, pil_to_filter, resize, resize_bicubic_torch_aa,
+            resize_bicubic_torch_aa_rgb, resize_rgb_bytes, rgb_bytes, round_half_to_even,
+            TransformError,
         },
     },
 };
@@ -185,10 +187,11 @@ fn resize_rgb_frame_to_raw(
     target_height: u32,
     filter: FilterType,
 ) -> Result<Vec<u8>, TransformError> {
-    // BICUBIC (Qwen default) uses the PIL-compatible path, same as the image
-    // path; other filters keep the SIMD resizer.
+    // BICUBIC (Qwen default) uses the torchvision `uint8` kernel the family's
+    // reference processors run, same as the image path; other filters keep
+    // the SIMD resizer.
     let resized = if filter == FilterType::CatmullRom {
-        resize_bicubic_pil_rgb(
+        resize_bicubic_torch_aa_rgb(
             frame.data,
             frame.width,
             frame.height,
@@ -294,7 +297,7 @@ fn resize_dynamic_frame_to_raw(
     filter: FilterType,
 ) -> (usize, usize, Vec<u8>) {
     let resized = if filter == FilterType::CatmullRom {
-        resize_bicubic_pil(frame, target_width, target_height)
+        resize_bicubic_torch_aa(frame, target_width, target_height)
     } else {
         resize(frame, target_width, target_height, filter)
     };
@@ -1194,12 +1197,13 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                 .zip(errors.iter_mut())
             {
                 scope.spawn(move |_| {
-                    // BICUBIC (Qwen default) uses the PIL-compatible path; other
-                    // filters keep the SIMD path.
+                    // BICUBIC (Qwen default) uses the torchvision `uint8` kernel
+                    // the family's reference processors run; other filters keep
+                    // the SIMD path.
                     let resized;
                     let img_ref = if plan.needs_resize {
                         resized = if filter == FilterType::CatmullRom {
-                            resize_bicubic_pil(image, plan.target_width, plan.target_height)
+                            resize_bicubic_torch_aa(image, plan.target_width, plan.target_height)
                         } else {
                             resize(image, plan.target_width, plan.target_height, filter)
                         };
@@ -1610,7 +1614,7 @@ mod tests {
             .unwrap();
         let actual = result.encoder_input.flat_f32().into_owned();
 
-        let resized = resize_bicubic_pil(&image, target_w as u32, target_h as u32);
+        let resized = resize_bicubic_torch_aa(&image, target_w as u32, target_h as u32);
         let tensor = to_tensor_and_normalize(
             &resized,
             &processor.default_mean(),
@@ -1637,7 +1641,7 @@ mod tests {
         let processor = QwenVLProcessorBase::new(create_video_test_config());
         let image = create_sized_pattern_frame(7, 9, 3);
         let (target_h, target_w) = processor.smart_resize(9, 7).unwrap();
-        let resized = resize_bicubic_pil(&image, target_w as u32, target_h as u32);
+        let resized = resize_bicubic_torch_aa(&image, target_w as u32, target_h as u32);
         let tensor = to_tensor_and_normalize(
             &resized,
             &processor.default_mean(),
@@ -1719,8 +1723,8 @@ mod tests {
     }
 
     /// When a video frame actually needs resizing, the DynamicImage path
-    /// (`preprocess_video` → `resize_bicubic_pil`) and the raw-RGB path
-    /// (`preprocess_video_rgb` → `resize_bicubic_pil_rgb`) must produce
+    /// (`preprocess_video` → `resize_bicubic_torch_aa`) and the raw-RGB path
+    /// (`preprocess_video_rgb` → `resize_bicubic_torch_aa_rgb`) must produce
     /// byte-for-byte identical encoder inputs. The other video tests use 4x4
     /// frames that need no resize, so this is the one exercising the
     /// default-bicubic resize branch.

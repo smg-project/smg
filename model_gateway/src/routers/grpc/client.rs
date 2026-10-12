@@ -960,6 +960,13 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // servicer writes both.
     "engine_reasoning_parser",
     "structured_outputs_start",
+    // A servicer's own vision verdict. `GetModelInfo.supports_vision` is a
+    // proto3 bool, so a `false` there cannot be told from a field the servicer
+    // never set and is dropped for this runtime (`ModelInfo::to_labels`); a
+    // servicer that knows it carries no media to its engine writes the
+    // verdict here on purpose, and the gateway refuses image and video input
+    // for the worker at its gate instead of after fetching it.
+    "supports_vision",
 ];
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
@@ -1133,6 +1140,46 @@ mod tests {
         let silent = ServerInfo::Vllm(Box::default()).to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
         assert!(!silent.contains_key("structured_outputs_start"));
+    }
+
+    /// An SGLang servicer's own vision verdict travels in `server_args`,
+    /// where a `false` is deliberate (the proto3 `GetModelInfo` bool cannot
+    /// say so): kept as the label either way, absent when the servicer wrote
+    /// none.
+    #[test]
+    fn server_info_to_labels_sglang_keeps_the_servicers_own_vision_verdict() {
+        let info = |verdict: Option<bool>| {
+            let mut fields = BTreeMap::from([("tp_size".to_string(), number_value(2.0))]);
+            if let Some(verdict) = verdict {
+                fields.insert(
+                    "supports_vision".to_string(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::BoolValue(verdict)),
+                    },
+                );
+            }
+            ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+                server_args: Some(prost_types::Struct { fields }),
+                ..Default::default()
+            }))
+        };
+        assert_eq!(
+            info(Some(false))
+                .to_labels()
+                .get(SUPPORTS_VISION_LABEL)
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            info(Some(true))
+                .to_labels()
+                .get(SUPPORTS_VISION_LABEL)
+                .map(String::as_str),
+            Some("true")
+        );
+        let silent = info(None).to_labels();
+        assert!(!silent.contains_key(SUPPORTS_VISION_LABEL));
+        assert_eq!(silent.get("tp_size").map(String::as_str), Some("2"));
     }
 
     /// `supports_vision` is a label only when a servicer set it on purpose:

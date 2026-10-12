@@ -33,6 +33,7 @@ use std::{
         Arc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use chrono::{TimeDelta, Utc};
@@ -44,6 +45,9 @@ use data_connector::{
 use serde_json::json;
 use tokio::task::JoinSet;
 
+mod common;
+use common::Relay;
+
 fn test_db_url() -> Option<String> {
     std::env::var("DATA_CONNECTOR_TEST_POSTGRES_URL").ok()
 }
@@ -52,6 +56,7 @@ async fn postgres_bundle(db_url: &str) -> Result<StorageBundle, String> {
     let postgres_cfg = PostgresConfig {
         db_url: db_url.to_string(),
         pool_max: 4,
+        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
         // The shared test database starts with no migrations applied; opt in
         // to auto-migrate so `create_storage` doesn't require a human to run
         // the pending migrations by hand first.
@@ -212,6 +217,7 @@ async fn conversation_metadata_round_trips_json_column() {
         .create_conversation(NewConversation {
             id: None,
             metadata: Some(metadata.clone()),
+            tenant: None,
         })
         .await
         .expect("create_conversation");
@@ -279,6 +285,7 @@ async fn conversation_item_content_round_trips_json_column() {
             role: Some("user".to_string()),
             content: content.clone(),
             status: Some("completed".to_string()),
+            tenant: None,
         })
         .await
         .expect("create_item");
@@ -345,7 +352,8 @@ async fn find_response_by_output_item_queries_the_stored_output() {
 /// the store's `CREATE TABLE IF NOT EXISTS` leaves it as it is, so it has
 /// only what its owner gave it. `unique_id` decides whether the mapped id
 /// column carries a unique index. Returns the connection and the task that
-/// drives it (the connection ends with the set).
+/// drives it (the connection ends with the set). The table carries every core
+/// column, as one an operator created for this gateway would.
 async fn create_configured_responses_table(
     db_url: &str,
     table: &str,
@@ -368,7 +376,8 @@ async fn create_configured_responses_table(
             "DROP TABLE IF EXISTS {table}; \
              CREATE TABLE {table} ({id_def}, conversation_id VARCHAR(64), \
              previous_response_id VARCHAR(64), input JSON, created_at TIMESTAMPTZ, \
-             safety_identifier VARCHAR(128), model VARCHAR(128), payload JSON)"
+             safety_identifier VARCHAR(128), model VARCHAR(128), payload JSON, \
+             tenant VARCHAR(255))"
         ))
         .await
         .map_err(|e| format!("create the configured responses table: {e}"))?;
@@ -391,6 +400,7 @@ async fn configured_table_bundle(db_url: &str, table: &str) -> Result<StorageBun
     let postgres_cfg = PostgresConfig {
         db_url: db_url.to_string(),
         pool_max: 4,
+        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
         schema: Some(SchemaConfig {
             auto_migrate: true,
             responses,
@@ -709,6 +719,7 @@ async fn conversation_items_linked_a_microsecond_apart_list_in_link_order() {
         .create_conversation(NewConversation {
             id: None,
             metadata: None,
+            tenant: None,
         })
         .await
         .expect("create conversation");
@@ -731,6 +742,7 @@ async fn conversation_items_linked_a_microsecond_apart_list_in_link_order() {
                 role: Some("user".to_string()),
                 content: json!([]),
                 status: Some("completed".to_string()),
+                tenant: None,
             })
             .await
             .expect("create item");
@@ -791,6 +803,7 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
         .create_conversation(NewConversation {
             id: None,
             metadata: None,
+            tenant: None,
         })
         .await
         .expect("create conversation");
@@ -807,6 +820,7 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
             role: Some("user".to_string()),
             content: json!([]),
             status: Some("completed".to_string()),
+            tenant: None,
         })
         .await
         .expect("create item");
@@ -861,4 +875,741 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
         .await
         .expect("is linked"));
     assert!(list(SortOrder::Asc).await.is_empty());
+}
+
+/// A database of its own on the test server, for the tests of a first start:
+/// created from the test url under a unique name, dropped at the end.
+struct ScratchDatabase {
+    admin_url: String,
+    name: String,
+    url: String,
+}
+
+impl ScratchDatabase {
+    async fn create(db_url: &str, tag: &str) -> Result<Self, String> {
+        let name = format!(
+            "smg_scratch_{tag}_{}",
+            ulid::Ulid::new().to_string().to_lowercase()
+        );
+        let url = database_url(db_url, &name)?;
+        let scratch = Self {
+            admin_url: db_url.to_string(),
+            name,
+            url,
+        };
+        scratch
+            .admin(&format!("CREATE DATABASE \"{}\"", scratch.name))
+            .await?;
+        Ok(scratch)
+    }
+
+    /// Runs one statement on the test database (`CREATE` / `DROP DATABASE`
+    /// run outside a transaction, on a connection of their own).
+    async fn admin(&self, sql: &str) -> Result<(), String> {
+        let (client, connection) = tokio_postgres::connect(&self.admin_url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("connect to the test database: {e}"))?;
+        let mut driver = JoinSet::new();
+        driver.spawn(async move {
+            let _ = connection.await;
+        });
+        let result = client
+            .batch_execute(sql)
+            .await
+            .map_err(|e| format!("{sql}: {e}"));
+        drop(client);
+        driver.join_all().await;
+        result
+    }
+
+    /// The schema versions the database records, in order.
+    async fn versions(&self) -> Result<Vec<i32>, String> {
+        let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("connect to the scratch database: {e}"))?;
+        let mut driver = JoinSet::new();
+        driver.spawn(async move {
+            let _ = connection.await;
+        });
+        let rows = client
+            .query("SELECT version FROM _schema_versions ORDER BY version", &[])
+            .await
+            .map_err(|e| format!("read the schema versions: {e}"));
+        drop(client);
+        driver.join_all().await;
+        Ok(rows?.iter().map(|row| row.get::<_, i32>(0)).collect())
+    }
+
+    /// The indexes of the database's current schema, by name.
+    async fn indexes(&self) -> Result<Vec<String>, String> {
+        let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("connect to the scratch database: {e}"))?;
+        let mut driver = JoinSet::new();
+        driver.spawn(async move {
+            let _ = connection.await;
+        });
+        let rows = client
+            .query(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() ORDER BY indexname",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("read the indexes: {e}"));
+        drop(client);
+        driver.join_all().await;
+        Ok(rows?.iter().map(|row| row.get::<_, String>(0)).collect())
+    }
+
+    /// Runs one statement on the scratch database itself.
+    async fn run(&self, sql: &str) -> Result<(), String> {
+        let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("connect to the scratch database: {e}"))?;
+        let mut driver = JoinSet::new();
+        driver.spawn(async move {
+            let _ = connection.await;
+        });
+        let result = client
+            .batch_execute(sql)
+            .await
+            .map_err(|e| format!("{sql}: {e}"));
+        drop(client);
+        driver.join_all().await;
+        result
+    }
+
+    /// Whether `table` exists in the scratch database.
+    async fn has_table(&self, table: &str) -> Result<bool, String> {
+        let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("connect to the scratch database: {e}"))?;
+        let mut driver = JoinSet::new();
+        driver.spawn(async move {
+            let _ = connection.await;
+        });
+        let row = client
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+            .await
+            .map_err(|e| format!("look up {table}: {e}"));
+        drop(client);
+        driver.join_all().await;
+        Ok(row?.get(0))
+    }
+
+    async fn drop(self) {
+        let _ = self
+            .admin(&format!(
+                "DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)",
+                self.name
+            ))
+            .await;
+    }
+}
+
+/// Six gateways start together on `scratch` (`auto_migrate` on, as a
+/// deployment that migrates at start-up): the start-up failures, and the
+/// versions the database records afterwards.
+async fn six_gateways_start_together(
+    scratch: &ScratchDatabase,
+) -> (Vec<String>, Result<Vec<i32>, String>) {
+    let mut starts = JoinSet::new();
+    for _ in 0..6 {
+        let url = scratch.url.clone();
+        starts.spawn(async move {
+            let postgres_cfg: PostgresConfig = serde_json::from_value(json!({
+                "db_url": url,
+                "pool_max": 2,
+                "schema": {"auto_migrate": true},
+            }))
+            .map_err(|e| format!("a Postgres config: {e}"))?;
+            create_storage(StorageFactoryConfig {
+                backend: &HistoryBackend::Postgres,
+                oracle: None,
+                postgres: Some(&postgres_cfg),
+                redis: None,
+                hook: None,
+            })
+            .await
+            .map(drop)
+        });
+    }
+    let outcomes = starts.join_all().await;
+    let versions = scratch.versions().await;
+    (
+        outcomes.into_iter().filter_map(Result::err).collect(),
+        versions,
+    )
+}
+
+/// `db_url` with its database name replaced by `name`.
+fn database_url(db_url: &str, name: &str) -> Result<String, String> {
+    let scheme_end = db_url
+        .find("://")
+        .ok_or_else(|| format!("no scheme in the database url {db_url}"))?
+        + 3;
+    let rest = &db_url[scheme_end..];
+    let path_start = rest
+        .find('/')
+        .ok_or_else(|| format!("no database name in the url {db_url}"))?;
+    let query_start = rest[path_start..]
+        .find('?')
+        .map_or(rest.len(), |q| path_start + q);
+    Ok(format!(
+        "{}{}/{name}{}",
+        &db_url[..scheme_end],
+        &rest[..path_start],
+        &rest[query_start..]
+    ))
+}
+
+/// A first start on an empty database comes up without `auto_migrate`: the
+/// tables are created in their current shape, so nothing is pending, and the
+/// version table records every migration as applied.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_fresh_database_bootstraps_at_the_latest_version_without_auto_migrate() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "fresh")
+        .await
+        .expect("create a scratch database");
+    let postgres_cfg: PostgresConfig = serde_json::from_value(json!({
+        "db_url": scratch.url,
+        "pool_max": 4,
+        "schema": {"auto_migrate": false},
+    }))
+    .expect("a Postgres config without auto_migrate");
+    let outcome = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&postgres_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await;
+    let versions = scratch.versions().await;
+    let indexes = scratch.indexes().await;
+    let served = match &outcome {
+        Ok(bundle) => Some(
+            bundle
+                .conversation_storage
+                .create_conversation(NewConversation {
+                    id: None,
+                    metadata: None,
+                    tenant: None,
+                })
+                .await,
+        ),
+        Err(_) => None,
+    };
+    drop(outcome);
+    scratch.drop().await;
+    served
+        .expect("a fresh database must come up without auto_migrate")
+        .expect("the fresh store serves");
+    assert_eq!(versions.expect("read the versions"), vec![1, 2, 3, 4]);
+    let indexes = indexes.expect("read the indexes");
+    for index in ["conv_item_links_conv_idx", "responses_safety_idx"] {
+        assert!(
+            indexes.iter().any(|name| name == index),
+            "{index} is created by the bootstrap: {indexes:?}"
+        );
+    }
+}
+
+/// Gateways starting together on an empty database all come up: the
+/// bootstrap (tables, versions, migrations) runs once under the schema lock
+/// and the others find it done.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn gateways_starting_together_on_an_empty_database_all_come_up() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    for round in 0..3 {
+        let scratch = ScratchDatabase::create(&db_url, &format!("race{round}"))
+            .await
+            .expect("create a scratch database");
+        let (failures, versions) = six_gateways_start_together(&scratch).await;
+        scratch.drop().await;
+        assert!(
+            failures.is_empty(),
+            "round {round}: {} of 6 starts failed: {failures:?}",
+            failures.len()
+        );
+        assert_eq!(
+            versions.expect("read the versions"),
+            vec![1, 2, 3, 4],
+            "round {round}"
+        );
+    }
+}
+
+/// The bootstrap reads the schema version in a snapshot taken after its lock
+/// wait whatever the server's default isolation: under a `repeatable read`
+/// default a gateway queued behind another's bootstrap would otherwise read
+/// the versions table as it was before that bootstrap and apply the
+/// migrations again to tables that already have their final shape.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn gateways_starting_together_come_up_under_a_repeatable_read_default() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    for round in 0..3 {
+        let scratch = ScratchDatabase::create(&db_url, &format!("rr{round}"))
+            .await
+            .expect("create a scratch database");
+        if let Err(e) = scratch
+            .admin(&format!(
+                "ALTER DATABASE \"{}\" SET default_transaction_isolation TO 'repeatable read'",
+                scratch.name
+            ))
+            .await
+        {
+            scratch.drop().await;
+            panic!("set the database's default isolation: {e}");
+        }
+        let (failures, versions) = six_gateways_start_together(&scratch).await;
+        scratch.drop().await;
+        assert!(
+            failures.is_empty(),
+            "round {round}: {} of 6 starts failed under a repeatable read default: {failures:?}",
+            failures.len()
+        );
+        assert_eq!(
+            versions.expect("read the versions"),
+            vec![1, 2, 3, 4],
+            "round {round}"
+        );
+    }
+}
+
+/// A read or a write costs one round trip after the first on a connection:
+/// the statement is prepared once and cached on the connection, not parsed
+/// again on every call (a parse round trip and an execute round trip each),
+/// and no statement is closed, so the cache kept it. Measured on the wire,
+/// with the relay counting the server's ReadyForQuery and the client's Close
+/// messages.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let (relayed_url, meter) = relayed_database(&db_url).expect("start the relay");
+    let bundle = postgres_bundle(&relayed_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let (resp, conv, items) = (
+        bundle.response_storage,
+        bundle.conversation_storage,
+        bundle.conversation_item_storage,
+    );
+
+    // One record of each kind, and the first call of every statement, which
+    // prepares it (the pool hands the same connection back to sequential
+    // calls).
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({"id": stored.id.0, "status": "completed"});
+    let response_id = resp.store_response(stored).await.expect("store response");
+    let conversation = conv
+        .create_conversation(NewConversation {
+            tenant: None,
+            id: None,
+            metadata: None,
+        })
+        .await
+        .expect("create conversation");
+    let second = conv
+        .create_conversation(NewConversation {
+            tenant: None,
+            id: None,
+            metadata: None,
+        })
+        .await
+        .expect("create a second conversation");
+    let item = items
+        .create_item(NewConversationItem {
+            tenant: None,
+            id: None,
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([]),
+            status: Some("completed".to_string()),
+        })
+        .await
+        .expect("create item");
+    items
+        .link_item(&conversation.id, &item.id, Utc::now())
+        .await
+        .expect("link item");
+    let params = || ListParams {
+        limit: 10,
+        order: SortOrder::Asc,
+        after: None,
+    };
+    resp.get_response(&response_id).await.expect("read");
+    conv.get_conversation(&conversation.id).await.expect("read");
+    items
+        .is_item_linked(&conversation.id, &item.id)
+        .await
+        .expect("read");
+    items
+        .list_items(&conversation.id, params())
+        .await
+        .expect("read");
+
+    // Every later call of a statement: one round trip, and no statement closed.
+    let closes_before = meter.closes.load(Ordering::SeqCst);
+    let mut costs = Vec::new();
+    for (name, call) in [
+        ("get_response", {
+            let resp = resp.clone();
+            let id = response_id.clone();
+            Box::pin(async move {
+                resp.get_response(&id)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>
+        }),
+        ("get_conversation", {
+            let conv = conv.clone();
+            let id = conversation.id.clone();
+            Box::pin(async move {
+                conv.get_conversation(&id)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        }),
+        ("is_item_linked", {
+            let items = items.clone();
+            let (cid, iid) = (conversation.id.clone(), item.id.clone());
+            Box::pin(async move {
+                items
+                    .is_item_linked(&cid, &iid)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        }),
+        ("list_items", {
+            let items = items.clone();
+            let cid = conversation.id.clone();
+            Box::pin(async move {
+                items
+                    .list_items(&cid, params())
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        }),
+        ("create_conversation", {
+            let conv = conv.clone();
+            Box::pin(async move {
+                conv.create_conversation(NewConversation {
+                    tenant: None,
+                    id: None,
+                    metadata: None,
+                })
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string())
+            })
+        }),
+        ("link_item", {
+            let items = items.clone();
+            let (cid, iid) = (second.id.clone(), item.id.clone());
+            Box::pin(async move {
+                items
+                    .link_item(&cid, &iid, Utc::now())
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }),
+    ] {
+        let before = meter.ready_for_query.load(Ordering::SeqCst);
+        call.await.expect(name);
+        costs.push((name, meter.ready_for_query.load(Ordering::SeqCst) - before));
+    }
+    let costly: Vec<_> = costs.iter().filter(|(_, trips)| *trips != 1).collect();
+    assert!(
+        costly.is_empty(),
+        "round trips per call after the first: {costs:?}; expected one each"
+    );
+    assert_eq!(
+        meter.closes.load(Ordering::SeqCst) - closes_before,
+        0,
+        "no statement was closed: each stayed cached on its connection"
+    );
+}
+
+/// A database whose schema version is ahead of the migrations this build
+/// knows is refused at start-up with a message that says so (an older
+/// gateway behind a store a newer build migrated forward would otherwise
+/// start and fail its first read); the schema config's `version` at that
+/// version is the operator's word that the build may run against it. On a
+/// database of its own, so nothing shared sees the future version.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_database_ahead_of_this_build_is_refused_at_startup() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "ahead")
+        .await
+        .expect("create a scratch database");
+    // The schema at this build's version first, then a future migration.
+    let at_this_build = postgres_bundle(&scratch.url).await.map(drop);
+    let recorded = scratch
+        .run(
+            "INSERT INTO _schema_versions (version, description) VALUES (99, 'a future migration') \
+             ON CONFLICT (version) DO NOTHING",
+        )
+        .await;
+    let refused = postgres_bundle(&scratch.url).await.map(drop);
+    let allowed_cfg = PostgresConfig {
+        db_url: scratch.url.clone(),
+        pool_max: 4,
+        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
+        schema: Some(SchemaConfig {
+            auto_migrate: true,
+            version: Some(99),
+            ..Default::default()
+        }),
+    };
+    let allowed = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&allowed_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await
+    .map(drop);
+    scratch.drop().await;
+
+    at_this_build.expect("the schema at this build's version comes up");
+    recorded.expect("record a future migration");
+    let message = refused.expect_err("a database ahead of this build must be refused at start-up");
+    assert!(
+        message.contains("version 99") && message.contains("ahead of the latest migration"),
+        "{message}"
+    );
+    allowed.expect("`version: 99` lets the build run against the newer database");
+}
+
+/// The refusal comes before any table is touched: a database whose version
+/// table says 99 but has no responses table (a newer migration renamed or
+/// dropped it) reads as a fresh database otherwise, and a fresh start would
+/// create the legacy table in the newer store and stamp 1..3 next to 99.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_database_ahead_of_this_build_is_refused_before_its_tables_are_touched() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "ahead_fresh")
+        .await
+        .expect("create a scratch database");
+    let prepared = scratch
+        .run(
+            "CREATE TABLE _schema_versions (version INTEGER NOT NULL PRIMARY KEY, \
+             description VARCHAR(512), applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); \
+             INSERT INTO _schema_versions (version, description) VALUES (99, 'a future migration')",
+        )
+        .await;
+    let refused = postgres_bundle(&scratch.url).await.map(drop);
+    let responses_created = scratch.has_table("responses").await;
+    let versions = scratch.versions().await;
+    scratch.drop().await;
+
+    prepared.expect("prepare a database at a future version without a responses table");
+    let message = refused
+        .expect_err("a database ahead of this build must be refused before its tables are created");
+    assert!(message.contains("version 99"), "{message}");
+    assert!(
+        !responses_created.expect("look up the responses table"),
+        "the refusal must come before the responses table is created"
+    );
+    assert_eq!(
+        versions.expect("read the versions"),
+        vec![99],
+        "nothing stamped next to the future version"
+    );
+}
+
+/// A store that accepts the connection and then stops answering (a frozen or
+/// partitioned server, a stalled proxy) fails the call at the configured
+/// bound, with an error that names the backend, the call and the bound; once
+/// the store answers again, the same pool serves the next call.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_store_that_stops_answering_fails_the_call_at_its_bound() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let (relay, relayed_url) = Relay::in_front_of(&db_url, 5432).expect("start the relay");
+    // The bound as an operator configures it; one second here.
+    let postgres_cfg: PostgresConfig = serde_json::from_value(json!({
+        "db_url": relayed_url,
+        "pool_max": 4,
+        "op_timeout_secs": 1,
+        "schema": {"auto_migrate": true},
+    }))
+    .expect("a Postgres config with a call bound");
+    let resp = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&postgres_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await
+    .expect("failed to initialize Postgres storage")
+    .response_storage;
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({"id": stored.id.0, "status": "completed"});
+    let id = resp.store_response(stored).await.expect("store response");
+
+    relay.hold();
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), resp.get_response(&id)).await;
+    let elapsed = started.elapsed();
+    relay.release();
+    let result = outcome.unwrap_or_else(|_| {
+        panic!("the read was still waiting on the store after 10 s: nothing bounds a store call")
+    });
+    let err = result.expect_err("a store that does not answer must fail the call");
+    assert!(
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+        "the call failed after {elapsed:?}; the bound is 1 s"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("postgres get_response") && message.contains("bound of 1 s"),
+        "{message}"
+    );
+
+    // The store answers again: the pool serves the next call.
+    let read_back = tokio::time::timeout(Duration::from_secs(10), resp.get_response(&id))
+        .await
+        .expect("the read after the release must return")
+        .expect("the read after the release must succeed");
+    assert_eq!(read_back.map(|r| r.id), Some(id));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn responses_and_conversations_keep_their_tenant_and_the_identifier_queries_are_scoped() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let resp = bundle.response_storage;
+
+    // Three responses under one safety identifier (unique to this run): tenant
+    // a's, tenant b's and one stored under no tenant.
+    let mut of_a = StoredResponse::new(None);
+    let identifier = format!("sid_{}", of_a.id.0);
+    of_a.safety_identifier = Some(identifier.clone());
+    of_a.tenant = Some("header:a".to_string());
+    of_a.input = json!(["a"]);
+    of_a.raw_response = json!({"output": []});
+    let mut of_b = StoredResponse::new(None);
+    of_b.safety_identifier = Some(identifier.clone());
+    of_b.tenant = Some("header:b".to_string());
+    of_b.input = json!(["b"]);
+    of_b.raw_response = json!({"output": []});
+    let mut of_nobody = StoredResponse::new(None);
+    of_nobody.safety_identifier = Some(identifier.clone());
+    of_nobody.input = json!(["nobody"]);
+    of_nobody.raw_response = json!({"output": []});
+    let id_a = resp.store_response(of_a).await.expect("store a's");
+    let id_b = resp.store_response(of_b).await.expect("store b's");
+    let id_nobody = resp
+        .store_response(of_nobody)
+        .await
+        .expect("store the untenanted one");
+
+    // The tenant column round-trips.
+    let fetched = resp.get_response(&id_a).await.unwrap().expect("a's record");
+    assert_eq!(fetched.tenant.as_deref(), Some("header:a"));
+    let fetched = resp
+        .get_response(&id_nobody)
+        .await
+        .unwrap()
+        .expect("the untenanted record");
+    assert_eq!(fetched.tenant, None);
+
+    // The listing by safety identifier is scoped in the query itself.
+    let ids = |responses: Vec<StoredResponse>| {
+        let mut ids: Vec<String> = responses.into_iter().map(|r| r.id.0).collect();
+        ids.sort();
+        ids
+    };
+    let mut expected = vec![id_a.0.clone(), id_nobody.0.clone()];
+    expected.sort();
+    let listed = resp
+        .list_identifier_responses(&identifier, Some("header:a"), None)
+        .await
+        .expect("list as a");
+    assert_eq!(ids(listed), expected, "a's record and the untenanted one");
+    let listed = resp
+        .list_identifier_responses(&identifier, None, Some(10))
+        .await
+        .expect("list without a tenant");
+    assert_eq!(ids(listed), vec![id_nobody.0.clone()]);
+
+    // So is the deletion: a's call takes a's record and the untenanted one, b's stays.
+    let deleted = resp
+        .delete_identifier_responses(&identifier, Some("header:a"))
+        .await
+        .expect("delete as a");
+    assert_eq!(deleted, 2);
+    assert!(resp.get_response(&id_a).await.unwrap().is_none());
+    assert!(resp.get_response(&id_b).await.unwrap().is_some());
+    let left = resp
+        .list_identifier_responses(&identifier, Some("header:b"), None)
+        .await
+        .expect("list as b");
+    assert_eq!(ids(left), vec![id_b.0.clone()]);
+
+    // A conversation keeps its tenant through a read and a metadata update.
+    let conversations = bundle.conversation_storage;
+    let created = conversations
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+            tenant: Some("header:a".to_string()),
+        })
+        .await
+        .expect("create conversation");
+    let fetched = conversations
+        .get_conversation(&created.id)
+        .await
+        .expect("get conversation")
+        .expect("created");
+    assert_eq!(fetched.tenant.as_deref(), Some("header:a"));
+    let metadata = json!({"topic": "tenants"}).as_object().cloned();
+    let updated = conversations
+        .update_conversation(&created.id, metadata.clone())
+        .await
+        .expect("update conversation")
+        .expect("exists");
+    assert_eq!(updated.tenant.as_deref(), Some("header:a"));
+    assert_eq!(updated.metadata, metadata);
+    assert_eq!(updated.created_at, fetched.created_at);
+    assert!(conversations
+        .delete_conversation(&created.id)
+        .await
+        .expect("delete conversation"));
 }

@@ -22,6 +22,10 @@
 //! dropped. `{"version": 1, "workers": []}` is a valid, intentionally empty
 //! fleet. Writers should write a temporary file in the same directory and
 //! rename it over the manifest.
+//!
+//! Editing a record in place, such as correcting its bootstrap port, updates
+//! its worker in place with the new settings. A new `id` at a reused address
+//! signals a new instance there, whose worker is removed and re-registered.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

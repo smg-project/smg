@@ -29,6 +29,10 @@
 //! [`plain()`] is the table for a template that writes the message's content and nothing else: one
 //! state, no marker.
 //!
+//! [`for_model()`] picks the table for a model id: the registry of the checkpoints bellwether has
+//! recorded, each with the table that reads it and its own turn opener where the table's is not
+//! its template's.
+//!
 //! [`Format`]: crate::Format
 //! [`Engine`]: crate::Engine
 
@@ -51,6 +55,7 @@ pub mod olmo3;
 pub mod plain;
 pub mod qwen2_5;
 pub mod qwen3;
+pub mod registry;
 pub mod seed_oss;
 pub mod xlam;
 
@@ -73,5 +78,6 @@ pub use olmo3::olmo3;
 pub use plain::plain;
 pub use qwen2_5::qwen2_5;
 pub use qwen3::qwen3;
+pub use registry::{for_model, groups, table_for, Table};
 pub use seed_oss::seed_oss;
 pub use xlam::xlam;

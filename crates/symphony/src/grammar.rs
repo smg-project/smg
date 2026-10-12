@@ -27,8 +27,9 @@
 //! xLAM's bare list of JSON objects, written from the tools alone since its table has no markers;
 //! for MiniMax M3, the XML tree of elements with the table's separator before every tag (the
 //! `xml` module); Gemma 4's `call:NAME{key:value}` spelling, the keys sorted and each string
-//! between `<|"|>` tokens (the `gemma` module). The gateway's old parsers wrote these tags by
-//! hand, one function per parser;
+//! between `<|"|>` tokens (the `gemma` module); for Inkling, the call marker and a JSON object
+//! whose `args` the schema accepts, wherever the marker stands in a message. The gateway's old
+//! parsers wrote these tags by hand, one function per parser;
 //! where one exists for a format Symphony has, the derived tag is pinned to it in the tests, so
 //! the switch changes nothing an engine sees.
 //!
@@ -49,9 +50,9 @@
 //! other state, its own row into the block. So the model closes whatever the prompt left open on
 //! its way to the calls, whichever that was.
 //!
-//! A table without calls gives `None`, as does Inkling's named JSON (a forced call's tag would
-//! start inside the first message, before any opener) until its tag is derived; the gateway takes
-//! the JSON-schema path for it.
+//! Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
+//! trigger inside whatever message the model is writing. A table without calls gives `None`, and
+//! the gateway takes the JSON-schema path for it.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -193,13 +194,13 @@ impl Grammar {
         json!({"format": self.to_json()})
     }
 
-    /// The nodes in the tree, this one included: its size, for a derivation that bounds it.
+    /// The nodes in the tree, this one included: its size, for a derivation that bounds it. A
+    /// JSON schema leaf counts by the size of its schema (a node per four of the schema's own, a
+    /// long string weighing its length), since the definitions attached to it are copied with it.
     pub(crate) fn nodes(&self) -> usize {
         1 + match self {
-            Self::ConstString(_)
-            | Self::AnyText { .. }
-            | Self::Regex(_)
-            | Self::JsonSchema { .. } => 0,
+            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) => 0,
+            Self::JsonSchema { schema, .. } => json_nodes(schema) / 4,
             Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
             Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
             Self::Tag(tag) => tag.content.nodes(),
@@ -207,6 +208,22 @@ impl Grammar {
                 tags.iter().map(|tag| tag.content.nodes()).sum()
             }
         }
+    }
+}
+
+/// The nodes of a JSON value: one per scalar, one per object or array and one per member, and
+/// one more per sixty-four bytes of a string, so a long `description` weighs what it costs.
+fn json_nodes(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            1 + map
+                .values()
+                .map(|member| 1 + json_nodes(member))
+                .sum::<usize>()
+        }
+        Value::Array(items) => 1 + items.iter().map(json_nodes).sum::<usize>(),
+        Value::String(text) => 1 + text.len() / 64,
+        _ => 1,
     }
 }
 
@@ -339,7 +356,9 @@ impl Format {
                 return xml::calls(markers?, self.separator(), &named, at_least_one);
             }
             CallSyntax::Gemma => gemma::calls(markers?, &named, at_least_one),
-            CallSyntax::NamedJson(_) => return None,
+            CallSyntax::NamedJson(marker) => {
+                return self.named_json_calls(marker, &named, at_least_one);
+            }
         };
         if !reasoning_open {
             return Some(calls);
@@ -398,6 +417,51 @@ impl Format {
             tags,
             at_least_one,
         }
+    }
+
+    /// Inkling's named JSON: the tag the gateway's old Inkling parser hand-writes. The marker that
+    /// says a message is a call triggers it, inside whatever message the model is writing, the
+    /// first one included: the marker, `{"name":"NAME","args":` as the template writes it, the
+    /// arguments the tool's schema accepts, `}` and the message's close (the terminal of the row
+    /// from the turn's own state, where a message starts, to the wrapper state a closed message
+    /// leaves the engine in). The tool's name before the marker stays free text: the assembler
+    /// takes the call's name from the object and drops the header as the template's framing. The
+    /// messages before the call (a thought, the template's empty answer) are free text too, and a
+    /// thought is a message of its own, so the tag is the same whether the prompt left the model
+    /// inside one or not. The tag is wider than the parser at one point, as the gateway's is: a
+    /// marker outside a message's header (after an answer's text, or after a message's close with
+    /// no opener between) is writable here and reads as that message's text, so an output written
+    /// there satisfies `at_least_one` and yields no call; the model does not write it, the
+    /// sequence being off its training. `None` for a table whose messages have no close.
+    fn named_json_calls(
+        &self,
+        marker: &str,
+        tools: &[&Tool],
+        at_least_one: bool,
+    ) -> Option<Grammar> {
+        let (_, close, _) = self
+            .transitions()
+            .find(|&(source, _, target)| source == 0 && self.emits(target) == Emits::Wrapper)?;
+        let close = self.terminal_text(close);
+        let tags = tools
+            .iter()
+            .map(|tool| {
+                let quoted = Value::String(tool.function.name.clone());
+                Tag::new(
+                    format!("{marker}{{\"name\":{quoted},\"args\":"),
+                    Grammar::JsonSchema {
+                        schema: tool.function.parameters.clone(),
+                        style: None,
+                    },
+                    format!("}}{close}"),
+                )
+            })
+            .collect();
+        Some(Grammar::TriggeredTags {
+            triggers: vec![marker.to_string()],
+            tags,
+            at_least_one,
+        })
     }
 
     /// xLAM's list: the whole output is `[`, the calls joined by `, `, `]`, each call a JSON object
@@ -1247,6 +1311,54 @@ mod tests {
                 ]},
                 list,
             ]})
+        );
+    }
+
+    #[test]
+    fn inkling_derives_the_tag_the_gateway_hand_writes_today() {
+        // The old crate's `InklingParser::build_structural_tag`: one trigger, the call marker; per
+        // named tool a tag from the marker and `{"name":"NAME","args":` to `}<|end_message|>`
+        // around the tool's schema; `at_least_one` as asked. The messages before the call (a
+        // thought, the template's empty answer, the tool's name before the marker) are free text,
+        // so the recorded thinking turn stays writable, and a call in the first message is
+        // constrained too. The same tag with the thought open.
+        let tools = weather_tools();
+        let payload = formats::inkling()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let schema = value!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let per_tool = |name: &str, schema: &Value| {
+            value!({
+                "type": "tag",
+                "begin": format!("<|content_invoke_tool_json|>{{\"name\":\"{name}\",\"args\":"),
+                "content": {"type": "json_schema", "json_schema": schema},
+                "end": "}<|end_message|>",
+            })
+        };
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<|content_invoke_tool_json|>"],
+                "tags": [
+                    per_tool("get_weather", &schema),
+                    per_tool("lookup", &schema),
+                    per_tool("ping", &value!({})),
+                ],
+                "at_least_one": true,
+            }})
+        );
+        assert_eq!(
+            formats::inkling()
+                .grammar(&tools, false, true)
+                .expect("a grammar")
+                .payload()["format"]["at_least_one"],
+            false
+        );
+        assert_eq!(
+            formats::inkling().grammar(&tools, true, true),
+            formats::inkling().grammar(&tools, true, false)
         );
     }
 

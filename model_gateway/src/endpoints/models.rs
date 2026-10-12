@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use axum::{
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
     Json,
 };
@@ -69,7 +69,25 @@ impl ModelShape {
     /// (`not_found_error`, top-level `type`, `request_id`) for a Messages
     /// client, as `/v1/messages` answers it.
     async fn not_found(self, model_id: &str, request_id: String) -> Response {
-        let response = error::model_not_found(model_id);
+        self.error(error::model_not_found(model_id), request_id)
+            .await
+    }
+
+    /// The 503 of an inventory with no model in it (no worker registered, or
+    /// every worker gone): the gateway's error envelope with a typed code, as
+    /// every other refusal answers, in the caller's shape.
+    async fn no_models(self, request_id: String) -> Response {
+        self.error(
+            error::service_unavailable("no_models_available", "No models available"),
+            request_id,
+        )
+        .await
+    }
+
+    /// An OpenAI-shaped error response in the caller's shape: as it is for an
+    /// OpenAI client, re-shaped into the Messages envelope for a Messages
+    /// client.
+    async fn error(self, response: Response, request_id: String) -> Response {
         match self {
             Self::OpenAi => response,
             Self::Anthropic => into_messages_envelope(response, request_id).await,
@@ -77,13 +95,19 @@ impl ModelShape {
     }
 }
 
-/// Answer `GET /v1/models` for the caller identified by `headers`.
-pub async fn list_models(context: &AppContext, headers: &HeaderMap) -> Response {
+/// Answer `GET /v1/models` for the caller identified by `headers`
+/// (`request_id` names the request in the Messages envelope of a refusal).
+pub async fn list_models(
+    context: &AppContext,
+    headers: &HeaderMap,
+    request_id: String,
+) -> Response {
     list_models_with(
         &context.worker_registry,
         &context.client,
         &context.gateway_auth,
         headers,
+        request_id,
     )
     .await
 }
@@ -94,6 +118,7 @@ pub(crate) async fn list_models_with(
     client: &reqwest::Client,
     gateway_auth: &AuthConfig,
     headers: &HeaderMap,
+    request_id: String,
 ) -> Response {
     let bearer_token = bearer_token(headers);
     let shape = ModelShape::from_headers(headers);
@@ -103,7 +128,7 @@ pub(crate) async fn list_models_with(
     // below, which would forward it externally.
     if let Some(ref token) = bearer_token {
         if gateway_auth.contains_token(token) {
-            return registry_models_response(registry, shape);
+            return registry_models_response(registry, shape, request_id).await;
         }
     }
 
@@ -116,7 +141,7 @@ pub(crate) async fn list_models_with(
         }
     }
 
-    registry_models_response(registry, shape)
+    registry_models_response(registry, shape, request_id).await
 }
 
 /// Answer `GET /v1/models/{id}` from the self-hosted inventory: the card of
@@ -182,11 +207,16 @@ fn self_hosted_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
         .collect()
 }
 
-/// The self-hosted inventory as a list in the caller's shape.
-fn registry_models_response(registry: &WorkerRegistry, shape: ModelShape) -> Response {
+/// The self-hosted inventory as a list in the caller's shape, or the 503 of
+/// an empty one in the caller's error envelope.
+async fn registry_models_response(
+    registry: &WorkerRegistry,
+    shape: ModelShape,
+    request_id: String,
+) -> Response {
     let cards = self_hosted_cards(registry);
     if cards.is_empty() {
-        (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
+        shape.no_models(request_id).await
     } else {
         shape.list(cards)
     }
@@ -283,7 +313,7 @@ mod tests {
         Arc,
     };
 
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -291,6 +321,38 @@ mod tests {
         config::types::TenantApiKeyEntry,
         worker::{BasicWorkerBuilder, Worker, WorkerType},
     };
+
+    /// An inventory with no model in it answers the gateway's JSON error
+    /// envelope with a typed code, as every other refusal does, in the
+    /// caller's shape: the OpenAI envelope, or the Messages envelope with its
+    /// `request_id` for a Messages client.
+    #[tokio::test]
+    async fn an_empty_inventory_answers_the_error_envelope_in_the_callers_shape() {
+        let registry = WorkerRegistry::new();
+
+        let response =
+            registry_models_response(&registry, ModelShape::OpenAi, "req_1".to_string()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["code"], "no_models_available", "{body}");
+        assert_eq!(body["error"]["message"], "No models available", "{body}");
+        assert!(body["error"]["type"].is_string(), "{body}");
+
+        let response =
+            registry_models_response(&registry, ModelShape::Anthropic, "req_2".to_string()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = json_body(response).await;
+        assert_eq!(body["type"], "error", "{body}");
+        assert_eq!(body["error"]["message"], "No models available", "{body}");
+        assert_eq!(body["request_id"], "req_2", "{body}");
+    }
 
     /// A tenant-scoped credential must never reach the upstream fan-out:
     /// that would forward the gateway's own secret to an external provider
@@ -358,7 +420,14 @@ mod tests {
             .header(header::AUTHORIZATION, "Bearer team-red-secret")
             .body(())
             .unwrap();
-        let response = list_models_with(&registry, &client, &gateway_auth, req.headers()).await;
+        let response = list_models_with(
+            &registry,
+            &client,
+            &gateway_auth,
+            req.headers(),
+            "req_test".to_string(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             hit_count.load(Ordering::SeqCst),
@@ -373,7 +442,14 @@ mod tests {
             .header(header::AUTHORIZATION, "Bearer not-a-gateway-key")
             .body(())
             .unwrap();
-        let _ = list_models_with(&registry, &client, &gateway_auth, req.headers()).await;
+        let _ = list_models_with(
+            &registry,
+            &client,
+            &gateway_auth,
+            req.headers(),
+            "req_test".to_string(),
+        )
+        .await;
         assert_eq!(
             hit_count.load(Ordering::SeqCst),
             1,
@@ -421,9 +497,17 @@ mod tests {
         let client = crate::http_client::client();
         let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
-        let openai =
-            json_body(list_models_with(&registry, &client, &gateway_auth, &HeaderMap::new()).await)
-                .await;
+        let openai = json_body(
+            list_models_with(
+                &registry,
+                &client,
+                &gateway_auth,
+                &HeaderMap::new(),
+                "req_test".to_string(),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(openai["object"], "list");
         assert_eq!(openai["data"][0]["object"], "model");
         assert_eq!(openai["data"][0]["id"], "m1");
@@ -431,8 +515,17 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        let anthropic =
-            json_body(list_models_with(&registry, &client, &gateway_auth, &headers).await).await;
+        let anthropic = json_body(
+            list_models_with(
+                &registry,
+                &client,
+                &gateway_auth,
+                &headers,
+                "req_test".to_string(),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(anthropic["has_more"], false);
         assert_eq!(anthropic["first_id"], "m1");
         assert_eq!(anthropic["last_id"], "m1");

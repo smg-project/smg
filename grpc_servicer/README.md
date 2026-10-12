@@ -69,7 +69,11 @@ multimodal engine also advertises its resolved `--limit-mm-per-prompt` as
 itself holds requests to the engine's limits. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
-`--allowed-media-domains` the worker fetches from any host the router forwards.
+`--allowed-media-domains` the worker fetches from any public host the router
+forwards. A media URL that names or resolves to a loopback, link-local or
+private address is refused on the worker as on the router, redirects included,
+unless `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1` is set for a deployment whose media
+origin is internal.
 Related knobs: `--mm-max-inflight` (`SMG_VLLM_MM_MAX_INFLIGHT`, default 64)
 bounds concurrent media jobs; `--mm-max-items` (`SMG_VLLM_MM_MAX_ITEMS`, unset
 by default) overrides the model's per-modality reference limits;

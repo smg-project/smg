@@ -191,7 +191,8 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
 ];
 
 /// Jemalloc's run-time options for a long-running gateway, for every final
-/// artifact (the `smg` executable, the Python extension) to export as
+/// artifact (the `smg` executable, the Python extension, the Go FFI library)
+/// to export as
 /// `_rjem_malloc_conf` next to its `#[global_allocator]`. With the stock
 /// settings a thread's freed pages decay back to the OS only when that thread
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
@@ -263,7 +264,11 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_responses_total",
-        "Total HTTP responses by path, status_code and error_code"
+        "Total HTTP responses by path, status_code and error_code, counted once the \
+         response has gone out in full (its last frame, or the length it declared); a \
+         request whose client closed the connection first counts as status_code 499 \
+         with error_code client_closed_request, as does the rare request the server \
+         dropped unanswered (a handler panic, a forced shutdown)"
     );
     describe_gauge!(
         "smg_http_connections_active",
@@ -844,6 +849,10 @@ pub(crate) fn init_metrics() {
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
     );
+    describe_counter!(
+        "smg_responses_not_stored_total",
+        "Responses with store: true whose record or conversation linking was not written, by mode (foreground: the request was answered with the failure; background: the record keeps what it had) and step (record: nothing is stored; linking: the record is stored, its items are not in the conversation)"
+    );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
@@ -1410,6 +1419,18 @@ impl Metrics {
             "smg_responses_stream_failures_total",
             "model" => model,
             "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// A `store: true` response whose record (`step` record: nothing is
+    /// stored) or conversation linking (`step` linking) was not written, by
+    /// `mode` (foreground, background).
+    pub fn record_response_not_stored(mode: &'static str, step: &'static str) {
+        counter!(
+            "smg_responses_not_stored_total",
+            "mode" => mode,
+            "step" => step
         )
         .increment(1);
     }

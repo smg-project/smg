@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
-    types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
 };
 
 pub(super) struct Qwen3VLVisionSpec;
@@ -292,6 +292,30 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         ])
     }
 
+    fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
+        // One layout per modality. A video batch carries `patches_per_video`
+        // and `video_grid_thw` and no image tensor at all, so slicing its
+        // patches by `patches_per_image` (the legacy map's one answer) fails
+        // at assembly for every video; the image batch is the mirror case.
+        match modality {
+            Modality::Video => EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_video"),
+                HashMap::from([
+                    ("video_grid_thw".to_string(), FieldLayout::Batched),
+                    ("patches_per_video".to_string(), FieldLayout::Batched),
+                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
+                ]),
+            ),
+            _ => EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([
+                    ("image_grid_thw".to_string(), FieldLayout::Batched),
+                    ("patches_per_image".to_string(), FieldLayout::Batched),
+                ]),
+            ),
+        }
+    }
+
     fn keep_on_cpu_keys(&self) -> Vec<String> {
         vec!["image_grid_thw".to_string(), "video_grid_thw".to_string()]
     }
@@ -304,7 +328,7 @@ mod tests {
     use crate::{
         encoder_inputs::ModelSpecificValue,
         registry::{test_helpers::*, ModelMetadata, ModelRegistry},
-        types::ImageSize,
+        types::{FieldLayout, ImageSize, Modality},
     };
 
     #[test]
@@ -357,11 +381,11 @@ mod tests {
             .prompt_replacements_for(
                 &metadata,
                 &test_preprocessed_with_tokens(&[ImageSize::new(448, 448)], &[128]),
-                crate::types::Modality::Video,
+                Modality::Video,
             )
             .unwrap();
 
-        assert_eq!(replacements[0].modality, crate::types::Modality::Video);
+        assert_eq!(replacements[0].modality, Modality::Video);
         assert_eq!(replacements[0].tokens.len(), 128);
         assert_eq!(replacements[0].tokens[0], 151656);
     }
@@ -393,7 +417,7 @@ mod tests {
                 ModelSpecificValue::int_2d(vec![2, 16, 20], 1, 3),
             );
         let replacements = spec
-            .prompt_replacements_for(&metadata, &preprocessed, crate::types::Modality::Video)
+            .prompt_replacements_for(&metadata, &preprocessed, Modality::Video)
             .unwrap();
 
         let tokens = &replacements[0].tokens;
@@ -436,7 +460,7 @@ mod tests {
                 ModelSpecificValue::int_2d(vec![2, 16, 20], 1, 3),
             );
         let replacements = spec
-            .prompt_replacements_for(&metadata, &preprocessed, crate::types::Modality::Video)
+            .prompt_replacements_for(&metadata, &preprocessed, Modality::Video)
             .unwrap();
 
         // Two temporal frames -> a vision_end/vision_start seam splits the 160
@@ -527,5 +551,51 @@ mod tests {
             .lookup(&metadata)
             .expect("should match qwen4_exp alias");
         assert_eq!(spec.name(), "qwen3_vl");
+    }
+
+    #[test]
+    fn qwen3_vl_layouts_are_modality_specific() {
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
+        let config = json!({
+            "model_type": "qwen3_vl",
+            "image_token_id": 151655,
+            "video_token_id": 151656,
+        });
+        let metadata = ModelMetadata {
+            model_id: "custom-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).expect("qwen3 spec");
+
+        // A video batch carries patches_per_video / video_grid_thw and nothing
+        // image-shaped: its patches are sliced by the sizes tensor it has.
+        let video = spec.encoder_field_layouts_for(Modality::Video);
+        assert_eq!(video.encoder_input, FieldLayout::flat("patches_per_video"));
+        for key in [
+            "video_grid_thw",
+            "patches_per_video",
+            "video_second_per_grid",
+        ] {
+            assert_eq!(
+                video.model_specific.get(key),
+                Some(&FieldLayout::Batched),
+                "{key}"
+            );
+        }
+        assert!(!video.model_specific.contains_key("patches_per_image"));
+        assert!(!video.model_specific.contains_key("image_grid_thw"));
+
+        let image = spec.encoder_field_layouts_for(Modality::Image);
+        assert_eq!(image.encoder_input, FieldLayout::flat("patches_per_image"));
+        for key in ["image_grid_thw", "patches_per_image"] {
+            assert_eq!(
+                image.model_specific.get(key),
+                Some(&FieldLayout::Batched),
+                "{key}"
+            );
+        }
+        assert!(!image.model_specific.contains_key("patches_per_video"));
     }
 }

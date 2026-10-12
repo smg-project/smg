@@ -65,11 +65,13 @@ use crate::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
         gateway::Gateway,
+        grpc::common::responses::spawn_unstored_sweeper,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
     server::connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
+    tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
@@ -170,7 +172,8 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    models::list_models(&state.context, req.headers()).await
+    let request_id = middleware::request_id_of(&req);
+    models::list_models(&state.context, req.headers(), request_id).await
 }
 
 async fn v1_model(
@@ -511,67 +514,116 @@ async fn v1_audio_transcriptions(
         .await
 }
 
+// The stored-state routes act for the caller's tenant (`storage_tenant` of
+// the request's route meta): a stored response or conversation of another
+// tenant answers as an unknown id does.
+
 async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::get_response(&state.context.response_storage, &response_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::get_response(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     state
         .router
-        .cancel_response(Some(&headers), &response_id)
+        .cancel_response(Some(&headers), &tenant_meta, &response_id)
         .await
 }
 
 async fn v1_responses_delete(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::delete_response(&state.context.response_storage, &response_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::delete_response(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::list_response_input_items(&state.context.response_storage, &response_id)
-        .await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::list_response_input_items(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Json(body): Json<Value>,
 ) -> Response {
-    conversations::create_conversation(&state.context.conversation_storage, body).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::create_conversation(&state.context.conversation_storage, tenant.as_deref(), body)
+        .await
 }
 
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
 ) -> Response {
-    conversations::get_conversation(&state.context.conversation_storage, &conversation_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::get_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+    )
+    .await
 }
 
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    conversations::update_conversation(&state.context.conversation_storage, &conversation_id, body)
-        .await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::update_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+        body,
+    )
+    .await
 }
 
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
 ) -> Response {
-    conversations::delete_conversation(&state.context.conversation_storage, &conversation_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::delete_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+    )
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -583,6 +635,7 @@ struct ListItemsQuery {
 
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Query(ListItemsQuery {
         limit,
@@ -590,9 +643,11 @@ async fn v1_conversations_list_items(
         after,
     }): Query<ListItemsQuery>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::list_conversation_items(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         limit,
         order.as_deref(),
@@ -603,12 +658,15 @@ async fn v1_conversations_list_items(
 
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::create_conversation_items(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         body,
     )
@@ -617,6 +675,7 @@ async fn v1_conversations_create_items(
 
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path((conversation_id, item_id)): Path<(String, String)>,
     RawQuery(query): RawQuery,
 ) -> Response {
@@ -626,9 +685,11 @@ async fn v1_conversations_get_item(
         Ok(include) => include,
         Err(response) => return response,
     };
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::get_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         &item_id,
         include,
@@ -638,11 +699,14 @@ async fn v1_conversations_get_item(
 
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path((conversation_id, item_id)): Path<(String, String)>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         &item_id,
     )
@@ -916,7 +980,9 @@ pub struct ServerConfig {
     /// main `port` regardless.
     pub health_check_port: Option<u16>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's
-    /// container-aware default (`available_parallelism()`).
+    /// container-aware default (`available_parallelism()`). Only the CLI's
+    /// `main` sizes its runtime from it; `startup` runs on the caller's
+    /// runtime and logs the size it finds (and this setting, as `pinned`).
     pub runtime_worker_threads: Option<usize>,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
@@ -1061,6 +1127,13 @@ pub fn build_app(
             .route_layer(axum::middleware::from_fn_with_state(
                 StreamBodyState::new(app_state.router.clone(), app_state.context.clone()),
                 stream_eligible_request_bodies,
+            ))
+            // Every SSE stream of these routes carries a keep-alive through an
+            // upstream silence (a comment; the Messages API's ping event),
+            // written between frames, nothing while frames flow.
+            .route_layer(axum::middleware::from_fn_with_state(
+                middleware::SseKeepAlive::from_config(&app_state.context.router_config),
+                middleware::sse_keepalive_middleware,
             ))
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
@@ -1345,6 +1418,35 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
+    // The mesh listener's port against the others: the mesh configuration is
+    // not part of `RouterConfig`, so the validator cannot see it, and this is
+    // the one place the CLI, the Python binding and a library caller all pass.
+    if let Some(mesh_server_config) = &config.mesh_server_config {
+        crate::config::validate_mesh_listener_port(
+            mesh_server_config.bind_addr.port(),
+            config.port,
+            config
+                .prometheus_config
+                .as_ref()
+                .map(|prometheus_config| prometheus_config.port),
+            config.health_check_port,
+        )?;
+    }
+
+    // The TLS material is parsed before anything binds: a certificate or key
+    // file the gateway could read but not use used to fail at the HTTP bind,
+    // after the metrics listener was up.
+    let tls_config = match (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        (Some(cert), Some(key)) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+                .await
+                .map_err(|e| format!("Failed to create TLS config: {e}"))?,
+        ),
+        _ => None,
+    };
 
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -1381,6 +1483,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ))
     };
 
+    // The runtime was built by the caller (the CLI's `main`, the Python
+    // binding, a library caller) before the subscriber existed: its size is
+    // logged here, where the line reaches the log. `pinned` is the
+    // configuration's say; only the CLI's `main` sizes its runtime from it.
+    info!(
+        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
+        pinned = config.runtime_worker_threads.is_some(),
+        "Tokio runtime sized"
+    );
+
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{
@@ -1397,22 +1509,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
     init_mm_settings(mm_settings);
 
-    // Start the metrics server. It binds the port eagerly so we fail fast on
-    // port conflicts or bad addresses.
-    if let Some(prometheus_config) = &config.prometheus_config {
+    // The metrics recorder is installed now so start-up records land in it;
+    // its listener binds further down, once every configuration read that
+    // can still fail (storage hooks, policy files, store connections) has
+    // happened, right before the probe and HTTP listeners: nothing binds
+    // before a fatal configuration error.
+    let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
         metrics::init_startup_series();
-        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
-            handle,
-            prometheus_config.host.clone(),
-            prometheus_config.port,
-        )
-        .await?;
-        // Tokio runtime self-observability (event-loop canary + sampler).
-        // `startup` runs on the main runtime, so the observer lands on —
-        // and therefore measures — the runtime that serves requests.
-        runtime_metrics::spawn_observer();
-    }
+        handle
+    });
 
     // Build the mesh server if configured. Starting gossip is deferred until
     // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
@@ -1445,8 +1551,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await?,
     );
 
-    // Register the CRDT namespaces and start the inbound sync adapters, then
-    // start gossip. Order matters: see the note at the mesh build above.
+    // Register the CRDT namespaces and start the inbound sync adapters now;
+    // gossip starts further down, after the metrics and probe listeners are
+    // bound. Order matters: see the note at the mesh build above.
     let mesh_adapters = mesh_handler.as_ref().map(|handler| {
         MeshAdapters::start(
             handler.mesh_kv(),
@@ -1456,17 +1563,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             app_context.policy_registry.clone(),
         )
     });
-    if let Some(mesh_server) = mesh_server {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
-        )]
-        spawn(async move {
-            if let Err(e) = mesh_server.start().await {
-                tracing::error!("Mesh server failed: {}", e);
-            }
-        });
-    }
 
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
@@ -1669,6 +1765,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.clone(),
     );
 
+    // The metrics listener: the recorder exists since the top of start-up,
+    // the port binds only now (see there). It still binds eagerly, so a port
+    // conflict or a bad address fails the start before the HTTP listener.
+    if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
+            handle,
+            prometheus_config.host.clone(),
+            prometheus_config.port,
+        )
+        .await?;
+        // Tokio runtime self-observability (event-loop canary + sampler).
+        // `startup` runs on the main runtime, so the observer lands on —
+        // and therefore measures — the runtime that serves requests.
+        runtime_metrics::spawn_observer();
+    }
+
+    // The records of unstored background responses whose polling window
+    // ended with no gateway there to retire them (a stop or a crash inside
+    // the window, with a store that outlives the process) are swept now,
+    // whatever this gateway's background setting (an earlier one may have had
+    // it on), and then once per window while background mode is on, where new
+    // unstored records can appear. Dropping the JoinHandle detaches the task.
+    let _unstored_sweeper = spawn_unstored_sweeper(
+        app_context.response_storage.clone(),
+        config.router_config.max_background_responses > 0,
+    );
+
     // Optional isolated probe listener (additive): when `--health-check-port`
     // is set, serves /liveness, /readiness, /health on that port from a
     // dedicated single-worker runtime on its own OS thread, so probes
@@ -1788,7 +1911,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // One bind-host rule for every listener: IPv6 with or without brackets.
     let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
+    // The HTTP listener binds now, eagerly, the last of the listeners: a port
+    // another process holds fails the start here, before the mesh server
+    // below has joined the cluster. Bound through tokio, as axum-server
+    // binds (the same socket options and accept backlog; std's bind would
+    // queue 128 connections instead of 1024), and served from the socket at
+    // `serve` below.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .and_then(tokio::net::TcpListener::into_std)
+        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
+
+    // The mesh server starts once every listener is bound: a member that
+    // joined the cluster and vanished with a failed bind is the partial start
+    // the checks above exist to prevent. The adapters registered their
+    // namespaces earlier, so gossip is safe to start.
+    if let Some(mesh_server) = mesh_server {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
+        )]
+        spawn(async move {
+            if let Err(e) = mesh_server.start().await {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
+    }
 
     // Set up graceful shutdown (common to both TLS and non-TLS)
 
@@ -1860,22 +2009,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "HTTP connection timeouts (0 = disabled)"
     );
 
-    let server_result = if let (Some(cert), Some(key)) = (
-        &config.router_config.server_cert,
-        &config.router_config.server_key,
-    ) {
+    let server_result = if let Some(tls_config) = tls_config {
         info!("TLS enabled");
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
-            .await
-            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
 
-        axum_server::bind_rustls(addr, tls_config)
+        axum_server::from_tcp_rustls(listener, tls_config)?
             .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
-        bind_http_server(addr, connection_timeouts)
+        axum_server::from_tcp(listener)?
+            .acceptor(http_acceptor(connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -1898,11 +2042,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-/// Disable Nagle buffering on accepted plain-HTTP sockets so small streaming
-/// writes need not wait for outstanding data to be acknowledged, and bound the
-/// connections that carry no request (see [`connection_timeouts`]). This
-/// changes no HTTP payload; the separately configured TLS listener applies the
-/// same bounds around its handshake acceptor.
+/// The plain-HTTP acceptor: Nagle buffering disabled on accepted sockets so
+/// small streaming writes need not wait for outstanding data to be
+/// acknowledged, and the connections that carry no request bounded (see
+/// [`connection_timeouts`]). This changes no HTTP payload; the separately
+/// configured TLS listener applies the same bounds around its handshake
+/// acceptor.
+fn http_acceptor(
+    timeouts: ConnectionTimeouts,
+) -> ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor> {
+    ConnectionTimeoutAcceptor::new(axum_server::accept::NoDelayAcceptor::new(), timeouts)
+}
+
+/// A plain-HTTP server bound on `addr` with [`http_acceptor`]. Start-up
+/// serves a listener it bound earlier (see `startup`); the tests bind here.
+#[cfg(test)]
 fn bind_http_server(
     addr: std::net::SocketAddr,
     timeouts: ConnectionTimeouts,
@@ -1910,10 +2064,7 @@ fn bind_http_server(
     std::net::SocketAddr,
     ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor>,
 > {
-    axum_server::bind(addr).acceptor(ConnectionTimeoutAcceptor::new(
-        axum_server::accept::NoDelayAcceptor::new(),
-        timeouts,
-    ))
+    axum_server::bind(addr).acceptor(http_acceptor(timeouts))
 }
 
 #[expect(

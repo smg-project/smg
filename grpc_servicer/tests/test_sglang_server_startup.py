@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -93,6 +94,7 @@ def server_mod(monkeypatch):
         ),
         "smg_grpc_servicer.sglang.scheduler_launcher": _module(
             "smg_grpc_servicer.sglang.scheduler_launcher",
+            SchedulerStartError=type("SchedulerStartError", (RuntimeError,), {}),
             launch_scheduler_process_only=lambda **_kwargs: None,
             terminate_scheduler_processes=lambda _procs: None,
         ),
@@ -108,6 +110,9 @@ def server_mod(monkeypatch):
     spec = importlib.util.spec_from_file_location("test_sglang_grpc_server", module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # The exit over a dead engine without its guard: the guard would end the
+    # test process after its grace.
+    monkeypatch.setattr(module, "guarded_exit", lambda code, **_kwargs: SystemExit(code))
     return module
 
 
@@ -209,8 +214,10 @@ def test_scheduler_launch_failure_never_starts_serving(monkeypatch, server_mod):
     health_servicer_factory = Mock()
     warmup_thread_factory = Mock()
 
+    launcher = sys.modules["smg_grpc_servicer.sglang.scheduler_launcher"]
+
     async def fail_launch(**_kwargs):
-        raise RuntimeError("scheduler failed")
+        raise launcher.SchedulerStartError("scheduler failed")
 
     monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", fail_launch)
     monkeypatch.setattr(server_mod.grpc.aio, "server", grpc_server_factory, raising=False)
@@ -218,8 +225,10 @@ def test_scheduler_launch_failure_never_starts_serving(monkeypatch, server_mod):
     monkeypatch.setattr(server_mod.threading, "Thread", warmup_thread_factory)
 
     server_args = SimpleNamespace(disaggregation_mode="null")
-    with pytest.raises(RuntimeError, match="scheduler failed"):
+    # smg-lab #292: an engine that did not start is a named exit, not a traceback.
+    with pytest.raises(SystemExit) as raised:
         asyncio.run(server_mod.serve_grpc(server_args))
+    assert raised.value.code == 1
 
     grpc_server_factory.assert_not_called()
     health_servicer_factory.assert_not_called()
@@ -269,6 +278,133 @@ def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod
     assert params.n == 1
     assert params.max_new_tokens == 8
     channel.close.assert_called_once()
+
+
+def _serving_server(monkeypatch, server_mod, events, *, scheduler_exited):
+    """`serve_grpc` up to the wait for the scheduler, every collaborator stood in
+    for; the wait reports `scheduler_exited`."""
+    scheduler_procs = [object(), object()]
+    request_manager = object()
+
+    async def stop_server(grace):
+        events.append("server-stop")
+
+    async def shutdown_servicer():
+        events.append("servicer-shutdown")
+
+    async def wait_for_shutdown(*_args):
+        events.append("scheduler-wait")
+        return scheduler_exited
+
+    grpc_server = SimpleNamespace(
+        add_insecure_port=Mock(),
+        start=AsyncMock(),
+        stop=AsyncMock(side_effect=stop_server),
+    )
+    health_servicer = SimpleNamespace(
+        set_not_serving=Mock(side_effect=lambda: events.append("health"))
+    )
+    servicer = SimpleNamespace(shutdown=AsyncMock(side_effect=shutdown_servicer))
+    warmup_thread = SimpleNamespace(start=Mock(), is_alive=Mock(return_value=False))
+
+    async def launch(**_kwargs):
+        return {}, object(), scheduler_procs, request_manager
+
+    monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", launch)
+    monkeypatch.setattr(
+        server_mod,
+        "ModelConfig",
+        SimpleNamespace(from_server_args=Mock(return_value=object())),
+    )
+    monkeypatch.setattr(
+        server_mod.grpc.aio, "server", Mock(return_value=grpc_server), raising=False
+    )
+    monkeypatch.setattr(server_mod, "SGLangHealthServicer", Mock(return_value=health_servicer))
+    monkeypatch.setattr(
+        server_mod.health_pb2_grpc, "add_HealthServicer_to_server", Mock(), raising=False
+    )
+    monkeypatch.setattr(server_mod, "SGLangSchedulerServicer", Mock(return_value=servicer))
+    monkeypatch.setattr(
+        server_mod.sglang_scheduler_pb2_grpc,
+        "add_SglangSchedulerServicer_to_server",
+        Mock(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server_mod,
+        "sglang_scheduler_pb2",
+        SimpleNamespace(
+            DESCRIPTOR=SimpleNamespace(
+                services_by_name={
+                    "SglangScheduler": SimpleNamespace(full_name="test.SglangScheduler")
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(server_mod.reflection, "SERVICE_NAME", "reflection", raising=False)
+    monkeypatch.setattr(server_mod.reflection, "enable_server_reflection", Mock(), raising=False)
+    monkeypatch.setattr(server_mod.threading, "Thread", Mock(return_value=warmup_thread))
+    monkeypatch.setattr(
+        server_mod, "wait_for_scheduler_shutdown", AsyncMock(side_effect=wait_for_shutdown)
+    )
+    monkeypatch.setattr(
+        server_mod,
+        "terminate_scheduler_processes",
+        Mock(side_effect=lambda _procs: events.append("scheduler-terminate")),
+    )
+    return SimpleNamespace(
+        disaggregation_mode="null",
+        host="127.0.0.1",
+        port=50051,
+        ssl_certfile=None,
+        ssl_keyfile=None,
+    )
+
+
+def test_a_scheduler_exit_after_start_up_ends_the_server_with_exit_code_1(monkeypatch, server_mod):
+    """smg-lab #292: when the watchdog reports that a scheduler process exited
+    on its own, the server shuts down as on a signal and the servicer exits
+    with code 1 instead of 0 (an orchestrator restarts it)."""
+    events = []
+    server_args = _serving_server(monkeypatch, server_mod, events, scheduler_exited=True)
+
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(server_mod.serve_grpc(server_args, model_info={}))
+
+    assert raised.value.code == 1
+    assert events == [
+        "scheduler-wait",
+        "health",
+        "server-stop",
+        "servicer-shutdown",
+        "scheduler-terminate",
+    ]
+
+
+def test_a_signal_shutdown_still_returns_normally(monkeypatch, server_mod):
+    events = []
+    server_args = _serving_server(monkeypatch, server_mod, events, scheduler_exited=False)
+    assert asyncio.run(server_mod.serve_grpc(server_args, model_info={})) is None
+    assert events[0] == "scheduler-wait" and events[-1] == "scheduler-terminate"
+
+
+def test_a_servicer_configuration_error_is_a_named_exit_not_a_traceback(
+    monkeypatch, server_mod, caplog
+):
+    """smg-lab #292: a knob the servicer cannot use (the implementation
+    selector here) ends the start with one ERROR line naming it and exit
+    code 2, before any scheduler or engine work."""
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "bogus")
+    launched = Mock()
+    monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", launched)
+    caplog.set_level(logging.ERROR)
+
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="null")))
+
+    assert raised.value.code == 2
+    assert "SMG_SGLANG_SERVICER_IMPL" in caplog.text and "bogus" in caplog.text
+    launched.assert_not_called()
 
 
 def test_server_waits_for_scheduler_shutdown(monkeypatch, server_mod):

@@ -846,7 +846,9 @@ impl std::str::FromStr for TransportMode {
 /// - `Auto`: forward media references when every worker serving the model
 ///   advertises worker-side processing; otherwise preprocess on the router.
 /// - `Router`: always preprocess on the router (kill switch).
-/// - `Worker`: always forward references; fail when no capable worker exists.
+/// - `Worker`: forward references; a request carrying per-item hints is
+///   preprocessed on the router, which applies them; fail when no capable
+///   worker exists.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]

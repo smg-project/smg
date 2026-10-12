@@ -340,7 +340,7 @@ impl MlxEngineClient {
     }
 
     fn build_sampling_params_from_completion(request: &CompletionRequest) -> proto::SamplingParams {
-        let logprobs = request.logprobs.map(|v| v.min(5) as i32);
+        let logprobs = request.logprobs.map(|v| v.min(20) as i32);
 
         proto::SamplingParams {
             temperature: request.temperature,

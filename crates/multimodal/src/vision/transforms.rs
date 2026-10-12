@@ -448,12 +448,15 @@ fn fir_image_to_dynamic(
 // ---------------------------------------------------------------------------
 // Pillow-exact bicubic resize.
 //
-// Qwen image processors resize via `PIL.Image.resize(size, BICUBIC)` on the
-// uint8 image. The SIMD `fast_image_resize` path above is the same filter
-// *family* (Catmull-Rom, a=-0.5) but diverges bit-wise on non-integer ratios
-// (support scaling + fixed-point details), which the vision encoder amplifies
-// into a large embedding shift. This routine replicates Pillow's `Resample.c`
-// algorithm exactly, validated against Pillow.
+// The image processors whose reference resizes via `PIL.Image.resize(size,
+// BICUBIC)` on the uint8 image take this kernel; the ones whose reference is
+// torchvision-backed (the Qwen vision families, Gemma 4) take the `uint8`
+// resampler below, which differs only in how the taps are quantized. The SIMD
+// `fast_image_resize` path above is the same filter *family* (Catmull-Rom,
+// a=-0.5) but diverges bit-wise on non-integer ratios (support scaling +
+// fixed-point details), which the vision encoder amplifies into a large
+// embedding shift. This routine replicates Pillow's `Resample.c` algorithm
+// exactly, validated against Pillow.
 const PIL_PRECISION_BITS: u32 = 32 - 8 - 2;
 const PIL_BICUBIC_SUPPORT: f64 = 2.0;
 const PIL_LANCZOS_SUPPORT: f64 = 3.0;
@@ -1119,6 +1122,30 @@ pub fn resize_bicubic_torch_aa_rgb(
     })
 }
 
+/// The torchvision `uint8` BICUBIC resize of [`resize_bicubic_torch_aa_rgb`]
+/// for a decoded image.
+pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
+    let rgb = image.to_rgb8();
+    let (in_w, in_h) = rgb.dimensions();
+    let output = resize_pil_bytes(
+        rgb.as_raw(),
+        in_w,
+        in_h,
+        out_w,
+        out_h,
+        false,
+        PilResizeFilter::Bicubic,
+        KernelQuantization::TorchUint8,
+    );
+    #[expect(
+        clippy::expect_used,
+        reason = "output is exactly out_w*out_h*3 bytes by construction"
+    )]
+    DynamicImage::ImageRgb8(
+        RgbImage::from_raw(out_w, out_h, output).expect("torch resize buffer size"),
+    )
+}
+
 /// Resize image preserving aspect ratio, fitting within max dimensions.
 pub fn resize_to_fit(
     image: &DynamicImage,
@@ -1477,6 +1504,38 @@ mod tests {
 
     fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
+    }
+
+    /// The raw-RGB torchvision `uint8` resizer must be byte-for-byte identical
+    /// to the `DynamicImage` form the Qwen image path uses (the raw-RGB form
+    /// serves `preprocess_video_rgb`).
+    #[test]
+    fn resize_bicubic_torch_aa_rgb_matches_dynamic_path() {
+        let (src_w, src_h) = (37u32, 23u32);
+        let (out_w, out_h) = (16u32, 28u32);
+        let mut img = RgbImage::new(src_w, src_h);
+        for y in 0..src_h {
+            for x in 0..src_w {
+                img.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        ((x * 7) ^ (y * 13)) as u8,
+                        (x * 3 + y * 5) as u8,
+                        (x + y * y) as u8,
+                    ]),
+                );
+            }
+        }
+        let via_dynamic =
+            resize_bicubic_torch_aa(&DynamicImage::ImageRgb8(img.clone()), out_w, out_h);
+        let via_bytes =
+            resize_bicubic_torch_aa_rgb(img.as_raw(), src_w, src_h, out_w, out_h).unwrap();
+        assert_eq!(
+            via_dynamic.to_rgb8().into_raw(),
+            via_bytes.into_raw(),
+            "raw-RGB torch bicubic must equal DynamicImage torch bicubic byte-for-byte"
+        );
     }
 
     /// The raw-RGB video resizer must be byte-for-byte identical to the

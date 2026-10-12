@@ -878,3 +878,70 @@ def test_the_spawn_start_method_is_forced_when_the_engines_setup_left_it_unset(
     rust.launch_scheduler_ranks(_preparable_args(recorded), handshake_port=24321)
 
     assert recorded["start_method_calls"] == [("spawn", True)]
+
+
+# ── the knobs are validated before the bind (smg-lab #292) ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "name, value, text",
+    [
+        ("SMG_SGLANG_SERVICER_DRAIN_SECS", "abc", "is not a number"),
+        ("SMG_SGLANG_SERVICER_DRAIN_SECS", "-5", "must be at least 0"),
+        ("SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS", "abc", "is not a number"),
+        ("SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS", "-1", "must be greater than 0"),
+        ("SMG_SGLANG_SERVICER_HANDSHAKE_PORT", "70000", "must be between 1 and 65535"),
+        ("SMG_SGLANG_SERVICER_HANDSHAKE_PORT", "abc", "is not a port number"),
+    ],
+)
+def test_serve_rust_refuses_a_bad_knob_before_the_server_binds(
+    monkeypatch, tmp_path, name, value, text
+):
+    """smg-lab #292: every knob is read and validated first; a value the
+    servicer cannot use is a named error before any engine work, before the
+    server is constructed (and so before the port is bound), and before the
+    scheduler ranks start. The drain was read only once the engine ran."""
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+
+    def no_engine_work(*_args, **_kwargs):
+        raise AssertionError("no engine work before the knobs are validated")
+
+    monkeypatch.setattr(rust, "model_facts", no_engine_work)
+    monkeypatch.setattr(rust, "server_facts", no_engine_work)
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", no_engine_work)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
+        asyncio.run(rust.serve_rust(_server_args()))
+    assert created == {}
+
+
+def test_serve_rust_refuses_a_socket_dir_that_is_a_file_before_the_server_binds(
+    monkeypatch, tmp_path
+):
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    a_file = tmp_path / "a-file"
+    a_file.write_text("not a directory")
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(a_file))
+
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="SMG_ZMQ_SOCKET_DIR=.*not a dir"):
+        asyncio.run(rust.serve_rust(_server_args()))
+    assert created == {}
+
+
+def test_a_disaggregated_worker_is_refused_as_a_configuration_error():
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="PD disaggregation"):
+        rust.refuse_disaggregation(_server_args(disaggregation_mode="prefill"))

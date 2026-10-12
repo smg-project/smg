@@ -67,12 +67,18 @@ fn serve_once(
     format!("http://127.0.0.1:{port}/media")
 }
 
+/// A connector over `config` that may fetch from these tests' loopback
+/// origins (the address policy refuses them unless private media hosts are
+/// allowed).
 fn connector(config: MediaConnectorConfig) -> MediaConnector {
-    let client = common::http_client_builder()
-        .no_proxy()
-        .build()
-        .expect("client");
-    MediaConnector::new(client, config).expect("media connector")
+    MediaConnector::new(
+        common::http_client_builder().no_proxy(),
+        MediaConnectorConfig {
+            allow_private_hosts: true,
+            ..config
+        },
+    )
+    .expect("media connector")
 }
 
 /// A short generated clip, or `None` where ffmpeg is not on PATH.

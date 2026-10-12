@@ -374,6 +374,8 @@ class GrpcRequestManager:
             # Streaming mode: multiplex responses with index for ordering
             logger.debug(f"Streaming mode: multiplexing {n} streams")
             rid_to_index = {rid: i for i, rid in enumerate(request_ids)}
+            # The sub-requests still running, by their handler generator.
+            live = dict(zip(generators, request_ids))
 
             # Create async tasks for all generators
             task_map = {}
@@ -381,30 +383,78 @@ class GrpcRequestManager:
                 task = asyncio.create_task(generator.__anext__())
                 task_map[task] = generator
 
-            # Process responses as they arrive
-            while task_map:
-                done, _ = await asyncio.wait(task_map.keys(), return_when=asyncio.FIRST_COMPLETED)
+            # Process responses as they arrive. The consumer may leave at any
+            # point (the client cancelled, the stream was closed downstream):
+            # ``asyncio.wait`` does not cancel the tasks it waits on, so the
+            # sub-requests still running are aborted and closed on the way out,
+            # as a single request's cancel aborts it.
+            try:
+                while task_map:
+                    done, _ = await asyncio.wait(
+                        task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                    )
 
-                for task in done:
-                    generator = task_map.pop(task)
-                    try:
-                        response = await task
+                    for task in done:
+                        generator = task_map.pop(task)
+                        try:
+                            response = await task
 
-                        # Add index for client-side ordering
-                        if isinstance(response, dict):
-                            response_rid = response.get("request_id", "")
-                            if response_rid in rid_to_index:
-                                response["index"] = rid_to_index[response_rid]
+                            # Add index for client-side ordering
+                            if isinstance(response, dict):
+                                response_rid = response.get("request_id", "")
+                                if response_rid in rid_to_index:
+                                    response["index"] = rid_to_index[response_rid]
 
-                        yield response
+                            yield response
 
-                        # Create next task for this generator
-                        next_task = asyncio.create_task(generator.__anext__())
-                        task_map[next_task] = generator
+                            # Create next task for this generator
+                            next_task = asyncio.create_task(generator.__anext__())
+                            task_map[next_task] = generator
 
-                    except StopAsyncIteration:
-                        # This generator is finished
-                        pass
+                        except StopAsyncIteration:
+                            # This generator is finished
+                            live.pop(generator, None)
+            finally:
+                if live:
+                    await self._abort_sub_requests(live, task_map)
+
+    async def _abort_sub_requests(
+        self,
+        live: dict[AsyncGenerator, str],
+        task_map: dict[asyncio.Task, AsyncGenerator],
+    ) -> None:
+        """Abort the sub-requests of a multiplexed n>1 stream whose consumer left
+        while they were still running, and close their handlers.
+
+        A handler waiting on the scheduler has a pending task: cancelling it
+        delivers the cancel to the handler, which runs its own path (abort at
+        the scheduler, cleanup, the root span ended). A handler parked at its
+        yield, its output read by the consumer or not yet read, is past the
+        point a cancel reaches: its abort is sent here, then the handler is
+        closed and cleans up as it does on any exit.
+        """
+        task_of = {generator: task for task, generator in task_map.items()}
+        pending = [task for task in task_of.values() if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending)
+        for generator, request_id in live.items():
+            task = task_of.get(generator)
+            if task is not None and not task.cancelled() and task.exception() is not None:
+                # the handler finished or failed on its own (StopAsyncIteration
+                # when the loop had not consumed its end yet); the exception is
+                # retrieved here, so the loop does not log it
+                pass
+            # The request's own state decides: a handler that took the cancel
+            # (pending, or cancelled before it resumed: the cancel is thrown
+            # in at its ``yield``) removed it on its abort path; a handler
+            # parked at its ``yield`` with no task, or whose task already
+            # completed with an unread output, is still registered and is
+            # aborted here.
+            if request_id in self.rid_to_state:
+                await self.abort_request(request_id)
+            await generator.aclose()
 
     async def _handle_single_request(
         self,

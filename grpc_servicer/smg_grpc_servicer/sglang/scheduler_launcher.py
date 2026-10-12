@@ -17,7 +17,15 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, numa_utils
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+from smg_grpc_servicer.rust_lifecycle import READY_POLL_SECS
+
 logger = logging.getLogger(__name__)
+
+
+class SchedulerStartError(RuntimeError):
+    """A scheduler process did not start: it exited, closed its pipe or
+    reported a failure before it was ready. The server answers it with a
+    named exit instead of a traceback."""
 
 
 def run_scheduler_with_signal_handling(*args, **kwargs):
@@ -169,6 +177,10 @@ def _start_scheduler_processes(
                 ):
                     proc.start()
                     scheduler_procs.append(proc)
+                # The rank holds its end of the pipe; this one closes, so a rank
+                # that dies before reporting shows as EOF on the reader instead
+                # of a wait that never ends.
+                writer.close()
 
                 scheduler_pipe_readers.append(reader)
     else:
@@ -182,22 +194,33 @@ def _start_scheduler_processes(
         )
         proc.start()
         scheduler_procs.append(proc)
+        writer.close()
 
     # TODO(CatherineSue): handle cases for multi-node
 
-    # Wait for all scheduler processes to be ready
+    # Wait for all scheduler processes to be ready: polling, so a process that
+    # dies during its start (a weight load that fails, a crash) is noticed and
+    # the launch fails, instead of a wait on a report that never comes.
     scheduler_infos = []
     for i, reader in enumerate(scheduler_pipe_readers):
+        while not reader.poll(READY_POLL_SECS):
+            dead = next((proc for proc in scheduler_procs if not proc.is_alive()), None)
+            if dead is not None:
+                dead.join(timeout=1.0)
+                raise SchedulerStartError(
+                    f"Scheduler process {dead.pid} exited with code {dead.exitcode} "
+                    "before it was ready"
+                )
         try:
             data = reader.recv()
         except EOFError:
             logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
             scheduler_procs[i].join()
             logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise RuntimeError(f"Failed to initialize scheduler rank {i}")
+            raise SchedulerStartError(f"Failed to initialize scheduler rank {i}")
 
         if data.get("status") != "ready":
-            raise RuntimeError(
+            raise SchedulerStartError(
                 f"Scheduler rank {i} initialization failed: {data.get('error', 'Unknown error')}"
             )
         scheduler_infos.append(data)

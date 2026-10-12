@@ -80,8 +80,9 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5,
-        ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v4_1, dots3, for_model, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon,
+        kimi_k3, lfm2_5, ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3,
+        seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -636,14 +637,19 @@ impl Family {
         matches!(self, Self::Inkling | Self::Gemma4)
     }
 
-    /// The engine for one of the model's cases: the family's table, with the model's own turn
-    /// opener when its template is not the table's ([`OPENERS`]), and the case's tools.
-    fn engine(self, slug: &str, fixture: &Fixture) -> Engine {
+    /// The table for one of the model's cases: the family's, with the model's own turn opener
+    /// when its template is not the table's ([`OPENERS`]).
+    fn table(self, slug: &str) -> symphony::Format {
         let mut format = self.format();
         if let Some((_, opener)) = OPENERS.iter().find(|(model, _)| *model == slug) {
             format = format.opens_turn(opener);
         }
-        Engine::new(format, Declared::of(&fixture.request.tools))
+        format
+    }
+
+    /// The engine for one of the model's cases: the model's table and the case's tools.
+    fn engine(self, slug: &str, fixture: &Fixture) -> Engine {
+        Engine::new(self.table(slug), Declared::of(&fixture.request.tools))
     }
 
     fn format(self) -> symphony::Format {
@@ -821,6 +827,17 @@ impl GenerationPrompt {
             self,
             Self::Plain | Self::OpensTheThoughtWhenAsked | Self::MarkerAlone
         )
+    }
+}
+
+/// Every recorded model reads with the table the registry gives its slug, opener included: the
+/// replays below check the families' tables and openers against the recorded outputs, and this
+/// ties them to `formats::for_model`, which the gateway asks, so a correction here reaches it.
+#[test]
+fn every_recorded_model_reads_with_the_registrys_table() {
+    for (slug, family, _) in MODELS {
+        let registered = for_model(slug).unwrap_or_else(|| panic!("{slug}: not in the registry"));
+        assert_eq!(registered, family.table(slug), "{slug}");
     }
 }
 

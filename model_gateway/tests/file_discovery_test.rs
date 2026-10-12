@@ -23,11 +23,15 @@ const REREAD: Duration = Duration::from_millis(200);
 const CONVERGE: Duration = Duration::from_secs(15);
 
 async fn test_context() -> Arc<AppContext> {
+    // Remove at once rather than after the drain window.
+    test_context_with_drain(0).await
+}
+
+async fn test_context_with_drain(drain_settle_secs: u64) -> Arc<AppContext> {
     let mut config = RouterConfig::builder()
         .worker_startup_timeout_secs(2)
         .build_unchecked();
-    // Remove at once rather than after the drain window.
-    config.health_check.drain_settle_secs = 0;
+    config.health_check.drain_settle_secs = drain_settle_secs;
     common::create_test_context(config).await
 }
 
@@ -224,6 +228,103 @@ async fn a_missing_manifest_is_retried_not_emptied() {
         has_url(&app_context.worker_registry.get_all_urls(), port),
         "worker dropped after the manifest was removed"
     );
+
+    handle.abort();
+}
+
+/// `(discovery id, KV connector, Ready)` of every registered worker at `port`.
+fn registrations_at(app_context: &AppContext, port: u16) -> Vec<(String, Option<String>, bool)> {
+    app_context
+        .worker_registry
+        .get_all()
+        .into_iter()
+        .filter(|worker| worker.url().ends_with(&format!(":{port}")))
+        .map(|worker| {
+            let spec = &worker.metadata().spec;
+            let id = spec
+                .labels
+                .get(DISCOVERY_ID_LABEL)
+                .cloned()
+                .unwrap_or_default();
+            let ready = worker.status() == openai_protocol::worker::WorkerStatus::Ready;
+            (id, spec.kv_connector.clone(), ready)
+        })
+        .collect()
+}
+
+/// Editing a record but keeping its id changes its configuration, not its
+/// instance: the worker is updated to the new settings rather than left as it
+/// was registered. This is the common way to fix a manifest.
+///
+/// It must stay registered throughout. The drain window is real here and the
+/// worker is Ready before the edit: a removal submitted beside the update
+/// would drain the worker, then delete whatever sits at its URL once the drain
+/// ends, which by then is the updated worker.
+#[tokio::test]
+async fn an_in_place_edit_updates_the_worker_in_place() {
+    const DRAIN: Duration = Duration::from_secs(2);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("workers.json");
+    let app_context = test_context_with_drain(DRAIN.as_secs()).await;
+    let (_engine, port) = start_mock_engine().await;
+    let record = |connector: &str| {
+        format!(
+            r#"{{"version": 1, "workers": [{{"id": "engine-a", "url": "127.0.0.1:{port}", "kv_connector": "{connector}"}}]}}"#
+        )
+    };
+    let connector_of = |app_context: &AppContext| -> Vec<(String, Option<String>)> {
+        registrations_at(app_context, port)
+            .into_iter()
+            .map(|(id, connector, _)| (id, connector))
+            .collect()
+    };
+    let registered = |connector: &str| vec![("engine-a".to_string(), Some(connector.to_string()))];
+
+    write_manifest(&path, &record("MooncakeConnector"));
+    let handle = start_file_discovery(&path, &app_context).await;
+    let deadline = tokio::time::Instant::now() + CONVERGE;
+    while registrations_at(&app_context, port)
+        != vec![(
+            "engine-a".to_string(),
+            Some("MooncakeConnector".to_string()),
+            true,
+        )]
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never became Ready: {:?}",
+            registrations_at(&app_context, port)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    write_manifest(&path, &record("NixlConnector"));
+    let deadline = tokio::time::Instant::now() + CONVERGE;
+    loop {
+        let current = connector_of(&app_context);
+        if current == registered("NixlConnector") {
+            break;
+        }
+        assert!(
+            current == registered("MooncakeConnector"),
+            "the worker left the registry while being updated: {current:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the edit never reached the registry: {current:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Past the drain window and several rereads, it is still there.
+    let settled = tokio::time::Instant::now() + DRAIN + Duration::from_secs(1);
+    while tokio::time::Instant::now() < settled {
+        assert_eq!(
+            connector_of(&app_context),
+            registered("NixlConnector"),
+            "the updated worker did not stay registered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     handle.abort();
 }

@@ -876,6 +876,54 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_takes_the_direct_path_input_by_input() {
+        use crate::traits::{Encoder, Encoding};
+        let mut state = 0x5A5A_1234_5678_9ABCu64;
+        for shape in shapes() {
+            let tokenizer = crate::huggingface::HuggingFaceTokenizer::from_tokenizer(tokenizer_of(
+                &shape, &mut state,
+            ));
+            let added: Vec<&str> = shape.special.to_vec();
+            let mut texts: Vec<String> = (0..8)
+                .map(|round| random_text(&mut state, 1 + round * 5, &added))
+                .filter(|text| !shape.nfc || text.nfc().eq(text.chars()))
+                .collect();
+            // Under an NFC shape, one input the direct encoder declines sits
+            // in the middle of the batch: it takes the `tokenizers` path on
+            // its own, and its neighbours stay on the direct path.
+            let declined = "e\u{301}";
+            if shape.nfc {
+                texts.insert(texts.len() / 2, declined.to_string());
+            }
+            let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let batch = tokenizer.encode_batch(&inputs, false).expect("batch");
+            assert_eq!(batch.len(), inputs.len(), "{}", shape.name);
+            for (input, encoding) in inputs.iter().zip(&batch) {
+                let single = tokenizer.encode(input, false).expect("encode");
+                assert_eq!(
+                    encoding.token_ids(),
+                    single.token_ids(),
+                    "{}: {input:?}",
+                    shape.name
+                );
+                if shape.nfc && *input == declined {
+                    assert!(
+                        matches!(encoding, Encoding::Hf(_)),
+                        "{}: the declined input takes the tokenizers path",
+                        shape.name
+                    );
+                } else {
+                    assert!(
+                        matches!(encoding, Encoding::Plain(_)),
+                        "{}: the batch left the direct path for {input:?}",
+                        shape.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ids_match_tokenizers_on_random_text_for_every_shape() {
         let mut state = 0x0F0F_1234_ABCD_9876u64;
         for shape in shapes() {

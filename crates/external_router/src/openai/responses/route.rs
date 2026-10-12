@@ -27,7 +27,7 @@ use super::{
 use crate::{
     error, known,
     metrics::{bool_to_static_str, metrics_labels, Metrics},
-    tenant::TenantRequestMeta,
+    tenant::{storage_tenant, TenantRequestMeta},
     worker::{SelectWorkerRequest, WorkerSource},
 };
 
@@ -111,11 +111,14 @@ pub(in crate::openai) async fn route_responses(
     request_body.model = model_id.to_string();
     request_body.conversation = None;
 
+    // The stored state as the caller's tenant may see it.
+    let tenant = storage_tenant(tenant_meta);
     let loaded_history = match super::history::load_input_history(
         deps.responses_components,
         conversation.map(|c| c.as_id()),
         &mut request_body,
         model,
+        tenant.as_deref(),
     )
     .await
     {

@@ -9,9 +9,8 @@ use axum::response::Response;
 use openai_protocol::{
     common::{ToolCall, Usage},
     responses::{
-        InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponseUsage, ResponsesRequest,
-        ResponsesResponse, ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+        ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::{json, to_string};
@@ -34,7 +33,7 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
-                utils::resolve_function_identity, ResponsesContext,
+                utils::resolve_function_identity, NotStored, ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
@@ -63,8 +62,10 @@ pub(crate) async fn serve_harmony_responses(
     // Clone request for persistence
     let original_request = request.clone();
 
-    // Load previous conversation history if previous_response_id is set
-    let current_request = load_previous_messages(ctx, request).await?;
+    // Load previous conversation history if previous_response_id is set, as
+    // the caller's tenant may see it
+    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
+    let current_request = load_previous_messages(ctx, request, tenant.as_deref()).await?;
 
     // Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -90,16 +91,19 @@ pub(crate) async fn serve_harmony_responses(
         response.id = response_id;
     }
 
-    // Persist response to storage if store=true
+    // Persist response to storage if store=true; a foreground response the
+    // client expects stored is answered as stored or not at all.
     persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
         &response,
         &original_request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
     )
-    .await;
+    .await
+    .map_err(NotStored::into_response)?;
 
     Ok(response)
 }
@@ -524,23 +528,7 @@ fn build_tool_response(
         .created_at(created_at)
         .status(ResponseStatus::Completed)
         .output(output)
-        .usage(ResponsesUsage::Modern(ResponseUsage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            input_tokens_details: usage
-                .prompt_tokens_details
-                .as_ref()
-                .map(InputTokensDetails::from)
-                .unwrap_or_default(),
-            output_tokens_details: OutputTokensDetails {
-                reasoning_tokens: usage
-                    .completion_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.reasoning_tokens)
-                    .unwrap_or(0),
-            },
-        }))
+        .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)))
         .build()
 }
 

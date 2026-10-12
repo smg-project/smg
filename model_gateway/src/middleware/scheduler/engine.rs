@@ -109,7 +109,7 @@ impl PriorityScheduler {
     /// the initial capacity, sum to more than the available capacity (a
     /// too-small fleet or misconfiguration — the caller falls back to legacy
     /// admission). Runtime capacity dips are handled gracefully by the
-    /// priority-ordered clamp in `apply_new_capacity`, not by rejection.
+    /// proportional clamp in `apply_new_capacity`, not by rejection.
     pub fn new(
         settings: &SchedulerSettings,
         capacity: u16,
@@ -262,6 +262,20 @@ impl PriorityScheduler {
             return AdmitOutcome::Rejected(RejectionReason::QueueFull);
         }
         let enqueued_at = Instant::now();
+        // The client may go away while we are queued: nothing fires `cancel`
+        // (the middleware cannot see a disconnect before the handler runs),
+        // the response future is dropped and this future with it. The guard
+        // records that exit (the wait, the `client_cancelled` outcome) and
+        // reaps the waiter; without it an abandoned wait left no trace in
+        // any counter, only in the queue-depth gauge until the dispatcher
+        // found the closed receiver.
+        let mut queued = QueuedWait {
+            class,
+            enqueued_at,
+            waiter_cancel: waiter_cancel.clone(),
+            release_notify: Arc::clone(&self.release_notify),
+            outcome_reached: false,
+        };
 
         // Lost-wakeup guard: a slot may have been released after our
         // fast-path try_acquire failed but before try_enqueue returned.
@@ -283,18 +297,11 @@ impl PriorityScheduler {
             () = tokio::time::sleep(timeout) => AdmitOutcome::Rejected(RejectionReason::QueueTimeout),
             () = cancel.cancelled() => AdmitOutcome::Rejected(RejectionReason::ClientCancelled),
         };
+        queued.outcome_reached = true;
         super::metrics::record_queue_wait(class, enqueued_at.elapsed());
-
-        // Mark the waiter cancelled on any exit path so the queue's
-        // `drop_cancelled_head` reaps it. Harmless if the waiter was
-        // already popped (Admitted path) — the token has no other readers.
-        waiter_cancel.cancel();
-        // Kick the dispatcher so head GC runs promptly. Without this,
-        // a `queue_size = 1` queue could reject the *next* admit as
-        // QueueFull for up to one full periodic tick (5s on defaults)
-        // even though the head waiter has already timed out / been
-        // cancelled.
-        self.release_notify.notify_one();
+        // The guard's drop marks the waiter cancelled and kicks the
+        // dispatcher, on this path as on the abandoned one.
+        drop(queued);
         outcome
     }
 
@@ -647,11 +654,13 @@ impl PriorityScheduler {
     /// Recomputes the live per-class reservations from the immutable floors +
     /// shares (`desired_reservations`), so the effective reservation tracks
     /// capacity and a recovery restores it automatically. When the desired
-    /// sum exceeds the new capacity (a runtime dip below what the floors +
-    /// shares want), the priority-ordered clamp keeps the highest classes
-    /// whole and yields the lowest — runtime never rejects. On grow, also
-    /// fires `release_notify` so the dispatcher re-evaluates queued waiters
-    /// under the larger ceiling.
+    /// sum exceeds the new capacity (a pool smaller than the floors, or a
+    /// runtime dip below what the floors + shares want), the proportional
+    /// clamp scales every class's reservation by the same fraction and
+    /// leaves the rounding remainder unreserved — runtime never rejects, and
+    /// no class is locked out of an idle pool. On grow, also fires
+    /// `release_notify` so the dispatcher re-evaluates queued waiters under
+    /// the larger ceiling.
     ///
     /// The capacity and the per-class reservations are separate atomics, so
     /// they cannot be published together. We order the two writes so a
@@ -669,18 +678,27 @@ impl PriorityScheduler {
         }
 
         // Desired reservations (floor + share) at the new capacity, then the
-        // priority-ordered clamp if they no longer fit. Pure function of
+        // proportional clamp if they no longer fit. Pure function of
         // (immutable baseline, new capacity), so it is idempotent and both
         // directional.
         let desired =
             desired_reservations(self.reserved_floor, &self.reserved_per_slot, new_capacity);
         let desired_total: u32 = desired.iter().map(|&r| u32::from(r)).sum();
         let new_reserved = if desired_total > u32::from(new_capacity) {
+            let clamped = clamp_reservations_to_capacity(desired, new_capacity);
+            let reserved_total: u32 = clamped.iter().map(|&r| u32::from(r)).sum();
             warn!(
+                new_capacity,
                 desired_total_reserved = desired_total,
-                new_capacity, "scheduler: reservations clamped to capacity (priority order)"
+                reserved_system = clamped[Class::System as usize],
+                reserved_interactive = clamped[Class::Interactive as usize],
+                reserved_default = clamped[Class::Default as usize],
+                reserved_bulk = clamped[Class::Bulk as usize],
+                unreserved = u32::from(new_capacity).saturating_sub(reserved_total),
+                "scheduler: capacity is below the configured reservations; each class keeps the \
+                 same fraction of its reservation and the rest of the pool is shared by every class"
             );
-            clamp_reservations_to_capacity(desired, new_capacity)
+            clamped
         } else {
             desired
         };
@@ -705,6 +723,34 @@ impl PriorityScheduler {
     }
 }
 
+/// A queued admission's exit guard. On every exit it marks the waiter
+/// cancelled so the queue's `drop_cancelled_head` reaps it (harmless if the
+/// waiter was already popped: the token has no other readers) and kicks the
+/// dispatcher so head GC runs promptly (without this, a `queue_size = 1`
+/// queue could reject the *next* admit as QueueFull for up to one periodic
+/// tick even though the head waiter is gone). When no outcome was reached,
+/// the future was dropped while queued (the client disconnected): the wait
+/// and the `client_cancelled` outcome are recorded here, since the caller
+/// never sees a result to record.
+struct QueuedWait {
+    class: Class,
+    enqueued_at: Instant,
+    waiter_cancel: CancellationToken,
+    release_notify: Arc<Notify>,
+    outcome_reached: bool,
+}
+
+impl Drop for QueuedWait {
+    fn drop(&mut self) {
+        if !self.outcome_reached {
+            super::metrics::record_queue_wait(self.class, self.enqueued_at.elapsed());
+            super::metrics::record_admit(self.class, super::metrics::outcome::CLIENT_CANCELLED);
+        }
+        self.waiter_cancel.cancel();
+        self.release_notify.notify_one();
+    }
+}
+
 /// Desired per-class reservation at `capacity`:
 /// `max(floor, ceil(per_slot × capacity))`, capped per class at `capacity`.
 /// The per-class result always fits the pool, but `Σ` may exceed `capacity`
@@ -725,22 +771,37 @@ fn desired_reservations(floor: [u16; 4], per_slot: &[f64; 4], capacity: u16) -> 
     })
 }
 
-/// Clamp desired reservations to fit `capacity`, priority-ordered: fill
-/// System → Bulk, each taking `min(desired, remaining)`. The highest classes
-/// keep their seats under an extreme shrink and the lowest yield first. The
-/// result always sums to `<= capacity`.
+/// Clamp desired reservations to fit `capacity`: every class keeps the same
+/// fraction of what it asked for (`desired × capacity / Σ desired`, rounded
+/// down), so no class is reserved whole at the expense of the others. A
+/// priority-ordered fill would hand a pool smaller than the floors to the
+/// highest class entirely: with the built-in floors, a pool of four slots
+/// was reserved for `system`, which carries no traffic, and every other
+/// class was admitted only by the starvation override. The rounding
+/// remainder is left unreserved and shared by every class; when the scaled
+/// reservations still fill the pool exactly, one slot is taken back from the
+/// largest reservation (the highest class on a tie) so a class without a
+/// reservation is never locked out of an idle pool. Desired reservations
+/// that already fit are returned as they are.
 fn clamp_reservations_to_capacity(desired: [u16; 4], capacity: u16) -> [u16; 4] {
-    let mut remaining = capacity;
-    let mut out = [0u16; 4];
-    for class in [
-        Class::System,
-        Class::Interactive,
-        Class::Default,
-        Class::Bulk,
-    ] {
-        let give = desired[class as usize].min(remaining);
-        out[class as usize] = give;
-        remaining -= give;
+    let desired_total: u64 = desired.iter().map(|&r| u64::from(r)).sum();
+    if desired_total <= u64::from(capacity) {
+        return desired;
+    }
+    // desired_total > capacity >= 0, so the division is defined and every
+    // scaled value is below its desired value and within u16.
+    let mut out = desired.map(|r| (u64::from(r) * u64::from(capacity) / desired_total) as u16);
+    let reserved_total: u32 = out.iter().map(|&r| u32::from(r)).sum();
+    if capacity > 0 && reserved_total >= u32::from(capacity) {
+        // `max_by_key` returns the last maximum: in lane order that is the
+        // highest class on a tie.
+        if let Some(largest) = Class::ALL
+            .iter()
+            .copied()
+            .max_by_key(|&class| out[class as usize])
+        {
+            out[largest as usize] = out[largest as usize].saturating_sub(1);
+        }
     }
     out
 }
@@ -1314,11 +1375,12 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_new_capacity_shrink_clamps_reservations_priority_ordered() {
+    fn test_apply_new_capacity_shrink_clamps_reservations_proportionally() {
         // Built-in defaults at capacity 80: desired is System 32, Interactive
-        // 128 (floor), Default ceil(0.10*80)=8 — Σ 168 > 80. The
-        // priority-ordered clamp keeps System whole (32), gives Interactive
-        // the remainder (48), and yields Default and Bulk.
+        // 80 (the 128 floor capped at capacity), Default ceil(0.10*80)=8 —
+        // Σ 120 > 80. Every class keeps 80/120 of its reservation, rounded
+        // down (System 21, Interactive 53, Default 5, Bulk 0), and the
+        // remaining slot is shared.
         let s = default_settings();
         let scheduler = PriorityScheduler::new(&s, 256).unwrap();
         scheduler.apply_new_capacity(80);
@@ -1328,12 +1390,12 @@ mod tests {
             .map(|c| u32::from(scheduler.slot_pool.reserved(*c)))
             .sum();
         assert!(
-            new_total <= 80,
-            "clamped reservations ({new_total}) must fit"
+            new_total < 80,
+            "clamped reservations ({new_total}) must leave room"
         );
-        assert_eq!(scheduler.slot_pool.reserved(Class::System), 32);
-        assert_eq!(scheduler.slot_pool.reserved(Class::Interactive), 48);
-        assert_eq!(scheduler.slot_pool.reserved(Class::Default), 0);
+        assert_eq!(scheduler.slot_pool.reserved(Class::System), 21);
+        assert_eq!(scheduler.slot_pool.reserved(Class::Interactive), 53);
+        assert_eq!(scheduler.slot_pool.reserved(Class::Default), 5);
         assert_eq!(scheduler.slot_pool.reserved(Class::Bulk), 0);
     }
 
@@ -1348,11 +1410,11 @@ mod tests {
         assert_eq!(scheduler.slot_pool.reserved(Class::Interactive), 128);
         assert_eq!(scheduler.slot_pool.reserved(Class::Default), 26);
 
-        // Shrink to 80: desired Σ 168 > 80 → priority clamp (System 32, the
-        // remaining 48 to Interactive, Default/Bulk yield).
+        // Shrink to 80: desired Σ 120 > 80 → the proportional clamp (System
+        // 21, Interactive 53, Default 5, Bulk 0; one slot shared).
         scheduler.apply_new_capacity(80);
-        assert_eq!(scheduler.slot_pool.reserved(Class::Interactive), 48);
-        assert_eq!(scheduler.slot_pool.reserved(Class::Default), 0);
+        assert_eq!(scheduler.slot_pool.reserved(Class::Interactive), 53);
+        assert_eq!(scheduler.slot_pool.reserved(Class::Default), 5);
 
         // Recover to 256 → fully restored, not stuck at the clamped values.
         scheduler.apply_new_capacity(256);
@@ -1398,19 +1460,176 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_reservations_priority_ordered() {
-        // [Bulk, Default, Interactive, System], Σ 185 > 100.
+    fn test_clamp_reservations_proportional() {
+        // [Bulk, Default, Interactive, System], Σ 185 > 100: every class
+        // keeps 100/185 of its reservation, rounded down; 2 slots are shared.
         let out = clamp_reservations_to_capacity([5, 20, 128, 32], 100);
-        // System keeps its 32, Interactive takes the remaining 68, rest yield.
-        assert_eq!(out[Class::System as usize], 32);
-        assert_eq!(out[Class::Interactive as usize], 68);
-        assert_eq!(out[Class::Default as usize], 0);
-        assert_eq!(out[Class::Bulk as usize], 0);
-        assert_eq!(out.iter().map(|&r| u32::from(r)).sum::<u32>(), 100);
+        assert_eq!(out[Class::System as usize], 17);
+        assert_eq!(out[Class::Interactive as usize], 69);
+        assert_eq!(out[Class::Default as usize], 10);
+        assert_eq!(out[Class::Bulk as usize], 2);
+        assert_eq!(out.iter().map(|&r| u32::from(r)).sum::<u32>(), 98);
         // Fits already: every class keeps its full desired value.
         assert_eq!(
             clamp_reservations_to_capacity([1, 2, 3, 4], 100),
             [1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn test_clamp_on_small_pools_leaves_every_class_headroom() {
+        // The built-in floors on a pool of 4 (the issue's bed before its
+        // second worker was counted): desired is System 4, Interactive 4
+        // (both capped at capacity), Default ceil(0.4)=1, Bulk 0 — Σ 9. The
+        // old priority-ordered fill reserved all four for System, which
+        // carries no traffic, and every other class was admitted only by the
+        // starvation override. Now System and Interactive keep 4/9 of their
+        // reservation (1 each), 2 slots are shared, and a request of any
+        // class finds a slot on an idle pool.
+        let floor = [0u16, 0, 128, 32];
+        let per_slot = [0.0f64, 0.10, 0.25, 0.0];
+        for (capacity, expected, shared) in [
+            (4u16, [0u16, 0, 1, 1], 2u16),
+            (16, [0, 0, 7, 7], 2),
+            (8, [0, 0, 3, 3], 2),
+        ] {
+            let desired = desired_reservations(floor, &per_slot, capacity);
+            let out = clamp_reservations_to_capacity(desired, capacity);
+            assert_eq!(out, expected, "capacity {capacity}");
+            let reserved: u16 = out.iter().sum();
+            assert_eq!(capacity - reserved, shared, "capacity {capacity}");
+            for class in Class::ALL {
+                assert!(
+                    super::super::slots::slots_available_to([0; 4], out, capacity, class) >= 1,
+                    "capacity {capacity}: {class:?} has headroom on an idle pool"
+                );
+            }
+        }
+        // A pool large enough for the floors + shares is not clamped at all:
+        // 1024 → System 32, Interactive 256, Default 103, Bulk 0 (Σ 391).
+        let desired = desired_reservations(floor, &per_slot, 1024);
+        assert_eq!(desired, [0, 103, 256, 32]);
+        assert_eq!(clamp_reservations_to_capacity(desired, 1024), desired);
+    }
+
+    #[test]
+    fn test_clamp_leaves_one_slot_unreserved_when_the_scaled_shares_fill_the_pool() {
+        // [Bulk, Default, Interactive, System] = [0, 2, 4, 4] at 5: every
+        // share divides exactly ([0, 1, 2, 2] = 5), which would reserve the
+        // whole pool and lock Bulk out until the starvation override; one
+        // slot comes back from the largest reservation (System on the tie).
+        assert_eq!(
+            clamp_reservations_to_capacity([0, 2, 4, 4], 5),
+            [0, 1, 2, 1]
+        );
+        // A pool of one slot: nothing is reserved, the slot is shared.
+        assert_eq!(
+            clamp_reservations_to_capacity([0, 1, 8, 8], 1),
+            [0, 0, 0, 0]
+        );
+        // Capacity zero stays zero everywhere.
+        assert_eq!(
+            clamp_reservations_to_capacity([0, 1, 8, 8], 0),
+            [0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn test_one_request_of_any_class_is_admitted_on_a_small_idle_pool() {
+        // Built at 1024 (the legacy fallback before the workers report), then
+        // the fleet reports 4 slots: one request of each class is admitted at
+        // once on the idle pool, and the pool holds four at a time.
+        let s = default_settings();
+        let scheduler = PriorityScheduler::new(&s, 1024).unwrap();
+        scheduler.apply_new_capacity(4);
+        for class in Class::ALL {
+            let permit = scheduler.acquire_inflight(class, rid("one"));
+            assert!(
+                permit.is_some(),
+                "{class:?} is admitted on an idle pool of 4"
+            );
+            drop(permit);
+        }
+        let held: Vec<_> = (0..2)
+            .map(|i| scheduler.acquire_inflight(Class::Bulk, rid(&format!("b{i}"))))
+            .collect();
+        assert!(
+            held.iter().all(Option::is_some),
+            "the 2 shared slots serve Bulk"
+        );
+        assert!(
+            scheduler.acquire_inflight(Class::Bulk, rid("b2")).is_none(),
+            "the slots reserved for Interactive and System stay theirs"
+        );
+        assert!(
+            scheduler
+                .acquire_inflight(Class::Interactive, rid("i0"))
+                .is_some(),
+            "Interactive still has its reserved slot"
+        );
+    }
+
+    #[test]
+    fn test_small_pool_gives_interactive_more_headroom_than_bulk_without_locking_bulk_out() {
+        // Two workers of four slots (the issue's bed): capacity 8, desired
+        // Σ 17 → System 3, Interactive 3, Default 0, Bulk 0, 2 shared.
+        let s = default_settings();
+        let scheduler = PriorityScheduler::new(&s, 1024).unwrap();
+        scheduler.apply_new_capacity(8);
+        let reserved = Class::ALL.map(|c| scheduler.slot_pool.reserved(c));
+        let room =
+            |class: Class| super::super::slots::slots_available_to([0; 4], reserved, 8, class);
+        assert_eq!(room(Class::Bulk), 2, "Bulk is not locked out");
+        assert_eq!(room(Class::Default), 2);
+        assert_eq!(
+            room(Class::Interactive),
+            5,
+            "Interactive has the shorter wait"
+        );
+        assert_eq!(room(Class::System), 8);
+    }
+
+    #[tokio::test]
+    async fn test_dropped_queued_admission_is_recorded_as_client_cancelled() {
+        use std::{
+            future::Future,
+            task::{Context, Poll},
+        };
+
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let rendered = render_with_recorder(|| {
+            // One slot, held; the next Bulk admission queues. The client goes
+            // away: axum drops the middleware's future and the queued admit
+            // with it, without firing its cancel token.
+            let s = settings_with(Class::Bulk, 8, 30);
+            let scheduler = PriorityScheduler::new(&s, 1).unwrap();
+            let _held = scheduler
+                .acquire_inflight(Class::Bulk, rid("held"))
+                .expect("the slot");
+            let admit = scheduler.admit(Class::Bulk, rid("queued"), CancellationToken::new());
+            let mut admit = Box::pin(admit);
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(
+                matches!(admit.as_mut().poll(&mut cx), Poll::Pending),
+                "the admission waits in the queue"
+            );
+            assert_eq!(scheduler.class_queues[Class::Bulk as usize].depth(), 1);
+            drop(admit);
+            // The abandoned waiter is marked for the queue's head GC.
+            scheduler.class_queues[Class::Bulk as usize].drop_cancelled_head();
+            assert_eq!(scheduler.class_queues[Class::Bulk as usize].depth(), 0);
+        });
+        assert!(
+            rendered.contains(
+                "smg_scheduler_admit_total{class=\"bulk\",outcome=\"client_cancelled\"} 1"
+            ),
+            "the abandoned wait is an admission outcome: {rendered}"
+        );
+        assert!(
+            rendered.contains("smg_scheduler_queue_wait_seconds_count{class=\"bulk\"} 1"),
+            "the abandoned wait is recorded: {rendered}"
         );
     }
 

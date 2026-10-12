@@ -1,6 +1,6 @@
 //! Conversation CRUD handlers for the /v1/conversations API - shared across routers
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 
 use axum::{
     http::StatusCode,
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use smg_data_connector::{
     AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
-    SortOrder,
+    SortOrder, StorageFailure,
 };
 use tracing::info;
 
@@ -27,6 +27,10 @@ use crate::routers::{
 
 pub const MAX_METADATA_PROPERTIES: usize = 16;
 const MAX_ITEMS_PER_REQUEST: usize = 20;
+/// The longest item id a client may supply, in bytes: the id columns of the
+/// SQL stores are 64 wide, and every backend gives the same refusal before any
+/// store is asked, where one of them used to fail the insert instead.
+pub const MAX_ITEM_ID_LENGTH: usize = 64;
 
 const SUPPORTED_ITEM_TYPES: &[&str] = &[
     "message",
@@ -73,8 +77,11 @@ fn not_found(message: impl Into<String>) -> Response {
     route_error::not_found("not_found", message)
 }
 
-fn internal_error(message: impl Into<String>) -> Response {
-    route_error::internal_error("internal_error", message)
+/// A failed store call: `503 storage_unavailable` when the store did not
+/// answer within its bound, else the `500 internal_error` these handlers
+/// answer; `context` opens the message.
+fn store_error(context: &str, error: &(impl StorageFailure + Display)) -> Response {
+    route_error::storage_failure("internal_error", context, error)
 }
 
 fn bad_request_structured(error_obj: Value) -> Response {
@@ -92,18 +99,36 @@ fn item_already_in_conversation() -> Response {
     }))
 }
 
+/// The refusal of a client-supplied item id longer than the stores keep, under
+/// the public API's code for a string over its bound.
+fn item_id_above_max_length(id: &str) -> Response {
+    bad_request_structured(json!({
+        "message": format!(
+            "Item id must be at most {MAX_ITEM_ID_LENGTH} bytes long, got {}",
+            id.len()
+        ),
+        "type": "invalid_request_error",
+        "param": "items[].id",
+        "code": "string_above_max_length"
+    }))
+}
+
 // ============================================================================
 // Storage Helpers
 // ============================================================================
 
+/// The conversation under `conv_id` as a caller of `tenant` may see it. A
+/// conversation stored under another tenant answers as an unknown id does, so
+/// an id tells a caller nothing about another tenant's conversations.
 async fn ensure_conversation_exists(
     storage: &Arc<dyn ConversationStorage>,
     conv_id: &ConversationId,
+    tenant: Option<&str>,
 ) -> Result<Conversation, Response> {
     match storage.get_conversation(conv_id).await {
-        Ok(Some(conv)) => Ok(conv),
-        Ok(None) => Err(not_found("Conversation not found")),
-        Err(e) => Err(internal_error(format!("Failed to get conversation: {e}"))),
+        Ok(Some(conv)) if conv.is_visible_to(tenant) => Ok(conv),
+        Ok(_) => Err(not_found("Conversation not found")),
+        Err(e) => Err(store_error("Failed to get conversation", &e)),
     }
 }
 
@@ -163,43 +188,57 @@ fn apply_metadata_patches(
 // Conversation CRUD Handlers
 // ============================================================================
 
-pub async fn create_conversation(storage: &Arc<dyn ConversationStorage>, body: Value) -> Response {
+/// `POST /v1/conversations`: the conversation is scoped to the caller's
+/// `tenant`.
+pub async fn create_conversation(
+    storage: &Arc<dyn ConversationStorage>,
+    tenant: Option<&str>,
+    body: Value,
+) -> Response {
     let metadata = match validate_metadata(&body) {
         Ok(m) => m,
         Err(msg) => return bad_request(msg),
     };
 
-    let new_conv = NewConversation { id: None, metadata };
+    let new_conv = NewConversation {
+        id: None,
+        metadata,
+        tenant: tenant.map(str::to_string),
+    };
 
     match storage.create_conversation(new_conv).await {
         Ok(conversation) => {
             info!(conversation_id = %conversation.id.0, "Created conversation");
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Err(e) => internal_error(format!("Failed to create conversation: {e}")),
+        Err(e) => store_error("Failed to create conversation", &e),
     }
 }
 
-pub async fn get_conversation(storage: &Arc<dyn ConversationStorage>, conv_id: &str) -> Response {
+pub async fn get_conversation(
+    storage: &Arc<dyn ConversationStorage>,
+    tenant: Option<&str>,
+    conv_id: &str,
+) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    match storage.get_conversation(&conversation_id).await {
-        Ok(Some(conversation)) => {
+    match ensure_conversation_exists(storage, &conversation_id, tenant).await {
+        Ok(conversation) => {
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Ok(None) => not_found("Conversation not found"),
-        Err(e) => internal_error(format!("Failed to get conversation: {e}")),
+        Err(response) => response,
     }
 }
 
 pub async fn update_conversation(
     storage: &Arc<dyn ConversationStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     body: Value,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    let current = match ensure_conversation_exists(storage, &conversation_id).await {
+    let current = match ensure_conversation_exists(storage, &conversation_id, tenant).await {
         Ok(c) => c,
         Err(response) => return response,
     };
@@ -218,15 +257,20 @@ pub async fn update_conversation(
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
         Ok(None) => not_found("Conversation not found"),
-        Err(e) => internal_error(format!("Failed to update conversation: {e}")),
+        Err(e) => store_error("Failed to update conversation", &e),
     }
 }
 
 pub async fn delete_conversation(
     storage: &Arc<dyn ConversationStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
+
+    if let Err(response) = ensure_conversation_exists(storage, &conversation_id, tenant).await {
+        return response;
+    }
 
     match storage.delete_conversation(&conversation_id).await {
         Ok(true) => {
@@ -242,7 +286,7 @@ pub async fn delete_conversation(
                 .into_response()
         }
         Ok(false) => not_found("Conversation not found"),
-        Err(e) => internal_error(format!("Failed to delete conversation: {e}")),
+        Err(e) => store_error("Failed to delete conversation", &e),
     }
 }
 
@@ -253,6 +297,7 @@ pub async fn delete_conversation(
 pub async fn list_conversation_items(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     limit: Option<usize>,
     order: Option<&str>,
@@ -260,7 +305,8 @@ pub async fn list_conversation_items(
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
+    if let Err(response) =
+        ensure_conversation_exists(conversation_storage, &conversation_id, tenant).await
     {
         return response;
     }
@@ -295,19 +341,21 @@ pub async fn list_conversation_items(
             )
                 .into_response()
         }
-        Err(e) => internal_error(format!("Failed to list items: {e}")),
+        Err(e) => store_error("Failed to list items", &e),
     }
 }
 
 pub async fn create_conversation_items(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     body: Value,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
+    if let Err(response) =
+        ensure_conversation_exists(conversation_storage, &conversation_id, tenant).await
     {
         return response;
     }
@@ -323,6 +371,16 @@ pub async fn create_conversation_items(
         ));
     }
 
+    // Bounded before any store is asked, for the whole batch: the stores' id columns are
+    // this wide, and a later item's over-long id must not leave earlier items behind.
+    if let Some(id_str) = items_array
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .find(|id| id.len() > MAX_ITEM_ID_LENGTH)
+    {
+        return item_id_above_max_length(id_str);
+    }
+
     let mut created_items = Vec::new();
     let mut warnings = Vec::new();
     let mut link_pairs = Vec::new();
@@ -333,7 +391,7 @@ pub async fn create_conversation_items(
 
     for item_val in items_array {
         let added_at = stamps.next_added_at();
-        match process_item(item_storage, &conversation_id, item_val, added_at).await {
+        match process_item(item_storage, &conversation_id, item_val, added_at, tenant).await {
             Ok((item_json, item_id, warning)) => {
                 if seen_ids.insert(item_id.0.clone()) {
                     link_pairs.push((item_id, added_at));
@@ -349,7 +407,7 @@ pub async fn create_conversation_items(
 
     // Batch-link all items in a single operation
     if let Err(e) = item_storage.link_items(&conversation_id, &link_pairs).await {
-        return internal_error(format!("Failed to link items to conversation: {e}"));
+        return store_error("Failed to link items to conversation", &e);
     }
 
     let mut response = json!({
@@ -370,12 +428,15 @@ pub async fn create_conversation_items(
 }
 
 /// Process a single item for creation. Returns (json, item_id, warning).
-/// Linking is deferred to the caller for batch operation.
+/// Linking is deferred to the caller for batch operation. An item that exists
+/// already (an `item_reference`, an item arriving under its own id) is taken
+/// only when the caller's `tenant` may see it; a new item is scoped to it.
 async fn process_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
     item_val: &Value,
     added_at: chrono::DateTime<Utc>,
+    tenant: Option<&str>,
 ) -> Result<(Value, ConversationItemId, Option<String>), Response> {
     let item_type = item_val
         .get("type")
@@ -384,15 +445,16 @@ async fn process_item(
 
     // Handle item_reference specially - just resolve existing item
     if item_type == "item_reference" {
-        return process_item_reference(item_storage, conversation_id, item_val, added_at).await;
+        return process_item_reference(item_storage, conversation_id, item_val, added_at, tenant)
+            .await;
     }
 
     let user_provided_id = item_val.get("id").and_then(|v| v.as_str());
 
     let (item, warning) = if let Some(id_str) = user_provided_id {
-        process_item_with_id(item_storage, conversation_id, item_val, id_str).await?
+        process_item_with_id(item_storage, conversation_id, item_val, id_str, tenant).await?
     } else {
-        process_new_item(item_storage, item_val).await?
+        process_new_item(item_storage, item_val, tenant).await?
     };
 
     let item_id = item.id.clone();
@@ -409,6 +471,7 @@ async fn process_item_reference(
     conversation_id: &ConversationId,
     item_val: &Value,
     _added_at: chrono::DateTime<Utc>,
+    tenant: Option<&str>,
 ) -> Result<(Value, ConversationItemId, Option<String>), Response> {
     let ref_id = item_val
         .get("id")
@@ -420,19 +483,16 @@ async fn process_item_reference(
     let is_linked = item_storage
         .is_item_linked(conversation_id, &item_id)
         .await
-        .map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
+        .map_err(|e| store_error("Failed to check item link", &e))?;
     if is_linked {
         return Err(item_already_in_conversation());
     }
 
+    // An item of another tenant is as unknown as a missing one.
     let existing_item = match item_storage.get_item(&item_id).await {
-        Ok(Some(item)) => item,
-        Ok(None) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
-        Err(e) => {
-            return Err(internal_error(format!(
-                "Failed to get referenced item: {e}"
-            )))
-        }
+        Ok(Some(item)) if item.is_visible_to(tenant) => item,
+        Ok(_) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
+        Err(e) => return Err(store_error("Failed to get referenced item", &e)),
     };
 
     let item_id = existing_item.id.clone();
@@ -445,37 +505,44 @@ async fn process_item_with_id(
     conversation_id: &ConversationId,
     item_val: &Value,
     id_str: &str,
+    tenant: Option<&str>,
 ) -> Result<(ConversationItem, Option<String>), Response> {
+    // Bounded before any store is asked: the stores' id columns are this wide,
+    // and an id over the bound must be the same 400 on every backend.
+    if id_str.len() > MAX_ITEM_ID_LENGTH {
+        return Err(item_id_above_max_length(id_str));
+    }
     let item_id = ConversationItemId::from(id_str);
 
     // Check if already linked
     let is_linked = item_storage
         .is_item_linked(conversation_id, &item_id)
         .await
-        .map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
+        .map_err(|e| store_error("Failed to check item link", &e))?;
 
     if is_linked {
         return Err(item_already_in_conversation());
     }
 
-    // Check if item exists globally
+    // Check if item exists globally: the caller's own (or an untenanted one)
+    // is taken as it is; another tenant's is neither served nor overwritten.
     match item_storage.get_item(&item_id).await {
-        Ok(Some(existing)) => Ok((existing, None)),
+        Ok(Some(existing)) if existing.is_visible_to(tenant) => Ok((existing, None)),
+        Ok(Some(_)) => Err(bad_request(format!("Item id '{id_str}' cannot be used"))),
         Ok(None) => {
             // Create new item with the provided ID
-            let (mut new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
+            let (mut new_item, warning) =
+                parse_item_from_value(item_val, tenant).map_err(bad_request)?;
             new_item.id = Some(item_id);
 
             let created = item_storage
                 .create_item(new_item)
                 .await
-                .map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+                .map_err(|e| store_error("Failed to create item", &e))?;
 
             Ok((created, warning))
         }
-        Err(e) => Err(internal_error(format!(
-            "Failed to check item existence: {e}"
-        ))),
+        Err(e) => Err(store_error("Failed to check item existence", &e)),
     }
 }
 
@@ -483,13 +550,14 @@ async fn process_item_with_id(
 async fn process_new_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
     item_val: &Value,
+    tenant: Option<&str>,
 ) -> Result<(ConversationItem, Option<String>), Response> {
-    let (new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
+    let (new_item, warning) = parse_item_from_value(item_val, tenant).map_err(bad_request)?;
 
     let created = item_storage
         .create_item(new_item)
         .await
-        .map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+        .map_err(|e| store_error("Failed to create item", &e))?;
 
     Ok((created, warning))
 }
@@ -548,6 +616,7 @@ pub fn parse_item_include_query(query: Option<&str>) -> Result<Option<Vec<String
 pub async fn get_conversation_item(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     item_id: &str,
     _include: Option<Vec<String>>,
@@ -555,7 +624,8 @@ pub async fn get_conversation_item(
     let conversation_id = ConversationId::from(conv_id);
     let item_id = ConversationItemId::from(item_id);
 
-    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
+    if let Err(response) =
+        ensure_conversation_exists(conversation_storage, &conversation_id, tenant).await
     {
         return response;
     }
@@ -565,7 +635,7 @@ pub async fn get_conversation_item(
         .await
     {
         Ok(linked) => linked,
-        Err(e) => return internal_error(format!("Failed to check item link: {e}")),
+        Err(e) => return store_error("Failed to check item link", &e),
     };
 
     if !is_linked {
@@ -575,13 +645,14 @@ pub async fn get_conversation_item(
     match item_storage.get_item(&item_id).await {
         Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(&item))).into_response(),
         Ok(None) => not_found("Item not found"),
-        Err(e) => internal_error(format!("Failed to get item: {e}")),
+        Err(e) => store_error("Failed to get item", &e),
     }
 }
 
 pub async fn delete_conversation_item(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     item_id: &str,
 ) -> Response {
@@ -589,7 +660,7 @@ pub async fn delete_conversation_item(
     let item_id = ConversationItemId::from(item_id);
 
     let conversation =
-        match ensure_conversation_exists(conversation_storage, &conversation_id).await {
+        match ensure_conversation_exists(conversation_storage, &conversation_id, tenant).await {
             Ok(conv) => conv,
             Err(response) => return response,
         };
@@ -603,7 +674,7 @@ pub async fn delete_conversation_item(
             );
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Err(e) => internal_error(format!("Failed to delete item: {e}")),
+        Err(e) => store_error("Failed to delete item", &e),
     }
 }
 
@@ -613,6 +684,7 @@ pub async fn delete_conversation_item(
 
 fn parse_item_from_value(
     item_val: &Value,
+    tenant: Option<&str>,
 ) -> Result<(NewConversationItem, Option<String>), String> {
     let item_type = item_val
         .get("type")
@@ -672,6 +744,7 @@ fn parse_item_from_value(
             role,
             content,
             status,
+            tenant: tenant.map(str::to_string),
         },
         warning,
     ))
@@ -710,8 +783,308 @@ pub fn conversation_to_json(conversation: &Conversation) -> Value {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
+    use smg_data_connector::{MemoryConversationItemStorage, MemoryConversationStorage};
 
     use super::*;
+
+    /// A client-supplied item id longer than the stores' id columns is refused
+    /// at the handler, before any store is asked, so every backend answers the
+    /// same 400 under the public API's code; an id at the bound is kept and
+    /// linked under that id.
+    #[tokio::test]
+    async fn an_item_id_over_the_bound_is_refused_before_the_store_and_one_at_the_bound_is_kept() {
+        let conversation_storage: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let item_storage: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let conversation = conversation_storage
+            .create_conversation(NewConversation {
+                id: None,
+                metadata: None,
+                tenant: None,
+            })
+            .await
+            .unwrap();
+        let conv_id = conversation.id.0.clone();
+        let items = |id: &str| json!({"items": [{"type": "message", "role": "user", "content": "x", "id": id}]});
+
+        // 65 and 64 characters: one over the stores' 64-character id columns, one at the bound.
+        let over = format!("msg_{}", "a".repeat(61));
+        assert_eq!(over.len(), 65);
+        let response = create_conversation_items(
+            &conversation_storage,
+            &item_storage,
+            None,
+            &conv_id,
+            items(&over),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "string_above_max_length", "{json}");
+        assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
+        assert_eq!(json["error"]["param"], "items[].id", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("64"),
+            "the message names the bound: {json}"
+        );
+
+        // The bound holds for the whole batch before any store is asked: an over-long
+        // id on the second item leaves the first item unstored and unlinked.
+        let batch = json!({"items": [
+            {"type": "message", "role": "user", "content": "first", "id": "msg_first"},
+            {"type": "message", "role": "user", "content": "second", "id": over}
+        ]});
+        let response =
+            create_conversation_items(&conversation_storage, &item_storage, None, &conv_id, batch)
+                .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let listed = item_storage
+            .list_items(
+                &ConversationId::from(conv_id.as_str()),
+                ListParams {
+                    limit: 10,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "nothing is stored for a refused batch: {listed:?}"
+        );
+        // The store itself, not the conversation's links: the old per-item check
+        // created the first item before refusing the second, linking none.
+        assert!(
+            item_storage
+                .get_item(&ConversationItemId::from("msg_first"))
+                .await
+                .unwrap()
+                .is_none(),
+            "an earlier item of a refused batch is not stored"
+        );
+        let over_id = ConversationItemId::from(over.as_str());
+        assert!(
+            item_storage.get_item(&over_id).await.unwrap().is_none(),
+            "nothing is stored under the refused id"
+        );
+        assert!(!item_storage
+            .is_item_linked(&conversation.id, &over_id)
+            .await
+            .unwrap());
+
+        let at_bound = format!("msg_{}", "a".repeat(60));
+        assert_eq!(at_bound.len(), 64);
+        let response = create_conversation_items(
+            &conversation_storage,
+            &item_storage,
+            None,
+            &conv_id,
+            items(&at_bound),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(item_storage
+            .is_item_linked(
+                &conversation.id,
+                &ConversationItemId::from(at_bound.as_str())
+            )
+            .await
+            .unwrap());
+    }
+
+    const A: Option<&str> = Some("header:tenant-a");
+    const B: Option<&str> = Some("header:tenant-b");
+
+    async fn json_of(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A conversation created by tenant a with one item; the stores and the ids.
+    async fn conversation_of_a() -> (
+        Arc<dyn ConversationStorage>,
+        Arc<dyn ConversationItemStorage>,
+        String,
+        String,
+    ) {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let created = json_of(create_conversation(&conversations, A, json!({})).await).await;
+        let conv_id = created["id"].as_str().unwrap().to_string();
+        let added = json_of(
+            create_conversation_items(
+                &conversations,
+                &items,
+                A,
+                &conv_id,
+                json!({"items": [{"type": "message", "role": "user", "content": "secret"}]}),
+            )
+            .await,
+        )
+        .await;
+        let item_id = added["data"][0]["id"].as_str().unwrap().to_string();
+        (conversations, items, conv_id, item_id)
+    }
+
+    /// A conversation created under a tenant is read, listed, written into and
+    /// deleted by that tenant only; another tenant, and a caller without one,
+    /// get the answer of an unknown id on every route and change nothing.
+    #[tokio::test]
+    async fn another_tenants_conversation_answers_not_found_on_every_route() {
+        let (conversations, items, conv_id, item_id) = conversation_of_a().await;
+        let stored = conversations
+            .get_conversation(&ConversationId::from(conv_id.as_str()))
+            .await
+            .unwrap()
+            .expect("created");
+        assert_eq!(
+            stored.tenant.as_deref(),
+            A,
+            "the conversation carries its tenant"
+        );
+
+        for caller in [B, None] {
+            let answers = [
+                get_conversation(&conversations, caller, &conv_id).await,
+                update_conversation(
+                    &conversations,
+                    caller,
+                    &conv_id,
+                    json!({"metadata": {"k": "v"}}),
+                )
+                .await,
+                list_conversation_items(&conversations, &items, caller, &conv_id, None, None, None)
+                    .await,
+                create_conversation_items(
+                    &conversations,
+                    &items,
+                    caller,
+                    &conv_id,
+                    json!({"items": [{"type": "message", "role": "user", "content": "intruder"}]}),
+                )
+                .await,
+                get_conversation_item(&conversations, &items, caller, &conv_id, &item_id, None)
+                    .await,
+                delete_conversation_item(&conversations, &items, caller, &conv_id, &item_id).await,
+                delete_conversation(&conversations, caller, &conv_id).await,
+            ];
+            for answer in answers {
+                assert_eq!(answer.status(), StatusCode::NOT_FOUND, "{caller:?}");
+            }
+        }
+
+        // Nothing changed for its owner: the one item is still there, the
+        // conversation too, and the owner's own calls work.
+        let listed = json_of(
+            list_conversation_items(&conversations, &items, A, &conv_id, None, None, None).await,
+        )
+        .await;
+        assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            get_conversation_item(&conversations, &items, A, &conv_id, &item_id, None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete_conversation_item(&conversations, &items, A, &conv_id, &item_id)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete_conversation(&conversations, A, &conv_id)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_conversation(&conversations, A, &conv_id).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// An item of another tenant is as unknown as a missing one to an
+    /// `item_reference`, and an item arriving under that id is refused rather
+    /// than served or overwritten; the owner references its own item freely.
+    #[tokio::test]
+    async fn another_tenants_item_cannot_be_referenced_or_adopted() {
+        let (conversations, items, _conv_a, item_a) = conversation_of_a().await;
+        let created = json_of(create_conversation(&conversations, B, json!({})).await).await;
+        let conv_b = created["id"].as_str().unwrap().to_string();
+
+        let reference = json!({"items": [{"type": "item_reference", "id": item_a}]});
+        let answer = create_conversation_items(&conversations, &items, B, &conv_b, reference).await;
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+        let adopt = json!({"items": [{"type": "message", "id": item_a, "role": "user", "content": "mine now"}]});
+        let answer = create_conversation_items(&conversations, &items, B, &conv_b, adopt).await;
+        assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
+        // a's item is untouched and still a's.
+        let stored = items
+            .get_item(&ConversationItemId::from(item_a.as_str()))
+            .await
+            .unwrap()
+            .expect("still there");
+        assert_eq!(stored.tenant.as_deref(), A);
+        assert_eq!(stored.content[0]["text"], "secret");
+        let listed = json_of(
+            list_conversation_items(&conversations, &items, B, &conv_b, None, None, None).await,
+        )
+        .await;
+        assert_eq!(listed["data"].as_array().map(Vec::len), Some(0));
+
+        // The owner references its own item into a second conversation of its own.
+        let created = json_of(create_conversation(&conversations, A, json!({})).await).await;
+        let conv_a2 = created["id"].as_str().unwrap().to_string();
+        let reference = json!({"items": [{"type": "item_reference", "id": item_a}]});
+        let answer =
+            create_conversation_items(&conversations, &items, A, &conv_a2, reference).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+    }
+
+    /// Without tenant identity nothing changes: a conversation created by a
+    /// caller without a tenant is served to every caller, as before.
+    #[tokio::test]
+    async fn a_conversation_without_a_tenant_is_served_to_every_caller() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let created = json_of(create_conversation(&conversations, None, json!({})).await).await;
+        let conv_id = created["id"].as_str().unwrap().to_string();
+        for caller in [None, A] {
+            assert_eq!(
+                get_conversation(&conversations, caller, &conv_id)
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "{caller:?}"
+            );
+            assert_eq!(
+                list_conversation_items(&conversations, &items, caller, &conv_id, None, None, None)
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "{caller:?}"
+            );
+        }
+        assert_eq!(
+            delete_conversation(&conversations, B, &conv_id)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
 
     /// The CRUD helpers answer with the gateway's envelope, an object an SDK
     /// decodes (`type` from the public vocabulary, a string `code`, `param`),
@@ -730,7 +1103,20 @@ mod tests {
                 "not_found",
             ),
             (
-                internal_error("boom"),
+                store_error(
+                    "Failed to get conversation",
+                    &smg_data_connector::ResponseStorageError::Timeout(
+                        "the redis get_conversation call exceeded its bound of 5 s".to_string(),
+                    ),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+            ),
+            (
+                store_error(
+                    "Failed to get conversation",
+                    &smg_data_connector::ResponseStorageError::StorageError("db error".to_string()),
+                ),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
             ),

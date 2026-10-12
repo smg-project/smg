@@ -55,7 +55,7 @@ use crate::{
         grpc::{
             common::responses::{
                 await_stream_startup, build_sse_response, persist_response_if_needed,
-                signal_stream_startup, stream_startup_channel,
+                signal_stream_startup, stored_foreground, stream_startup_channel,
                 streaming::{
                     attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
                 },
@@ -90,6 +90,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
     let response_id = params.response_id;
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
 
     // Get chat streaming response
     let chat_response = ctx
@@ -145,6 +146,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            tenant,
             request_context,
             tx.clone(),
         )
@@ -202,6 +204,7 @@ async fn process_and_transform_sse_stream(
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    tenant: Option<String>,
     request_context: Option<StorageRequestContext>,
     tx: SseSender,
 ) -> Result<(), String> {
@@ -311,18 +314,36 @@ async fn process_and_transform_sse_stream(
         final_response.error = Some(error.clone());
     }
     let usage_json = final_response.usage.as_ref().map(|usage| json!(usage));
-    event_emitter
-        .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
-        .await?;
-    persist_response_if_needed(
+    let persist = persist_response_if_needed(
         conversation_storage,
         conversation_item_storage,
         response_storage,
         &final_response,
         &original_request,
+        tenant.as_deref(),
         request_context,
-    )
-    .await;
+    );
+    if stored_foreground(&original_request) {
+        // A foreground response the client expects stored is written before
+        // its terminal event: a record that could not be written ends the
+        // stream with response.failed, not with a completed response that
+        // can be neither retrieved nor continued.
+        let not_stored = persist.await.err().map(|e| e.error_object());
+        let error = terminal_error.as_ref().or(not_stored.as_ref());
+        event_emitter
+            .emit_terminal(usage_json.as_ref(), error, &tx)
+            .await?;
+    } else {
+        // A background response's terminal write is retried behind the event
+        // (its client polls the record); an unstored response stores
+        // nothing. Neither fails the stream.
+        event_emitter
+            .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
+            .await?;
+        if let Err(e) = persist.await {
+            debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
+        }
+    }
 
     Ok(())
 }
@@ -1016,26 +1037,44 @@ async fn execute_tool_loop_streaming_internal(
     };
 
     let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
-    emitter
-        .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
-        .await?;
-
-    // Store the final object, as the other streaming paths do; a background
-    // response needs its terminal record under the id the client polls.
+    // The final object, read before the terminal event drains the emitter's
+    // items; a background response needs its terminal record under the id
+    // the client polls.
     let mut final_response = emitter.finalize(None);
     final_response.usage = state.usage.clone().map(ResponsesUsage::Modern);
-    if let Some(error) = terminal_error {
+    if let Some(error) = terminal_error.clone() {
+        // The emitter learns of the failure from the terminal event, which
+        // now follows the final object: the stored record says failed itself.
+        final_response.status = ResponseStatus::Failed;
+        final_response.incomplete_details = None;
         final_response.error = Some(error);
     }
-    persist_response_if_needed(
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let persist = persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
         &final_response,
         original_request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
-    )
-    .await;
+    );
+    if stored_foreground(original_request) {
+        // Written before its terminal event: a record that could not be
+        // written ends the stream with response.failed.
+        let not_stored = persist.await.err().map(|e| e.error_object());
+        let error = terminal_error.as_ref().or(not_stored.as_ref());
+        emitter
+            .emit_terminal(terminal_usage.as_ref(), error, &tx)
+            .await?;
+    } else {
+        emitter
+            .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
+            .await?;
+        if let Err(e) = persist.await {
+            debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
+        }
+    }
     Ok(())
 }
 
@@ -1309,6 +1348,7 @@ mod tests {
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
                 Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
                 None,
+                None,
                 tx,
             )
             .await
@@ -1488,6 +1528,7 @@ mod tests {
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
             None,
             tx,
         )
@@ -1792,6 +1833,7 @@ mod tests {
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
             None,
             tx,
         )

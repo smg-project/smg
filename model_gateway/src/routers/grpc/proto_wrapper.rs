@@ -41,6 +41,7 @@ use smg_grpc_client::{
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
 };
 use smg_mm_rdma::RdmaExporter;
+use tokio::time::error::Elapsed;
 
 use crate::{
     routers::grpc::{
@@ -2007,6 +2008,61 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// Stamp a disaggregated request's decode-leg response with the prefill
+    /// leg's prefix-cache hit (see [`PrefillCachedTokens`]). The decode leg
+    /// loads the prefix it was handed and reports it as cached, so its own
+    /// number is the transfer's size, not the request's cache hit; a chunk or
+    /// complete whose sample the prefill leg did not report keeps its own.
+    pub fn restamp_cached_tokens(&mut self, prefill: &PrefillCachedTokens) {
+        match self {
+            Self::Sglang(resp) => match resp.response.as_mut() {
+                Some(sglang::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(sglang::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Vllm(resp) => match resp.response.as_mut() {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(vllm::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Trtllm(resp) => match resp.response.as_mut() {
+                Some(trtllm::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.sequence_index, &mut chunk.cached_tokens);
+                }
+                Some(trtllm::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.sequence_index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Mlx(resp) => match resp.response.as_mut() {
+                Some(mlx::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(mlx::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::TokenSpeed(resp) => match resp.response.as_mut() {
+                Some(tokenspeed::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(tokenspeed::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+        }
+    }
+
     /// Whether this is a `Complete` the engine finished with reason `"error"`.
     pub fn engine_error(&self) -> bool {
         match self {
@@ -2700,6 +2756,66 @@ pub enum ProtoStream {
     /// Any of the above, with the worker it came from: every response is a
     /// sign of life for that worker (see [`crate::worker::liveness`]).
     Tracked(Box<TrackedStream>),
+    /// The decode leg of a disaggregated request: every response restamped
+    /// with the prefill leg's prefix-cache hit (see [`PrefillCachedTokens`]).
+    DecodeLeg(Box<DecodeLegStream>),
+}
+
+/// A disaggregated request's decode leg. Its engine loads the prompt's KV
+/// from the prefill leg and reports what it loaded as cached, so every chunk
+/// and complete it yields is restamped with the prefill leg's prefix-cache
+/// hit before the gateway reads it. Decode legs are not tracked today; if one
+/// ever is, the tracking must sit inside this wrapper, so that a
+/// [`PrefillTicket`] reads the engine's own `cached_tokens`, not the
+/// restamped value.
+pub struct DecodeLegStream {
+    inner: ProtoStream,
+    prefill: PrefillCachedTokens,
+}
+
+/// The prefix-cache hit of a disaggregated request, by sample index, as its
+/// prefill leg reported it on each `Complete`. The prefill leg is the one
+/// that computed the prompt against its prefix cache; the decode leg receives
+/// that prefix over the KV connector and counts it as cached, so read from the
+/// decode leg every request's `cached_tokens` is the transfer (the prompt
+/// less its last token), whatever the cache held. The decode leg's responses
+/// are restamped with these values (see [`ProtoStream::decode_leg`]) so the
+/// client's usage, and everything the gateway derives from it, carries the
+/// request's real cache hit.
+#[derive(Debug, Clone, Default)]
+pub struct PrefillCachedTokens {
+    by_index: HashMap<u32, u32>,
+}
+
+impl PrefillCachedTokens {
+    /// Record a prefill `Complete`'s cache hit under its sample index.
+    pub fn note(&mut self, complete: &ProtoGenerateComplete) {
+        self.by_index
+            .insert(complete.index(), complete.cached_tokens());
+    }
+
+    /// Whether no prefill completion was recorded (a stream another stage
+    /// drained, or a prefill leg that ended without one).
+    pub fn is_empty(&self) -> bool {
+        self.by_index.is_empty()
+    }
+
+    /// The prefill leg's cache hit for sample `index`: the sample's own
+    /// entry, or the one entry of a prefill that completed once for the
+    /// whole request.
+    pub fn for_index(&self, index: u32) -> Option<u32> {
+        match self.by_index.get(&index) {
+            Some(cached) => Some(*cached),
+            None if self.by_index.len() == 1 => self.by_index.values().next().copied(),
+            None => None,
+        }
+    }
+
+    fn restamp(&self, index: u32, cached: &mut u32) {
+        if let Some(value) = self.for_index(index) {
+            *cached = value;
+        }
+    }
 }
 
 /// A [`ProtoStream`] paired with the worker serving it, so each response it
@@ -2712,6 +2828,33 @@ pub struct TrackedStream {
     /// The request's place in the worker's pile; a non-streaming generation
     /// holds none.
     progress: Option<ProgressTicket>,
+    /// A response (or the stream's end) pulled ahead of the stream's reader
+    /// by [`ProtoStream::first_response_within`], handed to the next `next`
+    /// as it was: its bookkeeping ran when it was pulled.
+    replay: Option<Option<Result<ProtoGenerateResponse, tonic::Status>>>,
+}
+
+/// What [`ProtoStream::first_response_within`] found as the stream's first
+/// item, held for the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstItem {
+    /// A response: the leg answered.
+    Response,
+    /// A failure (the engine's own report, or the transport's): the reader
+    /// meets it next and accounts for it.
+    Failure,
+    /// The end: the stream closed with nothing on it.
+    End,
+}
+
+impl FirstItem {
+    fn of(item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) -> Self {
+        match item {
+            Some(Ok(_)) => Self::Response,
+            Some(Err(_)) => Self::Failure,
+            None => Self::End,
+        }
+    }
 }
 
 /// The request's place in its worker's tracked pile (see
@@ -2730,7 +2873,7 @@ impl Drop for ProgressTicket {
 /// backlog (see [`Worker::prefill_backlog`]), released by the first response
 /// (with the prefix-cache hit it reports, so the worker's rate learns the
 /// tokens the engine computed) or, failing that, when the stream is dropped.
-struct PrefillTicket {
+pub(crate) struct PrefillTicket {
     worker: Arc<dyn Worker>,
     tokens: u64,
     /// The first response is the request's first token (a streaming
@@ -2741,6 +2884,28 @@ struct PrefillTicket {
 }
 
 impl PrefillTicket {
+    /// Book `prompt_tokens` as pending prefill on `worker` from this moment,
+    /// timed: the dispatch paths book a leg before its call is polled, so the
+    /// span the worker's rate learns runs from the dispatch to the first
+    /// response whether the servicer sends its headers at once or, as the
+    /// gRPC servicers do, with the first message (a booking at the call's
+    /// return would then time nothing and teach a rate the worker does not
+    /// have, and the legs waiting in dispatch would be missing from the
+    /// backlog). `None` for an empty prompt. The ticket is handed to the leg's
+    /// stream by [`ProtoStream::tracked_prefill_leg_booked`]; dropped before
+    /// that (the call failed or was retired), it releases the prompt untimed.
+    pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Self> {
+        (prompt_tokens > 0).then(|| {
+            worker.note_prefill_started(prompt_tokens, true);
+            Self {
+                worker: Arc::clone(worker),
+                tokens: prompt_tokens,
+                timed: true,
+                released: false,
+            }
+        })
+    }
+
     /// The first response came back, reporting `cached` prompt tokens served
     /// from the engine's prefix cache.
     fn first_response(&mut self, cached: u64) {
@@ -2765,7 +2930,9 @@ impl Drop for PrefillTicket {
 mod tracked_tests {
     use std::sync::Arc;
 
-    use super::{sglang, vllm, FanoutStream, ProtoGenerateResponse, ProtoStream};
+    use super::{
+        sglang, vllm, FanoutStream, FirstItem, PrefillTicket, ProtoGenerateResponse, ProtoStream,
+    };
     use crate::worker::{BasicWorkerBuilder, Worker};
 
     #[test]
@@ -2865,6 +3032,105 @@ mod tracked_tests {
         drop(stream);
         assert_eq!(worker.tracked_load(), 0);
     }
+
+    #[test]
+    fn a_prefill_leg_booked_at_dispatch_is_pending_before_its_stream_exists() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        assert!(
+            PrefillTicket::book(&worker, 0).is_none(),
+            "an empty prompt books nothing"
+        );
+        let ticket = PrefillTicket::book(&worker, 4_096);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "pending from the dispatch, before the call has answered"
+        );
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_leg_booked(Arc::clone(&worker), ticket);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "handed to the stream: booked once, not again"
+        );
+        assert_eq!(worker.tracked_load(), 0, "a leg is never part of a pile");
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+            }
+            _ => panic!("a tracked stream"),
+        }
+        drop(stream);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "released with the stream"
+        );
+    }
+
+    #[test]
+    fn a_leg_booked_at_dispatch_whose_call_fails_releases_its_prompt() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let ticket = PrefillTicket::book(&worker, 1_000);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(100)
+        );
+        drop(ticket);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "a call that fails or is retired gives the prompt back untimed"
+        );
+    }
+
+    #[test]
+    fn a_prefill_leg_books_its_prompt_timed_and_joins_no_pile() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_leg(Arc::clone(&worker), 4_096);
+        assert_eq!(worker.tracked_load(), 0, "a leg is never part of a pile");
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "its prompt is pending prefill on the prefill worker (cold prior)"
+        );
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.progress.is_none());
+                assert!(tracked.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+            }
+            _ => panic!("a tracked stream"),
+        }
+        drop(stream);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "released with the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_response_pulled_ahead_is_replayed_to_the_reader_once() {
+        // An empty fan-out ends at once: the end is what is pulled ahead, and
+        // the reader sees it once more, then the stream as it is.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_leg(Arc::clone(&worker), 16);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(
+            stream.first_response_within(deadline).await.ok(),
+            Some(FirstItem::End),
+            "what was pulled ahead is named: the end, not a response"
+        );
+        assert_eq!(
+            stream.first_response_within(deadline).await.ok(),
+            Some(FirstItem::End),
+            "a second wait does not pull past the held item"
+        );
+        assert!(stream.next().await.is_none(), "the held end is replayed");
+        assert!(stream.next().await.is_none(), "and the stream stays ended");
+    }
 }
 
 /// The message of the `Internal` status a stream ends with when the engine
@@ -2922,14 +3188,115 @@ impl ProtoStream {
             worker,
             prefill,
             progress,
+            replay: None,
+        }))
+    }
+
+    /// Track this stream as the prefill leg of a disaggregated dispatch to
+    /// `worker`: its `prompt_tokens` are pending prefill there until its
+    /// first response, which times the prompt's prefill for the worker's
+    /// rate (the leg's first response is the end of its prefill, on either
+    /// dispatch shape), and every response is progress for the worker. The
+    /// leg joins no pile: the gateway bounds its silence per request (see
+    /// [`crate::worker::liveness::prefill_leg_bound`]) instead of judging the
+    /// worker by legs it cannot see progress on.
+    #[must_use]
+    pub fn tracked_prefill_leg(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {
+        let prefill = PrefillTicket::book(&worker, prompt_tokens);
+        self.tracked_prefill_leg_booked(worker, prefill)
+    }
+
+    /// [`Self::tracked_prefill_leg`] for a leg booked at its dispatch (see
+    /// [`PrefillTicket::book`]): the stream takes over the ticket, so the
+    /// first response ends the span that began before the call was polled.
+    #[must_use]
+    pub(crate) fn tracked_prefill_leg_booked(
+        self,
+        worker: Arc<dyn Worker>,
+        prefill: Option<PrefillTicket>,
+    ) -> Self {
+        Self::Tracked(Box::new(TrackedStream {
+            inner: self,
+            worker,
+            prefill,
+            progress: None,
+            replay: None,
+        }))
+    }
+
+    /// Wait for the stream's first item, a response or its end, until
+    /// `deadline`, and say which it was. Within the deadline the stream is
+    /// left for its reader as if nothing had been read: the item is replayed
+    /// by the next [`Self::next`], its bookkeeping already done. Past the
+    /// deadline the stream has produced nothing, and the caller decides its
+    /// fate. Only a tracked stream can hold an item back, so any other
+    /// returns at once as if a response had come (the dispatch paths wrap a
+    /// leg before they bound it).
+    pub async fn first_response_within(&mut self, deadline: Instant) -> Result<FirstItem, Elapsed> {
+        let Self::Tracked(tracked) = self else {
+            return Ok(FirstItem::Response);
+        };
+        if let Some(held) = &tracked.replay {
+            return Ok(FirstItem::of(held.as_ref()));
+        }
+        let item = tokio::time::timeout_at(deadline.into(), self.next()).await?;
+        let first = FirstItem::of(item.as_ref());
+        if let Self::Tracked(tracked) = self {
+            tracked.replay = Some(item);
+        }
+        Ok(first)
+    }
+
+    /// The worker this stream was dispatched to, when it is tracked.
+    pub fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        match self {
+            Self::Tracked(tracked) => Some(&tracked.worker),
+            Self::DecodeLeg(leg) => leg.inner.worker(),
+            _ => None,
+        }
+    }
+
+    /// This stream as a disaggregated request's decode leg: its responses
+    /// carry `prefill`'s prefix-cache hit instead of their own (see
+    /// [`PrefillCachedTokens`]). A prefill leg that reported nothing leaves
+    /// the stream as it is.
+    #[must_use]
+    pub fn decode_leg(self, prefill: PrefillCachedTokens) -> Self {
+        if prefill.is_empty() {
+            return self;
+        }
+        Self::DecodeLeg(Box::new(DecodeLegStream {
+            inner: self,
+            prefill,
         }))
     }
 
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        if let Self::DecodeLeg(leg) = self {
+            // A decode leg's messages are polled in place as a tracked
+            // stream's are, without a boxed future per message; a wrapper
+            // inside the wrapper recurses. The inner stream did its own
+            // bookkeeping and engine-error mapping; only the prompt-side usage
+            // changes here.
+            let item = if matches!(leg.inner, Self::Tracked(_) | Self::DecodeLeg(_)) {
+                Box::pin(leg.inner.next()).await
+            } else {
+                leg.inner.next_untracked().await
+            };
+            return item.map(|result| {
+                result.map(|mut response| {
+                    response.restamp_cached_tokens(&leg.prefill);
+                    response
+                })
+            });
+        }
         let Self::Tracked(tracked) = self else {
             return self.next_untracked().await;
         };
+        if let Some(item) = tracked.replay.take() {
+            return item;
+        }
         // Every dispatched stream is one tracked layer over a transport
         // stream: its messages are polled in place, without a boxed future
         // per message. A tracked stream inside a tracked stream recurses.
@@ -2986,6 +3353,9 @@ impl ProtoStream {
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
             Self::Tracked(_) => return Box::pin(self.next()).await,
+            // Reached only with one wrapper inside another: [`Self::next`]
+            // polls a decode leg in place.
+            Self::DecodeLeg(_) => return Box::pin(self.next()).await,
         };
         item.map(reject_engine_error)
     }
@@ -3001,6 +3371,7 @@ impl ProtoStream {
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
             Self::Tracked(stream) => stream.inner.mark_completed(),
+            Self::DecodeLeg(leg) => leg.inner.mark_completed(),
         }
     }
 
@@ -3028,12 +3399,21 @@ impl ProtoStream {
                     worker,
                     prefill,
                     progress,
+                    replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
                     inner: inner.defer_abort_until_first_item(),
                     worker,
                     prefill,
                     progress,
+                    replay,
+                }))
+            }
+            Self::DecodeLeg(leg) => {
+                let DecodeLegStream { inner, prefill } = *leg;
+                Self::DecodeLeg(Box::new(DecodeLegStream {
+                    inner: inner.defer_abort_until_first_item(),
+                    prefill,
                 }))
             }
         }
@@ -3054,6 +3434,10 @@ impl FanoutChild for ProtoStream {
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
     }
+
+    fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        ProtoStream::worker(self)
+    }
 }
 
 /// What a fan-out needs from a child stream. Implemented by [`ProtoStream`];
@@ -3070,6 +3454,12 @@ pub trait FanoutChild: Send {
     /// Defer the child's abort-on-drop until its first response.
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
+
+    /// The one worker the child was dispatched to, when it is tracked; a
+    /// fan-out over several workers answers `None`.
+    fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        None
+    }
 }
 
 /// One child per sample of an n>1 fan-out over rendezvous-room PD pairs.

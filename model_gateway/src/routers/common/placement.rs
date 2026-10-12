@@ -51,6 +51,19 @@ pub(crate) struct WireConstraint {
     pub requires_media_refs: bool,
 }
 
+impl WireConstraint {
+    /// Whether `worker` is on `wire`: its runtime and its transport when a
+    /// retry pins one, any worker when none is pinned. The one predicate
+    /// every narrowing to a retained plan's wire goes through, so the legs
+    /// a placement searches and the ones it judges cannot drift apart.
+    pub(crate) fn admits(wire: Option<Self>, worker: &dyn Worker) -> bool {
+        wire.is_none_or(|wire| {
+            worker.metadata().spec.runtime_type == wire.runtime
+                && *worker.connection_mode() == wire.connection
+        })
+    }
+}
+
 /// Whether Prefill admission may drop full workers from the candidate set
 /// before the policy runs. An explicit target under consistent hashing is
 /// exempt: it indexes the unfiltered set and stays strict, so the request
@@ -179,12 +192,9 @@ pub(crate) fn candidates(
     let pool = registry.get_routing_pool(model_id, pool);
     match wire {
         None => Candidates::Shared(pool),
-        Some(wire) => Candidates::Pinned(
+        Some(_) => Candidates::Pinned(
             pool.iter()
-                .filter(|w| {
-                    w.metadata().spec.runtime_type == wire.runtime
-                        && *w.connection_mode() == wire.connection
-                })
+                .filter(|w| WireConstraint::admits(wire, w.as_ref()))
                 .cloned()
                 .collect(),
         ),
@@ -402,8 +412,44 @@ pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
     response
 }
 
+/// The workers of `leg` a placement may use: those on `wire` when a retry
+/// pins one, narrowed to the ones the request's candidate filter admits. A
+/// failed leg's veto fallback and its verdict are judged over these, so a
+/// filter that admits only vetoed workers reads as a vetoed leg (steered,
+/// or shed under `--worker-overload-shed`) and not as an unavailable one
+/// because a worker the request may not use is idle. A narrowing that
+/// admits nothing is left out: a wire no worker of the leg is on keeps the
+/// leg's own verdict as before, judged over every worker and without the
+/// filter (a filter narrowed over workers the retry cannot use would turn
+/// that verdict into a shed over another wire's overloaded workers), and a
+/// filter that admits none of the workers on the wire is the caller's to
+/// name.
+fn admitted_leg(
+    leg: &[Arc<dyn Worker>],
+    wire: Option<WireConstraint>,
+    inputs: &PlacementInputs<'_>,
+) -> Vec<Arc<dyn Worker>> {
+    if wire.is_none() && inputs.candidate_filter.is_none() {
+        return leg.to_vec();
+    }
+    let narrowed = |workers: &[Arc<dyn Worker>], keep: &dyn Fn(&Arc<dyn Worker>) -> bool| {
+        let kept: Vec<Arc<dyn Worker>> = workers.iter().filter(|w| keep(w)).cloned().collect();
+        (!kept.is_empty()).then_some(kept)
+    };
+    let Some(on_wire) = narrowed(leg, &|w| WireConstraint::admits(wire, w.as_ref())) else {
+        return leg.to_vec();
+    };
+    narrowed(&on_wire, &|w| {
+        inputs
+            .candidate_filter
+            .is_none_or(|accepts| accepts(w.as_ref()))
+    })
+    .unwrap_or(on_wire)
+}
+
 /// The steering default for a disaggregated placement whose failed leg is
-/// vetoed on every worker, by the overload thresholds or by the liveness
+/// vetoed on every worker the request may use (`failed_leg`, see
+/// [`admitted_leg`]), by the overload thresholds or by the liveness
 /// tracker: the least-loaded routable prefill that has a routable partner,
 /// paired with its least-loaded routable partner. Pairs vetoed by overload
 /// alone come first; a liveness veto is crossed only when nothing else pairs,
@@ -428,10 +474,7 @@ fn relaxed_pair(
     let eligible = |w: &Arc<dyn Worker>| {
         w.is_healthy()
             && w.circuit_breaker_can_execute()
-            && wire.is_none_or(|wire| {
-                w.metadata().spec.runtime_type == wire.runtime
-                    && *w.connection_mode() == wire.connection
-            })
+            && WireConstraint::admits(wire, w.as_ref())
             && inputs
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
@@ -517,7 +560,7 @@ fn relaxed_pair(
 /// `homogeneous_runtime` narrows both legs to the runtime of the first
 /// prefill worker open under its own runtime, which the gRPC wire needs
 /// because its rendezvous is runtime-specific. A miss names the leg and carries the verdict judged
-/// from that leg's own candidates.
+/// from that leg's candidates the request may use.
 #[expect(
     clippy::too_many_arguments,
     reason = "pair placement threads every routing input plus the admission view"
@@ -534,10 +577,7 @@ pub(crate) fn select_pair(
 ) -> Result<Pair, Box<PairFailure>> {
     let eligible = |w: &Arc<dyn Worker>| {
         w.is_available()
-            && wire.is_none_or(|wire| {
-                w.metadata().spec.runtime_type == wire.runtime
-                    && *w.connection_mode() == wire.connection
-            })
+            && WireConstraint::admits(wire, w.as_ref())
             && inputs
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
@@ -586,6 +626,7 @@ pub(crate) fn select_pair(
         pairs.partners[i].iter().any(|d| partner_open(d, runtime))
     };
     if !pairs.prefill.iter().any(&eligible) {
+        let admitted = admitted_leg(&pairs.prefill, wire, &inputs);
         if let Some(pair) = relaxed_pair(
             registry,
             model_id,
@@ -593,14 +634,14 @@ pub(crate) fn select_pair(
             wire,
             prefill_capacity,
             &inputs,
-            &pairs.prefill,
+            &admitted,
         ) {
             return pair;
         }
         debug!("No available prefill workers");
         return Err(fail(
             WorkerLeg::Prefill,
-            failure_from(&pairs.prefill, model_id, registry.overload_shed_enabled()),
+            failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
     }
     let leg_runtime = homogeneous_runtime
@@ -639,6 +680,7 @@ pub(crate) fn select_pair(
         );
     }
     if open.is_empty() {
+        let admitted = admitted_leg(&pairs.decode_pool, wire, &inputs);
         if let Some(pair) = relaxed_pair(
             registry,
             model_id,
@@ -646,18 +688,14 @@ pub(crate) fn select_pair(
             wire,
             prefill_capacity,
             &inputs,
-            &pairs.decode_pool,
+            &admitted,
         ) {
             return pair;
         }
         debug!(?leg_runtime, "No available PD pair");
         return Err(fail(
             WorkerLeg::Decode,
-            failure_from(
-                &pairs.decode_pool,
-                model_id,
-                registry.overload_shed_enabled(),
-            ),
+            failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
     }
 
@@ -1308,6 +1346,183 @@ mod tests {
             failure_from(&[], MODEL, false),
             PlacementFailure::NoCandidates
         ));
+    }
+
+    /// A caller's filter narrows the veto fallback and the verdict too: a
+    /// decode leg whose only admitted worker is over the thresholds is
+    /// steered to it by default and shed under `--worker-overload-shed`,
+    /// instead of being refused as unavailable because a worker the request
+    /// may not use is idle.
+    #[test]
+    fn a_filtered_decode_leg_is_judged_over_the_workers_the_request_may_use() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let d1 = registry.get_by_url("grpc://d:1").expect("registered");
+        let not_d2 = |w: &dyn Worker| w.url() != "grpc://d:2";
+        let inputs = PlacementInputs {
+            candidate_filter: Some(&not_d2),
+            ..Default::default()
+        };
+        let place = |inputs: PlacementInputs<'_>| {
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs_of(&registry, &policies),
+                None,
+                true,
+                None,
+                inputs,
+            )
+        };
+
+        let pair = place(inputs).expect("the admitted decode worker is open");
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+
+        registry.set_worker_overloaded(&d1, true);
+        let pair = place(inputs).expect("the only admitted decode worker is vetoed: steered");
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+        let pair = place(PlacementInputs::default())
+            .expect("the idle worker takes a request without the filter");
+        assert_eq!(pair.decode.url(), "grpc://d:2");
+
+        registry.set_overload_shed(true);
+        let failure = place(inputs)
+            .err()
+            .expect("under shedding the admitted leg is all-overloaded");
+        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::AllOverloaded(_)),
+            "{:?}",
+            failure.verdict
+        );
+        let pair = place(PlacementInputs::default())
+            .expect("the idle worker still takes a request without the filter");
+        assert_eq!(pair.decode.url(), "grpc://d:2");
+    }
+
+    /// The prefill leg's mirror of the case above.
+    #[test]
+    fn a_filtered_prefill_leg_is_judged_over_the_workers_the_request_may_use() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let p1 = registry.get_by_url("grpc://p:1").expect("registered");
+        let not_p2 = |w: &dyn Worker| w.url() != "grpc://p:2";
+        let inputs = PlacementInputs {
+            candidate_filter: Some(&not_p2),
+            ..Default::default()
+        };
+        let place = |inputs: PlacementInputs<'_>| {
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs_of(&registry, &policies),
+                None,
+                true,
+                None,
+                inputs,
+            )
+        };
+
+        registry.set_worker_overloaded(&p1, true);
+        let pair = place(inputs).expect("the only admitted prefill worker is vetoed: steered");
+        assert_eq!(pair.prefill.url(), "grpc://p:1");
+        let pair = place(PlacementInputs::default())
+            .expect("the idle prefill worker takes a request without the filter");
+        assert_eq!(pair.prefill.url(), "grpc://p:2");
+
+        registry.set_overload_shed(true);
+        let failure = place(inputs)
+            .err()
+            .expect("under shedding the admitted leg is all-overloaded");
+        assert_eq!(failure.leg, WorkerLeg::Prefill);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::AllOverloaded(_)),
+            "{:?}",
+            failure.verdict
+        );
+    }
+
+    /// A retry whose pinned wire no prefill worker is on keeps the leg's own
+    /// verdict (unavailable: nothing the retry can use), whatever the filter
+    /// would keep of the other wire's workers: an overloaded worker the retry
+    /// cannot use is no reason to shed.
+    #[test]
+    fn a_leg_with_no_worker_on_the_pinned_wire_keeps_its_verdict_under_a_filter() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let p1 = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&p1, true);
+        registry.set_overload_shed(true);
+        // The retry's plan was built for a runtime none of the workers run.
+        let other_wire = Some(WireConstraint {
+            runtime: RuntimeType::Sglang,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+        });
+        let only_p1 = |w: &dyn Worker| w.url() == "grpc://p:1";
+        let failure = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs_of(&registry, &policies),
+            other_wire,
+            true,
+            None,
+            PlacementInputs {
+                candidate_filter: Some(&only_p1),
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("no worker on the wire: the pair fails");
+        assert_eq!(failure.leg, WorkerLeg::Prefill);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::Unavailable),
+            "the verdict is the leg's own, not a shed over the other wire's overloaded worker: {:?}",
+            failure.verdict
+        );
+    }
+
+    /// The single-worker placement already judges its fallback over the
+    /// candidates the filter admits: the only admitted worker, vetoed, is
+    /// taken by default.
+    #[test]
+    fn a_filtered_single_placement_steers_to_its_only_admitted_worker() {
+        let registry = registry_with(&[
+            ("http://h:1", ConnectionMode::Http, RuntimeType::Sglang),
+            ("http://h:2", ConnectionMode::Http, RuntimeType::Sglang),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let h1 = registry.get_by_url("http://h:1").expect("registered");
+        registry.set_worker_overloaded(&h1, true);
+        let only_h1 = |w: &dyn Worker| w.url() == "http://h:1";
+        let selected = select_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                candidate_filter: Some(&only_h1),
+                ..Default::default()
+            },
+        )
+        .expect("steered to the admitted worker");
+        assert_eq!(selected.url(), "http://h:1");
     }
 
     #[test]

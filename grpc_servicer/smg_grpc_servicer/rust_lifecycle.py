@@ -10,8 +10,12 @@ engine it supervises.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import dataclasses
+import faulthandler
 import glob
 import logging
+import math
 import multiprocessing
 import os
 import signal
@@ -19,7 +23,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -102,9 +106,66 @@ def resolve_tokenizer_dir(tokenizer: str, revision: str | None = None) -> str | 
     return None
 
 
-def env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    return float(value) if value else default
+SOCKET_DIR_ENV = "SMG_ZMQ_SOCKET_DIR"
+# The exit code of a servicer that refuses to start over a knob it cannot use
+# (argparse's convention for a usage error); an engine that died is 1.
+CONFIG_ERROR_EXIT_CODE = 2
+
+
+class ServicerConfigError(ValueError):
+    """A knob of the servicer (an environment variable, or the flag that
+    stands for one) holds a value the servicer cannot use. The message names
+    the variable and the value, so an operator can act on it without a
+    traceback; the entry points answer it with :data:`CONFIG_ERROR_EXIT_CODE`
+    (:func:`configuration_exit`)."""
+
+
+def env_float(
+    name: str,
+    default: float,
+    *,
+    environ: Mapping[str, str] | None = None,
+    minimum: float | None = None,
+    positive: bool = False,
+) -> float:
+    """``float(environ[name])``, ``default`` when the variable is unset or
+    empty. A value that is not a finite number, below ``minimum``, or not
+    above zero under ``positive`` is a :class:`ServicerConfigError` naming the
+    variable."""
+    source = os.environ if environ is None else environ
+    raw = source.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ServicerConfigError(f"{name}={raw!r} is not a number") from None
+    if math.isnan(value) or math.isinf(value):
+        raise ServicerConfigError(f"{name}={raw!r} is not a finite number")
+    if positive and value <= 0:
+        raise ServicerConfigError(f"{name}={raw!r} must be greater than 0")
+    if minimum is not None and value < minimum:
+        raise ServicerConfigError(f"{name}={raw!r} must be at least {minimum:g}")
+    return value
+
+
+def env_port(name: str, *, environ: Mapping[str, str] | None = None) -> int | None:
+    """A TCP port from ``environ[name]``, 1 to 65535; ``None`` when the
+    variable is unset, empty or 0 (the caller picks a free port). Anything
+    else is a :class:`ServicerConfigError` naming the variable."""
+    source = os.environ if environ is None else environ
+    raw = source.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ServicerConfigError(f"{name}={raw!r} is not a port number") from None
+    if value == 0:
+        return None
+    if not 1 <= value <= 65535:
+        raise ServicerConfigError(f"{name}={raw!r} must be between 1 and 65535")
+    return value
 
 
 def free_port() -> int:
@@ -113,8 +174,130 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def default_socket_dir() -> str:
-    return os.environ.get("SMG_ZMQ_SOCKET_DIR") or f"/tmp/smg-zmq-{os.getuid()}"
+def default_socket_dir(environ: Mapping[str, str] | None = None) -> str:
+    source = os.environ if environ is None else environ
+    return source.get(SOCKET_DIR_ENV) or f"/tmp/smg-zmq-{os.getuid()}"
+
+
+def prepare_socket_dir(path: str) -> str:
+    """``path`` as the servicer's IPC socket directory, created (mode 0700)
+    when it is missing. A path that exists and is not a directory, or that
+    cannot be created, is a :class:`ServicerConfigError` naming
+    ``SMG_ZMQ_SOCKET_DIR``: found before the gRPC port is bound, not by the
+    engine's first connection."""
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except FileExistsError:
+        raise ServicerConfigError(
+            f"{SOCKET_DIR_ENV}={path!r} exists and is not a directory"
+        ) from None
+    except OSError as error:
+        raise ServicerConfigError(
+            f"{SOCKET_DIR_ENV}={path!r} cannot be created: {error.strerror or error}"
+        ) from None
+    return path
+
+
+@dataclasses.dataclass(frozen=True)
+class LauncherKnobs:
+    """The launcher's own knobs, read and validated together
+    (:func:`read_launcher_knobs`) before any engine work and before the Rust
+    server binds its port."""
+
+    handshake_port: int | None
+    drain_secs: float
+    startup_timeout_secs: float
+    startup_ceiling_secs: float
+    socket_dir: str
+
+
+def read_launcher_knobs(
+    *,
+    handshake_port_env: str,
+    drain_secs_env: str,
+    startup_timeout_secs_env: str,
+    startup_ceiling_secs_env: str,
+    socket_dir: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> LauncherKnobs:
+    """Every knob of a Rust-servicer launcher at once, each failure a
+    :class:`ServicerConfigError` naming its variable: the handshake port (1 to
+    65535, or a free one), the drain on a signal (0 s or more), the startup
+    silence bound (above 0 s), the startup ceiling (0 lifts it), the IPC socket
+    directory (``socket_dir``, else ``$SMG_ZMQ_SOCKET_DIR``, else the
+    default; created). Nothing is read later: a bad value is refused before
+    the gRPC port is bound and before the engine starts."""
+    return LauncherKnobs(
+        handshake_port=env_port(handshake_port_env, environ=environ),
+        drain_secs=env_float(drain_secs_env, DEFAULT_DRAIN_SECS, environ=environ, minimum=0.0),
+        startup_timeout_secs=env_float(
+            startup_timeout_secs_env,
+            DEFAULT_STARTUP_TIMEOUT_SECS,
+            environ=environ,
+            positive=True,
+        ),
+        startup_ceiling_secs=env_float(
+            startup_ceiling_secs_env, DEFAULT_STARTUP_CEILING_SECS, environ=environ, minimum=0.0
+        ),
+        socket_dir=prepare_socket_dir(
+            default_socket_dir(environ) if socket_dir is None else socket_dir
+        ),
+    )
+
+
+def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger) -> SystemExit:
+    """The ``SystemExit`` an entry point raises for a configuration error: one
+    ERROR line naming the knob and exit code :data:`CONFIG_ERROR_EXIT_CODE`,
+    no traceback."""
+    log.error("servicer configuration error: %s", error)
+    return SystemExit(CONFIG_ERROR_EXIT_CODE)
+
+
+# How long a servicer that decided to exit over its engine may spend in the
+# interpreter's shutdown before the process is ended anyway.
+EXIT_GRACE_SECS = 15.0
+
+
+def _end_process(code: int, grace_secs: float) -> None:
+    """The guard fired: say so, record where every thread stands (the cause
+    of the hang, for the next reader of the log), terminate the children the
+    interpreter's own exit would have joined, then end the process. Every
+    step before the exit is best effort: the exit is the last resort and
+    happens whatever the others could do (a dump to a closed stderr raises)."""
+    try:
+        logger.error(
+            "The servicer's shutdown did not finish within %.0f s; ending the process with code %d",
+            grace_secs,
+            code,
+        )
+        for handler in logging.getLogger().handlers:
+            with contextlib.suppress(Exception):
+                handler.flush()
+        with contextlib.suppress(Exception):
+            faulthandler.dump_traceback(all_threads=True)
+        for child in multiprocessing.active_children():
+            with contextlib.suppress(Exception):
+                child.terminate()
+    except BaseException:  # noqa: BLE001 -- nothing may stand between the guard and the exit
+        pass
+    finally:
+        os._exit(code)
+
+
+def guarded_exit(code: int, *, grace_secs: float = EXIT_GRACE_SECS) -> SystemExit:
+    """The ``SystemExit`` a Python servicer raises to end over its engine
+    (the engine died, or never started), with a guard: the orderly exit runs
+    first (the drain, the launcher's own clean-up, the interpreter's
+    shutdown), and should that hang (a thread that never joins, a messaging
+    context waiting on an unclosed socket: a servicer was seen stuck there
+    for minutes with its engine already gone), a daemon timer ends the
+    process with ``code`` after ``grace_secs``. Arm it the moment the exit is
+    decided, ahead of the shutdown steps, with a grace that covers the
+    bounded ones."""
+    timer = threading.Timer(grace_secs, _end_process, args=(code, grace_secs))
+    timer.daemon = True
+    timer.start()
+    return SystemExit(code)
 
 
 class EngineProcess:

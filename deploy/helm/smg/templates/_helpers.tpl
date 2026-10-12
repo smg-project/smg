@@ -178,6 +178,8 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
+- "--shutdown-grace-period-secs"
+- {{ .Values.router.shutdownGracePeriodSeconds | quote }}
 - "--max-concurrent-requests"
 - {{ .Values.router.maxConcurrentRequests | quote }}
 - "--queue-size"

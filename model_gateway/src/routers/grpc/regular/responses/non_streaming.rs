@@ -34,7 +34,7 @@ use crate::{
         error,
         grpc::common::responses::{
             collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
-            ResponsesContext,
+            NotStored, ResponsesContext,
         },
     },
 };
@@ -51,8 +51,10 @@ pub(super) async fn route_responses_internal(
     request: Arc<ResponsesRequest>,
     params: ResponsesCallContext,
 ) -> Result<ResponsesResponse, Response> {
-    // 1. Load conversation history and build modified request
-    let modified_request = load_conversation_history(ctx, &request).await?;
+    // 1. Load conversation history (as the caller's tenant may see it) and
+    //    build modified request
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let modified_request = load_conversation_history(ctx, &request, tenant.as_deref()).await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -72,16 +74,19 @@ pub(super) async fn route_responses_internal(
         execute_without_mcp(ctx, &modified_request, &request, params).await?
     };
 
-    // 5. Persist response to storage if store=true
+    // 5. Persist response to storage if store=true; a foreground response the
+    // client expects stored is answered as stored or not at all.
     persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
         &responses_response,
         &request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
     )
-    .await;
+    .await
+    .map_err(NotStored::into_response)?;
 
     Ok(responses_response)
 }

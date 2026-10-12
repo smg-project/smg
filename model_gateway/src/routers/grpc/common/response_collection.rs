@@ -12,8 +12,12 @@ use crate::{
         error,
         grpc::{
             context::ExecutionResult,
-            proto_wrapper::{FanoutChild, ProtoGenerateComplete, ProtoResponseVariant},
-            utils::{account_pd_leg_failure, tonic_ext::TonicStatusExt},
+            proto_wrapper::{
+                FanoutChild, PrefillCachedTokens, ProtoGenerateComplete, ProtoResponseVariant,
+            },
+            utils::{
+                account_pd_leg_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
+            },
         },
     },
     worker::PrefillLoadGuard,
@@ -24,14 +28,19 @@ use crate::{
 /// Keep the streams' abort-on-drop armed until Decode succeeds, as before.
 /// Collectors continue to EOF to preserve their metadata collection behavior;
 /// streaming handlers can stop once all dispatched Prefill samples complete.
+/// Returns the prefix-cache hit each completed sample reported: the client's
+/// prompt-side usage, which the decode leg's responses are restamped with
+/// (`ProtoStream::decode_leg`); empty for a stream the execution stage
+/// drained itself.
 pub(crate) async fn drain_prefill<S: FanoutChild>(
     stream: &mut S,
     mut guards: Vec<Option<PrefillLoadGuard>>,
     finish_at_complete: bool,
     mut on_complete: impl FnMut(ProtoGenerateComplete) + Send,
-) -> Result<(), tonic::Status> {
+) -> Result<PrefillCachedTokens, tonic::Status> {
     let mut remaining = guards.len();
     let single_dispatch = remaining == 1;
+    let mut cached_tokens = PrefillCachedTokens::default();
     while let Some(response) = stream.next_item().await {
         // A prefill leg the engine retires with its rendezvous verdict is
         // counted under the rendezvous family before the failure propagates.
@@ -53,13 +62,14 @@ pub(crate) async fn drain_prefill<S: FanoutChild>(
                     }
                 }
             }
+            cached_tokens.note(&complete);
             on_complete(complete);
             if finish_at_complete && remaining == 0 {
                 break;
             }
         }
     }
-    Ok(())
+    Ok(cached_tokens)
 }
 
 /// Collect and merge responses from execution result
@@ -91,19 +101,33 @@ pub(crate) async fn collect_responses(
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
             let mut prefill_responses = Vec::new();
-            drain_prefill(&mut prefill, prefill_guards, false, |complete| {
-                prefill_responses.push(complete);
-            })
-            .await
-            .map_err(|e| {
-                e.to_http_error(
-                    "worker_stream_failed",
-                    format!("Prefill stream failed: {}", e.message()),
-                )
-            })?;
+            // The leg's worker, when its stream is tracked (the parallel
+            // dispatch books the leg on it and leaves the leg's breaker
+            // sample to its reader): a failure met here is the worker's,
+            // sampled on its breaker and counted once, as a streamed
+            // answer's reader does it.
+            let prefill_worker = prefill.worker().cloned();
+            let prefill_cached_tokens =
+                drain_prefill(&mut prefill, prefill_guards, false, |complete| {
+                    prefill_responses.push(complete);
+                })
+                .await
+                .map_err(|e| {
+                    if let Some(worker) = &prefill_worker {
+                        if let Some(sample) = UpstreamClass::of(&e).breaker_sample {
+                            worker.record_outcome(sample);
+                        }
+                        UpstreamClass::account_collected_failure(worker.as_ref(), &e);
+                    }
+                    e.to_http_error(
+                        "worker_stream_failed",
+                        format!("Prefill stream failed: {}", e.message()),
+                    )
+                })?;
 
-            // Collect decode for actual output (don't mark completed yet)
-            let mut decode_stream = *decode;
+            // Collect decode for actual output (don't mark completed yet); the
+            // client's prompt-side usage is the prefill leg's.
+            let mut decode_stream = (*decode).decode_leg(prefill_cached_tokens);
             let mut decode_responses = collect_stream_responses(
                 &mut decode_stream,
                 "Decode",
@@ -203,6 +227,12 @@ async fn collect_stream_responses<S: FanoutChild>(
                     account_pd_leg_failure(leg, &e);
                 }
                 trace_error!(function = "collect_stream_responses", worker = %worker_name, grpc_code = ?e.code(), error = ?e, "Worker stream error");
+                // The worker's failure counts against it as a streamed
+                // answer's does; the client's status and the router-error
+                // family are the pipeline's.
+                if let Some(worker) = stream.worker() {
+                    UpstreamClass::account_collected_failure(worker.as_ref(), &e);
+                }
                 // Don't mark as completed - let Drop send abort for error cases
                 return Err(e.to_http_error(
                     "worker_stream_failed",
@@ -217,10 +247,16 @@ async fn collect_stream_responses<S: FanoutChild>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use super::*;
-    use crate::routers::grpc::proto_wrapper::ProtoGenerateResponse;
+    use crate::{
+        routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+        worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType},
+    };
 
     /// A stream that is already at EOF, as sequential PD hands to the
     /// streaming layer after draining prefill in the execution stage.
@@ -328,6 +364,57 @@ mod tests {
                 && counted[0].ends_with(" 1"),
             "{rendered}"
         );
+    }
+
+    /// A leg's stream failure read into a non-streamed answer is counted
+    /// under the leg's own labels, and only when it is the worker's failure.
+    #[test]
+    fn a_collected_leg_failure_counts_against_the_legs_worker_when_it_is_the_workers_failure() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-under-test:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            UpstreamClass::account_collected_failure(
+                decode.as_ref(),
+                &tonic::Status::internal(ENGINE_ERROR_MESSAGE),
+            );
+            UpstreamClass::account_collected_failure(
+                decode.as_ref(),
+                &tonic::Status::unavailable("gone"),
+            );
+            // Capacity pushback and the request's own fault are not the worker's.
+            UpstreamClass::account_collected_failure(
+                decode.as_ref(),
+                &tonic::Status::resource_exhausted("full"),
+            );
+            UpstreamClass::account_collected_failure(
+                decode.as_ref(),
+                &tonic::Status::invalid_argument("bad"),
+            );
+        }
+        let rendered = handle.render();
+        let decode_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("smg_worker_errors_total{")
+                    && line.contains(r#"worker_type="decode""#)
+                    && line.contains(r#"connection_mode="grpc""#)
+            })
+            .collect();
+        assert_eq!(decode_lines.len(), 2, "{rendered}");
+        for (error_type, count) in [("engine_error", " 1"), ("backend_error", " 1")] {
+            let line = decode_lines
+                .iter()
+                .find(|line| line.contains(&format!(r#"error_type="{error_type}""#)))
+                .unwrap_or_else(|| panic!("{error_type} is counted:\n{rendered}"));
+            assert!(line.ends_with(count), "{line}");
+        }
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::{ContentPart, ResponseFormat},
+    common::{invalid, ContentPart, ResponseFormat},
 };
 
 pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
@@ -123,12 +123,6 @@ fn validate_tool_message_pairing(
         Some(at) => Err(unanswered(at, &order, &pending)),
         None => Ok(()),
     }
-}
-
-fn invalid(code: &'static str, message: String) -> validator::ValidationError {
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    e
 }
 
 /// `response_format: {"type": "json_object"}` needs the word "json" somewhere

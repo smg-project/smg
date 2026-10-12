@@ -43,7 +43,10 @@ impl MmProcessing {
 /// Why a request cannot be forwarded as media references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MmRefsError {
-    /// A part carries per-item processing hints the worker cannot honor.
+    /// A part carries per-item processing hints (the long-side cap, the
+    /// sampling rate) no worker honors, and the router cannot apply them
+    /// itself: it has no spec for the model, or the request carries a
+    /// modality only the worker processes (audio).
     HintUnsupported,
     /// The model's placeholder anchor is not one the worker can expand.
     ModelNotOptedIn(Modality),
@@ -88,7 +91,9 @@ impl std::fmt::Display for MmRefsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HintUnsupported => f.write_str(
-                "per-item media hints (max_long_side_pixel, fps) cannot be forwarded to a worker",
+                "per-item media hints (max_long_side_pixel, fps) cannot be forwarded to a worker, \
+                 and the router cannot apply them itself: it has no media spec for this model, \
+                 or an item is of a modality only the worker processes",
             ),
             Self::ModelNotOptedIn(modality) => write!(
                 f,
@@ -173,6 +178,19 @@ fn ensure_worker_expandable(
     Ok(())
 }
 
+/// Whether the router's own pipeline can serve `plan` for a vLLM worker: it has
+/// a spec for the model, and every modality is one it preprocesses for that
+/// runtime (audio is the worker's own processor's alone). Checked before the
+/// hint fallback, so a request the pipeline would refuse at worker selection
+/// keeps the cheap refusal instead of a fetch and a decode first.
+fn router_serves(plan: &MediaPlan, placeholders: &PlaceholderTokens) -> bool {
+    !placeholders.is_worker_only()
+        && plan
+            .modalities()
+            .iter()
+            .all(|&modality| runtime_supports_modality(RuntimeType::Vllm, modality))
+}
+
 /// Decide where this request's media is processed. Runs in preparation, before
 /// worker selection, so `auto` consults every registered worker of the model.
 pub(crate) fn resolve_mm_processing(
@@ -184,13 +202,18 @@ pub(crate) fn resolve_mm_processing(
 ) -> Result<MmProcessing, MmRefsError> {
     let (resolved, reason) = match components.processing {
         MmProcessingMode::Router => (MmProcessing::Router, "config"),
-        MmProcessingMode::Worker => {
-            if let Some(blocker) = refs_blocker(plan) {
-                return Err(blocker);
+        MmProcessingMode::Worker => match plan_carries_hints(plan)? {
+            // The hints are knobs of the router's own pipeline (the long-side
+            // cap, the sampling rate): a hinted request that pipeline can serve
+            // is preprocessed here, as under `auto`; every other request keeps
+            // forwarding references.
+            true if router_serves(plan, placeholders) => (MmProcessing::Router, "hint_fallback"),
+            true => return Err(MmRefsError::HintUnsupported),
+            false => {
+                ensure_worker_expandable(plan, placeholders)?;
+                (MmProcessing::Worker, "config")
             }
-            ensure_worker_expandable(plan, placeholders)?;
-            (MmProcessing::Worker, "config")
-        }
+        },
         MmProcessingMode::Auto => {
             if !plan.is_forwardable() {
                 (MmProcessing::Router, "plan_not_forwardable")
@@ -350,11 +373,19 @@ fn forwardable_ref(
     }
 }
 
-/// The first reason this plan cannot be forwarded, if any.
-pub(crate) fn refs_blocker(plan: &MediaPlan) -> Option<MmRefsError> {
-    plan.parts()
-        .iter()
-        .find_map(|part| forwardable_ref(part).err())
+/// Whether this plan is forwardable apart from per-item hints: `Ok(true)` when
+/// a part carries one, `Ok(false)` when none does; a part with no reference
+/// form at all is the error, whatever its position.
+fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
+    let mut hinted = false;
+    for part in plan.parts() {
+        match forwardable_ref(part) {
+            Ok(_) => {}
+            Err(MmRefsError::HintUnsupported) => hinted = true,
+            Err(blocker) => return Err(blocker),
+        }
+    }
+    Ok(hinted)
 }
 
 /// Build the wire payload from the plan, in authored (prompt) order.
@@ -696,22 +727,6 @@ mod tests {
         .expect_err("unopted model is refused");
         assert_eq!(err.code(), "multimodal_worker_processing_unsupported_model");
 
-        let hinted = plan(vec![MediaContentPart::VideoUrl {
-            url: "https://a/c.mp4".to_string(),
-            uuid: None,
-            fps: Some(2.0),
-            max_long_side_pixel: None,
-        }]);
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &hinted,
-            &expandable_placeholders(),
-        )
-        .expect_err("hints are refused");
-        assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
-
         let inline = plan(vec![MediaContentPart::ImageData {
             data: vec![0, 1, 2],
             mime_type: None,
@@ -727,6 +742,162 @@ mod tests {
         )
         .expect_err("inline bytes are refused by name");
         assert_eq!(err, MmRefsError::UnsupportedPart("inline image bytes"));
+    }
+
+    fn hinted_image(url: &str, max_long_side_pixel: u32) -> MediaContentPart {
+        MediaContentPart::ImageUrl {
+            url: url.to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: Some(max_long_side_pixel),
+        }
+    }
+
+    fn hinted_video(
+        url: &str,
+        fps: Option<f64>,
+        max_long_side_pixel: Option<u32>,
+    ) -> MediaContentPart {
+        MediaContentPart::VideoUrl {
+            url: url.to_string(),
+            uuid: None,
+            fps,
+            max_long_side_pixel,
+        }
+    }
+
+    #[test]
+    fn worker_mode_preprocesses_hinted_items_itself() {
+        let components = components(MmProcessingMode::Worker);
+        let registry = registry_with(vec![capable("grpc://127.0.0.1:9700")]);
+        let placeholders = expandable_placeholders();
+
+        // The hints are the router pipeline's knobs: a request carrying one
+        // is preprocessed here, whichever item carries it.
+        for (name, hinted) in [
+            (
+                "image long side",
+                plan(vec![hinted_image("https://a/1.png", 504)]),
+            ),
+            (
+                "video fps",
+                plan(vec![hinted_video("https://a/c.mp4", Some(1.0), None)]),
+            ),
+            (
+                "video long side",
+                plan(vec![hinted_video("https://a/c.mp4", None, Some(504))]),
+            ),
+            (
+                "one hinted item among plain ones",
+                plan(vec![
+                    image_url("https://a/1.png"),
+                    hinted_video("https://a/c.mp4", Some(2.0), None),
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                resolve_mm_processing(&components, &registry, MODEL, &hinted, &placeholders)
+                    .unwrap_or_else(|err| panic!("{name}: {err}")),
+                MmProcessing::Router,
+                "{name}"
+            );
+        }
+
+        // Plain items still forward.
+        assert_eq!(
+            resolve_mm_processing(
+                &components,
+                &registry,
+                MODEL,
+                &plan(vec![image_url("https://a/1.png")]),
+                &placeholders
+            )
+            .expect("plain items forward"),
+            MmProcessing::Worker
+        );
+
+        // The router expands the placeholders itself, so the model's worker
+        // expansion is not consulted for a hinted request.
+        let mut unopted = PlaceholderTokens::default();
+        unopted.insert(Modality::Image, "<|image|>".to_string());
+        assert_eq!(
+            resolve_mm_processing(
+                &components,
+                &registry,
+                MODEL,
+                &plan(vec![hinted_image("https://a/1.png", 252)]),
+                &unopted
+            )
+            .expect("the router processes it"),
+            MmProcessing::Router
+        );
+
+        // A part with no reference form is still refused by name, before or
+        // after the hinted one.
+        let inline = MediaContentPart::ImageData {
+            data: vec![0, 1, 2],
+            mime_type: None,
+            uuid: None,
+            detail: None,
+        };
+        for parts in [
+            vec![hinted_image("https://a/1.png", 504), inline.clone()],
+            vec![inline.clone(), hinted_image("https://a/1.png", 504)],
+        ] {
+            assert_eq!(
+                resolve_mm_processing(&components, &registry, MODEL, &plan(parts), &placeholders)
+                    .expect_err("inline bytes are refused"),
+                MmRefsError::UnsupportedPart("inline image bytes")
+            );
+        }
+
+        // Without a spec the router cannot apply the hints: the request is
+        // refused for the hint, not for the missing spec.
+        let err = resolve_mm_processing(
+            &components,
+            &registry,
+            MODEL,
+            &plan(vec![hinted_image("https://a/1.png", 504)]),
+            &PlaceholderTokens::worker_only(),
+        )
+        .expect_err("no pipeline applies the hint");
+        assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
+        assert!(
+            err.to_string().contains("cannot apply them itself"),
+            "{err}"
+        );
+
+        // Audio is the worker's alone on this runtime: a hinted request that
+        // also carries it keeps the cheap refusal instead of a fetch and a
+        // decode that worker selection would refuse, while the same audio
+        // without a hint still forwards.
+        let audio = MediaContentPart::AudioUrl {
+            url: "https://a/x.wav".to_string(),
+            uuid: None,
+        };
+        let mut with_audio = expandable_placeholders();
+        with_audio.insert(Modality::Audio, "<|audio_pad|>".to_string());
+        with_audio.set_worker_expandable(Modality::Audio, true);
+        let err = resolve_mm_processing(
+            &components,
+            &registry,
+            MODEL,
+            &plan(vec![hinted_image("https://a/1.png", 504), audio.clone()]),
+            &with_audio,
+        )
+        .expect_err("the router cannot serve audio to this worker");
+        assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
+        assert_eq!(
+            resolve_mm_processing(
+                &components,
+                &registry,
+                MODEL,
+                &plan(vec![audio]),
+                &with_audio
+            )
+            .expect("plain audio forwards"),
+            MmProcessing::Worker
+        );
     }
 
     #[test]

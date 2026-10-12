@@ -1108,10 +1108,13 @@ impl StreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
-        // logprobs, but the Prefill reservation must end with this phase.
-        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-            .await
-            .map_err(utils::StreamFailure::prefill)?;
+        // logprobs, but the Prefill reservation must end with this phase, and
+        // the client's prompt-side usage is the prefill leg's.
+        let prefill_cached_tokens =
+            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+                .await
+                .map_err(utils::StreamFailure::prefill)?;
+        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
         // so the first decode token yields honest PD TTFT.
@@ -1415,16 +1418,19 @@ impl StreamingProcessor {
         } else {
             None
         };
-        drain_prefill(&mut prefill_stream, prefill_guards, true, |complete| {
-            if ctx.return_logprob && input_token_logprobs.is_none() {
-                input_token_logprobs = complete
-                    .input_logprobs()
-                    .as_ref()
-                    .map(utils::convert_generate_input_logprobs);
-            }
-        })
-        .await
-        .map_err(utils::StreamFailure::prefill)?;
+        let prefill_cached_tokens =
+            drain_prefill(&mut prefill_stream, prefill_guards, true, |complete| {
+                if ctx.return_logprob && input_token_logprobs.is_none() {
+                    input_token_logprobs = complete
+                        .input_logprobs()
+                        .as_ref()
+                        .map(utils::convert_generate_input_logprobs);
+                }
+            })
+            .await
+            .map_err(utils::StreamFailure::prefill)?;
+        // The client's prompt-side usage is the prefill leg's.
+        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
 
         // Process decode stream with input_logprobs prepended. Pass pd_timing so
         // the first decode token yields honest PD TTFT.
@@ -3125,10 +3131,13 @@ impl StreamingProcessor {
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        // Consume prefill stream (Messages API does not expose prompt logprobs)
-        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-            .await
-            .map_err(utils::StreamFailure::prefill)?;
+        // Consume prefill stream (Messages API does not expose prompt logprobs);
+        // the client's prompt-side usage is the prefill leg's.
+        let prefill_cached_tokens =
+            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+                .await
+                .map_err(utils::StreamFailure::prefill)?;
+        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
 
         let result = self
             .process_messages_streaming_chunks(
@@ -3788,9 +3797,12 @@ impl StreamingProcessor {
         tx: &SseSender,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
-        drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-            .await
-            .map_err(utils::StreamFailure::prefill)?;
+        // The client's prompt-side usage is the prefill leg's.
+        let prefill_cached_tokens =
+            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+                .await
+                .map_err(utils::StreamFailure::prefill)?;
+        let decode_stream = decode_stream.decode_leg(prefill_cached_tokens);
 
         let result = self
             .process_completion_streaming_chunks(
@@ -4050,9 +4062,11 @@ fn assistant_choice(
 }
 
 #[cfg(test)]
-mod eof_tests;
+pub(crate) mod eof_tests;
 #[cfg(test)]
 mod failure_tests;
+#[cfg(test)]
+mod pd_usage_tests;
 
 #[cfg(test)]
 mod sse_bytes_tests;

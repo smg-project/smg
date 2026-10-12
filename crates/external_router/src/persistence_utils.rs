@@ -340,6 +340,7 @@ fn item_to_new_conversation_item(
     item_value: &Value,
     response_id: Option<String>,
     _is_input: bool,
+    tenant: Option<&str>,
 ) -> NewConversationItem {
     let item_type = item_value
         .get("type")
@@ -381,16 +382,19 @@ fn item_to_new_conversation_item(
             .get("status")
             .and_then(|v| v.as_str())
             .map(String::from),
+        tenant: tenant.map(str::to_string),
     }
 }
 
-/// Link all input and output items to a conversation
+/// Link all input and output items to a conversation; the items carry the
+/// caller's `tenant`.
 async fn link_items_to_conversation(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &ConversationId,
     input_items: &[Value],
     output_items: &[Value],
     response_id: &str,
+    tenant: Option<&str>,
 ) -> Result<(), String> {
     let response_id_opt = Some(response_id.to_string());
     // The inputs, then the outputs, each stamped later than the one before: the conversation
@@ -398,7 +402,7 @@ async fn link_items_to_conversation(
     let mut stamps = AddedAtSequence::new();
 
     for item in input_items {
-        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), true);
+        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), true, tenant);
         create_and_link_item(
             item_storage,
             Some(conv_id),
@@ -409,7 +413,7 @@ async fn link_items_to_conversation(
     }
 
     for item in output_items {
-        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), false);
+        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), false, tenant);
         create_and_link_item(
             item_storage,
             Some(conv_id),
@@ -435,6 +439,7 @@ pub async fn persist_conversation_items(
     response_storage: Arc<dyn ResponseStorage>,
     response_json: &Value,
     original_body: &ResponsesRequest,
+    tenant: Option<&str>,
     request_context: Option<StorageRequestContext>,
 ) -> Result<(), PersistError> {
     let inner = persist_conversation_items_inner(
@@ -443,6 +448,7 @@ pub async fn persist_conversation_items(
         response_storage,
         response_json,
         original_body,
+        tenant,
     );
     match request_context {
         Some(ctx) => with_request_context(ctx, inner).await,
@@ -496,12 +502,16 @@ impl std::fmt::Display for PersistError {
 
 impl std::error::Error for PersistError {}
 
+/// `tenant` is the caller's tenant: the stored response is scoped to it, and
+/// the response's items are linked into the request's conversation only when
+/// that conversation is visible to it.
 async fn persist_conversation_items_inner(
     conversation_storage: Arc<dyn ConversationStorage>,
     item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,
     response_json: &Value,
     original_body: &ResponsesRequest,
+    tenant: Option<&str>,
 ) -> Result<(), PersistError> {
     // Respect store=false: skip persistence entirely (matches official API behavior)
     if !original_body.store.unwrap_or(true) {
@@ -548,6 +558,7 @@ async fn persist_conversation_items_inner(
     let mut stored_response = build_stored_response(response_json, original_body);
     stored_response.id = response_id.clone();
     stored_response.input = Value::Array(input_items.clone());
+    stored_response.tenant = tenant.map(str::to_string);
 
     response_storage
         .store_response(stored_response)
@@ -564,7 +575,11 @@ async fn persist_conversation_items_inner(
     let conv_id_opt = if let Some(conv_ref) = &original_body.conversation {
         let conv_id = ConversationId::from(conv_ref.as_id());
         match conversation_storage.get_conversation(&conv_id).await {
-            Ok(Some(_)) => Some(conv_id),
+            Ok(Some(conversation)) if conversation.is_visible_to(tenant) => Some(conv_id),
+            Ok(Some(_)) => {
+                warn!(conversation_id = %conv_id.0, "Conversation belongs to another tenant, skipping item linking");
+                None
+            }
             Ok(None) => {
                 warn!(conversation_id = %conv_id.0, "Conversation not found, skipping item linking");
                 None
@@ -589,6 +604,7 @@ async fn persist_conversation_items_inner(
             &input_items,
             &output_items,
             &response_id_str,
+            tenant,
         )
         .await
         .map_err(|e| PersistError::new(PersistStep::Linking, false, e))?;
@@ -626,6 +642,7 @@ mod tests {
             content,
             status: Some("completed".to_string()),
             created_at: Utc::now(),
+            tenant: None,
         }
     }
 
@@ -669,7 +686,8 @@ mod tests {
             "revised_prompt": "cat",
         });
 
-        let new_item = item_to_new_conversation_item(&input_item, None, /* is_input */ true);
+        let new_item =
+            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
         assert_eq!(new_item.item_type, "image_generation_call");
         assert_eq!(
             new_item
@@ -694,7 +712,8 @@ mod tests {
             "status": "completed",
         });
 
-        let new_item = item_to_new_conversation_item(&input_item, None, /* is_input */ true);
+        let new_item =
+            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
         assert_eq!(new_item.item_type, "message");
         assert_eq!(
             new_item.content,

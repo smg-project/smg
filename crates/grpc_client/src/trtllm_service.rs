@@ -588,7 +588,7 @@ impl TrtllmServiceClient {
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_config = Self::build_sampling_config_from_completion(body);
         let output_config = proto::OutputConfig {
-            logprobs: body.logprobs.map(|v| v.min(5) as i32),
+            logprobs: body.logprobs.map(|v| v.min(20) as i32),
             prompt_logprobs: None,
             return_context_logits: false,
             return_generation_logits: false,

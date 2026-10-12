@@ -14,14 +14,14 @@ mod common;
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
-use common::test_certs::TestCertificates;
+use common::{gateway_launch::free_ports, test_certs::TestCertificates};
 use openssl::ssl::{HandshakeError, SslConnector, SslFiletype, SslMethod};
 
 const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -104,16 +104,6 @@ impl Drop for Gateway {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// `N` distinct free ports: all bound at once, so the kernel hands out
-/// different ones, then released for the gateways to bind moments later. A
-/// gateway that lost one in between is respawned on fresh ones
-/// (`spawn_pair`).
-fn free_ports<const N: usize>() -> [u16; N] {
-    let listeners: [TcpListener; N] =
-        std::array::from_fn(|_| TcpListener::bind((IP, 0)).expect("a free port"));
-    listeners.map(|listener| listener.local_addr().expect("the bound address").port())
 }
 
 /// A gateway with the mesh on and this node's identity, on `ports` (HTTP,

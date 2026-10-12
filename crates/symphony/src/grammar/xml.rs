@@ -456,10 +456,7 @@ mod tests {
             elements[1]["elements"][1],
             value!({"type": "json_schema", "json_schema": {
                 "$ref": "#/$defs/Count",
-                "$defs": {
-                    "Point": {"type": "object", "properties": {"x": {"type": "integer"}}},
-                    "Count": {"type": "integer"},
-                },
+                "$defs": {"Count": {"type": "integer"}},
             }})
         );
         assert_eq!(

@@ -10,6 +10,10 @@ use super::{background, ResponsesContext};
 ///
 /// A background response this gateway runs is stopped and answered as
 /// `cancelled`; see [`background::cancel`] for the other cases.
-pub(crate) async fn cancel_response_impl(ctx: &ResponsesContext, response_id: &str) -> Response {
-    background::cancel(ctx, response_id).await
+pub(crate) async fn cancel_response_impl(
+    ctx: &ResponsesContext,
+    tenant: Option<&str>,
+    response_id: &str,
+) -> Response {
+    background::cancel(ctx, tenant, response_id).await
 }
