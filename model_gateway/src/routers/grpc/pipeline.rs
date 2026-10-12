@@ -4214,6 +4214,7 @@ mod request_release_tests {
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
+            tokenizer_autoload: true,
         });
 
         let response = pipeline
