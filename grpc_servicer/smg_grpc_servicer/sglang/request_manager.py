@@ -447,9 +447,11 @@ class GrpcRequestManager:
                 # retrieved here, so the loop does not log it
                 pass
             # The request's own state decides: a handler that took the cancel
-            # removed it on its abort path; a handler whose fresh ``__anext__``
-            # task was cancelled before it resumed never saw the cancel, and
-            # its request is still registered, so it is aborted here.
+            # (pending, or cancelled before it resumed: the cancel is thrown
+            # in at its ``yield``) removed it on its abort path; a handler
+            # parked at its ``yield`` with no task, or whose task already
+            # completed with an unread output, is still registered and is
+            # aborted here.
             if request_id in self.rid_to_state:
                 await self.abort_request(request_id)
             await generator.aclose()
