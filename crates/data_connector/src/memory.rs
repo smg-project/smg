@@ -101,17 +101,21 @@ impl<K: Clone + Eq + Hash> Order<K> {
         self.queue.push_back((stamp, self.next, id));
     }
 
-    /// Moves a live `id` to the back, stamped `now`; an id the store does not
+    /// Moves a live `id` to the back, stamped `now`, and compacts (a read-heavy
+    /// workload leaves an entry behind per touch); an id the store does not
     /// hold is left alone.
     fn touch(&mut self, now: DateTime<Utc>, id: &K) {
         if self.live.contains_key(id) {
             self.push(now, id.clone());
+            self.compact();
         }
     }
 
-    /// No entry stands for `id` any more (its record went).
+    /// No entry stands for `id` any more (its record went); compacts, as a
+    /// delete leaves the entry behind.
     fn forget(&mut self, id: &K) {
         self.live.remove(id);
+        self.compact();
     }
 
     fn clear(&mut self) {
@@ -143,7 +147,9 @@ impl<K: Clone + Eq + Hash> Order<K> {
     /// store holds more than its count bound: `remove` drops the record under
     /// a live id, told why, and answers what became of it; `len` is the store's
     /// count before. One pass over the entries queued when called (a record
-    /// that stays is queued again behind them). Answers how many records went.
+    /// that stays is queued again behind them, with its stamp: the retention
+    /// counts from when it was stored, not from the pass that kept it).
+    /// Answers how many records went.
     fn evict(
         &mut self,
         bounds: &Bounds,
@@ -165,7 +171,7 @@ impl<K: Clone + Eq + Hash> Order<K> {
                 break;
             };
             budget -= 1;
-            let Some((_, seq, id)) = self.queue.pop_front() else {
+            let Some((stamp, seq, id)) = self.queue.pop_front() else {
                 break;
             };
             if self.live.get(&id) != Some(&seq) {
@@ -180,7 +186,7 @@ impl<K: Clone + Eq + Hash> Order<K> {
                 Fate::Absent => {
                     self.live.remove(&id);
                 }
-                Fate::Stays => self.push(now, id),
+                Fate::Stays => self.push(stamp, id),
             }
         }
         self.compact();
@@ -932,14 +938,10 @@ impl ResponseStorage for MemoryResponseStorage {
             .filter(|(_, response)| unstored_terminal_before(response, cutoff))
             .map(|(id, _)| id.clone())
             .collect();
+        // Through the one remover: the order forgets the id and an emptied
+        // identifier index entry goes with the record.
         for id in &expired {
-            if let Some(response) = store.responses.remove(id) {
-                if let Some(ref safety_identifier) = response.safety_identifier {
-                    if let Some(ids) = store.identifier_index.get_mut(safety_identifier) {
-                        ids.retain(|kept| kept != id);
-                    }
-                }
-            }
+            store.remove(id);
         }
         Ok(expired.len())
     }
@@ -2194,5 +2196,96 @@ mod tests {
         let last = conversations.stamp_of(&used.id).unwrap();
         assert_eq!(conversations.evict_at(last + TimeDelta::seconds(3_600)), 1);
         assert_eq!(conversations.stored_record_count(), Some(0));
+    }
+
+    /// A read or an update of a conversation moves its entry and leaves one
+    /// behind; those are compacted away too, so a read-heavy workload under
+    /// no retention does not grow the order.
+    #[tokio::test]
+    async fn the_order_is_compacted_when_touches_leave_entries_behind() {
+        let config = MemoryConfig {
+            max_responses: 10_000,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let conversations = MemoryConversationStorage::with_config(&config);
+        let conversation = conversations
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        for _ in 0..1_000 {
+            assert!(conversations
+                .get_conversation(&conversation.id)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(conversations.stored_record_count(), Some(1));
+        assert!(
+            conversations.inner.read().order.queue.len() <= 128,
+            "{} entries left",
+            conversations.inner.read().order.queue.len()
+        );
+    }
+
+    /// A running background response the count bound passes over keeps the
+    /// stamp it was stored with, so the retention drops it when that passes,
+    /// not a retention after the last pass that kept it.
+    #[tokio::test]
+    async fn a_running_response_passed_over_keeps_its_stamp_for_the_retention() {
+        let config = MemoryConfig {
+            max_responses: 1,
+            max_items: 1,
+            retention_secs: Some(3_600),
+        };
+        let store = MemoryResponseStorage::with_config(&config);
+        let stored_at = Utc::now();
+        for id in ["resp_bg_1", "resp_bg_2"] {
+            let mut queued = StoredResponse::new(None);
+            queued.id = id.into();
+            queued.raw_response = json!({"id": id, "status": "queued"});
+            store.store_response(queued).await.unwrap();
+        }
+        // Over the bound and both running: a pass half-way through the
+        // retention keeps both.
+        assert_eq!(store.evict_at(stored_at + TimeDelta::seconds(1_800)), 0);
+        assert_eq!(store.stored_record_count(), Some(2));
+        // The retention counted from the store drops them, running or not.
+        assert_eq!(store.evict_at(stored_at + TimeDelta::seconds(3_601)), 2);
+        assert_eq!(store.stored_record_count(), Some(0));
+    }
+
+    /// The unstored-response sweep removes through the one remover: the order
+    /// holds no live entry for a swept record, the entries left behind are
+    /// compacted away, and an emptied identifier index entry goes with it.
+    #[tokio::test]
+    async fn the_unstored_sweep_leaves_no_order_entry_behind() {
+        let config = MemoryConfig {
+            max_responses: 10_000,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let store = MemoryResponseStorage::with_config(&config);
+        let cutoff = Utc::now();
+        let past = cutoff.timestamp() - 60;
+        for i in 0..1_000 {
+            let mut response = StoredResponse::new(None);
+            response.safety_identifier = Some(format!("user-{}", i % 10));
+            response.raw_response =
+                json!({"status": "completed", "store": false, "completed_at": past});
+            store.store_response(response).await.unwrap();
+        }
+        assert_eq!(
+            store.delete_unstored_older_than(cutoff).await.unwrap(),
+            1_000
+        );
+        assert_eq!(store.stored_record_count(), Some(0));
+        assert_eq!(store.stats().identifier_count, 0);
+        assert!(store.store.read().order.live.is_empty());
+        assert!(
+            store.order_len() <= 128,
+            "{} entries left",
+            store.order_len()
+        );
     }
 }
