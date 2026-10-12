@@ -126,13 +126,24 @@ pub fn f32_to_f16_bits(value: f32) -> u16 {
 }
 
 /// The per-channel map from a pixel byte to the normalized value a float
-/// destination takes: `value * scale[c] + bias[c]`, the HF processor's
-/// rescale and normalize folded into one step, in `f32` exactly as the
-/// processors computed it before the bytes were kept instead.
+/// destination takes: `(value * scale - offset[c]) / divisor[c]` in `f32`,
+/// the arithmetic of the reference image processors (the torchvision-backed
+/// ones the serving engines run). They fuse rescale and normalize by scaling
+/// the mean and std into byte units and then subtract once and divide once,
+/// so a byte maps to the same `f32` here as there, and so to the same
+/// narrower float when the engine casts it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PixelNorm {
-    pub scale: [f32; 3],
-    pub bias: [f32; 3],
+    /// Multiplies the byte first: the rescale factor when the bytes are
+    /// rescaled but not normalized, else 1.
+    pub scale: f32,
+    /// Subtracted next, per channel: the mean, in byte units when the bytes
+    /// are rescaled as well (`mean / rescale_factor`); 0 without
+    /// normalization.
+    pub offset: [f32; 3],
+    /// Divides last, per channel: the std in the same units as `offset`; 1
+    /// without normalization.
+    pub divisor: [f32; 3],
     /// Consecutive elements of one channel within a row of the encoder
     /// input: for a patch layout `[C, temporal, patch_h, patch_w]` the
     /// temporal × patch_h × patch_w product. Channel `c` owns elements
@@ -144,7 +155,9 @@ impl PixelNorm {
     /// The `f32` each byte maps to, per channel.
     pub fn table_f32(&self) -> [[f32; 256]; 3] {
         std::array::from_fn(|channel| {
-            std::array::from_fn(|value| value as f32 * self.scale[channel] + self.bias[channel])
+            std::array::from_fn(|value| {
+                (value as f32 * self.scale - self.offset[channel]) / self.divisor[channel]
+            })
         })
     }
 

@@ -111,10 +111,14 @@ struct QwenVideoPlan {
     norm: PixelNorm,
 }
 
-/// The per-channel normalization the patch bytes carry: HF order, rescale
-/// (x / 255) then normalize ((x - mean) / std), each step only when its flag
-/// is on, folded into one `scale`/`bias` pair. Both off leaves the raw 0..255
-/// values, what an engine that normalizes on device takes.
+/// The per-channel normalization the patch bytes carry, in the reference
+/// processors' order and arithmetic: rescale (`x * rescale_factor`) then
+/// normalize (`(x - mean) / std`), each step only when its flag is on. With
+/// both on they fuse the two: the mean and std are scaled into byte units
+/// (`mean * (1 / rescale_factor)`, in `f32`) and every byte takes one
+/// subtraction and one division, which rounds differently from scaling the
+/// byte first. Both off leaves the raw 0..255 values, what an engine that
+/// normalizes on device takes.
 fn pixel_norm(
     config: &PreProcessorConfig,
     default_mean: [f64; 3],
@@ -135,20 +139,28 @@ fn pixel_norm(
         .unwrap_or(default_std);
     let do_normalize = config.do_normalize.unwrap_or(true);
     let do_rescale = config.do_rescale.unwrap_or(true);
-    let scale: [f32; 3] = std::array::from_fn(|channel| match (do_rescale, do_normalize) {
-        (true, true) => 1.0 / (255.0 * std[channel] as f32),
-        (true, false) => 1.0 / 255.0,
-        (false, true) => 1.0 / std[channel] as f32,
-        (false, false) => 1.0,
-    });
-    let bias: [f32; 3] = if do_normalize {
-        std::array::from_fn(|channel| -(mean[channel] as f32) / std[channel] as f32)
-    } else {
-        [0.0; 3]
+    let rescale_factor = config.get_rescale_factor();
+    let (scale, offset, divisor) = match (do_rescale, do_normalize) {
+        (true, true) => {
+            let into_bytes = (1.0 / rescale_factor) as f32;
+            (
+                1.0,
+                std::array::from_fn(|channel| mean[channel] as f32 * into_bytes),
+                std::array::from_fn(|channel| std[channel] as f32 * into_bytes),
+            )
+        }
+        (true, false) => (rescale_factor as f32, [0.0; 3], [1.0; 3]),
+        (false, true) => (
+            1.0,
+            std::array::from_fn(|channel| mean[channel] as f32),
+            std::array::from_fn(|channel| std[channel] as f32),
+        ),
+        (false, false) => (1.0, [0.0; 3], [1.0; 3]),
     };
     PixelNorm {
         scale,
-        bias,
+        offset,
+        divisor,
         channel_block,
     }
 }
@@ -1429,7 +1441,20 @@ mod tests {
     use image::RgbImage;
 
     use super::*;
-    use crate::vision::transforms::to_tensor_and_normalize;
+    use crate::vision::transforms::to_tensor_no_norm;
+
+    /// The tensor path's oracle for the byte path: the raw 0..255 planes
+    /// mapped through the per-byte table the bytes carry, the reference's
+    /// fused arithmetic (the table itself is checked against the reference
+    /// processors in `tests/qwen_pixel_norm_golden.rs`).
+    fn tensor_through_table(image: &DynamicImage, mean: &[f64; 3], std: &[f64; 3]) -> Array3<f32> {
+        let table = pixel_norm(&PreProcessorConfig::default(), *mean, *std, 1).table_f32();
+        let mut tensor = to_tensor_no_norm(image);
+        for (channel, mut plane) in tensor.outer_iter_mut().enumerate() {
+            plane.mapv_inplace(|value| table[channel][value as usize]);
+        }
+        tensor
+    }
 
     /// The opted-in Qwen processors must produce bit-identical pixels and
     /// metadata when individual images are concatenated instead of batched.
@@ -1615,7 +1640,7 @@ mod tests {
         let actual = result.encoder_input.flat_f32().into_owned();
 
         let resized = resize_bicubic_torch_aa(&image, target_w as u32, target_h as u32);
-        let tensor = to_tensor_and_normalize(
+        let tensor = tensor_through_table(
             &resized,
             &processor.default_mean(),
             &processor.default_std(),
@@ -1642,7 +1667,7 @@ mod tests {
         let image = create_sized_pattern_frame(7, 9, 3);
         let (target_h, target_w) = processor.smart_resize(9, 7).unwrap();
         let resized = resize_bicubic_torch_aa(&image, target_w as u32, target_h as u32);
-        let tensor = to_tensor_and_normalize(
+        let tensor = tensor_through_table(
             &resized,
             &processor.default_mean(),
             &processor.default_std(),
@@ -1669,12 +1694,13 @@ mod tests {
         let block_out = merge_size * merge_size * 3 * temporal_patch_size * patch_size * patch_size;
         let mean = processor.default_mean();
         let std = processor.default_std();
-        let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
-        let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
+        let offset: [f32; 3] = std::array::from_fn(|c| mean[c] as f32 * 255.0);
+        let divisor: [f32; 3] = std::array::from_fn(|c| std[c] as f32 * 255.0);
         let patch_features = 3 * temporal_patch_size * patch_size * patch_size;
         let norm = PixelNorm {
-            scale,
-            bias,
+            scale: 1.0,
+            offset,
+            divisor,
             channel_block: temporal_patch_size * patch_size * patch_size,
         };
 
@@ -1945,7 +1971,7 @@ mod tests {
         let tensors = frames
             .iter()
             .map(|frame| {
-                to_tensor_and_normalize(frame, &processor.default_mean(), &processor.default_std())
+                tensor_through_table(frame, &processor.default_mean(), &processor.default_std())
             })
             .collect::<Vec<_>>();
         let (grid_t, grid_h, grid_w) = processor.calculate_grid_thw(4, 4, frames.len());

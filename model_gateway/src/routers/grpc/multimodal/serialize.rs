@@ -172,8 +172,9 @@ mod tests {
             EncoderInput::bytes(
                 ArrayD::from_shape_vec(IxDyn(&[1, 6]), vec![0u8, 255, 51, 102, 153, 204]).unwrap(),
                 PixelNorm {
-                    scale: [0.5; 3],
-                    bias: [-1.0; 3],
+                    scale: 1.0,
+                    offset: [2.0; 3],
+                    divisor: [2.0; 3],
                     channel_block: 2,
                 },
             ),
