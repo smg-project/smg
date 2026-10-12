@@ -106,8 +106,9 @@ pub(crate) fn ensure_model_accepts_media(
     Err(error::bad_request(
         "multimodal_not_supported",
         format!(
-            "{modalities} input is not supported by model '{model_id}': its workers run as a \
-             language model only, without a vision encoder"
+            "{modalities} input is not supported by model '{model_id}': none of its workers \
+             accept vision input (the engine runs as a language model only, or its servicer \
+             does not carry media to it)"
         ),
     ))
 }
