@@ -403,15 +403,15 @@ characters, so the canonical key fits the column.
 
 With a Postgres or Redis history backend configured, `create_storage` makes one
 bounded contact with the store before anything else: a connection and one round
-trip (`SELECT 1` / `PING`) within `STARTUP_CONTACT_TIMEOUT` (10 s). A store that
-refuses the connection, or that accepts it and never answers, is a named error
-(the backend, the URL with its password masked, the bound) and the gateway exits
+trip (`SELECT 1` / `PING`) within the backend's store-call bound
+(`op_timeout_secs`, 5 s by default). A store that refuses the connection is a
+named error at once (the backend, the URL with its password masked, the cause);
+a store that accepts the connection and never answers is one when the bound
+passes (`did not answer within the start-up bound of 5 s`): the client library
+and the pool bound their own steps at twice the store-call bound, so the
+contact's verdict is the first to fire for either backend. The gateway exits
 before it binds its API port: it does not start without a history backend it
-cannot reach, for either backend alike. The Redis client library bounds its own
-connect (about a second) inside that bound, so a Redis that never answers is
-usually reported as unreachable with the library's timeout as the cause; the
-start-up bound is the ceiling. Oracle's contact is bounded by its own
-`pool_timeout_secs`.
+cannot reach. Oracle's contact is bounded by its own `pool_timeout_secs`.
 
 ## Database Schema
 

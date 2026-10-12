@@ -45,13 +45,13 @@ pub struct StorageFactoryConfig<'a> {
     pub hook: Option<Arc<dyn StorageHook>>,
 }
 
-/// Bound on the start-up contact with a configured Postgres or Redis store:
-/// one connection and one round trip. A store that refuses the connection, or
-/// that accepts it and never answers, is a named start-up error within this
-/// bound; the gateway does not start with a history backend it cannot reach.
-pub const STARTUP_CONTACT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Why the start-up contact with a store failed.
+/// Why the start-up contact with a store failed. The contact, one connection
+/// and one round trip, is bounded by the backend's store-call bound
+/// (`op_timeout_secs`): the client library and the pool bound their own steps
+/// at twice that, so a store that accepts the connection and never answers is
+/// the contact's own verdict, with the bound in the text, for either backend;
+/// a store that refuses the connection is a verdict at once. The gateway does
+/// not start with a history backend it cannot reach.
 #[derive(Debug)]
 pub(crate) enum StoreContactError {
     /// The connection or the round trip failed: refused, reset, rejected.
@@ -259,17 +259,11 @@ fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, Str
 
 async fn create_postgres_storage(postgres_cfg: &PostgresConfig) -> Result<StorageBundle, String> {
     let store = PostgresStore::new(postgres_cfg.clone())?;
+    let bound = postgres_cfg.op_timeout();
     store
-        .contact(STARTUP_CONTACT_TIMEOUT)
+        .contact(bound)
         .await
-        .map_err(|err| {
-            contact_error(
-                "Postgres",
-                &redacted(&postgres_cfg.db_url),
-                STARTUP_CONTACT_TIMEOUT,
-                err,
-            )
-        })?;
+        .map_err(|err| contact_error("Postgres", &redacted(&postgres_cfg.db_url), bound, err))?;
     // The tables, the schema version and the indexes: once per database, in
     // one transaction under the schema lock, so gateways starting together
     // take turns and a fresh database starts at the latest version.
@@ -292,17 +286,11 @@ async fn create_postgres_storage(postgres_cfg: &PostgresConfig) -> Result<Storag
 
 async fn create_redis_storage(redis_cfg: &RedisConfig) -> Result<StorageBundle, String> {
     let store = RedisStore::new(redis_cfg.clone())?;
+    let bound = redis_cfg.op_timeout();
     store
-        .contact(STARTUP_CONTACT_TIMEOUT)
+        .contact(bound)
         .await
-        .map_err(|err| {
-            contact_error(
-                "Redis",
-                &redacted(&redis_cfg.url),
-                STARTUP_CONTACT_TIMEOUT,
-                err,
-            )
-        })?;
+        .map_err(|err| contact_error("Redis", &redacted(&redis_cfg.url), bound, err))?;
     let redis_resp = RedisResponseStorage::new(store.clone());
     let redis_conv = RedisConversationStorage::new(store.clone());
     let redis_item = RedisConversationItemStorage::new(store);
@@ -331,6 +319,12 @@ mod tests {
         (listener, port)
     }
 
+    /// The store-call bound of the test configurations, the start-up
+    /// contact's bound: short, so the black-hole tests are quick, and under
+    /// the client's and pool's backstops (twice it) by construction.
+    const BOUND_SECS: u64 = 2;
+    const BOUND: Duration = Duration::from_secs(BOUND_SECS);
+
     /// A port nothing listens on: the connection is refused.
     fn closed_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
@@ -341,10 +335,7 @@ mod tests {
         PostgresConfig {
             db_url: format!("postgres://u:s3cr3t@127.0.0.1:{port}/db"),
             pool_max: 1,
-            // Well past the start-up bound: the pool's own backstop (twice the
-            // store-call bound) must not race the start-up contact's verdict,
-            // which is what these tests are about.
-            op_timeout_secs: 30,
+            op_timeout_secs: BOUND_SECS,
             schema: None,
         }
     }
@@ -374,7 +365,7 @@ mod tests {
         RedisConfig {
             url: format!("redis://:s3cr3t@127.0.0.1:{port}/0"),
             pool_max: 1,
-            op_timeout_secs: 5,
+            op_timeout_secs: BOUND_SECS,
             schema: None,
             retention_days: None,
         }
@@ -392,7 +383,7 @@ mod tests {
             HistoryBackend::Redis
         };
         tokio::time::timeout(
-            STARTUP_CONTACT_TIMEOUT + Duration::from_secs(20),
+            BOUND + Duration::from_secs(20),
             create_storage(StorageFactoryConfig {
                 backend: &backend,
                 oracle: None,
@@ -418,12 +409,12 @@ mod tests {
             .expect("a store that never answers is refused at start-up");
         assert!(
             err.contains("Postgres history backend")
-                && err.contains("did not answer within the start-up bound of 10 s"),
+                && err.contains("did not answer within the start-up bound of 2 s"),
             "{err}"
         );
         assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
         assert!(
-            started.elapsed() >= STARTUP_CONTACT_TIMEOUT,
+            started.elapsed() >= BOUND,
             "the verdict waited for the bound"
         );
     }
@@ -438,19 +429,21 @@ mod tests {
         let err = verdict
             .err()
             .expect("a store that never answers is refused at start-up");
-        // The client library bounds its own connect (about a second) inside
-        // the start-up bound, so the verdict usually names the store as
-        // unreachable with the library's timeout as the cause; the outer
-        // bound is the ceiling either way.
+        // The client's connect and the pool's create are bounded at twice the
+        // store-call bound: the start-up contact's own verdict comes first,
+        // and names the bound, the same as for Postgres.
         assert!(
             err.contains("Redis history backend")
-                && (err.contains("is unreachable at start-up")
-                    || err.contains("did not answer within the start-up bound of 10 s")),
+                && err.contains("did not answer within the start-up bound of 2 s"),
             "{err}"
         );
         assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
         assert!(
-            started.elapsed() <= STARTUP_CONTACT_TIMEOUT + Duration::from_secs(5),
+            started.elapsed() >= BOUND,
+            "the verdict waited for the bound"
+        );
+        assert!(
+            started.elapsed() <= BOUND + Duration::from_secs(5),
             "the verdict came within the bound"
         );
     }
