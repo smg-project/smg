@@ -1135,12 +1135,13 @@ async fn gateways_starting_together_come_up_under_a_repeatable_read_default() {
 
 /// A read or a write costs one round trip after the first on a connection:
 /// the statement is prepared once and cached on the connection, not parsed
-/// again on every call (a parse round trip and an execute round trip each).
-/// Measured on the wire, with the relay counting the server's ReadyForQuery
+/// again on every call (a parse round trip and an execute round trip each),
+/// and no statement is closed, so the cache kept it. Measured on the wire,
+/// with the relay counting the server's ReadyForQuery and the client's Close
 /// messages.
 #[tokio::test]
 #[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
-async fn a_read_is_one_round_trip_after_the_first_on_a_connection() {
+async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
     let Some(db_url) = test_db_url() else {
         return;
     };
@@ -1167,6 +1168,13 @@ async fn a_read_is_one_round_trip_after_the_first_on_a_connection() {
         })
         .await
         .expect("create conversation");
+    let second = conv
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+        })
+        .await
+        .expect("create a second conversation");
     let item = items
         .create_item(NewConversationItem {
             id: None,
@@ -1198,7 +1206,8 @@ async fn a_read_is_one_round_trip_after_the_first_on_a_connection() {
         .await
         .expect("read");
 
-    // Every later call of a statement: one round trip.
+    // Every later call of a statement: one round trip, and no statement closed.
+    let closes_before = meter.closes.load(Ordering::SeqCst);
     let mut costs = Vec::new();
     for (name, call) in [
         ("get_response", {
@@ -1244,6 +1253,28 @@ async fn a_read_is_one_round_trip_after_the_first_on_a_connection() {
                     .map_err(|e| e.to_string())
             })
         }),
+        ("create_conversation", {
+            let conv = conv.clone();
+            Box::pin(async move {
+                conv.create_conversation(NewConversation {
+                    id: None,
+                    metadata: None,
+                })
+                .await
+                .map(drop)
+                .map_err(|e| e.to_string())
+            })
+        }),
+        ("link_item", {
+            let items = items.clone();
+            let (cid, iid) = (second.id.clone(), item.id.clone());
+            Box::pin(async move {
+                items
+                    .link_item(&cid, &iid, Utc::now())
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+        }),
     ] {
         let before = meter.ready_for_query.load(Ordering::SeqCst);
         call.await.expect(name);
@@ -1253,5 +1284,10 @@ async fn a_read_is_one_round_trip_after_the_first_on_a_connection() {
     assert!(
         costly.is_empty(),
         "round trips per call after the first: {costs:?}; expected one each"
+    );
+    assert_eq!(
+        meter.closes.load(Ordering::SeqCst) - closes_before,
+        0,
+        "no statement was closed: each stayed cached on its connection"
     );
 }
