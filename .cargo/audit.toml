@@ -1,0 +1,13 @@
+# cargo-audit configuration. `cargo audit` runs on every pull request that changes the dependency
+# graph (the cargo-audit job of pr-test-rust.yml) and daily on main (cargo-audit-nightly.yml), both
+# through scripts/ci_cargo_audit.sh; an advisory that is not listed here fails the job. Every entry
+# needs a reason, and goes when the fixed release is in the lockfile.
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa 0.9, a timing side channel on RSA private-key operations (Marvin).
+    # rsa reaches the graph only through jsonwebtoken's RSA support (crates/auth) and has no fixed
+    # release. The gateway verifies JWT signatures with public keys (DecodingKey built from JWKS
+    # components) and never signs or decrypts with an RSA private key outside its test suite, so
+    # the side channel has no secret to leak.
+    "RUSTSEC-2023-0071",
+]

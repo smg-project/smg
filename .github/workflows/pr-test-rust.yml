@@ -414,6 +414,43 @@ jobs:
         if: always()
         run: sccache --show-stats
 
+  # --- Dependency audit ---
+
+  # cargo audit of Cargo.lock against the RustSec advisory database. A pull
+  # request that changes the dependency graph (the lockfile, a manifest, the
+  # audit's ignore list) fails here on an advisory that .cargo/audit.toml
+  # does not ignore; cargo-audit-nightly.yml runs the same script on main
+  # every day, for advisories published after the last lockfile change.
+  cargo-audit:
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && (
+        github.event_name != 'pull_request'
+        || needs.detect-changes.outputs.dependencies == 'true'
+      )
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # The advisory database is a git clone from github.com; see pre-commit
+      # for why the workflow token rides on every github.com git operation.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: cargo audit
+        run: bash scripts/ci_cargo_audit.sh
+
   # --- Benchmarks (standalone) ---
 
   # Advisory: the thresholds in e2e_test/benchmarks are absolute latencies on
@@ -516,6 +553,7 @@ jobs:
       realtime: ${{ steps.filter.outputs.realtime }}
       go-bindings: ${{ steps.filter.outputs.go-bindings }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
       # Symphony is not wired into the gateway yet: a change confined to its crate and the
       # lock file runs the CPU checks only, and every GPU lane below skips on this flag.
       symphony-only: ${{ steps.filter.outputs.symphony == 'true' && steps.filter.outputs.outside-symphony == 'false' }}
@@ -669,6 +707,15 @@ jobs:
               - '.github/workflows/pr-test-rust.yml'
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
+            # The dependency graph: the cargo-audit job runs on a pull request
+            # that changes it (or the audit's ignore list and script).
+            dependencies:
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - '**/Cargo.toml'
+              - '.cargo/audit.toml'
+              - 'scripts/ci_cargo_audit.sh'
+              - '.github/workflows/pr-test-rust.yml'
 
   # --- GPU E2E: organized by GPU tier + API, engine as matrix axis ---
 
@@ -1606,7 +1653,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -1673,6 +1720,7 @@ jobs:
                 "${{ needs.build-wheel.result }}" =~ $bad || \
                 "${{ needs.python-unit-tests.result }}" =~ $bad || \
                 "${{ needs.unit-tests.result }}" =~ $bad || \
+                "${{ needs.cargo-audit.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
