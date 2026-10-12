@@ -209,13 +209,13 @@ fn a_present_tokenizer_source_or_a_hub_id_serves() {
             "hub-id",
             vec!["--enable-igw", "--tokenizer-path", "some-org/some-model"],
         ),
-        // The connection mode follows the worker URLs; a gRPC worker that is
-        // not there yet is the shape of a deployment whose workers register
-        // later and bring the tokenizer with them.
+        // The connection mode follows the worker URLs, no IGW: a gRPC worker
+        // that is not there yet is the shape of a deployment whose workers
+        // register later and bring the tokenizer with them (the worker
+        // initialization is a background job, so the gateway serves first).
         (
             "grpc-model-on-the-worker",
             vec![
-                "--enable-igw",
                 "--worker-urls",
                 "grpc://127.0.0.1:1",
                 "--model-path",
