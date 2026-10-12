@@ -702,10 +702,12 @@ pub(crate) async fn drive_watching<F>(
 {
     let id = slot.id().to_string();
     let token = slot.cancel_token();
-    // Whether the record was there when the work started: only then is a
-    // record gone later a deletion. A store that never shows the record (no
-    // history backend, or a record deleted before the start) runs the work
-    // to its end as before and stores nothing over the missing record.
+    // Whether the record was there when the work started; the watch learns
+    // it from its own reads as well, so a store blip at this transition does
+    // not disarm it. Only a record seen is a deletion when it is gone later:
+    // a store that never shows the record (no history backend, or a record
+    // deleted before the start) runs the work to its end as before and
+    // stores nothing over the missing record.
     let record_seen = match set_stored_status(
         &storage,
         &id,
@@ -796,16 +798,16 @@ pub(crate) async fn drive_watching<F>(
 pub(crate) const DELETED: &str = "deleted";
 
 /// Resolves with the status once the record under `id` reads terminal, or,
-/// when the run saw its record at the start (`record_seen`), with
-/// [`DELETED`] once the record is gone. A store that never showed the record
-/// is not read as a deletion; a store that cannot be read is retried at the
-/// next tick.
+/// once the record was seen (`record_seen` at the start, or by a read of
+/// this watch), with [`DELETED`] once it is gone. A store that never showed
+/// the record is not read as a deletion; a store that cannot be read is
+/// retried at the next tick.
 async fn watch_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     request_context: Option<StorageRequestContext>,
     every: Duration,
-    record_seen: bool,
+    mut record_seen: bool,
 ) -> String {
     loop {
         tokio::time::sleep(every).await;
@@ -816,6 +818,7 @@ async fn watch_stored_status(
         };
         match stored {
             Ok(Some(stored)) => {
+                record_seen = true;
                 let status = stored.raw_response["status"].as_str().unwrap_or("");
                 if is_terminal(status) {
                     return status.to_string();
@@ -1593,6 +1596,61 @@ mod tests {
     /// The guard of the terminal persist: a terminal record reads closed, an
     /// open one does not, a record that is gone reads closed (the delete
     /// holds), and a store that cannot be read leaves the record open.
+    /// A store blip at the in_progress transition does not disarm the watch:
+    /// the run learns from its first good read that its record exists, and a
+    /// record deleted after that ends the run.
+    #[tokio::test]
+    async fn a_run_that_started_during_a_store_blip_still_ends_when_its_record_is_deleted() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        // The in_progress write fails: the record stays queued and the run
+        // starts without having seen it.
+        flaky.fail_next(1);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(10),
+        ));
+        // A few good reads of the record, then the delete.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            flaky.calls() > 2,
+            "the watch read the record: {} calls",
+            flaky.calls()
+        );
+        storage
+            .delete_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends once its record is gone")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert_eq!(
+            stored_raw(&storage, "resp_1").await,
+            Value::Null,
+            "nothing is written under the deleted id"
+        );
+        assert_eq!(registry.in_flight(), 0);
+    }
+
     #[tokio::test]
     async fn a_record_that_is_gone_reads_closed_and_an_unreadable_store_does_not() {
         let storage = storage();
