@@ -19,7 +19,7 @@ pub mod token_bucket;
 pub mod wasm;
 
 pub use auth::{auth_middleware, deny_all_middleware, AuthConfig};
-pub use body_limit::payload_too_large_envelope_middleware;
+pub use body_limit::{mark_passed_body_limit_middleware, payload_too_large_envelope_middleware};
 pub use body_timeout::{request_body_timeout_middleware, RequestBodyTimeouts};
 pub use concurrency::{concurrency_limit_middleware, AdmissionQueue, TokenGuardBody};
 pub use logging::{

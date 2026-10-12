@@ -1259,6 +1259,13 @@ where
 {
     app.fallback(sink_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
+        // Marks every response that came back through the body-limit layer
+        // below, so the envelope pass outside it re-shapes only the limit
+        // layer's own refusal (a 413 minted inside, a handler's or a relayed
+        // upstream's, keeps its body).
+        .layer(axum::middleware::from_fn(
+            middleware::mark_passed_body_limit_middleware,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,

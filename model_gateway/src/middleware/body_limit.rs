@@ -1,49 +1,43 @@
 //! The body-limit layer's refusal in the gateway's error envelope.
 //!
 //! `tower_http::limit::RequestBodyLimitLayer` refuses a declared
-//! `Content-Length` over `--max-payload-size` before any route layer runs,
-//! with a plain-text 413 (`length limit exceeded`); a chunked upload that
-//! crosses the limit is refused by the JSON extractor with the envelope and
-//! the code `request_body_too_large`. This pass, applied outside the limit
-//! layer, gives the declared-length refusal the same envelope, so a client
-//! parsing `error.code` and the `error_code` metric label see one class for
-//! one cause whatever the framing. The Messages routes re-shape it once more
-//! into their own envelope, as they do every error.
+//! `Content-Length` over `--max-payload-size` before any layer inside it
+//! runs, with a plain-text 413 (`length limit exceeded`); a chunked upload
+//! that crosses the limit is refused by the JSON extractor with the envelope
+//! and the code `request_body_too_large`. Two passes give the declared-length
+//! refusal the same envelope, and only that refusal: an inner pass marks every
+//! response that came back through the limit layer, and an outer pass
+//! re-shapes a 413 that carries no mark. A 413 minted inside (a handler's own
+//! limit, an upstream's page relayed by the HTTP router, the extractor's
+//! chunked refusal) is marked and left as it is.
 
-use axum::{
-    extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
 
-use crate::routers::error::create_error;
+use super::body_timeout::request_body_too_large_response;
 
-/// The error code of a request body over the payload limit, the extractor's
-/// code for the chunked framing.
-pub const REQUEST_BODY_TOO_LARGE: &str = "request_body_too_large";
+/// Set on every response that came back through the body-limit layer; a 413
+/// without it never got past that layer, so it is the layer's own refusal.
+#[derive(Clone, Copy, Debug)]
+pub struct PassedBodyLimit;
 
-/// A 413 without a JSON body (the limit layer's plain text) leaves as the
-/// gateway's envelope with [`REQUEST_BODY_TOO_LARGE`]; every other response
-/// passes unchanged.
-pub async fn payload_too_large_envelope_middleware(request: Request, next: Next) -> Response {
-    let response = next.run(request).await;
-    if response.status() != StatusCode::PAYLOAD_TOO_LARGE || has_json_body(&response) {
-        return response;
-    }
-    create_error(
-        StatusCode::PAYLOAD_TOO_LARGE,
-        REQUEST_BODY_TOO_LARGE,
-        "Request body exceeded the payload limit (max_payload_size)",
-    )
+/// The inner pass (applied inside the body-limit layer): marks the response.
+pub async fn mark_passed_body_limit_middleware(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(PassedBodyLimit);
+    response
 }
 
-fn has_json_body(response: &Response) -> bool {
-    response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|content_type| content_type.starts_with("application/json"))
+/// The outer pass (applied outside the body-limit layer): the limit layer's
+/// own 413 leaves as the gateway's envelope with the extractor's code and the
+/// metric label; every marked response passes unchanged.
+pub async fn payload_too_large_envelope_middleware(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE
+        || response.extensions().get::<PassedBodyLimit>().is_some()
+    {
+        return response;
+    }
+    request_body_too_large_response()
 }
 
 #[cfg(test)]
@@ -64,11 +58,23 @@ mod tests {
     use tower_http::limit::RequestBodyLimitLayer;
 
     use super::*;
-    use crate::routers::error::extract_error_code_from_response;
+    use crate::{
+        middleware::body_timeout::REQUEST_BODY_TOO_LARGE,
+        routers::error::extract_error_code_from_response,
+    };
 
+    /// The edge stack of the server: the mark inside the limit layer, the
+    /// envelope outside it.
     fn app() -> Router {
         Router::new()
             .route("/ok", post(|| async { StatusCode::OK }))
+            .route(
+                "/text-413",
+                post(|| async {
+                    // an upstream's page relayed as is, or a handler's own limit
+                    (StatusCode::PAYLOAD_TOO_LARGE, "Request Entity Too Large").into_response()
+                }),
+            )
             .route(
                 "/json-413",
                 post(|| async {
@@ -79,6 +85,7 @@ mod tests {
                         .into_response()
                 }),
             )
+            .layer(from_fn(mark_passed_body_limit_middleware))
             .layer(RequestBodyLimitLayer::new(16))
             .layer(from_fn(payload_too_large_envelope_middleware))
     }
@@ -114,10 +121,16 @@ mod tests {
         assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
     }
 
-    /// A 413 that already carries a JSON body (a handler's own) and any other
-    /// status pass unchanged.
+    /// A 413 minted inside the limit layer, plain text (an upstream's page,
+    /// a handler's own limit) or JSON, and any other status pass unchanged.
     #[tokio::test]
-    async fn json_413s_and_other_statuses_pass_unchanged() {
+    async fn responses_from_inside_the_limit_layer_pass_unchanged() {
+        let response = send("/text-413", 4).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(extract_error_code_from_response(&response), "");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"Request Entity Too Large");
+
         let response = send("/json-413", 4).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();

@@ -46,6 +46,17 @@ pub const REQUEST_BODY_TIMEOUT: &str = "request_body_timeout";
 /// Error code of a body that crossed the payload limit (`max_payload_size`).
 pub const REQUEST_BODY_TOO_LARGE: &str = "request_body_too_large";
 
+/// The refusal of a body over the payload limit: one code and one message
+/// for every framing (the chunked read here, a declared length at the edge
+/// in `body_limit`).
+pub(crate) fn request_body_too_large_response() -> Response {
+    create_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        REQUEST_BODY_TOO_LARGE,
+        "Request body exceeded the payload limit (max_payload_size)",
+    )
+}
+
 const READING: u8 = 0;
 const STALLED: u8 = 1;
 const TIMED_OUT: u8 = 2;
@@ -112,11 +123,7 @@ pub async fn request_body_timeout_middleware(
                 format!("Request body was not complete after {timeout_secs} seconds"),
             )
         }
-        TOO_LARGE => create_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            REQUEST_BODY_TOO_LARGE,
-            "Request body exceeded the payload limit (max_payload_size)",
-        ),
+        TOO_LARGE => request_body_too_large_response(),
         _ => response,
     }
 }
