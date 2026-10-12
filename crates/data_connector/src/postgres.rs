@@ -4,9 +4,9 @@ use std::{str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{ClientWrapper, Manager, ManagerConfig, Pool, RecyclingMethod};
 use serde_json::Value;
-use tokio_postgres::{IsolationLevel, NoTls, Row};
+use tokio_postgres::{types::ToSql, IsolationLevel, NoTls, Row};
 
 use crate::{
     common::{
@@ -198,6 +198,43 @@ impl Clone for PostgresStore {
     }
 }
 
+// ── Cached statements ────────────────────────────────────────────────────
+//
+// A statement passed as text costs two round trips per call: the parse and
+// the execute. Prepared once and cached on the connection (the pool keeps the
+// cache with the connection), every later call is one round trip, which is
+// what a store a few milliseconds away multiplies by.
+
+/// Runs `sql` as a statement prepared once per connection.
+async fn query_cached(
+    client: &ClientWrapper,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Vec<Row>, tokio_postgres::Error> {
+    let statement = client.prepare_cached(sql).await?;
+    client.query(&statement, params).await
+}
+
+/// Runs `sql` as a statement prepared once per connection; one row.
+async fn query_one_cached(
+    client: &ClientWrapper,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<Row, tokio_postgres::Error> {
+    let statement = client.prepare_cached(sql).await?;
+    client.query_one(&statement, params).await
+}
+
+/// Runs `sql` as a statement prepared once per connection; the rows affected.
+async fn execute_cached(
+    client: &ClientWrapper,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> Result<u64, tokio_postgres::Error> {
+    let statement = client.prepare_cached(sql).await?;
+    client.execute(&statement, params).await
+}
+
 /// Name of a JSON value's type, for error messages that must not echo
 /// caller-supplied content (metadata is arbitrary and may hold secrets/PII).
 fn json_type_name(value: &Value) -> &'static str {
@@ -280,7 +317,7 @@ impl ConversationStorage for PostgresConversationStorage {
         let table = s.qualified_table(self.store.schema.owner.as_deref());
 
         let mut col_names: Vec<&str> = vec![s.col("id")];
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id_str];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id_str];
         if !s.is_skipped("created_at") {
             col_names.push(s.col("created_at"));
             params.push(&created_at);
@@ -313,8 +350,7 @@ impl ConversationStorage for PostgresConversationStorage {
             .get()
             .await
             .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
-        client
-            .execute(&sql, &params)
+        execute_cached(&client, &sql, &params)
             .await
             .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
         Ok(conversation)
@@ -347,8 +383,7 @@ impl ConversationStorage for PostgresConversationStorage {
             .get()
             .await
             .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
-        let rows = client
-            .query(&sql, &[&id.0.as_str()])
+        let rows = query_cached(&client, &sql, &[&id.0.as_str()])
             .await
             .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
         if rows.is_empty() {
@@ -399,8 +434,7 @@ impl ConversationStorage for PostgresConversationStorage {
         if s.is_skipped("metadata") {
             // Nothing to update — just verify the row exists
             let sql = format!("SELECT 1 FROM {table} WHERE {col_id} = $1");
-            let rows = client
-                .query(&sql, &[&id.0.as_str()])
+            let rows = query_cached(&client, &sql, &[&id.0.as_str()])
                 .await
                 .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
             if rows.is_empty() {
@@ -421,8 +455,7 @@ impl ConversationStorage for PostgresConversationStorage {
 
         let (_, created_at) = if s.is_skipped("created_at") {
             let sql = format!("UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2");
-            let rows_affected = client
-                .execute(&sql, &[&metadata_value, &id.0.as_str()])
+            let rows_affected = execute_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
                 .await
                 .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
             if rows_affected == 0 {
@@ -434,8 +467,7 @@ impl ConversationStorage for PostgresConversationStorage {
             let sql = format!(
                 "UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2 RETURNING {col_created}"
             );
-            let rows = client
-                .query(&sql, &[&metadata_value, &id.0.as_str()])
+            let rows = query_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
                 .await
                 .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
             if rows.is_empty() {
@@ -463,13 +495,13 @@ impl ConversationStorage for PostgresConversationStorage {
             .get()
             .await
             .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
-        let rows_deleted = client
-            .execute(
-                &format!("DELETE FROM {table} WHERE {col_id} = $1"),
-                &[&id.0.as_str()],
-            )
-            .await
-            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+        let rows_deleted = execute_cached(
+            &client,
+            &format!("DELETE FROM {table} WHERE {col_id} = $1"),
+            &[&id.0.as_str()],
+        )
+        .await
+        .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
         Ok(rows_deleted > 0)
     }
 }
@@ -568,7 +600,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
 
         // Build dynamic column/param lists, respecting skip_columns
         let mut col_names: Vec<&str> = vec![si.col("id")];
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id.0];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id.0];
         if !si.is_skipped("response_id") {
             col_names.push(si.col("response_id"));
             params.push(&response_id);
@@ -620,8 +652,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .get()
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
-        client
-            .execute(&sql, &params)
+        execute_cached(&client, &sql, &params)
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         Ok(ConversationItem {
@@ -649,8 +680,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             sl.col("item_id"),
             sl.col("added_at"),
         ];
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            vec![&conversation_id.0, &item_id.0, &added_at];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&conversation_id.0, &item_id.0, &added_at];
 
         // Append extra columns from hooks or defaults
         let hook_extra = current_extra_columns().unwrap_or_default();
@@ -675,8 +705,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .get()
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
-        client
-            .execute(&sql, &params)
+        execute_cached(&client, &sql, &params)
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         Ok(())
@@ -711,8 +740,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
                 let cursor_sql = format!(
                 "SELECT {l_added_at} FROM {links_table} WHERE {l_conv_id} = $1 AND {l_item_id} = $2"
             );
-                let rows = client
-                    .query(&cursor_sql, &[&cid, &aid.as_str()])
+                let rows = query_cached(&client, &cursor_sql, &[&cid, &aid.as_str()])
                     .await
                     .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
                 if rows.is_empty() {
@@ -778,13 +806,11 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         let rows = if let Some((ts, iid)) = &after_key {
-            client
-                .query(&sql, &[&cid, ts, iid, &limit])
+            query_cached(&client, &sql, &[&cid, ts, iid, &limit])
                 .await
                 .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?
         } else {
-            client
-                .query(&sql, &[&cid, &limit])
+            query_cached(&client, &sql, &[&cid, &limit])
                 .await
                 .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?
         };
@@ -829,8 +855,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .get()
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
-        let rows = client
-            .query(&sql, &[&item_id.0.as_str()])
+        let rows = query_cached(&client, &sql, &[&item_id.0.as_str()])
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         if rows.is_empty() {
@@ -858,10 +883,13 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .get()
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
-        let row = client
-            .query_one(&sql, &[&conversation_id.0.as_str(), &item_id.0.as_str()])
-            .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        let row = query_one_cached(
+            &client,
+            &sql,
+            &[&conversation_id.0.as_str(), &item_id.0.as_str()],
+        )
+        .await
+        .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
@@ -884,10 +912,13 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .get()
             .await
             .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
-        client
-            .execute(&sql, &[&conversation_id.0.as_str(), &item_id.0.as_str()])
-            .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        execute_cached(
+            &client,
+            &sql,
+            &[&conversation_id.0.as_str(), &item_id.0.as_str()],
+        )
+        .await
+        .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
         Ok(())
     }
 }
@@ -1284,7 +1315,7 @@ impl ResponseStorage for PostgresResponseStorage {
 
         // Build dynamic column/param lists, skipping configured skip_columns
         let mut col_names: Vec<&str> = vec![s.col("id")];
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&response_id.0];
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&response_id.0];
 
         if !s.is_skipped("conversation_id") {
             col_names.push(s.col("conversation_id"));
@@ -1385,8 +1416,7 @@ impl ResponseStorage for PostgresResponseStorage {
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
-        let rows = client
-            .query(&sql, &[&response_id.0.as_str()])
+        let rows = query_cached(&client, &sql, &[&response_id.0.as_str()])
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         if rows.is_empty() {
@@ -1409,8 +1439,7 @@ impl ResponseStorage for PostgresResponseStorage {
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
-        let rows = client
-            .query(&sql, &[&item_id])
+        let rows = query_cached(&client, &sql, &[&item_id])
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         match rows.first() {
@@ -1430,13 +1459,13 @@ impl ResponseStorage for PostgresResponseStorage {
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
-        client
-            .execute(
-                &format!("DELETE FROM {table} WHERE {col_id} = $1"),
-                &[&response_id.0.as_str()],
-            )
-            .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+        execute_cached(
+            &client,
+            &format!("DELETE FROM {table} WHERE {col_id} = $1"),
+            &[&response_id.0.as_str()],
+        )
+        .await
+        .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         Ok(())
     }
 
@@ -1472,14 +1501,12 @@ impl ResponseStorage for PostgresResponseStorage {
                 "{} WHERE {col_safety} = $1{order_clause} LIMIT $2",
                 self.select_base,
             );
-            client
-                .query(&sql, &[&identifier, &l_i64])
+            query_cached(&client, &sql, &[&identifier, &l_i64])
                 .await
                 .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?
         } else {
             let sql = format!("{} WHERE {col_safety} = $1{order_clause}", self.select_base,);
-            client
-                .query(&sql, &[&identifier])
+            query_cached(&client, &sql, &[&identifier])
                 .await
                 .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?
         };
@@ -1512,8 +1539,7 @@ impl ResponseStorage for PostgresResponseStorage {
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
-        let rows_deleted = client
-            .execute(&sql, &[&identifier])
+        let rows_deleted = execute_cached(&client, &sql, &[&identifier])
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         Ok(rows_deleted as usize)
