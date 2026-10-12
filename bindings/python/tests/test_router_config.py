@@ -522,4 +522,6 @@ class TestRouterPositionalSignature:
             "jemalloc_prof_dir",
             "tokenizer_cache_l0_max_memory",
             "max_background_responses",
+            "header_read_timeout_secs",
+            "idle_connection_timeout_secs",
         ]
