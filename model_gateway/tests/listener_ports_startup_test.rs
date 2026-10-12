@@ -237,23 +237,35 @@ fn a_late_configuration_error_binds_nothing() {
     }
 }
 
-/// A listener port another process holds (here the metrics port) is refused
-/// with nothing left behind: the mesh server, which joins the cluster when
-/// it starts, must not come up and vanish with the process.
+/// A listener port another process holds is refused with the mesh server
+/// never started: a member that joined the cluster and vanished with the
+/// process is the partial start the checks exist to prevent. The metrics
+/// port held (the first bind), then the HTTP port (the last one).
 #[test]
 fn a_held_listener_port_starts_no_mesh_member() {
     let dir = tempfile::tempdir().expect("a temp dir");
-    let held = TcpListener::bind((IP, 0)).expect("a port to hold");
-    let metrics_port = held.local_addr().expect("the held address").port();
-    let [port, mesh_port, _] = free_ports();
-    let mut args = base_args(port, metrics_port);
-    args.extend(mesh_args(mesh_port));
+    for hold_http_port in [false, true] {
+        let held = TcpListener::bind((IP, 0)).expect("a port to hold");
+        let held_port = held.local_addr().expect("the held address").port();
+        let [free_port, mesh_port, _] = free_ports();
+        let (name, port, metrics_port, watch) = if hold_http_port {
+            // The metrics and probe listeners are up when the HTTP bind
+            // fails (they bind earlier, by design): the mesh port alone is
+            // watched here.
+            ("port-held", held_port, free_port, vec![mesh_port])
+        } else {
+            (
+                "metrics-port-held",
+                free_port,
+                held_port,
+                vec![mesh_port, free_port],
+            )
+        };
+        let mut args = base_args(port, metrics_port);
+        args.extend(mesh_args(mesh_port));
 
-    let launch = launch(
-        &args,
-        &[mesh_port, port],
-        &dir.path().join("metrics-port-held.log"),
-    );
-    assert_refused("metrics-port-held", &launch, &["Address already in use"]);
-    drop(held);
+        let launch = launch(&args, &watch, &dir.path().join(format!("{name}.log")));
+        assert_refused(name, &launch, &["Address already in use"]);
+        drop(held);
+    }
 }

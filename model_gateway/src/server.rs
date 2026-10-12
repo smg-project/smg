@@ -1709,22 +1709,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
     }
 
-    // The mesh server starts once the metrics and probe listeners are bound:
-    // a member that joined the cluster and vanished with a failed bind is the
-    // partial start the checks above exist to prevent. The adapters above
-    // have registered their namespaces, so gossip is safe to start.
-    if let Some(mesh_server) = mesh_server {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
-        )]
-        spawn(async move {
-            if let Err(e) = mesh_server.start().await {
-                tracing::error!("Mesh server failed: {}", e);
-            }
-        });
-    }
-
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
@@ -1833,7 +1817,31 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // One bind-host rule for every listener: IPv6 with or without brackets.
     let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
+    // The HTTP listener binds now, eagerly, the last of the listeners: a port
+    // another process holds fails the start here, before the mesh server
+    // below has joined the cluster. Its accept loop starts at `serve`.
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("Failed to configure the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
+
+    // The mesh server starts once every listener is bound: a member that
+    // joined the cluster and vanished with a failed bind is the partial start
+    // the checks above exist to prevent. The adapters registered their
+    // namespaces earlier, so gossip is safe to start.
+    if let Some(mesh_server) = mesh_server {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
+        )]
+        spawn(async move {
+            if let Err(e) = mesh_server.start().await {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
+    }
 
     // Set up graceful shutdown (common to both TLS and non-TLS)
 
@@ -1908,13 +1916,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let server_result = if let Some(tls_config) = tls_config {
         info!("TLS enabled");
 
-        axum_server::bind_rustls(addr, tls_config)
+        axum_server::from_tcp_rustls(listener, tls_config)?
             .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
-        bind_http_server(addr, connection_timeouts)
+        axum_server::from_tcp(listener)?
+            .acceptor(http_acceptor(connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -1937,11 +1946,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-/// Disable Nagle buffering on accepted plain-HTTP sockets so small streaming
-/// writes need not wait for outstanding data to be acknowledged, and bound the
-/// connections that carry no request (see [`connection_timeouts`]). This
-/// changes no HTTP payload; the separately configured TLS listener applies the
-/// same bounds around its handshake acceptor.
+/// The plain-HTTP acceptor: Nagle buffering disabled on accepted sockets so
+/// small streaming writes need not wait for outstanding data to be
+/// acknowledged, and the connections that carry no request bounded (see
+/// [`connection_timeouts`]). This changes no HTTP payload; the separately
+/// configured TLS listener applies the same bounds around its handshake
+/// acceptor.
+fn http_acceptor(
+    timeouts: ConnectionTimeouts,
+) -> ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor> {
+    ConnectionTimeoutAcceptor::new(axum_server::accept::NoDelayAcceptor::new(), timeouts)
+}
+
+/// A plain-HTTP server bound on `addr` with [`http_acceptor`]. Start-up
+/// serves a listener it bound earlier (see `startup`); the tests bind here.
+#[cfg(test)]
 fn bind_http_server(
     addr: std::net::SocketAddr,
     timeouts: ConnectionTimeouts,
@@ -1949,10 +1968,7 @@ fn bind_http_server(
     std::net::SocketAddr,
     ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor>,
 > {
-    axum_server::bind(addr).acceptor(ConnectionTimeoutAcceptor::new(
-        axum_server::accept::NoDelayAcceptor::new(),
-        timeouts,
-    ))
+    axum_server::bind(addr).acceptor(http_acceptor(timeouts))
 }
 
 #[expect(
