@@ -3013,6 +3013,7 @@ mod tests {
         ])
         .ignored_companions(&prefill, &[]);
         assert!(paired.is_empty(), "{paired:?}");
+    }
 
     /// The arguments of `smg launch ...`, the form a deployment uses.
     fn launch_args_from(args: &[&str]) -> CliArgs {
