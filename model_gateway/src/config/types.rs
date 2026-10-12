@@ -388,10 +388,15 @@ pub struct RouterConfig {
     /// RL control plane (`/v1/rl/*`); inert unless `rl.enabled`.
     #[serde(default)]
     pub rl: smg_rl::RlConfig,
-    /// Can be a HuggingFace model ID or local path
+    /// Can be a HuggingFace model ID or local path. A local path (absolute,
+    /// explicitly relative, or present on disk) must exist and hold a
+    /// tokenizer file at configuration validation; a model ID is fetched
+    /// lazily. Not checked with `disable_tokenizer_autoload`.
     pub model_path: Option<String>,
-    /// Overrides model_path tokenizer if provided
+    /// Overrides model_path tokenizer if provided; the same rule applies.
     pub tokenizer_path: Option<String>,
+    /// Path of the chat template file: must exist, be readable and not be
+    /// empty at configuration validation.
     pub chat_template: Option<String>,
     /// Alias → canonical model ID map. At worker creation, every alias whose
     /// canonical ID equals the worker's model ID is added to that model's

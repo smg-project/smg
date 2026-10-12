@@ -1210,15 +1210,17 @@ struct CliArgs {
     drain_settle_secs: u64,
 
     // ==================== Tokenizer ====================
-    /// Model path for loading tokenizer (HuggingFace ID or local path)
+    /// Model path for loading tokenizer (HuggingFace ID, fetched lazily, or a
+    /// local path, which must exist and hold a tokenizer file)
     #[arg(long, alias = "model", help_heading = "Tokenizer")]
     model_path: Option<String>,
 
-    /// Explicit tokenizer path (overrides model_path)
+    /// Explicit tokenizer path (overrides model_path); a local path must
+    /// exist and hold a tokenizer file
     #[arg(long, help_heading = "Tokenizer")]
     tokenizer_path: Option<String>,
 
-    /// Chat template path
+    /// Chat template path: an existing, non-empty template file
     #[arg(long, help_heading = "Tokenizer")]
     chat_template: Option<String>,
 

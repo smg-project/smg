@@ -1818,19 +1818,25 @@ class RouterArgs:
             f"--{prefix}model",
             type=str,
             default=None,
-            help="Model path for loading tokenizer (HuggingFace model ID or local path)",
+            help=(
+                "Model path for loading tokenizer (HuggingFace model ID, fetched lazily, or a"
+                " local path, which must exist and hold a tokenizer file)"
+            ),
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-path",
             type=str,
             default=None,
-            help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+            help=(
+                "Explicit tokenizer path (overrides model_path tokenizer if provided); a local"
+                " path must exist and hold a tokenizer file"
+            ),
         )
         tokenizer_group.add_argument(
             f"--{prefix}chat-template",
             type=str,
             default=None,
-            help="Chat template path (optional)",
+            help="Chat template path (optional): an existing, non-empty template file",
         )
         tokenizer_group.add_argument(
             f"--{prefix}disable-tokenizer-autoload",

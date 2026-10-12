@@ -1,4 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::Path,
+};
 
 use axum::http::HeaderName;
 use sha2::{Digest, Sha256};
@@ -24,6 +27,7 @@ fn validate_distinct_listener_ports(listeners: &[(&str, &str, u16)]) -> ConfigRe
     Ok(())
 }
 
+
 /// The mesh listener's port against the HTTP, metrics and probe ports. The
 /// mesh configuration lives beside the router configuration, out of
 /// [`ConfigValidator`]'s sight, so `server::startup` runs this check: it is
@@ -43,6 +47,72 @@ pub fn validate_mesh_listener_port(
     ];
     let listeners: Vec<_> = listeners.into_iter().flatten().collect();
     validate_distinct_listener_ports(&listeners)
+}
+
+/// Whether a tokenizer source names a path on this host rather than a hub
+/// id: absolute or explicitly relative, more than one separator (a hub id is
+/// `owner/name`), or simply present on disk.
+fn names_a_local_path(source: &str) -> bool {
+    source.starts_with('/')
+        || source.starts_with("./")
+        || source.starts_with("../")
+        || source.starts_with('~')
+        || source.matches('/').count() > 1
+        || Path::new(source).exists()
+}
+
+/// Why `path` cannot serve as a local tokenizer source, if it cannot: it
+/// must exist and be readable; a directory must hold one of the files the
+/// tokenizer loader recognizes, a file must not be empty.
+fn local_tokenizer_source_error(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "does not exist".to_string(),
+        _ => format!("cannot be read: {error}"),
+    })?;
+    if !metadata.is_dir() {
+        std::fs::File::open(path).map_err(|error| format!("cannot be read: {error}"))?;
+        if metadata.len() == 0 {
+            return Err("is empty".to_string());
+        }
+        return Ok(());
+    }
+    let mut entries =
+        std::fs::read_dir(path).map_err(|error| format!("cannot be read: {error}"))?;
+    let holds_a_tokenizer = entries.any(|entry| {
+        entry.is_ok_and(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == "tokenizer.json"
+                || name == "tiktoken.model"
+                || name.ends_with(".tiktoken")
+                || name == "vocab.json"
+        })
+    });
+    if holds_a_tokenizer {
+        Ok(())
+    } else {
+        Err(
+            "contains no tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken or vocab.json)"
+                .to_string(),
+        )
+    }
+}
+
+/// Why `path` is not a readable, non-empty text file, if it is not.
+fn text_file_error(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "does not exist".to_string(),
+        _ => format!("cannot be read: {error}"),
+    })?;
+    if metadata.is_dir() {
+        return Err("is a directory, not a file".to_string());
+    }
+    let content =
+        std::fs::read_to_string(path).map_err(|error| format!("cannot be read: {error}"))?;
+    if content.trim().is_empty() {
+        return Err("is empty".to_string());
+    }
+    Ok(())
 }
 
 /// Validate a user-supplied mesh server name. The name keys rate-limit
@@ -202,6 +272,7 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+        Self::validate_tokenizer_sources(config)?;
 
         Ok(())
     }
@@ -1398,6 +1469,45 @@ impl ConfigValidator {
             });
         }
 
+        Ok(())
+    }
+
+    /// The tokenizer sources named in the configuration are checked before
+    /// anything binds: `tokenizer_path` and `model_path` when they name a
+    /// path on this host (absolute, explicitly relative, more than one
+    /// separator, or present on disk; anything else is a hub id the loader
+    /// fetches lazily, as before), and `chat_template` always. A path must
+    /// exist and be readable, a directory must hold a tokenizer file the
+    /// loader knows, a file must not be empty. The load itself stays where it
+    /// was, a background job at start-up and at worker registration: this is
+    /// the part of it that can be known before serving. With autoload
+    /// disabled the paths are never read and are not checked.
+    fn validate_tokenizer_sources(config: &RouterConfig) -> ConfigResult<()> {
+        if config.disable_tokenizer_autoload {
+            return Ok(());
+        }
+        let sources = [
+            ("tokenizer_path", config.tokenizer_path.as_deref()),
+            ("model_path", config.model_path.as_deref()),
+        ];
+        for (field, source) in sources {
+            if let Some(source) = source.filter(|source| names_a_local_path(source)) {
+                local_tokenizer_source_error(Path::new(source)).map_err(|reason| {
+                    ConfigError::InvalidValue {
+                        field: field.to_string(),
+                        value: source.to_string(),
+                        reason,
+                    }
+                })?;
+            }
+        }
+        if let Some(template) = config.chat_template.as_deref() {
+            text_file_error(Path::new(template)).map_err(|reason| ConfigError::InvalidValue {
+                field: "chat_template".to_string(),
+                value: template.to_string(),
+                reason,
+            })?;
+        }
         Ok(())
     }
 
@@ -2820,10 +2930,148 @@ mod tests {
         );
 
         config.connection_mode = ConnectionMode::Grpc;
-        config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, "{}").unwrap();
+        config.tokenizer_path = Some(tokenizer.to_string_lossy().into_owned());
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    /// A directory with the one file the tokenizer loader looks for first.
+    fn tokenizer_dir(dir: &tempfile::TempDir) -> String {
+        let tok = dir.path().join("tok");
+        std::fs::create_dir(&tok).unwrap();
+        std::fs::write(tok.join("tokenizer.json"), "{}").unwrap();
+        tok.to_str().unwrap().to_string()
+    }
+
+    /// The `(value, reason)` of the `expected_field` error a configuration
+    /// is refused with.
+    fn refused_source(config: &RouterConfig, expected_field: &str) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == expected_field => (value, reason),
+            other => panic!("expected a {expected_field} error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tokenizer_or_model_path_that_cannot_be_read_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let empty_dir = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty_dir).unwrap();
+        let empty_file = dir.path().join("empty.json");
+        std::fs::write(&empty_file, "").unwrap();
+        let cases = [
+            (missing.to_str().unwrap(), "does not exist"),
+            (empty_dir.to_str().unwrap(), "contains no tokenizer file"),
+            (empty_file.to_str().unwrap(), "is empty"),
+        ];
+        for (path, expected) in cases {
+            let as_tokenizer = RouterConfig {
+                tokenizer_path: Some(path.to_string()),
+                ..Default::default()
+            };
+            let as_model = RouterConfig {
+                model_path: Some(path.to_string()),
+                ..Default::default()
+            };
+            for (field, config) in [("tokenizer_path", as_tokenizer), ("model_path", as_model)] {
+                let (value, reason) = refused_source(&config, field);
+                assert_eq!(value, path);
+                assert!(reason.contains(expected), "{field} {path}: {reason}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_tokenizer_path_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("unreadable.json");
+        std::fs::write(&unreadable, "{}").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged process reads regardless of the mode: nothing to test.
+        let privileged = std::fs::File::open(&unreadable).is_ok();
+        let config = RouterConfig {
+            tokenizer_path: Some(unreadable.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let verdict = ConfigValidator::validate(&config);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if privileged {
+            return;
+        }
+        match verdict {
+            Err(ConfigError::InvalidValue { field, reason, .. }) if field == "tokenizer_path" => {
+                assert!(reason.contains("cannot be read"), "{reason}");
+            }
+            other => panic!("expected a tokenizer_path error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hub_id_or_a_present_local_tokenizer_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let sources = [
+            tok.clone(),
+            format!("{tok}/tokenizer.json"),
+            "some-org/some-model".to_string(),
+        ];
+        for source in sources {
+            let config = RouterConfig {
+                tokenizer_path: Some(source.clone()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{source}");
+            let config = RouterConfig {
+                model_path: Some(source.clone()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{source}");
+        }
+        // With autoload disabled the paths are never read, so not checked.
+        let config = RouterConfig {
+            tokenizer_path: Some(format!("{}/missing", dir.path().to_str().unwrap())),
+            disable_tokenizer_autoload: true,
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_chat_template_that_cannot_be_used_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let missing = dir.path().join("missing.jinja");
+        let blank = dir.path().join("blank.jinja");
+        std::fs::write(&blank, " \n").unwrap();
+        let template = dir.path().join("template.jinja");
+        std::fs::write(&template, "{{ messages }}").unwrap();
+        let with_template = |path: &str| RouterConfig {
+            tokenizer_path: Some(tok.clone()),
+            chat_template: Some(path.to_string()),
+            ..Default::default()
+        };
+        let cases = [
+            (missing.to_str().unwrap(), "does not exist"),
+            (blank.to_str().unwrap(), "is empty"),
+            (dir.path().to_str().unwrap(), "is a directory"),
+        ];
+        for (path, expected) in cases {
+            let (value, reason) = refused_source(&with_template(path), "chat_template");
+            assert_eq!(value, path);
+            assert!(reason.contains(expected), "{path}: {reason}");
+        }
+        assert!(ConfigValidator::validate(&with_template(template.to_str().unwrap())).is_ok());
     }
 
     #[test]
