@@ -19,8 +19,8 @@
 //!
 //! The template sorts a call's keys, so a call's arguments come back with the keys in that order
 //! whatever order the request gave them: the replay counts such a case as respelled, not as a
-//! difference (bellwether #110). No grammar yet: `Format::grammar` gives `None` for this syntax
-//! until its tag is derived.
+//! difference (bellwether #110). `Format::grammar` writes a forced call's tag in this spelling,
+//! the keys sorted the same way (the grammar's `gemma` module).
 
 use crate::format::{CallSyntax, Emits, Format};
 

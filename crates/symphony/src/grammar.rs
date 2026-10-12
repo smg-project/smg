@@ -26,7 +26,9 @@
 //! list, each value in the template's spelling, for Olmo 3 and LFM2.5 (the `pythonic` module);
 //! xLAM's bare list of JSON objects, written from the tools alone since its table has no markers;
 //! for MiniMax M3, the XML tree of elements with the table's separator before every tag (the
-//! `xml` module). The gateway's old parsers wrote these tags by hand, one function per parser;
+//! `xml` module); Gemma 4's `call:NAME{key:value}` spelling, the keys sorted and each string
+//! between `<|"|>` tokens (the `gemma` module). The gateway's old parsers wrote these tags by
+//! hand, one function per parser;
 //! where one exists for a format Symphony has, the derived tag is pinned to it in the tests, so
 //! the switch changes nothing an engine sees.
 //!
@@ -47,19 +49,21 @@
 //! other state, its own row into the block. So the model closes whatever the prompt left open on
 //! its way to the calls, whichever that was.
 //!
-//! A table without calls gives `None`, as do Inkling's named JSON (a forced call's tag would start
-//! inside the first message, before any opener) and Gemma 4's syntax until their tags are derived;
-//! the gateway takes the JSON-schema path for them.
+//! A table without calls gives `None`, as does Inkling's named JSON (a forced call's tag would
+//! start inside the first message, before any opener) until its tag is derived; the gateway takes
+//! the JSON-schema path for it.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use crate::{
     format::{CallSyntax, Emits, Format},
+    gemma::STRING as GEMMA_STRING,
     tagged::{assembler::TAGS as TAGGED_TAGS, dsml, keyed::Tags as KeyedTags},
 };
 
 mod attributed;
+mod gemma;
 mod keyed;
 mod pythonic;
 mod schema;
@@ -187,6 +191,22 @@ impl Grammar {
     /// The grammar as a request carries it to the engine: under `format`.
     pub fn payload(&self) -> Value {
         json!({"format": self.to_json()})
+    }
+
+    /// The nodes in the tree, this one included: its size, for a derivation that bounds it.
+    pub(crate) fn nodes(&self) -> usize {
+        1 + match self {
+            Self::ConstString(_)
+            | Self::AnyText { .. }
+            | Self::Regex(_)
+            | Self::JsonSchema { .. } => 0,
+            Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
+            Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
+            Self::Tag(tag) => tag.content.nodes(),
+            Self::TriggeredTags { tags, .. } | Self::TagsWithSeparator { tags, .. } => {
+                tags.iter().map(|tag| tag.content.nodes()).sum()
+            }
+        }
     }
 }
 
@@ -318,7 +338,8 @@ impl Format {
             CallSyntax::Xml => {
                 return xml::calls(markers?, self.separator(), &named, at_least_one);
             }
-            CallSyntax::NamedJson(_) | CallSyntax::Gemma => return None,
+            CallSyntax::Gemma => gemma::calls(markers?, &named, at_least_one),
+            CallSyntax::NamedJson(_) => return None,
         };
         if !reasoning_open {
             return Some(calls);
@@ -345,6 +366,7 @@ impl Format {
             Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
             Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
+            Some(CallSyntax::Gemma) => &[GEMMA_STRING],
             _ => &[],
         };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));

@@ -3,7 +3,8 @@
 //! pins and the grammar of a value of that type, and the definitions a property's schema carries
 //! along so a `$ref` inside it still resolves when the engine compiles it on its own; and the walk
 //! over a tool's properties the syntaxes share: one argument per property, in the schema's order,
-//! optional unless the schema requires it.
+//! optional unless the schema requires it; and the rule for pairs a separator joins, which stands
+//! between two present pairs only (Olmo 3's `, `, Gemma 4's `,`).
 
 use serde_json::{json, Value};
 
@@ -43,6 +44,65 @@ pub(super) fn arguments(
             })
             .collect(),
     )
+}
+
+/// `pairs` joined by `separator`, each pair present when its flag says the schema requires it and
+/// otherwise optional. The separator stands between two present pairs only, so the sequence is
+/// one choice per pair that may stand first (every pair up to the first required one), each
+/// followed by the pairs after it, a required one with its separator, an optional one with its
+/// separator inside the option; the whole is optional when no pair is required, and no pairs are
+/// the empty text.
+pub(super) fn joined(pairs: &[(Grammar, bool)], separator: &str) -> Grammar {
+    let (first_required, may_start) = starts_of(pairs);
+    let mut starts: Vec<Grammar> = (0..may_start)
+        .map(|first| {
+            let mut elements = vec![pairs[first].0.clone()];
+            for (pair, required) in &pairs[first + 1..] {
+                let with_separator = Grammar::Sequence(vec![
+                    Grammar::ConstString(separator.to_string()),
+                    pair.clone(),
+                ]);
+                elements.push(if *required {
+                    with_separator
+                } else {
+                    Grammar::Optional(Box::new(with_separator))
+                });
+            }
+            Grammar::Sequence(elements)
+        })
+        .collect();
+    let some = match starts.len() {
+        0 => return Grammar::Sequence(Vec::new()),
+        1 => starts.swap_remove(0),
+        _ => Grammar::Or(starts),
+    };
+    if first_required.is_some() {
+        some
+    } else {
+        Grammar::Optional(Box::new(some))
+    }
+}
+
+/// The position of the first required pair, and how many pairs may stand first: every pair up to
+/// and including it, or all of them when none is required.
+fn starts_of(pairs: &[(Grammar, bool)]) -> (Option<usize>, usize) {
+    let first_required = pairs.iter().position(|(_, required)| *required);
+    (
+        first_required,
+        first_required.map_or(pairs.len(), |at| at + 1),
+    )
+}
+
+/// The nodes [`joined`] would make of `pairs`, the separators left out: each pair is copied into
+/// every start before it, so the pair at `i` goes into `i + 1` starts, or into every start when
+/// the required pairs leave fewer. A derivation that bounds its tree asks before joining.
+pub(super) fn joined_nodes(pairs: &[(Grammar, bool)]) -> usize {
+    let (_, may_start) = starts_of(pairs);
+    pairs
+        .iter()
+        .enumerate()
+        .map(|(at, (pair, _))| pair.nodes() * (at + 1).min(may_start))
+        .sum()
 }
 
 /// The schema's own keyword, or its `$ref` target's: a `$ref` lends its target's keywords, and

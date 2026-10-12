@@ -4,9 +4,8 @@
 //!
 //! A call is the tool's name, `(`, its arguments and `)`. The arguments are `key=value` pairs in
 //! the schema's order, joined by `, `, each present when the schema requires it and otherwise
-//! optional; since the comma stands between two present pairs only, the pairs are written as one
-//! choice per pair that may come first, the required ones and those after it following each with
-//! its comma. A value follows the property's type in the dialect's spelling of a value, which is
+//! optional, the comma between two present pairs only (the `schema` module's `joined`). A value
+//! follows the property's type in the dialect's spelling of a value, which is
 //! the template's: LFM2.5 writes Python, a string in either quote (`"Paris"`, `'Paris'`), a
 //! string `enum` as one of its values quoted the same way, a boolean as `True` or `False`, `null`
 //! as `None`; Olmo 3 writes every value through `tojson`, so JSON, a string in double quotes, an
@@ -20,7 +19,7 @@ use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use super::{
-    schema::{keyword, shape, Definitions},
+    schema::{joined, keyword, shape, Definitions},
     CallMarkers, Grammar, Tag,
 };
 use crate::pythonic::{Dialect, Framing, Values};
@@ -78,10 +77,8 @@ fn call(name: &str, parameters: &Value, values: Values) -> Grammar {
 }
 
 /// The arguments the tool's schema asks for, joined by `, `: every pair the schema requires, and
-/// each other pair optional. The comma stands between two present pairs only, so the sequence is
-/// one choice per pair that may stand first (every pair up to the first required one), each
-/// followed by the pairs after it, a required one with its comma, an optional one with its comma
-/// inside the option. A schema without properties takes any text up to the `)`.
+/// each other pair optional, the comma between two present pairs only ([`joined`]). A schema
+/// without properties takes any text up to the `)`.
 fn arguments(parameters: &Value, values: Values) -> Grammar {
     let Some(properties) = parameters
         .get("properties")
@@ -105,32 +102,7 @@ fn arguments(parameters: &Value, values: Values) -> Grammar {
             )
         })
         .collect();
-    let first_required = pairs.iter().position(|(_, required)| *required);
-    let may_start = first_required.map_or(pairs.len(), |at| at + 1);
-    let starts: Vec<Grammar> = (0..may_start)
-        .map(|first| {
-            let mut elements = vec![pairs[first].0.clone()];
-            for (pair, required) in &pairs[first + 1..] {
-                let with_comma =
-                    Grammar::Sequence(vec![Grammar::ConstString(", ".to_string()), pair.clone()]);
-                elements.push(if *required {
-                    with_comma
-                } else {
-                    Grammar::Optional(Box::new(with_comma))
-                });
-            }
-            Grammar::Sequence(elements)
-        })
-        .collect();
-    let some = match starts.len() {
-        1 => starts.into_iter().next().unwrap_or_else(any_arguments),
-        _ => Grammar::Or(starts),
-    };
-    if first_required.is_some() {
-        some
-    } else {
-        Grammar::Optional(Box::new(some))
-    }
+    joined(&pairs, ", ")
 }
 
 /// One pair: the key, `=`, and the value the property's schema pins.
