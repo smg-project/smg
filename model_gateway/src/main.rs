@@ -136,6 +136,16 @@ pub enum DiscoveryProvider {
     File,
 }
 
+impl DiscoveryProvider {
+    /// The spelling `--discovery-provider` takes for this provider.
+    fn flag_value(self) -> &'static str {
+        match self {
+            Self::Kubernetes => "kubernetes",
+            Self::File => "file",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "shepherd-model-gateway", alias = "smg", alias = "amg")]
 #[command(about = "Shepherd Model Gateway - High-performance inference gateway")]
@@ -2024,14 +2034,17 @@ impl CliArgs {
             reason: reason.to_string(),
         };
         for origin in &self.cors_allowed_origins {
-            let parsed = http::Uri::try_from(origin.as_str())
-                .ok()
-                .filter(|uri| uri.scheme().is_some() && uri.authority().is_some());
+            // Exactly what a browser sends as `Origin`: a path, even `/`, would
+            // never match the exact comparison of the CORS layer.
+            let parsed = http::Uri::try_from(origin.as_str()).ok().filter(|uri| {
+                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
+                    if origin.as_str() == format!("{scheme}://{authority}"))
+            });
             if parsed.is_none() || http::HeaderValue::from_str(origin).is_err() {
                 return Err(invalid(
                     "cors_allowed_origins",
                     origin,
-                    "not an origin (scheme://host[:port]); the policy would silently narrow to the origins that parse",
+                    "not exactly an origin (scheme://host[:port], nothing after it); the policy would silently narrow to the origins that match",
                 ));
             }
         }
@@ -2106,7 +2119,11 @@ impl CliArgs {
 
     /// The flags that only act with a companion, named when the companion is
     /// absent: each used to be ignored in silence.
-    fn ignored_companions(&self, prefill_urls: &[(String, Option<u16>)]) -> Vec<String> {
+    fn ignored_companions(
+        &self,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) -> Vec<String> {
         let mut ignored = Vec::new();
         if !(self.pd_disaggregation || self.epd_disaggregation) {
             for (flag, given) in [
@@ -2122,7 +2139,27 @@ impl CliArgs {
                 }
             }
         }
-        if !(self.service_discovery || self.discovery_provider.is_some()) {
+        if !self.epd_disaggregation {
+            for (flag, given) in [
+                ("--encode", !encode_urls.is_empty()),
+                ("--encode-policy", self.encode_policy.is_some()),
+            ] {
+                if given {
+                    ignored.push(format!("{flag} is ignored without --epd-disaggregation"));
+                }
+            }
+        }
+        // The selectors select Kubernetes pods: another provider ignores them
+        // as the absence of any does.
+        let provider = self.selected_discovery_provider();
+        if provider != Some(DiscoveryProvider::Kubernetes) {
+            let without = match provider {
+                None => "without --service-discovery".to_string(),
+                Some(provider) => format!(
+                    "under --discovery-provider {}: it selects Kubernetes pods",
+                    provider.flag_value()
+                ),
+            };
             for (flag, given) in [
                 ("--selector", !self.selector.is_empty()),
                 ("--prefill-selector", !self.prefill_selector.is_empty()),
@@ -2131,15 +2168,22 @@ impl CliArgs {
                 ("--router-selector", !self.router_selector.is_empty()),
             ] {
                 if given {
-                    ignored.push(format!("{flag} is ignored without --service-discovery"));
+                    ignored.push(format!("{flag} is ignored {without}"));
                 }
             }
-        } else if !self.worker_urls.is_empty() {
-            ignored.push(
-                "--worker-urls and --service-discovery are both given: both are worker sources, \
-                 the listed workers register first and the discovered ones join them"
-                    .to_string(),
-            );
+        }
+        if let Some(provider) = provider {
+            if !self.worker_urls.is_empty() {
+                let source = if self.service_discovery {
+                    "--service-discovery".to_string()
+                } else {
+                    format!("--discovery-provider {}", provider.flag_value())
+                };
+                ignored.push(format!(
+                    "--worker-urls and {source} are both given: both are worker sources, \
+                     the listed workers register first and the discovered ones join them"
+                ));
+            }
         }
         if self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled {
             ignored.push(
@@ -2153,8 +2197,12 @@ impl CliArgs {
     /// The companion warnings of [`ignored_companions`](Self::ignored_companions), one
     /// line each on stderr: the logger is not up when the flags are read.
     #[expect(clippy::print_stderr, reason = "pre-logger CLI configuration warnings")]
-    fn warn_ignored_companions(&self, prefill_urls: &[(String, Option<u16>)]) {
-        for ignored in self.ignored_companions(prefill_urls) {
+    fn warn_ignored_companions(
+        &self,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) {
+        for ignored in self.ignored_companions(prefill_urls, encode_urls) {
             eprintln!("WARNING: {ignored}");
         }
     }
@@ -2165,7 +2213,7 @@ impl CliArgs {
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         self.validate_flag_formats()?;
-        self.warn_ignored_companions(&prefill_urls);
+        self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
@@ -2733,6 +2781,10 @@ mod tests {
                 "cors_allowed_origins",
             ),
             (
+                vec!["--cors-allowed-origins", "https://example.com/"],
+                "cors_allowed_origins",
+            ),
+            (
                 vec!["--health-check-endpoint", "health"],
                 "health_check_endpoint",
             ),
@@ -2797,6 +2849,7 @@ mod tests {
     #[test]
     fn flags_without_their_companion_are_named() {
         let prefill = [("http://127.0.0.1:1".to_string(), None)];
+        let encode = [("http://127.0.0.1:3".to_string(), None)];
         let ignored = cli_args_from(&[
             "--decode",
             "http://127.0.0.1:2",
@@ -2804,17 +2857,21 @@ mod tests {
             "random",
             "--prefill-policy",
             "random",
+            "--encode-policy",
+            "random",
             "--selector",
             "a=b",
             "--priority-scheduler-config",
             "/dev/null",
         ])
-        .ignored_companions(&prefill);
+        .ignored_companions(&prefill, &encode);
         for flag in [
             "--prefill",
             "--decode",
             "--decode-policy",
             "--prefill-policy",
+            "--encode",
+            "--encode-policy",
             "--selector",
             "--priority-scheduler-config",
         ] {
@@ -2830,12 +2887,42 @@ mod tests {
             "--selector",
             "a=b",
         ])
-        .ignored_companions(&[]);
+        .ignored_companions(&[], &[]);
         assert!(
             both.iter()
                 .any(|m| m.contains("--worker-urls") && m.contains("--service-discovery")),
             "{both:?}"
         );
+        // Another provider ignores the selectors too, and the worker-urls
+        // note names the provider that was given.
+        let under_file = cli_args_from(&[
+            "--discovery-provider",
+            "file",
+            "--selector",
+            "a=b",
+            "--worker-urls",
+            "http://127.0.0.1:1",
+        ])
+        .ignored_companions(&[], &[]);
+        assert!(
+            under_file
+                .iter()
+                .any(|m| m.starts_with("--selector") && m.contains("--discovery-provider file")),
+            "{under_file:?}"
+        );
+        assert!(
+            under_file.iter().any(|m| m.starts_with("--worker-urls")
+                && m.contains("--discovery-provider file")
+                && !m.contains("--service-discovery")),
+            "{under_file:?}"
+        );
+        let under_kubernetes =
+            cli_args_from(&["--discovery-provider", "kubernetes", "--selector", "a=b"])
+                .ignored_companions(&[], &[]);
+        assert!(under_kubernetes.is_empty(), "{under_kubernetes:?}");
+        let epd = cli_args_from(&["--epd-disaggregation", "--encode-policy", "random"])
+            .ignored_companions(&[], &encode);
+        assert!(epd.is_empty(), "{epd:?}");
         let paired = cli_args_from(&[
             "--pd-disaggregation",
             "--decode",
@@ -2849,7 +2936,7 @@ mod tests {
             "--priority-scheduler-config",
             "/dev/null",
         ])
-        .ignored_companions(&prefill);
+        .ignored_companions(&prefill, &[]);
         assert!(paired.is_empty(), "{paired:?}");
     }
 
