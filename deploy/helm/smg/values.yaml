@@ -163,13 +163,23 @@ router:
     enabled: false
     minAvailable: 1
 
-  # -- Security context for router container
-  # NOTE: The default SMG image runs as root. Set runAsNonRoot: true only if
-  # your image is built with a non-root USER directive.
+  # -- Security context for the router container. The published image runs as
+  # a dedicated non-root user (UID 65532, see docker/Dockerfile), so the
+  # container is pinned to that user, drops every Linux capability (the router
+  # binds unprivileged ports only) and runs under the runtime's default seccomp
+  # profile. For an image built with another user, override runAsUser and
+  # runAsGroup (or set runAsNonRoot: false).
   securityContext:
     readOnlyRootFilesystem: true
-    runAsNonRoot: false
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
     allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
 
   # -- Liveness probe tuning
   livenessProbe:
