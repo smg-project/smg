@@ -4,7 +4,7 @@
 # forward migrations during e2e startup. Pin this to the latest core history
 # migration version that the Flyway-managed schema actually provides. Optional
 # skills/background tables are owned by their feature-specific schema lifecycle.
-version: 3
+version: 4
 auto_migrate: false
 
 conversations:
