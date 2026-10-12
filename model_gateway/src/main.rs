@@ -2013,11 +2013,160 @@ impl CliArgs {
         Ok(rcf)
     }
 
+    /// The flags whose value has a required shape, refused by name when the
+    /// shape is wrong: a wrong shape used to be dropped or passed on in
+    /// silence, which narrowed a security policy or broke a health policy
+    /// without a word.
+    fn validate_flag_formats(&self) -> ConfigResult<()> {
+        let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value: value.to_string(),
+            reason: reason.to_string(),
+        };
+        for origin in &self.cors_allowed_origins {
+            let parsed = http::Uri::try_from(origin.as_str())
+                .ok()
+                .filter(|uri| uri.scheme().is_some() && uri.authority().is_some());
+            if parsed.is_none() || http::HeaderValue::from_str(origin).is_err() {
+                return Err(invalid(
+                    "cors_allowed_origins",
+                    origin,
+                    "not an origin (scheme://host[:port]); the policy would silently narrow to the origins that parse",
+                ));
+            }
+        }
+        if !self.health_check_endpoint.starts_with('/') {
+            return Err(invalid(
+                "health_check_endpoint",
+                &self.health_check_endpoint,
+                "must start with '/': it is appended to every HTTP worker's URL",
+            ));
+        }
+        let buckets = &self.prometheus_duration_buckets;
+        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
+            return Err(invalid(
+                "prometheus_duration_buckets",
+                &bad.to_string(),
+                "every bucket bound must be a finite number above 0",
+            ));
+        }
+        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
+            return Err(invalid(
+                "prometheus_duration_buckets",
+                &format!("{} {}", pair[0], pair[1]),
+                "bucket bounds must ascend strictly",
+            ));
+        }
+        for entry in &self.storage_context_headers {
+            if !entry.contains('=') {
+                return Err(invalid(
+                    "storage_context_headers",
+                    entry,
+                    "expected 'header-name=context-key'",
+                ));
+            }
+        }
+        for name in &self.request_id_headers {
+            if http::header::HeaderName::try_from(name.as_str()).is_err() {
+                return Err(invalid(
+                    "request_id_headers",
+                    name,
+                    "not a valid HTTP header name: it could never match a request",
+                ));
+            }
+        }
+        if let Some(key) = &self.api_key {
+            if key.trim().is_empty() {
+                return Err(invalid(
+                    "api_key",
+                    "",
+                    "an empty credential would switch authentication on with a key nothing can present",
+                ));
+            }
+        }
+        for mapping in &self.jwt_role_mapping {
+            match mapping.split_once('=') {
+                Some((idp_role, gateway_role))
+                    if !idp_role.is_empty()
+                        && matches!(
+                            gateway_role.to_ascii_lowercase().as_str(),
+                            "admin" | "user"
+                        ) => {}
+                _ => {
+                    return Err(invalid(
+                        "jwt_role_mapping",
+                        mapping,
+                        "expected 'idp_role=admin' or 'idp_role=user'",
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The flags that only act with a companion, named when the companion is
+    /// absent: each used to be ignored in silence.
+    fn ignored_companions(&self, prefill_urls: &[(String, Option<u16>)]) -> Vec<String> {
+        let mut ignored = Vec::new();
+        if !(self.pd_disaggregation || self.epd_disaggregation) {
+            for (flag, given) in [
+                ("--prefill", !prefill_urls.is_empty()),
+                ("--decode", !self.decode.is_empty()),
+                ("--prefill-policy", self.prefill_policy.is_some()),
+                ("--decode-policy", self.decode_policy.is_some()),
+            ] {
+                if given {
+                    ignored.push(format!(
+                        "{flag} is ignored without --pd-disaggregation (or --epd-disaggregation)"
+                    ));
+                }
+            }
+        }
+        if !(self.service_discovery || self.discovery_provider.is_some()) {
+            for (flag, given) in [
+                ("--selector", !self.selector.is_empty()),
+                ("--prefill-selector", !self.prefill_selector.is_empty()),
+                ("--decode-selector", !self.decode_selector.is_empty()),
+                ("--encode-selector", !self.encode_selector.is_empty()),
+                ("--router-selector", !self.router_selector.is_empty()),
+            ] {
+                if given {
+                    ignored.push(format!("{flag} is ignored without --service-discovery"));
+                }
+            }
+        } else if !self.worker_urls.is_empty() {
+            ignored.push(
+                "--worker-urls and --service-discovery are both given: both are worker sources, \
+                 the listed workers register first and the discovered ones join them"
+                    .to_string(),
+            );
+        }
+        if self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled {
+            ignored.push(
+                "--priority-scheduler-config is ignored without --priority-scheduler-enabled"
+                    .to_string(),
+            );
+        }
+        ignored
+    }
+
+    /// The companion warnings of [`ignored_companions`](Self::ignored_companions), one
+    /// line each on stderr: the logger is not up when the flags are read.
+    #[expect(clippy::print_stderr, reason = "pre-logger CLI configuration warnings")]
+    fn warn_ignored_companions(&self, prefill_urls: &[(String, Option<u16>)]) {
+        for ignored in self.ignored_companions(prefill_urls) {
+            eprintln!("WARNING: {ignored}");
+        }
+    }
+
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        self.validate_flag_formats()?;
+        self.warn_ignored_companions(&prefill_urls);
+
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
         let mode = if matches!(self.backend, Some(Backend::Openai)) {
@@ -2567,6 +2716,141 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// A flag whose value has a required shape is refused by name when the
+    /// shape is wrong, where it used to be dropped or passed on in silence;
+    /// the well-formed spellings pass.
+    #[test]
+    fn malformed_flag_values_are_refused_by_name() {
+        for (args, field) in [
+            (
+                vec!["--cors-allowed-origins", "http://[bad"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "example.com"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--health-check-endpoint", "health"],
+                "health_check_endpoint",
+            ),
+            (
+                vec!["--prometheus-duration-buckets", "2", "1"],
+                "prometheus_duration_buckets",
+            ),
+            (
+                vec!["--prometheus-duration-buckets", "nan"],
+                "prometheus_duration_buckets",
+            ),
+            (
+                vec!["--prometheus-duration-buckets", "0"],
+                "prometheus_duration_buckets",
+            ),
+            (
+                vec!["--storage-context-headers", "noeq"],
+                "storage_context_headers",
+            ),
+            (
+                vec!["--request-id-headers", "bad header"],
+                "request_id_headers",
+            ),
+            (vec!["--api-key", ""], "api_key"),
+            (vec!["--jwt-role-mapping", "noeq"], "jwt_role_mapping"),
+            (vec!["--jwt-role-mapping", "ops=root"], "jwt_role_mapping"),
+        ] {
+            let err = cli_args_from(&args)
+                .to_router_config(vec![], vec![])
+                .expect_err(&args.join(" "));
+            match err {
+                ConfigError::InvalidValue { field: named, .. } => {
+                    assert_eq!(named, field, "{}", args.join(" "));
+                }
+                other => panic!("{}: {other}", args.join(" ")),
+            }
+        }
+        cli_args_from(&[
+            "--cors-allowed-origins",
+            "https://example.com:8443",
+            "--health-check-endpoint",
+            "/health",
+            "--prometheus-duration-buckets",
+            "0.1",
+            "1",
+            "--storage-context-headers",
+            "x-tenant=tenant",
+            "--request-id-headers",
+            "x-request-id",
+            "--api-key",
+            "secret",
+            "--jwt-role-mapping",
+            "ops=admin",
+        ])
+        .to_router_config(vec![], vec![])
+        .expect("well-formed values pass");
+    }
+
+    /// A flag that only acts with a companion is named when the companion is
+    /// absent, where it used to be ignored in silence; with the companion
+    /// present nothing is named.
+    #[test]
+    fn flags_without_their_companion_are_named() {
+        let prefill = [("http://127.0.0.1:1".to_string(), None)];
+        let ignored = cli_args_from(&[
+            "--decode",
+            "http://127.0.0.1:2",
+            "--decode-policy",
+            "random",
+            "--prefill-policy",
+            "random",
+            "--selector",
+            "a=b",
+            "--priority-scheduler-config",
+            "/dev/null",
+        ])
+        .ignored_companions(&prefill);
+        for flag in [
+            "--prefill",
+            "--decode",
+            "--decode-policy",
+            "--prefill-policy",
+            "--selector",
+            "--priority-scheduler-config",
+        ] {
+            assert!(
+                ignored.iter().any(|m| m.starts_with(flag)),
+                "{flag} is named in {ignored:?}"
+            );
+        }
+        let both = cli_args_from(&[
+            "--worker-urls",
+            "http://127.0.0.1:1",
+            "--service-discovery",
+            "--selector",
+            "a=b",
+        ])
+        .ignored_companions(&[]);
+        assert!(
+            both.iter()
+                .any(|m| m.contains("--worker-urls") && m.contains("--service-discovery")),
+            "{both:?}"
+        );
+        let paired = cli_args_from(&[
+            "--pd-disaggregation",
+            "--decode",
+            "http://127.0.0.1:2",
+            "--decode-policy",
+            "random",
+            "--service-discovery",
+            "--selector",
+            "a=b",
+            "--priority-scheduler-enabled",
+            "--priority-scheduler-config",
+            "/dev/null",
+        ])
+        .ignored_companions(&prefill);
+        assert!(paired.is_empty(), "{paired:?}");
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so
