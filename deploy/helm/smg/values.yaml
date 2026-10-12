@@ -171,15 +171,27 @@ router:
     runAsNonRoot: false
     allowPrivilegeEscalation: false
 
-  # -- Liveness probe tuning
+  # -- Liveness probe tuning. `/health` answers 200 while the process serves,
+  #    whatever the state of its workers.
   livenessProbe:
+    path: /health
     initialDelaySeconds: 10
     periodSeconds: 30
 
-  # -- Readiness probe tuning
+  # -- Readiness probe tuning. `/readiness` answers 503 while the gateway has
+  #    no healthy worker, while a tokenizer is not yet registered and while it
+  #    drains after SIGTERM, so traffic is steered away from such a pod.
   readinessProbe:
+    path: /readiness
     initialDelaySeconds: 5
     periodSeconds: 10
+
+  # -- Graceful shutdown: how long the gateway drains in-flight requests after
+  #    SIGTERM (passed as --shutdown-grace-period-secs). The pod's
+  #    terminationGracePeriodSeconds is this plus terminationGraceMarginSeconds,
+  #    so the drain is not cut short by the kubelet's default 30 s.
+  shutdownGracePeriodSeconds: 180
+  terminationGraceMarginSeconds: 30
 
   # -- Optional features
   wasm:
