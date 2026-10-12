@@ -839,6 +839,33 @@ impl ConfigValidator {
             });
         }
 
+        // Each listener needs its own port. Two of them on one port used to
+        // bind the first, answer, and die at the second bind with a raw
+        // AddrInUse that named no flag: a partial start an operator's
+        // monitoring saw come up and vanish.
+        let listeners = [
+            Some(("port", "--port", config.port)),
+            config
+                .metrics
+                .as_ref()
+                .map(|metrics| ("metrics.port", "--prometheus-port", metrics.port)),
+            config
+                .health_check_port
+                .map(|port| ("health_check_port", "--health-check-port", port)),
+        ];
+        let listeners: Vec<_> = listeners.into_iter().flatten().collect();
+        for (i, (field, flag, port)) in listeners.iter().enumerate() {
+            if let Some((_, other_flag, _)) = listeners[..i].iter().find(|(_, _, p)| p == port) {
+                return Err(ConfigError::InvalidValue {
+                    field: (*field).to_string(),
+                    value: port.to_string(),
+                    reason: format!(
+                        "{flag} and {other_flag} are both {port}; each listener needs its own port"
+                    ),
+                });
+            }
+        }
+
         if config.max_payload_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_payload_size".to_string(),
@@ -2773,6 +2800,52 @@ mod tests {
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_err());
+    }
+
+    /// Two listeners on one port are refused naming both flags; distinct
+    /// ports pass.
+    #[test]
+    fn equal_listener_ports_are_rejected() {
+        let listeners = |port: u16, metrics_port: u16, probe_port: Option<u16>| RouterConfig {
+            port,
+            metrics: Some(MetricsConfig {
+                port: metrics_port,
+                host: "127.0.0.1".to_string(),
+            }),
+            health_check_port: probe_port,
+            ..Default::default()
+        };
+        let refused = |config: &RouterConfig| match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => (field, value, reason),
+            other => panic!("expected an InvalidValue, got {other:?}"),
+        };
+
+        let (field, value, reason) = refused(&listeners(30001, 30001, None));
+        assert_eq!((field.as_str(), value.as_str()), ("metrics.port", "30001"));
+        assert!(
+            reason.contains("--prometheus-port") && reason.contains("--port"),
+            "{reason}"
+        );
+
+        let (field, _, reason) = refused(&listeners(30001, 30002, Some(30001)));
+        assert_eq!(field, "health_check_port");
+        assert!(
+            reason.contains("--health-check-port") && reason.contains("--port"),
+            "{reason}"
+        );
+
+        let (field, _, reason) = refused(&listeners(30001, 30002, Some(30002)));
+        assert_eq!(field, "health_check_port");
+        assert!(
+            reason.contains("--health-check-port") && reason.contains("--prometheus-port"),
+            "{reason}"
+        );
+
+        assert!(ConfigValidator::validate(&listeners(30001, 30002, Some(30003))).is_ok());
     }
 
     #[test]

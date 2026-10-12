@@ -1346,6 +1346,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
 
+    // The TLS material is parsed before anything binds: a certificate or key
+    // file the gateway could read but not use used to fail at the HTTP bind,
+    // after the metrics listener was up.
+    let tls_config = match (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        (Some(cert), Some(key)) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+                .await
+                .map_err(|e| format!("Failed to create TLS config: {e}"))?,
+        ),
+        _ => None,
+    };
+
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
     if let Some(trace_config) = &config.router_config.trace_config {
@@ -1397,22 +1412,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
     init_mm_settings(mm_settings);
 
-    // Start the metrics server. It binds the port eagerly so we fail fast on
-    // port conflicts or bad addresses.
-    if let Some(prometheus_config) = &config.prometheus_config {
+    // The metrics recorder is installed now so start-up records land in it;
+    // its listener binds further down, once every configuration read that
+    // can still fail (storage hooks, policy files, store connections) has
+    // happened, right before the probe and HTTP listeners: nothing binds
+    // before a fatal configuration error.
+    let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
         metrics::init_startup_series();
-        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
-            handle,
-            prometheus_config.host.clone(),
-            prometheus_config.port,
-        )
-        .await?;
-        // Tokio runtime self-observability (event-loop canary + sampler).
-        // `startup` runs on the main runtime, so the observer lands on —
-        // and therefore measures — the runtime that serves requests.
-        runtime_metrics::spawn_observer();
-    }
+        handle
+    });
 
     // Build the mesh server if configured. Starting gossip is deferred until
     // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
@@ -1669,6 +1678,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.clone(),
     );
 
+    // The metrics listener: the recorder exists since the top of start-up,
+    // the port binds only now (see there). It still binds eagerly, so a port
+    // conflict or a bad address fails the start before the HTTP listener.
+    if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
+            handle,
+            prometheus_config.host.clone(),
+            prometheus_config.port,
+        )
+        .await?;
+        // Tokio runtime self-observability (event-loop canary + sampler).
+        // `startup` runs on the main runtime, so the observer lands on —
+        // and therefore measures — the runtime that serves requests.
+        runtime_metrics::spawn_observer();
+    }
+
     // Optional isolated probe listener (additive): when `--health-check-port`
     // is set, serves /liveness, /readiness, /health on that port from a
     // dedicated single-worker runtime on its own OS thread, so probes
@@ -1860,14 +1885,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "HTTP connection timeouts (0 = disabled)"
     );
 
-    let server_result = if let (Some(cert), Some(key)) = (
-        &config.router_config.server_cert,
-        &config.router_config.server_key,
-    ) {
+    let server_result = if let Some(tls_config) = tls_config {
         info!("TLS enabled");
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
-            .await
-            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
 
         axum_server::bind_rustls(addr, tls_config)
             .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
