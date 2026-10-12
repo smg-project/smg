@@ -1368,8 +1368,8 @@ fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
 /// any extra column when it exists and is inserted when it does not. A second
 /// link of an item moves it, the contract of
 /// [`ConversationItemStorage::link_item`], where the key used to refuse the
-/// insert. Named binds, one per column, so the key's two occurrences are
-/// bound once.
+/// insert. Named binds, one per column, so an extra column's two occurrences
+/// (UPDATE SET and INSERT VALUES) are bound once.
 fn link_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
     let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
     let placeholders: Vec<String> = binds.iter().map(|bind| format!(":{bind}")).collect();
