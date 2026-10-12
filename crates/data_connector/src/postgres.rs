@@ -59,15 +59,17 @@ impl PostgresStore {
 
     /// Brings the database to the schema this build expects, once per
     /// database and in turn across gateways: one transaction under the schema
-    /// advisory lock creates the versions table and the history tables (`IF
-    /// NOT EXISTS`), records every migration as applied when the responses
-    /// table did not exist before (a first start creates the tables in their
-    /// final shape, so nothing is pending and no `auto_migrate` is needed),
-    /// applies the pending migrations otherwise (or refuses when
-    /// `auto_migrate` is off), and creates the indexes last, once the columns
-    /// they cover exist. Gateways starting together on an empty database all
-    /// come up: the next one waits for the first's commit and finds the
-    /// schema in place.
+    /// advisory lock creates the versions table, refuses a database whose
+    /// recorded version is ahead of the migrations this build knows (before
+    /// any history table is touched, see `schema_ahead_check`), creates the
+    /// history tables (`IF NOT EXISTS`), records every migration as applied
+    /// when the responses table did not exist before (a first start creates
+    /// the tables in their final shape, so nothing is pending and no
+    /// `auto_migrate` is needed), applies the pending migrations otherwise
+    /// (or refuses when `auto_migrate` is off), and creates the indexes
+    /// last, once the columns they cover exist. Gateways starting together
+    /// on an empty database all come up: the next one waits for the first's
+    /// commit and finds the schema in place.
     pub(crate) async fn bootstrap(&self) -> Result<(), String> {
         let mut client = self.pool.get().await.map_err(|e| {
             format!(

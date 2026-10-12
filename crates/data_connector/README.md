@@ -421,7 +421,7 @@ starting together on one database take turns and all come up):
 3. A fresh database (no responses table before this start) is recorded at the
    latest version: its tables were just created in their final shape, so no
    migration is pending and no `auto_migrate` is needed
-4. Otherwise the store's schema version is compared with the migrations the build knows: a database ahead of the build is refused (see "A database ahead of the build" below)
+4. Fresh or not, the store's schema version is compared with the migrations the build knows: a database ahead of the build is refused (see "A database ahead of the build" below). Postgres does this right after step 1, before any table is created; Oracle after step 2, as the first step of its migration run
 5. Pending migrations are checked:
    - If `auto_migrate: true` → migrations are applied automatically
    - If `auto_migrate: false` (default) → startup fails with actionable SQL if migrations are pending
