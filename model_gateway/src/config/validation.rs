@@ -6,6 +6,45 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::{middleware::scheduler, policies::cost as selection_cost};
 
+/// Each listener needs its own port. `listeners` are `(field, flag, port)`
+/// in configuration order; the first two on one port are refused under the
+/// later listener's field, naming both flags.
+fn validate_distinct_listener_ports(listeners: &[(&str, &str, u16)]) -> ConfigResult<()> {
+    for (i, (field, flag, port)) in listeners.iter().enumerate() {
+        if let Some((_, other_flag, _)) = listeners[..i].iter().find(|(_, _, p)| p == port) {
+            return Err(ConfigError::InvalidValue {
+                field: (*field).to_string(),
+                value: port.to_string(),
+                reason: format!(
+                    "{flag} and {other_flag} are both {port}; each listener needs its own port"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The mesh listener's port against the HTTP, metrics and probe ports. The
+/// mesh configuration lives beside the router configuration, out of
+/// [`ConfigValidator`]'s sight, so `server::startup` runs this check: it is
+/// the one place every way of building the server configuration (the CLI,
+/// the Python binding, a library caller) passes through.
+pub fn validate_mesh_listener_port(
+    mesh_port: u16,
+    port: u16,
+    metrics_port: Option<u16>,
+    health_check_port: Option<u16>,
+) -> ConfigResult<()> {
+    let listeners = [
+        Some(("port", "--port", port)),
+        metrics_port.map(|port| ("metrics.port", "--prometheus-port", port)),
+        health_check_port.map(|port| ("health_check_port", "--health-check-port", port)),
+        Some(("mesh_port", "--mesh-port", mesh_port)),
+    ];
+    let listeners: Vec<_> = listeners.into_iter().flatten().collect();
+    validate_distinct_listener_ports(&listeners)
+}
+
 /// Validate a user-supplied mesh server name. The name keys rate-limit
 /// shards as `rl:{counter}:{name}`, so an empty name or one containing the
 /// separator would corrupt shard keys; rejecting at config time avoids a
@@ -854,17 +893,7 @@ impl ConfigValidator {
                 .map(|port| ("health_check_port", "--health-check-port", port)),
         ];
         let listeners: Vec<_> = listeners.into_iter().flatten().collect();
-        for (i, (field, flag, port)) in listeners.iter().enumerate() {
-            if let Some((_, other_flag, _)) = listeners[..i].iter().find(|(_, _, p)| p == port) {
-                return Err(ConfigError::InvalidValue {
-                    field: (*field).to_string(),
-                    value: port.to_string(),
-                    reason: format!(
-                        "{flag} and {other_flag} are both {port}; each listener needs its own port"
-                    ),
-                });
-            }
-        }
+        validate_distinct_listener_ports(&listeners)?;
 
         if config.max_payload_size == 0 {
             return Err(ConfigError::InvalidValue {
@@ -2846,6 +2875,37 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&listeners(30001, 30002, Some(30003))).is_ok());
+    }
+
+    /// The mesh listener cannot share a port with the HTTP, metrics or probe
+    /// listener: refused under the mesh port's field, naming both flags. The
+    /// check runs in `server::startup`, so it holds for every way the server
+    /// configuration is built.
+    #[test]
+    fn mesh_port_equal_to_another_listener_is_rejected() {
+        for (flag, taken) in [
+            ("--port", 30001),
+            ("--prometheus-port", 30002),
+            ("--health-check-port", 30003),
+        ] {
+            match validate_mesh_listener_port(taken, 30001, Some(30002), Some(30003)) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "mesh_port");
+                    assert_eq!(value, taken.to_string());
+                    assert!(
+                        reason.contains("--mesh-port") && reason.contains(flag),
+                        "{reason}"
+                    );
+                }
+                other => panic!("--mesh-port equal to {flag} must be rejected, got {other:?}"),
+            }
+        }
+        assert!(validate_mesh_listener_port(30004, 30001, Some(30002), Some(30003)).is_ok());
+        assert!(validate_mesh_listener_port(30002, 30001, None, None).is_ok());
     }
 
     #[test]

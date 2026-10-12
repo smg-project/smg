@@ -1,9 +1,11 @@
 //! Two of the gateway's listeners on one port are refused before anything
-//! binds, naming both flags; and nothing binds before a configuration the
-//! gateway could read but not use (TLS material, a storage hook) is refused.
-//! Both used to be partial starts: a listener came up, answered, and the
-//! process died. The gateway runs as a process on purpose: the checks belong
-//! before the runtime and the listeners exist.
+//! binds, naming both flags; nothing binds before a configuration the
+//! gateway could read but not use (TLS material, a storage hook) is refused;
+//! and a listener port another process holds is refused without the mesh
+//! server having joined the cluster. All used to be partial starts: a
+//! listener came up, answered, and the process died. The gateway runs as a
+//! process on purpose: the checks belong before the runtime and the
+//! listeners exist.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -102,6 +104,20 @@ fn base_args(port: u16, metrics_port: u16) -> Vec<String> {
     .to_vec()
 }
 
+/// The mesh server on `mesh_port`, bound and advertised on the loopback.
+fn mesh_args(mesh_port: u16) -> Vec<String> {
+    let ip = IP.to_string();
+    [
+        "--enable-mesh",
+        "--mesh-host",
+        &ip,
+        "--mesh-port",
+        &mesh_port.to_string(),
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
 /// A launch that must end in a refusal: no watched port ever answered, a
 /// non-zero exit, no panic, and `named` in the error.
 fn assert_refused(name: &str, launch: &Launch, named: &[&str]) {
@@ -130,8 +146,9 @@ fn assert_refused(name: &str, launch: &Launch, named: &[&str]) {
     }
 }
 
-/// Every pair of the HTTP, metrics and probe ports on one port: refused
-/// naming both flags, with the port never answering.
+/// Every pair of the HTTP, metrics and probe ports on one port, and the mesh
+/// port on the HTTP port: refused naming both flags, with the port never
+/// answering.
 #[test]
 fn equal_listener_ports_refuse_to_start() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -144,8 +161,10 @@ fn equal_listener_ports_refuse_to_start() {
     probe_on_http_port.extend(["--health-check-port", &p].map(str::to_string));
     let mut probe_on_metrics_port = base_args(port, metrics_port);
     probe_on_metrics_port.extend(["--health-check-port", &m].map(str::to_string));
+    let mut mesh_on_http_port = base_args(port, metrics_port);
+    mesh_on_http_port.extend(mesh_args(port));
 
-    let cases: [(&str, Vec<String>, [&str; 2]); 3] = [
+    let cases: [(&str, Vec<String>, [&str; 2]); 4] = [
         (
             "prometheus-port-eq-port",
             same_metrics_port,
@@ -160,6 +179,11 @@ fn equal_listener_ports_refuse_to_start() {
             "health-check-port-eq-prometheus-port",
             probe_on_metrics_port,
             ["--health-check-port", "--prometheus-port"],
+        ),
+        (
+            "mesh-port-eq-port",
+            mesh_on_http_port,
+            ["--mesh-port", "--port"],
         ),
     ];
     for (name, args, flags) in cases {
@@ -211,4 +235,25 @@ fn a_late_configuration_error_binds_nothing() {
         );
         assert_refused(name, &launch, &named);
     }
+}
+
+/// A listener port another process holds (here the metrics port) is refused
+/// with nothing left behind: the mesh server, which joins the cluster when
+/// it starts, must not come up and vanish with the process.
+#[test]
+fn a_held_listener_port_starts_no_mesh_member() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let held = TcpListener::bind((IP, 0)).expect("a port to hold");
+    let metrics_port = held.local_addr().expect("the held address").port();
+    let [port, mesh_port, _] = free_ports();
+    let mut args = base_args(port, metrics_port);
+    args.extend(mesh_args(mesh_port));
+
+    let launch = launch(
+        &args,
+        &[mesh_port, port],
+        &dir.path().join("metrics-port-held.log"),
+    );
+    assert_refused("metrics-port-held", &launch, &["Address already in use"]);
+    drop(held);
 }

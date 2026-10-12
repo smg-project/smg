@@ -904,9 +904,9 @@ struct CliArgs {
     log_json: bool,
 
     // ==================== Prometheus Metrics ====================
-    /// Port to expose Prometheus metrics; 0 binds an OS-assigned ephemeral
-    /// port. Each listener (--port, --prometheus-port, --health-check-port,
-    /// --mesh-port) needs its own port.
+    /// Port to expose Prometheus metrics. Each listener (--port,
+    /// --prometheus-port, --health-check-port, --mesh-port) needs its own
+    /// port.
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
     prometheus_port: u16,
 
@@ -1724,27 +1724,8 @@ impl CliArgs {
             });
         }
 
-        // The mesh listener needs its own port too (the HTTP, metrics and
-        // probe ports are checked against each other in `ConfigValidator`).
-        let other_listeners = [
-            ("--port", Some(self.port)),
-            ("--prometheus-port", Some(self.prometheus_port)),
-            ("--health-check-port", self.health_check_port),
-        ];
-        if let Some((flag, _)) = other_listeners
-            .iter()
-            .find(|(_, port)| *port == Some(self.mesh_port))
-        {
-            return Err(ConfigError::InvalidValue {
-                field: "mesh_port".to_string(),
-                value: self.mesh_port.to_string(),
-                reason: format!(
-                    "--mesh-port and {flag} are both {}; each listener needs its own port",
-                    self.mesh_port
-                ),
-            });
-        }
-
+        // The mesh port against the other listeners' is checked in
+        // `server::startup`, for every way the server configuration is built.
         let bind_addr = Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
         let (advertise_host, advertise_field) =
             if let Some(host) = self.mesh_advertise_host.as_deref() {
@@ -3104,38 +3085,6 @@ mod tests {
         let server = cli.to_server_config(router).unwrap();
         let mesh = server.mesh_server_config.expect("mesh server config");
         assert_eq!(mesh.advertise_addr.port(), 39527);
-    }
-
-    /// The mesh listener cannot share a port with the HTTP, metrics or probe
-    /// listener; the error names both flags.
-    #[test]
-    fn mesh_port_equal_to_another_listener_is_rejected() {
-        for (flag, port) in [
-            ("--port", "39527"),
-            ("--prometheus-port", "39528"),
-            ("--health-check-port", "39529"),
-        ] {
-            let cli = cli_args_from(&[
-                "--enable-mesh",
-                "--mesh-advertise-host",
-                "10.0.0.1",
-                flag,
-                port,
-                "--mesh-port",
-                port,
-            ]);
-            let router = cli.to_router_config(vec![], vec![]).unwrap();
-            let Err(err) = cli.to_server_config(router) else {
-                panic!("--mesh-port equal to {flag} must be rejected");
-            };
-            let message = format!("{err}");
-            assert!(
-                message.contains("mesh_port")
-                    && message.contains(flag)
-                    && message.contains("--mesh-port"),
-                "unexpected error: {message}"
-            );
-        }
     }
 
     #[test]

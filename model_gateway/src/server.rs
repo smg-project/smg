@@ -1345,6 +1345,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
+    // The mesh listener's port against the others: the mesh configuration is
+    // not part of `RouterConfig`, so the validator cannot see it, and this is
+    // the one place the CLI, the Python binding and a library caller all pass.
+    if let Some(mesh_server_config) = &config.mesh_server_config {
+        crate::config::validate_mesh_listener_port(
+            mesh_server_config.bind_addr.port(),
+            config.port,
+            config
+                .prometheus_config
+                .as_ref()
+                .map(|prometheus_config| prometheus_config.port),
+            config.health_check_port,
+        )?;
+    }
 
     // The TLS material is parsed before anything binds: a certificate or key
     // file the gateway could read but not use used to fail at the HTTP bind,
@@ -1454,8 +1468,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await?,
     );
 
-    // Register the CRDT namespaces and start the inbound sync adapters, then
-    // start gossip. Order matters: see the note at the mesh build above.
+    // Register the CRDT namespaces and start the inbound sync adapters now;
+    // gossip starts further down, after the metrics and probe listeners are
+    // bound. Order matters: see the note at the mesh build above.
     let mesh_adapters = mesh_handler.as_ref().map(|handler| {
         MeshAdapters::start(
             handler.mesh_kv(),
@@ -1465,17 +1480,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             app_context.policy_registry.clone(),
         )
     });
-    if let Some(mesh_server) = mesh_server {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
-        )]
-        spawn(async move {
-            if let Err(e) = mesh_server.start().await {
-                tracing::error!("Mesh server failed: {}", e);
-            }
-        });
-    }
 
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
@@ -1703,6 +1707,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         let probe_addr =
             crate::health::start_probe_listener(&config.host, probe_port, probe_state.clone())?;
         info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
+    }
+
+    // The mesh server starts once the metrics and probe listeners are bound:
+    // a member that joined the cluster and vanished with a failed bind is the
+    // partial start the checks above exist to prevent. The adapters above
+    // have registered their namespaces, so gossip is safe to start.
+    if let Some(mesh_server) = mesh_server {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
+        )]
+        spawn(async move {
+            if let Err(e) = mesh_server.start().await {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
     }
 
     let app_state = Arc::new(AppState {
