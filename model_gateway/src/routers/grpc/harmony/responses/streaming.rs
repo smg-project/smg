@@ -359,14 +359,29 @@ async fn execute_mcp_tool_loop_streaming(
 
                     // The run is aborted, not answered: the stream ends as the
                     // non-streamed path does, `response.failed` with the error,
-                    // and the usage the non-streamed response carries.
-                    let usage_json = json!(ResponseUsage::from(&usage));
+                    // and the usage the non-streamed response carries; and the
+                    // failed object is stored as that path stores its own, read
+                    // before the terminal drains the items, so a background
+                    // response is polled as `failed` with this error rather
+                    // than as a run that ended without a result.
                     let error = json!({
                         "code": "max_tool_calls_exceeded",
                         "message": format!(
                             "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
                         ),
                     });
+                    let final_response =
+                        emitter.finalize_failed(Some(usage.clone()), error.clone());
+                    persist_response_if_needed(
+                        ctx.conversation_storage.clone(),
+                        ctx.conversation_item_storage.clone(),
+                        ctx.response_storage.clone(),
+                        &final_response,
+                        original_request,
+                        ctx.request_context.clone(),
+                    )
+                    .await;
+                    let usage_json = json!(ResponseUsage::from(&usage));
                     if let Err(e) = emitter
                         .emit_terminal(Some(&usage_json), Some(&error), tx)
                         .await
