@@ -593,6 +593,16 @@ impl Encoder for HuggingFaceTokenizer {
     }
 
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+        // A batch takes the path a single input takes: the direct encoder when
+        // the vocabulary has one (an input it declines goes through the
+        // `tokenizers` path on its own), so a batch never runs on the model
+        // whose word cache the direct encoder replaced.
+        if self.native.is_some() {
+            return inputs
+                .iter()
+                .map(|input| self.encode(input, add_special_tokens))
+                .collect();
+        }
         self.tokenizer
             .encode_batch(inputs.to_vec(), add_special_tokens)
             .map_err(|e| Error::msg(format!("Batch encoding failed: {e}")))

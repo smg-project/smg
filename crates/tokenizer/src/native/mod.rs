@@ -876,6 +876,39 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_takes_the_direct_path_input_by_input() {
+        use crate::traits::{Encoder, Encoding};
+        let mut state = 0x5A5A_1234_5678_9ABCu64;
+        for shape in shapes() {
+            let tokenizer = crate::huggingface::HuggingFaceTokenizer::from_tokenizer(tokenizer_of(
+                &shape, &mut state,
+            ));
+            let added: Vec<&str> = shape.special.to_vec();
+            let texts: Vec<String> = (0..8)
+                .map(|round| random_text(&mut state, 1 + round * 5, &added))
+                .filter(|text| !shape.nfc || text.nfc().eq(text.chars()))
+                .collect();
+            let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let batch = tokenizer.encode_batch(&inputs, false).expect("batch");
+            assert_eq!(batch.len(), inputs.len(), "{}", shape.name);
+            for (input, encoding) in inputs.iter().zip(&batch) {
+                let single = tokenizer.encode(input, false).expect("encode");
+                assert_eq!(
+                    encoding.token_ids(),
+                    single.token_ids(),
+                    "{}: {input:?}",
+                    shape.name
+                );
+                assert!(
+                    matches!(encoding, Encoding::Plain(_)),
+                    "{}: the batch left the direct path for {input:?}",
+                    shape.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn ids_match_tokenizers_on_random_text_for_every_shape() {
         let mut state = 0x0F0F_1234_ABCD_9876u64;
         for shape in shapes() {
