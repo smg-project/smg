@@ -524,4 +524,6 @@ class TestRouterPositionalSignature:
             "max_background_responses",
             "header_read_timeout_secs",
             "idle_connection_timeout_secs",
+            "mm_allowed_media_domains",
+            "mm_allow_private_media_hosts",
         ]

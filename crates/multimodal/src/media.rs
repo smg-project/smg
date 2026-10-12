@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     io::Write,
     path::{Path, PathBuf},
     process::{Output, Stdio},
@@ -18,14 +17,20 @@ use opencv::{
     prelude::*,
     videoio,
 };
-use reqwest::Client;
+use reqwest::{header::LOCATION, redirect, Client, StatusCode};
 use tokio::{fs, io::AsyncReadExt, process::Command, task, time};
 use tracing::info;
 use url::Url;
 
-use crate::audio::decode_audio_mono_f32;
+use crate::{
+    audio::decode_audio_mono_f32,
+    fetch_policy::{MediaHostPolicy, MediaHostResolver},
+};
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Redirects one media URL may lead through before the fetch is refused:
+/// reqwest's own default count, followed here hop by hop under the policy.
+const MAX_REDIRECTS: usize = 10;
 const DEFAULT_IMAGE_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_DECODED_BYTES: usize = 1024 * 1024 * 1024;
@@ -68,7 +73,15 @@ pub const DEFAULT_VIDEO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct MediaConnectorConfig {
+    /// Host names media may be fetched from, every redirect hop included;
+    /// `None` is any host the address policy passes.
     pub allowed_domains: Option<Vec<String>>,
+    /// Whether media may be fetched from a host that names or resolves to a
+    /// loopback, link-local, private or otherwise non-public address. Off,
+    /// such a URL is refused before anything is connected: a gateway that
+    /// fetches on a client's behalf must not be made to reach what only it
+    /// can reach. On, for a deployment whose media origin is internal.
+    pub allow_private_hosts: bool,
     pub allowed_local_media_path: Option<PathBuf>,
     /// Budget for one image or audio fetch by URL, connect to last byte;
     /// zero leaves only the HTTP client's own timeout.
@@ -82,6 +95,7 @@ impl Default for MediaConnectorConfig {
     fn default() -> Self {
         Self {
             allowed_domains: None,
+            allow_private_hosts: false,
             allowed_local_media_path: None,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             video_fetch_timeout: DEFAULT_VIDEO_FETCH_TIMEOUT,
@@ -223,20 +237,32 @@ impl FetchSource {
 #[derive(Clone)]
 pub struct MediaConnector {
     client: Client,
-    allowed_domains: Option<HashSet<String>>,
+    policy: Arc<MediaHostPolicy>,
+    resolver: Arc<MediaHostResolver>,
     allowed_local_media_path: Option<PathBuf>,
     fetch_timeout: Duration,
     video_fetch_timeout: Duration,
 }
 
 impl MediaConnector {
-    pub fn new(client: Client, config: MediaConnectorConfig) -> Result<Self, MediaConnectorError> {
-        let allowed_domains = config.allowed_domains.map(|domains| {
-            domains
-                .into_iter()
-                .map(|d| d.to_ascii_lowercase())
-                .collect::<HashSet<_>>()
-        });
+    /// The connector over the HTTP client `client` builds, finished here: the
+    /// client follows no redirect by itself (the connector follows them hop by
+    /// hop, each under the host policy) and resolves names through the
+    /// connector's resolver, which hands it the addresses the policy checked.
+    /// Nothing else about the client changes.
+    pub fn new(
+        client: reqwest::ClientBuilder,
+        config: MediaConnectorConfig,
+    ) -> Result<Self, MediaConnectorError> {
+        let policy = Arc::new(MediaHostPolicy::new(
+            config.allowed_domains,
+            config.allow_private_hosts,
+        ));
+        let resolver = Arc::new(MediaHostResolver::default());
+        let client = client
+            .redirect(redirect::Policy::none())
+            .dns_resolver(Arc::clone(&resolver))
+            .build()?;
 
         let allowed_local_media_path = if let Some(path) = config.allowed_local_media_path {
             Some(std::fs::canonicalize(path).map_err(MediaConnectorError::Io)?)
@@ -246,7 +272,8 @@ impl MediaConnector {
 
         Ok(Self {
             client,
-            allowed_domains,
+            policy,
+            resolver,
             allowed_local_media_path,
             fetch_timeout: config.fetch_timeout,
             video_fetch_timeout: config.video_fetch_timeout,
@@ -332,7 +359,6 @@ impl MediaConnector {
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         let parsed =
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
-        self.ensure_domain_allowed(&parsed)?;
 
         let bytes = self
             .fetch_http_bytes(
@@ -452,7 +478,6 @@ impl MediaConnector {
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
         let parsed =
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
-        self.ensure_domain_allowed(&parsed)?;
 
         let bytes = self
             .fetch_http_bytes(
@@ -475,7 +500,6 @@ impl MediaConnector {
     async fn fetch_http_audio(&self, url: &str) -> Result<Arc<AudioClip>, MediaConnectorError> {
         let parsed =
             Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
-        self.ensure_domain_allowed(&parsed)?;
 
         let bytes = self
             .fetch_http_bytes(
@@ -498,6 +522,14 @@ impl MediaConnector {
     /// body, with the body held to `limit` bytes. Running out of the budget
     /// in either phase (before the headers, or while the body arrives) is
     /// reported as the timeout it is, with the URL and the budget.
+    ///
+    /// Every hop is admitted under the host policy before it is connected:
+    /// the URL the request named and each redirect target, by name against
+    /// the allow-list and by address against the address policy, with the
+    /// checked addresses pinned for the client's resolver while the hop
+    /// connects. A redirect the policy refuses is reported with its target;
+    /// the chain is followed at most [`MAX_REDIRECTS`] times, under the one
+    /// budget.
     async fn fetch_http_bytes(
         &self,
         url: &Url,
@@ -505,30 +537,70 @@ impl MediaConnector {
         limit: usize,
         media: &'static str,
     ) -> Result<Bytes, MediaConnectorError> {
-        let mut req = self.client.get(url.as_str());
-        if budget > Duration::ZERO {
-            req = req.timeout(budget);
-        }
+        let started = Instant::now();
         let timed_out = || MediaConnectorError::Timeout {
             url: url.to_string(),
             budget,
         };
-
-        let resp = req.send().await.map_err(|err| {
-            if err.is_timeout() {
-                timed_out()
-            } else {
-                MediaConnectorError::Http(err)
+        let mut current = url.clone();
+        let mut redirects = 0;
+        loop {
+            let _hop = self
+                .resolver
+                .admit(&self.policy, &current)
+                .await
+                .map_err(|reason| {
+                    if redirects == 0 {
+                        reason
+                    } else {
+                        MediaConnectorError::DisallowedRedirect {
+                            url: url.to_string(),
+                            target: current.to_string(),
+                            reason: reason.to_string(),
+                        }
+                    }
+                })?;
+            let mut req = self.client.get(current.as_str());
+            if budget > Duration::ZERO {
+                let remaining = budget
+                    .checked_sub(started.elapsed())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or_else(timed_out)?;
+                req = req.timeout(remaining);
             }
-        })?;
 
-        let resp = resp.error_for_status()?;
-        collect_http_body_with_limit(resp, limit, media)
-            .await
-            .map_err(|err| match err {
-                MediaConnectorError::Http(http) if http.is_timeout() => timed_out(),
-                other => other,
-            })
+            let resp = req.send().await.map_err(|err| {
+                if err.is_timeout() {
+                    timed_out()
+                } else {
+                    MediaConnectorError::Http(err)
+                }
+            })?;
+
+            if let Some(target) = redirect_target(&resp) {
+                redirects += 1;
+                if redirects > MAX_REDIRECTS {
+                    return Err(MediaConnectorError::TooManyRedirects {
+                        url: url.to_string(),
+                        limit: MAX_REDIRECTS,
+                    });
+                }
+                current = target.map_err(|reason| MediaConnectorError::DisallowedRedirect {
+                    url: url.to_string(),
+                    target: reason.target,
+                    reason: reason.reason,
+                })?;
+                continue;
+            }
+
+            let resp = resp.error_for_status()?;
+            return collect_http_body_with_limit(resp, limit, media)
+                .await
+                .map_err(|err| match err {
+                    MediaConnectorError::Http(http) if http.is_timeout() => timed_out(),
+                    other => other,
+                });
+        }
     }
 
     async fn fetch_video_file(
@@ -573,19 +645,6 @@ impl MediaConnector {
         let bytes = read_file_with_limit(&canonical, audio_max_input_bytes(), "audio").await?;
         self.decode_audio(bytes, AudioSource::File { path: canonical })
             .await
-    }
-
-    fn ensure_domain_allowed(&self, url: &Url) -> Result<(), MediaConnectorError> {
-        if let Some(allowed) = &self.allowed_domains {
-            let host = url
-                .host_str()
-                .map(|h| h.to_ascii_lowercase())
-                .ok_or_else(|| MediaConnectorError::InvalidUrl(url.to_string()))?;
-            if !allowed.contains(&host) {
-                return Err(MediaConnectorError::DisallowedDomain(host));
-            }
-        }
-        Ok(())
     }
 
     fn decode_image(
@@ -691,6 +750,51 @@ impl MediaConnector {
 
 /// The local file the request names, up to `limit` bytes. Its I/O is the
 /// request's own ([`MediaConnectorError::Io`]).
+/// A redirect the client cannot follow: where to, and why.
+struct RefusedRedirect {
+    target: String,
+    reason: String,
+}
+
+/// Where a redirect response sends the fetch next, resolved against the URL
+/// that was fetched: `None` for a response that is no redirect (a status
+/// other than 301, 302, 303, 307 or 308, or one without a `Location`),
+/// which is then read as the media itself, as a client that follows no
+/// redirects reads it. A target that is not a URL, or not an `http`/`https`
+/// one, is a refused redirect.
+fn redirect_target(response: &reqwest::Response) -> Option<Result<Url, RefusedRedirect>> {
+    if !matches!(
+        response.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) {
+        return None;
+    }
+    let location = response.headers().get(LOCATION)?;
+    let Ok(location) = location.to_str() else {
+        return Some(Err(RefusedRedirect {
+            target: String::from_utf8_lossy(location.as_bytes()).into_owned(),
+            reason: "the redirect location is not text".to_string(),
+        }));
+    };
+    let Ok(target) = response.url().join(location) else {
+        return Some(Err(RefusedRedirect {
+            target: location.to_string(),
+            reason: "the redirect location is not a URL".to_string(),
+        }));
+    };
+    if !matches!(target.scheme(), "http" | "https") {
+        return Some(Err(RefusedRedirect {
+            reason: format!("unsupported media scheme: {}", target.scheme()),
+            target: target.to_string(),
+        }));
+    }
+    Some(Ok(target))
+}
+
 async fn read_file_with_limit(
     path: &Path,
     limit: usize,
@@ -3340,7 +3444,7 @@ mod tests {
     #[tokio::test]
     async fn decode_video_rejects_an_invalid_long_side_cap() {
         let connector = MediaConnector::new(
-            crate::test_support::http_client(),
+            crate::test_support::http_client_builder(),
             MediaConnectorConfig::default(),
         )
         .expect("default connector");

@@ -555,7 +555,7 @@ mod repeat_tests {
 
     fn tracker() -> AsyncMultiModalTracker {
         let connector = MediaConnector::new(
-            crate::test_support::http_client(),
+            crate::test_support::http_client_builder(),
             MediaConnectorConfig::default(),
         )
         .expect("default connector");

@@ -589,6 +589,9 @@ class TestParseRouterArgs:
                 "--rdma-slot-ttl-s",
                 "600",
                 "--log-mm-timing",
+                "--mm-allowed-media-domains",
+                "media.example, cdn.example",
+                "--mm-allow-private-media-hosts",
             ]
         )
         assert router_args.mm_processing == "worker"
@@ -597,6 +600,8 @@ class TestParseRouterArgs:
         assert router_args.rdma_listen_ip == "10.0.0.7"
         assert router_args.rdma_slot_ttl_s == 600
         assert router_args.log_mm_timing is True
+        assert router_args.mm_allowed_media_domains == ["media.example", "cdn.example"]
+        assert router_args.mm_allow_private_media_hosts is True
 
         defaults = parse_router_args([])
         assert defaults.mm_processing is None
@@ -605,6 +610,8 @@ class TestParseRouterArgs:
         assert defaults.rdma_listen_ip is None
         assert defaults.rdma_slot_ttl_s is None
         assert defaults.log_mm_timing is False
+        assert defaults.mm_allowed_media_domains is None
+        assert defaults.mm_allow_private_media_hosts is False
 
         with pytest.raises(SystemExit):
             parse_router_args(["--mm-processing", "routers"])
@@ -1807,6 +1814,8 @@ class TestRouterArgsFieldOrder:
         "power_of_two_load_metric",
         "header_read_timeout_secs",
         "idle_connection_timeout_secs",
+        "mm_allowed_media_domains",
+        "mm_allow_private_media_hosts",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

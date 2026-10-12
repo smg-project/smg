@@ -261,6 +261,17 @@ pub struct RouterConfig {
     /// = rdma` is the first-class one); when unset, falls back to `SMG_MM_PIXEL_RDMA`.
     #[serde(default)]
     pub mm_pixel_rdma: bool,
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name, every redirect hop included; unset (or empty)
+    /// allows any host the address policy passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_allowed_media_domains: Option<Vec<String>>,
+    /// Allow client-supplied media URLs that name or resolve to a loopback,
+    /// link-local or private address (a deployment whose media origin is
+    /// internal); off, such URLs are refused before anything is connected.
+    /// When unset, falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
+    #[serde(default)]
+    pub mm_allow_private_media_hosts: bool,
     /// Listener IP for the RDMA metadata exchange; when unset, falls back to
     /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1586,6 +1597,8 @@ impl Default for RouterConfig {
             mm_processing: None,
             mm_pixel_cache_mb: None,
             mm_pixel_rdma: false,
+            mm_allowed_media_domains: None,
+            mm_allow_private_media_hosts: false,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -1885,6 +1898,7 @@ mod tests {
         for key in [
             "mm_processing",
             "mm_pixel_cache_mb",
+            "mm_allowed_media_domains",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -1895,11 +1909,14 @@ mod tests {
         let mut without: serde_json::Value = serde_json::from_str(&json).unwrap();
         let object = without.as_object_mut().unwrap();
         object.remove("mm_pixel_rdma").unwrap();
+        object.remove("mm_allow_private_media_hosts").unwrap();
         object.remove("log_mm_timing").unwrap();
         let without: RouterConfig = serde_json::from_value(without).unwrap();
         assert_eq!(without.mm_processing, None);
         assert_eq!(without.mm_pixel_cache_mb, None);
         assert!(!without.mm_pixel_rdma);
+        assert_eq!(without.mm_allowed_media_domains, None);
+        assert!(!without.mm_allow_private_media_hosts);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -1910,6 +1927,8 @@ mod tests {
             .mm_processing(Some(MmProcessingMode::Worker))
             .mm_pixel_cache_mb(Some(512))
             .mm_pixel_rdma(true)
+            .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
+            .mm_allow_private_media_hosts(true)
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
@@ -1920,6 +1939,11 @@ mod tests {
         assert_eq!(with.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(with.mm_pixel_cache_mb, Some(512));
         assert!(with.mm_pixel_rdma);
+        assert_eq!(
+            with.mm_allowed_media_domains.as_deref(),
+            Some(&["media.example".to_string()][..])
+        );
+        assert!(with.mm_allow_private_media_hosts);
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);

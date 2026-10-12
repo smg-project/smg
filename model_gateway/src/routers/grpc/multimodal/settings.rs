@@ -53,6 +53,10 @@ const ENV_PIXEL_RDMA: &str = "SMG_MM_PIXEL_RDMA";
 const ENV_RDMA_LISTEN_IP: &str = "SMG_RDMA_LISTEN_IP";
 const ENV_RDMA_SLOT_TTL_S: &str = "SMG_RDMA_SLOT_TTL_S";
 const ENV_LOG_MM_TIMING: &str = "SMG_LOG_MM_TIMING";
+/// The opt-in for media origins on private, loopback or link-local addresses;
+/// not a legacy name: it is also how a worker's own media pipeline, which has
+/// no flags, is told (the worker reads it through [`mm_settings`]).
+const ENV_ALLOW_PRIVATE_MEDIA_HOSTS: &str = "SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultimodalSettings {
@@ -69,6 +73,14 @@ pub(crate) struct MultimodalSettings {
     pub rdma_slot_ttl_s: Setting<Option<u64>>,
     /// Per-request multimodal timing at INFO.
     pub log_mm_timing: Setting<bool>,
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name, every redirect hop included; `None` is any host
+    /// the address policy passes.
+    pub allowed_media_domains: Setting<Option<Vec<String>>>,
+    /// Whether a client-supplied media URL may name or resolve to a loopback,
+    /// link-local, private or otherwise non-public address; off, such URLs
+    /// are refused before anything is connected.
+    pub allow_private_media_hosts: Setting<bool>,
 }
 
 impl Default for MultimodalSettings {
@@ -80,6 +92,8 @@ impl Default for MultimodalSettings {
             rdma_listen_ip: Setting::from_default(None),
             rdma_slot_ttl_s: Setting::from_default(None),
             log_mm_timing: Setting::from_default(false),
+            allowed_media_domains: Setting::from_default(None),
+            allow_private_media_hosts: Setting::from_default(false),
         }
     }
 }
@@ -194,6 +208,28 @@ impl MultimodalSettings {
             }
         };
 
+        let allowed_media_domains = match config
+            .mm_allowed_media_domains
+            .clone()
+            .filter(|domains| !domains.is_empty())
+        {
+            Some(domains) => flag(Some(domains)),
+            None => defaults.allowed_media_domains.clone(),
+        };
+
+        let allow_private_media_hosts = if config.mm_allow_private_media_hosts {
+            flag(true)
+        } else {
+            match env_nonempty(ENV_ALLOW_PRIVATE_MEDIA_HOSTS)
+                .map(|value| value.to_ascii_lowercase())
+            {
+                Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on") => {
+                    from_env(true)
+                }
+                _ => defaults.allow_private_media_hosts,
+            }
+        };
+
         Ok(Self {
             processing,
             pixel_cache_mb,
@@ -201,6 +237,8 @@ impl MultimodalSettings {
             rdma_listen_ip,
             rdma_slot_ttl_s,
             log_mm_timing,
+            allowed_media_domains,
+            allow_private_media_hosts,
         })
     }
 }
@@ -283,6 +321,7 @@ mod tests {
                 ("SMG_RDMA_LISTEN_IP", "10.0.0.7"),
                 ("SMG_RDMA_SLOT_TTL_S", "600"),
                 ("SMG_LOG_MM_TIMING", "YES"),
+                ("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", "True"),
             ]),
         )
         .unwrap();
@@ -295,6 +334,9 @@ mod tests {
         );
         assert_eq!(settings.rdma_slot_ttl_s, from_env(Some(600)));
         assert_eq!(settings.log_mm_timing, from_env(true));
+        assert_eq!(settings.allow_private_media_hosts, from_env(true));
+        // The allow-list is a flag only: nothing in the environment lists hosts.
+        assert_eq!(settings.allowed_media_domains, Setting::from_default(None));
     }
 
     #[test]
@@ -306,6 +348,8 @@ mod tests {
             rdma_listen_ip: Some("192.168.1.2".to_string()),
             rdma_slot_ttl_s: Some(900),
             log_mm_timing: true,
+            mm_allowed_media_domains: Some(vec!["media.example".to_string()]),
+            mm_allow_private_media_hosts: true,
             ..RouterConfig::default()
         };
         let settings = MultimodalSettings::resolve_with(
@@ -317,6 +361,7 @@ mod tests {
                 ("SMG_RDMA_LISTEN_IP", "10.0.0.7"),
                 ("SMG_RDMA_SLOT_TTL_S", "600"),
                 ("SMG_LOG_MM_TIMING", "false"),
+                ("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", "0"),
             ]),
         )
         .unwrap();
@@ -329,6 +374,43 @@ mod tests {
         );
         assert_eq!(settings.rdma_slot_ttl_s, flag(Some(900)));
         assert_eq!(settings.log_mm_timing, flag(true));
+        assert_eq!(
+            settings.allowed_media_domains,
+            flag(Some(vec!["media.example".to_string()]))
+        );
+        assert_eq!(settings.allow_private_media_hosts, flag(true));
+    }
+
+    /// The media fetch policy's defaults: any public host, no private ones;
+    /// an empty allow-list is no allow-list, and only a true-ish opt-in
+    /// opens private hosts.
+    #[test]
+    fn media_fetch_policy_defaults_and_opt_in_spellings() {
+        let config = RouterConfig {
+            mm_allowed_media_domains: Some(Vec::new()),
+            ..RouterConfig::default()
+        };
+        let settings = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(settings.allowed_media_domains, Setting::from_default(None));
+        assert_eq!(
+            settings.allow_private_media_hosts,
+            Setting::from_default(false)
+        );
+        for (value, expected) in [
+            ("1", from_env(true)),
+            ("yes", from_env(true)),
+            ("ON", from_env(true)),
+            ("0", Setting::from_default(false)),
+            ("false", Setting::from_default(false)),
+            ("sometimes", Setting::from_default(false)),
+        ] {
+            let settings = MultimodalSettings::resolve_with(
+                &RouterConfig::default(),
+                env(&[("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", value)]),
+            )
+            .unwrap();
+            assert_eq!(settings.allow_private_media_hosts, expected, "{value}");
+        }
     }
 
     /// A mode that is nearly right would otherwise resolve to the default and

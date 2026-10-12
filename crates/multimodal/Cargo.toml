@@ -43,7 +43,7 @@ serde_bytes = "0.11"
 serde_json.workspace = true
 tempfile = "3.27"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "process", "time"] }
+tokio = { workspace = true, features = ["sync", "fs", "net", "rt-multi-thread", "process", "time"] }
 tracing.workspace = true
 url = "2.5.8"
 

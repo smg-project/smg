@@ -782,6 +782,21 @@ struct CliArgs {
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
     mm_pixel_rdma: bool,
 
+    /// Hosts the gateway fetches client-supplied media URLs from when it
+    /// processes media itself, by name, comma-separated; a redirect to any
+    /// other host is refused. Unset allows any host the address policy
+    /// passes (public addresses, or private ones with
+    /// `--mm-allow-private-media-hosts`).
+    #[arg(long, value_delimiter = ',', help_heading = "Multimodal")]
+    mm_allowed_media_domains: Option<Vec<String>>,
+
+    /// Allow client-supplied media URLs that name or resolve to a loopback,
+    /// link-local or private address, for a deployment whose media origin is
+    /// internal; by default such URLs are refused before anything is
+    /// connected. Falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
+    #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
+    mm_allow_private_media_hosts: bool,
+
     /// Listener IP for the RDMA pixel lane's metadata exchange; without one
     /// the lane stays on the inline path. Falls back to `SMG_RDMA_LISTEN_IP`.
     #[arg(long, help_heading = "Multimodal")]
@@ -2264,6 +2279,8 @@ impl CliArgs {
             .mm_processing(self.mm_processing)
             .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
             .mm_pixel_rdma(self.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
@@ -3615,7 +3632,11 @@ mod tests {
             "--rdma-slot-ttl-s",
             "600",
             "--log-mm-timing",
+            "--mm-allowed-media-domains",
+            "media.example,cdn.example",
+            "--mm-allow-private-media-hosts",
         ]);
+        let domains = Some(vec!["media.example".to_string(), "cdn.example".to_string()]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.mm_processing, Some(MmProcessingMode::Worker));
@@ -3624,6 +3645,8 @@ mod tests {
         assert_eq!(router_config.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(router_config.rdma_slot_ttl_s, Some(600));
         assert!(router_config.log_mm_timing);
+        assert_eq!(router_config.mm_allowed_media_domains, domains);
+        assert!(router_config.mm_allow_private_media_hosts);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         let nested = &server_config.router_config;
@@ -3633,6 +3656,8 @@ mod tests {
         assert_eq!(nested.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(nested.rdma_slot_ttl_s, Some(600));
         assert!(nested.log_mm_timing);
+        assert_eq!(nested.mm_allowed_media_domains, domains);
+        assert!(nested.mm_allow_private_media_hosts);
     }
 
     #[test]
@@ -3645,10 +3670,13 @@ mod tests {
         assert_eq!(router_config.rdma_listen_ip, None);
         assert_eq!(router_config.rdma_slot_ttl_s, None);
         assert!(!router_config.log_mm_timing);
+        assert_eq!(router_config.mm_allowed_media_domains, None);
+        assert!(!router_config.mm_allow_private_media_hosts);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.router_config.mm_processing, None);
         assert!(!server_config.router_config.log_mm_timing);
+        assert!(!server_config.router_config.mm_allow_private_media_hosts);
     }
 
     #[test]
