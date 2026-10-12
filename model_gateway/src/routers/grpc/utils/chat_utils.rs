@@ -518,13 +518,19 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 /// The request whose tools the template renders. A named `tool_choice`
 /// renders every tool, as the engine's own server renders it (the named call
 /// is forced by the tool constraint, built from `callable_tools`); an
-/// `allowed_tools` choice renders its subset; any other request renders as
-/// it is.
+/// `allowed_tools` choice renders its subset; `none` renders no tool, as the
+/// Responses path renders it, so the model is not offered a call it may not
+/// make and answers in text; any other request renders as it is.
 pub(crate) fn request_as_rendered(
     request: &ChatCompletionRequest,
 ) -> std::borrow::Cow<'_, ChatCompletionRequest> {
     match request.tool_choice {
         Some(ToolChoice::Function { .. }) => std::borrow::Cow::Borrowed(request),
+        Some(ToolChoice::Value(ToolChoiceValue::None)) if request.tools.is_some() => {
+            let mut rendered = request.clone();
+            rendered.tools = None;
+            std::borrow::Cow::Owned(rendered)
+        }
         _ => filter_chat_request_by_tool_choice(request),
     }
 }
@@ -1597,6 +1603,26 @@ mod tests {
             names(&request_as_rendered(&auto)),
             ["get_weather", "get_time"]
         );
+    }
+
+    /// `tool_choice: none` renders no tool: the model is not offered a call
+    /// it may not make, and the request's other fields render as sent.
+    #[test]
+    fn tool_choice_none_renders_no_tool() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "q"}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}}
+            ],
+            "tool_choice": "none",
+        }))
+        .expect("chat request");
+        let rendered = request_as_rendered(&request);
+        assert!(rendered.tools.is_none());
+        assert_eq!(rendered.messages.len(), request.messages.len());
+        // The request itself keeps its tools for the rest of the pipeline.
+        assert!(request.tools.is_some());
     }
 
     fn effort_request(reasoning_effort: Option<&str>) -> ChatCompletionRequest {

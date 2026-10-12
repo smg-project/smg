@@ -180,8 +180,8 @@ pub(crate) fn process_messages_prompt(
 
 /// The tools the template renders for a request: the custom tools as chat
 /// tools, narrowed by `tool_choice` the way the chat path narrows them (a
-/// forced tool renders alone). Shared by the preparation stage and
-/// count_tokens so both render the same prompt.
+/// forced tool renders alone, and `none` renders none). Shared by the
+/// preparation stage and count_tokens so both render the same prompt.
 pub(crate) fn template_tools(
     tools: Option<&[messages::Tool]>,
     tool_choice: Option<&messages::ToolChoice>,
@@ -189,6 +189,9 @@ pub(crate) fn template_tools(
     let Some(tools) = tools else {
         return Vec::new();
     };
+    if matches!(tool_choice, Some(messages::ToolChoice::None)) {
+        return Vec::new();
+    }
     let chat_tools = extract_chat_tools(tools);
     match tool_choice.map(convert_message_tool_choice) {
         Some(tc) => {
@@ -1500,6 +1503,31 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(counted, 5);
+    }
+
+    /// `tool_choice: {"type": "none"}` renders no tool, as on the chat path;
+    /// `auto` renders them all.
+    #[test]
+    fn tool_choice_none_renders_no_tool() {
+        let request = |tool_choice: Value| -> CountMessageTokensRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "tools": [{
+                    "name": "get_weather",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+                }],
+                "tool_choice": tool_choice,
+                "messages": [{"role": "user", "content": "Weather in Paris?"}]
+            }))
+            .unwrap()
+        };
+        let none = request(json!({"type": "none"}));
+        assert!(template_tools(none.tools.as_deref(), none.tool_choice.as_ref()).is_empty());
+        let auto = request(json!({"type": "auto"}));
+        assert_eq!(
+            template_tools(auto.tools.as_deref(), auto.tool_choice.as_ref()).len(),
+            1
+        );
     }
 
     /// With a string-format template an image is the placeholder the model's
