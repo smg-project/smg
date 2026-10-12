@@ -436,8 +436,15 @@ class Router:
         redis_config = None
         if history_backend == HistoryBackendType.Redis:
             retention_days = args_dict.get("redis_retention_days", 30)
-            # If retention_days is negative, it means persistent storage (None in Rust)
-            retention_arg = None if retention_days < 0 else retention_days
+            # -1 is the one spelling of persistent records (None in Rust); 0
+            # and the other negatives are refused by name, as the command
+            # line refuses them.
+            if retention_days < -1 or retention_days == 0:
+                raise ValueError(
+                    "redis_retention_days must be at least 1 "
+                    f"(-1 keeps records persistent), got {retention_days}"
+                )
+            retention_arg = None if retention_days == -1 else retention_days
 
             redis_config = PyRedisConfig(
                 url=args_dict.get("redis_url"),

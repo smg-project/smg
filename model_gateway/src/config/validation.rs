@@ -326,22 +326,25 @@ impl ConfigValidator {
                 Self::validate_oracle(oracle)?;
             }
         }
-        // The Redis and Postgres configurations carry their own rules (the
-        // URL, the pool size, a retention of 0 days that would expire every
-        // record as it is written); the command line ran them while building
-        // its config, the bindings and a directly built RouterConfig did not,
-        // so they run here for every start-up.
+        // The Redis and Postgres configurations carry their own numeric rules
+        // (the pool size, the call bound, a retention of 0 days that would
+        // expire every record as it is written); the command line ran them
+        // while building its config, the bindings and a directly built
+        // RouterConfig did not, so they run here for every start-up. The
+        // connection string's shape is the driver's: a socket path or a
+        // key=value string the driver understands is not refused here (the
+        // command line's own URL check stays with the command line).
         if config.history_backend == HistoryBackend::Redis {
             if let Some(redis) = &config.redis {
                 redis
-                    .validate()
+                    .validate_bounds()
                     .map_err(|reason| ConfigError::ValidationFailed { reason })?;
             }
         }
         if config.history_backend == HistoryBackend::Postgres {
             if let Some(postgres) = &config.postgres {
                 postgres
-                    .validate()
+                    .validate_bounds()
                     .map_err(|reason| ConfigError::ValidationFailed { reason })?;
             }
         }
@@ -2322,6 +2325,63 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The shared validation holds the stores' numeric rules and leaves the
+    /// connection string to the driver: a Redis socket path and a Postgres
+    /// key=value string, which the drivers accept and the command line's URL
+    /// check does not, pass it; a zero bound in the same configuration does
+    /// not.
+    #[test]
+    fn the_shared_validation_leaves_the_store_connection_string_to_the_driver() {
+        let redis = |pool_max| RedisConfig {
+            url: "unix:///run/redis.sock".to_string(),
+            pool_max,
+            op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+            schema: None,
+            retention_days: Some(7),
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(4)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(0)),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(reason.contains("pool_max"), "{reason}");
+            }
+            other => panic!("expected the Redis bound, got {other:?}"),
+        }
+
+        let postgres = |op_timeout_secs| PostgresConfig {
+            db_url: "host=/var/run/postgresql dbname=smg user=smg".to_string(),
+            pool_max: 4,
+            op_timeout_secs,
+            schema: None,
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Postgres,
+            postgres: Some(postgres(5)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Postgres,
+            postgres: Some(postgres(0)),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(reason.contains("op_timeout_secs"), "{reason}");
+            }
+            other => panic!("expected the Postgres bound, got {other:?}"),
+        }
     }
 
     #[test]

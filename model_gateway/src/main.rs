@@ -2123,12 +2123,13 @@ impl CliArgs {
         let pool_max = self.redis_pool_max_size.unwrap_or(16);
 
         let retention_days = match self.redis_retention_days {
-            Some(d) if d < 0 => None, // Persistent
-            // A retention of 0 days would expire every record as it is written.
-            Some(0) => {
+            Some(-1) => None, // Persistent
+            // A retention of 0 days would expire every record as it is
+            // written; -1 is the one spelling of persistent records.
+            Some(d) if d <= 0 => {
                 return Err(ConfigError::InvalidValue {
                     field: "redis_retention_days".to_string(),
-                    value: "0".to_string(),
+                    value: d.to_string(),
                     reason: "Must be at least 1 (-1 keeps records persistent)".to_string(),
                 });
             }
