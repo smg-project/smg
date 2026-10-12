@@ -2627,9 +2627,16 @@ impl FrameSelection {
     /// `None` unless it picks out exactly the selection it is standing in for,
     /// so a selection it cannot describe still gets the explicit list and the
     /// caller's existing fallback. Two spreads are described: the floored one
-    /// (`Even`) and the nearest-frame one (`EvenRounded`); ffmpeg's `round` is
-    /// half away from zero where the connector rounds ties to even, so a
-    /// selection with such a tie is not described and keeps the list.
+    /// (`Even`) and the nearest-frame one (`EvenRounded`). The connector
+    /// rounds the nearest frame's ties to even, as the reference does, where
+    /// ffmpeg's `round` is half away from zero, and a tie whose floor is even
+    /// is common (about one clip in five between 101 and 767 picks), so the
+    /// nearest-frame expression spells ties-to-even out of `floor`, `gt`, `eq`
+    /// and `mod`: `floor(x) + (frac > 0.5) + (frac == 0.5 and floor(x) odd)`.
+    /// Its position is `step * (last / denom)`, the picker's own arithmetic
+    /// (`i * step` with the stride rounded once, as the reference's linspace
+    /// computes it): `(step * last) / denom` lands on the other side of a tie
+    /// for some steps, and ffmpeg evaluates in the same doubles.
     fn spread_select_filter(&self) -> Option<String> {
         let last = self.total_frames.checked_sub(1).filter(|last| *last > 0)?;
         let denom = self
@@ -2638,15 +2645,17 @@ impl FrameSelection {
             .checked_sub(1)
             .filter(|denom| *denom > 0)?;
         let floored = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
-        let nearest = |step: f64| (step * last as f64 / denom as f64).round() as usize;
+        let stride = last as f64 / denom as f64;
+        let nearest_to_even = |step: f64| (step * stride).round_ties_even() as usize;
         if self.is_described_by(last, denom, floored) {
             return Some(format!(
                 "select='eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))'"
             ));
         }
-        if self.is_described_by(last, denom, nearest) {
+        if self.is_described_by(last, denom, nearest_to_even) {
+            let x = format!("round(n*{denom}/{last})*({last}/{denom})");
             return Some(format!(
-                "select='eq(n\\,round(round(n*{denom}/{last})*{last}/{denom}))'"
+                "select='eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2))'"
             ));
         }
         None
@@ -3954,14 +3963,19 @@ mod video_sampling_tests {
 
     #[test]
     fn a_long_selection_is_described_rather_than_listed() {
+        // The nearest-frame spread spells ties-to-even out of floor, gt, eq and
+        // mod, as spread_select_filter documents; x is the picker's own position.
+        let x = "round(n*767/17999)*(17999/767)";
         for (sampling, expected) in [
             (
                 FrameSampling::Even,
-                r"select='eq(n\,floor(round(n*767/17999)*17999/767))'",
+                r"select='eq(n\,floor(round(n*767/17999)*17999/767))'".to_string(),
             ),
             (
                 FrameSampling::EvenRounded,
-                r"select='eq(n\,round(round(n*767/17999)*17999/767))'",
+                format!(
+                    r"select='eq(n\,floor({x})+gt({x}-floor({x})\,0.5)+eq({x}-floor({x})\,0.5)*mod(floor({x})\,2))'"
+                ),
             ),
         ] {
             let long = VideoFetchConfig {
@@ -3996,6 +4010,14 @@ mod video_sampling_tests {
             (30.0, 1_800, 768),
             (24.0, 2_400, 768),
             (24.0, 1_500, 768),
+            // 103 picks over 1238 frames: pick 51 falls on 618.5 exactly, a tie
+            // whose floor is even (the connector takes 618, ffmpeg's `round`
+            // would take 619).
+            (24.0, 1_238, 768),
+            (25.0, 1_289, 768),
+            // 139 picks over 1672 frames: step 69 is a tie in exact arithmetic
+            // (835.5) that the picker's `i * step` lands just under (835).
+            (24.0, 1_672, 768),
         ];
         for sampling in [FrameSampling::Even, FrameSampling::EvenRounded] {
             for (fps, total, max_frames) in cases {
@@ -4011,12 +4033,12 @@ mod video_sampling_tests {
                 assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
                 let last = total - 1;
                 let denom = selection.frame_indices.len() - 1;
-                let frame_at = |step: f64| {
-                    let position = step * last as f64 / denom as f64;
-                    match sampling {
-                        FrameSampling::EvenRounded => position.round() as usize,
-                        _ => position.floor() as usize,
+                let frame_at = |step: f64| match sampling {
+                    // The picker's arithmetic: the stride rounded once, then scaled.
+                    FrameSampling::EvenRounded => {
+                        (step * (last as f64 / denom as f64)).round_ties_even() as usize
                     }
+                    _ => (step * last as f64 / denom as f64).floor() as usize,
                 };
                 let described: Vec<usize> = (0..total)
                     .filter(|index| {
@@ -4042,11 +4064,12 @@ mod video_sampling_tests {
     }
 
     #[test]
-    fn a_nearest_frame_tie_is_listed_not_described() {
+    fn a_nearest_frame_tie_is_described_to_even() {
         // 10 frames at 4 fps, 5 picks at 0, 2.25, 4.5, 6.75 and 9: the connector
         // takes 0, 2, 4 (the tie, to even), 7 and 9. ffmpeg's `round` would take
-        // the tie to 5 and its `floor` would take 6.75 to 6, so neither closed
-        // form picks this set and the frames are listed.
+        // the tie to 5 and its `floor` would take 6.75 to 6; the ties-to-even
+        // expression picks this set. Five frames are still listed (under the
+        // term limit), but the description is there for a longer clip.
         let rounded = VideoFetchConfig {
             sampling: FrameSampling::EvenRounded,
             ..cfg()
@@ -4054,11 +4077,45 @@ mod video_sampling_tests {
         assert_eq!(sampled_frame_indices(10, 4.0, rounded), vec![0, 2, 4, 7, 9]);
         let selection = FrameSelection::from_metadata(metadata(Some(4.0), Some(10)), rounded)
             .expect("frame rate and count are known");
-        assert!(selection.spread_select_filter().is_none());
+        let described = selection
+            .spread_select_filter()
+            .expect("a tie to even is described");
+        assert!(described.contains("mod(floor("), "{described}");
         assert_eq!(
             selection.select_filter(),
             r"select='eq(n\,0)+eq(n\,2)+eq(n\,4)+eq(n\,7)+eq(n\,9)'"
         );
+    }
+
+    /// Every nearest-frame spread over the term limit is described, ties
+    /// included: a sweep over the clip lengths from 51 s to 400 s at the
+    /// common frame rates (every length at 24 fps, every 13th at the others),
+    /// where the half-away-from-zero form left about one clip in five listed.
+    #[test]
+    fn every_nearest_frame_spread_over_the_term_limit_is_described() {
+        let rounded = VideoFetchConfig {
+            max_frames: 768,
+            sampling: FrameSampling::EvenRounded,
+            ..cfg()
+        };
+        let mut checked = 0usize;
+        for (fps, stride) in [(24usize, 1usize), (25, 13), (30, 13), (60, 13)] {
+            for total in (51 * fps..=400 * fps).step_by(stride) {
+                let selection =
+                    FrameSelection::from_metadata(metadata(Some(fps as f64), Some(total)), rounded)
+                        .expect("frame rate and count are known");
+                if selection.unique_count() <= FFMPEG_MAX_SELECT_TERMS {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    selection.spread_select_filter().is_some(),
+                    "{fps} fps, {total} frames ({} picks): listed, not described",
+                    selection.unique_count()
+                );
+            }
+        }
+        assert!(checked > 8_000, "{checked} selections checked");
     }
 
     #[test]
