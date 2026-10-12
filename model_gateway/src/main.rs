@@ -2034,17 +2034,29 @@ impl CliArgs {
             reason: reason.to_string(),
         };
         for origin in &self.cors_allowed_origins {
-            // Exactly what a browser sends as `Origin`: a path, even `/`, would
-            // never match the exact comparison of the CORS layer.
+            // Exactly what a browser sends as `Origin`: the scheme and the host
+            // in lower case, no userinfo, no default port, nothing after the
+            // authority (not even `/`); anything else never matches the exact
+            // comparison of the CORS layer.
+            let default_port = |scheme: &str| match scheme {
+                "http" | "ws" => Some(80),
+                "https" | "wss" => Some(443),
+                _ => None,
+            };
             let parsed = http::Uri::try_from(origin.as_str()).ok().filter(|uri| {
                 matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
-                    if origin.as_str() == format!("{scheme}://{authority}"))
+                    if origin.as_str() == format!("{scheme}://{authority}")
+                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
+                        && !authority.as_str().contains('@')
+                        && authority
+                            .port_u16()
+                            .is_none_or(|port| Some(port) != default_port(scheme)))
             });
             if parsed.is_none() || http::HeaderValue::from_str(origin).is_err() {
                 return Err(invalid(
                     "cors_allowed_origins",
                     origin,
-                    "not exactly an origin (scheme://host[:port], nothing after it); the policy would silently narrow to the origins that match",
+                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
                 ));
             }
         }
@@ -2782,6 +2794,18 @@ mod tests {
             ),
             (
                 vec!["--cors-allowed-origins", "https://example.com/"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "https://Example.com"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "https://example.com:443"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "https://user@example.com"],
                 "cors_allowed_origins",
             ),
             (
