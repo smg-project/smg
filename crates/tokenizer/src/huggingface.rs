@@ -794,8 +794,18 @@ impl HuggingFaceTokenizer {
         if stable_end == emitted.len() {
             return Ok(prefix.len());
         }
+        // The start is used as a byte index into the emitted text and into the
+        // decode it is aligned with: it has to be a boundary of both, which
+        // holds when the stable text is a prefix of the emitted text. A decoder
+        // step that spans the boundary (a `Replace` after the fuse) breaks
+        // that, and the alignment then covers the whole emitted text, as it
+        // did before the run's start was known.
         let stable = self.decode(&emitted[..stable_end], skip_special_tokens)?;
-        Ok(stable.len().min(prefix.len()))
+        Ok(if prefix.starts_with(stable.as_str()) {
+            stable.len()
+        } else {
+            prefix.len()
+        })
     }
 
     /// The client-visible step (see [`Decoder::decode_step`]): a seeded
