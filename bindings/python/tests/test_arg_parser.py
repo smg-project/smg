@@ -1816,6 +1816,7 @@ class TestRouterArgsFieldOrder:
         "idle_connection_timeout_secs",
         "mm_allowed_media_domains",
         "mm_allow_private_media_hosts",
+        "sse_keepalive_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1880,6 +1881,7 @@ class TestRouterArgsFieldOrder:
             "power_of_two_load_metric",
             "header_read_timeout_secs",
             "idle_connection_timeout_secs",
+            "sse_keepalive_secs",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "

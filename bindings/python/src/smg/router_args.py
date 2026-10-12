@@ -359,6 +359,9 @@ class RouterArgs:
     # Allow media URLs on loopback, link-local or private addresses (an internal
     # media origin); False falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS
     mm_allow_private_media_hosts: bool = False
+    # Seconds of upstream silence after which an open SSE stream carries a
+    # keep-alive frame; 0 sends none; appended last for the same reason
+    sse_keepalive_secs: int = 15
 
     @staticmethod
     def add_cli_args(
@@ -1018,6 +1021,19 @@ class RouterArgs:
                 " pauses while the worker applies backpressure, so a slow"
                 " worker read never trips it. Applies only to streamed"
                 " request bodies. 0 disables"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}sse-keepalive-secs",
+            type=int,
+            default=RouterArgs.sse_keepalive_secs,
+            help=(
+                "Seconds of upstream silence after which an open SSE stream"
+                " carries a keep-alive frame (an SSE comment on the"
+                " OpenAI-shaped endpoints, the ping event on /v1/messages), so"
+                " an idle-timeout proxy does not cut a stream that is waiting"
+                " on a long prefill. Nothing is sent while frames flow."
+                " 0 sends none"
             ),
         )
         routing_group.add_argument(

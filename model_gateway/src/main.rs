@@ -986,6 +986,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
 
+    /// Seconds of upstream silence after which an open SSE stream carries a
+    /// keep-alive frame (an SSE comment on the OpenAI-shaped endpoints, the
+    /// `ping` event on /v1/messages), so an idle-timeout proxy does not cut
+    /// a stream that is waiting on a long prefill. Nothing is sent while
+    /// frames flow. 0 sends none.
+    #[arg(long, default_value_t = 15, help_heading = "Request Handling")]
+    sse_keepalive_secs: u64,
+
     /// Idle timeout in seconds for pooled upstream connections. Must stay
     /// below the backend HTTP server's keep-alive timeout (vLLM and SGLang
     /// default to 5), or reused connections the server already closed fail
@@ -2486,6 +2494,7 @@ impl CliArgs {
             .header_read_timeout_secs(self.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .request_timeout_secs(self.request_timeout_secs)
+            .sse_keepalive_secs(self.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
@@ -3502,6 +3511,26 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.header_read_timeout_secs, 30);
         assert_eq!(defaults.idle_connection_timeout_secs, 90);
+    }
+
+    /// The SSE keep-alive interval is a router-only setting and must flow
+    /// into `RouterConfig`; it is on by default.
+    #[test]
+    fn sse_keepalive_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--sse-keepalive-secs", "40"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.sse_keepalive_secs, 40);
+
+        let off = cli_args_from(&["--sse-keepalive-secs", "0"]);
+        assert_eq!(
+            off.to_router_config(vec![], vec![])
+                .unwrap()
+                .sse_keepalive_secs,
+            0
+        );
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.sse_keepalive_secs, 15);
     }
 
     #[test]

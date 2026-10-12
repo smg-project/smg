@@ -13,6 +13,7 @@ pub mod messages_errors;
 pub mod metrics;
 pub mod request_id;
 pub mod scheduler;
+pub mod sse_keepalive;
 pub mod storage_context;
 pub mod tenant_resolution;
 pub mod token_bucket;
@@ -32,6 +33,7 @@ pub use messages_errors::{
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
+pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{
     ordinary_tenant_resolution_middleware, route_request_meta_middleware, TenantResolutionState,

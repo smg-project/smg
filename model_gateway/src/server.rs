@@ -1064,6 +1064,13 @@ pub fn build_app(
                 StreamBodyState::new(app_state.router.clone(), app_state.context.clone()),
                 stream_eligible_request_bodies,
             ))
+            // Every SSE stream of these routes carries a keep-alive through an
+            // upstream silence (a comment; the Messages API's ping event),
+            // written between frames, nothing while frames flow.
+            .route_layer(axum::middleware::from_fn_with_state(
+                middleware::SseKeepAlive::from_config(&app_state.context.router_config),
+                middleware::sse_keepalive_middleware,
+            ))
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
             .route("/v1/detokenize", post(v1_detokenize))
