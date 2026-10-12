@@ -105,7 +105,8 @@ fn byte_fallback_invalid_byte_keeps_streamed_text_and_counts_the_recovery() {
     let before = crate::decode_activity_stats();
     // "日本" streamed, then an invalid byte, then "語" and a regular token.
     // Batch decoding turns the whole run into ten replacement characters; the
-    // stream keeps "日本" (six bytes) and sends the remaining four, then "x".
+    // stream keeps "日本" (six bytes) and sends the remaining four once
+    // four bytes are pending (a run that cannot become valid), then "x".
     let mut ids = byte_ids("日本");
     ids.push(0xFF + 2);
     ids.extend(byte_ids("語"));
@@ -113,10 +114,7 @@ fn byte_fallback_invalid_byte_keeps_streamed_text_and_counts_the_recovery() {
     let (deltas, batch, recoveries) =
         stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
     assert_eq!(batch, format!("{}x", "\u{FFFD}".repeat(10)));
-    assert_eq!(
-        deltas,
-        vec!["日", "本", format!("{}x", "\u{FFFD}".repeat(4)).as_str()]
-    );
+    assert_eq!(deltas, vec!["日", "本", "\u{FFFD}".repeat(4).as_str(), "x"]);
     assert_eq!(recoveries, 1);
     // The same run cut by the end of input instead of a regular token.
     let mut ids = byte_ids("日本");
@@ -551,6 +549,214 @@ fn byte_fallback_token_stop_preserves_pending_text() {
         decoder.process_token(7).unwrap(),
         SequenceDecoderOutput::Stopped
     );
+}
+
+/// Every token through a stop decoder with no stops: the text of each step
+/// (`None` where it held), the end-of-input text, the recovery count.
+fn streamed_steps(
+    tokenizer: &Arc<dyn crate::TokenizerTrait>,
+    ids: &[u32],
+) -> (Vec<Option<String>>, String, u32) {
+    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+    let mut decoder =
+        StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), true);
+    let steps = ids
+        .iter()
+        .map(|&id| match decoder.process_token(id).unwrap() {
+            SequenceDecoderOutput::Text(delta) => Some(delta),
+            SequenceDecoderOutput::Held => None,
+            other => panic!("unexpected stop: {other:?}"),
+        })
+        .collect();
+    let released = match decoder.finish().unwrap() {
+        SequenceDecoderOutput::Text(delta) => delta,
+        SequenceDecoderOutput::Held => String::new(),
+        other => panic!("unexpected stop: {other:?}"),
+    };
+    (steps, released, decoder.prefix_mismatches())
+}
+
+#[test]
+fn byte_fallback_invalid_run_streams_one_replacement_per_byte_as_it_comes() {
+    let tokenizer = byte_fallback_full_tokenizer(vec![]);
+    // "日本", an invalid byte, "語", a regular token: with four bytes pending
+    // the run cannot become valid, so their replacement characters stream at
+    // once and every further byte's as it comes, instead of waiting for the
+    // regular token; the text at the end is the same as before (日本, four
+    // replacement characters, x) and one recovery counts.
+    let mut ids = byte_ids("日本");
+    ids.push(0xFF + 2);
+    ids.extend(byte_ids("語"));
+    ids.push(1);
+    let (steps, released, recoveries) = streamed_steps(&tokenizer, &ids);
+    let r = "\u{FFFD}".to_string();
+    assert_eq!(
+        steps,
+        vec![
+            None,
+            None,
+            Some("日".into()),
+            None,
+            None,
+            Some("本".into()),
+            None,
+            None,
+            None,
+            Some(r.repeat(4)),
+            Some("x".into()),
+        ]
+    );
+    assert_eq!(released, "");
+    assert_eq!(recoveries, 1);
+    // An incomplete sequence before the invalid byte belongs to the lost run:
+    // its bytes stream as replacement characters with the invalid one and
+    // the byte after it (four pending), then one per byte.
+    let mut ids = byte_ids("日");
+    ids.extend(byte_ids("本")[..2].iter());
+    ids.push(0xFF + 2);
+    ids.extend(byte_ids("語"));
+    let (steps, released, recoveries) = streamed_steps(&tokenizer, &ids);
+    assert_eq!(steps[..3], [None, None, Some("日".into())]);
+    assert_eq!(steps[3..7], [None, None, None, Some(r.repeat(4))]);
+    assert_eq!(steps[7..], [Some(r.clone()), Some(r.clone())]);
+    assert_eq!(released, "");
+    assert_eq!(recoveries, 1);
+    // Runs without an invalid byte are unchanged: each character as it closes.
+    let (steps, released, recoveries) = streamed_steps(&tokenizer, &byte_ids("日本語"));
+    let texts: Vec<_> = steps.into_iter().flatten().collect();
+    assert_eq!(texts, vec!["日", "本", "語"]);
+    assert_eq!(released, "");
+    assert_eq!(recoveries, 0);
+}
+
+#[test]
+fn raw_decode_step_over_an_invalid_run_is_bounded_and_does_not_count() {
+    // The raw step (what the gateway replays for token accounting) gets the
+    // same bound as the client path over an invalid run, and the process-wide
+    // counters do not move for it. The counters are shared with the other
+    // tests of this binary, so the run repeats: a counting step would add
+    // RUNS, concurrent tests a few.
+    const RUNS: u64 = 50;
+    let tokenizer = byte_fallback_full_tokenizer(vec![]);
+    let text: String = "日本語".chars().cycle().take(700).collect();
+    let mut run: Vec<u32> = byte_ids(&text)[..2_000].to_vec();
+    run[9] = 0xFF + 2;
+    run.push(1);
+    let before = crate::decode_activity_stats();
+    for _ in 0..RUNS {
+        let (mut ids, mut prefix, mut prefix_index) = (Vec::new(), String::new(), 0usize);
+        let mut streamed = String::new();
+        let mut max_window = 0;
+        for &id in &run {
+            let step = tokenizer
+                .decode_step(id, &mut ids, &mut prefix, &mut prefix_index, true)
+                .unwrap();
+            if let Some(delta) = step {
+                streamed.push_str(&delta);
+            }
+            max_window = max_window.max(ids.len());
+        }
+        assert!(max_window <= 16, "held window grew to {max_window} ids");
+        assert_eq!(streamed.chars().count(), 3 + (2_000 - 9) + 1);
+        assert!(streamed.starts_with("日本語\u{FFFD}") && streamed.ends_with("\u{FFFD}x"));
+    }
+    let after = crate::decode_activity_stats();
+    for (b, a) in before.iter().zip(after.iter()) {
+        assert!(
+            a.prefix_mismatches - b.prefix_mismatches < RUNS,
+            "{}: {} -> {}",
+            a.kind,
+            b.prefix_mismatches,
+            a.prefix_mismatches
+        );
+    }
+}
+
+#[test]
+fn byte_fallback_literal_replacement_characters_are_not_a_lost_run() {
+    // A literal U+FFFD (`EF BF BD`) is a valid character whose decode ends in
+    // the replacement character, so the step holds it; the bytes after it are
+    // not a lost run: the stream equals the batch decode and counts nothing.
+    let tokenizer = byte_fallback_full_tokenizer(vec![]);
+    for text in ["\u{FFFD}é", "\u{FFFD}\u{FFFD}", "\u{FFFD}😀", "é\u{FFFD}日"] {
+        let mut ids = byte_ids(text);
+        ids.push(1);
+        let (deltas, batch, recoveries) =
+            stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+        assert_eq!(batch, format!("{text}x"));
+        assert_eq!(deltas.concat(), batch, "{text:?}");
+        assert_eq!(recoveries, 0, "{text:?}");
+    }
+    // An invalid byte after a literal U+FFFD: the run is lost from that byte
+    // on, and nothing streamed before it is rewritten.
+    let mut ids = byte_ids("\u{FFFD}");
+    ids.push(0xFF + 2);
+    ids.extend(byte_ids("é"));
+    ids.push(1);
+    let (deltas, batch, recoveries) =
+        stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+    assert_eq!(batch, format!("{}x", "\u{FFFD}".repeat(6)));
+    assert_eq!(deltas.concat(), batch);
+    assert_eq!(recoveries, 0);
+}
+
+#[test]
+fn byte_fallback_lost_run_after_a_literal_replacement_character_counts_bytes() {
+    // "\u{FFFD}A" streamed as byte tokens, then invalid bytes, then a regular
+    // token. With fewer than four invalid bytes the run closes through the
+    // remainder path, which aligns the streamed text with the batch decode by
+    // characters and takes the streamed literal U+FFFD for one byte: two
+    // replacement characters more than the run has bytes. From four invalid
+    // bytes on, the lost-run path streams one replacement character per byte.
+    // Both keep "\u{FFFD}A" and count one recovery; the difference is
+    // smg-lab #330.
+    let tokenizer = byte_fallback_full_tokenizer(vec![]);
+    for (invalid, expected_tail) in [(3, 5), (4, 4), (8, 8)] {
+        let mut ids = byte_ids("\u{FFFD}A");
+        ids.extend(vec![0xFF + 2; invalid]);
+        ids.push(1);
+        let (deltas, batch, recoveries) =
+            stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+        assert_eq!(batch, format!("{}x", "\u{FFFD}".repeat(4 + invalid)));
+        assert_eq!(deltas[0], "\u{FFFD}A", "{invalid} invalid bytes");
+        assert_eq!(
+            deltas.concat(),
+            format!("\u{FFFD}A{}x", "\u{FFFD}".repeat(expected_tail)),
+            "{invalid} invalid bytes"
+        );
+        assert_eq!(recoveries, 1, "{invalid} invalid bytes");
+    }
+}
+
+#[test]
+fn byte_fallback_invalid_run_keeps_the_decode_window_bounded() {
+    // 2,000 byte tokens with an invalid byte at position 9: the held window
+    // stays at a handful of tokens, so the whole run costs a bounded amount
+    // of decoder work per token (the per-token work was proportional to the
+    // position in the run before, quadratic over the run).
+    use crate::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+    let tokenizer = byte_fallback_full_tokenizer(vec![]);
+    let text: String = "日本語".chars().cycle().take(700).collect();
+    let mut ids: Vec<u32> = byte_ids(&text)[..2_000].to_vec();
+    ids[9] = 0xFF + 2;
+    ids.push(1);
+    let mut decoder =
+        StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), true);
+    let mut chars = 0;
+    let mut max_window = 0;
+    for &id in &ids {
+        if let SequenceDecoderOutput::Text(delta) = decoder.process_token(id).unwrap() {
+            chars += delta.chars().count();
+        }
+        max_window = max_window.max(decoder.sequence_window_len());
+    }
+    if let SequenceDecoderOutput::Text(delta) = decoder.finish().unwrap() {
+        chars += delta.chars().count();
+    }
+    // 日本語 (three characters) streamed before the invalid byte, then one
+    // replacement character per remaining byte, then x.
+    assert_eq!(chars, 3 + (2_000 - 9) + 1);
+    assert!(max_window <= 16, "held window grew to {max_window} tokens");
 }
 
 #[test]
