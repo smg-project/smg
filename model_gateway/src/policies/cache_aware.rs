@@ -58,6 +58,7 @@
     cache_threshold:         Min prefix match ratio for highest-match routing (0.0-1.0)
     balance_abs_threshold:   Absolute margin of the spill gate (requests above the fleet mean); capped at
                              the in-flight count's natural swing at the pool's mean, never under four
+                             unless the configured value itself is lower (0: the relative part alone)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
     max_tree_size:           Max total size (chars/tokens) of each model's approximate tree,
@@ -140,9 +141,11 @@ const POOL_TABLE_REFRESH_MS: u64 = 1_000;
 /// regular pool, the PD legs' pools); past this the oldest goes.
 const POOL_TABLES_KEPT: usize = 8;
 
-/// The smallest absolute margin of the spill gate: a worker at most this many
-/// requests above the fleet mean is never over the gate, so a handful of
-/// requests on an otherwise idle fleet keep their cache affinity (see
+/// The floor of the swing-sized absolute margin of the spill gate: with a
+/// configured `balance_abs_threshold` of at least this, a worker at most this
+/// many requests above the fleet mean is never over the gate, so a handful of
+/// requests on an otherwise idle fleet keep their cache affinity; a lower
+/// configured value lowers the margin below it (see
 /// [`CacheAwarePolicy::absolute_margin`]).
 const MIN_ABSOLUTE_MARGIN: f64 = 4.0;
 
@@ -1808,7 +1811,8 @@ impl CacheAwarePolicy {
     /// requests above the mean, capped at the in-flight count's natural
     /// swing at this mean (two standard deviations of a Poisson count,
     /// `2 * sqrt(avg_load)`, rounded up to whole requests) and never under
-    /// [`MIN_ABSOLUTE_MARGIN`]. A fixed absolute margin sized for a large
+    /// [`MIN_ABSOLUTE_MARGIN`] unless the configured value is lower still
+    /// (0 leaves the relative margin to decide alone). A fixed absolute margin sized for a large
     /// pool cannot clear in a pool whose per-worker in-flight count stays
     /// below it (two workers at 32 in flight: the busier one would need 80
     /// at a margin of 64), so cache affinity there was never balanced at
@@ -4770,7 +4774,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_opens_at_the_same_load_as_before_once_the_mean_reaches_the_crossover() {
+    fn the_gate_opens_at_the_load_the_pools_mean_sets() {
         let policy = CacheAwarePolicy::with_config(launcher_defaults());
         // Pools of 2, 8 and 29 workers at 4, 8, 32 and 128 requests in
         // flight: the smallest in-flight count one worker must hold for the
@@ -4796,7 +4800,7 @@ mod tests {
                 .find(|&load| policy.over_count_pressure_gate(f64::from(load), avg_load));
             assert_eq!(first, opens_at, "{workers} workers, {in_flight} in flight");
         }
-        // At high means the relative margin decides, as before.
+        // At high means the relative margin decides, with either rule.
         assert!(!policy.over_count_pressure_gate(290.0, 200.0));
         assert!(policy.over_count_pressure_gate(301.0, 200.0));
     }

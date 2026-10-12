@@ -657,8 +657,10 @@ class RouterArgs:
                 "Spill gate, absolute part: a matched worker is skipped for the least-loaded one"
                 " when its load exceeds the healthy-fleet mean by this many requests AND by the"
                 " relative threshold. The margin is capped at the in-flight count's natural swing"
-                " at the pool's current mean (two standard deviations, never under four), so a"
-                " small pool can spill at all."
+                " at the pool's current mean (two standard deviations, never under four unless"
+                " this value is lower), so a small pool can spill at all. With the bucket policy"
+                " the pair keeps its own rule: balancing when (max_load - min_load) exceeds this"
+                " value and max_load exceeds min_load times the relative threshold."
             ),
         )
         routing_group.add_argument(

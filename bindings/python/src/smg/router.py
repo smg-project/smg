@@ -203,8 +203,11 @@ class Router:
             for the least-loaded one when its load exceeds the healthy-fleet mean by
             this many requests AND by balance_rel_threshold; the margin is capped at
             the in-flight count's natural swing at the pool's current mean (two
-            standard deviations, never under four requests), so a small pool can
-            spill at all. Default: 64
+            standard deviations, never under four requests unless this value is
+            lower), so a small pool can spill at all; with the bucket policy the
+            pair keeps its own rule (balancing when (max_load - min_load) exceeds
+            this value and max_load exceeds min_load times the relative
+            threshold). Default: 64
         balance_rel_threshold: Spill gate, relative part: the multiple of the
             healthy-fleet mean a matched worker's load must exceed, together with
             the absolute part. Default: 1.5
