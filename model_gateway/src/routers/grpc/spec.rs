@@ -23,6 +23,7 @@ use openai_protocol::{
 use serde_json::Value;
 
 use crate::routers::grpc::{
+    context::CompletionItem,
     regular::{stages::decisions::scoring::DecisionScoring, symphony::Assignment},
     utils,
 };
@@ -263,9 +264,12 @@ pub(crate) struct CompletionResponseSpec {
     pub choices_per_prompt: u32,
     pub echo: bool,
     pub suffix: Option<String>,
-    pub logprobs: bool,
+    /// `logprobs`: the number of alternatives each token reports, `None`
+    /// when the request asked for no logprobs.
+    pub logprobs: Option<u32>,
     pub include_usage: bool,
-    /// Populated only when `echo` (choices prepend their prompt text).
+    /// Populated only when `echo` (choices prepend their prompt text): each
+    /// prompt as written, or the decode of a token-id prompt.
     pub prompt_texts: Vec<String>,
     pub stop: Option<StringOrArray>,
     pub stop_token_ids: Option<Vec<u32>>,
@@ -274,13 +278,11 @@ pub(crate) struct CompletionResponseSpec {
     pub ignore_eos: bool,
 }
 
-impl From<&CompletionRequest> for CompletionResponseSpec {
-    fn from(request: &CompletionRequest) -> Self {
+impl CompletionResponseSpec {
+    /// The spec of `request` whose prompts were prepared as `items`.
+    pub fn new(request: &CompletionRequest, items: &[CompletionItem]) -> Self {
         let prompt_texts = if request.echo {
-            match &request.prompt {
-                StringOrArray::String(text) => vec![text.clone()],
-                StringOrArray::Array(texts) => texts.clone(),
-            }
+            items.iter().map(|item| item.text.clone()).collect()
         } else {
             Vec::new()
         };
@@ -288,7 +290,7 @@ impl From<&CompletionRequest> for CompletionResponseSpec {
             choices_per_prompt: request.n.unwrap_or(1).max(1),
             echo: request.echo,
             suffix: request.suffix.clone(),
-            logprobs: request.logprobs.is_some(),
+            logprobs: request.logprobs,
             include_usage: request
                 .stream_options
                 .as_ref()

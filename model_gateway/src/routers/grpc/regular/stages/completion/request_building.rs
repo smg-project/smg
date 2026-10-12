@@ -214,8 +214,9 @@ impl BuildStage for CompletionRequestBuildingStage {
 
         Ok(BuildOutput {
             plan,
-            spec: ResponseSpec::Completion(CompletionResponseSpec::from(
+            spec: ResponseSpec::Completion(CompletionResponseSpec::new(
                 completion_request.as_ref(),
+                items,
             )),
             stamp: AttemptStamp {
                 id: id_stamp,

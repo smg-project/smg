@@ -2306,7 +2306,8 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get input logprobs (SGLang and vLLM only - streaming chunks don't have prompt logprobs)
+    /// Get input logprobs (SGLang, vLLM and TokenSpeed: the chunk that
+    /// follows the prompt's scoring carries them)
     pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
         match self {
             Self::Sglang(c) => c
@@ -2317,8 +2318,12 @@ impl ProtoGenerateStreamChunk {
                 .input_logprobs
                 .as_ref()
                 .map(|lp| convert_input_logprobs!(lp)),
-            // TRT-LLM, MLX, and TokenSpeed streaming chunks don't have input_logprobs
-            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+            Self::TokenSpeed(c) => c
+                .input_logprobs
+                .as_ref()
+                .map(|lp| convert_input_logprobs!(lp)),
+            // TRT-LLM and MLX streaming chunks don't have input_logprobs
+            Self::Trtllm(_) | Self::Mlx(_) => None,
         }
     }
 
@@ -2640,7 +2645,7 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get input/prompt logprobs (SGLang, vLLM, and TensorRT-LLM)
+    /// Get input/prompt logprobs (SGLang, vLLM, TensorRT-LLM and TokenSpeed)
     pub fn input_logprobs(&self) -> Option<ProtoInputLogProbs> {
         match self {
             Self::Sglang(c) => c
@@ -2675,8 +2680,12 @@ impl ProtoGenerateComplete {
                     })
                 }
             }
-            // MLX and TokenSpeed do not have input_logprobs
-            Self::Mlx(_) | Self::TokenSpeed(_) => None,
+            Self::TokenSpeed(c) => c
+                .input_logprobs
+                .as_ref()
+                .map(|lp| convert_input_logprobs!(lp)),
+            // MLX does not have input_logprobs
+            Self::Mlx(_) => None,
         }
     }
 
@@ -4572,5 +4581,49 @@ mod tests {
             None,
             "no other proto carries the field"
         );
+    }
+
+    #[test]
+    fn tokenspeed_generate_messages_expose_the_prompt_logprobs() {
+        let input = tokenspeed::InputLogProbs {
+            token_logprobs: vec![
+                tokenspeed::InputTokenLogProb { value: None },
+                tokenspeed::InputTokenLogProb { value: Some(-1.5) },
+            ],
+            token_ids: vec![7, 8],
+            top_logprobs: vec![
+                tokenspeed::TopLogProbs::default(),
+                tokenspeed::TopLogProbs {
+                    values: vec![-0.5, -1.5],
+                    token_ids: vec![9, 8],
+                },
+            ],
+        };
+        let check = |lp: ProtoInputLogProbs| {
+            assert_eq!(lp.token_logprobs, vec![None, Some(-1.5)]);
+            assert_eq!(lp.token_ids, vec![7, 8]);
+            assert!(lp.top_logprobs[0].values.is_empty());
+            assert_eq!(lp.top_logprobs[1].token_ids, vec![9, 8]);
+        };
+        let complete = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            input_logprobs: Some(input.clone()),
+            ..Default::default()
+        });
+        check(
+            complete
+                .input_logprobs()
+                .expect("complete carries prompt logprobs"),
+        );
+        let chunk = ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+            input_logprobs: Some(input),
+            ..Default::default()
+        });
+        check(
+            chunk
+                .input_logprobs()
+                .expect("chunk carries prompt logprobs"),
+        );
+        let unset = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete::default());
+        assert!(unset.input_logprobs().is_none());
     }
 }

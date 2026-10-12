@@ -61,6 +61,7 @@ impl TokenSpeedScheduler for HeldWorker {
                     completion_tokens: 1,
                     cached_tokens: 0,
                     output_logprobs: None,
+                    input_logprobs: None,
                     weight_version: None,
                     index: 0,
                 })),

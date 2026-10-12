@@ -293,7 +293,8 @@ impl TokenSpeedSchedulerClient {
             }),
             sampling_params: Some(sampling_params),
             return_logprob: body.logprobs.is_some(),
-            logprob_start_len: Some(-1),
+            // `echo` with `logprobs` scores the whole prompt.
+            logprob_start_len: Some(if body.wants_prompt_logprobs() { 0 } else { -1 }),
             top_logprobs_num: body.logprobs.unwrap_or(0) as i32,
             stream: body.stream,
             ..Default::default()
@@ -864,5 +865,44 @@ mod seed_resolution_tests {
         let resolved = TokenSpeedSchedulerClient::resolve_sampling_seed(None, None)
             .expect("absent seeds should resolve");
         assert_eq!(resolved, None);
+    }
+
+    fn completion_request(echo: bool, logprobs: Option<u32>) -> tokenspeed_proto::GenerateRequest {
+        let body: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": [1, 2, 3],
+            "echo": echo,
+            "logprobs": logprobs,
+            "max_tokens": 1,
+        }))
+        .expect("completion request");
+        TokenSpeedSchedulerClient::build_generate_request_from_completion(
+            "r".to_string(),
+            &body,
+            String::new(),
+            vec![1, 2, 3],
+        )
+        .expect("generate request")
+    }
+
+    #[test]
+    fn echo_with_logprobs_scores_the_prompt_from_its_start() {
+        let request = completion_request(true, Some(5));
+        assert!(request.return_logprob);
+        assert_eq!(request.logprob_start_len, Some(0));
+        assert_eq!(request.top_logprobs_num, 5);
+    }
+
+    #[test]
+    fn a_completion_without_echo_or_logprobs_scores_no_prompt_position() {
+        for (echo, logprobs) in [(false, Some(5)), (true, None), (false, None)] {
+            let request = completion_request(echo, logprobs);
+            assert_eq!(request.return_logprob, logprobs.is_some());
+            assert_eq!(
+                request.logprob_start_len,
+                Some(-1),
+                "echo={echo} logprobs={logprobs:?}"
+            );
+        }
     }
 }

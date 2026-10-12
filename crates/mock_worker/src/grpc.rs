@@ -284,6 +284,7 @@ impl TokenSpeedScheduler for MockScheduler {
                     output_logprobs: None,
                     index: 0,
                     weight_version: self.cfg.weight_version.clone(),
+                    input_logprobs: None,
                 })),
             }));
         }
@@ -634,6 +635,7 @@ fn generate_stream(
                                 output_logprobs: None,
                                 index: 0,
                                 weight_version: st.weight_version.clone(),
+                                input_logprobs: None,
                             })),
                         };
                         return Some((Ok(resp), st));

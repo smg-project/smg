@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use indexmap::IndexMap;
 use serde::{
     de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
     Deserialize, Deserializer, Serialize,
@@ -904,11 +905,14 @@ pub struct PromptTokenUsageInfo {
     pub audio_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// Legacy (`/v1/completions`) logprobs: one entry per token in every list.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct LogProbs {
     pub tokens: Vec<String>,
     pub token_logprobs: Vec<Option<f32>>,
-    pub top_logprobs: Vec<Option<HashMap<String, f32>>>,
+    /// Each position's alternatives, most likely first.
+    #[schemars(with = "Vec<Option<std::collections::BTreeMap<String, f32>>>")]
+    pub top_logprobs: Vec<Option<IndexMap<String, f32>>>,
     pub text_offset: Vec<u32>,
 }
 

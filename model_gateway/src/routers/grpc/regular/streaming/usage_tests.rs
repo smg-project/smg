@@ -238,7 +238,7 @@ async fn streamed_completion_usage(
     let response = Arc::new(processor(false))
         .process_completion_streaming_response(
             context::ExecutionResult::Single { stream },
-            CompletionResponseSpec::from(request),
+            CompletionResponseSpec::new(request, &[]),
             dispatch,
             tokenizer(),
             None,
@@ -268,7 +268,7 @@ async fn non_streamed_completion_usage(
     let response = response_processor()
         .process_non_streaming_completion_response(
             context::ExecutionResult::Single { stream },
-            CompletionResponseSpec::from(request),
+            CompletionResponseSpec::new(request, &[]),
             dispatch(),
             tokenizer,
             &mut decoder,

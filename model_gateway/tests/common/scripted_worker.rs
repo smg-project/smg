@@ -78,6 +78,7 @@ impl TokenSpeedScheduler for ScriptedWorker {
                     output_logprobs: logprobs(&[*id]),
                     weight_version: None,
                     index: 0,
+                    input_logprobs: None,
                 })),
             }));
         }

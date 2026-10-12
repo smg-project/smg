@@ -23,7 +23,8 @@ pub(crate) use chat_utils::{
 };
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
-    convert_proto_to_openai_logprobs,
+    convert_proto_to_openai_logprobs, echoed_prompt_logprobs, CompletionLogprobs,
+    PromptLogprobsError,
 };
 pub use message_utils::{process_messages_with_encoding, template_tools};
 pub(crate) use metrics::{error_type_for_response, error_type_from_status, route_to_endpoint};

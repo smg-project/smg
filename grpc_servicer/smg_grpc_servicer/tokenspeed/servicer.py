@@ -277,6 +277,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         no_stop_trim = bool(request.sampling_params.no_stop_trim)
 
         aborted = False
+        # Stream mode: the engine ships a choice's prompt logprobs on one frame;
+        # its Complete repeats them, so a client reading only the Complete has them.
+        prompt_logprobs: dict[int, tokenspeed_scheduler_pb2.InputLogProbs] = {}
         try:
             engine_started = time.perf_counter()
             first_output = True
@@ -320,12 +323,20 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 choice_index = int(output.get("index", 0))
 
                 if request.stream:
-                    yield self._chunk_response(
+                    chunk = self._chunk_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+                    if chunk.chunk.HasField("input_logprobs"):
+                        prompt_logprobs[choice_index] = chunk.chunk.input_logprobs
+                    yield chunk
                     if is_finished:
                         yield self._complete_response(
-                            rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
+                            rid,
+                            output,
+                            reason_dict,
+                            choice_index,
+                            no_stop_trim=no_stop_trim,
+                            input_logprobs=prompt_logprobs.get(choice_index),
                         )
                 elif is_finished:
                     yield self._complete_response(
@@ -1734,6 +1745,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 completion_tokens=int(meta.get("completion_tokens", len(token_ids))),
                 cached_tokens=int(meta.get("cached_tokens", 0)),
                 output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
+                input_logprobs=self._convert_input_logprobs_to_proto(meta),
                 index=choice_index,
                 # protobuf treats None as unset for an optional field.
                 weight_version=_version_str(meta.get("weight_version")),
@@ -1748,9 +1760,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         choice_index: int = 0,
         *,
         no_stop_trim: bool = False,
+        input_logprobs: tokenspeed_scheduler_pb2.InputLogProbs | None = None,
     ) -> tokenspeed_scheduler_pb2.GenerateResponse:
         meta = output.get("meta_info", {})
         token_ids = self._generated_output_ids(output, reason_dict, no_stop_trim=no_stop_trim)
+        if input_logprobs is None:
+            input_logprobs = self._convert_input_logprobs_to_proto(meta)
 
         finish_reason = "stop"
         matched_kwargs: dict[str, Any] = {}
@@ -1777,11 +1792,55 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 spec_accepted_tokens=int(meta.get("spec_accepted_tokens", 0)),
                 spec_draft_tokens=int(meta.get("spec_draft_tokens", 0)),
                 output_logprobs=self._convert_output_logprobs_to_proto(output, len(token_ids)),
+                input_logprobs=input_logprobs,
                 index=choice_index,
                 # protobuf treats None as unset for an optional field.
                 weight_version=_version_str(meta.get("weight_version")),
                 **matched_kwargs,
             ),
+        )
+
+    @staticmethod
+    def _convert_input_logprobs_to_proto(
+        meta: dict,
+    ) -> tokenspeed_scheduler_pb2.InputLogProbs | None:
+        """Build an ``InputLogProbs`` proto from a frame's prompt logprobs.
+
+        ``meta_info["input_token_logprobs"]`` is the scored prompt as the
+        engine renders it, ``(logprob, token_id, text)`` tuples from
+        ``logprob_start_len`` on, the first logprob ``None`` (no context
+        predicts it); ``meta_info["input_top_logprobs"]`` is the parallel list
+        of top-K alternatives (``None`` or a list of the same tuples) when the
+        request asked for them. The engine ships both once, on the frame after
+        the prompt's last chunk (later stream frames carry empty lists).
+
+        Returns ``None`` when the frame carries no prompt logprobs.
+        """
+        token = (meta or {}).get("input_token_logprobs") or []
+        if not token:
+            return None
+        top = meta.get("input_top_logprobs") or []
+        top_proto = []
+        for i in range(len(token)):
+            entry = top[i] if i < len(top) else None
+            if entry:
+                top_proto.append(
+                    tokenspeed_scheduler_pb2.TopLogProbs(
+                        values=[t[0] for t in entry],
+                        token_ids=[t[1] for t in entry],
+                    )
+                )
+            else:
+                top_proto.append(tokenspeed_scheduler_pb2.TopLogProbs())
+        return tokenspeed_scheduler_pb2.InputLogProbs(
+            token_logprobs=[
+                tokenspeed_scheduler_pb2.InputTokenLogProb()
+                if t[0] is None
+                else tokenspeed_scheduler_pb2.InputTokenLogProb(value=float(t[0]))
+                for t in token
+            ],
+            token_ids=[t[1] for t in token],
+            top_logprobs=top_proto,
         )
 
     @staticmethod

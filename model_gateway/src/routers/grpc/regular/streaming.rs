@@ -3746,6 +3746,11 @@ impl StreamingProcessor {
 
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
+        // Per index, the legacy logprobs of the tokens not yet sent: each
+        // event carries those of the tokens it releases (the echoed prompt's
+        // with the first), so tokens the stop decoder holds go with the text
+        // they later release.
+        let mut logprobs: HashMap<u32, utils::CompletionLogprobs<'_>> = HashMap::new();
         let mut stopped_indices: HashSet<u32> = HashSet::new();
         // The per-chunk SSE frames: the bytes around a chunk's choice are the
         // same for every chunk of this stream and are serialized once here;
@@ -3808,6 +3813,23 @@ impl StreamingProcessor {
                     let (mut text, stopped) =
                         Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
 
+                    if let Some(top_k) = completion_request.logprobs {
+                        let choice_logprobs = logprobs.entry(index).or_insert_with(|| {
+                            utils::CompletionLogprobs::new(tokenizer.as_ref(), top_k)
+                        });
+                        if *is_first && echo {
+                            let input = utils::echoed_prompt_logprobs(
+                                chunk.input_logprobs(),
+                                chunk.prompt_tokens(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                            choice_logprobs.push_prompt(&input);
+                        }
+                        if let Some(output) = chunk.output_logprobs() {
+                            choice_logprobs.push_output(&output);
+                        }
+                    }
+
                     if *is_first {
                         if echo {
                             text.insert_str(0, prompt_text);
@@ -3823,7 +3845,7 @@ impl StreamingProcessor {
                             &CompletionStreamChoice {
                                 text,
                                 index,
-                                logprobs: None,
+                                logprobs: logprobs.get_mut(&index).and_then(|lp| lp.take()),
                                 finish_reason: None,
                             },
                         )
@@ -3858,7 +3880,7 @@ impl StreamingProcessor {
                             &CompletionStreamChoice {
                                 text: String::new(),
                                 index,
-                                logprobs: None,
+                                logprobs: logprobs.get_mut(&index).and_then(|lp| lp.take()),
                                 finish_reason: Some("stop".to_string()),
                             },
                         )
@@ -3883,6 +3905,21 @@ impl StreamingProcessor {
                     // (e.g., max_tokens=0). The Chunk arm normally prepends prompt_text
                     // on the first event, but if no Chunks arrive we must emit it here.
                     let is_first = is_firsts.entry(index).or_insert(true);
+                    if *is_first && echo {
+                        if let Some(top_k) = completion_request.logprobs {
+                            let input = utils::echoed_prompt_logprobs(
+                                complete.input_logprobs(),
+                                complete.prompt_tokens(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                            logprobs
+                                .entry(index)
+                                .or_insert_with(|| {
+                                    utils::CompletionLogprobs::new(tokenizer.as_ref(), top_k)
+                                })
+                                .push_prompt(&input);
+                        }
+                    }
                     if *is_first && echo && !prompt_text.is_empty() {
                         Self::send_completion_chunk(
                             tx,
@@ -3891,7 +3928,7 @@ impl StreamingProcessor {
                             &CompletionStreamChoice {
                                 text: prompt_text.to_string(),
                                 index,
-                                logprobs: None,
+                                logprobs: logprobs.get_mut(&index).and_then(|lp| lp.take()),
                                 finish_reason: None,
                             },
                         )
@@ -3916,7 +3953,7 @@ impl StreamingProcessor {
                                     &CompletionStreamChoice {
                                         text,
                                         index,
-                                        logprobs: None,
+                                        logprobs: logprobs.get_mut(&index).and_then(|lp| lp.take()),
                                         finish_reason: None,
                                     },
                                 )
@@ -3968,6 +4005,8 @@ impl StreamingProcessor {
                         }
                     };
 
+                    // Tokens whose text never surfaced (a stop the decoder
+                    // held to the end) still report their logprobs.
                     Self::send_completion_chunk(
                         tx,
                         &mut sse_buffer,
@@ -3975,7 +4014,7 @@ impl StreamingProcessor {
                         &CompletionStreamChoice {
                             text: String::new(),
                             index,
-                            logprobs: None,
+                            logprobs: logprobs.get_mut(&index).and_then(|lp| lp.take()),
                             finish_reason,
                         },
                     )

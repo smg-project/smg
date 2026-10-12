@@ -18,8 +18,7 @@ use axum::{
 };
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::StringOrArray,
-    completion::CompletionRequest,
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     responses::{ResponseInput, ResponsesRequest},
 };
@@ -64,7 +63,7 @@ fn create_minimal_chat_request() -> ChatCompletionRequest {
 fn create_minimal_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
-        prompt: StringOrArray::String("Hello".to_string()),
+        prompt: CompletionPrompt::Text("Hello".to_string()),
         suffix: None,
         max_tokens: Some(100),
         temperature: None,
