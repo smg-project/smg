@@ -37,7 +37,7 @@ use tracing::{debug, error, warn, Instrument};
 
 use super::{
     request_body::RawBody,
-    stream_failure::{note_sent, on_frame_boundary, RelaySource, UpstreamCut},
+    stream_failure::{note_sent, RelaySource, UpstreamCut},
 };
 use crate::{
     config::types::RetryConfig,
@@ -2152,15 +2152,8 @@ impl PDRouter {
                                 if upstream_sse {
                                     // On its own frame: a cut inside a frame leaves
                                     // a partial line the event must not merge into.
-                                    let event = source.error_event(&cut);
-                                    let event = if on_frame_boundary(&sent_tail) {
-                                        event
-                                    } else {
-                                        let mut framed = Vec::with_capacity(event.len() + 2);
-                                        framed.extend_from_slice(b"\n\n");
-                                        framed.extend_from_slice(&event);
-                                        Bytes::from(framed)
-                                    };
+                                    let event =
+                                        source.error_event_on_its_own_frame(&cut, &sent_tail);
                                     let _ = tx.send(Ok(event)).await;
                                     break;
                                 }
