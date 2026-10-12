@@ -142,7 +142,7 @@ pub(super) fn complete_with_prompt(
 
 /// The mock server accepts the client connection. This test supplies the
 /// response frames and controls EOF.
-pub(super) async fn scripted_stream(
+pub(crate) async fn scripted_stream(
     responses: Vec<proto::GenerateResponse>,
     grpc_status: &'static str,
 ) -> (ProtoStream, JoinHandle<()>) {

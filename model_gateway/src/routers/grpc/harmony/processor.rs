@@ -27,6 +27,31 @@ use crate::routers::{
     },
 };
 
+/// The usage of a Harmony chat completion: the engine's counters through
+/// the chat usage builder the regular path uses, with the reasoning tokens
+/// the Harmony parser counted on the analysis and commentary channels, every
+/// detail counter present. The streamed answer's usage chunk and the
+/// non-streamed answer both build their usage here, so a request's two
+/// usage objects are the same.
+pub(super) fn chat_usage(
+    counts: response_formatting::TokenCounts,
+    parsed_reasoning_tokens: u32,
+) -> Usage {
+    response_formatting::chat_usage(counts.usage(), Some(parsed_reasoning_tokens), 0)
+}
+
+/// The usage of one Responses API iteration: the engine's counters with the
+/// reasoning tokens the Harmony parser counted; the same object whether the
+/// iteration streamed or not.
+pub(super) fn iteration_usage(
+    counts: response_formatting::TokenCounts,
+    parsed_reasoning_tokens: u32,
+) -> Usage {
+    counts
+        .usage()
+        .with_reasoning_tokens(parsed_reasoning_tokens)
+}
+
 /// Processor for non-streaming Harmony responses
 ///
 /// Collects all output tokens from execution and parses them using
@@ -176,11 +201,13 @@ impl HarmonyResponseProcessor {
             });
         }
 
-        // Build usage from proto fields, every detail counter present as the
-        // OpenAI API sends it
-        let usage = response_formatting::build_usage(&all_responses)
-            .with_reasoning_tokens(total_reasoning_tokens)
-            .with_complete_details();
+        // The usage from the engine's counters, built as the streamed answer
+        // builds its usage chunk: with the reasoning tokens the parser
+        // counted and every detail counter present as the OpenAI API sends it.
+        let usage = chat_usage(
+            response_formatting::TokenCounts::of(&all_responses),
+            total_reasoning_tokens,
+        );
 
         // Final ChatCompletionResponse
         Ok(
@@ -321,9 +348,12 @@ impl HarmonyResponseProcessor {
             );
         }
 
-        // Build usage (needed for both ToolCallsFound and Completed)
-        let usage = response_formatting::build_usage(std::slice::from_ref(complete))
-            .with_reasoning_tokens(parsed.reasoning_token_count);
+        // The usage of the iteration, as the streamed iteration builds it
+        // (needed for both ToolCallsFound and Completed).
+        let usage = iteration_usage(
+            response_formatting::TokenCounts::of(std::slice::from_ref(complete)),
+            parsed.reasoning_token_count,
+        );
 
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {

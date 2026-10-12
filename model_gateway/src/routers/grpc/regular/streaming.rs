@@ -4050,7 +4050,7 @@ fn assistant_choice(
 }
 
 #[cfg(test)]
-mod eof_tests;
+pub(crate) mod eof_tests;
 #[cfg(test)]
 mod failure_tests;
 

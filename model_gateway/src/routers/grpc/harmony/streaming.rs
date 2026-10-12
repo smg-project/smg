@@ -11,7 +11,7 @@ use openai_protocol::{
     chat::{
         ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
     },
-    common::{ChatLogProbs, FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
+    common::{ChatLogProbs, FunctionCallDelta, ToolCall, ToolCallDelta},
     responses::{
         InputTokensDetails, OutputTokensDetails, ResponseStatus, ResponseUsage, ResponsesResponse,
         ResponsesUsage,
@@ -23,7 +23,7 @@ use tracing::{debug, error};
 
 use super::{
     builder::{convert_harmony_logprobs, try_harmony_encoding},
-    processor::ResponsesIterationResult,
+    processor::{chat_usage, iteration_usage, ResponsesIterationResult},
     stop::TextStopScanner,
     types::HarmonyChannelDelta,
     HarmonyParserAdapter,
@@ -39,7 +39,7 @@ use crate::{
         grpc::{
             common::{
                 response_collection::drain_prefill,
-                response_formatting::CompletionTokenTracker,
+                response_formatting::{CompletionTokenTracker, TokenCounts},
                 responses::{
                     build_sse_response,
                     streaming::{
@@ -289,6 +289,14 @@ impl HarmonyStreamingProcessor {
         let mut final_scanners: HashMap<u32, TextStopScanner> = HashMap::new();
         let mut router_stopped: HashSet<u32> = HashSet::new();
         let mut completion_tokens = CompletionTokenTracker::new();
+        // The engine's own reasoning and speculative counters per decode
+        // `Complete`, and the reasoning tokens the Harmony parser counted over
+        // every index: the usage chunk is built from the same counters as the
+        // non-streamed answer.
+        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut spec_accepted: HashMap<u32, u32> = HashMap::new();
+        let mut spec_drafted: HashMap<u32, u32> = HashMap::new();
+        let mut parsed_reasoning_tokens: u32 = 0;
         // Indices that received a *decode* `Complete` -- unlike `prompt_tokens`
         // (which may already be populated from the prefill phase before this
         // loop even starts, in PD mode), this is only ever set from this
@@ -433,6 +441,9 @@ impl HarmonyStreamingProcessor {
                     cached_tokens
                         .entry(index)
                         .or_insert_with(|| complete_wrapper.cached_tokens());
+                    reasoning_tokens.insert(index, complete_wrapper.reasoning_tokens());
+                    spec_accepted.insert(index, complete_wrapper.spec_accepted_tokens());
+                    spec_drafted.insert(index, complete_wrapper.spec_draft_tokens());
 
                     // Finalize parser and emit final chunk
                     if let Some(parser) = parsers.get_mut(&index) {
@@ -440,6 +451,7 @@ impl HarmonyStreamingProcessor {
 
                         let final_output =
                             parser.finalize(complete_wrapper.finish_reason().to_string());
+                        parsed_reasoning_tokens += final_output.reasoning_token_count;
 
                         // A router-side stop already closed this choice.
                         if router_stopped.contains(&index) {
@@ -492,14 +504,20 @@ impl HarmonyStreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         decode_stream.mark_completed();
 
-        // Compute totals once for both usage chunk and metrics. Every `n>1`
-        // choice shares one prompt; each Complete reports that same full
-        // length, so max (not sum) is the actual prompt cost. cached_tokens
-        // is a property of that same shared prompt, not of the individual
-        // completion, so it takes the same treatment.
-        let total_prompt: u32 = prompt_tokens.values().copied().max().unwrap_or(0);
-        let total_completion: u32 = completion_tokens.total();
-        let total_cached: u32 = cached_tokens.values().copied().max().unwrap_or(0);
+        // The counters once, for the usage chunk, the settlement and the
+        // metrics. Every `n>1` choice shares one prompt; each Complete reports
+        // that same full length, so max (not sum) is the actual prompt cost.
+        // cached_tokens is a property of that same shared prompt, not of the
+        // individual completion, so it takes the same treatment; each choice
+        // is its own generation, so the rest sum.
+        let counts = TokenCounts {
+            prompt: prompt_tokens.values().copied().max().unwrap_or(0),
+            completion: completion_tokens.total(),
+            cached: cached_tokens.values().copied().max().unwrap_or(0),
+            reasoning: reasoning_tokens.values().sum(),
+            spec_accepted: spec_accepted.values().sum(),
+            spec_drafted: spec_drafted.values().sum(),
+        };
 
         if let Some(handle) = reservation {
             // A clean decode EOF with fewer decode `Complete` messages than
@@ -515,8 +533,8 @@ impl HarmonyStreamingProcessor {
             } else {
                 handle
                     .settle_success(UsageSettlement {
-                        actual_input_tokens: total_prompt,
-                        completion_tokens: total_completion,
+                        actual_input_tokens: counts.prompt,
+                        completion_tokens: counts.completion,
                     })
                     .await;
             }
@@ -525,9 +543,8 @@ impl HarmonyStreamingProcessor {
         // Emit final usage if requested
         if let Some(true) = stream_options.as_ref().and_then(|so| so.include_usage) {
             Self::emit_usage_chunk(
-                total_prompt,
-                total_completion,
-                total_cached,
+                counts,
+                parsed_reasoning_tokens,
                 dispatch,
                 original_request,
                 tx,
@@ -544,8 +561,8 @@ impl HarmonyStreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
-            input_tokens: Some(total_prompt as u64),
-            output_tokens: total_completion as u64,
+            input_tokens: Some(counts.prompt as u64),
+            output_tokens: counts.completion as u64,
         });
 
         Ok(())
@@ -654,11 +671,12 @@ impl HarmonyStreamingProcessor {
         Ok(())
     }
 
-    /// Emit usage chunk at the end
+    /// Emit the usage chunk at the end: the usage object the non-streamed
+    /// answer carries, from `counts` and the reasoning tokens the parser
+    /// counted.
     async fn emit_usage_chunk(
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        cached_tokens: u32,
+        counts: TokenCounts,
+        parsed_reasoning_tokens: u32,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
@@ -667,10 +685,7 @@ impl HarmonyStreamingProcessor {
         let usage_chunk =
             ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
                 .created(dispatch.created)
-                .usage(
-                    Usage::from_counts(prompt_tokens, completion_tokens)
-                        .with_cached_tokens(cached_tokens),
-                )
+                .usage(chat_usage(counts, parsed_reasoning_tokens))
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
 
@@ -799,6 +814,10 @@ impl HarmonyStreamingProcessor {
         let mut completion_tokens: u32 = 0;
         let mut cached_tokens: u32 = prefill_cached_tokens;
         let mut reasoning_token_count: u32 = 0;
+        // The engine's own reasoning and speculative counters, from Complete.
+        let mut engine_reasoning_tokens: u32 = 0;
+        let mut spec_accepted: u32 = 0;
+        let mut spec_drafted: u32 = 0;
 
         // Process stream
         let mut chunk_count = 0;
@@ -1042,6 +1061,9 @@ impl HarmonyStreamingProcessor {
                     if !complete_wrapper.chunk_semantics().is_delta() {
                         completion_tokens = complete_wrapper.completion_tokens();
                     }
+                    engine_reasoning_tokens = complete_wrapper.reasoning_tokens();
+                    spec_accepted = complete_wrapper.spec_accepted_tokens();
+                    spec_drafted = complete_wrapper.spec_draft_tokens();
 
                     // Finalize parser and get complete output
                     // Responses API: no user-specified stop sequences
@@ -1261,6 +1283,19 @@ impl HarmonyStreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         decode_stream.mark_completed();
 
+        // The usage of the iteration, as the non-streamed iteration builds it.
+        let usage = iteration_usage(
+            TokenCounts {
+                prompt: prompt_tokens,
+                completion: completion_tokens,
+                cached: cached_tokens,
+                reasoning: engine_reasoning_tokens,
+                spec_accepted,
+                spec_drafted,
+            },
+            reasoning_token_count,
+        );
+
         // Return result based on whether tool calls were found
         if let Some(tool_calls) = accumulated_tool_calls {
             if !tool_calls.is_empty() {
@@ -1274,9 +1309,7 @@ impl HarmonyStreamingProcessor {
                     tool_calls,
                     analysis: analysis_content,
                     partial_text: accumulated_final_text,
-                    usage: Usage::from_counts(prompt_tokens, completion_tokens)
-                        .with_cached_tokens(cached_tokens)
-                        .with_reasoning_tokens(reasoning_token_count),
+                    usage,
                     request_id: emitter.response_id.clone(),
                 });
             }
@@ -1300,9 +1333,7 @@ impl HarmonyStreamingProcessor {
                     }))
                     .build(),
             ),
-            usage: Usage::from_counts(prompt_tokens, completion_tokens)
-                .with_cached_tokens(cached_tokens)
-                .with_reasoning_tokens(reasoning_token_count),
+            usage,
         })
     }
 }
@@ -1312,6 +1343,9 @@ impl Default for HarmonyStreamingProcessor {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod usage_tests;
 
 #[cfg(test)]
 mod tests {
