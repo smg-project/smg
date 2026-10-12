@@ -417,11 +417,11 @@ being forced on every history-backed deployment.
 On startup (Postgres: in one transaction under an advisory lock, so gateways
 starting together on one database take turns and all come up):
 1. The `_schema_versions` tracking table is created
-2. Tables are created if they don't exist (`CREATE TABLE` / `CREATE TABLE IF NOT EXISTS`)
-3. A fresh database (no responses table before this start) is recorded at the
+2. The store's schema version is compared with the migrations the build knows: a database ahead of the build is refused (see "A database ahead of the build" below). Postgres does this here, before any history table is touched; Oracle after its history tables exist (step 3), as the first step of its migration run
+3. Tables are created if they don't exist (`CREATE TABLE` / `CREATE TABLE IF NOT EXISTS`)
+4. A fresh database (no responses table before this start) is recorded at the
    latest version: its tables were just created in their final shape, so no
    migration is pending and no `auto_migrate` is needed
-4. Fresh or not, the store's schema version is compared with the migrations the build knows: a database ahead of the build is refused (see "A database ahead of the build" below). Postgres does this right after step 1, before any table is created; Oracle after step 2, as the first step of its migration run
 5. Pending migrations are checked:
    - If `auto_migrate: true` → migrations are applied automatically
    - If `auto_migrate: false` (default) → startup fails with actionable SQL if migrations are pending
