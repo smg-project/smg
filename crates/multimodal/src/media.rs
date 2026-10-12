@@ -130,6 +130,12 @@ pub enum FrameSampling {
     Even,
     /// One frame per sampling interval from the start, plus the last frame.
     Interval,
+    /// `trunc(duration x rate)` frames, at least `min_frames`, at most
+    /// `max_frames` and never more than the clip has, each the nearest frame
+    /// of `linspace(0, n - 1, count)` (ties to even, as numpy rounds): the
+    /// rule of the Qwen3-VL family's reference video processor, whose prompt
+    /// stamps every temporal group with the times of the frames it picked.
+    EvenRounded,
     /// Every frame of a clip with at most `max_frames`; a longer clip gives
     /// `max_frames` spread evenly from the first frame to the last
     /// (`numpy.linspace(0, n - 1, max_frames)` truncated to integers), the
@@ -1633,12 +1639,15 @@ fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32
     (decoder_budget.max(1) / active_decodes).clamp(1, max_threads) as i32
 }
 
-/// Source index per output frame; short clips repeat frames up to `min_frames`.
-fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+/// Source index per output frame of a clip of `total_frames` at `fps` under
+/// `cfg`, in order, duplicates kept; the `Even` and `Interval` rules repeat
+/// frames up to `min_frames` on short clips.
+pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     match cfg.sampling {
         FrameSampling::UpTo { max_frames } => up_to_frame_indices(total_frames, max_frames),
         _ if total_frames == 0 => Vec::new(),
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
+        FrameSampling::EvenRounded => even_rounded_frame_indices(total_frames, fps, cfg),
         FrameSampling::Interval => interval_frame_indices(total_frames, fps, cfg),
     }
 }
@@ -1694,6 +1703,44 @@ fn spread_evenly(total_frames: usize, count: usize) -> Vec<usize> {
     let denom = (count - 1) as f64;
     (0..count)
         .map(|idx| ((idx as f64 * last) / denom).floor() as usize)
+        .collect()
+}
+
+/// The Qwen3-VL family's reference video processor sampling at `cfg.sample_fps`:
+/// `trunc(duration x rate)` frames, at least `min_frames`, at most `max_frames`
+/// and never more than the clip has; a clip whose rate is unknown gets
+/// `max_frames`. The reference then repeats its last pick up to a whole
+/// temporal group, which the processor's own temporal padding does here.
+fn even_rounded_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+    let target_frames = if fps.is_finite() && fps > 0.0 {
+        (total_frames as f64 / fps * f64::from(cfg.sample_fps)).trunc() as usize
+    } else {
+        cfg.max_frames
+    };
+    let count = target_frames
+        .max(cfg.min_frames)
+        .min(cfg.max_frames)
+        .min(total_frames);
+    spread_evenly_rounded(total_frames, count)
+}
+
+/// `count` frames from the first to the last, each the nearest frame of
+/// `numpy.linspace(0, total_frames - 1, count)`: `i * step` for
+/// `step = (total_frames - 1) / (count - 1)` rounded with ties to even, as
+/// numpy rounds, and the last one the last frame itself.
+fn spread_evenly_rounded(total_frames: usize, count: usize) -> Vec<usize> {
+    if count <= 1 {
+        return vec![0];
+    }
+    let step = (total_frames - 1) as f64 / (count - 1) as f64;
+    (0..count)
+        .map(|idx| {
+            if idx + 1 == count {
+                total_frames - 1
+            } else {
+                (idx as f64 * step).round_ties_even() as usize
+            }
+        })
         .collect()
 }
 
@@ -2512,7 +2559,7 @@ impl FrameSelection {
                     loader_frame_indices(claimed, visible, max_frames),
                 )
             }
-            FrameSampling::Even | FrameSampling::Interval => {
+            FrameSampling::Even | FrameSampling::EvenRounded | FrameSampling::Interval => {
                 let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
                 (
                     total_frames,
@@ -3444,6 +3491,41 @@ mod tests {
         let indices = super::sampled_frame_indices(1, 30.0, cfg);
         assert_eq!(indices, vec![0, 0, 0, 0]);
         assert_eq!(super::counted_frame_indices(&indices), vec![(0, 4)]);
+    }
+
+    #[test]
+    fn even_rounded_sampling_picks_the_reference_processors_frames() {
+        // The frames the Qwen3-VL family's reference video processor picks at
+        // its 2 fps rate, as the engine's own loader recorded them for these
+        // clips: trunc(duration x 2) frames, at least 4, never more than the
+        // clip has, at the nearest frames of an even spread (ties to even).
+        let cfg = VideoFetchConfig {
+            sampling: FrameSampling::EvenRounded,
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(
+            super::sampled_frame_indices(24, 24.0, cfg),
+            vec![0, 8, 15, 23]
+        );
+        assert_eq!(
+            super::sampled_frame_indices(120, 24.0, cfg),
+            vec![0, 13, 26, 40, 53, 66, 79, 93, 106, 119]
+        );
+        let thirty_seconds = super::sampled_frame_indices(720, 24.0, cfg);
+        assert_eq!(thirty_seconds.len(), 60);
+        assert_eq!(&thirty_seconds[..6], &[0, 12, 24, 37, 49, 61]);
+        let ten_minutes = super::sampled_frame_indices(14400, 24.0, cfg);
+        assert_eq!(ten_minutes.len(), 768);
+        assert_eq!(&ten_minutes[..8], &[0, 19, 38, 56, 75, 94, 113, 131]);
+        assert_eq!(ten_minutes[767], 14399);
+        // A clip shorter than the minimum gives each of its frames once.
+        assert_eq!(super::sampled_frame_indices(1, 30.0, cfg), vec![0]);
+        assert_eq!(super::sampled_frame_indices(3, 10.0, cfg), vec![0, 1, 2]);
+        // An unknown rate takes the maximum, bounded by the clip.
+        assert_eq!(
+            super::sampled_frame_indices(5, 0.0, cfg),
+            vec![0, 1, 2, 3, 4]
+        );
     }
 
     #[test]

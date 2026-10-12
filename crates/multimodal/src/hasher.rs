@@ -97,6 +97,9 @@ pub fn hash_video_with_sampling(
             hasher.update(&[2]);
             hasher.update(&(max_frames as u64).to_le_bytes());
         }
+        FrameSampling::EvenRounded => {
+            hasher.update(&[3]);
+        }
     }
     hasher.finalize().to_hex().to_string()
 }
