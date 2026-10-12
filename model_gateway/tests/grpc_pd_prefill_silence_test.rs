@@ -34,7 +34,7 @@ mod common;
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -929,7 +929,35 @@ fn a_sequential_prefill_whose_legs_queue_is_not_given_up_on() {
             },
         )
         .await;
-        let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_LEGS).await;
+        // The legs are booked on the prefill worker at their dispatch, while
+        // their calls are still held at the gate: sampled through the run,
+        // the backlog shows them waiting (a booking at the call's return
+        // would show nothing: the span from the call's return to the first
+        // message, which is the same message, is too short to be sampled or
+        // to teach a rate).
+        let done = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let done = Arc::clone(&done);
+            let prefill = Arc::clone(&workers[0]);
+            async move {
+                let mut largest = Duration::ZERO;
+                while !done.load(Ordering::Acquire) {
+                    largest = largest.max(prefill.prefill_backlog());
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                largest
+            }
+        };
+        let chats = async {
+            let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_LEGS).await;
+            done.store(true, Ordering::Release);
+            answers
+        };
+        let (answers, largest_backlog) = tokio::join!(chats, sampler);
+        assert!(
+            largest_backlog > Duration::ZERO,
+            "the held legs are pending prefill on their worker from the dispatch"
+        );
         assert_all_answered_past_the_bound(&answers);
         assert_eq!(
             workers[0].circuit_breaker_state(),
