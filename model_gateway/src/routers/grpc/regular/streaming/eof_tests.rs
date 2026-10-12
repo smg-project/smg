@@ -422,6 +422,46 @@ async fn byte_fallback_generate_mid_run_stop_reports_gateway_stop() {
 }
 
 #[tokio::test]
+async fn byte_fallback_generate_stop_token_keeps_the_engine_matched_stop() {
+    // The engine finishes on a stop token (EOS or a request stop_token_ids
+    // entry): the local decoder stops on it too, without a string match, and
+    // the response keeps the engine's matched stop, the token id.
+    let tokenizer = byte_fallback_tokenizer();
+    let mut terminal = complete(0, "stop");
+    if let Some(GenerationEvent::Complete(complete)) = &mut terminal.response {
+        complete.output_ids = vec![1, 1, 3];
+        complete.completion_tokens = 3;
+        complete.matched_stop = Some(proto::generate_complete::MatchedStop::MatchedTokenId(3));
+    }
+    let (stream, server) = scripted_stream(vec![terminal], "0").await;
+    let mut decoder = StopSequenceDecoder::new(
+        tokenizer,
+        llm_tokenizer::StopSequenceConfig::default().with_stop_token(3),
+        true,
+    );
+    let processor = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    );
+    let responses = processor
+        .process_non_streaming_generate_response(
+            context::ExecutionResult::Single { stream },
+            dispatch(),
+            &mut decoder,
+            false,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+    server.abort();
+    let wire = serde_json::to_value(&responses[0]).unwrap();
+    assert_eq!(wire["text"], "tt");
+    assert_eq!(wire["meta_info"]["finish_reason"]["type"], "stop");
+    assert_eq!(wire["meta_info"]["matched_stop"], 3);
+}
+
+#[tokio::test]
 async fn byte_fallback_generate_eof_reports_gateway_stop() {
     let tokenizer = byte_fallback_tokenizer();
     let mut terminal = complete(0, "length");

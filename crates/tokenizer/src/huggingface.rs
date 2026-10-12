@@ -776,7 +776,8 @@ impl Decoder for HuggingFaceTokenizer {
     /// incomplete trailing sequence waits. Batch decoding would turn a run
     /// with an invalid byte into one replacement character per byte, including
     /// the characters already streamed: those stay as streamed and the rest of
-    /// the run follows the batch text (counted as a `byte_run` recovery).
+    /// the run follows the batch text (reported as a `byte_run` recovery by
+    /// `decode_step_reporting`; this raw step does not count it).
     fn decode_step(
         &self,
         token_id: TokenIdType,

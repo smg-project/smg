@@ -513,13 +513,13 @@ impl ResponseProcessor {
                 complete.completion_tokens(),
             );
 
-            let matched_stop = if stopped_at_finish {
-                stop_decoder
-                    .matched_stop()
-                    .map(|stop| serde_json::Value::String(stop.to_string()))
-            } else {
-                complete.matched_stop_json()
-            };
+            // The decoder's string stop when it matched one (the engine does not
+            // see string stops it did not apply), else the engine's value: a
+            // stop token's id stays reported, as on the other paths.
+            let matched_stop = stop_decoder
+                .matched_stop()
+                .map(|stop| serde_json::Value::String(stop.to_string()))
+                .or_else(|| complete.matched_stop_json());
 
             // Extract logprobs if requested (convert proto types to Generate format)
             let input_token_logprobs = if request_logprobs {
