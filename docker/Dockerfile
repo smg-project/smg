@@ -146,7 +146,7 @@ RUN apt update -y \
     && apt clean
 
 # install rustup from rustup.rs; no default toolchain: the repository's
-# rust-toolchain.toml selects the release once the source is in place
+# rust-toolchain.toml selects the release once it is copied in (below)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
 
 # working directory

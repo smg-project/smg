@@ -14,8 +14,10 @@ updates:
     # The Dockerfiles live in docker/; their base images are pinned by digest
     # and this entry keeps the digests current (tag bumps are done by hand:
     # a new Ubuntu release changes glibc and package names). Dependabot
-    # rewrites FROM lines only; the ARG default of ci-tokenspeed.Dockerfile
-    # carries the same digest and moves with docker/Dockerfile by hand.
+    # rewrites FROM lines only; two more places carry the ubuntu:24.04 digest
+    # and move with docker/Dockerfile by hand: the ARG default of
+    # ci-tokenspeed.Dockerfile and the base-image fallback of
+    # .github/workflows/ci-tokenspeed-image.yml.
     directory: /docker
     schedule:
       interval: weekly
