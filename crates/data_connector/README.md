@@ -421,10 +421,11 @@ starting together on one database take turns and all come up):
 3. A fresh database (no responses table before this start) is recorded at the
    latest version: its tables were just created in their final shape, so no
    migration is pending and no `auto_migrate` is needed
-4. Otherwise pending migrations are checked:
+4. Otherwise the store's schema version is compared with the migrations the build knows: a database ahead of the build is refused (see "A database ahead of the build" below)
+5. Pending migrations are checked:
    - If `auto_migrate: true` → migrations are applied automatically
    - If `auto_migrate: false` (default) → startup fails with actionable SQL if migrations are pending
-5. Indexes are created last, once the columns they cover exist
+6. Indexes are created last, once the columns they cover exist
 
 Current core history migrations:
 
@@ -434,12 +435,22 @@ Current core history migrations:
 | 2 | Remove legacy `user_id` column from responses |
 | 3 | Drop redundant `output`, `metadata`, `instructions`, `tool_calls` columns from responses |
 
+#### A database ahead of the build
+
+A database whose `_schema_versions` is above the latest migration a build
+knows (a newer build migrated it forward; the gateway was rolled back) is
+refused at startup with a message that names both versions: the build does
+not know the shape of a newer schema and would otherwise start and fail its
+first read of a changed column. Upgrade the gateway, or set `version` to the
+database's version in the schema config to run the build against it anyway
+(logged once at startup).
+
 #### Controlling migrations
 
 | Config field | Type | Default | Description |
 |---|---|---|---|
 | `auto_migrate` | `bool` | `false` | Set to `true` to apply migrations automatically on startup (the environment variable `DB_AUTO_MIGRATE=true` sets the default). When `false`, startup fails with the exact SQL if migrations are pending. |
-| `version` | `u32` (optional) | `None` | Starting version — migrations up to this number are skipped. Use when your database is already at a known version. |
+| `version` | `u32` (optional) | `None` | Starting version — migrations up to this number are skipped. Use when your database is already at a known version, or to run a build against a database whose schema version is ahead of it (refused at startup otherwise, see above). |
 
 Example: opt in to automatic migration:
 

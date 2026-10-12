@@ -1291,3 +1291,79 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
         "no statement was closed: each stayed cached on its connection"
     );
 }
+
+/// Runs one statement on the test database over a connection of its own.
+async fn run_statement(db_url: &str, sql: &str) -> Result<(), String> {
+    let (client, connection) = tokio_postgres::connect(db_url, tokio_postgres::NoTls)
+        .await
+        .map_err(|e| format!("connect to the test database: {e}"))?;
+    let mut driver = JoinSet::new();
+    driver.spawn(async move {
+        let _ = connection.await;
+    });
+    let result = client
+        .batch_execute(sql)
+        .await
+        .map_err(|e| format!("{sql}: {e}"));
+    drop(client);
+    driver.join_all().await;
+    result
+}
+
+/// A database whose schema version is ahead of the migrations this build
+/// knows is refused at start-up with a message that says so (an older
+/// gateway behind a store a newer build migrated forward would otherwise
+/// start and fail its first read); the schema config's `version` at that
+/// version is the operator's word that the build may run against it.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_database_ahead_of_this_build_is_refused_at_startup() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    // The schema at this build's version first.
+    drop(
+        postgres_bundle(&db_url)
+            .await
+            .expect("failed to initialize Postgres storage"),
+    );
+    run_statement(
+        &db_url,
+        "INSERT INTO _schema_versions (version, description) VALUES (99, 'a future migration') \
+         ON CONFLICT (version) DO NOTHING",
+    )
+    .await
+    .expect("record a future migration");
+
+    let refused = postgres_bundle(&db_url).await.map(drop);
+    let allowed_cfg = PostgresConfig {
+        db_url: db_url.clone(),
+        pool_max: 4,
+        schema: Some(SchemaConfig {
+            auto_migrate: true,
+            version: Some(99),
+            ..Default::default()
+        }),
+    };
+    let allowed = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&allowed_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await
+    .map(drop);
+
+    // The shared database is left as it was before the assertions.
+    run_statement(&db_url, "DELETE FROM _schema_versions WHERE version = 99")
+        .await
+        .expect("remove the future migration");
+
+    let message = refused.expect_err("a database ahead of this build must be refused at start-up");
+    assert!(
+        message.contains("version 99") && message.contains("ahead of the latest migration"),
+        "{message}"
+    );
+    allowed.expect("`version: 99` lets the build run against the newer database");
+}
