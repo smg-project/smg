@@ -372,7 +372,11 @@ async fn execute_mcp_tool_loop_streaming(
                     });
                     let final_response =
                         emitter.finalize_failed(Some(usage.clone()), error.clone());
-                    persist_response_if_needed(
+                    // The terminal below carries the run's own error and is
+                    // counted by emit_terminal; a record that could not be
+                    // written is logged (the background poll then finds no
+                    // result, as before this exit stored one).
+                    if let Err(not_stored) = persist_response_if_needed(
                         ctx.conversation_storage.clone(),
                         ctx.conversation_item_storage.clone(),
                         ctx.response_storage.clone(),
@@ -380,7 +384,13 @@ async fn execute_mcp_tool_loop_streaming(
                         original_request,
                         ctx.request_context.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(
+                            error = ?not_stored.error_object(),
+                            "The failed object of the tool-call-limit exit could not be stored"
+                        );
+                    }
                     let usage_json = json!(ResponseUsage::from(&usage));
                     if let Err(e) = emitter
                         .emit_terminal(Some(&usage_json), Some(&error), tx)
@@ -443,7 +453,10 @@ async fn execute_mcp_tool_loop_streaming(
                     // polled from this record. Then response.completed with the
                     // usage the non-streamed response carries.
                     let final_response = emitter.finalize(Some(usage.clone()));
-                    persist_response_if_needed(
+                    // As the completed exit: a foreground response the client
+                    // expects stored ends with response.failed when its
+                    // record could not be written.
+                    let not_stored = persist_response_if_needed(
                         ctx.conversation_storage.clone(),
                         ctx.conversation_item_storage.clone(),
                         ctx.response_storage.clone(),
@@ -451,10 +464,22 @@ async fn execute_mcp_tool_loop_streaming(
                         original_request,
                         ctx.request_context.clone(),
                     )
-                    .await;
+                    .await
+                    .err()
+                    .map(|e| e.error_object());
                     let usage_json = json!(ResponseUsage::from(&usage));
-                    let event = emitter.emit_completed(Some(&usage_json));
-                    emitter.send_event_best_effort(&event, tx).await;
+                    let event = match &not_stored {
+                        Some(error) => emitter.emit_failed(Some(&usage_json), error),
+                        None => emitter.emit_completed(Some(&usage_json)),
+                    };
+                    // Counted only once the terminal reached the client, as emit_terminal counts.
+                    let delivered = emitter.send_event_best_effort(&event, tx).await;
+                    if delivered && not_stored.is_some() {
+                        Metrics::record_responses_stream_failure(
+                            &original_request.model,
+                            failure_reason(not_stored.as_ref()),
+                        );
+                    }
                     return;
                 }
 
