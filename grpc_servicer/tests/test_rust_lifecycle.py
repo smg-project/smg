@@ -594,3 +594,21 @@ def test_the_guard_says_it_fired_and_terminates_the_children(monkeypatch, caplog
     rust_lifecycle._end_process(1, 15.0)
     assert "did not finish within 15 s; ending the process with code 1" in caplog.text
     assert dumped == [True] and terminated == [4242] and ended == [1]
+
+
+def test_the_guard_ends_the_process_even_when_its_report_fails(monkeypatch):
+    """The exit is the last resort: a stack dump that raises (a closed stderr)
+    or a child that cannot be terminated never keeps the process alive."""
+
+    def failing_dump(all_threads=False):
+        raise RuntimeError("sys.stderr is None")
+
+    monkeypatch.setattr(rust_lifecycle.faulthandler, "dump_traceback", failing_dump)
+    child = types.SimpleNamespace(
+        pid=4242, terminate=lambda: (_ for _ in ()).throw(OSError("gone"))
+    )
+    monkeypatch.setattr(rust_lifecycle.multiprocessing, "active_children", lambda: [child])
+    ended: list[int] = []
+    monkeypatch.setattr(rust_lifecycle.os, "_exit", ended.append)
+    rust_lifecycle._end_process(1, 15.0)
+    assert ended == [1]

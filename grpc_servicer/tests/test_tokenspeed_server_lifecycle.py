@@ -102,8 +102,14 @@ def server_mod(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     # The exit over a dead engine without its guard: the guard would end the
-    # test process after its grace.
-    monkeypatch.setattr(module, "guarded_exit", lambda code, **_kwargs: SystemExit(code))
+    # test process after its grace; the grace it was asked for is recorded.
+    module._armed_graces = []  # noqa: SLF001 -- test hook
+
+    def fake_guarded_exit(code, *, grace_secs=None):
+        module._armed_graces.append(grace_secs)  # noqa: SLF001
+        return SystemExit(code)
+
+    monkeypatch.setattr(module, "guarded_exit", fake_guarded_exit)
     return module
 
 
@@ -167,6 +173,7 @@ def test_an_engine_that_exits_after_start_up_ends_the_server_with_exit_code_1(
     events = []
     server_args = _wire(monkeypatch, server_mod, events)
     caplog.set_level(logging.ERROR)
+    armed = server_mod._armed_graces  # noqa: SLF001
 
     async def exercise():
         task = asyncio.create_task(server_mod.serve_grpc(server_args))
@@ -185,6 +192,9 @@ def test_an_engine_that_exits_after_start_up_ends_the_server_with_exit_code_1(
     assert _FakeWatch.instances[0].stopped
     assert events == ["server-start", ("server-stop", 5.0)]
     assert "engine process 4242 exited with code 1" in caplog.text
+    # The guard's grace covers the servicer's own drain bound and the bounded stops.
+    assert server_mod.ENGINE_EXIT_GRACE_SECS >= server_mod.SHUTDOWN_DRAIN_SECS + 5.0 + 5.0
+    assert armed == [server_mod.ENGINE_EXIT_GRACE_SECS]
 
 
 def test_a_signal_shutdown_still_returns_normally(monkeypatch, server_mod):

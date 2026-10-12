@@ -27,6 +27,13 @@ from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
 
 logger = logging.getLogger(__name__)
 
+# The servicer's own shutdown waits for the in-flight requests up to this
+# long (`TokenSpeedSchedulerServicer.shutdown`'s drain bound) before it ends
+# the engine processes; the exit guard's grace covers it, the server's stop
+# (5 s) and the warmup thread's join (5 s) on top of the lifecycle's grace.
+SHUTDOWN_DRAIN_SECS = 30.0
+ENGINE_EXIT_GRACE_SECS = EXIT_GRACE_SECS + SHUTDOWN_DRAIN_SECS + 10.0
+
 # Match the other SMG servicers' 256 MiB default — a single oversized or
 # malformed gRPC frame can otherwise trigger a multi-GiB transient
 # allocation. VLM deployments that genuinely need bigger ``pixel_values``
@@ -116,8 +123,9 @@ async def serve_grpc(server_args: ServerArgs) -> None:
             return
         # The guard is armed here, the moment the exit is known and ahead of
         # the shutdown (the servicer's own tear-down can block), with a grace
-        # that covers its bounded steps.
-        engine_exit["exit"] = guarded_exit(1, grace_secs=EXIT_GRACE_SECS + 10.0)
+        # that covers its bounded steps: the servicer's drain, the server stop,
+        # the warmup join.
+        engine_exit["exit"] = guarded_exit(1, grace_secs=ENGINE_EXIT_GRACE_SECS)
         loop.call_soon_threadsafe(stop_event.set)
 
     # The engine's processes are watched from before the first one starts: one
@@ -241,7 +249,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         watch.stop()
         logger.info("Shutting down TokenSpeed gRPC server")
         try:
-            await servicer.shutdown()
+            await servicer.shutdown(drain_timeout_secs=SHUTDOWN_DRAIN_SECS)
         except Exception:  # noqa: BLE001
             logger.exception("servicer.shutdown() raised")
         if discovery_servicer is not None:
