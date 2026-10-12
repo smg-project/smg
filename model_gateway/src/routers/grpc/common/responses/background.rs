@@ -1593,9 +1593,6 @@ mod tests {
         assert_eq!(registry.in_flight(), 0);
     }
 
-    /// The guard of the terminal persist: a terminal record reads closed, an
-    /// open one does not, a record that is gone reads closed (the delete
-    /// holds), and a store that cannot be read leaves the record open.
     /// A store blip at the in_progress transition does not disarm the watch:
     /// the run learns from its first good read that its record exists, and a
     /// record deleted after that ends the run.
@@ -1651,6 +1648,9 @@ mod tests {
         assert_eq!(registry.in_flight(), 0);
     }
 
+    /// The guard of the terminal persist: a terminal record reads closed, an
+    /// open one does not, a record that is gone reads closed (the delete
+    /// holds), and a store that cannot be read leaves the record open.
     #[tokio::test]
     async fn a_record_that_is_gone_reads_closed_and_an_unreadable_store_does_not() {
         let storage = storage();
