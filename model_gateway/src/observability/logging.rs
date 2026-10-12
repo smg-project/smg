@@ -381,11 +381,14 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     layers.push(stdout_layer);
 
-    // The configuration validation has created the directory and checked it
-    // is writable before this runs (`ConfigValidator::validate_log_dir`); a
-    // start that bypassed it keeps the console logging on either failure
-    // here, reported on stderr, instead of a panic in the appender or a start
-    // without any log output.
+    // A start through the CLI or the bindings validated this path before
+    // anything bound (`ConfigValidator::validate_log_dir`, over the
+    // `RouterConfig` field both fill from the same flag as this one): an
+    // existing path is a writable directory, a missing one sits under a
+    // writable directory and is created here. A caller that set only this
+    // `ServerConfig` field, or bypassed the validation, keeps the console
+    // logging on either failure here, reported on stderr, instead of a panic
+    // in the appender or a start without any log output.
     if let Some(log_dir) = &config.log_dir {
         let log_dir = PathBuf::from(log_dir);
 
