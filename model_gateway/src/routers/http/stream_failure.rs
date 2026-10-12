@@ -16,7 +16,7 @@
 
 use std::{error::Error as _, sync::Arc};
 
-use axum::http::StatusCode;
+use axum::{http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
 use tracing::warn;
@@ -32,6 +32,25 @@ use crate::{
 
 /// The route whose streams end with the Messages API's own error event.
 const MESSAGES_ROUTE: &str = "/v1/messages";
+
+/// Response extension: the successful head of a streamed response was
+/// recorded on the worker's circuit breaker before the relay task was
+/// spawned, so the caller does not record it again (a second success sample
+/// would count twice toward closing a half-open breaker).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeadSuccessRecorded;
+
+/// Mark `response` as a streamed response whose successful head was recorded
+/// before its relay was spawned (see [`HeadSuccessRecorded`]).
+pub(crate) fn mark_head_success_recorded(response: &mut Response) {
+    response.extensions_mut().insert(HeadSuccessRecorded);
+}
+
+/// Whether the successful head of `response` was recorded before its relay
+/// was spawned, so its caller must not record it again.
+pub(crate) fn head_success_recorded(response: &Response) -> bool {
+    response.extensions().get::<HeadSuccessRecorded>().is_some()
+}
 
 /// An upstream body error, classed the way a failed dispatch of it is: the
 /// client's timeout expiring mid-body is a gateway timeout, as it is when it
@@ -139,6 +158,13 @@ impl RelaySource {
     /// route, how far the response had come and
     /// the cause. The task runs under the request's span, so the line carries
     /// the request's id as every line of the request does.
+    ///
+    /// The breaker sample sits outside the request's attempt ledger on
+    /// purpose: the relay task outlives the attempt that produced the head,
+    /// which its caller recorded before the task was spawned, so the cut is
+    /// sampled after the head's success and never erased by it. A request
+    /// retried onto the same worker after a failed head is thus charged for
+    /// that head and for the cut.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
         let error_type = error_type_from_status(cut.status);
         warn!(

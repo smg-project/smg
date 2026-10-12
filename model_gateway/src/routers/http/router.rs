@@ -83,7 +83,10 @@ use crate::{
                 serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
             },
             request_stream::{CappedBodyStream, StreamProgress},
-            stream_failure::{note_sent, RelaySource, UpstreamCut},
+            stream_failure::{
+                head_success_recorded, mark_head_success_recorded, note_sent, RelaySource,
+                UpstreamCut,
+            },
         },
         BodyPolicy, RouterTrait,
     },
@@ -693,6 +696,11 @@ impl Router {
             ),
         };
 
+        // A streamed head's success was recorded before its relay task was
+        // spawned (see `forward_worker_response`); the adapter's verdict
+        // below may still turn the answer into a failure, which is recorded.
+        let head_success_recorded = head_success_recorded(&response);
+
         // Judge the converted result so malformed successes become backend
         // failures and follow the same outcome accounting and retry policy.
         let mut response = if let Some(adapter) = decision_adapter {
@@ -706,7 +714,9 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
 
         let status = response.status();
-        ledger.record_outcome(worker.as_ref(), status.as_u16());
+        if !head_success_recorded || !status.is_success() {
+            ledger.record_outcome(worker.as_ref(), status.as_u16());
+        }
         // A definitive answer closes the retry window on this worker: the next
         // attempt goes to another available worker, or the answer stands.
         ledger.settle(
@@ -1383,6 +1393,18 @@ impl Router {
             // relay await on `send` instead of buffering the whole response.
             let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
+            // The head's success is the worker's before the relay can sample
+            // the body's failure: on a multi-threaded runtime the task may
+            // run first with a body error already buffered behind the head,
+            // and the head's success recorded by the caller afterwards would
+            // reset the breaker's failure streak and erase the cut's sample.
+            // A failed head is the caller's to record (through its ledger on
+            // the typed route); the relay never accounts its body.
+            let head_success_recorded = status.is_success();
+            if head_success_recorded {
+                source.worker().record_outcome(status.as_u16());
+            }
+
             // The relay runs under the request's span, so a failure after
             // the head went out is logged with the request's id.
             let span = tracing::Span::current();
@@ -1489,6 +1511,9 @@ impl Router {
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
             mark_upstream_answer(&mut response);
+            if head_success_recorded {
+                mark_head_success_recorded(&mut response);
+            }
 
             // Attach load guard to response body for proper RAII lifecycle
             // Guard is dropped when response body is consumed or client disconnects
@@ -1995,7 +2020,11 @@ impl Router {
             && error_code != STREAMED_BODY_TOO_LARGE
             && error_code != STREAMED_BODY_ABORTED
         {
-            worker.record_outcome(status.as_u16());
+            // A streamed head's success was recorded before its relay task
+            // was spawned (see `forward_worker_response`).
+            if !head_success_recorded(&response) {
+                worker.record_outcome(status.as_u16());
+            }
             if status.is_server_error() {
                 Metrics::record_worker_error(
                     metrics_labels::WORKER_REGULAR,
@@ -4129,6 +4158,59 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// [`spawn_cut_stub`] without the pauses: the head and one chunk leave
+    /// the engine's server, and the cut follows as soon as the server has
+    /// flushed them (one yield of its task), so the body's error is right
+    /// behind the head when the relay starts.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_abrupt_cut_stub(path: &'static str, chunk: &'static str) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let head = stream::iter(vec![Ok(Bytes::from_static(chunk.as_bytes()))]);
+                let cut = stream::once(async {
+                    tokio::task::yield_now().await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::other("the engine went away"))
+                });
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(head.chain(cut)),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A regular worker at `url` whose breaker is half-open: it opened on two
+    /// failures, its timeout is over, and one success closes it. The order of
+    /// a head's success and a cut's failure is then readable from its state:
+    /// the success first closes it and the cut leaves it closed (one failure
+    /// under the threshold of two); the cut first opens it again.
+    fn half_open_worker(url: &str) -> crate::worker::BasicWorker {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                failure_threshold: 2,
+                success_threshold: 1,
+                timeout_duration: Duration::ZERO,
+                ..Default::default()
+            })
+            .build();
+        worker.record_circuit_breaker_outcome(false);
+        worker.record_circuit_breaker_outcome(false);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        worker
+    }
+
     /// A regular worker at `url` whose circuit breaker opens on the first failure.
     fn fragile_worker(url: &str) -> crate::worker::BasicWorker {
         BasicWorkerBuilder::new(url)
@@ -4219,6 +4301,156 @@ mod tests {
         assert!(
             !worker.circuit_breaker_can_execute(),
             "the cut is the worker's failure: its threshold-1 breaker opens"
+        );
+    }
+
+    /// The successful head of a streamed response is recorded on the worker's
+    /// breaker before the relay task is spawned, so a body the worker cuts
+    /// right behind the head is sampled after the head's success and stands,
+    /// instead of being erased by a success recorded after it. Read on a
+    /// current-thread runtime, where the relay cannot run before the body is
+    /// polled: the half-open breaker is closed by the head's success as soon
+    /// as the head is relayed, the response is marked so its caller does not
+    /// record it again, and the cut read afterwards is the one failure on the
+    /// closed breaker.
+    #[tokio::test]
+    async fn a_streamed_heads_success_is_recorded_before_the_relay_can_sample_a_cut() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![half_open_worker("http://127.0.0.1:9")],
+        );
+        let worker = Arc::clone(&router.worker_registry.get_all()[0]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let sample = |family: &str| {
+            handle
+                .render()
+                .lines()
+                .find(|line| {
+                    line.starts_with(family) && line.contains(r#"worker="http://127.0.0.1:9""#)
+                })
+                .map(str::to_string)
+        };
+        let items: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(CHAT_SSE_CHUNKS[0].as_bytes())),
+            Err(std::io::Error::other("the engine went away")),
+        ];
+        let upstream = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(reqwest::Body::wrap_stream(stream::iter(items)))
+            .unwrap();
+
+        let response = router
+            .forward_worker_response(
+                reqwest::Response::from(upstream),
+                StreamRelayMode {
+                    is_stream: true,
+                    rechunk: false,
+                },
+                RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
+                WorkerLoadGuard::with_key(Arc::clone(&worker), None),
+            )
+            .await;
+
+        // The head is out and the relay has not run: the success is recorded.
+        assert!(head_success_recorded(&response));
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        assert!(
+            sample("smg_worker_cb_outcomes_total{")
+                .is_some_and(|line| line.contains(r#"outcome="success""#) && line.ends_with(" 1")),
+            "{}",
+            handle.render()
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert_eq!(sse_events(body).len(), 3, "{body}");
+        // The cut is the one failure after the success: sampled and standing.
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        assert_eq!(
+            sample("smg_worker_cb_consecutive_failures{").as_deref(),
+            Some(r#"smg_worker_cb_consecutive_failures{worker="http://127.0.0.1:9"} 1"#),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// Through the typed route on a multi-threaded runtime, against an
+    /// engine's server that writes the head and dies at once (the body's
+    /// error waits behind the head): the relay task could sample the cut
+    /// before the caller recorded the head, and the head's success then
+    /// erased the sample. With the head recorded before the relay is spawned,
+    /// the half-open breaker is closed by the head and left closed by the
+    /// cut, every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cut_right_behind_the_head_is_sampled_after_the_heads_success_on_the_typed_route() {
+        const ROUNDS: usize = 40;
+        let url = spawn_abrupt_cut_stub("/v1/chat/completions", CHAT_SSE_CHUNKS[0]).await;
+        let mut reopened = Vec::new();
+        for round in 0..ROUNDS {
+            let router = streaming_router(
+                least_load_policy(),
+                1024 * 1024,
+                vec![half_open_worker(&url)],
+            );
+            let response = router
+                .route_typed_request(
+                    None,
+                    streaming_chat_request(),
+                    "/v1/chat/completions",
+                    crate::worker::UNKNOWN_MODEL_ID,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let state = router.worker_registry.get_all()[0].circuit_breaker_state();
+            if state != CircuitState::Closed {
+                reopened.push((round, state));
+            }
+        }
+        assert!(
+            reopened.is_empty(),
+            "the cut was sampled before the head's success in {} of {ROUNDS} rounds: {reopened:?}",
+            reopened.len()
+        );
+    }
+
+    /// The same, through the streamed route (the raw request body relayed as
+    /// it arrives), whose caller records the head itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cut_right_behind_the_head_is_sampled_after_the_heads_success_on_the_streamed_route()
+    {
+        const ROUNDS: usize = 40;
+        let url = spawn_abrupt_cut_stub("/generate", CHAT_SSE_CHUNKS[0]).await;
+        let mut reopened = Vec::new();
+        for round in 0..ROUNDS {
+            let router = streaming_router(
+                least_load_policy(),
+                1024 * 1024,
+                vec![half_open_worker(&url)],
+            );
+            let response = router
+                .route_streaming_request(
+                    streamed_request(&[b"{\"text\":\"hi\"}"]),
+                    "/generate",
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let state = router.worker_registry.get_all()[0].circuit_breaker_state();
+            if state != CircuitState::Closed {
+                reopened.push((round, state));
+            }
+        }
+        assert!(
+            reopened.is_empty(),
+            "the cut was sampled before the head's success in {} of {ROUNDS} rounds: {reopened:?}",
+            reopened.len()
         );
     }
 
