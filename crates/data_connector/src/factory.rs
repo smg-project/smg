@@ -91,7 +91,7 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             // here, so a bound of 0 s or a bad URL is refused by name instead
             // of failing every call once the gateway is up.
             postgres_cfg
-                .validate()
+                .validate_bounds()
                 .map_err(|e| format!("Invalid Postgres configuration: {e}"))?;
 
             let log_db_url = match Url::parse(&postgres_cfg.db_url) {
@@ -122,7 +122,7 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
                 .redis
                 .ok_or("Redis configuration is required when history_backend=redis")?;
             redis_cfg
-                .validate()
+                .validate_bounds()
                 .map_err(|e| format!("Invalid Redis configuration: {e}"))?;
 
             let log_redis_url = match Url::parse(&redis_cfg.url) {

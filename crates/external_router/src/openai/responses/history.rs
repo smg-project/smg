@@ -112,9 +112,10 @@ pub(crate) async fn load_input_history(
                     metrics_labels::ENDPOINT_RESPONSES,
                     metrics_labels::ERROR_INTERNAL,
                 );
-                return Err(error::internal_error(
+                return Err(error::storage_failure(
                     "load_previous_response_chain_failed",
-                    format!("Failed to load previous response chain for {prev_id_str}: {e}"),
+                    format!("Failed to load previous response chain for {prev_id_str}"),
+                    &e,
                 ));
             }
         }
@@ -124,23 +125,42 @@ pub(crate) async fn load_input_history(
     if let Some(conv_id_str) = conversation {
         let conv_id = ConversationId::from(conv_id_str);
 
-        if let Ok(None) = components
+        match components
             .conversation_storage
             .get_conversation(&conv_id)
             .await
         {
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_OPENAI,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                metrics_labels::ENDPOINT_RESPONSES,
-                metrics_labels::ERROR_VALIDATION,
-            );
-            return Err(error::not_found(
-                "not_found",
-                format!("No conversation found with id '{}'", conv_id.0),
-            ));
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_VALIDATION,
+                );
+                return Err(error::not_found(
+                    "not_found",
+                    format!("No conversation found with id '{}'", conv_id.0),
+                ));
+            }
+            Err(e) => {
+                warn!("Failed to check conversation {}: {}", conv_id.0, e);
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_INTERNAL,
+                );
+                return Err(error::storage_failure(
+                    "check_conversation_failed",
+                    format!("Failed to check conversation {}", conv_id.0),
+                    &e,
+                ));
+            }
         }
 
         let params = ListParams {
@@ -223,6 +243,19 @@ pub(crate) async fn load_input_history(
             }
             Err(e) => {
                 warn!("Failed to load conversation history: {}", e);
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_OPENAI,
+                    metrics_labels::BACKEND_EXTERNAL,
+                    metrics_labels::CONNECTION_HTTP,
+                    model,
+                    metrics_labels::ENDPOINT_RESPONSES,
+                    metrics_labels::ERROR_INTERNAL,
+                );
+                return Err(error::storage_failure(
+                    "load_conversation_history_failed",
+                    "Failed to load conversation history",
+                    &e,
+                ));
             }
         }
     }

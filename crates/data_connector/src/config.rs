@@ -116,6 +116,21 @@ impl PostgresConfig {
         Duration::from_secs(self.op_timeout_secs)
     }
 
+    /// The numeric invariants every entry path must hold (the CLI, the
+    /// Python bindings, a config built by hand), checked by the factory
+    /// before any connection. The connection string's shape is left to the
+    /// driver here: [`Self::validate`] checks it for the CLI's URLs, while a
+    /// socket path or a key=value string the driver understands passes.
+    pub fn validate_bounds(&self) -> Result<(), String> {
+        if self.pool_max == 0 {
+            return Err("pool_max must be greater than 0".to_string());
+        }
+        if self.op_timeout_secs == 0 {
+            return Err("op_timeout_secs must be greater than 0".to_string());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let s = self.db_url.trim();
         if s.is_empty() {
@@ -142,15 +157,7 @@ impl PostgresConfig {
             return Err("db_url must include a database name".to_string());
         }
 
-        if self.pool_max == 0 {
-            return Err("pool_max must be greater than 0".to_string());
-        }
-
-        if self.op_timeout_secs == 0 {
-            return Err("op_timeout_secs must be greater than 0".to_string());
-        }
-
-        Ok(())
+        self.validate_bounds()
     }
 }
 
@@ -206,6 +213,21 @@ impl RedisConfig {
         Duration::from_secs(self.op_timeout_secs)
     }
 
+    /// The numeric invariants every entry path must hold (the CLI, the
+    /// Python bindings, a config built by hand), checked by the factory
+    /// before any connection. The connection string's shape is left to the
+    /// driver here: [`Self::validate`] checks it for the CLI's URLs, while a
+    /// socket path or a key=value string the driver understands passes.
+    pub fn validate_bounds(&self) -> Result<(), String> {
+        if self.pool_max == 0 {
+            return Err("pool_max must be greater than 0".to_string());
+        }
+        if self.op_timeout_secs == 0 {
+            return Err("op_timeout_secs must be greater than 0".to_string());
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let s = self.url.trim();
         if s.is_empty() {
@@ -223,21 +245,53 @@ impl RedisConfig {
             return Err("redis url must have a host".to_string());
         }
 
-        if self.pool_max == 0 {
-            return Err("pool_max must be greater than 0".to_string());
-        }
-
-        if self.op_timeout_secs == 0 {
-            return Err("op_timeout_secs must be greater than 0".to_string());
-        }
-
-        Ok(())
+        self.validate_bounds()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── validate_bounds ─────────────────────────────────────────────────
+
+    /// The factory's check holds the bounds only: a connection string the
+    /// driver understands but the CLI's URL check does not (a key=value
+    /// string, a socket path) passes it, and a zero bound does not.
+    #[test]
+    fn validate_bounds_leaves_the_connection_string_to_the_driver() {
+        let postgres = PostgresConfig {
+            db_url: "host=/var/run/postgresql dbname=smg user=smg".to_string(),
+            pool_max: 4,
+            op_timeout_secs: 5,
+            schema: None,
+        };
+        assert!(postgres.validate_bounds().is_ok());
+        assert!(postgres.validate().is_err());
+        let zero = PostgresConfig {
+            op_timeout_secs: 0,
+            ..postgres
+        };
+        assert!(zero
+            .validate_bounds()
+            .unwrap_err()
+            .contains("op_timeout_secs"));
+
+        let redis = RedisConfig {
+            url: "unix:///run/redis.sock".to_string(),
+            pool_max: 4,
+            op_timeout_secs: 5,
+            retention_days: Some(1),
+            schema: None,
+        };
+        assert!(redis.validate_bounds().is_ok());
+        assert!(redis.validate().is_err());
+        let zero = RedisConfig {
+            pool_max: 0,
+            ..redis
+        };
+        assert!(zero.validate_bounds().unwrap_err().contains("pool_max"));
+    }
 
     // ── PostgresConfig::validate ────────────────────────────────────────
 
