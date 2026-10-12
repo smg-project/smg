@@ -1005,6 +1005,15 @@ impl ConfigValidator {
                 let ancestor = path
                     .ancestors()
                     .skip(1)
+                    // A relative path's last ancestor is "", which is the
+                    // current directory but does not stat.
+                    .map(|ancestor| {
+                        if ancestor.as_os_str().is_empty() {
+                            Path::new(".")
+                        } else {
+                            ancestor
+                        }
+                    })
                     .find(|ancestor| ancestor.exists())
                     .ok_or_else(|| {
                         invalid("cannot be created: no existing ancestor".to_string())
@@ -1895,6 +1904,32 @@ mod tests {
         );
         assert!(ConfigValidator::validate(&log_dir_config(dir.path().to_str().unwrap())).is_ok());
         assert!(ConfigValidator::validate(&RouterConfig::default()).is_ok());
+    }
+
+    /// A relative `--log-dir` (a systemd `WorkingDirectory=`, a container
+    /// `WORKDIR`, a local run) that does not exist yet is accepted: its
+    /// nearest existing ancestor is the working directory, which the walk
+    /// reaches as "" and must read as ".". Nothing is created.
+    #[test]
+    fn a_missing_relative_log_dir_under_the_working_directory_is_accepted() {
+        let leaf = format!(
+            "log-dir-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        for relative in [leaf.clone(), format!("{leaf}/run/logs")] {
+            assert!(
+                ConfigValidator::validate(&log_dir_config(&relative)).is_ok(),
+                "{relative}"
+            );
+            assert!(
+                !Path::new(&leaf).exists(),
+                "{relative}: created by the validation"
+            );
+        }
     }
 
     #[cfg(unix)]
