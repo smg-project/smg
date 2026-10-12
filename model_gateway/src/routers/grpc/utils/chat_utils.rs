@@ -164,7 +164,8 @@ pub(crate) const TOKENIZER_LOAD_FAILED_CODE: &str = "tokenizer_load_failed";
 
 /// The 503 for a served model whose tokenizer the gateway will not register
 /// on its own: its load was skipped (no path to load it from) or failed for
-/// good, as the registration workflow recorded for the model. The envelope
+/// good, or its tokenizer was removed, as the registration recorded for the
+/// model (a load in flight is pending, not this). The envelope
 /// of [`tokenizer_not_ready`] without the `Retry-After`: a retry changes
 /// nothing until a tokenizer registers for the model (a worker re-registering
 /// with a usable path, an operator's `POST /v1/tokenizers`), which clears
@@ -196,8 +197,9 @@ pub(crate) fn tokenizer_load_failed(
 
 /// The error for a model without a registered tokenizer: a model nobody
 /// serves is the client's mistake (404); a served model whose tokenizer load
-/// was skipped or failed for good gets none on its own (503 without a retry
-/// hint, [`tokenizer_load_failed`]); a served model whose tokenizer the
+/// was skipped or failed for good, or whose tokenizer was removed, gets none
+/// on its own (503 without a retry hint, [`tokenizer_load_failed`]); a
+/// served model whose tokenizer the
 /// gateway is still loading is not ready yet (503 with a `Retry-After`, the
 /// state `/readiness` reports); a served model with no tokenizer when the
 /// gateway does not load tokenizers itself (`--disable-tokenizer-autoload`)
@@ -2390,6 +2392,11 @@ mod tests {
         );
         for (failure, autoload, reason) in [
             (&TokenizerLoadFailure::NoSource, true, "no tokenizer path"),
+            (
+                &TokenizerLoadFailure::Removed,
+                true,
+                "the tokenizer was removed",
+            ),
             (&failed, true, "the load failed"),
             (&failed, false, "the load failed"),
         ] {

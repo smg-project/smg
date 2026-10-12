@@ -106,25 +106,24 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                 );
                 path.clone()
             } else {
-                // Nothing will load this model's tokenizer. Unless the model
-                // has one already (another worker's or the operator's
-                // registration), record it, so that requests are answered
-                // with the fact instead of a retry hint; one line per model
-                // and entry.
-                if app_context.tokenizer_registry.contains(&model_id) {
-                    debug!(
-                        "No tokenizer_path or model_path found for model {} (checked worker labels and router config); its tokenizer is registered already",
-                        model_id
-                    );
-                } else if app_context
-                    .tokenizer_load_failures
-                    .record(&model_id, TokenizerLoadFailure::NoSource)
-                {
-                    warn!(
-                        "No tokenizer_path or model_path found for model {} (checked worker labels and router config); its requests answer 503 tokenizer_load_failed until a tokenizer is registered",
-                        model_id
-                    );
-                }
+                // Nothing of this worker's loads the model's tokenizer. Unless
+                // the model has one already (another worker's or the
+                // operator's registration) or a load of it is in flight (that
+                // load decides), record it, so that requests are answered with
+                // the fact instead of a retry hint.
+                let recorded = !app_context.tokenizer_registry.contains(&model_id)
+                    && app_context
+                        .tokenizer_load_failures
+                        .record(&model_id, TokenizerLoadFailure::NoSource);
+                warn!(
+                    "No tokenizer_path or model_path found for model {} (checked worker labels and router config){}",
+                    model_id,
+                    if recorded {
+                        "; its requests answer 503 tokenizer_load_failed until a tokenizer is registered"
+                    } else {
+                        ""
+                    }
+                );
                 continue;
             };
 
@@ -147,10 +146,8 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                 fail_on_duplicate: false,
             };
 
-            // A load starts for the model: pending until the job ends.
-            app_context.tokenizer_load_failures.clear(&model_id);
-
-            // Submit job (fire-and-forget, don't wait for completion)
+            // Submit job (fire-and-forget, don't wait for completion); the
+            // queue counts the accepted load in flight for the model.
             if let Err(e) = job_queue
                 .submit(Job::AddTokenizer {
                     config: Box::new(config),

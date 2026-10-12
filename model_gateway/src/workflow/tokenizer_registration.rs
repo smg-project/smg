@@ -32,7 +32,7 @@ use crate::{
     routers::grpc::multimodal::{
         load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
     },
-    worker::ConnectionMode,
+    worker::{ConnectionMode, WorkerRegistry},
 };
 
 /// Configuration for adding a tokenizer
@@ -64,8 +64,8 @@ pub struct TokenizerRemovalRequest {
 }
 
 /// Why a served model's tokenizer will not register on its own: the terminal
-/// outcome of its load, kept per model so that a request for the model is
-/// answered with that fact (503 `tokenizer_load_failed`, no `Retry-After`)
+/// outcome of its last load, kept per model so that a request for the model
+/// is answered with that fact (503 `tokenizer_load_failed`, no `Retry-After`)
 /// instead of the retry hint of a load still in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenizerLoadFailure {
@@ -75,6 +75,9 @@ pub enum TokenizerLoadFailure {
     NoSource,
     /// The registration workflow failed; its error, for the log.
     Failed(String),
+    /// The model's tokenizer was removed (`DELETE /v1/tokenizers/{id}`)
+    /// while the model is still served; nothing reloads it on its own.
+    Removed,
 }
 
 impl TokenizerLoadFailure {
@@ -86,19 +89,31 @@ impl TokenizerLoadFailure {
                 "no tokenizer path in the worker's labels or the router configuration"
             }
             Self::Failed(_) => "the load failed; see the gateway log",
+            Self::Removed => "the tokenizer was removed; register one again",
         }
     }
 }
 
-/// The models whose tokenizer load ended without a tokenizer, by model id. A
-/// model without an entry and without a registered tokenizer is pending (a
-/// load in flight, or none started yet). An entry is made when a load is
-/// skipped for lack of a source or fails for good, and removed when a load
-/// starts or succeeds (a worker re-registering with a usable path, an
-/// operator's `POST /v1/tokenizers`).
+/// A model's tokenizer loads: how many are in flight (accepted, not ended)
+/// and the terminal outcome of the last one, when it ended without a
+/// tokenizer.
+#[derive(Debug, Default)]
+struct ModelLoadState {
+    in_flight: u32,
+    failure: Option<TokenizerLoadFailure>,
+}
+
+/// The tokenizer loads of the served models, by model id: the loads in
+/// flight and the last terminal failure. A model with a load in flight is
+/// pending, whatever was recorded before (the load decides when it ends); a
+/// model without one and without a registered tokenizer is pending too,
+/// until a failure is recorded: its load skipped for lack of a source, the
+/// last of its loads failed for good, or its tokenizer removed. A load that
+/// is accepted or succeeds clears the record (a worker re-registering with a
+/// usable path, an operator's `POST /v1/tokenizers`).
 #[derive(Debug, Default)]
 pub struct TokenizerLoadFailures {
-    by_model: DashMap<String, TokenizerLoadFailure>,
+    by_model: DashMap<String, ModelLoadState>,
 }
 
 impl TokenizerLoadFailures {
@@ -106,45 +121,96 @@ impl TokenizerLoadFailures {
         Self::default()
     }
 
-    /// Records the model's failure; `true` when the model was not in that
-    /// state before (the moment to log it: once per model and entry).
+    /// A load for the model was accepted: the model is pending until it
+    /// ends, whatever was recorded.
+    pub fn load_started(&self, model: &str) {
+        let mut state = self.by_model.entry(model.to_string()).or_default();
+        state.in_flight += 1;
+        state.failure = None;
+    }
+
+    /// A load for the model ended; `true` when it was the last one in flight
+    /// (the moment its failure counts).
+    pub fn load_ended(&self, model: &str) -> bool {
+        let Some(mut state) = self.by_model.get_mut(model) else {
+            return true;
+        };
+        state.in_flight = state.in_flight.saturating_sub(1);
+        let last = state.in_flight == 0;
+        drop(state);
+        self.forget_if_blank(model);
+        last
+    }
+
+    /// Records the model's failure, unless a load is in flight (that load
+    /// decides); `true` when the model was not in that state before (the
+    /// moment to log it: once per model and entry).
     pub fn record(&self, model: &str, failure: TokenizerLoadFailure) -> bool {
-        self.by_model
-            .insert(model.to_string(), failure.clone())
-            .as_ref()
-            != Some(&failure)
+        let mut state = self.by_model.entry(model.to_string()).or_default();
+        if state.in_flight > 0 {
+            return false;
+        }
+        let newly = state.failure.as_ref() != Some(&failure);
+        state.failure = Some(failure);
+        newly
     }
 
-    /// Forgets the model's failure, a load having started or succeeded;
-    /// `true` when there was one.
+    /// Forgets the model's failure, a load having succeeded; `true` when
+    /// there was one.
     pub fn clear(&self, model: &str) -> bool {
-        self.by_model.remove(model).is_some()
+        let Some(mut state) = self.by_model.get_mut(model) else {
+            return false;
+        };
+        let had = state.failure.take().is_some();
+        drop(state);
+        self.forget_if_blank(model);
+        had
     }
 
-    /// The model's recorded failure, if its last load ended in one.
+    /// The model's recorded failure, unless a load is in flight.
     pub fn get(&self, model: &str) -> Option<TokenizerLoadFailure> {
-        self.by_model.get(model).map(|entry| entry.clone())
+        self.by_model
+            .get(model)
+            .filter(|state| state.in_flight == 0)
+            .and_then(|state| state.failure.clone())
+    }
+
+    fn forget_if_blank(&self, model: &str) {
+        self.by_model.remove_if(model, |_, state| {
+            state.in_flight == 0 && state.failure.is_none()
+        });
     }
 }
 
-/// Notes the outcome of a tokenizer registration job for `model` (the
-/// autoload a worker's registration starts and an operator's request alike):
-/// a success clears the model's record; a failure is recorded, and logged
-/// once per model and entry, unless the registry holds a tokenizer for the
-/// model anyway (a duplicate registration fails without taking anything
-/// away). Requests for a recorded model are answered 503
-/// `tokenizer_load_failed` without a retry hint until a tokenizer registers.
+/// Notes the end of a tokenizer registration job for `model` (the autoload a
+/// worker's registration starts, an operator's request and the start-up load
+/// alike): a success clears the model's record; a failure is recorded, and
+/// logged once per model and entry, when it was the model's last load in
+/// flight, the model is served and the registry holds no tokenizer for it (a
+/// failed duplicate registration takes nothing away; a name no served model
+/// carries is nobody's request). Requests for a recorded model are answered
+/// 503 `tokenizer_load_failed` without a retry hint until a tokenizer
+/// registers.
 pub fn note_tokenizer_load_outcome(
     failures: &TokenizerLoadFailures,
     registry: &TokenizerRegistry,
+    workers: &WorkerRegistry,
     model: &str,
     result: &Result<String, String>,
 ) {
+    let last = failures.load_ended(model);
     match result {
         Ok(_) => {
             failures.clear(model);
         }
-        Err(_) if registry.contains(model) => {}
+        Err(_) if !last || registry.contains(model) => {}
+        Err(error) if !workers.contains_model(model) => {
+            debug!(
+                name = %model,
+                error = %error,
+                "Tokenizer load failed for a name no served model carries; nothing to record"
+            );
+        }
         Err(error) => {
             if failures.record(model, TokenizerLoadFailure::Failed(error.clone())) {
                 warn!(
@@ -154,6 +220,23 @@ pub fn note_tokenizer_load_outcome(
                 );
             }
         }
+    }
+}
+
+/// Notes the removal of the tokenizer `name` (`DELETE /v1/tokenizers/{id}`):
+/// for a model still served nothing reloads it on its own, so the model's
+/// requests are answered 503 `tokenizer_load_failed` without a retry hint
+/// until a tokenizer registers; logged once per model and entry.
+pub fn note_tokenizer_removed(
+    failures: &TokenizerLoadFailures,
+    workers: &WorkerRegistry,
+    name: &str,
+) {
+    if workers.contains_model(name) && failures.record(name, TokenizerLoadFailure::Removed) {
+        warn!(
+            model = %name,
+            "Tokenizer removed for a served model; its requests answer 503 tokenizer_load_failed until a tokenizer is registered"
+        );
     }
 }
 
@@ -530,7 +613,13 @@ pub fn create_tokenizer_workflow_data(
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, WorkerType},
+    };
+
     use super::*;
+    use crate::worker::BasicWorkerBuilder;
 
     #[test]
     fn worker_tokenizer_bundle_preserves_configured_template() {
@@ -680,17 +769,39 @@ mod tests {
             .expect("Workflow validation should pass");
     }
 
+    /// A worker registry serving `model`.
+    fn serving(model: &str) -> WorkerRegistry {
+        let workers = WorkerRegistry::new();
+        workers
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://worker:30000")
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .model(ModelCard::new(model))
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ))
+            .expect("register worker");
+        workers
+    }
+
     /// A failed load is recorded once per model and entry (the log line's
     /// allowance), a different reason is a new entry, and the next load,
-    /// starting or succeeding, clears the record.
+    /// accepted or succeeding, clears the record.
     #[test]
     fn a_load_failure_is_recorded_once_per_entry_and_cleared_by_the_next_load() {
         let failures = TokenizerLoadFailures::new();
         let registry = TokenizerRegistry::new();
+        let workers = serving("m");
         let error = "Workflow failed at step load_tokenizer: boom".to_string();
         assert_eq!(failures.get("m"), None);
 
-        note_tokenizer_load_outcome(&failures, &registry, "m", &Err(error.clone()));
+        failures.load_started("m");
+        assert_eq!(failures.get("m"), None);
+        note_tokenizer_load_outcome(&failures, &registry, &workers, "m", &Err(error.clone()));
         assert_eq!(
             failures.get("m"),
             Some(TokenizerLoadFailure::Failed(error.clone()))
@@ -700,11 +811,71 @@ mod tests {
         assert_eq!(failures.get("m"), Some(TokenizerLoadFailure::NoSource));
         assert_eq!(failures.get("other"), None);
 
-        assert!(failures.clear("m"));
-        assert!(!failures.clear("m"));
-        assert!(failures.record("m", TokenizerLoadFailure::Failed(error.clone())));
-        note_tokenizer_load_outcome(&failures, &registry, "m", &Ok("m completed".to_string()));
+        failures.load_started("m");
+        assert_eq!(failures.get("m"), None, "a load accepted: pending again");
+        note_tokenizer_load_outcome(
+            &failures,
+            &registry,
+            &workers,
+            "m",
+            &Ok("m completed".to_string()),
+        );
         assert_eq!(failures.get("m"), None);
+        assert!(!failures.clear("m"));
+    }
+
+    /// While another load of the model is in flight, neither a registration
+    /// without a path nor an earlier load's failure is recorded: the last
+    /// load decides.
+    #[test]
+    fn a_failure_is_not_recorded_while_another_load_of_the_model_is_in_flight() {
+        let failures = TokenizerLoadFailures::new();
+        let registry = TokenizerRegistry::new();
+        let workers = serving("m");
+
+        failures.load_started("m");
+        assert!(!failures.record("m", TokenizerLoadFailure::NoSource));
+        assert_eq!(failures.get("m"), None);
+
+        failures.load_started("m");
+        note_tokenizer_load_outcome(
+            &failures,
+            &registry,
+            &workers,
+            "m",
+            &Err("first".to_string()),
+        );
+        assert_eq!(failures.get("m"), None, "a load is still in flight");
+        note_tokenizer_load_outcome(
+            &failures,
+            &registry,
+            &workers,
+            "m",
+            &Err("second".to_string()),
+        );
+        assert_eq!(
+            failures.get("m"),
+            Some(TokenizerLoadFailure::Failed("second".to_string()))
+        );
+    }
+
+    /// A failed load of a name no served model carries (the start-up load,
+    /// named by its source; an operator's registration of another name) is
+    /// nobody's request: nothing is recorded.
+    #[test]
+    fn a_failed_load_of_a_name_nobody_serves_is_not_recorded() {
+        let failures = TokenizerLoadFailures::new();
+        let registry = TokenizerRegistry::new();
+        let workers = WorkerRegistry::new();
+        failures.load_started("/models/x");
+        note_tokenizer_load_outcome(
+            &failures,
+            &registry,
+            &workers,
+            "/models/x",
+            &Err("boom".to_string()),
+        );
+        assert_eq!(failures.get("/models/x"), None);
     }
 
     /// A registration that fails for a model whose tokenizer the registry
@@ -713,6 +884,7 @@ mod tests {
     async fn a_failed_duplicate_registration_of_a_registered_tokenizer_is_no_failure() {
         let failures = TokenizerLoadFailures::new();
         let registry = TokenizerRegistry::new();
+        let workers = serving("m");
         registry
             .load("id", "m", "mock", || async {
                 factory::create_tokenizer_with_chat_template("mock", None)
@@ -720,12 +892,27 @@ mod tests {
             })
             .await
             .expect("the mock tokenizer loads");
+        failures.load_started("m");
         note_tokenizer_load_outcome(
             &failures,
             &registry,
+            &workers,
             "m",
             &Err("Tokenizer 'm' already exists (id: id)".to_string()),
         );
         assert_eq!(failures.get("m"), None);
+    }
+
+    /// A tokenizer removed while its model is served is recorded, once; one
+    /// of a name nobody serves is not.
+    #[test]
+    fn a_removed_tokenizer_is_recorded_only_for_a_served_model() {
+        let failures = TokenizerLoadFailures::new();
+        let workers = serving("m");
+        note_tokenizer_removed(&failures, &workers, "m");
+        assert_eq!(failures.get("m"), Some(TokenizerLoadFailure::Removed));
+        assert!(!failures.record("m", TokenizerLoadFailure::Removed));
+        note_tokenizer_removed(&failures, &workers, "other");
+        assert_eq!(failures.get("other"), None);
     }
 }

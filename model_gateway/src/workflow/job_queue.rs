@@ -25,9 +25,9 @@ use crate::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        create_worker_workflow_data, note_tokenizer_load_outcome, McpServerConfigRequest,
-        TokenizerConfigRequest, TokenizerRemovalRequest, WasmModuleConfigRequest,
-        WasmModuleRemovalRequest, WorkerRegistrationMode,
+        create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
+        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
+        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode,
     },
 };
 
@@ -256,13 +256,19 @@ impl JobQueue {
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
-        if self.context.upgrade().is_none() {
+        let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
-        }
+        };
 
         // Extract values before moving job
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
+        // A tokenizer load accepted for its model counts as in flight from
+        // here: the model is pending until the job ends, whatever was recorded.
+        let tokenizer_load = match &job {
+            Job::AddTokenizer { config } => Some(config.name.clone()),
+            _ => None,
+        };
 
         // Record pending status
         self.status_map.insert(
@@ -272,6 +278,9 @@ impl JobQueue {
 
         match self.tx.send(job).await {
             Ok(()) => {
+                if let Some(model) = &tokenizer_load {
+                    context.tokenizer_load_failures.load_started(model);
+                }
                 let (queue_depth, available_permits) = self.get_load_info();
                 debug!(
                     "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
@@ -701,10 +710,9 @@ impl JobQueue {
                     .await
             }
             Job::AddTokenizer { config } => {
-                // A load in flight: the model is pending again until this job
-                // ends, when its outcome is noted for the model (a failure
-                // answers the model's requests 503 tokenizer_load_failed).
-                context.tokenizer_load_failures.clear(&config.name);
+                // The load was counted in flight at submission; its end is
+                // noted for the model (a failure of the model's last load
+                // answers its requests 503 tokenizer_load_failed).
                 let result = async {
                     let engines = context
                         .workflow_engines
@@ -739,6 +747,7 @@ impl JobQueue {
                 note_tokenizer_load_outcome(
                     &context.tokenizer_load_failures,
                     &context.tokenizer_registry,
+                    &context.worker_registry,
                     &config.name,
                     &result,
                 );
@@ -748,6 +757,11 @@ impl JobQueue {
                 // Tokenizer removal is synchronous and fast
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
                     context.multimodal_config_registry.remove(&entry.id);
+                    note_tokenizer_removed(
+                        &context.tokenizer_load_failures,
+                        &context.worker_registry,
+                        &entry.name,
+                    );
                     info!(
                         "Successfully removed tokenizer '{}' (id: {})",
                         entry.name, entry.id

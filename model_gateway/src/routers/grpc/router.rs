@@ -1221,7 +1221,7 @@ mod pd_tests {
     };
 
     use http::header::RETRY_AFTER;
-    use llm_tokenizer::registry::TokenizerRegistry;
+    use llm_tokenizer::{factory, registry::TokenizerRegistry};
     use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
     use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use serde_json::json;
@@ -1594,6 +1594,103 @@ mod pd_tests {
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(ctx.tokenizer_load_failures.get("m"), None);
+    }
+
+    /// Two registrations of one model: while worker A's tokenizer load is in
+    /// flight (held here on the registry's per-name lock), worker B
+    /// registering without a path does not turn the model's answer into a
+    /// final failure; the model stays not ready with its retry hint, and
+    /// answers once A's load ends.
+    #[tokio::test]
+    async fn a_registration_without_a_path_defers_to_the_models_load_in_flight() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&ctx),
+            ))
+            .ok();
+        ctx.workflow_engines
+            .set(WorkflowEngines::new(&ctx.router_config))
+            .ok();
+        let worker = grpc_worker_for_m();
+        ctx.worker_registry
+            .register(worker.clone())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let tokenizer_dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer.json"),
+            MINIMAL_TOKENIZER_JSON,
+        )
+        .expect("tokenizer.json");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "hello"}"#,
+        )
+        .expect("tokenizer_config.json");
+        let path = tokenizer_dir
+            .path()
+            .to_str()
+            .expect("utf-8 path")
+            .to_string();
+
+        // A load of `m` held on the registry's per-name lock for 1.5 s: worker
+        // A's job, submitted next, waits behind it; worker B registers without
+        // a path meanwhile.
+        let held_path = path.clone();
+        let held = ctx
+            .tokenizer_registry
+            .load("held", "m", &path, move || async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                factory::create_tokenizer_with_chat_template(&held_path, None)
+                    .map_err(|e| e.to_string())
+            });
+        let registrations = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut step = tokenizer_step_input(&ctx, &worker, &[("tokenizer_path", &path)]);
+            SubmitTokenizerJobStep
+                .execute(&mut step)
+                .await
+                .expect("the step runs");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut step = tokenizer_step_input(&ctx, &worker, &[]);
+            SubmitTokenizerJobStep
+                .execute(&mut step)
+                .await
+                .expect("the step runs");
+            router
+                .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+                .await
+        };
+        let (held, response) = tokio::join!(held, registrations);
+        held.expect("the held load succeeds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_not_ready",
+            "a load in flight keeps the retry hint"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = router
+                .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+                .await;
+            if response.status() == StatusCode::OK {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the model did not answer");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn message_request(body: serde_json::Value) -> CreateMessageRequest {
