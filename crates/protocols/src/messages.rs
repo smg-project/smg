@@ -984,6 +984,11 @@ pub enum ToolUseCaller {
     /// A code-execution server tool issued the call.
     #[serde(rename = "code_execution_20250825")]
     CodeExecution20250825 { tool_id: String },
+    /// A caller kind this build does not know, kept as the upstream sent it:
+    /// a `tool_use` block of an upstream answer must parse whatever caller the
+    /// public API adds later, and leave with the same object.
+    #[serde(untagged)]
+    Other(Value),
 }
 
 /// Stop reasons
@@ -2160,6 +2165,27 @@ mod tests {
         ));
         let value = serde_json::to_value(&block).expect("serialize");
         assert_eq!(value["caller"]["type"], "code_execution_20250825");
+    }
+
+    /// A caller kind this build does not know (one the public API adds later)
+    /// must not fail the parse of an upstream answer: it is kept as sent.
+    #[test]
+    fn an_unknown_caller_kind_of_an_upstream_block_is_kept_as_sent() {
+        let caller =
+            json!({"type": "some_future_tool_20270101", "tool_id": "srvtoolu_9", "extra": 1});
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_3", "name": "lookup", "input": {}, "caller": caller
+        }))
+        .expect("an unknown caller kind still parses");
+        assert!(matches!(
+            &block,
+            ContentBlock::ToolUse {
+                caller: ToolUseCaller::Other(_),
+                ..
+            }
+        ));
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"], caller, "{value}");
     }
 
     #[test]
