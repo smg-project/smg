@@ -2008,6 +2008,61 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// Stamp a disaggregated request's decode-leg response with the prefill
+    /// leg's prefix-cache hit (see [`PrefillCachedTokens`]). The decode leg
+    /// loads the prefix it was handed and reports it as cached, so its own
+    /// number is the transfer's size, not the request's cache hit; a chunk or
+    /// complete whose sample the prefill leg did not report keeps its own.
+    pub fn restamp_cached_tokens(&mut self, prefill: &PrefillCachedTokens) {
+        match self {
+            Self::Sglang(resp) => match resp.response.as_mut() {
+                Some(sglang::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(sglang::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Vllm(resp) => match resp.response.as_mut() {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(vllm::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Trtllm(resp) => match resp.response.as_mut() {
+                Some(trtllm::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.sequence_index, &mut chunk.cached_tokens);
+                }
+                Some(trtllm::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.sequence_index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Mlx(resp) => match resp.response.as_mut() {
+                Some(mlx::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(mlx::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::TokenSpeed(resp) => match resp.response.as_mut() {
+                Some(tokenspeed::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(tokenspeed::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+        }
+    }
+
     /// Whether this is a `Complete` the engine finished with reason `"error"`.
     pub fn engine_error(&self) -> bool {
         match self {
@@ -2701,6 +2756,65 @@ pub enum ProtoStream {
     /// Any of the above, with the worker it came from: every response is a
     /// sign of life for that worker (see [`crate::worker::liveness`]).
     Tracked(Box<TrackedStream>),
+    /// The decode leg of a disaggregated request: every response restamped
+    /// with the prefill leg's prefix-cache hit (see [`PrefillCachedTokens`]).
+    DecodeLeg(Box<DecodeLegStream>),
+}
+
+/// A disaggregated request's decode leg. Its engine loads the prompt's KV
+/// from the prefill leg and reports what it loaded as cached, so every chunk
+/// and complete it yields is restamped with the prefill leg's prefix-cache
+/// hit before the gateway reads it. The wrapper sits outside the worker
+/// tracking, so the decode worker still learns its prefill rate from what its
+/// own engine computed.
+pub struct DecodeLegStream {
+    inner: ProtoStream,
+    prefill: PrefillCachedTokens,
+}
+
+/// The prefix-cache hit of a disaggregated request, by sample index, as its
+/// prefill leg reported it on each `Complete`. The prefill leg is the one
+/// that computed the prompt against its prefix cache; the decode leg receives
+/// that prefix over the KV connector and counts it as cached, so read from the
+/// decode leg every request's `cached_tokens` is the transfer (the prompt
+/// less its last token), whatever the cache held. The decode leg's responses
+/// are restamped with these values (see [`ProtoStream::decode_leg`]) so the
+/// client's usage, and everything the gateway derives from it, carries the
+/// request's real cache hit.
+#[derive(Debug, Clone, Default)]
+pub struct PrefillCachedTokens {
+    by_index: HashMap<u32, u32>,
+}
+
+impl PrefillCachedTokens {
+    /// Record a prefill `Complete`'s cache hit under its sample index.
+    pub fn note(&mut self, complete: &ProtoGenerateComplete) {
+        self.by_index
+            .insert(complete.index(), complete.cached_tokens());
+    }
+
+    /// Whether no prefill completion was recorded (a stream another stage
+    /// drained, or a prefill leg that ended without one).
+    pub fn is_empty(&self) -> bool {
+        self.by_index.is_empty()
+    }
+
+    /// The prefill leg's cache hit for sample `index`: the sample's own
+    /// entry, or the one entry of a prefill that completed once for the
+    /// whole request.
+    pub fn for_index(&self, index: u32) -> Option<u32> {
+        match self.by_index.get(&index) {
+            Some(cached) => Some(*cached),
+            None if self.by_index.len() == 1 => self.by_index.values().next().copied(),
+            None => None,
+        }
+    }
+
+    fn restamp(&self, index: u32, cached: &mut u32) {
+        if let Some(value) = self.for_index(index) {
+            *cached = value;
+        }
+    }
 }
 
 /// A [`ProtoStream`] paired with the worker serving it, so each response it
@@ -3136,8 +3250,24 @@ impl ProtoStream {
     pub fn worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Tracked(tracked) => Some(&tracked.worker),
+            Self::DecodeLeg(leg) => leg.inner.worker(),
             _ => None,
         }
+    }
+
+    /// This stream as a disaggregated request's decode leg: its responses
+    /// carry `prefill`'s prefix-cache hit instead of their own (see
+    /// [`PrefillCachedTokens`]). A prefill leg that reported nothing leaves
+    /// the stream as it is.
+    #[must_use]
+    pub fn decode_leg(self, prefill: PrefillCachedTokens) -> Self {
+        if prefill.is_empty() {
+            return self;
+        }
+        Self::DecodeLeg(Box::new(DecodeLegStream {
+            inner: self,
+            prefill,
+        }))
     }
 
     /// Get next item from stream
@@ -3204,6 +3334,16 @@ impl ProtoStream {
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
             Self::Tracked(_) => return Box::pin(self.next()).await,
+            // The inner stream (tracked or not) did its own bookkeeping and
+            // engine-error mapping; only the prompt-side usage changes here.
+            Self::DecodeLeg(leg) => {
+                return Box::pin(leg.inner.next()).await.map(|result| {
+                    result.map(|mut response| {
+                        response.restamp_cached_tokens(&leg.prefill);
+                        response
+                    })
+                })
+            }
         };
         item.map(reject_engine_error)
     }
@@ -3219,6 +3359,7 @@ impl ProtoStream {
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
             Self::Tracked(stream) => stream.inner.mark_completed(),
+            Self::DecodeLeg(leg) => leg.inner.mark_completed(),
         }
     }
 
@@ -3254,6 +3395,13 @@ impl ProtoStream {
                     prefill,
                     progress,
                     replay,
+                }))
+            }
+            Self::DecodeLeg(leg) => {
+                let DecodeLegStream { inner, prefill } = *leg;
+                Self::DecodeLeg(Box::new(DecodeLegStream {
+                    inner: inner.defer_abort_until_first_item(),
+                    prefill,
                 }))
             }
         }

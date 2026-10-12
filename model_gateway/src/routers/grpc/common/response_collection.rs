@@ -12,7 +12,9 @@ use crate::{
         error,
         grpc::{
             context::ExecutionResult,
-            proto_wrapper::{FanoutChild, ProtoGenerateComplete, ProtoResponseVariant},
+            proto_wrapper::{
+                FanoutChild, PrefillCachedTokens, ProtoGenerateComplete, ProtoResponseVariant,
+            },
             utils::{
                 account_pd_leg_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
             },
@@ -26,14 +28,19 @@ use crate::{
 /// Keep the streams' abort-on-drop armed until Decode succeeds, as before.
 /// Collectors continue to EOF to preserve their metadata collection behavior;
 /// streaming handlers can stop once all dispatched Prefill samples complete.
+/// Returns the prefix-cache hit each completed sample reported: the client's
+/// prompt-side usage, which the decode leg's responses are restamped with
+/// (`ProtoStream::decode_leg`); empty for a stream the execution stage
+/// drained itself.
 pub(crate) async fn drain_prefill<S: FanoutChild>(
     stream: &mut S,
     mut guards: Vec<Option<PrefillLoadGuard>>,
     finish_at_complete: bool,
     mut on_complete: impl FnMut(ProtoGenerateComplete) + Send,
-) -> Result<(), tonic::Status> {
+) -> Result<PrefillCachedTokens, tonic::Status> {
     let mut remaining = guards.len();
     let single_dispatch = remaining == 1;
+    let mut cached_tokens = PrefillCachedTokens::default();
     while let Some(response) = stream.next_item().await {
         // A prefill leg the engine retires with its rendezvous verdict is
         // counted under the rendezvous family before the failure propagates.
@@ -55,13 +62,14 @@ pub(crate) async fn drain_prefill<S: FanoutChild>(
                     }
                 }
             }
+            cached_tokens.note(&complete);
             on_complete(complete);
             if finish_at_complete && remaining == 0 {
                 break;
             }
         }
     }
-    Ok(())
+    Ok(cached_tokens)
 }
 
 /// Collect and merge responses from execution result
@@ -99,25 +107,27 @@ pub(crate) async fn collect_responses(
             // sampled on its breaker and counted once, as a streamed
             // answer's reader does it.
             let prefill_worker = prefill.worker().cloned();
-            drain_prefill(&mut prefill, prefill_guards, false, |complete| {
-                prefill_responses.push(complete);
-            })
-            .await
-            .map_err(|e| {
-                if let Some(worker) = &prefill_worker {
-                    if let Some(sample) = UpstreamClass::of(&e).breaker_sample {
-                        worker.record_outcome(sample);
+            let prefill_cached_tokens =
+                drain_prefill(&mut prefill, prefill_guards, false, |complete| {
+                    prefill_responses.push(complete);
+                })
+                .await
+                .map_err(|e| {
+                    if let Some(worker) = &prefill_worker {
+                        if let Some(sample) = UpstreamClass::of(&e).breaker_sample {
+                            worker.record_outcome(sample);
+                        }
+                        UpstreamClass::account_collected_failure(worker.as_ref(), &e);
                     }
-                    UpstreamClass::account_collected_failure(worker.as_ref(), &e);
-                }
-                e.to_http_error(
-                    "worker_stream_failed",
-                    format!("Prefill stream failed: {}", e.message()),
-                )
-            })?;
+                    e.to_http_error(
+                        "worker_stream_failed",
+                        format!("Prefill stream failed: {}", e.message()),
+                    )
+                })?;
 
-            // Collect decode for actual output (don't mark completed yet)
-            let mut decode_stream = *decode;
+            // Collect decode for actual output (don't mark completed yet); the
+            // client's prompt-side usage is the prefill leg's.
+            let mut decode_stream = (*decode).decode_leg(prefill_cached_tokens);
             let mut decode_responses = collect_stream_responses(
                 &mut decode_stream,
                 "Decode",

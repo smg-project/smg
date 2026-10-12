@@ -40,8 +40,8 @@ use crate::{
             },
             multimodal::worker_language_model_only,
             proto_wrapper::{
-                FanoutStream, FirstItem, PrefillTicket, ProtoEmbedRequest, ProtoGenerateRequest,
-                ProtoRequest, ProtoResponseVariant, ProtoStream,
+                FanoutStream, FirstItem, PrefillCachedTokens, PrefillTicket, ProtoEmbedRequest,
+                ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant, ProtoStream,
             },
             utils::{
                 account_pd_leg_failure,
@@ -1823,14 +1823,17 @@ async fn execute_sequential_pd(
     }
 
     // Drain prefill response, harvesting connector params, the processed
-    // media identity, and input logprobs from the Complete frame
+    // media identity, input logprobs and the prefix-cache hit from the
+    // Complete frame
     let mut prefill_kv_params: Option<String> = None;
     let mut prefill_media_identity: Option<vllm::MediaIdentity> = None;
     let mut prefill_input_logprobs = None;
+    let mut prefill_cached_tokens = PrefillCachedTokens::default();
     while let Some(result) = prefill_stream.next().await {
         match result {
             Ok(response) => {
                 if let ProtoResponseVariant::Complete(complete) = response.into_response() {
+                    prefill_cached_tokens.note(&complete);
                     if let Some(json) = complete.kv_transfer_params_json() {
                         prefill_kv_params = Some(json.to_owned());
                     }
@@ -2006,8 +2009,13 @@ async fn execute_sequential_pd(
     // transfer; aborting decode mid-transfer on a client disconnect can
     // crash or leak on the engine side. Defer the abort until the first
     // decode response proves the handoff finished (see the parallel PD
-    // path for the same invariant).
-    let decode_stream = decode_stream.defer_abort_until_first_item();
+    // path for the same invariant). The client's prompt-side usage is the
+    // prefill leg's: the decode leg's responses carry the prefix-cache hit
+    // the prefill leg reported, not the transfer the decode leg counts as
+    // cached.
+    let decode_stream = decode_stream
+        .defer_abort_until_first_item()
+        .decode_leg(prefill_cached_tokens);
 
     // Surface the PD shape (not `Single`) so the streaming layer anchors TTFT
     // at prefill dispatch. Without this, the decode stream is established only
