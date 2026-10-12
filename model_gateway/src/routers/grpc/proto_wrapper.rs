@@ -2758,7 +2758,7 @@ impl Drop for ProgressTicket {
 /// backlog (see [`Worker::prefill_backlog`]), released by the first response
 /// (with the prefix-cache hit it reports, so the worker's rate learns the
 /// tokens the engine computed) or, failing that, when the stream is dropped.
-struct PrefillTicket {
+pub(crate) struct PrefillTicket {
     worker: Arc<dyn Worker>,
     tokens: u64,
     /// The first response is the request's first token (a streaming
@@ -2769,6 +2769,28 @@ struct PrefillTicket {
 }
 
 impl PrefillTicket {
+    /// Book `prompt_tokens` as pending prefill on `worker` from this moment,
+    /// timed: the dispatch paths book a leg before its call is polled, so the
+    /// span the worker's rate learns runs from the dispatch to the first
+    /// response whether the servicer sends its headers at once or, as the
+    /// gRPC servicers do, with the first message (a booking at the call's
+    /// return would then time nothing and teach a rate the worker does not
+    /// have, and the legs waiting in dispatch would be missing from the
+    /// backlog). `None` for an empty prompt. The ticket is handed to the leg's
+    /// stream by [`ProtoStream::tracked_prefill_leg_booked`]; dropped before
+    /// that (the call failed or was retired), it releases the prompt untimed.
+    pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Self> {
+        (prompt_tokens > 0).then(|| {
+            worker.note_prefill_started(prompt_tokens, true);
+            Self {
+                worker: Arc::clone(worker),
+                tokens: prompt_tokens,
+                timed: true,
+                released: false,
+            }
+        })
+    }
+
     /// The first response came back, reporting `cached` prompt tokens served
     /// from the engine's prefix cache.
     fn first_response(&mut self, cached: u64) {
@@ -2793,7 +2815,9 @@ impl Drop for PrefillTicket {
 mod tracked_tests {
     use std::sync::Arc;
 
-    use super::{sglang, vllm, FanoutStream, FirstItem, ProtoGenerateResponse, ProtoStream};
+    use super::{
+        sglang, vllm, FanoutStream, FirstItem, PrefillTicket, ProtoGenerateResponse, ProtoStream,
+    };
     use crate::worker::{BasicWorkerBuilder, Worker};
 
     #[test]
@@ -2892,6 +2916,57 @@ mod tracked_tests {
         assert_eq!(worker.tracked_load(), 0);
         drop(stream);
         assert_eq!(worker.tracked_load(), 0);
+    }
+
+    #[test]
+    fn a_prefill_leg_booked_at_dispatch_is_pending_before_its_stream_exists() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        assert!(
+            PrefillTicket::book(&worker, 0).is_none(),
+            "an empty prompt books nothing"
+        );
+        let ticket = PrefillTicket::book(&worker, 4_096);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "pending from the dispatch, before the call has answered"
+        );
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_leg_booked(Arc::clone(&worker), ticket);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "handed to the stream: booked once, not again"
+        );
+        assert_eq!(worker.tracked_load(), 0, "a leg is never part of a pile");
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+            }
+            _ => panic!("a tracked stream"),
+        }
+        drop(stream);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "released with the stream"
+        );
+    }
+
+    #[test]
+    fn a_leg_booked_at_dispatch_whose_call_fails_releases_its_prompt() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let ticket = PrefillTicket::book(&worker, 1_000);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(100)
+        );
+        drop(ticket);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "a call that fails or is retired gives the prompt back untimed"
+        );
     }
 
     #[test]
@@ -3012,15 +3087,19 @@ impl ProtoStream {
     /// worker by legs it cannot see progress on.
     #[must_use]
     pub fn tracked_prefill_leg(self, worker: Arc<dyn Worker>, prompt_tokens: u64) -> Self {
-        let prefill = (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens, true);
-            PrefillTicket {
-                worker: Arc::clone(&worker),
-                tokens: prompt_tokens,
-                timed: true,
-                released: false,
-            }
-        });
+        let prefill = PrefillTicket::book(&worker, prompt_tokens);
+        self.tracked_prefill_leg_booked(worker, prefill)
+    }
+
+    /// [`Self::tracked_prefill_leg`] for a leg booked at its dispatch (see
+    /// [`PrefillTicket::book`]): the stream takes over the ticket, so the
+    /// first response ends the span that began before the call was polled.
+    #[must_use]
+    pub(crate) fn tracked_prefill_leg_booked(
+        self,
+        worker: Arc<dyn Worker>,
+        prefill: Option<PrefillTicket>,
+    ) -> Self {
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,

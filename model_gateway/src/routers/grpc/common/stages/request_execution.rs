@@ -40,8 +40,8 @@ use crate::{
             },
             multimodal::worker_language_model_only,
             proto_wrapper::{
-                FanoutStream, FirstItem, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest,
-                ProtoResponseVariant, ProtoStream,
+                FanoutStream, FirstItem, PrefillTicket, ProtoEmbedRequest, ProtoGenerateRequest,
+                ProtoRequest, ProtoResponseVariant, ProtoStream,
             },
             utils::{
                 account_pd_leg_failure,
@@ -949,6 +949,13 @@ async fn execute_parallel_pd(
     {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
+    // The leg is booked on its worker here, before its call is polled: a
+    // servicer that sends its headers with the first message answers the
+    // call only once the prefill is done, so a booking at the call's return
+    // would time nothing (see `PrefillTicket::book`). The bound above was
+    // read before the booking, so the leg's own prompt is not counted twice.
+    let prefill_ticket =
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
     let prefill_dispatch: PdLegDispatch = Box::pin(dispatch_prefill_within(
         bound,
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
@@ -990,15 +997,16 @@ async fn execute_parallel_pd(
                 (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
             };
 
-            // The prefill leg's prompt is pending prefill on its worker until
-            // its first response (which teaches the worker's rate); what is
-            // left of the leg's bound is spent waiting for that response
-            // here, before the response to the client begins, so a silent
-            // prefill fails the attempt where the retry layer can still take
-            // the request to another prefill worker.
+            // The prefill leg's prompt has been pending prefill on its worker
+            // since its dispatch, until its first response (which teaches the
+            // worker's rate); the stream takes the booking over. What is left
+            // of the leg's bound is spent waiting for that response here,
+            // before the response to the client begins, so a silent prefill
+            // fails the attempt where the retry layer can still take the
+            // request to another prefill worker.
             let mut prefill_stream = match prefill_worker {
                 Some(worker) => {
-                    prefill_stream.tracked_prefill_leg(Arc::clone(worker), prompt_tokens)
+                    prefill_stream.tracked_prefill_leg_booked(Arc::clone(worker), prefill_ticket)
                 }
                 None => prefill_stream,
             };
@@ -1750,6 +1758,11 @@ async fn execute_sequential_pd(
         Metrics::record_worker_request(prefill.url(), prefill.model_id());
     }
     let mut prefill_client = prefill_client.clone();
+    // Booked before the call is polled, for the servicers that send their
+    // headers with the first message (see `PrefillTicket::book`); the bound
+    // above was read before the booking.
+    let prefill_ticket =
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
         bound,
         Box::pin(async move { prefill_client.generate(prefill_request).await }),
@@ -1760,10 +1773,13 @@ async fn execute_sequential_pd(
     )
     .await
     .map_err(|e| sequential_prefill_failure(&e, workers, ledger, prefill_label))?;
-    // The prompt is pending prefill on its worker until the first response,
-    // which teaches the worker's rate.
+    // The prompt has been pending prefill on its worker since the dispatch,
+    // until the first response, which teaches the worker's rate; the stream
+    // takes the booking over.
     let mut prefill_stream = match prefill_worker {
-        Some(worker) => prefill_stream.tracked_prefill_leg(Arc::clone(worker), prompt_tokens),
+        Some(worker) => {
+            prefill_stream.tracked_prefill_leg_booked(Arc::clone(worker), prefill_ticket)
+        }
         None => prefill_stream,
     };
     if let Err(e) = first_prefill_response_within(
