@@ -352,6 +352,13 @@ class RouterArgs:
     # keep-alive connection may sit with no request in flight (0 disables)
     header_read_timeout_secs: int = 30
     idle_connection_timeout_secs: int = 90
+    # Hosts the router fetches client-supplied media URLs from when it processes
+    # media itself (every redirect hop included); None allows any host the
+    # address policy passes
+    mm_allowed_media_domains: list[str] | None = None
+    # Allow media URLs on loopback, link-local or private addresses (an internal
+    # media origin); False falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS
+    mm_allow_private_media_hosts: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -1253,6 +1260,26 @@ class RouterArgs:
             ),
         )
         parser.add_argument(
+            f"--{prefix}mm-allowed-media-domains",
+            type=lambda value: [host.strip() for host in value.split(",") if host.strip()],
+            default=RouterArgs.mm_allowed_media_domains,
+            help=(
+                "Hosts the router fetches client-supplied media URLs from when it"
+                " processes media itself, comma-separated; a redirect to any other"
+                " host is refused. Unset allows any host the address policy passes"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-allow-private-media-hosts",
+            action="store_true",
+            default=RouterArgs.mm_allow_private_media_hosts,
+            help=(
+                "Allow client-supplied media URLs that name or resolve to a loopback,"
+                " link-local or private address (an internal media origin); by default"
+                " such URLs are refused. Falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
+            ),
+        )
+        parser.add_argument(
             f"--{prefix}rdma-listen-ip",
             type=str,
             default=RouterArgs.rdma_listen_ip,
@@ -1730,25 +1757,34 @@ class RouterArgs:
             f"--{prefix}health-failure-threshold",
             type=int,
             default=RouterArgs.health_failure_threshold,
-            help=("Number of consecutive health check failures before marking worker unhealthy"),
+            help=(
+                "Number of consecutive health check failures before marking worker unhealthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-success-threshold",
             type=int,
             default=RouterArgs.health_success_threshold,
-            help=("Number of consecutive health check successes before marking worker healthy"),
+            help=(
+                "Number of consecutive health check successes before marking worker healthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-timeout-secs",
             type=int,
             default=RouterArgs.health_check_timeout_secs,
-            help="Timeout in seconds for health check requests",
+            help="Timeout in seconds for health check requests (at least 1)",
         )
         health_group.add_argument(
             f"--{prefix}health-check-interval-secs",
             type=int,
             default=RouterArgs.health_check_interval_secs,
-            help="Interval in seconds between runtime health checks",
+            help=(
+                "Interval in seconds between runtime health checks (at least 1;"
+                f" --{prefix}disable-health-check turns probing off)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-endpoint",
@@ -2463,13 +2499,13 @@ class RouterArgs:
         for key_str in api_keys_list:
             parts = key_str.split(":", 3)  # Split into at most 4 parts
             if len(parts) != 4:
-                raise ValueError(
-                    f"Invalid API key format: '{key_str}'. Expected 'id:name:role:key'"
-                )
+                # The entry is not shown: it carries the credential.
+                raise ValueError("Invalid control-plane API key entry: expected 'id:name:role:key'")
             key_id, name, role, key = parts
             role_lower = role.lower()
             if role_lower not in ("admin", "user"):
-                raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
+                # Nor the role field: with the fields out of order it is the credential.
+                raise ValueError("Invalid control-plane API key role: must be 'admin' or 'user'")
             parsed_keys.append((key_id, name, key, role_lower))
         return parsed_keys
 

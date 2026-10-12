@@ -119,6 +119,13 @@ impl StopSequenceDecoder {
         self.sequence.prefix_mismatches()
     }
 
+    /// Tokens the incremental decoder currently holds in its window (the
+    /// emitted prefix's tokens and the pending ones); a test of its bound.
+    #[doc(hidden)]
+    pub fn sequence_window_len(&self) -> usize {
+        self.sequence.token_ids().len()
+    }
+
     fn with_sequence(sequence: Sequence, config: StopSequenceConfig) -> Self {
         // Build Aho-Corasick automaton from all stop sequences
         // Hidden sequences come first, then visible sequences

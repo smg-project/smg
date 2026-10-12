@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import os
 import signal
@@ -462,3 +463,152 @@ def test_ensure_spawn_start_method_forces_spawn_only_when_it_is_not_set(monkeypa
     assert "test scheduler: the multiprocessing start method was not spawn; setting it" in (
         caplog.text
     )
+
+
+# ── the launcher knobs (smg-lab #292) ──────────────────────────────────────────
+
+
+def test_env_float_names_the_variable_on_a_value_it_cannot_use():
+    ConfigError = rust_lifecycle.ServicerConfigError
+    assert rust_lifecycle.env_float("X_DRAIN", 5.0, environ={}) == 5.0
+    assert rust_lifecycle.env_float("X_DRAIN", 5.0, environ={"X_DRAIN": " "}) == 5.0
+    assert rust_lifecycle.env_float("X_DRAIN", 5.0, environ={"X_DRAIN": "2.5"}) == 2.5
+    with pytest.raises(ConfigError, match="X_DRAIN='abc' is not a number"):
+        rust_lifecycle.env_float("X_DRAIN", 5.0, environ={"X_DRAIN": "abc"})
+    with pytest.raises(ConfigError, match="X_DRAIN='-5' must be at least 0"):
+        rust_lifecycle.env_float("X_DRAIN", 5.0, environ={"X_DRAIN": "-5"}, minimum=0.0)
+    with pytest.raises(ConfigError, match="X_START='-1' must be greater than 0"):
+        rust_lifecycle.env_float("X_START", 1.0, environ={"X_START": "-1"}, positive=True)
+    with pytest.raises(ConfigError, match="X_START='nan' is not a finite number"):
+        rust_lifecycle.env_float("X_START", 1.0, environ={"X_START": "nan"})
+    assert issubclass(ConfigError, ValueError)
+
+
+def test_env_port_takes_a_port_or_none_and_refuses_the_rest():
+    ConfigError = rust_lifecycle.ServicerConfigError
+    assert rust_lifecycle.env_port("X_PORT", environ={}) is None
+    assert rust_lifecycle.env_port("X_PORT", environ={"X_PORT": "0"}) is None
+    assert rust_lifecycle.env_port("X_PORT", environ={"X_PORT": "24321"}) == 24321
+    with pytest.raises(ConfigError, match="X_PORT='abc' is not a port number"):
+        rust_lifecycle.env_port("X_PORT", environ={"X_PORT": "abc"})
+    with pytest.raises(ConfigError, match="X_PORT='70000' must be between 1 and 65535"):
+        rust_lifecycle.env_port("X_PORT", environ={"X_PORT": "70000"})
+
+
+def test_prepare_socket_dir_creates_the_directory_and_refuses_a_file(tmp_path):
+    ConfigError = rust_lifecycle.ServicerConfigError
+    created = rust_lifecycle.prepare_socket_dir(str(tmp_path / "sockets"))
+    assert os.path.isdir(created) and (os.stat(created).st_mode & 0o777) == 0o700
+    assert rust_lifecycle.prepare_socket_dir(created) == created
+    a_file = tmp_path / "a-file"
+    a_file.write_text("not a directory")
+    with pytest.raises(ConfigError, match="SMG_ZMQ_SOCKET_DIR=.*exists and is not a directory"):
+        rust_lifecycle.prepare_socket_dir(str(a_file))
+    with pytest.raises(ConfigError, match="SMG_ZMQ_SOCKET_DIR=.*cannot be created"):
+        rust_lifecycle.prepare_socket_dir(str(a_file / "below"))
+
+
+def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
+    names = dict(
+        handshake_port_env="X_HS",
+        drain_secs_env="X_DRAIN",
+        startup_timeout_secs_env="X_START",
+        startup_ceiling_secs_env="X_CEIL",
+    )
+    socket_dir = {"SMG_ZMQ_SOCKET_DIR": str(tmp_path / "sockets")}
+    knobs = rust_lifecycle.read_launcher_knobs(**names, environ=socket_dir)
+    assert knobs == rust_lifecycle.LauncherKnobs(
+        handshake_port=None,
+        drain_secs=rust_lifecycle.DEFAULT_DRAIN_SECS,
+        startup_timeout_secs=rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS,
+        startup_ceiling_secs=rust_lifecycle.DEFAULT_STARTUP_CEILING_SECS,
+        socket_dir=str(tmp_path / "sockets"),
+    )
+    assert os.path.isdir(tmp_path / "sockets")
+    knobs = rust_lifecycle.read_launcher_knobs(
+        **names,
+        socket_dir=str(tmp_path / "given"),
+        environ={"X_HS": "24321", "X_DRAIN": "0", "X_START": "42", "X_CEIL": "0", **socket_dir},
+    )
+    assert (knobs.handshake_port, knobs.drain_secs) == (24321, 0.0)
+    assert (knobs.startup_timeout_secs, knobs.startup_ceiling_secs) == (42.0, 0.0)
+    assert knobs.socket_dir == str(tmp_path / "given") and os.path.isdir(knobs.socket_dir)
+    for name, value, text in [
+        ("X_HS", "70000", "must be between 1 and 65535"),
+        ("X_HS", "abc", "is not a port number"),
+        ("X_DRAIN", "-5", "must be at least 0"),
+        ("X_DRAIN", "abc", "is not a number"),
+        ("X_START", "abc", "is not a number"),
+        ("X_START", "-1", "must be greater than 0"),
+        ("X_CEIL", "-1", "must be at least 0"),
+    ]:
+        with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
+            rust_lifecycle.read_launcher_knobs(**names, environ={name: value, **socket_dir})
+
+
+def test_configuration_exit_is_one_error_line_and_exit_code_2(caplog):
+    caplog.set_level(logging.ERROR)
+    error = rust_lifecycle.ServicerConfigError("X_DRAIN='abc' is not a number")
+    exit_ = rust_lifecycle.configuration_exit(error)
+    assert isinstance(exit_, SystemExit)
+    assert exit_.code == rust_lifecycle.CONFIG_ERROR_EXIT_CODE == 2
+    assert "servicer configuration error: X_DRAIN='abc' is not a number" in caplog.text
+
+
+def test_guarded_exit_ends_a_hung_shutdown_after_the_grace(monkeypatch):
+    """The exit over a dead engine is a normal SystemExit first; a shutdown
+    that hangs past the grace is ended by the guard with the same code."""
+    ended = threading.Event()
+    codes: list[int] = []
+
+    def end_process(code: int, grace_secs: float) -> None:
+        codes.append(code)
+        assert grace_secs == 0.05
+        ended.set()
+
+    monkeypatch.setattr(rust_lifecycle, "_end_process", end_process)
+    exit_ = rust_lifecycle.guarded_exit(1, grace_secs=0.05)
+    assert isinstance(exit_, SystemExit) and exit_.code == 1
+    assert ended.wait(5.0) and codes == [1]
+    # The guard is a daemon timer: it never keeps a finished interpreter alive.
+    guard = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+    assert all(t.daemon for t in guard)
+
+
+def test_the_guard_says_it_fired_and_terminates_the_children(monkeypatch, caplog):
+    """When the guard ends the process it says so, dumps every thread's stack
+    (the cause of the hang, for the next reader) and terminates the children
+    the interpreter's own exit would have joined, before ending the process."""
+    terminated: list[int] = []
+    child = types.SimpleNamespace(pid=4242, terminate=lambda: terminated.append(4242))
+    monkeypatch.setattr(rust_lifecycle.multiprocessing, "active_children", lambda: [child])
+    dumped: list[bool] = []
+    monkeypatch.setattr(
+        rust_lifecycle.faulthandler,
+        "dump_traceback",
+        lambda all_threads=False: dumped.append(all_threads),
+    )
+    ended: list[int] = []
+    monkeypatch.setattr(rust_lifecycle.os, "_exit", ended.append)
+    caplog.set_level(logging.ERROR)
+    rust_lifecycle._end_process(1, 15.0)
+    assert "did not finish within 15 s; ending the process with code 1" in caplog.text
+    assert dumped == [True] and terminated == [4242] and ended == [1]
+
+
+def test_the_guard_ends_the_process_even_when_its_report_fails(monkeypatch):
+    """The exit is the last resort: a stack dump that raises (a closed stderr)
+    or a child that cannot be terminated never keeps the process alive."""
+
+    def failing_dump(all_threads=False):
+        raise RuntimeError("sys.stderr is None")
+
+    monkeypatch.setattr(rust_lifecycle.faulthandler, "dump_traceback", failing_dump)
+    child = types.SimpleNamespace(
+        pid=4242, terminate=lambda: (_ for _ in ()).throw(OSError("gone"))
+    )
+    monkeypatch.setattr(rust_lifecycle.multiprocessing, "active_children", lambda: [child])
+    ended: list[int] = []
+    monkeypatch.setattr(rust_lifecycle.os, "_exit", ended.append)
+    rust_lifecycle._end_process(1, 15.0)
+    assert ended == [1]

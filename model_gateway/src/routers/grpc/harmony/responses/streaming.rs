@@ -28,7 +28,7 @@ use crate::{
             common::responses::{
                 await_stream_startup, ensure_mcp_connection, persist_response_if_needed,
                 stream_startup_channel,
-                streaming::{ResponseStreamEventEmitter, StreamStartupSender},
+                streaming::{failure_reason, ResponseStreamEventEmitter, StreamStartupSender},
                 BackgroundStream, ResponsesContext,
             },
             harmony::{processor::ResponsesIterationResult, streaming::HarmonyStreamingProcessor},
@@ -451,8 +451,10 @@ async fn execute_mcp_tool_loop_streaming(
                 // Finalize response from emitter's accumulated data
                 let final_response = emitter.finalize(Some(usage.clone()));
 
-                // Persist response to storage if store=true
-                persist_response_if_needed(
+                // Persist response to storage if store=true; a foreground
+                // response the client expects stored ends with
+                // response.failed when its record could not be written.
+                let not_stored = persist_response_if_needed(
                     ctx.conversation_storage.clone(),
                     ctx.conversation_item_storage.clone(),
                     ctx.response_storage.clone(),
@@ -460,9 +462,11 @@ async fn execute_mcp_tool_loop_streaming(
                     original_request,
                     ctx.request_context.clone(),
                 )
-                .await;
+                .await
+                .err()
+                .map(|e| e.error_object());
 
-                // Emit response.completed with usage
+                // Emit response.completed (or response.failed) with usage
                 let mut usage_json = json!({
                     "input_tokens": usage.prompt_tokens,
                     "output_tokens": usage.completion_tokens,
@@ -474,8 +478,18 @@ async fn execute_mcp_tool_loop_streaming(
                             json!({ "cached_tokens": details.cached_tokens });
                     }
                 }
-                let event = emitter.emit_completed(Some(&usage_json));
-                emitter.send_event_best_effort(&event, tx).await;
+                let event = match &not_stored {
+                    Some(error) => emitter.emit_failed(Some(&usage_json), error),
+                    None => emitter.emit_completed(Some(&usage_json)),
+                };
+                // Counted only once the terminal reached the client, as emit_terminal counts.
+                let delivered = emitter.send_event_best_effort(&event, tx).await;
+                if delivered && not_stored.is_some() {
+                    Metrics::record_responses_stream_failure(
+                        &original_request.model,
+                        failure_reason(not_stored.as_ref()),
+                    );
+                }
                 return;
             }
         }
@@ -554,8 +568,10 @@ async fn execute_without_mcp_streaming(
     // Finalize response from emitter's accumulated data
     let final_response = emitter.finalize(Some(usage.clone()));
 
-    // Persist response to storage if store=true
-    persist_response_if_needed(
+    // Persist response to storage if store=true; a foreground response the
+    // client expects stored ends with response.failed when its record could
+    // not be written.
+    let not_stored = persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
@@ -563,9 +579,11 @@ async fn execute_without_mcp_streaming(
         original_request,
         ctx.request_context.clone(),
     )
-    .await;
+    .await
+    .err()
+    .map(|e| e.error_object());
 
-    // Emit response.completed with usage
+    // Emit response.completed (or response.failed) with usage
     let mut usage_json = json!({
         "input_tokens": usage.prompt_tokens,
         "output_tokens": usage.completion_tokens,
@@ -576,6 +594,16 @@ async fn execute_without_mcp_streaming(
             usage_json["input_tokens_details"] = json!({ "cached_tokens": details.cached_tokens });
         }
     }
-    let event = emitter.emit_completed(Some(&usage_json));
-    emitter.send_event_best_effort(&event, tx).await;
+    let event = match &not_stored {
+        Some(error) => emitter.emit_failed(Some(&usage_json), error),
+        None => emitter.emit_completed(Some(&usage_json)),
+    };
+    // Counted only once the terminal reached the client, as emit_terminal counts.
+    let delivered = emitter.send_event_best_effort(&event, tx).await;
+    if delivered && not_stored.is_some() {
+        Metrics::record_responses_stream_failure(
+            &original_request.model,
+            failure_reason(not_stored.as_ref()),
+        );
+    }
 }

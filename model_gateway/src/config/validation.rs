@@ -6,6 +6,45 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::{middleware::scheduler, policies::cost as selection_cost};
 
+/// Each listener needs its own port. `listeners` are `(field, flag, port)`
+/// in configuration order; the first two on one port are refused under the
+/// later listener's field, naming both flags.
+fn validate_distinct_listener_ports(listeners: &[(&str, &str, u16)]) -> ConfigResult<()> {
+    for (i, (field, flag, port)) in listeners.iter().enumerate() {
+        if let Some((_, other_flag, _)) = listeners[..i].iter().find(|(_, _, p)| p == port) {
+            return Err(ConfigError::InvalidValue {
+                field: (*field).to_string(),
+                value: port.to_string(),
+                reason: format!(
+                    "{flag} and {other_flag} are both {port}; each listener needs its own port"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The mesh listener's port against the HTTP, metrics and probe ports. The
+/// mesh configuration lives beside the router configuration, out of
+/// [`ConfigValidator`]'s sight, so `server::startup` runs this check: it is
+/// the one place every way of building the server configuration (the CLI,
+/// the Python binding, a library caller) passes through.
+pub fn validate_mesh_listener_port(
+    mesh_port: u16,
+    port: u16,
+    metrics_port: Option<u16>,
+    health_check_port: Option<u16>,
+) -> ConfigResult<()> {
+    let listeners = [
+        Some(("port", "--port", port)),
+        metrics_port.map(|port| ("metrics.port", "--prometheus-port", port)),
+        health_check_port.map(|port| ("health_check_port", "--health-check-port", port)),
+        Some(("mesh_port", "--mesh-port", mesh_port)),
+    ];
+    let listeners: Vec<_> = listeners.into_iter().flatten().collect();
+    validate_distinct_listener_ports(&listeners)
+}
+
 /// Validate a user-supplied mesh server name. The name keys rate-limit
 /// shards as `rl:{counter}:{name}`, so an empty name or one containing the
 /// separator would corrupt shard keys; rejecting at config time avoids a
@@ -149,6 +188,7 @@ impl ConfigValidator {
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
+        Self::validate_health_check(&config.health_check)?;
 
         if config.history_backend == HistoryBackend::Oracle {
             if config.oracle.is_none() {
@@ -839,6 +879,23 @@ impl ConfigValidator {
             });
         }
 
+        // Each listener needs its own port. Two of them on one port used to
+        // bind the first, answer, and die at the second bind with a raw
+        // AddrInUse that named no flag: a partial start an operator's
+        // monitoring saw come up and vanish.
+        let listeners = [
+            Some(("port", "--port", config.port)),
+            config
+                .metrics
+                .as_ref()
+                .map(|metrics| ("metrics.port", "--prometheus-port", metrics.port)),
+            config
+                .health_check_port
+                .map(|port| ("health_check_port", "--health-check-port", port)),
+        ];
+        let listeners: Vec<_> = listeners.into_iter().flatten().collect();
+        validate_distinct_listener_ports(&listeners)?;
+
         if config.max_payload_size == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_payload_size".to_string(),
@@ -1268,6 +1325,50 @@ impl ConfigValidator {
                 value: cb.window_duration_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
+        }
+        Ok(())
+    }
+
+    /// The worker health checker's knobs: the interval and the timeout are
+    /// periods in whole seconds, the thresholds counts of consecutive
+    /// probes, and none of them means anything at 0. An interval of 0 made
+    /// the checker a busy loop (thousands of probes per second against every
+    /// worker, one core at 100 %); a timeout of 0 times every probe out at
+    /// once; a threshold of 0 flips a worker's state without a probe. The
+    /// interval is refused with probing disabled too: the checker's loop
+    /// still sleeps on it between connect signals.
+    fn validate_health_check(health_check: &HealthCheckConfig) -> ConfigResult<()> {
+        let knobs = [
+            (
+                "health_check.check_interval_secs",
+                health_check.check_interval_secs,
+                "--health-check-interval-secs 0 would probe every worker in a busy loop; \
+                 --disable-health-check turns probing off",
+            ),
+            (
+                "health_check.timeout_secs",
+                health_check.timeout_secs,
+                "--health-check-timeout-secs 0 would time every probe out at once",
+            ),
+            (
+                "health_check.failure_threshold",
+                u64::from(health_check.failure_threshold),
+                "--health-failure-threshold 0 would fail a worker without a probe",
+            ),
+            (
+                "health_check.success_threshold",
+                u64::from(health_check.success_threshold),
+                "--health-success-threshold 0 would pass a worker without a probe",
+            ),
+        ];
+        for (field, value, consequence) in knobs {
+            if value == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: format!("Must be >= 1 ({consequence})"),
+                });
+            }
         }
         Ok(())
     }
@@ -2775,6 +2876,83 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Two listeners on one port are refused naming both flags; distinct
+    /// ports pass.
+    #[test]
+    fn equal_listener_ports_are_rejected() {
+        let listeners = |port: u16, metrics_port: u16, probe_port: Option<u16>| RouterConfig {
+            port,
+            metrics: Some(MetricsConfig {
+                port: metrics_port,
+                host: "127.0.0.1".to_string(),
+            }),
+            health_check_port: probe_port,
+            ..Default::default()
+        };
+        let refused = |config: &RouterConfig| match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => (field, value, reason),
+            other => panic!("expected an InvalidValue, got {other:?}"),
+        };
+
+        let (field, value, reason) = refused(&listeners(30001, 30001, None));
+        assert_eq!((field.as_str(), value.as_str()), ("metrics.port", "30001"));
+        assert!(
+            reason.contains("--prometheus-port") && reason.contains("--port"),
+            "{reason}"
+        );
+
+        let (field, _, reason) = refused(&listeners(30001, 30002, Some(30001)));
+        assert_eq!(field, "health_check_port");
+        assert!(
+            reason.contains("--health-check-port") && reason.contains("--port"),
+            "{reason}"
+        );
+
+        let (field, _, reason) = refused(&listeners(30001, 30002, Some(30002)));
+        assert_eq!(field, "health_check_port");
+        assert!(
+            reason.contains("--health-check-port") && reason.contains("--prometheus-port"),
+            "{reason}"
+        );
+
+        assert!(ConfigValidator::validate(&listeners(30001, 30002, Some(30003))).is_ok());
+    }
+
+    /// The mesh listener cannot share a port with the HTTP, metrics or probe
+    /// listener: refused under the mesh port's field, naming both flags. The
+    /// check runs in `server::startup`, so it holds for every way the server
+    /// configuration is built.
+    #[test]
+    fn mesh_port_equal_to_another_listener_is_rejected() {
+        for (flag, taken) in [
+            ("--port", 30001),
+            ("--prometheus-port", 30002),
+            ("--health-check-port", 30003),
+        ] {
+            match validate_mesh_listener_port(taken, 30001, Some(30002), Some(30003)) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "mesh_port");
+                    assert_eq!(value, taken.to_string());
+                    assert!(
+                        reason.contains("--mesh-port") && reason.contains(flag),
+                        "{reason}"
+                    );
+                }
+                other => panic!("--mesh-port equal to {flag} must be rejected, got {other:?}"),
+            }
+        }
+        assert!(validate_mesh_listener_port(30004, 30001, Some(30002), Some(30003)).is_ok());
+        assert!(validate_mesh_listener_port(30002, 30001, None, None).is_ok());
+    }
+
     #[test]
     fn test_reject_health_check_port_zero() {
         let mut config = RouterConfig::new(
@@ -2796,6 +2974,89 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// Every health-check knob at 0 is refused naming the field; the smallest
+    /// values pass; a zero interval is refused with probing disabled too.
+    #[test]
+    fn zero_health_check_knobs_are_rejected() {
+        let zeroed = [
+            (
+                "health_check.check_interval_secs",
+                HealthCheckConfig {
+                    check_interval_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.timeout_secs",
+                HealthCheckConfig {
+                    timeout_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.failure_threshold",
+                HealthCheckConfig {
+                    failure_threshold: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.success_threshold",
+                HealthCheckConfig {
+                    success_threshold: 0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, health_check) in zeroed {
+            let config = RouterConfig {
+                health_check,
+                ..Default::default()
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, name);
+                    assert_eq!(value, "0");
+                    assert!(reason.starts_with("Must be >= 1"), "{name}: {reason}");
+                }
+                other => panic!("{name}: expected an InvalidValue, got {other:?}"),
+            }
+        }
+
+        let smallest = RouterConfig {
+            health_check: HealthCheckConfig {
+                check_interval_secs: 1,
+                timeout_secs: 1,
+                failure_threshold: 1,
+                success_threshold: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&smallest).is_ok());
+        assert!(ConfigValidator::validate(&RouterConfig::default()).is_ok());
+
+        let disabled_but_zero = RouterConfig {
+            health_check: HealthCheckConfig {
+                check_interval_secs: 0,
+                disable_health_check: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                ConfigValidator::validate(&disabled_but_zero),
+                Err(ConfigError::InvalidValue { ref field, .. }) if field == "health_check.check_interval_secs"
+            ),
+            "the checker's loop sleeps on the interval with probing disabled too"
+        );
     }
 
     /// The CLI parsers reject these, but TOML/JSON and the Python bindings

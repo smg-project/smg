@@ -50,13 +50,12 @@ fn wav_i16_mono(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
 fn test_connector(allowed_path: Option<PathBuf>) -> MediaConnector {
     let client = common::http_client_builder()
         .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("client");
+        .no_proxy();
     MediaConnector::new(
         client,
         MediaConnectorConfig {
             allowed_domains: None,
+            allow_private_hosts: false,
             allowed_local_media_path: allowed_path,
             fetch_timeout: Duration::from_secs(5),
             video_fetch_timeout: Duration::from_secs(5),

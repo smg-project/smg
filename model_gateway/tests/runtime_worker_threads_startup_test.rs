@@ -1,7 +1,8 @@
 //! `--runtime-worker-threads 0` is a configuration error: the gateway exits
 //! non-zero with the field in the error, without the async runtime builder's
-//! panic, and its port is never bound; a count of 1 serves. The gateway runs
-//! as a process on purpose: the runtime is built in `main`, before `startup`.
+//! panic, and its port is never bound; a count of 1 serves its health route.
+//! The gateway runs as a process on purpose: the runtime is built in `main`,
+//! before `startup`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::allow_attributes)]
 
 use std::{
@@ -23,8 +24,15 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 struct Launch {
     /// The exit status; `None` when the gateway had to be killed.
     status: Option<ExitStatus>,
-    /// Whether the gateway answered `GET /health` on its port at any point.
-    listened: bool,
+    /// Whether anything accepted a connection on the gateway's port at any
+    /// point: the signal the refusal case must never see, latched on a bare
+    /// connect so a bind that precedes an exit is not missed.
+    bound: bool,
+    /// Whether the gateway answered `GET /health` with 200: the positive
+    /// proof that the gateway itself serves there, where a bare connect
+    /// would also pass for another process that took the port in the gap
+    /// after `free_ports` released it.
+    served: bool,
     /// Its stdout and stderr.
     log: String,
 }
@@ -40,7 +48,8 @@ fn free_ports() -> [u16; 2] {
 }
 
 /// Runs the gateway with `args` on fresh ports, its output in `log_path`,
-/// until it exits, binds its port or `EXIT_TIMEOUT` passes.
+/// until it exits, serves its health route or `EXIT_TIMEOUT` passes; whether
+/// its port ever accepted a connection is kept apart from whether it served.
 fn launch(args: &[&str], log_path: &Path) -> Launch {
     let [port, metrics_port] = free_ports();
     let ip = IP.to_string();
@@ -57,13 +66,17 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
         .expect("spawn the gateway");
     let deadline = Instant::now() + EXIT_TIMEOUT;
     let address = SocketAddr::from((IP, port));
-    let mut listened = false;
+    let mut bound = false;
+    let mut served = false;
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll the gateway") {
             break Some(status);
         }
-        listened = answers_health(&address);
-        if listened || Instant::now() >= deadline {
+        if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_millis(200)) {
+            bound = true;
+            served = answers_health(stream);
+        }
+        if served || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -72,19 +85,15 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
     };
     Launch {
         status,
-        listened,
+        bound,
+        served,
         log: fs::read_to_string(log_path).unwrap_or_default(),
     }
 }
 
-/// Whether the gateway answers `GET /health` with 200 on `address`: the
-/// positive proof that the gateway itself serves there, where a bare connect
-/// would also pass for another process that took the port in the gap after
-/// `free_ports` released it.
-fn answers_health(address: &SocketAddr) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(address, Duration::from_millis(200)) else {
-        return false;
-    };
+/// Whether the gateway answers `GET /health` with 200 over `stream`, a
+/// connection to its port.
+fn answers_health(mut stream: TcpStream) -> bool {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     if stream
         .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -108,8 +117,8 @@ fn a_zero_runtime_worker_thread_count_refuses_to_start() {
     );
     let log = &launch.log;
     assert!(
-        !launch.listened,
-        "the gateway served with a zero worker-thread count\n{log}"
+        !launch.bound,
+        "the gateway bound its port with a zero worker-thread count\n{log}"
     );
     let status = launch.status.unwrap_or_else(|| {
         panic!("the gateway neither exited nor listened within {EXIT_TIMEOUT:?}\n{log}")
@@ -134,8 +143,8 @@ fn a_runtime_worker_thread_count_of_one_serves() {
         &dir.path().join("one.log"),
     );
     assert!(
-        launch.listened,
-        "the gateway did not serve with one worker thread (exit {:?})\n{}",
+        launch.served,
+        "the gateway did not serve its health route with one worker thread (exit {:?})\n{}",
         launch.status, launch.log
     );
 }

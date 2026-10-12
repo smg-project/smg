@@ -24,8 +24,9 @@ use crate::{
     postgres_migrations::POSTGRES_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
     versioning::{
-        postgres_create_versions_table, postgres_table_exists, run_postgres_migrations,
-        stamp_postgres_versions, POSTGRES_SCHEMA_LOCK_ID, VERSIONS_TABLE,
+        postgres_create_versions_table, postgres_current_version, postgres_table_exists,
+        run_postgres_migrations, schema_ahead_check, stamp_postgres_versions,
+        POSTGRES_SCHEMA_LOCK_ID, VERSIONS_TABLE,
     },
 };
 
@@ -58,15 +59,17 @@ impl PostgresStore {
 
     /// Brings the database to the schema this build expects, once per
     /// database and in turn across gateways: one transaction under the schema
-    /// advisory lock creates the versions table and the history tables (`IF
-    /// NOT EXISTS`), records every migration as applied when the responses
-    /// table did not exist before (a first start creates the tables in their
-    /// final shape, so nothing is pending and no `auto_migrate` is needed),
-    /// applies the pending migrations otherwise (or refuses when
-    /// `auto_migrate` is off), and creates the indexes last, once the columns
-    /// they cover exist. Gateways starting together on an empty database all
-    /// come up: the next one waits for the first's commit and finds the
-    /// schema in place.
+    /// advisory lock creates the versions table, refuses a database whose
+    /// recorded version is ahead of the migrations this build knows (before
+    /// any history table is touched, see `schema_ahead_check`), creates the
+    /// history tables (`IF NOT EXISTS`), records every migration as applied
+    /// when the responses table did not exist before (a first start creates
+    /// the tables in their final shape, so nothing is pending and no
+    /// `auto_migrate` is needed), applies the pending migrations otherwise
+    /// (or refuses when `auto_migrate` is off), and creates the indexes
+    /// last, once the columns they cover exist. Gateways starting together
+    /// on an empty database all come up: the next one waits for the first's
+    /// commit and finds the schema in place.
     pub(crate) async fn bootstrap(&self) -> Result<(), String> {
         let mut client = self.pool.get().await.map_err(|e| {
             format!(
@@ -108,6 +111,18 @@ impl PostgresStore {
             })?;
 
         let schema = &self.schema;
+        // The store's version against this build's migrations first, before
+        // any table is touched: a store a newer build migrated forward is
+        // refused here whatever the responses table looks like (a table that
+        // a newer migration renamed or dropped would otherwise read as a
+        // fresh database and be re-created in its legacy shape).
+        let current = postgres_current_version(&*tx).await?;
+        schema_ahead_check(
+            "postgres",
+            current,
+            &POSTGRES_HISTORY_MIGRATIONS,
+            schema.version,
+        )?;
         let responses_table = schema.responses.qualified_table(schema.owner.as_deref());
         let fresh = !postgres_table_exists(&tx, &responses_table).await?;
         for ddl in [

@@ -170,7 +170,8 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    models::list_models(&state.context, req.headers()).await
+    let request_id = middleware::request_id_of(&req);
+    models::list_models(&state.context, req.headers(), request_id).await
 }
 
 async fn v1_model(
@@ -1345,6 +1346,35 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // of construction path — a bypassed empty/duplicate tenant key would
     // otherwise silently reach `AuthConfig`.
     config.router_config.validate()?;
+    // The mesh listener's port against the others: the mesh configuration is
+    // not part of `RouterConfig`, so the validator cannot see it, and this is
+    // the one place the CLI, the Python binding and a library caller all pass.
+    if let Some(mesh_server_config) = &config.mesh_server_config {
+        crate::config::validate_mesh_listener_port(
+            mesh_server_config.bind_addr.port(),
+            config.port,
+            config
+                .prometheus_config
+                .as_ref()
+                .map(|prometheus_config| prometheus_config.port),
+            config.health_check_port,
+        )?;
+    }
+
+    // The TLS material is parsed before anything binds: a certificate or key
+    // file the gateway could read but not use used to fail at the HTTP bind,
+    // after the metrics listener was up.
+    let tls_config = match (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        (Some(cert), Some(key)) => Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+                .await
+                .map_err(|e| format!("Failed to create TLS config: {e}"))?,
+        ),
+        _ => None,
+    };
 
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -1397,22 +1427,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     llm_multimodal::init_log_video_decode_timing(mm_settings.log_mm_timing.value);
     init_mm_settings(mm_settings);
 
-    // Start the metrics server. It binds the port eagerly so we fail fast on
-    // port conflicts or bad addresses.
-    if let Some(prometheus_config) = &config.prometheus_config {
+    // The metrics recorder is installed now so start-up records land in it;
+    // its listener binds further down, once every configuration read that
+    // can still fail (storage hooks, policy files, store connections) has
+    // happened, right before the probe and HTTP listeners: nothing binds
+    // before a fatal configuration error.
+    let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
         metrics::init_startup_series();
-        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
-            handle,
-            prometheus_config.host.clone(),
-            prometheus_config.port,
-        )
-        .await?;
-        // Tokio runtime self-observability (event-loop canary + sampler).
-        // `startup` runs on the main runtime, so the observer lands on —
-        // and therefore measures — the runtime that serves requests.
-        runtime_metrics::spawn_observer();
-    }
+        handle
+    });
 
     // Build the mesh server if configured. Starting gossip is deferred until
     // MeshAdapters has registered the `worker:`/`rl:` CRDT namespaces below —
@@ -1445,8 +1469,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await?,
     );
 
-    // Register the CRDT namespaces and start the inbound sync adapters, then
-    // start gossip. Order matters: see the note at the mesh build above.
+    // Register the CRDT namespaces and start the inbound sync adapters now;
+    // gossip starts further down, after the metrics and probe listeners are
+    // bound. Order matters: see the note at the mesh build above.
     let mesh_adapters = mesh_handler.as_ref().map(|handler| {
         MeshAdapters::start(
             handler.mesh_kv(),
@@ -1456,17 +1481,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             app_context.policy_registry.clone(),
         )
     });
-    if let Some(mesh_server) = mesh_server {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
-        )]
-        spawn(async move {
-            if let Err(e) = mesh_server.start().await {
-                tracing::error!("Mesh server failed: {}", e);
-            }
-        });
-    }
 
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
@@ -1669,6 +1683,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.clone(),
     );
 
+    // The metrics listener: the recorder exists since the top of start-up,
+    // the port binds only now (see there). It still binds eagerly, so a port
+    // conflict or a bad address fails the start before the HTTP listener.
+    if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
+            handle,
+            prometheus_config.host.clone(),
+            prometheus_config.port,
+        )
+        .await?;
+        // Tokio runtime self-observability (event-loop canary + sampler).
+        // `startup` runs on the main runtime, so the observer lands on —
+        // and therefore measures — the runtime that serves requests.
+        runtime_metrics::spawn_observer();
+    }
+
     // Optional isolated probe listener (additive): when `--health-check-port`
     // is set, serves /liveness, /readiness, /health on that port from a
     // dedicated single-worker runtime on its own OS thread, so probes
@@ -1788,7 +1818,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // One bind-host rule for every listener: IPv6 with or without brackets.
     let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
+    // The HTTP listener binds now, eagerly, the last of the listeners: a port
+    // another process holds fails the start here, before the mesh server
+    // below has joined the cluster. Bound through tokio, as axum-server
+    // binds (the same socket options and accept backlog; std's bind would
+    // queue 128 connections instead of 1024), and served from the socket at
+    // `serve` below.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .and_then(tokio::net::TcpListener::into_std)
+        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
+
+    // The mesh server starts once every listener is bound: a member that
+    // joined the cluster and vanished with a failed bind is the partial start
+    // the checks above exist to prevent. The adapters registered their
+    // namespaces earlier, so gossip is safe to start.
+    if let Some(mesh_server) = mesh_server {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
+        )]
+        spawn(async move {
+            if let Err(e) = mesh_server.start().await {
+                tracing::error!("Mesh server failed: {}", e);
+            }
+        });
+    }
 
     // Set up graceful shutdown (common to both TLS and non-TLS)
 
@@ -1860,22 +1916,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "HTTP connection timeouts (0 = disabled)"
     );
 
-    let server_result = if let (Some(cert), Some(key)) = (
-        &config.router_config.server_cert,
-        &config.router_config.server_key,
-    ) {
+    let server_result = if let Some(tls_config) = tls_config {
         info!("TLS enabled");
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
-            .await
-            .map_err(|e| format!("Failed to create TLS config: {e}"))?;
 
-        axum_server::bind_rustls(addr, tls_config)
+        axum_server::from_tcp_rustls(listener, tls_config)?
             .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
-        bind_http_server(addr, connection_timeouts)
+        axum_server::from_tcp(listener)?
+            .acceptor(http_acceptor(connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -1898,11 +1949,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-/// Disable Nagle buffering on accepted plain-HTTP sockets so small streaming
-/// writes need not wait for outstanding data to be acknowledged, and bound the
-/// connections that carry no request (see [`connection_timeouts`]). This
-/// changes no HTTP payload; the separately configured TLS listener applies the
-/// same bounds around its handshake acceptor.
+/// The plain-HTTP acceptor: Nagle buffering disabled on accepted sockets so
+/// small streaming writes need not wait for outstanding data to be
+/// acknowledged, and the connections that carry no request bounded (see
+/// [`connection_timeouts`]). This changes no HTTP payload; the separately
+/// configured TLS listener applies the same bounds around its handshake
+/// acceptor.
+fn http_acceptor(
+    timeouts: ConnectionTimeouts,
+) -> ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor> {
+    ConnectionTimeoutAcceptor::new(axum_server::accept::NoDelayAcceptor::new(), timeouts)
+}
+
+/// A plain-HTTP server bound on `addr` with [`http_acceptor`]. Start-up
+/// serves a listener it bound earlier (see `startup`); the tests bind here.
+#[cfg(test)]
 fn bind_http_server(
     addr: std::net::SocketAddr,
     timeouts: ConnectionTimeouts,
@@ -1910,10 +1971,7 @@ fn bind_http_server(
     std::net::SocketAddr,
     ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor>,
 > {
-    axum_server::bind(addr).acceptor(ConnectionTimeoutAcceptor::new(
-        axum_server::accept::NoDelayAcceptor::new(),
-        timeouts,
-    ))
+    axum_server::bind(addr).acceptor(http_acceptor(timeouts))
 }
 
 #[expect(

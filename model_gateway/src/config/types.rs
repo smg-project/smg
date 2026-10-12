@@ -124,7 +124,11 @@ pub struct RouterConfig {
     pub worker_stall_secs: u64,
     /// Seconds without a token or a completion from a worker that still
     /// answers polls, with requests in flight and a growing queue, after which
-    /// new requests stop being routed to it until it makes progress.
+    /// new requests stop being routed to it until it makes progress. The same
+    /// bound caps how long a disaggregated prefill leg may produce nothing,
+    /// with its worker answering no other leg, before its request fails over
+    /// to another prefill worker; on the parallel dispatch shape it must
+    /// cover the decode-side wait a leg's first response may see.
     #[serde(default = "default_worker_wedge_secs")]
     pub worker_wedge_secs: u64,
     /// Seconds without any contact from a worker whose KV-event stream pushes
@@ -261,6 +265,17 @@ pub struct RouterConfig {
     /// = rdma` is the first-class one); when unset, falls back to `SMG_MM_PIXEL_RDMA`.
     #[serde(default)]
     pub mm_pixel_rdma: bool,
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name, every redirect hop included; unset (or empty)
+    /// allows any host the address policy passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_allowed_media_domains: Option<Vec<String>>,
+    /// Allow client-supplied media URLs that name or resolve to a loopback,
+    /// link-local or private address (a deployment whose media origin is
+    /// internal); off, such URLs are refused before anything is connected.
+    /// When unset, falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
+    #[serde(default)]
+    pub mm_allow_private_media_hosts: bool,
     /// Listener IP for the RDMA metadata exchange; when unset, falls back to
     /// `SMG_RDMA_LISTEN_IP`, and without either the lane stays on the inline path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1395,12 +1410,19 @@ pub struct FileDiscoveryConfig {
 
 pub use smg_external_router::RetryConfig;
 
-/// Health check configuration for worker monitoring
+/// Health check configuration for worker monitoring. The four counts and
+/// periods are at least 1 (checked at configuration validation): none of
+/// them has a meaning at 0, and a zero interval would make the checker a
+/// busy loop. `disable_health_check` turns probing off.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
+    /// Consecutive failed probes before a worker leaves rotation; at least 1.
     pub failure_threshold: u32,
+    /// Consecutive passed probes before a worker returns; at least 1.
     pub success_threshold: u32,
+    /// Seconds a single probe may take; at least 1.
     pub timeout_secs: u64,
+    /// Seconds between the probes of a worker; at least 1.
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
@@ -1586,6 +1608,8 @@ impl Default for RouterConfig {
             mm_processing: None,
             mm_pixel_cache_mb: None,
             mm_pixel_rdma: false,
+            mm_allowed_media_domains: None,
+            mm_allow_private_media_hosts: false,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -1885,6 +1909,7 @@ mod tests {
         for key in [
             "mm_processing",
             "mm_pixel_cache_mb",
+            "mm_allowed_media_domains",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -1895,11 +1920,14 @@ mod tests {
         let mut without: serde_json::Value = serde_json::from_str(&json).unwrap();
         let object = without.as_object_mut().unwrap();
         object.remove("mm_pixel_rdma").unwrap();
+        object.remove("mm_allow_private_media_hosts").unwrap();
         object.remove("log_mm_timing").unwrap();
         let without: RouterConfig = serde_json::from_value(without).unwrap();
         assert_eq!(without.mm_processing, None);
         assert_eq!(without.mm_pixel_cache_mb, None);
         assert!(!without.mm_pixel_rdma);
+        assert_eq!(without.mm_allowed_media_domains, None);
+        assert!(!without.mm_allow_private_media_hosts);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -1910,6 +1938,8 @@ mod tests {
             .mm_processing(Some(MmProcessingMode::Worker))
             .mm_pixel_cache_mb(Some(512))
             .mm_pixel_rdma(true)
+            .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
+            .mm_allow_private_media_hosts(true)
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
@@ -1920,6 +1950,11 @@ mod tests {
         assert_eq!(with.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(with.mm_pixel_cache_mb, Some(512));
         assert!(with.mm_pixel_rdma);
+        assert_eq!(
+            with.mm_allowed_media_domains.as_deref(),
+            Some(&["media.example".to_string()][..])
+        );
+        assert!(with.mm_allow_private_media_hosts);
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);

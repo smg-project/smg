@@ -1,6 +1,8 @@
 pub mod audio;
 pub mod encoder_inputs;
 pub mod error;
+mod fetch_policy;
+pub use fetch_policy::effective_allowed_domains;
 pub mod hasher;
 pub mod hub;
 pub mod jpeg_turbo;
@@ -47,16 +49,16 @@ pub use vision::{
 pub(crate) mod test_support {
     use rustls::crypto::ring;
 
-    /// A plain HTTP client for the tests' media connectors. The library
-    /// takes its client from the caller; the tests build it here, with the
-    /// process-level TLS crypto provider installed first (reqwest's
+    /// The HTTP client builder for the tests' media connectors. The library
+    /// takes its client's builder from the caller; the tests make it here,
+    /// with the process-level TLS crypto provider installed first (reqwest's
     /// `rustls-no-provider` client panics at build time without one).
     #[expect(
         clippy::disallowed_methods,
         reason = "a test binary's client factory; the process TLS crypto provider is installed first"
     )]
-    pub(crate) fn http_client() -> reqwest::Client {
+    pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
         let _ = ring::default_provider().install_default();
-        reqwest::Client::new()
+        reqwest::Client::builder()
     }
 }

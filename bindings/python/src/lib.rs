@@ -588,6 +588,8 @@ struct Router {
     priority_scheduler_tenant_metric_top_n: u32,
     tenant_rate_limit_enabled: bool,
     tenant_rate_limit_config: Option<String>,
+    mm_allowed_media_domains: Option<Vec<String>>,
+    mm_allow_private_media_hosts: bool,
     /// The keyword-only `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
@@ -1121,6 +1123,8 @@ impl Router {
             .mm_processing(mm_processing)
             .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
             .mm_pixel_rdma(self.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
@@ -1346,6 +1350,8 @@ impl Router {
         max_background_responses = 1024,
         header_read_timeout_secs = 30,
         idle_connection_timeout_secs = 90,
+        mm_allowed_media_domains = None,
+        mm_allow_private_media_hosts = false,
         // Keyword-only, so it never takes a positional slot.
         *,
         mesh_tls_ca_cert = None,
@@ -1542,6 +1548,8 @@ impl Router {
         max_background_responses: usize,
         header_read_timeout_secs: u64,
         idle_connection_timeout_secs: u64,
+        mm_allowed_media_domains: Option<Vec<String>>,
+        mm_allow_private_media_hosts: bool,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
@@ -1764,6 +1772,8 @@ impl Router {
             priority_scheduler_tenant_metric_top_n,
             tenant_rate_limit_enabled,
             tenant_rate_limit_config,
+            mm_allowed_media_domains,
+            mm_allow_private_media_hosts,
             discovery,
             mesh_tls_ca_cert,
             mesh_tls_cert,

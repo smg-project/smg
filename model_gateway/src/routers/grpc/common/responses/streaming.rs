@@ -94,10 +94,11 @@ struct ToolCallStreamItem {
 /// reported a failed generation (also the case when the finish reason alone
 /// says so and no error object was built). Anything else counts as `other`
 /// so a client-visible code can never widen the label set.
-fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
+pub(crate) fn failure_reason(error: Option<&serde_json::Value>) -> &'static str {
     match error.and_then(|e| e.get("code")).and_then(|c| c.as_str()) {
         Some("stream_error") => "stream_error",
         Some("server_error") | None => "server_error",
+        Some("storage_unavailable") => "storage_unavailable",
         Some(_) => "other",
     }
 }
@@ -468,6 +469,26 @@ impl ResponseStreamEventEmitter {
         })
     }
 
+    /// The `response.failed` terminal event of a response that ended with
+    /// `error` after its items were emitted (a record that could not be
+    /// written, for one); terminal like [`Self::emit_completed`], which it is
+    /// built on. The paths that emit their terminal themselves use it.
+    pub fn emit_failed(
+        &mut self,
+        usage: Option<&serde_json::Value>,
+        error: &serde_json::Value,
+    ) -> serde_json::Value {
+        self.finish_reason = Some("failed".into());
+        let mut event = self.emit_completed(usage);
+        event["type"] = json!(ResponseEvent::FAILED);
+        event["response"]["status"] = json!("failed");
+        event["response"]["error"] = error.clone();
+        if let Some(response) = event["response"].as_object_mut() {
+            response.remove("incomplete_details");
+        }
+        event
+    }
+
     /// Close remaining item event sequences, retaining unfinished wire statuses,
     /// and emit exactly one terminal event.
     pub async fn emit_terminal(
@@ -482,15 +503,10 @@ impl ResponseStreamEventEmitter {
         self.close_reasoning_item(tx).await?;
         self.close_message_item(tx).await?;
         self.close_tool_call_items(tx).await?;
-        let mut event = self.emit_completed(usage);
-        if let Some(error) = error {
-            event["type"] = json!(ResponseEvent::FAILED);
-            event["response"]["status"] = json!("failed");
-            event["response"]["error"] = error.clone();
-            if let Some(response) = event["response"].as_object_mut() {
-                response.remove("incomplete_details");
-            }
-        }
+        let event = match error {
+            Some(error) => self.emit_failed(usage, error),
+            None => self.emit_completed(usage),
+        };
         let failed = event["type"] == ResponseEvent::FAILED;
         self.send_event(&event, tx).await?;
         if failed {

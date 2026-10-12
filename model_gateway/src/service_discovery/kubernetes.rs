@@ -105,7 +105,7 @@ pub struct ServiceDiscoveryConfig {
     /// Annotation listing the pod's worker data ports (comma-separated).
     /// Absent = single worker at `port`.
     pub worker_ports_annotation: String,
-    /// KV metadata is captured at worker registration; replace a Pod after changing it.
+    /// Editing the KV annotations on a live Pod updates its worker in place.
     pub kv_connector_annotation: String,
     pub kv_engine_id_annotation: String,
     /// Per-worker model_id override source from pod metadata.
@@ -1228,10 +1228,13 @@ mod tests {
         crate::worker::endpoint_key(url).expect(url)
     }
 
+    /// A registered worker whose Pod the tests then stop publishing, so its
+    /// fingerprint never comes into play.
     fn owned(url: &str, discovery_id: &str) -> reconciler::OwnedWorker {
         reconciler::OwnedWorker {
             worker_id: WorkerId::from_string(url.to_string()),
             discovery_id: Some(discovery_id.to_string()),
+            spec_hash: None,
             endpoint: Endpoint::parse_with_rank(url).expect(url).0,
             revision: 1,
         }

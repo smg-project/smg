@@ -3,10 +3,14 @@
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use anyhow::anyhow;
-use axum::response::Response;
+use axum::{
+    http::{header::RETRY_AFTER, HeaderValue},
+    response::Response,
+};
 use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
@@ -25,13 +29,17 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::routers::{
-    common::sse,
-    error,
-    grpc::{context::RequestContext, multimodal::PlaceholderTokens, ProcessedMessages},
+use crate::{
+    middleware::ReportedRefusal,
+    observability::log_throttle::KeyedLogThrottle,
+    routers::{
+        common::sse,
+        error,
+        grpc::{context::RequestContext, multimodal::PlaceholderTokens, ProcessedMessages},
+    },
 };
 
 /// Type alias for the SSE channel sender used across streaming endpoints.
@@ -81,16 +89,12 @@ pub(crate) fn resolve_tokenizer(
         .get(model_id)
         .ok_or_else(|| {
             let served = ctx.components.worker_registry.contains_model(model_id);
-            if served {
-                error!(
-                    function = %stage_name,
-                    model = %model_id,
-                    "Tokenizer not found for model"
-                );
-            } else {
-                debug!(function = %stage_name, model = %model_id, "Unknown model");
-            }
-            Box::new(missing_tokenizer_response(model_id, served))
+            Box::new(missing_tokenizer_response(
+                stage_name,
+                model_id,
+                served,
+                ctx.components.tokenizer_autoload,
+            ))
         })?;
 
     // Cache tokenizer in context for reuse in response processing stage
@@ -99,18 +103,89 @@ pub(crate) fn resolve_tokenizer(
     Ok(tokenizer)
 }
 
-/// The error for a model without a registered tokenizer: a model nobody
-/// serves is the client's mistake (404), a served model with no tokenizer is
-/// a gateway fault (500).
-fn missing_tokenizer_response(model_id: &str, served: bool) -> Response {
-    if served {
-        error::internal_error(
-            "tokenizer_not_found",
-            format!("Tokenizer not found for model: {model_id}"),
-        )
-    } else {
-        error::model_not_found(model_id)
+/// Lines per second the tokenizer-window WARN admits per model, and the
+/// models the throttle tracks: the allowance of the worker-selection
+/// refusal line, for the same reason (a client retrying at once through the
+/// window is one condition, not a line per request).
+const TOKENIZER_NOT_READY_LINES_PER_SECOND: u32 = 10;
+const TOKENIZER_NOT_READY_LOG_MODELS: usize = 64;
+
+static TOKENIZER_NOT_READY_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    TOKENIZER_NOT_READY_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    TOKENIZER_NOT_READY_LOG_MODELS,
+);
+
+/// The client-visible code of [`tokenizer_not_ready`].
+pub(crate) const TOKENIZER_NOT_READY_CODE: &str = "tokenizer_not_ready";
+
+/// Seconds a client is asked to wait before retrying through the window: a
+/// tokenizer registration takes a fraction of a second on a warm cache.
+const TOKENIZER_NOT_READY_RETRY_AFTER_SECS: u32 = 1;
+
+/// The 503 for a served model whose tokenizer the gateway has not registered
+/// yet: the window between a worker turning healthy and the end of its
+/// tokenizer load, which `/readiness` reports as not ready ("tokenizer not
+/// yet registered"). A planned, transient state, so the answer is the
+/// retryable class with a `Retry-After`, like a pool with no available
+/// worker, not a 500. One WARN per request, capped per model at
+/// [`TOKENIZER_NOT_READY_LINES_PER_SECOND`] a second (the overflow is counted
+/// as `suppressed` on the next admitted line); the response is marked
+/// [`ReportedRefusal`], so the pipeline's and the access log's lines for it
+/// stay at DEBUG (three ERROR lines per request were the storm of the 500).
+/// A served model whose tokenizer autoload was skipped (no path to load it
+/// from) or failed is answered the same until the gateway records failed
+/// loads per model: a model stuck on this answer has the one WARN or ERROR
+/// line of its registration to look for.
+pub(crate) fn tokenizer_not_ready(function: &str, model_id: &str) -> Response {
+    let mut response = error::service_unavailable(
+        TOKENIZER_NOT_READY_CODE,
+        format!("Tokenizer for model '{model_id}' is not registered yet; retry shortly"),
+    );
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from(TOKENIZER_NOT_READY_RETRY_AFTER_SECS),
+    );
+    response.extensions_mut().insert(ReportedRefusal);
+    if let Some(admitted) = TOKENIZER_NOT_READY_LOG.admit(model_id) {
+        warn!(
+            function = %function,
+            model = %model_id,
+            suppressed = admitted.suppressed,
+            "Tokenizer not yet registered for a served model"
+        );
     }
+    response
+}
+
+/// The error for a model without a registered tokenizer: a model nobody
+/// serves is the client's mistake (404); a served model whose tokenizer the
+/// gateway is still loading is not ready yet (503, the state `/readiness`
+/// reports); a served model with no tokenizer when the gateway does not load
+/// tokenizers itself (`--disable-tokenizer-autoload`) is a gateway fault
+/// (500): nothing will register one.
+fn missing_tokenizer_response(
+    function: &str,
+    model_id: &str,
+    served: bool,
+    tokenizer_autoload: bool,
+) -> Response {
+    if !served {
+        debug!(function = %function, model = %model_id, "Unknown model");
+        return error::model_not_found(model_id);
+    }
+    if tokenizer_autoload {
+        return tokenizer_not_ready(function, model_id);
+    }
+    error!(
+        function = %function,
+        model = %model_id,
+        "Tokenizer not found for model"
+    );
+    error::internal_error(
+        "tokenizer_not_found",
+        format!("Tokenizer not found for model: {model_id}"),
+    )
 }
 
 /// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
@@ -2206,14 +2281,32 @@ mod tests {
         assert_eq!(processed.text, "user: Hello\nassistant: Sure");
     }
 
+    /// A model nobody serves is a 404; a served model whose tokenizer is
+    /// still loading is a 503 with a `Retry-After`, marked as reported so it
+    /// logs once; a served model without a tokenizer when the gateway does
+    /// not load tokenizers itself is a 500.
     #[test]
-    fn missing_tokenizer_is_a_client_error_only_for_unknown_models() {
+    fn a_missing_tokenizer_is_a_404_a_503_while_it_loads_or_a_500_without_autoload() {
         assert_eq!(
-            missing_tokenizer_response("nonexistent-model", false).status(),
+            missing_tokenizer_response("stage", "nonexistent-model", false, true).status(),
             http::StatusCode::NOT_FOUND
         );
+        let not_ready = missing_tokenizer_response("stage", "served-model", true, true);
+        assert_eq!(not_ready.status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            missing_tokenizer_response("served-model", true).status(),
+            error::extract_error_code_from_response(&not_ready),
+            TOKENIZER_NOT_READY_CODE
+        );
+        assert_eq!(
+            not_ready
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        assert!(not_ready.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(
+            missing_tokenizer_response("stage", "served-model", true, false).status(),
             http::StatusCode::INTERNAL_SERVER_ERROR
         );
     }

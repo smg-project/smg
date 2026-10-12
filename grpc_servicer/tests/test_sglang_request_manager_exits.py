@@ -239,3 +239,172 @@ def test_failed_embedding_dispatch_ends_the_root_span(manager):
     asyncio.run(scenario())
     assert manager.exporter.names() == [" Req"]
     assert "e-fail" not in manager.rid_to_state
+
+
+# ---------------------------------------------------------------------------
+# n > 1: the multiplexed sub-requests on the consumer's exit
+# ---------------------------------------------------------------------------
+#
+# The checks run inside the loop, right after the consumer left: at the end of
+# ``asyncio.run`` the loop cancels every task still pending and closes every
+# async generator still open, which would abort the sub-requests by itself and
+# hide a request manager that leaves them running.
+
+
+def _multi(stream: bool, n: int):
+    return SimpleNamespace(stream=stream, sampling_params=SimpleNamespace(n=n, max_new_tokens=8))
+
+
+def _chunk(rm, rid: str) -> dict:
+    """A non-terminal output for the request, as the output path queues it."""
+    item = {"request_id": rid, "token_ids": [1], "finished": False}
+    rm.rid_to_state[rid].out_queue.put_nowait(item)
+    return item
+
+
+async def _sub_requests_dispatched(rm, base: str, n: int) -> None:
+    """Phase 1 (the prefix request) answered; phase 2 (the n sub-requests)
+    dispatched and waiting on the scheduler."""
+    await _settle()
+    assert [m.rid for m in rm.sent] == [f"{base}-prefix"]
+    _finished(rm, f"{base}-prefix")
+    await _settle()
+    await _settle()
+    assert [m.rid for m in rm.sent] == [f"{base}-prefix"] + [f"{base}-{i}" for i in range(n)]
+
+
+def _aborts(rm, after: int) -> list[str]:
+    return sorted(m.rid for m in rm.sent[after:])
+
+
+def _all_ended(rm, spans: int) -> None:
+    """Every request's root span ended, once; no request state left."""
+    assert rm.exporter.names() == [" Req"] * spans
+    assert [span.ended for span in rm.exporter.spans] == [1] * spans
+    assert rm.rid_to_state == {}
+
+
+def test_client_cancel_of_a_streaming_n2_request_aborts_both_sub_requests(manager):
+    async def scenario():
+        got: list = []
+
+        async def consume():
+            async for item in manager.generate_request(_multi(True, 2), "r-multi", None):
+                got.append(item)
+
+        task = asyncio.create_task(consume())
+        await _sub_requests_dispatched(manager, "r-multi", 2)
+        _chunk(manager, "r-multi-0")
+        await _settle()
+        assert got == [{"request_id": "r-multi-0", "token_ids": [1], "finished": False, "index": 0}]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _settle()
+        assert _aborts(manager, 3) == ["r-multi-0", "r-multi-1"], "both sub-requests aborted"
+        _all_ended(manager, 3)
+
+    asyncio.run(scenario())
+
+
+def test_a_closed_multiplexed_stream_aborts_a_sub_request_whose_output_was_not_read(manager):
+    """Both sub-requests have an output queued; the consumer reads one and
+    leaves. One handler is parked at its yield behind the consumer, the other
+    at its yield with its output unread: neither waits on anything a cancel
+    could reach, so the abort is sent on the stream's close (what the event
+    loop does with a generator its consumer dropped)."""
+
+    async def scenario():
+        got: list = []
+        stream = manager.generate_request(_multi(True, 2), "r-unread", None)
+
+        async def consume():
+            async for item in stream:
+                got.append(item)
+                break
+
+        task = asyncio.create_task(consume())
+        await _sub_requests_dispatched(manager, "r-unread", 2)
+        _chunk(manager, "r-unread-0")
+        _chunk(manager, "r-unread-1")
+        await task
+        assert len(got) == 1
+        assert _aborts(manager, 3) == [], "nothing aborted while the stream is merely suspended"
+        await stream.aclose()
+        await _settle()
+        assert _aborts(manager, 3) == ["r-unread-0", "r-unread-1"], "both sub-requests aborted"
+        _all_ended(manager, 3)
+
+    asyncio.run(scenario())
+
+
+def test_a_failing_sub_request_handler_aborts_its_running_sibling(manager):
+    """One sub-request's dispatch fails while the other waits on the scheduler:
+    the failure leaves the multiplex loop through its ``finally``, which aborts
+    the sibling still running (before, it kept generating)."""
+    sent = manager.sent
+
+    def dispatch(obj):
+        if getattr(obj, "rid", None) == "r-fail-0":
+            raise RuntimeError("scheduler socket closed")
+        sent.append(obj)
+
+    manager.send_to_scheduler = SimpleNamespace(send_pyobj=dispatch)
+
+    async def scenario():
+        got: list = []
+
+        async def consume():
+            async for item in manager.generate_request(_multi(True, 2), "r-fail", None):
+                got.append(item)
+
+        task = asyncio.create_task(consume())
+        await _settle()
+        assert [m.rid for m in manager.sent] == ["r-fail-prefix"]
+        _finished(manager, "r-fail-prefix")
+        with pytest.raises(RuntimeError, match="socket closed"):
+            await task
+        await _settle()
+        assert got == []
+        assert [m.rid for m in manager.sent][:2] == ["r-fail-prefix", "r-fail-1"], (
+            "the sibling was dispatched; the failing one never reached the scheduler"
+        )
+        assert _aborts(manager, 2) == ["r-fail-1"], "the running sibling is aborted"
+        _all_ended(manager, 3)
+
+    asyncio.run(scenario())
+
+
+def test_client_cancel_of_a_non_streaming_n3_request_aborts_only_the_running_sub_request(manager):
+    """The non-streaming path runs the sub-requests one after another: a cancel
+    reaches the one in flight through its own handler, and the ones not yet
+    started were never dispatched."""
+
+    async def scenario():
+        got: list = []
+
+        async def consume():
+            async for item in manager.generate_request(_multi(False, 3), "r-batch", None):
+                got.append(item)
+
+        task = asyncio.create_task(consume())
+        await _settle()
+        assert [m.rid for m in manager.sent] == ["r-batch-prefix"]
+        _finished(manager, "r-batch-prefix")
+        await _settle()
+        await _settle()
+        assert [m.rid for m in manager.sent] == ["r-batch-prefix", "r-batch-0"]
+        _finished(manager, "r-batch-0")
+        await _settle()
+        await _settle()
+        assert [m.rid for m in manager.sent] == ["r-batch-prefix", "r-batch-0", "r-batch-1"]
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _settle()
+        assert got == []
+        assert _aborts(manager, 3) == ["r-batch-1"], "the sub-request in flight is aborted"
+        assert "r-batch-2" not in [m.rid for m in manager.sent], "the third was never dispatched"
+        _all_ended(manager, 3)
+
+    asyncio.run(scenario())

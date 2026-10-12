@@ -163,13 +163,26 @@ router:
     enabled: false
     minAvailable: 1
 
-  # -- Security context for router container
-  # NOTE: The default SMG image runs as root. Set runAsNonRoot: true only if
-  # your image is built with a non-root USER directive.
+  # -- Security context for the router container. The published image runs as
+  # a dedicated non-root user (UID 65532, see docker/Dockerfile; its primary
+  # group is the one the image gave that user, so no runAsGroup is pinned
+  # here), so the container is pinned to that user, drops every Linux
+  # capability (the router binds unprivileged ports only) and runs under the
+  # runtime's default seccomp profile. For an image built with another user,
+  # set runAsUser to that UID; to fall back to the image's own USER, set
+  # runAsUser to null (Helm merges values, so overriding runAsNonRoot alone
+  # keeps the pinned UID) and, when that USER is a name rather than a number,
+  # runAsNonRoot to false, since the kubelet cannot verify a named user.
   securityContext:
     readOnlyRootFilesystem: true
-    runAsNonRoot: false
+    runAsNonRoot: true
+    runAsUser: 65532
     allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
 
   # -- Liveness probe tuning. `/health` answers 200 while the process serves,
   #    whatever the state of its workers.

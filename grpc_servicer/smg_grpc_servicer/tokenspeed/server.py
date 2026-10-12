@@ -18,11 +18,23 @@ from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
+from smg_grpc_servicer.rust_lifecycle import EXIT_GRACE_SECS, guarded_exit
+from smg_grpc_servicer.tokenspeed import engine_watchdog
+from smg_grpc_servicer.tokenspeed.engine_watchdog import EngineProcessWatch
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.scheduler_launcher import launch_engine
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
 
 logger = logging.getLogger(__name__)
+
+# The scheduler servicer's own shutdown waits for the in-flight requests up
+# to this long (`TokenSpeedSchedulerServicer.shutdown`'s drain bound) before
+# it ends the engine processes; the exit guard's grace covers it, the
+# server's stop (5 s) and the warmup thread's join (5 s) on top of the
+# lifecycle's grace. An encode worker's servicer drains nothing; the same
+# grace serves it as a ceiling (a shorter one would buy nothing).
+SHUTDOWN_DRAIN_SECS = 30.0
+ENGINE_EXIT_GRACE_SECS = EXIT_GRACE_SECS + SHUTDOWN_DRAIN_SECS + 10.0
 
 # Match the other SMG servicers' 256 MiB default — a single oversized or
 # malformed gRPC frame can otherwise trigger a multi-GiB transient
@@ -90,10 +102,55 @@ class TokenSpeedEncodeDiscoveryServicer(TokenSpeedSchedulerServicer):
 
 
 async def serve_grpc(server_args: ServerArgs) -> None:
-    """Run the TokenSpeed gRPC server until a shutdown signal is received."""
+    """Run the TokenSpeed gRPC server until a shutdown signal is received, or
+    until the engine dies: then the servicer exits with code 1."""
 
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    launched = threading.Event()
+    engine_exit: dict[str, SystemExit] = {}
+
+    def on_engine_exit(pid: int, code: int | None) -> None:
+        logger.error(
+            "TokenSpeed engine process %s exited with code %s; the servicer cannot serve",
+            pid,
+            code,
+        )
+        if not launched.is_set():
+            # The launch is still waiting on the engine's ready report (on the
+            # main thread, inside TokenSpeed's launcher): nothing drains, the
+            # other engine processes are terminated and the process ends now.
+            watch.terminate_seen()
+            engine_watchdog.exit_process(1)
+            return
+        # The guard is armed here, the moment the exit is known and ahead of
+        # the shutdown (the servicer's own tear-down can block), with a grace
+        # that covers its bounded steps: the servicer's drain, the server stop,
+        # the warmup join.
+        engine_exit["exit"] = guarded_exit(1, grace_secs=ENGINE_EXIT_GRACE_SECS)
+        loop.call_soon_threadsafe(stop_event.set)
+
+    # The engine's processes are watched from before the first one starts: one
+    # that exits during the launch ends the servicer instead of leaving it on a
+    # ready report that never comes; one that exits later stops the server and
+    # the servicer exits with it.
+    watch = EngineProcessWatch(on_engine_exit)
+    watch.start()
     logger.info("Launching TokenSpeed scheduler + AsyncLLM...")
-    async_llm, scheduler_info = launch_engine(server_args)
+    try:
+        async_llm, scheduler_info = launch_engine(server_args)
+    except RuntimeError:
+        # The engine's launcher raised (a rank that reported a failure, or
+        # anything else on its way up): the traceback is kept, the engine
+        # processes it had started are terminated, and the servicer exits 1.
+        watch.stop()
+        watch.terminate_seen()
+        logger.error("The TokenSpeed engine did not start", exc_info=True)
+        raise guarded_exit(1) from None
+    launched.set()
+    # The engine's processes are all up by now: later children (a process
+    # pool, a manager) are not the engine.
+    watch.freeze()
 
     max_message_bytes = _grpc_max_message_bytes()
     server = grpc.aio.server(
@@ -144,6 +201,9 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         primary_service = tokenspeed_encoder_pb2.DESCRIPTOR.services_by_name[
             "TokenSpeedEncoder"
         ].full_name
+        # Encode is fire-and-forget: the encoder servicer has nothing to drain
+        # and its shutdown takes no bound.
+        servicer_shutdown_kwargs: dict[str, float] = {}
     else:
         servicer = TokenSpeedSchedulerServicer(
             async_llm=async_llm,
@@ -155,6 +215,10 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         primary_service = tokenspeed_scheduler_pb2.DESCRIPTOR.services_by_name[
             "TokenSpeedScheduler"
         ].full_name
+        # The scheduler servicer drains its in-flight requests for up to this
+        # long before it ends the engine processes; the exit guard's grace
+        # covers it.
+        servicer_shutdown_kwargs = {"drain_timeout_secs": SHUTDOWN_DRAIN_SECS}
 
     service_names = (
         primary_service,
@@ -177,9 +241,6 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     )
     warmup_thread.start()
 
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-
     def _signal_handler() -> None:
         logger.info("Received shutdown signal")
         stop_event.set()
@@ -194,9 +255,10 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     try:
         await stop_event.wait()
     finally:
+        watch.stop()
         logger.info("Shutting down TokenSpeed gRPC server")
         try:
-            await servicer.shutdown()
+            await servicer.shutdown(**servicer_shutdown_kwargs)
         except Exception:  # noqa: BLE001
             logger.exception("servicer.shutdown() raised")
         if discovery_servicer is not None:
@@ -207,6 +269,13 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         await server.stop(5.0)
         if warmup_thread.is_alive():
             warmup_thread.join(timeout=5.0)
+
+    if engine_exit:
+        # The engine ended on its own: the servicer exits with it, non-zero,
+        # so an orchestrator restarts the pod instead of keeping a worker that
+        # can no longer serve.
+        logger.error("The TokenSpeed engine exited on its own; the servicer exits with code 1")
+        raise engine_exit["exit"]
 
 
 def _wait_and_warmup(

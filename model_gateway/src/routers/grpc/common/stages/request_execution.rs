@@ -1,6 +1,11 @@
 //! Request execution: dispatch one attempt of the retained execution plan.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
@@ -18,7 +23,7 @@ use crate::{
     },
     routers::{
         common::{
-            attempt_ledger::{mark_upstream_answer, AttemptLedger},
+            attempt_ledger::{mark_failed_leg, mark_upstream_answer, AttemptLedger},
             kv_transfer::{
                 connector_mode_for_worker, is_moriio_worker, mooncake_decode_params,
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
@@ -35,8 +40,8 @@ use crate::{
             },
             multimodal::worker_language_model_only,
             proto_wrapper::{
-                FanoutStream, ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest,
-                ProtoResponseVariant, ProtoStream,
+                FanoutStream, FirstItem, PrefillTicket, ProtoEmbedRequest, ProtoGenerateRequest,
+                ProtoRequest, ProtoResponseVariant, ProtoStream,
             },
             utils::{
                 account_pd_leg_failure,
@@ -44,7 +49,7 @@ use crate::{
             },
         },
     },
-    worker::{ConnectionModeExt, PrefillLoadGuard, Worker},
+    worker::{liveness, ConnectionModeExt, PrefillLoadGuard, Worker},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -924,6 +929,15 @@ async fn execute_parallel_pd(
     // recorded at the first decode token in streaming. prefill_start anchors it.
     let prefill_start = Instant::now();
     let (prefill_label, decode_label) = pd_leg_labels(workers);
+    // The prefill leg's silence is bounded from its dispatch: a call that
+    // returns no stream, or a stream with nothing on it, within the bound
+    // fails the attempt instead of holding the request (and the decode room
+    // the admission gate claimed for it) until its own timeout.
+    let prefill_worker = workers.prefill_worker();
+    let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
+    let request_id = prefill_request.request_id().to_string();
+    let bound =
+        prefill_worker.and_then(|worker| PrefillLegBound::at(worker, prompt_tokens, prefill_start));
     // Each leg owns its client handle (a cheap channel clone, the same one
     // batched dispatch takes per sub-request) so the leg still in flight when
     // its partner fails can be moved off the request path.
@@ -935,32 +949,97 @@ async fn execute_parallel_pd(
     {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    let prefill_dispatch: PdLegDispatch =
-        Box::pin(async move { prefill_client.generate(prefill_request).await });
+    // The leg is booked on its worker here, before its call is polled: a
+    // servicer that sends its headers with the first message answers the
+    // call only once the prefill is done, so a booking at the call's return
+    // would time nothing (see `PrefillTicket::book`). The bound above was
+    // read before the booking, so the leg's own prompt is not counted twice.
+    let prefill_ticket =
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
+    let prefill_dispatch: PdLegDispatch = Box::pin(dispatch_prefill_within(
+        bound,
+        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        prefill_worker.cloned(),
+        prefill_label,
+        request_id.clone(),
+        prompt_tokens,
+    ));
     let decode_dispatch: PdLegDispatch =
         Box::pin(async move { decode_client.generate(decode_request).await });
 
     match dispatch_pd_legs(prefill_dispatch, decode_dispatch).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
-            // Record circuit breaker outcomes (client errors don't count as failures)
+            // Record circuit breaker outcomes (client errors don't count as
+            // failures). A prefill dispatch that succeeded is sampled once
+            // its first response is in (below), as the sequential path
+            // samples it after the drain: a leg that was accepted into
+            // silence is one failure of its worker, not a success and then a
+            // failure, which would reset the breaker's streak every time.
             workers.record_prefill_decode_outcomes(
                 ledger,
-                prefill_result.breaker_status(),
+                prefill_result
+                    .breaker_status()
+                    .filter(|_| prefill_result.is_err()),
                 decode_result.breaker_status(),
             );
 
             // Both legs are translated before either is propagated: a
             // decode-side failure is logged and counted even when the prefill
             // error is the one the client sees.
-            let prefill =
-                prefill_result.map_err(|e| pd_leg_error(PdLeg::Prefill, prefill_label, &e));
-            let decode = decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, decode_label, &e));
+            let prefill = prefill_result
+                .map_err(|e| pd_leg_error(PdLeg::Prefill, prefill_label, &e, workers));
+            let decode =
+                decode_result.map_err(|e| pd_leg_error(PdLeg::Decode, decode_label, &e, workers));
             let (prefill_stream, decode_stream) = match (prefill, decode) {
                 (Ok(prefill), Ok(decode)) => (prefill, decode),
                 // The surviving leg's stream drops here, which aborts its
                 // room on the worker.
                 (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
             };
+
+            // The prefill leg's prompt has been pending prefill on its worker
+            // since its dispatch, until its first response (which teaches the
+            // worker's rate); the stream takes the booking over. What is left
+            // of the leg's bound is spent waiting for that response here,
+            // before the response to the client begins, so a silent prefill
+            // fails the attempt where the retry layer can still take the
+            // request to another prefill worker.
+            let mut prefill_stream = match prefill_worker {
+                Some(worker) => {
+                    prefill_stream.tracked_prefill_leg_booked(Arc::clone(worker), prefill_ticket)
+                }
+                None => prefill_stream,
+            };
+            match first_prefill_response_within(
+                &mut prefill_stream,
+                bound,
+                prefill_worker,
+                prefill_label,
+                &request_id,
+                prompt_tokens,
+            )
+            .await
+            {
+                Err(e) => {
+                    // Dropping the prefill stream aborts its room. The
+                    // decode's abort waits for its first response (30 s at
+                    // most): a handoff the silent prefill may yet start must
+                    // not be torn down mid-write.
+                    drop(prefill_stream);
+                    drop(decode_stream.defer_abort_until_first_item());
+                    if let Some(status) = e.breaker_status() {
+                        workers.record_outcome_prefill(ledger, status);
+                    }
+                    return Err(pd_leg_error(PdLeg::Prefill, prefill_label, &e, workers));
+                }
+                // The leg answered: the success its dispatch's sample waited
+                // for. A leg whose first item is a failure is charged once,
+                // where its reader meets it (the streaming layer's
+                // accounting); a stream that ended with nothing on it is no
+                // success of the leg either.
+                Ok(FirstItem::Response) => workers.record_outcome_prefill(ledger, 200),
+                Ok(FirstItem::Failure | FirstItem::End) => {}
+            }
 
             // A client disconnect drops both leg streams, which normally fires an
             // immediate abort to each worker. The decode leg must not be aborted
@@ -1011,9 +1090,24 @@ async fn execute_parallel_pd(
                 }
             };
             if let Some(worker) = partner_worker {
-                retire_pd_leg(leg.partner(), partner_label, Arc::clone(worker), partner);
+                // The partner of a prefill that fell silent is retired with
+                // its abort deferred (that prefill may yet start the handoff
+                // the decode is waiting for) and uncharged: a late failure
+                // of a handoff that never came is not the decode's fault.
+                let retirement = if is_prefill_silence(&error) {
+                    Retirement::PartnerSilent
+                } else {
+                    Retirement::PartnerFailed
+                };
+                retire_pd_leg(
+                    leg.partner(),
+                    partner_label,
+                    Arc::clone(worker),
+                    partner,
+                    retirement,
+                );
             }
-            Err(pd_leg_error(leg, label, &error))
+            Err(pd_leg_error(leg, label, &error, workers))
         }
     }
 }
@@ -1087,7 +1181,19 @@ async fn dispatch_pd_legs(
 
 /// Log, count and translate one leg's dispatch failure into the client answer.
 /// A failure that names the rendezvous counts under the rendezvous family too.
-fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> Response {
+/// A prefill leg's silence verdict was logged and counted where its bound
+/// passed, and answers under its own code (see [`prefill_silence_response`]).
+fn pd_leg_error(
+    leg: PdLeg,
+    connection: &'static str,
+    error: &tonic::Status,
+    workers: &WorkerSelection,
+) -> Response {
+    if leg == PdLeg::Prefill && is_prefill_silence(error) {
+        if let Some(prefill) = workers.prefill_worker() {
+            return prefill_silence_response(error, prefill);
+        }
+    }
     Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
     account_pd_leg_failure(leg.name(), error);
     start_failure_response(
@@ -1098,15 +1204,61 @@ fn pd_leg_error(leg: PdLeg, connection: &'static str, error: &tonic::Status) -> 
     )
 }
 
-/// Finish off the leg that was still dispatching when its partner failed.
+/// Why a PD leg still dispatching is retired off the request path (see
+/// [`retire_pd_leg`]), and what its late result is worth to its worker's
+/// record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retirement {
+    /// Its partner failed to start, and the request with it. The leg's own
+    /// late result is still this request's one word on its worker: sampled
+    /// on the breaker and counted as a dispatch's is.
+    PartnerFailed,
+    /// Its partner, the prefill, fell silent: the request charged that
+    /// prefill where its bound passed, and this leg's late result is not its
+    /// worker's fault (the handoff it waited for never came), so it is
+    /// neither sampled nor counted. Its abort is deferred: the prefill may
+    /// yet start the handoff, which must not be torn down mid-write.
+    PartnerSilent,
+    /// Its own silence bound passed. The request charged its worker once,
+    /// where the bound passed (the breaker sample through the ledger, the
+    /// `timeout` worker error): its late result is neither sampled nor
+    /// counted, whatever it is. A late stream is aborted, a late error noted.
+    Silent,
+}
+
+impl Retirement {
+    fn cause(self) -> &'static str {
+        match self {
+            Self::PartnerFailed => "its partner failed",
+            Self::PartnerSilent => "its partner fell silent",
+            Self::Silent => "its silence bound passed",
+        }
+    }
+
+    fn defer_abort(self) -> bool {
+        matches!(self, Self::PartnerSilent)
+    }
+
+    /// Whether the late result is this request's word on the worker.
+    fn charges(self) -> bool {
+        matches!(self, Self::PartnerFailed)
+    }
+}
+
+/// Finish off a leg that was still dispatching when its request gave up on
+/// it: its partner failed, or its own silence bound passed
+/// ([`Retirement`]).
 ///
 /// The request is already answered; what is left is the engine-side room,
 /// which the abandoned leg will allocate the moment its dispatch lands and
 /// then hold for its own deadline. Dropping the leg's stream as soon as it
 /// arrives is the abort path the router already uses on a client disconnect,
-/// and it is the only thing that releases that room early. The abort is *not*
-/// deferred here: deferral exists to protect an in-flight KV handoff, and the
-/// peer that would have written it is the leg that just failed.
+/// and it is the only thing that releases that room early. The abort is
+/// deferred only when a KV handoff may still be written into the leg: the
+/// decode partner of a prefill that fell silent rather than failed; a peer
+/// that failed to start writes nothing. The late result is sampled and
+/// counted only when it is the request's one word on the worker; a leg
+/// given up on for its silence charged its worker when the bound passed.
 #[expect(
     clippy::disallowed_methods,
     reason = "the abandoned PD leg is retired off the request path; its dispatch is bounded by the engine's own deadline"
@@ -1116,33 +1268,249 @@ fn retire_pd_leg(
     connection: &'static str,
     worker: Arc<dyn Worker>,
     dispatch: PdLegDispatch,
+    retirement: Retirement,
 ) {
     tokio::spawn(async move {
         let result = dispatch.await;
-        if let Some(status) = result.breaker_status() {
+        if let Some(status) = result.breaker_status().filter(|_| retirement.charges()) {
             worker.record_outcome(status);
         }
+        let cause = retirement.cause();
         match result {
             Ok(stream) => {
                 debug!(
                     leg = leg.name(),
                     worker = worker.url(),
-                    "Aborting the room of the PD leg abandoned after its partner failed"
+                    cause,
+                    "Aborting the room of an abandoned PD leg"
                 );
-                drop(stream);
+                if retirement.defer_abort() {
+                    drop(stream.defer_abort_until_first_item());
+                } else {
+                    drop(stream);
+                }
             }
-            Err(error) => {
+            Err(error) if retirement.charges() => {
                 Metrics::record_worker_error(leg.name(), connection, metrics_labels::ERROR_BACKEND);
                 error!(
                     function = "retire_pd_leg",
                     leg = leg.name(),
                     worker = worker.url(),
+                    cause,
                     error = %error,
-                    "PD leg failed after its partner had already failed"
+                    "Abandoned PD leg failed after its request had given up on it"
+                );
+            }
+            Err(error) => {
+                debug!(
+                    leg = leg.name(),
+                    worker = worker.url(),
+                    cause,
+                    error = %error,
+                    "Abandoned PD leg failed late; its request had charged what it gave up on"
                 );
             }
         }
     });
+}
+
+/// The message a prefill leg's silence verdict starts with (see
+/// [`prefill_leg_silent`]); it tells the verdict from an engine's own
+/// `DEADLINE_EXCEEDED`.
+const PREFILL_SILENCE_MESSAGE: &str = "prefill leg produced nothing within";
+
+/// The bound on one prefill leg's silence, counted from its dispatch (see
+/// [`liveness::prefill_leg_bound`]).
+#[derive(Clone, Copy, Debug)]
+struct PrefillLegBound {
+    deadline: Instant,
+    bound: Duration,
+}
+
+impl PrefillLegBound {
+    /// The bound for a leg of `prompt_tokens` dispatched to `worker` at
+    /// `dispatched`; `None` when the rule is off.
+    fn at(worker: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
+        let bound = liveness::prefill_leg_bound(worker, prompt_tokens)?;
+        // A bound past the clock's range never expires: the leg stays unbounded.
+        let deadline = dispatched.checked_add(bound)?;
+        Some(Self { deadline, bound })
+    }
+}
+
+/// The verdict on a prefill leg that produced nothing within its bound, in
+/// `phase` (`dispatch`: the call returned no stream; `first_response`: the
+/// stream yielded nothing), while its worker answered no other leg within
+/// the bound either (see [`liveness::prefill_leg_reprieve`]): one WARN
+/// naming the worker, the request and how long ago the worker last
+/// answered anything, the worker-error counter under the timeout class, and
+/// the status the leg's failure is reported with. Nothing else bounds this
+/// wait below the request's own timeout: the engine's health probes keep
+/// passing, the queue timeout ended at worker selection, and the admission
+/// gate only gates the dispatch. The attempt fails here; the retry layer
+/// takes the request to another prefill worker when one is available (see
+/// [`prefill_silence_response`]).
+fn prefill_leg_silent(
+    worker: &Arc<dyn Worker>,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+    bound: Duration,
+    phase: &'static str,
+) -> tonic::Status {
+    let worker_last_answer = worker
+        .prefill_answered_ago()
+        .map_or_else(|| "never".to_string(), |ago| format!("{ago:.1?} ago"));
+    warn!(
+        request_id = %request_id,
+        worker = worker.url(),
+        worker_type = metrics_labels::WORKER_PREFILL,
+        phase,
+        prompt_tokens,
+        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        worker_last_answer = %worker_last_answer,
+        "PD prefill leg produced nothing within its silence bound, and its worker answered no other leg within it; giving up on it"
+    );
+    Metrics::record_worker_error(
+        metrics_labels::WORKER_PREFILL,
+        connection,
+        metrics_labels::ERROR_TIMEOUT,
+    );
+    tonic::Status::deadline_exceeded(format!(
+        "{PREFILL_SILENCE_MESSAGE} {bound:.1?} of its dispatch ({phase})"
+    ))
+}
+
+/// Whether `status` is a prefill leg's silence verdict.
+fn is_prefill_silence(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::DeadlineExceeded
+        && status.message().starts_with(PREFILL_SILENCE_MESSAGE)
+}
+
+/// The client answer for a prefill leg's silence: a 504 under its own error
+/// code, replayable on another prefill worker. The leg's worker is marked on
+/// the response so the retry window closes on it alone (its decode partner
+/// stays selectable) and the answer stands when no other prefill worker is
+/// available (see `attempt_ledger::FailedLeg`).
+fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -> Response {
+    let mut response = error::gateway_timeout(
+        "prefill_worker_silent",
+        format!("Prefill worker silent: {}", status.message()),
+    );
+    mark_failed_leg(&mut response, prefill.as_ref());
+    response
+}
+
+/// Await a prefill leg's dispatch within its bound. Past the deadline the
+/// leg waits on while its worker keeps answering other legs (a bound past
+/// the worker's latest answer, re-read each time: see
+/// [`liveness::prefill_leg_reprieve`]); once the worker has answered
+/// nothing for a bound, the still-pending call is retired off the request
+/// path (its room is aborted when it lands) and the silence verdict takes
+/// its place. Without a bound or a worker to charge, the call is awaited as
+/// it is.
+async fn dispatch_prefill_within(
+    bound: Option<PrefillLegBound>,
+    mut dispatch: PdLegDispatch,
+    worker: Option<Arc<dyn Worker>>,
+    connection: &'static str,
+    request_id: String,
+    prompt_tokens: u64,
+) -> StreamResult {
+    let (Some(bound), Some(worker)) = (bound, worker) else {
+        return dispatch.await;
+    };
+    let mut deadline = bound.deadline;
+    loop {
+        if let Ok(result) = tokio::time::timeout_at(deadline.into(), &mut dispatch).await {
+            return result;
+        }
+        let Some(more) = liveness::prefill_leg_reprieve(&worker, bound.bound) else {
+            retire_pd_leg(
+                PdLeg::Prefill,
+                connection,
+                Arc::clone(&worker),
+                dispatch,
+                Retirement::Silent,
+            );
+            return Err(prefill_leg_silent(
+                &worker,
+                connection,
+                &request_id,
+                prompt_tokens,
+                bound.bound,
+                "dispatch",
+            ));
+        };
+        deadline = Instant::now() + more;
+    }
+}
+
+/// Wait for a prefill leg's first item within what is left of its bound,
+/// with the same reprieves as [`dispatch_prefill_within`], and say what it
+/// was. The item stays on the stream for its reader; past the bound, with
+/// the worker silent, the silence verdict (the caller drops the leg, which
+/// aborts its room). Without a bound nothing is pulled ahead and the leg
+/// counts as answered, as its dispatch did.
+async fn first_prefill_response_within(
+    stream: &mut ProtoStream,
+    bound: Option<PrefillLegBound>,
+    worker: Option<&Arc<dyn Worker>>,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+) -> Result<FirstItem, tonic::Status> {
+    let (Some(bound), Some(worker)) = (bound, worker) else {
+        return Ok(FirstItem::Response);
+    };
+    let mut deadline = bound.deadline;
+    loop {
+        if let Ok(first) = stream.first_response_within(deadline).await {
+            return Ok(first);
+        }
+        let Some(more) = liveness::prefill_leg_reprieve(worker, bound.bound) else {
+            return Err(prefill_leg_silent(
+                worker,
+                connection,
+                request_id,
+                prompt_tokens,
+                bound.bound,
+                "first_response",
+            ));
+        };
+        deadline = Instant::now() + more;
+    }
+}
+
+/// The attempt's answer for a prefill leg that failed to start or fell
+/// silent on the sequential path: the breaker sample, the worker-error
+/// counter (the silence verdict counted itself) and the client response.
+fn sequential_prefill_failure(
+    e: &tonic::Status,
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    connection: &'static str,
+) -> Response {
+    if let Some(status) = e.breaker_status() {
+        workers.record_outcome_prefill(ledger, status);
+    }
+    if is_prefill_silence(e) {
+        if let Some(prefill) = workers.prefill_worker() {
+            return prefill_silence_response(e, prefill);
+        }
+    }
+    Metrics::record_worker_error(
+        metrics_labels::WORKER_PREFILL,
+        connection,
+        metrics_labels::ERROR_BACKEND,
+    );
+    account_pd_leg_failure(metrics_labels::WORKER_PREFILL, e);
+    start_failure_response(
+        e,
+        "execute_sequential_pd",
+        PdLeg::Prefill.error_message(),
+        PdLeg::Prefill.error_code(),
+    )
 }
 
 /// How the vLLM sequential-PD decode leg is built from the request.
@@ -1382,32 +1750,66 @@ async fn execute_sequential_pd(
         "vLLM PD: sending prefill request (max_tokens=1)"
     );
 
-    // Send to prefill, wait for completion
+    // Send to prefill, wait for completion. The leg's silence is bounded
+    // from its dispatch (see `prefill_leg_silent`): a call that returns no
+    // stream (a servicer that holds its headers until the first message in
+    // front of a frozen engine), or a stream with nothing on it, within the
+    // bound fails the attempt here, where the retry layer can still take
+    // the request to another prefill worker.
     let (prefill_label, decode_label) = pd_leg_labels(workers);
+    let prefill_worker = workers.prefill_worker();
+    let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
+    let request_id = prefill_request.request_id().to_string();
     let prefill_start = Instant::now();
-    if let Some(prefill) = workers.prefill_worker() {
+    let bound =
+        prefill_worker.and_then(|worker| PrefillLegBound::at(worker, prompt_tokens, prefill_start));
+    if let Some(prefill) = prefill_worker {
         Metrics::record_worker_request(prefill.url(), prefill.model_id());
     }
-    let mut prefill_stream = prefill_client
-        .generate(prefill_request)
-        .await
-        .map_err(|e| {
-            if let Some(status) = e.breaker_status() {
-                workers.record_outcome_prefill(ledger, status);
-            }
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_PREFILL,
-                prefill_label,
-                metrics_labels::ERROR_BACKEND,
-            );
-            account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
-            start_failure_response(
-                &e,
-                "execute_sequential_pd",
-                PdLeg::Prefill.error_message(),
-                PdLeg::Prefill.error_code(),
-            )
-        })?;
+    let mut prefill_client = prefill_client.clone();
+    // Booked before the call is polled, for the servicers that send their
+    // headers with the first message (see `PrefillTicket::book`); the bound
+    // above was read before the booking.
+    let prefill_ticket =
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, prompt_tokens));
+    let prefill_stream = dispatch_prefill_within(
+        bound,
+        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        prefill_worker.cloned(),
+        prefill_label,
+        request_id.clone(),
+        prompt_tokens,
+    )
+    .await
+    .map_err(|e| sequential_prefill_failure(&e, workers, ledger, prefill_label))?;
+    // The prompt has been pending prefill on its worker since the dispatch,
+    // until the first response, which teaches the worker's rate; the stream
+    // takes the booking over.
+    let mut prefill_stream = match prefill_worker {
+        Some(worker) => {
+            prefill_stream.tracked_prefill_leg_booked(Arc::clone(worker), prefill_ticket)
+        }
+        None => prefill_stream,
+    };
+    if let Err(e) = first_prefill_response_within(
+        &mut prefill_stream,
+        bound,
+        prefill_worker,
+        prefill_label,
+        &request_id,
+        prompt_tokens,
+    )
+    .await
+    {
+        // Dropping the stream aborts the leg's room: nothing was handed off.
+        drop(prefill_stream);
+        return Err(sequential_prefill_failure(
+            &e,
+            workers,
+            ledger,
+            prefill_label,
+        ));
+    }
 
     // Drain prefill response, harvesting connector params, the processed
     // media identity, and input logprobs from the Complete frame
@@ -1627,7 +2029,50 @@ mod tests {
     use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+    use crate::{
+        routers::common::{attempt_ledger::FailedLeg, retry::is_retryable_response},
+        worker::{
+            BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
+            WorkerType,
+        },
+    };
+
+    /// A decode leg retired because its prefill fell silent is not charged
+    /// for failing late: the handoff it waited for never came, and the
+    /// request charged the prefill where the bound passed. A partner that
+    /// failed to start still charges, as before.
+    #[tokio::test]
+    async fn the_partner_of_a_silent_prefill_is_not_charged_for_its_late_failure() {
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30001")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let late: PdLegDispatch =
+            Box::pin(async { Err(tonic::Status::unavailable("the handoff never came")) });
+        retire_pd_leg(
+            PdLeg::Decode,
+            "grpc",
+            Arc::clone(&decode),
+            late,
+            Retirement::PartnerSilent,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "a late failure after the prefill fell silent is not the decode worker's fault"
+        );
+        assert!(Retirement::PartnerSilent.defer_abort());
+        assert!(!Retirement::PartnerSilent.charges());
+        assert!(Retirement::PartnerFailed.charges());
+        assert!(!Retirement::PartnerFailed.defer_abort());
+        assert!(!Retirement::Silent.charges());
+    }
 
     fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
         ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
@@ -1666,6 +2111,7 @@ mod tests {
     fn a_leg_that_fails_its_rendezvous_at_dispatch_is_counted() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
+        let workers = tokenspeed_pair();
         metrics::with_local_recorder(&recorder, || {
             pd_leg_error(
                 PdLeg::Prefill,
@@ -1675,11 +2121,13 @@ mod tests {
                      req.bootstrap_room=41 with exception KVTransferError(bootstrap_room=41): \
                      Request 41 timed out after 120.0s in KVPoll.Bootstrapping",
                 ),
+                &workers,
             );
             pd_leg_error(
                 PdLeg::Decode,
                 metrics_labels::CONNECTION_GRPC,
                 &tonic::Status::unavailable("connection reset"),
+                &workers,
             );
         });
         let rendered = handle.render();
@@ -1946,6 +2394,173 @@ mod tests {
             }
             PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
         }
+    }
+
+    /// The failure a dispatch ended with (a stream has no `Debug`).
+    fn failure(result: StreamResult) -> tonic::Status {
+        match result {
+            Err(status) => status,
+            Ok(_) => panic!("expected the dispatch to fail"),
+        }
+    }
+
+    fn three_second_bound() -> PrefillLegBound {
+        PrefillLegBound {
+            deadline: Instant::now() + Duration::from_secs(3),
+            bound: Duration::from_secs(3),
+        }
+    }
+
+    /// A prefill call that has returned no stream by its bound is given up on
+    /// at the bound, not at the request's timeout: the verdict names the
+    /// silence, and the attempt answers a 504 under its own code that the
+    /// retry layer may take to another prefill worker, this one excluded.
+    #[tokio::test(start_paused = true)]
+    async fn a_prefill_dispatch_past_its_bound_is_given_up_on_at_the_bound() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let result = dispatch_prefill_within(
+            Some(three_second_bound()),
+            never_answers(),
+            Some(Arc::clone(&prefill)),
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-silent".to_string(),
+            256,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
+            "given up on at the bound, not later: {elapsed:?}"
+        );
+        let status = failure(result);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(is_prefill_silence(&status), "{status:?}");
+
+        let response = pd_leg_error(
+            PdLeg::Prefill,
+            metrics_labels::CONNECTION_GRPC,
+            &status,
+            &workers,
+        );
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("prefill_worker_silent")
+        );
+        assert!(
+            response.extensions().get::<FailedLeg>().is_some(),
+            "the retry window closes on the prefill worker alone"
+        );
+        assert!(
+            is_retryable_response(&response),
+            "another prefill worker may take the request"
+        );
+    }
+
+    /// A prefill that answers, or fails on its own, within its bound passes
+    /// through as it is; an engine's own deadline is not the verdict; without
+    /// a bound the call is awaited as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_prefill_that_answers_within_its_bound_passes_through() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let status = failure(
+            dispatch_prefill_within(
+                Some(three_second_bound()),
+                answers_after(Duration::from_secs(1)),
+                Some(prefill),
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-late".to_string(),
+                256,
+            )
+            .await,
+        );
+        assert_eq!(status.message(), "late leg");
+        assert!(!is_prefill_silence(&status));
+        assert!(!is_prefill_silence(&tonic::Status::deadline_exceeded(
+            "bootstrap timeout"
+        )));
+        let status = failure(
+            dispatch_prefill_within(
+                None,
+                fails_now("refused"),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-unbounded".to_string(),
+                256,
+            )
+            .await,
+        );
+        assert_eq!(status.message(), "refused");
+    }
+
+    /// A prefill stream that answers (here: ends) within its bound is left
+    /// for its reader as it was, and what came is named: the end is not a
+    /// response the breaker would sample a success for.
+    #[tokio::test]
+    async fn a_prefill_stream_that_answers_within_its_bound_is_left_for_its_reader() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_prefill_leg(Arc::clone(&prefill), 256);
+        let first = first_prefill_response_within(
+            &mut stream,
+            Some(three_second_bound()),
+            Some(&prefill),
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-ended",
+            256,
+        )
+        .await
+        .expect("ended within the bound");
+        assert_eq!(first, FirstItem::End);
+        assert!(stream.next().await.is_none(), "the end is replayed");
+    }
+
+    /// A prefill call past its bound waits on while its worker answers other
+    /// legs: the verdict is on the worker, not the leg. The worker answers
+    /// another leg half a second in, so the call is given up on a bound
+    /// after that answer, not at its own bound. (Real time: the worker's
+    /// stamps are on the gateway clock, which a paused runtime does not
+    /// move.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_past_its_bound_waits_on_while_its_worker_answers() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let bound = Duration::from_secs(1);
+        let answered_at = Duration::from_millis(500);
+        let other_leg = async {
+            tokio::time::sleep(answered_at).await;
+            prefill.note_prefill_started(256, true);
+            prefill.note_prefill_ended(256, true, Some(0));
+        };
+        let started = Instant::now();
+        let (result, ()) = tokio::join!(
+            dispatch_prefill_within(
+                Some(PrefillLegBound {
+                    deadline: started + bound,
+                    bound,
+                }),
+                never_answers(),
+                Some(Arc::clone(&prefill)),
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-queued".to_string(),
+                256,
+            ),
+            other_leg
+        );
+        let elapsed = started.elapsed();
+        let status = failure(result);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= answered_at + bound && elapsed < answered_at + 3 * bound,
+            "given up on a bound after the worker's latest answer, not at its own bound: {elapsed:?}"
+        );
     }
 
     /// Admission and the load guards read the same count, so a batched plan

@@ -20,7 +20,7 @@ use llm_multimodal::{
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{vllm_proto as vllm, WorkerMediaFault};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{
     assemble::{assemble_vllm_batches_with, VllmAssembly},
@@ -31,7 +31,7 @@ use super::{
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::{routers::grpc::proto_wrapper::vllm_mm_identity, worker::http_client::build_client};
+use crate::{routers::grpc::proto_wrapper::vllm_mm_identity, worker::http_client::build_with};
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";
@@ -424,21 +424,32 @@ impl WorkerMediaPipeline {
                  --mm-device-do-normalize=false or use --mm-processor inprocess"
             );
         }
-        let client = build_client(
+        // The worker fetches the client-supplied media URLs the router
+        // forwards: the engine's own allow-list bounds the hosts by name, and
+        // the address policy refuses private origins unless the worker's
+        // environment allows them (a worker has no flags of its own).
+        let connector_config = MediaConnectorConfig {
+            allowed_domains: settings.allowed_domains.clone(),
+            allow_private_hosts: mm_settings().allow_private_media_hosts.value,
+            allowed_local_media_path: None,
+            fetch_timeout: settings.fetch_timeout,
+            video_fetch_timeout: settings.video_fetch_timeout,
+        };
+        // The line shows the allow-list as the connector enforces it (trimmed,
+        // a list with no names being none), not as it was spelled.
+        info!(
+            allowed_media_domains =
+                ?llm_multimodal::effective_allowed_domains(connector_config.allowed_domains.as_deref()),
+            allow_private_media_hosts = connector_config.allow_private_hosts,
+            "media fetch policy for worker-side processing"
+        );
+        let connector = build_with(
             || crate::http_client::client_builder().timeout(Duration::from_secs(30)),
             false,
             "media HTTP client",
+            |client| MediaConnector::new(client, connector_config.clone()),
         )
-        .map_err(anyhow::Error::msg)?;
-        let connector = MediaConnector::new(
-            client,
-            MediaConnectorConfig {
-                allowed_domains: settings.allowed_domains.clone(),
-                allowed_local_media_path: None,
-                fetch_timeout: settings.fetch_timeout,
-                video_fetch_timeout: settings.video_fetch_timeout,
-            },
-        )
+        .map_err(anyhow::Error::msg)
         .context("building the media connector")?;
         let components = MultimodalComponents {
             media_connector: Arc::new(connector),

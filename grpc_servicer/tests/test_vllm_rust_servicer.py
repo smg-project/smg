@@ -1476,3 +1476,76 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     # decides (the typed one in the engine-gated job).
     assert _kv_events(recorded["engine_args_from"].kv_events_config) == KV_EVENTS_ON
     assert _kv_events(ns.kv_events_config) == KV_EVENTS_ON
+
+
+# ── the knobs are validated before the bind (smg-lab #292) ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "name, value, text",
+    [
+        ("SMG_VLLM_SERVICER_DRAIN_SECS", "abc", "is not a number"),
+        ("SMG_VLLM_SERVICER_DRAIN_SECS", "-5", "must be at least 0"),
+        ("SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS", "abc", "is not a number"),
+        ("SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS", "-1", "must be greater than 0"),
+        ("SMG_VLLM_SERVICER_HANDSHAKE_PORT", "70000", "must be between 1 and 65535"),
+        ("SMG_VLLM_SERVICER_HANDSHAKE_PORT", "abc", "is not a port number"),
+    ],
+)
+def test_serve_rust_refuses_a_bad_knob_before_any_engine_work(
+    monkeypatch, tmp_path, name, value, text
+):
+    """smg-lab #292: the knobs are validated before the engine config is
+    built, the server constructed (the port bound) or the engine launched;
+    nothing of vLLM is imported before the verdict, so none of it is stubbed
+    here. The drain was read only once the engine ran."""
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    monkeypatch.setenv(name, value)
+    args = argparse.Namespace(model="org/m", grpc=True, host=None, port=50051)
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
+        asyncio.run(rust.serve_rust(args))
+
+
+def test_serve_rust_refuses_a_socket_dir_that_is_a_file_before_any_engine_work(
+    monkeypatch, tmp_path
+):
+    a_file = tmp_path / "a-file"
+    a_file.write_text("not a directory")
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(a_file))
+    args = argparse.Namespace(model="org/m", grpc=True, host=None, port=50051)
+    with pytest.raises(
+        rust_lifecycle.ServicerConfigError, match="SMG_ZMQ_SOCKET_DIR=.*not a directory"
+    ):
+        asyncio.run(rust.serve_rust(args))
+
+
+def test_the_switch_answers_a_configuration_error_with_exit_code_2(monkeypatch, caplog):
+    """smg-lab #292: through the launcher's switch, a knob the servicer cannot
+    use is one ERROR line naming it and exit code 2, not the launcher's
+    "Server failed" traceback; the Python path never runs."""
+    import logging
+
+    from smg_grpc_servicer.vllm import launcher_switch
+
+    calls = []
+
+    async def serve_grpc(args):
+        calls.append(args)
+
+    switched = launcher_switch.with_servicer_switch(serve_grpc)
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="bogus")))
+    assert raised.value.code == 2 and calls == []
+    assert "SMG_VLLM_SERVICER_IMPL must be one of" in caplog.text
+
+    async def failing_serve_rust(args):
+        raise rust_lifecycle.ServicerConfigError(
+            "SMG_VLLM_SERVICER_DRAIN_SECS='abc' is not a number"
+        )
+
+    monkeypatch.setattr(rust, "serve_rust", failing_serve_rust)
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(switched(argparse.Namespace(servicer_impl="rust")))
+    assert raised.value.code == 2 and calls == []
+    assert "SMG_VLLM_SERVICER_DRAIN_SECS='abc' is not a number" in caplog.text

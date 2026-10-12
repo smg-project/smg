@@ -13,6 +13,8 @@ pub(crate) use streaming::{
     await_stream_startup, build_sse_response, build_sse_response_from_stream,
     signal_stream_startup, stream_startup_channel, StreamStartupSender,
 };
-pub(crate) use utils::{ensure_mcp_connection, persist_response_if_needed};
+pub(crate) use utils::{
+    ensure_mcp_connection, persist_response_if_needed, stored_foreground, NotStored,
+};
 
 pub(crate) use crate::routers::common::mcp_utils::collect_user_function_names;

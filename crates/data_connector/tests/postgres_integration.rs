@@ -947,6 +947,42 @@ impl ScratchDatabase {
         Ok(rows?.iter().map(|row| row.get::<_, String>(0)).collect())
     }
 
+    /// Runs one statement on the scratch database itself.
+    async fn run(&self, sql: &str) -> Result<(), String> {
+        let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("connect to the scratch database: {e}"))?;
+        let mut driver = JoinSet::new();
+        driver.spawn(async move {
+            let _ = connection.await;
+        });
+        let result = client
+            .batch_execute(sql)
+            .await
+            .map_err(|e| format!("{sql}: {e}"));
+        drop(client);
+        driver.join_all().await;
+        result
+    }
+
+    /// Whether `table` exists in the scratch database.
+    async fn has_table(&self, table: &str) -> Result<bool, String> {
+        let (client, connection) = tokio_postgres::connect(&self.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("connect to the scratch database: {e}"))?;
+        let mut driver = JoinSet::new();
+        driver.spawn(async move {
+            let _ = connection.await;
+        });
+        let row = client
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+            .await
+            .map_err(|e| format!("look up {table}: {e}"));
+        drop(client);
+        driver.join_all().await;
+        Ok(row?.get(0))
+    }
+
     async fn drop(self) {
         let _ = self
             .admin(&format!(
@@ -1111,13 +1147,16 @@ async fn gateways_starting_together_come_up_under_a_repeatable_read_default() {
         let scratch = ScratchDatabase::create(&db_url, &format!("rr{round}"))
             .await
             .expect("create a scratch database");
-        scratch
+        if let Err(e) = scratch
             .admin(&format!(
                 "ALTER DATABASE \"{}\" SET default_transaction_isolation TO 'repeatable read'",
                 scratch.name
             ))
             .await
-            .expect("set the database's default isolation");
+        {
+            scratch.drop().await;
+            panic!("set the database's default isolation: {e}");
+        }
         let (failures, versions) = six_gateways_start_together(&scratch).await;
         scratch.drop().await;
         assert!(
@@ -1289,5 +1328,99 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
         meter.closes.load(Ordering::SeqCst) - closes_before,
         0,
         "no statement was closed: each stayed cached on its connection"
+    );
+}
+
+/// A database whose schema version is ahead of the migrations this build
+/// knows is refused at start-up with a message that says so (an older
+/// gateway behind a store a newer build migrated forward would otherwise
+/// start and fail its first read); the schema config's `version` at that
+/// version is the operator's word that the build may run against it. On a
+/// database of its own, so nothing shared sees the future version.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_database_ahead_of_this_build_is_refused_at_startup() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "ahead")
+        .await
+        .expect("create a scratch database");
+    // The schema at this build's version first, then a future migration.
+    let at_this_build = postgres_bundle(&scratch.url).await.map(drop);
+    let recorded = scratch
+        .run(
+            "INSERT INTO _schema_versions (version, description) VALUES (99, 'a future migration') \
+             ON CONFLICT (version) DO NOTHING",
+        )
+        .await;
+    let refused = postgres_bundle(&scratch.url).await.map(drop);
+    let allowed_cfg = PostgresConfig {
+        db_url: scratch.url.clone(),
+        pool_max: 4,
+        schema: Some(SchemaConfig {
+            auto_migrate: true,
+            version: Some(99),
+            ..Default::default()
+        }),
+    };
+    let allowed = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&allowed_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await
+    .map(drop);
+    scratch.drop().await;
+
+    at_this_build.expect("the schema at this build's version comes up");
+    recorded.expect("record a future migration");
+    let message = refused.expect_err("a database ahead of this build must be refused at start-up");
+    assert!(
+        message.contains("version 99") && message.contains("ahead of the latest migration"),
+        "{message}"
+    );
+    allowed.expect("`version: 99` lets the build run against the newer database");
+}
+
+/// The refusal comes before any table is touched: a database whose version
+/// table says 99 but has no responses table (a newer migration renamed or
+/// dropped it) reads as a fresh database otherwise, and a fresh start would
+/// create the legacy table in the newer store and stamp 1..3 next to 99.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_database_ahead_of_this_build_is_refused_before_its_tables_are_touched() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "ahead_fresh")
+        .await
+        .expect("create a scratch database");
+    let prepared = scratch
+        .run(
+            "CREATE TABLE _schema_versions (version INTEGER NOT NULL PRIMARY KEY, \
+             description VARCHAR(512), applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); \
+             INSERT INTO _schema_versions (version, description) VALUES (99, 'a future migration')",
+        )
+        .await;
+    let refused = postgres_bundle(&scratch.url).await.map(drop);
+    let responses_created = scratch.has_table("responses").await;
+    let versions = scratch.versions().await;
+    scratch.drop().await;
+
+    prepared.expect("prepare a database at a future version without a responses table");
+    let message = refused
+        .expect_err("a database ahead of this build must be refused before its tables are created");
+    assert!(message.contains("version 99"), "{message}");
+    assert!(
+        !responses_created.expect("look up the responses table"),
+        "the refusal must come before the responses table is created"
+    );
+    assert_eq!(
+        versions.expect("read the versions"),
+        vec![99],
+        "nothing stamped next to the future version"
     );
 }

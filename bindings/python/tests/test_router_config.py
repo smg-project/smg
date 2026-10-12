@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.launch_router import RouterArgs, launch_router
-from smg.router import policy_from_str
+from smg.router import build_control_plane_auth_config, policy_from_str
 from smg.smg_rs import PolicyType
 from smg.smg_rs import Router as _Router
 
@@ -524,4 +524,17 @@ class TestRouterPositionalSignature:
             "max_background_responses",
             "header_read_timeout_secs",
             "idle_connection_timeout_secs",
+            "mm_allowed_media_domains",
+            "mm_allow_private_media_hosts",
         ]
+
+
+class TestControlPlaneAuthHalfJwt:
+    """An issuer without an audience (or the reverse) is refused, not a silently open control plane."""
+
+    def test_half_jwt_configuration_is_refused(self):
+        with pytest.raises(ValueError, match="jwt-audience"):
+            build_control_plane_auth_config({"jwt_issuer": "https://issuer.example"})
+        with pytest.raises(ValueError, match="jwt-issuer"):
+            build_control_plane_auth_config({"jwt_audience": "aud"})
+        assert build_control_plane_auth_config({}) is None

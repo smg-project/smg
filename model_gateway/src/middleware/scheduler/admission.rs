@@ -129,8 +129,10 @@ pub async fn priority_admission_middleware(
     // NOTE: client-disconnect detection during the queue wait is not yet
     // wired (axum does not surface it to a middleware pre-`next.run`), so we
     // pass a fresh token; queued waits are bounded by `queue_timeout`. A
-    // real disconnect drops the response future (and the SchedulerGuardBody)
-    // once admitted, releasing the slot.
+    // real disconnect drops the response future: while queued, the scheduler
+    // records that exit as `client_cancelled` and reaps the waiter; once
+    // admitted, the SchedulerGuardBody is dropped with it, releasing the
+    // slot.
     let cancel = CancellationToken::new();
 
     match state.scheduler.admit(class, request_id, cancel).await {

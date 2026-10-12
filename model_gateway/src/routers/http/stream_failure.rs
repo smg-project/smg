@@ -189,6 +189,27 @@ impl RelaySource {
             Bytes::from(format!("data: {event}\n\ndata: [DONE]\n\n"))
         }
     }
+
+    /// [`Self::error_event`] written on its own frame: when `sent_tail` (the
+    /// last bytes relayed, kept by [`note_sent`]) does not stand on a frame
+    /// boundary, a blank line opens one first, so a cut inside a frame
+    /// leaves the partial line as it is and the event parses on its own.
+    /// The regular relay and the disaggregated router's decode relay end a
+    /// cut SSE body with it.
+    pub(crate) fn error_event_on_its_own_frame(
+        &self,
+        cut: &UpstreamCut,
+        sent_tail: &[u8],
+    ) -> Bytes {
+        let event = self.error_event(cut);
+        if on_frame_boundary(sent_tail) {
+            return event;
+        }
+        let mut framed = Vec::with_capacity(event.len() + 2);
+        framed.extend_from_slice(b"\n\n");
+        framed.extend_from_slice(&event);
+        Bytes::from(framed)
+    }
 }
 
 /// Whether a relayed SSE body stands on a frame boundary after `tail`, the
@@ -196,7 +217,7 @@ impl RelaySource {
 /// a cut body is written on its own frame, so a cut that lands inside a
 /// frame (a reset mid-write, an intermediary that re-chunks) does not merge
 /// the partial line and the event into one line a client cannot parse.
-pub(crate) fn on_frame_boundary(tail: &[u8]) -> bool {
+fn on_frame_boundary(tail: &[u8]) -> bool {
     tail.is_empty() || tail.ends_with(b"\n\n") || tail.ends_with(b"\r\n\r\n")
 }
 
@@ -420,6 +441,22 @@ mod tests {
             other => panic!("the protocol's error event, got {other:?}"),
         }
         assert!(!text.contains("[DONE]"), "{text:?}");
+    }
+
+    /// After a partial line the event opens a frame of its own; on a
+    /// boundary it is written as it is.
+    #[test]
+    fn the_event_that_ends_a_cut_opens_a_frame_after_a_partial_line() {
+        let (source, _worker) = source("/v1/chat/completions");
+        let cut = cut(StatusCode::BAD_GATEWAY);
+        let on_boundary = source.error_event_on_its_own_frame(&cut, b"}\n\n");
+        assert_eq!(on_boundary, source.error_event(&cut));
+        let after_partial = source.error_event_on_its_own_frame(&cut, b"\"con");
+        assert!(
+            after_partial.starts_with(b"\n\ndata: "),
+            "{after_partial:?}"
+        );
+        assert_eq!(&after_partial[2..], &source.error_event(&cut)[..]);
     }
 
     /// The boundary is read from the last bytes sent, across chunks.

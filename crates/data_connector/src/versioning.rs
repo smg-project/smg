@@ -146,6 +146,41 @@ fn pending_migrations_error(
     msg
 }
 
+// ── A schema ahead of this build ───────────────────────────────────────────
+
+/// Refuses a store whose schema version is ahead of the migrations this
+/// build knows: an older gateway behind a store that a newer build migrated
+/// forward (a rollback of the gateway image is the usual case) would start,
+/// then fail its first read of a changed column. The schema config's
+/// `version` at or above the store's version is the operator's word that this
+/// build may run against it; it is logged once.
+pub(crate) fn schema_ahead_check(
+    backend: &str,
+    current: u32,
+    migrations: &[Migration],
+    config_version: Option<u32>,
+) -> Result<(), String> {
+    let latest = migrations.last().map_or(0, |m| m.version);
+    if current <= latest {
+        return Ok(());
+    }
+    if config_version.is_some_and(|version| version >= current) {
+        tracing::warn!(
+            backend,
+            schema_version = current,
+            latest_known = latest,
+            "the schema is ahead of the migrations this build knows; running on the schema config's `version`"
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "The {backend} schema is at version {current}, ahead of the latest migration this build knows \
+         (v{latest}). This build does not know the shape of a newer schema: upgrade the gateway to the \
+         build that migrated the database, or set `version: {current}` in the {backend} schema config to \
+         run this build against it anyway."
+    ))
+}
+
 // ── Oracle helpers ─────────────────────────────────────────────────────────
 
 /// Run pending Oracle migrations on a synchronous `oracle::Connection`.
@@ -162,6 +197,7 @@ pub fn run_oracle_migrations(
     ensure_oracle_versions_table(conn, schema)?;
 
     let current = oracle_current_version(conn, schema)?;
+    schema_ahead_check("oracle", current, migrations, config_version)?;
     let skip_up_to = config_version.unwrap_or(0);
     let effective_start = current.max(skip_up_to);
 
@@ -460,7 +496,7 @@ pub async fn postgres_table_exists(
 }
 
 /// Read the current (highest) schema version from the Postgres versions table.
-async fn postgres_current_version(client: &impl GenericClient) -> Result<u32, String> {
+pub(crate) async fn postgres_current_version(client: &impl GenericClient) -> Result<u32, String> {
     let row = client
         .query_one(
             &format!("SELECT COALESCE(MAX(version), 0) FROM {VERSIONS_TABLE}"),
@@ -630,6 +666,38 @@ mod tests {
                 "the refusal should name {needle}: {err}"
             );
         }
+    }
+
+    /// A store at or below this build's latest migration passes; one ahead
+    /// of it is refused with the versions and the override named, unless the
+    /// schema config's `version` reaches the store's.
+    #[test]
+    fn a_schema_ahead_of_this_build_is_refused_unless_the_version_setting_reaches_it() {
+        let migrations: Vec<Migration> = (1..=3)
+            .map(|version| Migration {
+                version,
+                description: "test",
+                up: |_| vec![],
+            })
+            .collect();
+        assert!(schema_ahead_check("postgres", 0, &migrations, None).is_ok());
+        assert!(schema_ahead_check("postgres", 3, &migrations, None).is_ok());
+        let err = schema_ahead_check("postgres", 99, &migrations, None)
+            .expect_err("a schema ahead of the build is refused");
+        for needle in [
+            "version 99",
+            "(v3)",
+            "`version: 99`",
+            "postgres schema config",
+        ] {
+            assert!(
+                err.contains(needle),
+                "the refusal should name {needle}: {err}"
+            );
+        }
+        assert!(schema_ahead_check("oracle", 99, &migrations, Some(50)).is_err());
+        assert!(schema_ahead_check("oracle", 99, &migrations, Some(99)).is_ok());
+        assert!(schema_ahead_check("oracle", 99, &migrations, Some(100)).is_ok());
     }
 
     #[test]

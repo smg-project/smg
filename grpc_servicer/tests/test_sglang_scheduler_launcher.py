@@ -87,6 +87,9 @@ def test_ready_failure_terminates_every_started_scheduler(monkeypatch, scheduler
         def __init__(self, result):
             self.result = result
 
+        def poll(self, _timeout=None):
+            return True
+
         def recv(self):
             return self.result
 
@@ -126,7 +129,9 @@ def test_ready_failure_terminates_every_started_scheduler(monkeypatch, scheduler
     )
     monkeypatch.setattr(scheduler_launcher_mod.mp, "set_start_method", lambda *_args, **_kw: None)
     monkeypatch.setattr(
-        scheduler_launcher_mod.mp, "Pipe", lambda **_kwargs: (next(readers), object())
+        scheduler_launcher_mod.mp,
+        "Pipe",
+        lambda **_kwargs: (next(readers), SimpleNamespace(close=lambda: None)),
     )
     monkeypatch.setattr(scheduler_launcher_mod.mp, "Process", Process)
 
@@ -158,6 +163,9 @@ def test_schedulers_start_with_the_run_scheduler_process_arguments(
     monkeypatch, scheduler_launcher_mod
 ):
     class Reader:
+        def poll(self, _timeout=None):
+            return True
+
         def recv(self):
             return {"status": "ready"}
 
@@ -171,7 +179,14 @@ def test_schedulers_start_with_the_run_scheduler_process_arguments(
         def start(self):
             pass
 
-    writers = [object(), object()]
+    class Writer:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    writers = [Writer(), Writer()]
     pipes = iter([(Reader(), writer) for writer in writers])
     monkeypatch.setattr(scheduler_launcher_mod.mp, "set_start_method", lambda *_args, **_kw: None)
     monkeypatch.setattr(scheduler_launcher_mod.mp, "Pipe", lambda **_kwargs: next(pipes))
@@ -206,3 +221,84 @@ def test_schedulers_start_with_the_run_scheduler_process_arguments(
         assert bound["dp_rank"] is None
         assert bound["pipe_writer"] is writers[tp_rank]
         assert not {"display_tp_rank", "display_dp_rank", "display_moe_ep_rank"} & bound.keys()
+    # smg-lab #292: the parent's copy of each ready pipe's write end is closed
+    # once the rank has it, so a rank that dies before reporting shows as EOF.
+    assert all(writer.closed for writer in writers)
+
+
+def test_a_scheduler_process_that_dies_before_its_ready_report_fails_the_launch(
+    monkeypatch, scheduler_launcher_mod
+):
+    """smg-lab #292: the wait for the ready reports polls, so a scheduler
+    process that exits during its start (the servicer kept running on a
+    report that never came) ends the launch with a named error and every
+    started process terminated."""
+
+    class Reader:
+        def poll(self, _timeout=None):
+            return False
+
+        def recv(self):
+            raise AssertionError("nothing to receive from a dead rank")
+
+    class Process:
+        instances = []
+
+        def __init__(self, **_kwargs):
+            self.alive = False
+            self.exitcode = None
+            self.pid = 4242
+            self.terminated = False
+            self.join_timeouts = []
+            self.instances.append(self)
+
+        def start(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def kill(self):
+            self.alive = False
+
+        def join(self, timeout=None):
+            self.join_timeouts.append(timeout)
+
+    monkeypatch.setattr(scheduler_launcher_mod, "READY_POLL_SECS", 0.0)
+    monkeypatch.setattr(scheduler_launcher_mod.mp, "set_start_method", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        scheduler_launcher_mod.mp,
+        "Pipe",
+        lambda **_kwargs: (Reader(), SimpleNamespace(close=lambda: None)),
+    )
+    monkeypatch.setattr(scheduler_launcher_mod.mp, "Process", Process)
+    server_args = SimpleNamespace(
+        check_server_args=lambda: None,
+        dp_size=1,
+        enable_memory_saver=False,
+        nnodes=1,
+        pp_size=1,
+        tp_size=1,
+        node_rank=0,
+        base_gpu_id=0,
+        gpu_id_step=1,
+    )
+    # The rank starts, then dies on its own before it reports.
+    original_start = Process.start
+
+    def start_then_die(self):
+        original_start(self)
+        self.alive = False
+        self.exitcode = 1
+
+    monkeypatch.setattr(Process, "start", start_then_die)
+
+    with pytest.raises(RuntimeError, match="exited with code 1 before it was ready"):
+        scheduler_launcher_mod.launch_scheduler_process_only(server_args, port_args=object())
+
+    assert len(Process.instances) == 1
+    assert Process.instances[0].terminated or not Process.instances[0].is_alive()

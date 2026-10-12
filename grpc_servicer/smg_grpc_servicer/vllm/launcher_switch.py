@@ -50,10 +50,21 @@ def with_servicer_switch(
 
     @functools.wraps(serve_grpc)
     async def serve_grpc_with_switch(args: Any, *rest: Any, **kwargs: Any) -> Any:
-        from smg_grpc_servicer.vllm.rust import resolve_servicer_impl, serve_rust
+        from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
+        from smg_grpc_servicer.vllm.rust import (
+            configure_logging,
+            resolve_servicer_impl,
+            serve_rust,
+        )
 
-        if resolve_servicer_impl(args) == "rust":
-            raise SystemExit(await serve_rust(args))
+        try:
+            if resolve_servicer_impl(args) == "rust":
+                raise SystemExit(await serve_rust(args))
+        except ServicerConfigError as error:
+            # A knob the servicer cannot use: one named ERROR line and exit
+            # code 2, not the launcher's traceback.
+            configure_logging()
+            raise configuration_exit(error) from None
         return await serve_grpc(args, *rest, **kwargs)
 
     setattr(serve_grpc_with_switch, _SWITCH_MARK, True)

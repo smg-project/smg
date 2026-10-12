@@ -60,14 +60,13 @@ fn serve_once(
 /// The connector's reading of fetching `url` as an image under
 /// `fetch_timeout`, with the error's words.
 async fn fault_of(url: String, fetch_timeout: Duration) -> (MediaFault, String) {
-    let client = common::http_client_builder()
-        .no_proxy()
-        .build()
-        .expect("client");
+    // The origins of these tests are on loopback, which the address policy
+    // refuses unless private media hosts are allowed.
     let connector = MediaConnector::new(
-        client,
+        common::http_client_builder().no_proxy(),
         MediaConnectorConfig {
             fetch_timeout,
+            allow_private_hosts: true,
             ..MediaConnectorConfig::default()
         },
     )

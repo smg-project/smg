@@ -400,6 +400,21 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name (every redirect hop included); `None` is any host
+    /// the address policy passes.
+    pub fn mm_allowed_media_domains(mut self, domains: Option<Vec<String>>) -> Self {
+        self.config.mm_allowed_media_domains = domains;
+        self
+    }
+
+    /// Allow client-supplied media URLs on loopback, link-local or private
+    /// addresses (a deployment whose media origin is internal).
+    pub fn mm_allow_private_media_hosts(mut self, allowed: bool) -> Self {
+        self.config.mm_allow_private_media_hosts = allowed;
+        self
+    }
+
     /// Listener IP for the RDMA metadata exchange.
     pub fn rdma_listen_ip(mut self, ip: Option<impl Into<String>>) -> Self {
         self.config.rdma_listen_ip = ip.map(Into::into);

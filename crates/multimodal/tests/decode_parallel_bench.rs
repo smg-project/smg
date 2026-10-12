@@ -38,8 +38,11 @@ async fn frames(connector: &MediaConnector, bytes: &[u8], count: usize) -> Vec<A
 async fn bench_decode_all() {
     let path = std::env::var("REAL_JPEG").expect("set REAL_JPEG to a JPEG path");
     let bytes = std::fs::read(&path).expect("read jpeg");
-    let connector = MediaConnector::new(common::http_client(), MediaConnectorConfig::default())
-        .expect("connector");
+    let connector = MediaConnector::new(
+        common::http_client_builder(),
+        MediaConnectorConfig::default(),
+    )
+    .expect("connector");
     // Warm up the decoder and the pool.
     ImageFrame::decode_all(&frames(&connector, &bytes, 2).await).expect("warm-up");
 

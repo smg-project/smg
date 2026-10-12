@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
 use thiserror::Error;
 
@@ -44,6 +44,34 @@ pub enum MediaConnectorError {
     InvalidUrl(String),
     #[error("media domain '{0}' is not in the allow list")]
     DisallowedDomain(String),
+    /// The host names or resolves to an address media is not fetched from
+    /// (loopback, link-local, private, shared address space, unspecified,
+    /// multicast, broadcast) and private media hosts are not allowed.
+    #[error(
+        "media host '{host}' resolves to {address}, a {class} address, which media is not \
+         fetched from unless private media hosts are allowed"
+    )]
+    DisallowedAddress {
+        host: String,
+        address: IpAddr,
+        class: &'static str,
+    },
+    #[error("media host '{host}' could not be resolved: {source}")]
+    UnresolvableHost {
+        host: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A redirect to a target the host policy refuses, or that is no media
+    /// URL; `reason` is the refusal in the policy's words.
+    #[error("the fetch of {url} was redirected to {target}, which is refused: {reason}")]
+    DisallowedRedirect {
+        url: String,
+        target: String,
+        reason: String,
+    },
+    #[error("the fetch of {url} was redirected more than {limit} times")]
+    TooManyRedirects { url: String, limit: usize },
     #[error("local media path is not allowed: {0}")]
     DisallowedLocalPath(String),
     #[error("HTTP error while fetching media: {0}")]
@@ -98,8 +126,9 @@ pub enum MultiModalError {
 /// answered and whether the process that fetched is at fault at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaFault {
-    /// The request's own: a URL that cannot be parsed or is not allowed, a
-    /// host that cannot be resolved or refuses the connection, a host that
+    /// The request's own: a URL that cannot be parsed or is not allowed (by
+    /// name, by the address it leads to, or by where it redirects), a host
+    /// that cannot be resolved or refuses the connection, a host that
     /// answers 4xx, a local file the request names that cannot be read, a
     /// payload that is not the media it claims to be or is too large, a
     /// media parameter out of range. The host's reachability is judged from
@@ -140,6 +169,10 @@ impl MediaConnectorError {
             | Self::UnsupportedScheme(_)
             | Self::InvalidUrl(_)
             | Self::DisallowedDomain(_)
+            | Self::DisallowedAddress { .. }
+            | Self::UnresolvableHost { .. }
+            | Self::DisallowedRedirect { .. }
+            | Self::TooManyRedirects { .. }
             | Self::DisallowedLocalPath(_)
             | Self::Io(_)
             | Self::Base64Decode(_)
@@ -230,6 +263,24 @@ mod tests {
             MediaConnectorError::UnsupportedScheme("ftp".to_string()),
             MediaConnectorError::InvalidUrl("not a url".to_string()),
             MediaConnectorError::DisallowedDomain("media.example".to_string()),
+            MediaConnectorError::DisallowedAddress {
+                host: "media.example".to_string(),
+                address: IpAddr::from([10, 0, 0, 5]),
+                class: "private",
+            },
+            MediaConnectorError::UnresolvableHost {
+                host: "media.invalid".to_string(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+            MediaConnectorError::DisallowedRedirect {
+                url: "http://media.example/a.png".to_string(),
+                target: "http://10.0.0.5/a.png".to_string(),
+                reason: "private".to_string(),
+            },
+            MediaConnectorError::TooManyRedirects {
+                url: "http://media.example/a.png".to_string(),
+                limit: 10,
+            },
             MediaConnectorError::DataUrl("missing comma in data url".to_string()),
             MediaConnectorError::PayloadTooLarge {
                 media: "image",

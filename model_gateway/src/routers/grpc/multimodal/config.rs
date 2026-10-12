@@ -17,7 +17,7 @@ use super::{
     pixel_cache::{pixel_cache_with_budget, PixelCache},
     settings::MultimodalSettings,
 };
-use crate::worker::http_client::build_client;
+use crate::worker::http_client::build_with;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug, Clone)]
@@ -269,14 +269,30 @@ impl MultimodalComponents {
         max_inflight_bytes: Option<usize>,
         settings: &MultimodalSettings,
     ) -> Result<Self> {
-        let client = build_client(
+        // The router fetches client-supplied media URLs itself here: the
+        // connector's host policy (the allow-list and the address policy)
+        // comes from the same resolved settings as the placement mode.
+        let connector_config = MediaConnectorConfig {
+            allowed_domains: settings.allowed_media_domains.value.clone(),
+            allow_private_hosts: settings.allow_private_media_hosts.value,
+            ..MediaConnectorConfig::default()
+        };
+        // The line shows the allow-list as the connector enforces it (trimmed,
+        // a list with no names being none), not as it was spelled.
+        tracing::info!(
+            allowed_media_domains =
+                ?llm_multimodal::effective_allowed_domains(connector_config.allowed_domains.as_deref()),
+            allow_private_media_hosts = connector_config.allow_private_hosts,
+            allow_private_media_hosts_source = settings.allow_private_media_hosts.source.as_str(),
+            "media fetch policy for router-side processing"
+        );
+        let media_connector = build_with(
             || crate::http_client::client_builder().timeout(std::time::Duration::from_secs(30)),
             false,
             "media HTTP client",
+            |client| MediaConnector::new(client, connector_config.clone()),
         )
         .map_err(anyhow::Error::msg)?;
-        let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
-            .context("Failed to create MediaConnector")?;
 
         super::report_jpeg_decoder();
         let processing = settings.processing.value;

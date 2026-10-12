@@ -12,7 +12,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // Jemalloc's run-time options for a long-running server (see
 // `SERVER_MALLOC_CONF`): the executable exports them as jemalloc's
 // application-provided `malloc_conf`, as the Python extension does for the
-// router launched from Python.
+// router launched from Python and the Go FFI library for a Go host.
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 use smg::observability::metrics::SERVER_MALLOC_CONF;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
@@ -134,6 +134,16 @@ pub enum DiscoveryProvider {
     Kubernetes,
     #[value(name = "file")]
     File,
+}
+
+impl DiscoveryProvider {
+    /// The spelling `--discovery-provider` takes for this provider.
+    fn flag_value(self) -> &'static str {
+        match self {
+            Self::Kubernetes => "kubernetes",
+            Self::File => "file",
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -642,8 +652,16 @@ struct CliArgs {
     /// it makes progress. The bound stretches to the time its in-flight
     /// prompts may still need in prefill, up to 120 seconds. The pile is the
     /// streaming gRPC generations in flight; HTTP workers, PD legs and
-    /// non-streaming generations give no signal and never form one. 0
-    /// disables the rule.
+    /// non-streaming generations give no signal and never form one. The
+    /// same bound, read per request, is how long a prefill leg of a
+    /// disaggregated dispatch may produce nothing, with its worker answering
+    /// no other leg either, before its request fails over to another
+    /// prefill worker (or fails, when there is none); a leg queued on a
+    /// worker that keeps answering waits on. On the parallel dispatch shape
+    /// a prefill leg's first response also waits for the decode side (its
+    /// bootstrap, and KV pre-allocation under decode pressure), so the
+    /// threshold must cover that wait for a prefill worker with nothing
+    /// else to answer meanwhile. 0 disables both.
     #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
     worker_wedge_secs: u64,
 
@@ -782,6 +800,21 @@ struct CliArgs {
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
     mm_pixel_rdma: bool,
 
+    /// Hosts the gateway fetches client-supplied media URLs from when it
+    /// processes media itself, by name, comma-separated; a redirect to any
+    /// other host is refused. Unset allows any host the address policy
+    /// passes (public addresses, or private ones with
+    /// `--mm-allow-private-media-hosts`).
+    #[arg(long, value_delimiter = ',', help_heading = "Multimodal")]
+    mm_allowed_media_domains: Option<Vec<String>>,
+
+    /// Allow client-supplied media URLs that name or resolve to a loopback,
+    /// link-local or private address, for a deployment whose media origin is
+    /// internal; by default such URLs are refused before anything is
+    /// connected. Falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
+    #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
+    mm_allow_private_media_hosts: bool,
+
     /// Listener IP for the RDMA pixel lane's metadata exchange; without one
     /// the lane stays on the inline path. Falls back to `SMG_RDMA_LISTEN_IP`.
     #[arg(long, help_heading = "Multimodal")]
@@ -904,7 +937,9 @@ struct CliArgs {
     log_json: bool,
 
     // ==================== Prometheus Metrics ====================
-    /// Port to expose Prometheus metrics; 0 binds an OS-assigned ephemeral port
+    /// Port to expose Prometheus metrics. Each listener (--port,
+    /// --prometheus-port, --health-check-port, --mesh-port) needs its own
+    /// port.
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
     prometheus_port: u16,
 
@@ -1121,18 +1156,21 @@ struct CliArgs {
 
     // ==================== Health Checks ====================
     /// Consecutive probe failures before a worker is taken out of rotation
+    /// (at least 1)
     #[arg(long, default_value_t = 3, help_heading = "Health Checks")]
     health_failure_threshold: u32,
 
-    /// Consecutive probe successes before a worker returns to rotation
+    /// Consecutive probe successes before a worker returns to rotation (at
+    /// least 1)
     #[arg(long, default_value_t = 2, help_heading = "Health Checks")]
     health_success_threshold: u32,
 
-    /// Timeout in seconds for a single health probe
+    /// Timeout in seconds for a single health probe (at least 1)
     #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
     health_check_timeout_secs: u64,
 
-    /// Interval in seconds between health probes of each worker
+    /// Interval in seconds between health probes of each worker (at least
+    /// 1; --disable-health-check turns probing off)
     #[arg(long, default_value_t = 60, help_heading = "Health Checks")]
     health_check_interval_secs: u64,
 
@@ -1492,45 +1530,47 @@ fn parse_model_alias(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-/// Parse role mapping from CLI format "idp_role=gateway_role"
-#[expect(
-    clippy::print_stderr,
-    reason = "pre-logger CLI argument parsing warnings"
-)]
-fn parse_role_mapping(mapping: &str) -> Option<(String, Role)> {
+/// Parse a JWT role mapping from CLI format "idp_role=gateway_role". A
+/// malformed entry is a configuration error, never a dropped mapping: with
+/// the mapping dropped the map can end up empty, and an empty map grants the
+/// gateway's admin role to any token whose roles claim says `admin`.
+fn parse_role_mapping(mapping: &str) -> ConfigResult<(String, Role)> {
     let parts: Vec<&str> = mapping.splitn(2, '=').collect();
     if parts.len() != 2 {
-        eprintln!(
-            "WARNING: Invalid role mapping format '{mapping}'. Expected 'idp_role=gateway_role'"
-        );
-        return None;
+        return Err(ConfigError::InvalidValue {
+            field: "jwt-role-mapping".to_string(),
+            value: mapping.to_string(),
+            reason: "expected 'idp_role=gateway_role'".to_string(),
+        });
     }
     let idp_role = parts[0].to_string();
     let gateway_role = match parts[1].to_lowercase().as_str() {
         "admin" => Role::Admin,
         "user" => Role::User,
-        other => {
-            eprintln!(
-                "WARNING: Invalid gateway role '{other}' in mapping. Valid roles: admin, user"
-            );
-            return None;
+        _ => {
+            return Err(ConfigError::InvalidValue {
+                field: "jwt-role-mapping".to_string(),
+                value: mapping.to_string(),
+                reason: "the gateway role must be 'admin' or 'user'".to_string(),
+            });
         }
     };
-    Some((idp_role, gateway_role))
+    Ok((idp_role, gateway_role))
 }
 
-/// Parse control plane API key from CLI format "id:name:role:key"
-#[expect(
-    clippy::print_stderr,
-    reason = "pre-logger CLI argument parsing warnings"
-)]
-fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
+/// Parse a control-plane API key from CLI format "id:name:role:key". A
+/// malformed entry is a configuration error, never a dropped key: a dropped
+/// key would leave the control plane open (or lock an operator out) with
+/// nothing but a stderr line to show for it. The entry is not echoed, since
+/// it carries the credential.
+fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
     let parts: Vec<&str> = key_str.splitn(4, ':').collect();
     if parts.len() != 4 {
-        eprintln!(
-            "WARNING: Invalid control-plane-api-key format '{key_str}'. Expected 'id:name:role:key'"
-        );
-        return None;
+        return Err(ConfigError::InvalidValue {
+            field: "control-plane-api-keys".to_string(),
+            value: "<redacted>".to_string(),
+            reason: "expected 'id:name:role:key'".to_string(),
+        });
     }
     let id = parts[0];
     let name = parts[1];
@@ -1540,15 +1580,17 @@ fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
     let role = match role_str.to_lowercase().as_str() {
         "admin" => Role::Admin,
         "user" => Role::User,
-        other => {
-            eprintln!(
-                "WARNING: Invalid role '{other}' in control-plane-api-key. Valid roles: admin, user"
-            );
-            return None;
+        // The field is not named either: with the fields out of order it is the credential.
+        _ => {
+            return Err(ConfigError::InvalidValue {
+                field: "control-plane-api-keys".to_string(),
+                value: "<redacted>".to_string(),
+                reason: "the role must be 'admin' or 'user'".to_string(),
+            });
         }
     };
 
-    Some(ApiKeyEntry::new(id, name, key, role))
+    Ok(ApiKeyEntry::new(id, name, key, role))
 }
 
 /// Parse a tenant-scoped data-plane API key from CLI format "tenant_id:key".
@@ -1573,17 +1615,20 @@ fn parse_tenant_api_key(key_str: &str) -> ConfigResult<TenantApiKeyEntry> {
 }
 
 impl CliArgs {
-    /// Build control plane authentication configuration from CLI args.
-    #[expect(clippy::print_stderr, reason = "pre-logger CLI configuration warnings")]
-    fn build_control_plane_auth_config(&self) -> ControlPlaneAuthConfig {
+    /// Build control plane authentication configuration from CLI args. A
+    /// configuration that asks for authentication but cannot be honoured
+    /// (a malformed key entry, an issuer without an audience or the reverse)
+    /// is an error: silently dropping it would start the control plane open.
+    fn build_control_plane_auth_config(&self) -> ConfigResult<ControlPlaneAuthConfig> {
         // Build JWT config if issuer and audience are provided
         let jwt = match (&self.jwt_issuer, &self.jwt_audience) {
             (Some(issuer), Some(audience)) => {
-                let role_mapping: HashMap<String, Role> = self
+                // One malformed mapping refuses the start: dropped, it could widen access
+                let role_mapping = self
                     .jwt_role_mapping
                     .iter()
-                    .filter_map(|m| parse_role_mapping(m))
-                    .collect();
+                    .map(|m| parse_role_mapping(m))
+                    .collect::<ConfigResult<HashMap<String, Role>>>()?;
 
                 let mut jwt_config = JwtConfig::new(issuer.clone(), audience.clone());
                 jwt_config.role_claim.clone_from(&self.jwt_role_claim);
@@ -1594,28 +1639,30 @@ impl CliArgs {
                 Some(jwt_config)
             }
             (Some(_), None) => {
-                eprintln!("WARNING: --jwt-issuer provided but --jwt-audience is missing. JWT auth disabled.");
-                None
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--jwt-issuer requires --jwt-audience (control-plane JWT authentication would otherwise be silently disabled)".to_string(),
+                });
             }
             (None, Some(_)) => {
-                eprintln!("WARNING: --jwt-audience provided but --jwt-issuer is missing. JWT auth disabled.");
-                None
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--jwt-audience requires --jwt-issuer (control-plane JWT authentication would otherwise be silently disabled)".to_string(),
+                });
             }
             (None, None) => None,
         };
 
-        // Build API keys from CLI args
-        let api_keys: Vec<ApiKeyEntry> = self
+        // Build API keys from CLI args; one malformed entry refuses the start
+        let api_keys = self
             .control_plane_api_keys
             .iter()
-            .filter_map(|k| parse_control_plane_api_key(k))
-            .collect();
+            .map(|k| parse_control_plane_api_key(k))
+            .collect::<ConfigResult<Vec<ApiKeyEntry>>>()?;
 
-        ControlPlaneAuthConfig {
+        Ok(ControlPlaneAuthConfig {
             jwt,
             api_keys,
             audit_enabled: !self.disable_audit_logging,
-        }
+        })
     }
 
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
@@ -1722,6 +1769,8 @@ impl CliArgs {
             });
         }
 
+        // The mesh port against the other listeners' is checked in
+        // `server::startup`, for every way the server configuration is built.
         let bind_addr = Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
         let (advertise_host, advertise_field) =
             if let Some(host) = self.mesh_advertise_host.as_deref() {
@@ -2013,11 +2062,210 @@ impl CliArgs {
         Ok(rcf)
     }
 
+    /// The flags whose value has a required shape, refused by name when the
+    /// shape is wrong: a wrong shape used to be dropped or passed on in
+    /// silence, which narrowed a security policy or broke a health policy
+    /// without a word.
+    fn validate_flag_formats(&self) -> ConfigResult<()> {
+        let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value: value.to_string(),
+            reason: reason.to_string(),
+        };
+        for origin in &self.cors_allowed_origins {
+            // Exactly what a browser sends as `Origin`: the scheme and the host
+            // in lower case, no userinfo, no default port, nothing after the
+            // authority (not even `/`); anything else never matches the exact
+            // comparison of the CORS layer.
+            let default_port = |scheme: &str| match scheme {
+                "http" | "ws" => Some(80),
+                "https" | "wss" => Some(443),
+                _ => None,
+            };
+            let parsed = http::Uri::try_from(origin.as_str()).ok().filter(|uri| {
+                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
+                    if origin.as_str() == format!("{scheme}://{authority}")
+                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
+                        && !authority.as_str().contains('@')
+                        && authority
+                            .port_u16()
+                            .is_none_or(|port| Some(port) != default_port(scheme)))
+            });
+            if parsed.is_none() || http::HeaderValue::from_str(origin).is_err() {
+                return Err(invalid(
+                    "cors_allowed_origins",
+                    origin,
+                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
+                ));
+            }
+        }
+        if !self.health_check_endpoint.starts_with('/') {
+            return Err(invalid(
+                "health_check_endpoint",
+                &self.health_check_endpoint,
+                "must start with '/': it is appended to every HTTP worker's URL",
+            ));
+        }
+        let buckets = &self.prometheus_duration_buckets;
+        if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
+            return Err(invalid(
+                "prometheus_duration_buckets",
+                &bad.to_string(),
+                "every bucket bound must be a finite number above 0",
+            ));
+        }
+        if let Some(pair) = buckets.windows(2).find(|w| w[1] <= w[0]) {
+            return Err(invalid(
+                "prometheus_duration_buckets",
+                &format!("{} {}", pair[0], pair[1]),
+                "bucket bounds must ascend strictly",
+            ));
+        }
+        for entry in &self.storage_context_headers {
+            if !entry.contains('=') {
+                return Err(invalid(
+                    "storage_context_headers",
+                    entry,
+                    "expected 'header-name=context-key'",
+                ));
+            }
+        }
+        for name in &self.request_id_headers {
+            if http::header::HeaderName::try_from(name.as_str()).is_err() {
+                return Err(invalid(
+                    "request_id_headers",
+                    name,
+                    "not a valid HTTP header name: it could never match a request",
+                ));
+            }
+        }
+        if let Some(key) = &self.api_key {
+            if key.trim().is_empty() {
+                return Err(invalid(
+                    "api_key",
+                    "",
+                    "an empty credential would switch authentication on with a key nothing can present",
+                ));
+            }
+        }
+        for mapping in &self.jwt_role_mapping {
+            match mapping.split_once('=') {
+                Some((idp_role, gateway_role))
+                    if !idp_role.is_empty()
+                        && matches!(
+                            gateway_role.to_ascii_lowercase().as_str(),
+                            "admin" | "user"
+                        ) => {}
+                _ => {
+                    return Err(invalid(
+                        "jwt_role_mapping",
+                        mapping,
+                        "expected 'idp_role=admin' or 'idp_role=user'",
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The flags that only act with a companion, named when the companion is
+    /// absent: each used to be ignored in silence.
+    fn ignored_companions(
+        &self,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) -> Vec<String> {
+        let mut ignored = Vec::new();
+        if !(self.pd_disaggregation || self.epd_disaggregation) {
+            for (flag, given) in [
+                ("--prefill", !prefill_urls.is_empty()),
+                ("--decode", !self.decode.is_empty()),
+                ("--prefill-policy", self.prefill_policy.is_some()),
+                ("--decode-policy", self.decode_policy.is_some()),
+            ] {
+                if given {
+                    ignored.push(format!(
+                        "{flag} is ignored without --pd-disaggregation (or --epd-disaggregation)"
+                    ));
+                }
+            }
+        }
+        if !self.epd_disaggregation {
+            for (flag, given) in [
+                ("--encode", !encode_urls.is_empty()),
+                ("--encode-policy", self.encode_policy.is_some()),
+            ] {
+                if given {
+                    ignored.push(format!("{flag} is ignored without --epd-disaggregation"));
+                }
+            }
+        }
+        // The selectors select Kubernetes pods: another provider ignores them
+        // as the absence of any does.
+        let provider = self.selected_discovery_provider();
+        if provider != Some(DiscoveryProvider::Kubernetes) {
+            let without = match provider {
+                None => "without --service-discovery".to_string(),
+                Some(provider) => format!(
+                    "under --discovery-provider {}: it selects Kubernetes pods",
+                    provider.flag_value()
+                ),
+            };
+            for (flag, given) in [
+                ("--selector", !self.selector.is_empty()),
+                ("--prefill-selector", !self.prefill_selector.is_empty()),
+                ("--decode-selector", !self.decode_selector.is_empty()),
+                ("--encode-selector", !self.encode_selector.is_empty()),
+                ("--router-selector", !self.router_selector.is_empty()),
+            ] {
+                if given {
+                    ignored.push(format!("{flag} is ignored {without}"));
+                }
+            }
+        }
+        if let Some(provider) = provider {
+            if !self.worker_urls.is_empty() {
+                let source = if self.service_discovery {
+                    "--service-discovery".to_string()
+                } else {
+                    format!("--discovery-provider {}", provider.flag_value())
+                };
+                ignored.push(format!(
+                    "--worker-urls and {source} are both given: both are worker sources, \
+                     the listed workers register first and the discovered ones join them"
+                ));
+            }
+        }
+        if self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled {
+            ignored.push(
+                "--priority-scheduler-config is ignored without --priority-scheduler-enabled"
+                    .to_string(),
+            );
+        }
+        ignored
+    }
+
+    /// The companion warnings of [`ignored_companions`](Self::ignored_companions), one
+    /// line each on stderr: the logger is not up when the flags are read.
+    #[expect(clippy::print_stderr, reason = "pre-logger CLI configuration warnings")]
+    fn warn_ignored_companions(
+        &self,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) {
+        for ignored in self.ignored_companions(prefill_urls, encode_urls) {
+            eprintln!("WARNING: {ignored}");
+        }
+    }
+
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
+        self.validate_flag_formats()?;
+        self.warn_ignored_companions(&prefill_urls, &encode_urls);
+
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
         let mode = if matches!(self.backend, Some(Backend::Openai)) {
@@ -2264,6 +2512,8 @@ impl CliArgs {
             .mm_processing(self.mm_processing)
             .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
             .mm_pixel_rdma(self.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
@@ -2396,7 +2646,7 @@ impl CliArgs {
 
         // Build control plane auth config
         let control_plane_auth = {
-            let config = self.build_control_plane_auth_config();
+            let config = self.build_control_plane_auth_config()?;
             if config.is_enabled() {
                 Some(config)
             } else {
@@ -2569,6 +2819,192 @@ mod tests {
         Cli::parse_from(argv).router_args
     }
 
+    /// A flag whose value has a required shape is refused by name when the
+    /// shape is wrong, where it used to be dropped or passed on in silence;
+    /// the well-formed spellings pass.
+    #[test]
+    fn malformed_flag_values_are_refused_by_name() {
+        for (args, field) in [
+            (
+                vec!["--cors-allowed-origins", "http://[bad"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "example.com"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "https://example.com/"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "https://Example.com"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "https://example.com:443"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--cors-allowed-origins", "https://user@example.com"],
+                "cors_allowed_origins",
+            ),
+            (
+                vec!["--health-check-endpoint", "health"],
+                "health_check_endpoint",
+            ),
+            (
+                vec!["--prometheus-duration-buckets", "2", "1"],
+                "prometheus_duration_buckets",
+            ),
+            (
+                vec!["--prometheus-duration-buckets", "nan"],
+                "prometheus_duration_buckets",
+            ),
+            (
+                vec!["--prometheus-duration-buckets", "0"],
+                "prometheus_duration_buckets",
+            ),
+            (
+                vec!["--storage-context-headers", "noeq"],
+                "storage_context_headers",
+            ),
+            (
+                vec!["--request-id-headers", "bad header"],
+                "request_id_headers",
+            ),
+            (vec!["--api-key", ""], "api_key"),
+            (vec!["--jwt-role-mapping", "noeq"], "jwt_role_mapping"),
+            (vec!["--jwt-role-mapping", "ops=root"], "jwt_role_mapping"),
+        ] {
+            let err = cli_args_from(&args)
+                .to_router_config(vec![], vec![])
+                .expect_err(&args.join(" "));
+            match err {
+                ConfigError::InvalidValue { field: named, .. } => {
+                    assert_eq!(named, field, "{}", args.join(" "));
+                }
+                other => panic!("{}: {other}", args.join(" ")),
+            }
+        }
+        cli_args_from(&[
+            "--cors-allowed-origins",
+            "https://example.com:8443",
+            "--health-check-endpoint",
+            "/health",
+            "--prometheus-duration-buckets",
+            "0.1",
+            "1",
+            "--storage-context-headers",
+            "x-tenant=tenant",
+            "--request-id-headers",
+            "x-request-id",
+            "--api-key",
+            "secret",
+            "--jwt-role-mapping",
+            "ops=admin",
+        ])
+        .to_router_config(vec![], vec![])
+        .expect("well-formed values pass");
+    }
+
+    /// A flag that only acts with a companion is named when the companion is
+    /// absent, where it used to be ignored in silence; with the companion
+    /// present nothing is named.
+    #[test]
+    fn flags_without_their_companion_are_named() {
+        let prefill = [("http://127.0.0.1:1".to_string(), None)];
+        let encode = [("http://127.0.0.1:3".to_string(), None)];
+        let ignored = cli_args_from(&[
+            "--decode",
+            "http://127.0.0.1:2",
+            "--decode-policy",
+            "random",
+            "--prefill-policy",
+            "random",
+            "--encode-policy",
+            "random",
+            "--selector",
+            "a=b",
+            "--priority-scheduler-config",
+            "/dev/null",
+        ])
+        .ignored_companions(&prefill, &encode);
+        for flag in [
+            "--prefill",
+            "--decode",
+            "--decode-policy",
+            "--prefill-policy",
+            "--encode",
+            "--encode-policy",
+            "--selector",
+            "--priority-scheduler-config",
+        ] {
+            assert!(
+                ignored.iter().any(|m| m.starts_with(flag)),
+                "{flag} is named in {ignored:?}"
+            );
+        }
+        let both = cli_args_from(&[
+            "--worker-urls",
+            "http://127.0.0.1:1",
+            "--service-discovery",
+            "--selector",
+            "a=b",
+        ])
+        .ignored_companions(&[], &[]);
+        assert!(
+            both.iter()
+                .any(|m| m.contains("--worker-urls") && m.contains("--service-discovery")),
+            "{both:?}"
+        );
+        // Another provider ignores the selectors too, and the worker-urls
+        // note names the provider that was given.
+        let under_file = cli_args_from(&[
+            "--discovery-provider",
+            "file",
+            "--selector",
+            "a=b",
+            "--worker-urls",
+            "http://127.0.0.1:1",
+        ])
+        .ignored_companions(&[], &[]);
+        assert!(
+            under_file
+                .iter()
+                .any(|m| m.starts_with("--selector") && m.contains("--discovery-provider file")),
+            "{under_file:?}"
+        );
+        assert!(
+            under_file.iter().any(|m| m.starts_with("--worker-urls")
+                && m.contains("--discovery-provider file")
+                && !m.contains("--service-discovery")),
+            "{under_file:?}"
+        );
+        let under_kubernetes =
+            cli_args_from(&["--discovery-provider", "kubernetes", "--selector", "a=b"])
+                .ignored_companions(&[], &[]);
+        assert!(under_kubernetes.is_empty(), "{under_kubernetes:?}");
+        let epd = cli_args_from(&["--epd-disaggregation", "--encode-policy", "random"])
+            .ignored_companions(&[], &encode);
+        assert!(epd.is_empty(), "{epd:?}");
+        let paired = cli_args_from(&[
+            "--pd-disaggregation",
+            "--decode",
+            "http://127.0.0.1:2",
+            "--decode-policy",
+            "random",
+            "--service-discovery",
+            "--selector",
+            "a=b",
+            "--priority-scheduler-enabled",
+            "--priority-scheduler-config",
+            "/dev/null",
+        ])
+        .ignored_companions(&prefill, &[]);
+        assert!(paired.is_empty(), "{paired:?}");
+    }
+
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so
     /// IPv6 works with or without brackets, as it does for `--host`.
     #[test]
@@ -2720,6 +3156,111 @@ mod tests {
                 "args {args:?}"
             );
         }
+    }
+
+    /// A malformed `--control-plane-api-keys` entry or an unknown role used to
+    /// be dropped with a stderr line, which started the control plane open:
+    /// every such entry is now a configuration error, a valid one still works.
+    #[test]
+    fn control_plane_api_key_entries_fail_closed() {
+        for bad in [
+            &["--control-plane-api-keys", "bad"][..],
+            &["--control-plane-api-keys", "i:n:bogus:s3cr3t"][..],
+            // the fields out of order: the role field is the credential
+            &[
+                "--control-plane-api-keys",
+                "ops:Ops Key:sk-live-abc123:admin",
+            ][..],
+            &["--control-plane-api-keys", ""][..],
+            &[
+                "--control-plane-api-keys",
+                "i:n:admin:s3cr3t",
+                "--control-plane-api-keys",
+                "bad",
+            ][..],
+        ] {
+            let err = cli_args_from(bad)
+                .build_control_plane_auth_config()
+                .expect_err("a malformed control-plane key entry must refuse the start");
+            let text = err.to_string();
+            assert!(text.contains("control-plane-api-keys"), "{bad:?}: {text}");
+            assert!(
+                !text.contains("s3cr3t")
+                    && !text.contains("sk-live-abc123")
+                    && !text.contains("'bad'"),
+                "the entry (it carries the credential) must not be echoed: {text}"
+            );
+        }
+        let config = cli_args_from(&["--control-plane-api-keys", "i:n:admin:s3cr3t"])
+            .build_control_plane_auth_config()
+            .expect("a valid entry");
+        assert!(config.is_enabled());
+        assert_eq!(config.api_keys.len(), 1);
+    }
+
+    /// `--jwt-issuer` without `--jwt-audience` (and the reverse) used to
+    /// disable JWT authentication silently; both halves are required together.
+    #[test]
+    fn jwt_issuer_and_audience_are_required_together() {
+        assert!(cli_args_from(&["--jwt-issuer", "https://issuer.example"])
+            .build_control_plane_auth_config()
+            .is_err());
+        assert!(cli_args_from(&["--jwt-audience", "aud"])
+            .build_control_plane_auth_config()
+            .is_err());
+        let config = cli_args_from(&[
+            "--jwt-issuer",
+            "https://issuer.example",
+            "--jwt-audience",
+            "aud",
+            "--jwt-jwks-uri",
+            "https://issuer.example/jwks",
+        ])
+        .build_control_plane_auth_config()
+        .expect("a complete JWT configuration");
+        assert!(config.jwt.is_some());
+        assert!(cli_args_from(&[])
+            .build_control_plane_auth_config()
+            .expect("no auth configured")
+            .jwt
+            .is_none());
+    }
+
+    /// A malformed `--jwt-role-mapping` entry used to be dropped with a stderr
+    /// line; an empty map grants the gateway's admin role to any token whose
+    /// roles claim says `admin`, so every such entry is a configuration error.
+    #[test]
+    fn jwt_role_mapping_entries_fail_closed() {
+        let jwt = [
+            "--jwt-issuer",
+            "https://issuer.example",
+            "--jwt-audience",
+            "aud",
+        ];
+        for bad in ["admin:user", "gw-admins=root", "gw-admins"] {
+            let args: Vec<&str> = jwt
+                .iter()
+                .copied()
+                .chain(["--jwt-role-mapping", bad])
+                .collect();
+            let err = cli_args_from(&args)
+                .build_control_plane_auth_config()
+                .expect_err("a malformed role mapping must refuse the start");
+            assert!(err.to_string().contains("jwt-role-mapping"), "{bad}: {err}");
+        }
+        let args: Vec<&str> = jwt
+            .iter()
+            .copied()
+            .chain(["--jwt-role-mapping", "gw-admins=admin"])
+            .collect();
+        let config = cli_args_from(&args)
+            .build_control_plane_auth_config()
+            .expect("a valid role mapping");
+        let jwt_config = config.jwt.expect("JWT configured");
+        assert!(matches!(
+            jwt_config.role_mapping.get("gw-admins"),
+            Some(Role::Admin)
+        ));
     }
 
     /// A grouped ZMQ handshake needs at least one engine, so `0` (and any
@@ -3615,7 +4156,11 @@ mod tests {
             "--rdma-slot-ttl-s",
             "600",
             "--log-mm-timing",
+            "--mm-allowed-media-domains",
+            "media.example,cdn.example",
+            "--mm-allow-private-media-hosts",
         ]);
+        let domains = Some(vec!["media.example".to_string(), "cdn.example".to_string()]);
 
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.mm_processing, Some(MmProcessingMode::Worker));
@@ -3624,6 +4169,8 @@ mod tests {
         assert_eq!(router_config.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(router_config.rdma_slot_ttl_s, Some(600));
         assert!(router_config.log_mm_timing);
+        assert_eq!(router_config.mm_allowed_media_domains, domains);
+        assert!(router_config.mm_allow_private_media_hosts);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         let nested = &server_config.router_config;
@@ -3633,6 +4180,8 @@ mod tests {
         assert_eq!(nested.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(nested.rdma_slot_ttl_s, Some(600));
         assert!(nested.log_mm_timing);
+        assert_eq!(nested.mm_allowed_media_domains, domains);
+        assert!(nested.mm_allow_private_media_hosts);
     }
 
     #[test]
@@ -3645,10 +4194,13 @@ mod tests {
         assert_eq!(router_config.rdma_listen_ip, None);
         assert_eq!(router_config.rdma_slot_ttl_s, None);
         assert!(!router_config.log_mm_timing);
+        assert_eq!(router_config.mm_allowed_media_domains, None);
+        assert!(!router_config.mm_allow_private_media_hosts);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.router_config.mm_processing, None);
         assert!(!server_config.router_config.log_mm_timing);
+        assert!(!server_config.router_config.mm_allow_private_media_hosts);
     }
 
     #[test]

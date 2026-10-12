@@ -19,8 +19,13 @@
 //!   `<|end_message|>` is the message's, dropped.
 //! - **The turn's end token is ignored.** The template writes `<|content_model_end_sampling|>`
 //!   after the turn; an engine that passes it through has it dropped wherever it stands.
-//! - **No grammar yet.** `Format::grammar` gives `None` for this syntax: a forced call's tag would
-//!   start inside the first message, before any opener, which the derivation does not write yet.
+//! - **A forced call's tag is the gateway's.** `Format::grammar` writes the tag the gateway's old
+//!   Inkling parser hand-writes: the call marker triggers it inside whatever message the model is
+//!   writing, the first one included, then `{"name":"NAME","args":`, the schema, `}` and
+//!   `<|end_message|>`; the tool's name before the marker, a thought and the template's empty
+//!   answer are free text, so the recorded thinking turn stays writable. A marker outside a
+//!   message's header is writable under the tag too and reads as that message's text: the
+//!   grammar is wider than the table there, as the gateway's tag is.
 //!
 //! What the table leaves out, for want of fixtures: image and audio messages, which the template
 //! writes for the user and never for the model; and the text-mode invocation,
