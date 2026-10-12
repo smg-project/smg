@@ -1268,8 +1268,13 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
         order: SortOrder::Asc,
         after: None,
     };
+    let metadata: serde_json::Map<String, serde_json::Value> =
+        [("k".to_string(), json!("v"))].into_iter().collect();
     resp.get_response(&response_id).await.expect("read");
     conv.get_conversation(&conversation.id).await.expect("read");
+    conv.update_conversation(&conversation.id, Some(metadata.clone()))
+        .await
+        .expect("update");
     items
         .is_item_linked(&conversation.id, &item.id)
         .await
@@ -1299,6 +1304,17 @@ async fn a_read_or_a_write_is_one_round_trip_after_the_first_on_a_connection() {
             let id = conversation.id.clone();
             Box::pin(async move {
                 conv.get_conversation(&id)
+                    .await
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            })
+        }),
+        ("update_conversation", {
+            let conv = conv.clone();
+            let id = conversation.id.clone();
+            let metadata = metadata.clone();
+            Box::pin(async move {
+                conv.update_conversation(&id, Some(metadata))
                     .await
                     .map(drop)
                     .map_err(|e| e.to_string())

@@ -382,6 +382,53 @@ impl PostgresConversationStorage {
             ))),
         }
     }
+    /// The columns a conversation is read with: the id, then its creation
+    /// time, metadata and tenant when the schema keeps them.
+    fn row_columns(s: &crate::schema::TableConfig) -> Vec<String> {
+        let mut columns = vec![s.col("id").to_string()];
+        for name in ["created_at", "metadata", "tenant"] {
+            if !s.is_skipped(name) {
+                columns.push(s.col(name).to_string());
+            }
+        }
+        columns
+    }
+
+    /// The conversation a row read with [`Self::row_columns`] holds.
+    fn conversation_from_row(
+        s: &crate::schema::TableConfig,
+        row: &Row,
+    ) -> Result<Conversation, ConversationStorageError> {
+        let id_str: String = row.get(s.col("id"));
+        let created_at: DateTime<Utc> = if s.is_skipped("created_at") {
+            Utc::now()
+        } else {
+            row.get(s.col("created_at"))
+        };
+        // Use `try_get` (not `get`) so schema drift or malformed data in the
+        // `JSON` column returns an error instead of panicking the request task.
+        let metadata_json: Option<Value> = if s.is_skipped("metadata") {
+            None
+        } else {
+            row.try_get(s.col("metadata")).map_err(|e| {
+                ConversationStorageError::StorageError(format!(
+                    "failed to decode metadata column: {e}"
+                ))
+            })?
+        };
+        let metadata = Self::parse_metadata(metadata_json)?;
+        let tenant: Option<String> = if s.is_skipped("tenant") {
+            None
+        } else {
+            row.get(s.col("tenant"))
+        };
+        Ok(Conversation::with_parts(
+            ConversationId(id_str),
+            created_at,
+            metadata,
+            tenant,
+        ))
+    }
 }
 
 #[async_trait]
@@ -453,21 +500,9 @@ impl ConversationStorage for PostgresConversationStorage {
         let s = &self.store.schema.conversations;
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_id = s.col("id");
-
-        let mut select_cols = vec![col_id.to_string()];
-        if !s.is_skipped("created_at") {
-            select_cols.push(s.col("created_at").to_string());
-        }
-        if !s.is_skipped("metadata") {
-            select_cols.push(s.col("metadata").to_string());
-        }
-        if !s.is_skipped("tenant") {
-            select_cols.push(s.col("tenant").to_string());
-        }
-
         let sql = format!(
             "SELECT {} FROM {table} WHERE {col_id} = $1",
-            select_cols.join(", ")
+            Self::row_columns(s).join(", ")
         );
 
         let client = self
@@ -479,39 +514,10 @@ impl ConversationStorage for PostgresConversationStorage {
         let rows = query_cached(&client, &sql, &[&id.0.as_str()])
             .await
             .map_err(ConversationStorageError::from_pg)?;
-        if rows.is_empty() {
-            return Ok(None);
+        match rows.first() {
+            Some(row) => Self::conversation_from_row(s, row).map(Some),
+            None => Ok(None),
         }
-        let row = &rows[0];
-        let id_str: String = row.get(s.col("id"));
-        let created_at: DateTime<Utc> = if s.is_skipped("created_at") {
-            Utc::now()
-        } else {
-            row.get(s.col("created_at"))
-        };
-        // Use `try_get` (not `get`) so schema drift or malformed data in the
-        // `JSON` column returns an error instead of panicking the request task.
-        let metadata_json: Option<Value> = if s.is_skipped("metadata") {
-            None
-        } else {
-            row.try_get(s.col("metadata")).map_err(|e| {
-                ConversationStorageError::StorageError(format!(
-                    "failed to decode metadata column: {e}"
-                ))
-            })?
-        };
-        let metadata = Self::parse_metadata(metadata_json)?;
-        let tenant: Option<String> = if s.is_skipped("tenant") {
-            None
-        } else {
-            row.get(s.col("tenant"))
-        };
-        Ok(Some(Conversation::with_parts(
-            ConversationId(id_str),
-            created_at,
-            metadata,
-            tenant,
-        )))
     }
 
     async fn update_conversation(
@@ -519,42 +525,45 @@ impl ConversationStorage for PostgresConversationStorage {
         id: &ConversationId,
         metadata: Option<ConversationMetadata>,
     ) -> Result<Option<Conversation>, ConversationStorageError> {
-        // The row as stored (its creation time and its tenant come back as
-        // they are), then the one column the update moves.
-        let Some(current) = self.get_conversation(id).await? else {
-            return Ok(None);
-        };
         let s = &self.store.schema.conversations;
         if s.is_skipped("metadata") {
-            return Ok(Some(Conversation {
-                metadata,
-                ..current
-            }));
+            // Nothing to move in the table: the row as stored, with the
+            // metadata the caller holds.
+            return Ok(self
+                .get_conversation(id)
+                .await?
+                .map(|current| Conversation {
+                    metadata,
+                    ..current
+                }));
         }
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_id = s.col("id");
         let col_meta = s.col("metadata");
+        // One statement: the update, returning the row's other columns (its
+        // creation time, its tenant) for the answer; no row returned = no
+        // row matched.
+        let sql = format!(
+            "UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2 RETURNING {}",
+            Self::row_columns(s).join(", ")
+        );
 
         // Bind the JSON column as `Value`, not a serialized `String` (see
         // `create_conversation` for why `tokio-postgres` requires this).
-        let metadata_value: Option<Value> = metadata.clone().map(Value::Object);
+        let metadata_value: Option<Value> = metadata.map(Value::Object);
         let client = self
             .store
             .pool
             .get()
             .await
             .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
-        let sql = format!("UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2");
-        let rows_affected = execute_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
+        let rows = query_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
             .await
             .map_err(ConversationStorageError::from_pg)?;
-        if rows_affected == 0 {
-            return Ok(None);
+        match rows.first() {
+            Some(row) => Self::conversation_from_row(s, row).map(Some),
+            None => Ok(None),
         }
-        Ok(Some(Conversation {
-            metadata,
-            ..current
-        }))
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
