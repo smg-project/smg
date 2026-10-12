@@ -39,8 +39,8 @@ use std::{
 use chrono::{TimeDelta, Utc};
 use data_connector::{
     create_storage, ConversationItemId, ConversationItemStorageError, HistoryBackend, ListParams,
-    NewConversation, NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
-    StorageFactoryConfig, StorageFailure, StoredResponse, TableConfig,
+    NewConversation, NewConversationItem, PostgresConfig, ResponseId, SchemaConfig, SortOrder,
+    StorageBundle, StorageFactoryConfig, StorageFailure, StoredResponse, TableConfig,
 };
 use serde_json::json;
 use tokio::task::JoinSet;
@@ -1670,4 +1670,139 @@ async fn a_constraint_the_store_refuses_is_its_answer_not_unavailable() {
     );
     assert!(!err.is_unavailable(), "{err}");
     assert!(err.to_string().contains("duplicate key"), "{err}");
+}
+
+/// A response whose object carries the escape `\u0000` (a model's or a
+/// client's text can) stores with the unstored-record sweep index on the
+/// table, the sweep still takes the unstored terminal records past their
+/// window through that index, and the index an earlier release built over
+/// `::jsonb` (which refused every such row) is dropped by the next start. On
+/// a database of its own, so the shared one keeps no NUL row behind.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earlier_index_goes() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "nul_index")
+        .await
+        .expect("create a scratch database");
+    // First start: the tables and the sweep index. Then the index an earlier
+    // release built, by hand on the still empty table, as its release note
+    // asked an operator to; a second start must drop it.
+    let first = postgres_bundle(&scratch.url).await.map(drop);
+    let legacy = scratch
+        .run(
+            "CREATE INDEX responses_unstored_idx ON responses ((raw_response::jsonb->>'status')) \
+             WHERE (raw_response::jsonb->>'store') = 'false'",
+        )
+        .await;
+    let bundle = postgres_bundle(&scratch.url).await;
+
+    let outcome = async {
+        first.map_err(|e| format!("the first start: {e}"))?;
+        legacy.map_err(|e| format!("the earlier release's index: {e}"))?;
+        let storage = bundle
+            .map_err(|e| format!("the second start: {e}"))?
+            .response_storage;
+
+        let record = |store: bool, status: &str, completed_at: i64| {
+            let mut stored = StoredResponse::new(None);
+            stored.raw_response = json!({
+                "id": stored.id.0, "store": store, "status": status,
+                "completed_at": completed_at, "instructions": "a\u{0}b", "output": [],
+            });
+            stored
+        };
+        let now = Utc::now().timestamp();
+        let kept = record(true, "completed", now - 3_600);
+        let swept = record(false, "completed", now - 3_600);
+        let fresh = record(false, "completed", now - 60);
+        for stored in [&kept, &swept, &fresh] {
+            storage
+                .store_response(stored.clone())
+                .await
+                .map_err(|e| format!("a record whose object carries a NUL escape stores: {e}"))?;
+        }
+
+        let deleted = storage
+            .delete_unstored_older_than(Utc::now() - TimeDelta::seconds(600))
+            .await
+            .map_err(|e| format!("the sweep: {e}"))?;
+        let left = |id: &ResponseId| {
+            let storage = storage.clone();
+            let id = id.clone();
+            async move { storage.get_response(&id).await.map(|r| r.is_some()) }
+        };
+        let kept_left = left(&kept.id).await.map_err(|e| e.to_string())?;
+        let swept_left = left(&swept.id).await.map_err(|e| e.to_string())?;
+        let fresh_left = left(&fresh.id).await.map_err(|e| e.to_string())?;
+
+        let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| e.to_string())?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test drives its own connection for the queries it makes"
+        )]
+        let driver = tokio::spawn(connection);
+        let indexes: Vec<String> = client
+            .query(
+                "SELECT indexname FROM pg_indexes WHERE tablename = 'responses' ORDER BY indexname",
+                &[],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        client
+            .batch_execute("SET enable_seqscan = off")
+            .await
+            .map_err(|e| e.to_string())?;
+        let plan: Vec<String> = client
+            .query(
+                "EXPLAIN DELETE FROM responses WHERE \
+                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'store' = 'false' AND \
+                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
+                 IN ('completed', 'incomplete', 'failed', 'cancelled') AND \
+                 COALESCE((replace(raw_response::text, '\\u0000', '\\u0020')::json->>'completed_at')::bigint, \
+                 EXTRACT(EPOCH FROM created_at)::bigint) < 0",
+                &[],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        drop(client);
+        let _ = driver.await;
+        Ok::<_, String>((deleted, kept_left, swept_left, fresh_left, indexes, plan))
+    }
+    .await;
+    scratch.drop().await;
+
+    let (deleted, kept_left, swept_left, fresh_left, indexes, plan) = outcome.unwrap();
+    assert_eq!(
+        deleted, 1,
+        "the one unstored terminal record past the window"
+    );
+    assert!(kept_left, "the stored record stays");
+    assert!(!swept_left, "the swept record is gone");
+    assert!(fresh_left, "the unstored record inside its window stays");
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "responses_unstored_text_idx"),
+        "the sweep index exists: {indexes:?}"
+    );
+    assert!(
+        indexes.iter().all(|name| name != "responses_unstored_idx"),
+        "the earlier release's index is gone after the second start: {indexes:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("responses_unstored_text_idx")),
+        "the sweep plans on its index: {plan:?}"
+    );
 }

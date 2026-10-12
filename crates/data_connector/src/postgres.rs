@@ -223,6 +223,21 @@ impl PostgresStore {
             .await?;
         }
 
+        // The index an earlier release built over `::jsonb` refused every row
+        // whose object carries the escape `\u0000`: it goes on every start
+        // (a no-op once gone); an existing table gets the replacement from its
+        // operator, concurrently (see the release note).
+        tx.batch_execute(&PostgresResponseStorage::legacy_unstored_index_drop_ddl(
+            schema,
+        ))
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to drop the earlier unstored response index: {}",
+                describe_error(&e)
+            )
+        })?;
+
         // The indexes last, so the share lock a `CREATE INDEX IF NOT EXISTS`
         // takes on its table is not held while the migrations wait for their
         // own locks: the links index on columns the table always has, then
@@ -1139,7 +1154,10 @@ impl PostgresResponseStorage {
 
     /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
     /// object's status, over the unstored records only, so a sweep reads
-    /// those rows and no other. Its expressions are the sweep's predicate.
+    /// those rows and no other. Its expressions are the sweep's predicate,
+    /// read through [`nul_safe_json_text`]: an index over `::jsonb` refused
+    /// every row whose object carries the escape `\u0000` (a model's or a
+    /// client's text can), so that form is not used.
     pub(crate) fn unstored_index_ddl(schema: &SchemaConfig) -> Option<String> {
         let s = &schema.responses;
         if s.is_skipped("raw_response") {
@@ -1147,10 +1165,21 @@ impl PostgresResponseStorage {
         }
         let table = s.qualified_table(schema.owner.as_deref());
         let col_raw = s.col("raw_response");
+        let status = nul_safe_json_text(col_raw, "status");
+        let store = nul_safe_json_text(col_raw, "store");
         Some(format!(
-            "CREATE INDEX IF NOT EXISTS responses_unstored_idx ON {table} (({col_raw}::jsonb->>'status')) \
-             WHERE ({col_raw}::jsonb->>'store') = 'false';"
+            "CREATE INDEX IF NOT EXISTS {UNSTORED_INDEX} ON {table} (({status})) WHERE {store} = 'false';"
         ))
+    }
+
+    /// The statement that drops the index an earlier release built over
+    /// `::jsonb` under [`LEGACY_UNSTORED_INDEX`], valid or not: with it on
+    /// the table no row whose object carries `\u0000` can be written.
+    pub(crate) fn legacy_unstored_index_drop_ddl(schema: &SchemaConfig) -> String {
+        match schema.owner.as_deref() {
+            Some(owner) => format!("DROP INDEX IF EXISTS {owner}.{LEGACY_UNSTORED_INDEX};"),
+            None => format!("DROP INDEX IF EXISTS {LEGACY_UNSTORED_INDEX};"),
+        }
     }
 
     pub fn build_response_from_row(
@@ -1380,6 +1409,22 @@ fn link_sql(table: &str, col_names: &[&str]) -> String {
 /// The statement of the upsert path: the row is inserted, or every other
 /// column of the row under the id (the first column) is replaced;
 /// `DO NOTHING` when the id is the only column.
+/// The name of the index the unstored-record sweep reads.
+const UNSTORED_INDEX: &str = "responses_unstored_text_idx";
+/// The name an earlier release gave that index, built over `::jsonb`.
+const LEGACY_UNSTORED_INDEX: &str = "responses_unstored_idx";
+
+/// `field` of the JSON object in `col_raw` as text, in a form that every stored
+/// object survives: the column's text with the escape `\u0000` replaced by
+/// `\u0020` (a space) before it is parsed as `json`. A `::jsonb` cast, and
+/// `->>` on a `json` value, both fail on an object that carries that escape
+/// anywhere, and an index expression is evaluated for every row written; the
+/// replacement keeps a literal backslash sequence in the text valid, which
+/// replacing with nothing would not.
+fn nul_safe_json_text(col_raw: &str, field: &str) -> String {
+    format!("replace({col_raw}::text, '\\u0000', '\\u0020')::json->>'{field}'")
+}
+
 fn upsert_sql(table: &str, col_names: &[&str]) -> String {
     let placeholders = param_placeholders(col_names.len());
     let id_col = col_names.first().copied().unwrap_or("id");
@@ -1683,17 +1728,22 @@ impl ResponseStorage for PostgresResponseStorage {
 
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_raw = s.col("raw_response");
+        // The same expressions as the index (see `unstored_index_ddl`), so
+        // the planner matches it.
+        let store = nul_safe_json_text(col_raw, "store");
+        let status = nul_safe_json_text(col_raw, "status");
+        let completed_at = nul_safe_json_text(col_raw, "completed_at");
         let ended = if s.is_skipped("created_at") {
-            format!("({col_raw}::jsonb->>'completed_at')::bigint")
+            format!("({completed_at})::bigint")
         } else {
             format!(
-                "COALESCE(({col_raw}::jsonb->>'completed_at')::bigint, EXTRACT(EPOCH FROM {})::bigint)",
+                "COALESCE(({completed_at})::bigint, EXTRACT(EPOCH FROM {})::bigint)",
                 s.col("created_at")
             )
         };
         let sql = format!(
-            "DELETE FROM {table} WHERE {col_raw}::jsonb->>'store' = 'false' \
-             AND {col_raw}::jsonb->>'status' IN ('completed', 'incomplete', 'failed', 'cancelled') \
+            "DELETE FROM {table} WHERE {store} = 'false' \
+             AND {status} IN ('completed', 'incomplete', 'failed', 'cancelled') \
              AND {ended} < $1"
         );
 
