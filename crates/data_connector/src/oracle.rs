@@ -771,14 +771,13 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     params.push(val);
                 }
 
-                let placeholders: Vec<String> =
-                    (1..=params.len()).map(|i| format!(":{i}")).collect();
-                let sql = format!(
-                    "INSERT INTO {table} ({}) VALUES ({})",
-                    columns.join(", "),
-                    placeholders.join(", ")
-                );
-                conn.execute(&sql, &params[..]).map_err(map_oracle_error)?;
+                let (sql, binds) = link_sql(&table, &columns);
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
                 Ok(())
             })
             .await
@@ -817,25 +816,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     columns.push(*name);
                 }
 
-                let col_list = columns.join(", ");
-
-                // Build INSERT ALL ... SELECT 1 FROM DUAL
-                let mut sql = String::from("INSERT ALL");
-                for (idx, _) in owned_items.iter().enumerate() {
-                    let mut placeholders = vec![
-                        ":cid".to_string(),
-                        format!(":iid{idx}"),
-                        format!(":ts{idx}"),
-                    ];
-                    for (ei, _) in extra_cols.iter().enumerate() {
-                        placeholders.push(format!(":ex{ei}"));
-                    }
-                    sql.push_str(&format!(
-                        " INTO {table} ({col_list}) VALUES ({})",
-                        placeholders.join(", ")
-                    ));
-                }
-                sql.push_str(" SELECT 1 FROM DUAL");
+                let sql = link_items_sql(&table, &columns, owned_items.len());
 
                 let mut params_vec: Vec<(&str, &dyn ToSql)> = vec![("cid", &cid)];
 
@@ -1379,6 +1360,81 @@ fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
     (sql, binds)
 }
 
+/// The statement of a link: a MERGE on the (conversation, item) key, the
+/// first two columns, so the row takes the new stamp and the new values of
+/// any extra column when it exists and is inserted when it does not. A second
+/// link of an item moves it, the contract of
+/// [`ConversationItemStorage::link_item`], where the key used to refuse the
+/// insert. Named binds, one per column, so the key's two occurrences are
+/// bound once.
+fn link_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
+    let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
+    let placeholders: Vec<String> = binds.iter().map(|bind| format!(":{bind}")).collect();
+    (merge_links_sql(table, columns, &[placeholders]), binds)
+}
+
+/// The statement of a batch link: one MERGE whose source is the batch's rows
+/// (ids and stamps, far under the source's size limit), keyed as [`link_sql`]
+/// is. The binds are `:cid` (the conversation, once), `:iid<n>` and `:ts<n>`
+/// per row, `:ex<n>` per extra column (one value for the whole batch).
+fn link_items_sql(table: &str, columns: &[&str], rows: usize) -> String {
+    let extra = columns.len().saturating_sub(3);
+    let row_binds: Vec<Vec<String>> = (0..rows)
+        .map(|idx| {
+            let mut binds = vec![
+                ":cid".to_string(),
+                format!(":iid{idx}"),
+                format!(":ts{idx}"),
+            ];
+            binds.extend((0..extra).map(|ei| format!(":ex{ei}")));
+            binds
+        })
+        .collect();
+    merge_links_sql(table, columns, &row_binds)
+}
+
+/// One MERGE into the links `table` with one source row per entry of
+/// `row_binds` (one bind per column, in the columns' order), matched on the
+/// first two columns: the stamp and the extra columns of a matched row take
+/// the source's values, an unmatched row is inserted.
+fn merge_links_sql(table: &str, columns: &[&str], row_binds: &[Vec<String>]) -> String {
+    let source: Vec<String> = row_binds
+        .iter()
+        .map(|binds| {
+            let selected: Vec<String> = columns
+                .iter()
+                .zip(binds)
+                .map(|(col, bind)| format!("{bind} AS {col}"))
+                .collect();
+            format!("SELECT {} FROM dual", selected.join(", "))
+        })
+        .collect();
+    let on: Vec<String> = columns
+        .iter()
+        .take(2)
+        .map(|col| format!("t.{col} = s.{col}"))
+        .collect();
+    let updates: Vec<String> = columns
+        .iter()
+        .skip(2)
+        .map(|col| format!("t.{col} = s.{col}"))
+        .collect();
+    let matched = if updates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
+    };
+    let values: Vec<String> = columns.iter().map(|col| format!("s.{col}")).collect();
+    format!(
+        "MERGE INTO {table} t USING ({}) s ON ({}){matched} \
+         WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
+        source.join(" UNION ALL "),
+        on.join(" AND "),
+        columns.join(", "),
+        values.join(", ")
+    )
+}
+
 #[async_trait]
 impl ResponseStorage for OracleResponseStorage {
     async fn store_response(
@@ -1757,6 +1813,51 @@ mod tests {
             .skip_columns
             .insert("raw_response".to_string());
         assert!(find_by_output_item_sql(&schema, "SELECT 1 FROM dual").is_none());
+    }
+
+    #[test]
+    fn link_sql_merges_on_the_conversation_and_item_key() {
+        let (sql, binds) = link_sql(
+            "links",
+            &["conversation_id", "item_id", "added_at", "tenant"],
+        );
+        assert_eq!(
+            sql,
+            "MERGE INTO links t USING (SELECT :v1 AS conversation_id, :v2 AS item_id, \
+             :v3 AS added_at, :v4 AS tenant FROM dual) s \
+             ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
+             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = s.tenant \
+             WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
+             VALUES (s.conversation_id, s.item_id, s.added_at, s.tenant)"
+        );
+        assert_eq!(binds, ["v1", "v2", "v3", "v4"]);
+        // The key alone leaves nothing to move.
+        let (sql, _) = link_sql("l", &["conversation_id", "item_id"]);
+        assert!(!sql.contains("WHEN MATCHED"), "{sql}");
+        assert!(
+            sql.ends_with("VALUES (s.conversation_id, s.item_id)"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn link_items_sql_merges_the_batch_in_one_statement() {
+        let sql = link_items_sql(
+            "links",
+            &["conversation_id", "item_id", "added_at", "tenant"],
+            2,
+        );
+        assert_eq!(
+            sql,
+            "MERGE INTO links t USING (\
+             SELECT :cid AS conversation_id, :iid0 AS item_id, :ts0 AS added_at, :ex0 AS tenant FROM dual \
+             UNION ALL \
+             SELECT :cid AS conversation_id, :iid1 AS item_id, :ts1 AS added_at, :ex0 AS tenant FROM dual) s \
+             ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
+             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = s.tenant \
+             WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
+             VALUES (s.conversation_id, s.item_id, s.added_at, s.tenant)"
+        );
     }
 
     #[test]

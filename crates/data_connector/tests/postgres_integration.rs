@@ -791,7 +791,7 @@ async fn conversation_items_linked_a_microsecond_apart_list_in_link_order() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
-async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once() {
+async fn a_second_link_of_an_item_moves_it_and_the_item_lists_once() {
     let Some(db_url) = test_db_url() else {
         return;
     };
@@ -809,41 +809,49 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
         .expect("create conversation");
     let items = bundle.conversation_item_storage;
 
-    // One item, its id unique to this run (the database is shared) and within the 64
+    // Two items, their ids unique to this run (the database is shared) and within the 64
     // characters of the id column.
-    let id = ConversationItemId::from(format!("msg_r_{}", conversation.id.0).as_str());
+    let nonce = &conversation.id.0;
+    let ids: Vec<ConversationItemId> = ["a", "b"]
+        .iter()
+        .map(|s| ConversationItemId::from(format!("msg_{s}_{nonce}").as_str()))
+        .collect();
+    for id in &ids {
+        items
+            .create_item(NewConversationItem {
+                id: Some(id.clone()),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([]),
+                status: Some("completed".to_string()),
+                tenant: None,
+            })
+            .await
+            .expect("create item");
+    }
+    let base = Utc::now();
+    let at = |seconds: i64| base + TimeDelta::seconds(seconds);
     items
-        .create_item(NewConversationItem {
-            id: Some(id.clone()),
-            response_id: None,
-            item_type: "message".to_string(),
-            role: Some("user".to_string()),
-            content: json!([]),
-            status: Some("completed".to_string()),
-            tenant: None,
-        })
-        .await
-        .expect("create item");
-    let first = Utc::now();
-    items
-        .link_item(&conversation.id, &id, first)
+        .link_item(&conversation.id, &ids[0], at(0))
         .await
         .expect("link item");
-    assert!(items
-        .is_item_linked(&conversation.id, &id)
+    items
+        .link_item(&conversation.id, &ids[1], at(1))
         .await
-        .expect("is linked"));
+        .expect("link item");
 
-    // The links table keys one row per (conversation, item): a second link of the same item is
-    // refused by the database. The gateway refuses a duplicate before it gets here, so a client
-    // sees the same 400 on every backend rather than this error.
-    let again = items
-        .link_item(&conversation.id, &id, first + TimeDelta::seconds(1))
-        .await;
-    assert!(
-        again.is_err(),
-        "a second link of the same item is refused by the key"
-    );
+    // The links table keys one row per (conversation, item): a second link of the first item,
+    // through either link path, moves it to the new stamp instead of being refused by the key,
+    // the contract every backend answers. The gateway refuses a duplicate before it gets here.
+    items
+        .link_item(&conversation.id, &ids[0], at(2))
+        .await
+        .expect("a second link moves the item");
+    items
+        .link_items(&conversation.id, &[(ids[0].clone(), at(3))])
+        .await
+        .expect("a second batch link moves the item");
 
     let list = |order: SortOrder| {
         let items = items.clone();
@@ -863,18 +871,22 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
                 .collect::<Vec<_>>()
         }
     };
-    assert_eq!(list(SortOrder::Asc).await, std::slice::from_ref(&id));
+    assert_eq!(list(SortOrder::Asc).await, [ids[1].clone(), ids[0].clone()]);
+    assert_eq!(
+        list(SortOrder::Desc).await,
+        [ids[0].clone(), ids[1].clone()]
+    );
 
-    // One link per item: the delete takes the item out of the conversation.
+    // One row per item: the delete takes the item out of the conversation.
     items
-        .delete_item(&conversation.id, &id)
+        .delete_item(&conversation.id, &ids[0])
         .await
         .expect("delete item");
     assert!(!items
-        .is_item_linked(&conversation.id, &id)
+        .is_item_linked(&conversation.id, &ids[0])
         .await
         .expect("is linked"));
-    assert!(list(SortOrder::Asc).await.is_empty());
+    assert_eq!(list(SortOrder::Asc).await, std::slice::from_ref(&ids[1]));
 }
 
 /// A database of its own on the test server, for the tests of a first start:

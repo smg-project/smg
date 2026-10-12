@@ -750,14 +750,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             params.push(val);
         }
 
-        let placeholders: String = (1..=params.len())
-            .map(|i| format!("${i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({placeholders})",
-            col_names.join(", ")
-        );
+        let sql = link_sql(&table, &col_names);
 
         let client = self
             .store
@@ -1332,6 +1325,37 @@ fn param_placeholders(n: usize) -> String {
         .join(", ")
 }
 
+/// The statement of a link: the row is inserted, or, for an item the
+/// conversation already has, the row under the (conversation, item) key (the
+/// first two columns, the table's primary key) takes the new stamp and the
+/// new values of any extra column. A second link of an item moves it, the
+/// contract of [`ConversationItemStorage::link_item`], where the key used to
+/// refuse the insert.
+fn link_sql(table: &str, col_names: &[&str]) -> String {
+    let placeholders = param_placeholders(col_names.len());
+    let columns = col_names.join(", ");
+    let key = col_names
+        .iter()
+        .take(2)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let updates: Vec<String> = col_names
+        .iter()
+        .skip(2)
+        .map(|col| format!("{col} = EXCLUDED.{col}"))
+        .collect();
+    if updates.is_empty() {
+        return format!(
+            "INSERT INTO {table} ({columns}) VALUES ({placeholders}) ON CONFLICT ({key}) DO NOTHING"
+        );
+    }
+    format!(
+        "INSERT INTO {table} ({columns}) VALUES ({placeholders}) ON CONFLICT ({key}) DO UPDATE SET {}",
+        updates.join(", ")
+    )
+}
+
 /// The statement of the upsert path: the row is inserted, or every other
 /// column of the row under the id (the first column) is replaced;
 /// `DO NOTHING` when the id is the only column.
@@ -1772,6 +1796,25 @@ mod tests {
         assert!(
             !PostgresConversationItemStorage::table_ddl(&schema).contains("CREATE INDEX"),
             "the tables' DDL carries no index"
+        );
+    }
+
+    #[test]
+    fn link_sql_moves_an_item_the_conversation_already_has() {
+        assert_eq!(
+            link_sql(
+                "conversation_item_links",
+                &["conversation_id", "item_id", "added_at", "tenant"]
+            ),
+            "INSERT INTO conversation_item_links (conversation_id, item_id, added_at, tenant) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (conversation_id, item_id) \
+             DO UPDATE SET added_at = EXCLUDED.added_at, tenant = EXCLUDED.tenant"
+        );
+        // The key alone leaves nothing to move.
+        assert_eq!(
+            link_sql("l", &["conversation_id", "item_id"]),
+            "INSERT INTO l (conversation_id, item_id) VALUES ($1, $2) \
+             ON CONFLICT (conversation_id, item_id) DO NOTHING"
         );
     }
 

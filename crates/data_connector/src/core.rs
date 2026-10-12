@@ -334,6 +334,11 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         item: NewConversationItem,
     ) -> ConversationItemResult<ConversationItem>;
 
+    /// Link `item_id` into the conversation at `added_at`. An item the
+    /// conversation already has is moved, neither duplicated nor refused: its
+    /// one link takes the new stamp, so the item lists once, at its new
+    /// position, on every backend (the SQL stores upsert on the
+    /// (conversation, item) key).
     async fn link_item(
         &self,
         conversation_id: &ConversationId,
@@ -341,9 +346,10 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         added_at: DateTime<Utc>,
     ) -> ConversationItemResult<()>;
 
-    /// Batch-link multiple items to a conversation in a single operation.
-    /// Default implementation loops over `link_item`; backends may override
-    /// with a more efficient batched approach.
+    /// Batch-link multiple items to a conversation in a single operation,
+    /// each link as [`Self::link_item`] (an item the conversation already
+    /// has moves). Default implementation loops over `link_item`; backends
+    /// may override with a more efficient batched approach.
     async fn link_items(
         &self,
         conversation_id: &ConversationId,
