@@ -7,8 +7,9 @@
 //! broke, its server cancelled the stream, it finished the request with an
 //! error of its own, or it rejected the request after its first chunk) is
 //! classed the way a failed dispatch of the same status is, by
-//! [`UpstreamClass`]: the worker whose stream it was (the one worker, a
-//! decode leg, or the prefill leg drained before the answer) is charged (its
+//! [`UpstreamClass`]: the worker whose stream it was (the one worker or a
+//! decode leg; the prefill leg drained before the answer is classed as a
+//! dispatch, the class its breaker sample comes from) is charged (its
 //! circuit breaker, the worker-error family) only for the classes a failed
 //! dispatch charges it for, the router-error family counts every one under
 //! the same `error_type`, and the event's `type` tells a stream the worker

@@ -1846,7 +1846,7 @@ async fn execute_sequential_pd(
                 if let Some(status) = e.breaker_status() {
                     workers.record_outcome_prefill(ledger, status);
                 }
-                UpstreamClass::account_stream_failure(
+                UpstreamClass::account_dispatch_failure(
                     metrics_labels::WORKER_PREFILL,
                     prefill_label,
                     &e,
