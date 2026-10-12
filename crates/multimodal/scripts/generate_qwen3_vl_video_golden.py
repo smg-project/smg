@@ -107,7 +107,7 @@ def main() -> None:
             "torch": torch.__version__,
             "torchvision": torchvision.__version__,
         },
-        "clip": CLIP,
+        "clip": args.clip.resolve().relative_to(crate).as_posix(),
         "clip_frames": len(frames),
         "clip_fps": fps,
         "sampled_indices": indices,
