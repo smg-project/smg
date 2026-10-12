@@ -6,6 +6,8 @@
 
 use std::{fmt::Write as _, fs, path::PathBuf};
 
+use openai_protocol::common::{Function, Tool};
+use serde_json::json;
 use symphony::formats::{groups, table_for, Table};
 
 /// The switch that writes the table into the README instead of checking it.
@@ -941,6 +943,110 @@ fn render() -> String {
 
 fn readme_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md")
+}
+
+/// The variable naming a directory to write every table's structural tag into, as a request
+/// carries it, one file per table and request shape (`<Table>-required|optional-closed|open.json`),
+/// the directory's earlier files of those names removed first; `tools/compile_structural_tags.py`
+/// compiles them with xgrammar, the engines' grammar library.
+const WRITE_TAGS_ENV: &str = "SYMPHONY_WRITE_TAGS";
+/// How the written files end, one per request shape: what a run removes before it writes.
+const TAG_FILE_ENDINGS: [&str; 4] = [
+    "-required-closed.json",
+    "-optional-closed.json",
+    "-required-open.json",
+    "-optional-open.json",
+];
+
+/// Tools whose schemas reach every value shape the grammars write: a required string, a number
+/// with a bound, a string enum, a boolean, `null`, a list of strings, an object with properties, a
+/// reference to a definition holding an enum, a property that pins no type, and a tool without
+/// properties.
+fn tag_tools() -> Vec<Tool> {
+    let tool = |name: &str, parameters: serde_json::Value| Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters,
+            strict: None,
+            extra: Default::default(),
+        },
+    };
+    vec![
+        tool(
+            "get_weather",
+            json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer", "minimum": 1},
+                    "units": {"type": "string", "enum": ["c", "f"]},
+                    "detailed": {"type": "boolean"},
+                    "nothing": {"type": "null"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "options": {"type": "object", "properties": {
+                        "limit": {"type": "number"},
+                        "verbose": {"type": "boolean"},
+                    }},
+                    "scale": {"$ref": "#/$defs/Scale"},
+                    "anything": {},
+                },
+                "required": ["city", "days"],
+                "$defs": {"Scale": {"type": "string", "enum": ["small", "large"]}},
+            }),
+        ),
+        tool("ping", json!({"type": "object"})),
+    ]
+}
+
+#[test]
+fn every_tables_structural_tag_is_written_when_asked() {
+    let Ok(directory) = std::env::var(WRITE_TAGS_ENV) else {
+        return;
+    };
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory).expect("the directory");
+    // Only this run's tags: a payload an earlier run left for a table or a shape that no longer
+    // derives one would be compiled as if it were current. Only files named as this test names
+    // them go, so a directory holding anything else keeps it.
+    for entry in fs::read_dir(&directory).expect("the directory's entries") {
+        let path = entry.expect("an entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if TAG_FILE_ENDINGS.iter().any(|ending| name.ends_with(ending)) {
+            fs::remove_file(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+        }
+    }
+    let tools = tag_tools();
+    let mut seen: Vec<String> = Vec::new();
+    let mut written = 0;
+    for table in GROUPS.iter().filter_map(|group| group.table) {
+        let name = format!("{table:?}");
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.push(name.clone());
+        for (at_least_one, reasoning_open) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let Some(grammar) = table.format().grammar(&tools, at_least_one, reasoning_open) else {
+                continue;
+            };
+            let file = format!(
+                "{name}-{}-{}.json",
+                if at_least_one { "required" } else { "optional" },
+                if reasoning_open { "open" } else { "closed" }
+            );
+            let payload =
+                serde_json::to_string_pretty(&grammar.payload()).expect("the payload as JSON");
+            fs::write(directory.join(&file), payload).unwrap_or_else(|why| panic!("{file}: {why}"));
+            written += 1;
+        }
+    }
+    assert!(written > 0, "no table wrote a tag");
 }
 
 #[test]
