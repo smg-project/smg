@@ -3176,6 +3176,7 @@ mod tests {
         media_refs: false,
         vision: true,
     };
+
     /// A regular worker with `labels`, built as [`labeled_worker`] builds every
     /// worker of these tests.
     fn regular_worker(url: &str, model_id: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
@@ -4359,7 +4360,7 @@ mod tests {
     const VISION_ENCODER: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "true")];
     const UNLABELED: &[(&str, &str)] = &[];
 
-    /// A gRPC worker of `worker_type`, with `labels`, with `labels`.
+    /// A gRPC worker of `worker_type`, with `labels`.
     fn labeled_worker(
         url: &str,
         model_id: &str,
