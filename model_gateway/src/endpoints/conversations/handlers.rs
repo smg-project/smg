@@ -790,7 +790,7 @@ mod tests {
         // The bound holds for the whole batch before any store is asked: an over-long
         // id on the second item leaves the first item unstored and unlinked.
         let batch = json!({"items": [
-            {"type": "message", "role": "user", "content": "first"},
+            {"type": "message", "role": "user", "content": "first", "id": "msg_first"},
             {"type": "message", "role": "user", "content": "second", "id": over}
         ]});
         let response =
@@ -810,6 +810,16 @@ mod tests {
         assert!(
             listed.is_empty(),
             "nothing is stored for a refused batch: {listed:?}"
+        );
+        // The store itself, not the conversation's links: the old per-item check
+        // created the first item before refusing the second, linking none.
+        assert!(
+            item_storage
+                .get_item(&ConversationItemId::from("msg_first"))
+                .await
+                .unwrap()
+                .is_none(),
+            "an earlier item of a refused batch is not stored"
         );
         let over_id = ConversationItemId::from(over.as_str());
         assert!(
