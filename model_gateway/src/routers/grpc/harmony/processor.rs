@@ -7,9 +7,8 @@ use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
     common::{ChatLogProbs, ToolCall, Usage},
     responses::{
-        InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponseUsage, ResponsesRequest,
-        ResponsesResponse, ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+        ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use tracing::error;
@@ -350,23 +349,7 @@ impl HarmonyResponseProcessor {
             .status(ResponseStatus::Completed)
             .output(output)
             .maybe_text(responses_request.text.clone())
-            .usage(ResponsesUsage::Modern(ResponseUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                input_tokens_details: usage
-                    .prompt_tokens_details
-                    .as_ref()
-                    .map(InputTokensDetails::from)
-                    .unwrap_or_default(),
-                output_tokens_details: OutputTokensDetails {
-                    reasoning_tokens: usage
-                        .completion_tokens_details
-                        .as_ref()
-                        .and_then(|d| d.reasoning_tokens)
-                        .unwrap_or(0),
-                },
-            }))
+            .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)))
             .build();
 
         Ok(ResponsesIterationResult::Completed {

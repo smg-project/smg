@@ -6,14 +6,14 @@ use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
-    common::{Usage, UsageInfo},
+    common::Usage,
     event_types::{
         ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
         ResponseEvent,
     },
     responses::{
         IncludeField, IncompleteDetails, IncompleteReason, ResponseOutputItem, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::json;
@@ -867,20 +867,8 @@ impl ResponseStreamEventEmitter {
             })
             .collect();
 
-        // Convert Usage to ResponsesUsage
-        let responses_usage = usage.map(|u| {
-            let usage_info = UsageInfo {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                reasoning_tokens: u
-                    .completion_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.reasoning_tokens),
-                prompt_tokens_details: u.prompt_tokens_details.clone(),
-            };
-            ResponsesUsage::Modern(usage_info.to_response_usage())
-        });
+        // The usage the terminal event carries, through the one conversion.
+        let responses_usage = usage.map(|u| ResponsesUsage::Modern(ResponseUsage::from(&u)));
 
         // Match the streamed terminal event: a `length` finish reports
         // status=incomplete with the truncation reason.

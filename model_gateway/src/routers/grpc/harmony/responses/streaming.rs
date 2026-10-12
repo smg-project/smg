@@ -354,16 +354,25 @@ async fn execute_mcp_tool_loop_streaming(
                         total_after = total_calls_after,
                         effective_limit = effective_limit,
                         user_max = ?max_tool_calls,
-                        "Reached tool call limit in streaming - emitting completion with incomplete_details"
+                        "Reached tool call limit in streaming - ending the stream as failed"
                     );
 
-                    // Emit response.completed with incomplete_details and the
-                    // usage the non-streamed response carries
-                    let incomplete_details = json!({ "reason": "max_tool_calls" });
-                    let mut usage_json = json!(ResponseUsage::from(&usage));
-                    usage_json["incomplete_details"] = incomplete_details;
-                    let event = emitter.emit_completed(Some(&usage_json));
-                    emitter.send_event_best_effort(&event, tx).await;
+                    // The run is aborted, not answered: the stream ends as the
+                    // non-streamed path does, `response.failed` with the error,
+                    // and the usage the non-streamed response carries.
+                    let usage_json = json!(ResponseUsage::from(&usage));
+                    let error = json!({
+                        "code": "max_tool_calls_exceeded",
+                        "message": format!(
+                            "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
+                        ),
+                    });
+                    if let Err(e) = emitter
+                        .emit_terminal(Some(&usage_json), Some(&error), tx)
+                        .await
+                    {
+                        warn!(error = %e, "Failed to end the Harmony Responses stream at the tool-call limit");
+                    }
                     return;
                 }
 
