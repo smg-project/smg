@@ -473,6 +473,9 @@ fn injected_status(status: u16) -> Status {
         408 | 504 => Status::deadline_exceeded(MESSAGE),
         409 => Status::aborted(MESSAGE),
         429 => Status::resource_exhausted(MESSAGE),
+        // The call the worker's side ended: what a connection that closed
+        // under it produces at the gateway.
+        499 => Status::cancelled(MESSAGE),
         501 => Status::unimplemented(MESSAGE),
         502 | 503 => Status::unavailable(MESSAGE),
         other if (400..=499).contains(&other) => Status::invalid_argument(MESSAGE),
@@ -1072,6 +1075,7 @@ mod tests {
         assert_eq!(injected_status(429).code(), tonic::Code::ResourceExhausted);
         assert_eq!(injected_status(504).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(400).code(), tonic::Code::InvalidArgument);
+        assert_eq!(injected_status(499).code(), tonic::Code::Cancelled);
         // The two non-inverse cases (read back as 504 and 503) and a 4xx
         // without its own code (read back as 400).
         assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);

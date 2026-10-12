@@ -244,7 +244,9 @@ stays up but failing), sends requests through the gateway and reads
 `failed_total` against the gateway's retry and breaker metrics; a retried
 request that reached a worker shows in `/admin/requests` once per admission,
 so `requests` there against `injected_failures` tells retried attempts from
-duplicated work.
+duplicated work. `status=499` makes a gRPC worker answer `cancelled`, the code
+a call gets when the worker's connection closes under it (a worker dying as
+the request arrives); an HTTP worker answers the bare 499.
 
 ## Long prompts
 

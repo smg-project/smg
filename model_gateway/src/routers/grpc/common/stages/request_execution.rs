@@ -2227,6 +2227,31 @@ mod tests {
         );
     }
 
+    /// A leg start the worker's side cancelled (its connection closed under
+    /// the call) is the worker's failure, not a rejection of the request: a
+    /// 502 under the leg's code, which the retry layer replays on another
+    /// worker, never a 400 the client would read as its own mistake.
+    #[test]
+    fn a_leg_start_the_worker_cancelled_is_a_retryable_502_not_a_rejection() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let cancelled = start_failure_response(
+            &tonic::Status::cancelled("operation was canceled"),
+            "execute_sequential_pd",
+            PdLeg::Decode.error_message(),
+            PdLeg::Decode.error_code(),
+        );
+        assert_eq!(cancelled.status(), http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            cancelled
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "decode_worker_failed_to_start"
+        );
+        assert!(is_retryable_response(&cancelled));
+    }
+
     #[test]
     fn a_spent_sidecar_budget_is_not_retried_but_a_fast_sidecar_failure_is() {
         use crate::routers::common::retry::is_retryable_response;
