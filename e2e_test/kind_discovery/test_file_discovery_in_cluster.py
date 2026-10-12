@@ -6,7 +6,7 @@ test publishes and edits the manifest the way an operator would, with
 `kubectl apply`; the kubelet projects each update into the Pod by atomically
 swapping the mounted files, the kind of replacement file discovery expects.
 
-The gateway's periodic reread is an hour apart (file_in_cluster.yaml), so
+The gateway is deployed with its periodic reread raised to an hour, so
 every update below is read because the gateway's watch saw the swap.
 """
 
@@ -28,6 +28,10 @@ CONFIGMAP = "smg-file-workers"
 # The kubelet projects a ConfigMap update within about a minute. Touching the
 # Pod in `publish_manifest` usually brings that down to seconds.
 PROPAGATION = 180.0
+# The reference deployment's periodic reread, and the one the test deploys
+# instead: far beyond PROPAGATION, so no reread can stand in for the watch.
+REFERENCE_INTERVAL = '- --discovery-check-interval-secs\n            - "30"'
+TEST_INTERVAL = '- --discovery-check-interval-secs\n            - "3600"'
 
 needs_images = pytest.mark.skipif(
     not (os.environ.get("SMG_MOCK_IMAGE") and os.environ.get("SMG_GATEWAY_IMAGE")),
@@ -124,9 +128,16 @@ class FileGateway:
         raise AssertionError(f"timed out waiting for {what}: no {needle!r} in the gateway log")
 
 
+def deployment() -> str:
+    """file_in_cluster.yaml with the test's reread interval."""
+    reference = (HERE / "file_in_cluster.yaml").read_text()
+    assert reference.count(REFERENCE_INTERVAL) == 1, "the interval args moved"
+    return reference.replace(REFERENCE_INTERVAL, TEST_INTERVAL)
+
+
 @pytest.fixture(scope="class")
 def file_gateway(kind_cluster):
-    kubectl("apply", "-f", str(HERE / "file_in_cluster.yaml"))
+    kubectl("apply", "-f", "-", stdin=deployment())
     kubectl("rollout", "status", "deployment/smg-gateway-file", "--timeout=180s")
     kubectl("rollout", "status", "deployment/engines-file", "--timeout=180s")
 

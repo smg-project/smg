@@ -399,6 +399,44 @@ async fn a_manifest_created_after_startup_is_read_when_it_appears() {
     handle.abort();
 }
 
+/// A directory removed and recreated under the manifest, as a deploy tool or
+/// a sidecar may do, is watched again: with no tick due for an hour, the
+/// manifest written into the new directory still applies.
+#[tokio::test]
+async fn a_recreated_directory_is_watched_again() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("smg");
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("workers.json");
+    let app_context = test_context().await;
+    let (_engine_a, port_a) = start_mock_engine().await;
+    let (_engine_b, port_b) = start_mock_engine().await;
+
+    write_manifest(&path, &manifest(&[port_a]));
+    let handle = start_file_discovery_every(&path, NO_REREAD, &app_context).await;
+    wait_for(&app_context, "the startup read registering a", |urls| {
+        has_url(urls, port_a)
+    })
+    .await;
+
+    std::fs::remove_dir_all(&dir).unwrap();
+    // Past the settle window, so the provider has re-watched the path (and
+    // found it missing) before the directory returns.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    std::fs::create_dir(&dir).unwrap();
+    // Let a re-watch of the recreated directory start before the write.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    write_manifest(&path, &manifest(&[port_a, port_b]));
+    wait_for(
+        &app_context,
+        "the manifest in the new directory read",
+        |urls| has_url(urls, port_a) && has_url(urls, port_b),
+    )
+    .await;
+
+    handle.abort();
+}
+
 /// The watch sees only the manifest's own directory. A manifest that is a
 /// symlink into another directory changes without an event there, and the
 /// tick still reads that change.

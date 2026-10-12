@@ -7,9 +7,12 @@
 # gateway starts before the manifest exists, and the test publishes it.
 #
 # The kubelet projects each ConfigMap update by swapping a `..data` symlink in
-# the mount, which the gateway's watch on that directory reports. The
-# periodic reread is set far beyond the test's run, so every update the test
-# sees applied was read because the gateway saw it arrive.
+# the mount, which the gateway's watch on that directory reports, so an
+# update applies once it is projected. The periodic reread is the fallback,
+# and it also retries registrations: an engine not yet listening when its
+# record appeared, or one the health checker removed, waits for it. The e2e
+# test raises it to an hour when applying this file, to prove the watch
+# alone carries the updates; keep a short interval in a real deployment.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,7 +42,7 @@ spec:
             - --discovery-file
             - /etc/smg/workers.json
             - --discovery-check-interval-secs
-            - "3600"
+            - "30"
             - --policy
             - round_robin
           volumeMounts:

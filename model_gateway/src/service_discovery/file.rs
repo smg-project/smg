@@ -32,11 +32,14 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{event::ModifyKind, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openai_protocol::worker::WorkerType;
 use serde::Deserialize;
 use tokio::{sync::mpsc, task, time};
@@ -294,28 +297,76 @@ async fn read_manifest(config: &FileProviderConfig) -> Result<DesiredState, Mani
 /// as a handful of events within a few milliseconds.
 const SETTLE: Duration = Duration::from_millis(200);
 
+/// How often an unwatched manifest's directory is tried again. Trying is one
+/// system call, and a directory that a deploy tool recreates is back within
+/// about this long.
+const REWATCH: Duration = Duration::from_secs(1);
+
+/// A watch on the manifest's directory. Dropping it stops the watch.
+struct ManifestWatch {
+    _watcher: RecommendedWatcher,
+    /// Set once the watched directory itself is removed or moved away. The
+    /// watch then reports nothing more, not even for a directory recreated at
+    /// the same path, so it has to be started again.
+    lost: Arc<AtomicBool>,
+}
+
+impl ManifestWatch {
+    fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+}
+
 /// Watch the manifest's directory and send on `wake` whenever the manifest may
-/// have changed.
+/// have changed, or the watch stopped working.
 ///
 /// The directory rather than the file: a writer that renames a new file over
 /// the manifest replaces its inode, and a watch on the old inode never
 /// reports it. A send that finds the channel full is dropped, because a wake
 /// is already pending and the reread it causes reads the latest file.
-fn watch_manifest(path: &Path, wake: mpsc::Sender<()>) -> notify::Result<RecommendedWatcher> {
+fn watch_manifest(path: &Path, wake: mpsc::Sender<()>) -> notify::Result<ManifestWatch> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
+    // Watched by its absolute path, which is how inotify names the directory
+    // in an event about the directory itself. FSEvents names it resolved.
+    let dir = std::path::absolute(dir).map_err(notify::Error::io)?;
+    let dir_names: Vec<PathBuf> = [Some(dir.clone()), dir.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+        .collect();
     let name = path.file_name().map(OsStr::to_os_string);
+    let lost = Arc::new(AtomicBool::new(false));
+    let lost_by_event = Arc::clone(&lost);
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-        // A failed or overflowing watch may have dropped a change, so it
-        // rereads too.
-        if event.map_or(true, |event| concerns_manifest(&event, name.as_deref())) {
+        let wakes = match event {
+            Ok(event) if removes_directory(&event, &dir_names) => {
+                lost_by_event.store(true, Ordering::Relaxed);
+                true
+            }
+            Ok(event) => concerns_manifest(&event, name.as_deref()),
+            // A failed watch may have dropped a change, so it rereads too.
+            Err(_) => true,
+        };
+        if wakes {
             let _ = wake.try_send(());
         }
     })?;
-    watcher.watch(dir, RecursiveMode::NonRecursive)?;
-    Ok(watcher)
+    watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+    Ok(ManifestWatch {
+        _watcher: watcher,
+        lost,
+    })
+}
+
+/// Whether an event says the watched directory itself was removed or moved
+/// away, given the names an event may call it by.
+fn removes_directory(event: &Event, dir_names: &[PathBuf]) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+    ) && event.paths.iter().any(|path| dir_names.contains(path))
 }
 
 /// Whether an event in the manifest's directory may have changed the manifest.
@@ -338,27 +389,31 @@ fn concerns_manifest(event: &Event, name: Option<&OsStr>) -> bool {
 
 /// Start watching, or say why the provider is polling only. Polling alone is
 /// still correct: the tick rereads whatever the watch would have reported.
+/// `warned` records that a failure was logged, so retries do not repeat it
+/// and the watch starting is logged in turn.
 fn start_watch(
     config: &FileProviderConfig,
     wake: &mpsc::Sender<()>,
     warned: &mut bool,
-) -> Option<RecommendedWatcher> {
+) -> Option<ManifestWatch> {
     match watch_manifest(&config.path, wake.clone()) {
-        Ok(watcher) => {
+        Ok(watch) => {
             if *warned {
                 info!(
                     "Watching discovery manifest {} for changes",
                     config.path.display()
                 );
+                *warned = false;
             }
-            Some(watcher)
+            Some(watch)
         }
         Err(error) => {
             if !*warned {
                 warn!(
-                    "Cannot watch discovery manifest {} ({error}); rereading every {}s only, and retrying the watch",
+                    "Cannot watch discovery manifest {} ({error}); rereading every {}s, and retrying the watch every {}s",
                     config.path.display(),
-                    config.check_interval.as_secs_f64()
+                    config.check_interval.as_secs_f64(),
+                    REWATCH.as_secs_f64()
                 );
                 *warned = true;
             }
@@ -399,20 +454,33 @@ pub(super) fn start_file_discovery(
         let kind = DiscoveryKind::File;
         let (wake_tx, mut wake_rx) = mpsc::channel(1);
         let mut warned = false;
-        // Dropping the watcher stops it, so it lives as long as this loop.
-        let mut watcher = start_watch(&config, &wake_tx, &mut warned);
+        // Held for as long as this loop runs: dropping it stops the watch.
+        let mut watch = start_watch(&config, &wake_tx, &mut warned);
         let mut last_good: Option<DesiredState> = None;
         let mut interval = time::interval(config.check_interval);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    // The directory may not have existed yet.
-                    if watcher.is_none() {
-                        watcher = start_watch(&config, &wake_tx, &mut warned);
+                _ = interval.tick() => {}
+                Some(()) = wake_rx.recv() => settle(&mut wake_rx).await,
+                // Unwatched, because the directory does not exist (yet, or
+                // any more): retry soon rather than on the tick, and read
+                // once watching, since nothing reported changes until then.
+                () = time::sleep(REWATCH), if watch.is_none() => {
+                    watch = start_watch(&config, &wake_tx, &mut warned);
+                    if watch.is_none() {
+                        continue;
                     }
                 }
-                Some(()) = wake_rx.recv() => settle(&mut wake_rx).await,
+            }
+            if watch.as_ref().is_some_and(ManifestWatch::is_lost) {
+                warn!(
+                    "The directory of discovery manifest {} was removed or moved; watching it again once it exists",
+                    config.path.display()
+                );
+                // Logged here, so a failed retry stays quiet.
+                warned = true;
+                watch = start_watch(&config, &wake_tx, &mut warned);
             }
             let started_at = time::Instant::now();
             match read_manifest(&config).await {
@@ -793,8 +861,63 @@ mod tests {
         );
     }
 
+    /// Only an event about the watched directory itself, removed or moved
+    /// away, marks the watch lost; events about files inside it do not.
+    #[test]
+    fn only_the_directory_going_away_loses_the_watch() {
+        use notify::event::{CreateKind, RemoveKind, RenameMode};
+
+        let dir = [PathBuf::from("/run/smg")];
+        for event in [
+            // inotify's DELETE_SELF and MOVE_SELF.
+            event(EventKind::Remove(RemoveKind::Folder), &["/run/smg"]),
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                &["/run/smg"],
+            ),
+        ] {
+            assert!(removes_directory(&event, &dir), "{event:?}");
+        }
+        for event in [
+            event(
+                EventKind::Remove(RemoveKind::File),
+                &["/run/smg/workers.json"],
+            ),
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                &["/run/smg/workers.json.tmp", "/run/smg/workers.json"],
+            ),
+            event(EventKind::Create(CreateKind::Folder), &["/run/smg"]),
+        ] {
+            assert!(!removes_directory(&event, &dir), "{event:?}");
+        }
+    }
+
+    /// Removing the watched directory marks the watch lost and wakes the
+    /// provider, which then watches the path again.
+    #[tokio::test]
+    async fn removing_the_directory_loses_the_watch() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("smg");
+        std::fs::create_dir(&dir).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let watch = watch_manifest(&dir.join("workers.json"), tx).unwrap();
+        assert!(!watch.is_lost());
+
+        std::fs::remove_dir(&dir).unwrap();
+        assert!(
+            woken(&mut rx, Duration::from_secs(10)).await,
+            "removal not seen"
+        );
+        let deadline = time::Instant::now() + Duration::from_secs(10);
+        while !watch.is_lost() {
+            assert!(time::Instant::now() < deadline, "the watch never lost");
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// The directory must exist to be watched; until it does, the provider
-    /// polls, and the tick retries the watch.
+    /// polls, and retries the watch every second.
     #[test]
     fn a_missing_directory_cannot_be_watched() {
         let dir = tempfile::tempdir().unwrap();
