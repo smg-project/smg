@@ -401,14 +401,15 @@ pub(crate) async fn persist_response_if_needed(
         "foreground"
     };
     // A background response's record may have been closed while the work
-    // ran (a cancel, here or on another gateway sharing the store): a
-    // terminal record is not rewritten by a late result.
+    // ran (a cancel, here or on another gateway sharing the store), or
+    // deleted: a terminal record is not rewritten by a late result and a
+    // deleted one is not re-created by it.
     if background
         && background::is_closed(&response_storage, &response.id, request_context.clone()).await
     {
         debug!(
             response_id = %response.id,
-            "Background response record already closed; the result is not stored"
+            "Background response record already closed or deleted; the result is not stored"
         );
         return Ok(());
     }
@@ -471,14 +472,15 @@ pub(crate) async fn persist_response_if_needed(
                 }
                 attempts += 1;
                 tokio::time::sleep(every).await;
-                // A cancel that landed meanwhile wins: a closed record is not
-                // rewritten by the result that waited for the store.
+                // A cancel or a delete that landed meanwhile wins: a closed
+                // record is not rewritten by the result that waited for the
+                // store, a deleted one not re-created.
                 if background::is_closed(&response_storage, &response.id, request_context.clone())
                     .await
                 {
                     debug!(
                         response_id = %response.id,
-                        "Background response record was closed while its result waited for the store; the result is not stored"
+                        "Background response record was closed or deleted while its result waited for the store; the result is not stored"
                     );
                     return Ok(());
                 }
@@ -756,6 +758,76 @@ mod tests {
         )
         .await
         .expect("nothing to store, nothing to report");
+    }
+
+    /// A background response deleted while its work ran (its record is gone
+    /// when the result arrives): the result is not stored under the id again
+    /// and nothing of it reaches the conversation; the delete holds.
+    #[tokio::test]
+    async fn a_background_result_whose_record_was_deleted_is_not_stored() {
+        let conversation_storage: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let item_storage: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let response_storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let conversation = conversation_storage
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "background": true,
+            "conversation": conversation.id.0,
+            "max_output_tokens": 64
+        }))
+        .unwrap();
+        background::store_record(
+            &response_storage,
+            &background::queued_response("resp_d", &request),
+            &request,
+            None,
+        )
+        .await
+        .unwrap();
+        response_storage
+            .delete_response(&ResponseId::from("resp_d"))
+            .await
+            .unwrap();
+
+        persist_response_if_needed(
+            conversation_storage,
+            item_storage.clone(),
+            response_storage.clone(),
+            &completed_response("resp_d", &request),
+            &request,
+            None,
+        )
+        .await;
+
+        assert!(
+            response_storage
+                .get_response(&ResponseId::from("resp_d"))
+                .await
+                .unwrap()
+                .is_none(),
+            "the deleted record is not re-created by the result"
+        );
+        let items = item_storage
+            .list_items(
+                &conversation.id,
+                ListParams {
+                    limit: 10,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            items.is_empty(),
+            "nothing is linked to the conversation: {items:?}"
+        );
     }
 
     fn registry_with_aliased_worker() -> Arc<WorkerRegistry> {
