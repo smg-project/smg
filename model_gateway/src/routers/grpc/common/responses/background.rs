@@ -467,18 +467,25 @@ pub(crate) async fn sweep_unstored(storage: &Arc<dyn ResponseStorage>) -> usize 
     }
 }
 
-/// Runs [`sweep_unstored`] now and then once per polling window, for the life
-/// of the gateway.
+/// Runs [`sweep_unstored`] now, for the records an earlier gateway left in a
+/// store that outlives it, whatever this gateway's background setting; then,
+/// when `repeat` says so, once per polling window for the life of the gateway
+/// (background mode on: new unstored records can appear; off, none can, and
+/// the one sweep at start-up is all the store needs).
 #[expect(
     clippy::disallowed_methods,
     reason = "a periodic sweep over the store for the gateway's lifetime; nothing waits on it at shutdown"
 )]
 pub(crate) fn spawn_unstored_sweeper(
     storage: Arc<dyn ResponseStorage>,
+    repeat: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             sweep_unstored(&storage).await;
+            if !repeat {
+                return;
+            }
             tokio::time::sleep(UNSTORED_RETENTION).await;
         }
     })
@@ -1781,6 +1788,32 @@ mod tests {
 
     /// The sweep takes the unstored records whose window ended and leaves a
     /// fresh one, a stored one and one still running.
+    /// With background mode off the sweeper still runs once at start-up, for
+    /// the records an earlier gateway left, and then ends.
+    #[tokio::test]
+    async fn the_sweeper_runs_once_with_background_mode_off() {
+        let storage = storage();
+        let mut left = StoredResponse::new(None);
+        left.id = ResponseId::from("resp_left");
+        left.raw_response = json!({
+            "id": "resp_left",
+            "store": false,
+            "status": "completed",
+            "completed_at": chrono::Utc::now().timestamp() - 3 * UNSTORED_RETENTION.as_secs() as i64,
+        });
+        storage.store_response(left).await.unwrap();
+
+        spawn_unstored_sweeper(Arc::clone(&storage), false)
+            .await
+            .expect("the one-shot sweeper ends");
+
+        assert!(storage
+            .get_response(&ResponseId::from("resp_left"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[tokio::test]
     async fn the_sweep_retires_the_unstored_records_left_past_their_window() {
         use smg_data_connector::{MemoryResponseStorage, StoredResponse};
