@@ -1069,7 +1069,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
 
-    /// CORS allowed origins
+    /// Origins a browser may call the gateway from (exact origins,
+    /// space-separated), or `*` alone for any origin. Without this flag the
+    /// gateway makes no cross-origin allowance
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
 
@@ -2166,6 +2168,18 @@ impl CliArgs {
             reason: reason.to_string(),
         };
         for origin in &self.cors_allowed_origins {
+            // A lone `*` is the open policy; next to an origin it would be
+            // either a typo or a list the layer cannot express.
+            if origin == "*" {
+                if self.cors_allowed_origins.len() == 1 {
+                    continue;
+                }
+                return Err(invalid(
+                    "cors_allowed_origins",
+                    origin,
+                    "'*' stands alone: either any origin or a list of exact origins",
+                ));
+            }
             // Exactly what a browser sends as `Origin`: the scheme and the host
             // in lower case, no userinfo, no default port, nothing after the
             // authority (not even `/`); anything else never matches the exact
@@ -2966,6 +2980,10 @@ mod tests {
                 vec!["--request-id-headers", "bad header"],
                 "request_id_headers",
             ),
+            (
+                vec!["--cors-allowed-origins", "*", "https://example.com"],
+                "cors_allowed_origins",
+            ),
             (vec!["--api-key", ""], "api_key"),
             (vec!["--jwt-role-mapping", "noeq"], "jwt_role_mapping"),
             (vec!["--jwt-role-mapping", "ops=root"], "jwt_role_mapping"),
@@ -2999,6 +3017,9 @@ mod tests {
         ])
         .to_router_config(vec![], vec![])
         .expect("well-formed values pass");
+        cli_args_from(&["--cors-allowed-origins", "*"])
+            .to_router_config(vec![], vec![])
+            .expect("a lone '*' is the open policy");
     }
 
     /// A flag that only acts with a companion is named when the companion is
