@@ -113,6 +113,41 @@ fn validate_cost(cost: f32) -> Result<(), WorkerServiceError> {
     Ok(())
 }
 
+/// A rejected key as the error shows it: whole when short, else its first
+/// characters and its length, so a key the size of the payload limit does
+/// not come back as a body (or a log line) of that size.
+fn shown_key(key: &str) -> String {
+    const SHOWN: usize = 64;
+    if key.chars().count() <= SHOWN {
+        return format!("{key:?}");
+    }
+    let head: String = key.chars().take(SHOWN).collect();
+    format!("{head:?}... ({} bytes)", key.len())
+}
+
+/// The labels a PATCH would leave on the worker: the request's merged into
+/// the existing ones (`UpdateWorkerPropertiesStep` keeps every key it does not
+/// name), held to the same cap as a registration, so repeated updates cannot
+/// grow a worker past it.
+fn validate_merged_labels(
+    existing: &HashMap<String, String>,
+    update: &HashMap<String, String>,
+) -> Result<(), WorkerServiceError> {
+    let added = update
+        .keys()
+        .filter(|key| !existing.contains_key(*key))
+        .count();
+    let merged = existing.len() + added;
+    if merged > MAX_WORKER_LABELS {
+        return Err(bad_request(format!(
+            "{merged} labels on the worker after this update ({} now, {added} new); at most \
+             {MAX_WORKER_LABELS} are accepted",
+            existing.len()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerServiceError> {
     if labels.len() > MAX_WORKER_LABELS {
         return Err(bad_request(format!(
@@ -126,8 +161,9 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
             || !key.chars().all(|c| c.is_ascii_graphic())
         {
             return Err(bad_request(format!(
-                "label key {key:?} must be 1 to {MAX_LABEL_KEY_BYTES} printable ASCII characters \
-                 without spaces"
+                "label key {} must be 1 to {MAX_LABEL_KEY_BYTES} printable ASCII characters \
+                 without spaces",
+                shown_key(key)
             )));
         }
         if value.len() > MAX_LABEL_VALUE_BYTES || value.chars().any(char::is_control) {
@@ -670,6 +706,11 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
+        if let (Some(labels), Some(worker)) =
+            (&update.labels, self.worker_registry.get_by_url(&url))
+        {
+            validate_merged_labels(&worker.metadata().spec.labels, labels)?;
+        }
 
         let job = Job::UpdateWorker {
             url: url.clone(),
@@ -953,5 +994,64 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+    }
+
+    /// The label cap holds for the worker, not the request: a PATCH merges
+    /// its labels into the existing ones, so one that would leave more than
+    /// the cap on the worker is refused, while one that only rewrites keys
+    /// the worker has is taken.
+    #[tokio::test]
+    async fn update_worker_holds_the_label_cap_over_the_merged_labels() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let full: HashMap<String, String> = (0..MAX_WORKER_LABELS)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let worker = BasicWorkerBuilder::new("grpc://10.0.0.6:8000")
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .labels(full)
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+        let id = registry.reserve_id_for_url("grpc://10.0.0.6:8000");
+        let service = make_service(Arc::clone(&registry));
+        let one_more: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k_new": "v"}})).expect("an update");
+        let err = service
+            .update_worker(id.as_str(), one_more)
+            .await
+            .expect_err("a 129th label");
+        assert!(
+            matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("129 labels on the worker")),
+            "{err}"
+        );
+        let rewrite: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k0": "w", "k1": "w"}})).expect("an update");
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), rewrite)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// A rejected key is not echoed whole: a key the size of the payload
+    /// limit comes back as its first characters and its length.
+    #[test]
+    fn a_rejected_label_key_is_shown_truncated() {
+        let long = "k".repeat(1 << 20);
+        let labels: HashMap<String, String> = [(long.clone(), "v".to_string())].into();
+        let err = validate_labels(&labels).expect_err("a key over the cap");
+        let WorkerServiceError::BadRequest { message } = err else {
+            panic!("expected a bad request, got {err}");
+        };
+        assert!(message.len() < 512, "{} bytes", message.len());
+        assert!(
+            message.contains(&format!("({} bytes)", long.len())),
+            "{message}"
+        );
+        let short: HashMap<String, String> = [("has space".to_string(), "v".to_string())].into();
+        let err = validate_labels(&short).expect_err("a key with a space");
+        assert!(err.to_string().contains("\"has space\""), "{err}");
     }
 }
