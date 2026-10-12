@@ -123,7 +123,9 @@ pub async fn list_response_input_items(
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use smg_data_connector::{MemoryResponseStorage, ResponseStorageError, StoredResponse};
+    use smg_data_connector::{
+        MemoryConfig, MemoryResponseStorage, ResponseStorageError, StoredResponse,
+    };
 
     use super::*;
     use crate::routers::error::HEADER_X_SMG_ERROR_CODE;
@@ -316,13 +318,6 @@ mod tests {
         };
         assert_eq!(body(other).await, body(missing).await);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use smg_data_connector::{MemoryConfig, MemoryResponseStorage, StoredResponse};
-
-    use super::*;
 
     /// A response the bounded memory store evicted answers as an unknown id.
     #[tokio::test]
@@ -341,15 +336,17 @@ mod tests {
             ids.push(storage.store_response(stored).await.unwrap().0);
         }
         assert_eq!(
-            get_response(&storage, &ids[0]).await.status(),
+            get_response(&storage, None, &ids[0]).await.status(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            list_response_input_items(&storage, &ids[0]).await.status(),
+            list_response_input_items(&storage, None, &ids[0])
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            get_response(&storage, &ids[2]).await.status(),
+            get_response(&storage, None, &ids[2]).await.status(),
             StatusCode::OK
         );
     }

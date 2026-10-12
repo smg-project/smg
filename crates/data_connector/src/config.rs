@@ -34,7 +34,9 @@ pub struct MemoryConfig {
     /// conversation that lists them.
     pub max_items: usize,
     /// How long a record is kept, in seconds; `None` (or 0) keeps a record
-    /// until a count bound drops it. Conversations follow the retention only.
+    /// until a count bound drops it. Conversations follow the retention only,
+    /// counted from their last use (created, read or updated); a background
+    /// response still running is not dropped by a count bound.
     pub retention_secs: Option<u64>,
 }
 
@@ -59,10 +61,10 @@ impl MemoryConfig {
     }
 
     /// The retention as a duration; `None` for no retention.
-    pub fn retention(&self) -> Option<std::time::Duration> {
+    pub fn retention(&self) -> Option<Duration> {
         self.retention_secs
             .filter(|secs| *secs > 0)
-            .map(std::time::Duration::from_secs)
+            .map(Duration::from_secs)
     }
 }
 

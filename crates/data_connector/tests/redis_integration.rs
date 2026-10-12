@@ -281,6 +281,7 @@ async fn a_store_that_stops_answering_fails_the_call_at_its_bound() {
         oracle: None,
         postgres: None,
         redis: Some(&redis_cfg),
+        memory: None,
         hook: None,
     })
     .await
@@ -341,6 +342,7 @@ async fn a_store_a_few_hundred_milliseconds_away_still_answers() {
         oracle: None,
         postgres: None,
         redis: Some(&redis_cfg),
+        memory: None,
         hook: None,
     })
     .await

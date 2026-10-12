@@ -377,6 +377,7 @@ mod tests {
             oracle: None,
             postgres: Some(&postgres_cfg),
             redis: None,
+            memory: None,
             hook: None,
         })
         .await
@@ -396,6 +397,7 @@ mod tests {
             oracle: None,
             postgres: None,
             redis: Some(&redis_cfg),
+            memory: None,
             hook: None,
         })
         .await

@@ -1299,7 +1299,10 @@ struct CliArgs {
     history_memory_max_items: usize,
 
     /// How long the memory history backend keeps a record, in seconds, checked
-    /// on every write; 0 keeps a record until a count bound drops it.
+    /// on every write; 0 keeps a record until a count bound drops it. A
+    /// conversation is kept that long after its last use (created, read or
+    /// updated); a background response still running is not dropped by a
+    /// count bound.
     #[arg(long, default_value_t = 86_400, help_heading = "Backend")]
     history_memory_retention_secs: u64,
 

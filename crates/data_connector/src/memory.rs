@@ -6,6 +6,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    hash::Hash,
     sync::Arc,
 };
 
@@ -48,35 +49,143 @@ impl Bounds {
     }
 }
 
-/// The ids of a store in insertion order with their stamps, oldest first. An
-/// id a client deleted stays in the queue until it reaches the front, where
-/// it is skipped; the store's real count is what the bound is held against.
-type Order<K> = VecDeque<(DateTime<Utc>, K)>;
+/// Why an entry at the front of the order is up for eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// Older than the retention.
+    Expired,
+    /// The store holds more than its count bound.
+    Over,
+}
 
-/// Evicts from the front of `order` while it is expired at `now` or the store
-/// holds more than the bound: `remove` drops the record under an id and
-/// answers whether there was one; `len` is the store's count before. Answers
-/// how many records went.
-fn evict<K>(
-    order: &mut Order<K>,
-    bounds: &Bounds,
-    now: DateTime<Utc>,
-    mut len: usize,
-    mut remove: impl FnMut(&K) -> bool,
-) -> usize {
-    let mut evicted = 0;
-    while let Some((stamp, _)) = order.front() {
-        if !(bounds.expired(*stamp, now) || bounds.over(len)) {
-            break;
-        }
-        if let Some((_, id)) = order.pop_front() {
-            if remove(&id) {
-                evicted += 1;
-                len -= 1;
-            }
+/// What became of the record an eviction asked a store to drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// The record went.
+    Removed,
+    /// There was no record under the id.
+    Absent,
+    /// The store keeps the record for now; it is queued again, as of now.
+    Stays,
+}
+
+/// The ids of a store in insertion order with their stamps, oldest first.
+/// Every entry carries the sequence number it was queued with, and `live`
+/// keeps the sequence of the entry that stands for each id the store holds.
+/// An entry a delete or a re-insert under the same id left behind stands for
+/// nothing: it is skipped at the front, so it never drops the id's newer
+/// record, and such entries are compacted away when they outnumber the live
+/// ones. The store's real count is what the count bound is held against.
+struct Order<K> {
+    queue: VecDeque<(DateTime<Utc>, u64, K)>,
+    live: HashMap<K, u64>,
+    next: u64,
+}
+
+impl<K> Default for Order<K> {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            live: HashMap::new(),
+            next: 0,
         }
     }
-    evicted
+}
+
+impl<K: Clone + Eq + Hash> Order<K> {
+    /// Queues `id` at `stamp` as the entry that stands for it; a re-insert or
+    /// a touch of an id moves it to the back.
+    fn push(&mut self, stamp: DateTime<Utc>, id: K) {
+        self.next += 1;
+        self.live.insert(id.clone(), self.next);
+        self.queue.push_back((stamp, self.next, id));
+    }
+
+    /// Moves a live `id` to the back, stamped `now`; an id the store does not
+    /// hold is left alone.
+    fn touch(&mut self, now: DateTime<Utc>, id: &K) {
+        if self.live.contains_key(id) {
+            self.push(now, id.clone());
+        }
+    }
+
+    /// No entry stands for `id` any more (its record went).
+    fn forget(&mut self, id: &K) {
+        self.live.remove(id);
+    }
+
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.live.clear();
+    }
+
+    /// Drops the entries that stand for nothing once they outnumber the live
+    /// ones (a store-then-delete workload leaves one behind per write);
+    /// amortised constant time per write.
+    fn compact(&mut self) {
+        if self.queue.len() > 2 * self.live.len().max(64) {
+            let live = &self.live;
+            self.queue.retain(|(_, seq, id)| live.get(id) == Some(seq));
+        }
+    }
+
+    /// The stamp of the entry that stands for `id`.
+    #[cfg(test)]
+    fn stamp_of(&self, id: &K) -> Option<DateTime<Utc>> {
+        let seq = *self.live.get(id)?;
+        self.queue
+            .iter()
+            .find(|(_, entry, _)| *entry == seq)
+            .map(|(stamp, _, _)| *stamp)
+    }
+
+    /// Evicts from the front while the entry there is expired at `now` or the
+    /// store holds more than its count bound: `remove` drops the record under
+    /// a live id, told why, and answers what became of it; `len` is the store's
+    /// count before. One pass over the entries queued when called (a record
+    /// that stays is queued again behind them). Answers how many records went.
+    fn evict(
+        &mut self,
+        bounds: &Bounds,
+        now: DateTime<Utc>,
+        mut len: usize,
+        mut remove: impl FnMut(&K, Why) -> Fate,
+    ) -> usize {
+        let mut evicted = 0;
+        let mut budget = self.queue.len();
+        while budget > 0 {
+            let Some((stamp, _, _)) = self.queue.front() else {
+                break;
+            };
+            let why = if bounds.expired(*stamp, now) {
+                Why::Expired
+            } else if bounds.over(len) {
+                Why::Over
+            } else {
+                break;
+            };
+            budget -= 1;
+            let Some((_, seq, id)) = self.queue.pop_front() else {
+                break;
+            };
+            if self.live.get(&id) != Some(&seq) {
+                continue;
+            }
+            match remove(&id, why) {
+                Fate::Removed => {
+                    self.live.remove(&id);
+                    evicted += 1;
+                    len -= 1;
+                }
+                Fate::Absent => {
+                    self.live.remove(&id);
+                }
+                Fate::Stays => self.push(now, id),
+            }
+        }
+        self.compact();
+        evicted
+    }
 }
 
 // ============================================================================
@@ -96,8 +205,12 @@ impl ConversationInner {
             order,
         } = self;
         let len = conversations.len();
-        let evicted = evict(order, bounds, now, len, |id| {
-            conversations.remove(id).is_some()
+        let evicted = order.evict(bounds, now, len, |id, _| {
+            if conversations.remove(id).is_some() {
+                Fate::Removed
+            } else {
+                Fate::Absent
+            }
         });
         if evicted > 0 {
             tracing::debug!(
@@ -111,8 +224,10 @@ impl ConversationInner {
 }
 
 /// In-memory conversation storage used for development and tests; the
-/// conversations follow the retention of its [`MemoryConfig`] (a conversation
-/// record is small; its items have a bound of their own).
+/// conversations follow the retention of its [`MemoryConfig`], counted from
+/// the conversation's last use (created, read or updated), so one a client
+/// keeps using is kept (a conversation record is small; its items have a
+/// bound of their own).
 #[derive(Clone)]
 pub struct MemoryConversationStorage {
     inner: Arc<RwLock<ConversationInner>>,
@@ -139,10 +254,16 @@ impl MemoryConversationStorage {
         }
     }
 
-    /// Drops the conversations older than the retention at `now`; answers how
-    /// many went. Every write does this at the current time.
+    /// Drops the conversations whose last use is older than the retention at
+    /// `now`; answers how many went. Every write does this at the current time.
     pub fn evict_at(&self, now: DateTime<Utc>) -> usize {
         self.inner.write().evict(&self.bounds, now)
+    }
+
+    /// The stamp the retention of `id` counts from.
+    #[cfg(test)]
+    pub(super) fn stamp_of(&self, id: &ConversationId) -> Option<DateTime<Utc>> {
+        self.inner.read().order.stamp_of(id)
     }
 }
 
@@ -160,7 +281,7 @@ impl ConversationStorage for MemoryConversationStorage {
             .insert(conversation.id.clone(), conversation.clone())
             .is_none()
         {
-            store.order.push_back((now, conversation.id.clone()));
+            store.order.push(now, conversation.id.clone());
         }
         store.evict(&self.bounds, now);
         Ok(conversation)
@@ -170,7 +291,13 @@ impl ConversationStorage for MemoryConversationStorage {
         &self,
         id: &ConversationId,
     ) -> ConversationResult<Option<Conversation>> {
-        Ok(self.inner.read().conversations.get(id).cloned())
+        // A read is a use: the retention counts from it.
+        let mut store = self.inner.write();
+        let conversation = store.conversations.get(id).cloned();
+        if conversation.is_some() {
+            store.order.touch(Utc::now(), id);
+        }
+        Ok(conversation)
     }
 
     async fn update_conversation(
@@ -181,14 +308,20 @@ impl ConversationStorage for MemoryConversationStorage {
         let mut store = self.inner.write();
         if let Some(entry) = store.conversations.get_mut(id) {
             entry.metadata = metadata;
-            return Ok(Some(entry.clone()));
+            let updated = entry.clone();
+            store.order.touch(Utc::now(), id);
+            return Ok(Some(updated));
         }
 
         Ok(None)
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
-        let removed = self.inner.write().conversations.remove(id).is_some();
+        let mut store = self.inner.write();
+        let removed = store.conversations.remove(id).is_some();
+        if removed {
+            store.order.forget(id);
+        }
         Ok(removed)
     }
 
@@ -294,7 +427,13 @@ impl ConversationItemInner {
     fn evict(&mut self, bounds: &Bounds, now: DateTime<Utc>) -> usize {
         let len = self.items.len();
         let mut order = std::mem::take(&mut self.order);
-        let evicted = evict(&mut order, bounds, now, len, |id| self.evict_item(id));
+        let evicted = order.evict(bounds, now, len, |id, _| {
+            if self.evict_item(id) {
+                Fate::Removed
+            } else {
+                Fate::Absent
+            }
+        });
         self.order = order;
         if evicted > 0 {
             tracing::debug!(
@@ -366,7 +505,7 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         };
         let mut store = self.inner.write();
         if store.items.insert(id.clone(), item.clone()).is_none() {
-            store.order.push_back((created_at, id));
+            store.order.push(created_at, id);
         }
         store.evict(&self.bounds, created_at);
         Ok(item)
@@ -513,10 +652,26 @@ struct InnerStore {
 }
 
 impl InnerStore {
+    /// Whether the record under `id` is a background response still running
+    /// (`queued` or `in_progress`): its client is still to read it, so a count
+    /// bound passes it over (the retention does not).
+    fn running(&self, id: &ResponseId) -> bool {
+        self.responses.get(id).is_some_and(|response| {
+            matches!(
+                response
+                    .raw_response
+                    .get("status")
+                    .and_then(serde_json::Value::as_str),
+                Some("queued" | "in_progress")
+            )
+        })
+    }
+
     fn remove(&mut self, response_id: &ResponseId) -> bool {
         let Some(response) = self.responses.remove(response_id) else {
             return false;
         };
+        self.order.forget(response_id);
         if let Some(ref safety_identifier) = response.safety_identifier {
             if let Some(user_responses) = self.identifier_index.get_mut(safety_identifier) {
                 user_responses.retain(|id| id != response_id);
@@ -531,7 +686,15 @@ impl InnerStore {
     fn evict(&mut self, bounds: &Bounds, now: DateTime<Utc>) -> usize {
         let len = self.responses.len();
         let mut order = std::mem::take(&mut self.order);
-        let evicted = evict(&mut order, bounds, now, len, |id| self.remove(id));
+        let evicted = order.evict(bounds, now, len, |id, why| {
+            if why == Why::Over && self.running(id) {
+                Fate::Stays
+            } else if self.remove(id) {
+                Fate::Removed
+            } else {
+                Fate::Absent
+            }
+        });
         self.order = order;
         if evicted > 0 {
             tracing::debug!(
@@ -545,7 +708,10 @@ impl InnerStore {
 }
 
 /// In-memory implementation of response storage; bounded by the response
-/// count and the retention of its [`MemoryConfig`].
+/// count and the retention of its [`MemoryConfig`]. A background response
+/// still running (`queued` or `in_progress`) is not dropped by the count
+/// bound, so its client finds it when it polls; the retention drops it like
+/// any record.
 pub struct MemoryResponseStorage {
     /// Single lock wrapping the maps to prevent deadlocks and ensure atomic updates
     store: Arc<RwLock<InnerStore>>,
@@ -580,6 +746,12 @@ impl MemoryResponseStorage {
             response_count: store.responses.len(),
             identifier_count: store.identifier_index.len(),
         }
+    }
+
+    /// The entries the order holds, the live ones and the ones left behind.
+    #[cfg(test)]
+    pub(super) fn order_len(&self) -> usize {
+        self.store.read().order.queue.len()
     }
 
     /// Clear all data (useful for testing)
@@ -628,7 +800,7 @@ impl ResponseStorage for MemoryResponseStorage {
             .insert(response_id.clone(), response)
             .is_none()
         {
-            store.order.push_back((now, response_id.clone()));
+            store.order.push(now, response_id.clone());
         }
         store.evict(&self.bounds, now);
         tracing::debug!(
@@ -794,6 +966,9 @@ impl ResponseStorage for MemoryResponseStorage {
             .iter()
             .filter(|id| store.responses.remove(id).is_some())
             .count();
+        for id in &gone {
+            store.order.forget(id);
+        }
         if !kept.is_empty() {
             store.identifier_index.insert(identifier.to_string(), kept);
         }
@@ -1389,7 +1564,7 @@ mod tests {
         assert_eq!(store.stored_record_count(), Some(2));
         // The index follows: the evicted record is not listed.
         let listed = store
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert_eq!(listed.len(), 2);
@@ -1835,5 +2010,189 @@ mod tests {
         store.delete_item(&conv, &ids[0]).await.unwrap();
         assert!(!store.is_item_linked(&conv, &ids[0]).await.unwrap());
         assert_eq!(list(SortOrder::Asc).await, ["msg_b"]);
+    }
+
+    /// An id stored again after a delete is a new record: the entry its
+    /// predecessor left in the order stands for nothing, so it drops no one.
+    #[tokio::test]
+    async fn a_reused_id_is_not_evicted_by_the_entry_its_predecessor_left() {
+        let config = MemoryConfig {
+            max_responses: 2,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let store = MemoryResponseStorage::with_config(&config);
+        let a: ResponseId = "resp_a".into();
+        let b: ResponseId = "resp_b".into();
+        let mut first = StoredResponse::new(None);
+        first.id = a.clone();
+        store.store_response(first).await.unwrap();
+        let mut second = StoredResponse::new(None);
+        second.id = b.clone();
+        store.store_response(second).await.unwrap();
+        store.delete_response(&a).await.unwrap();
+        let mut again = StoredResponse::new(None);
+        again.id = a.clone();
+        again.input = json!("again");
+        store.store_response(again).await.unwrap();
+        // Over the bound: the oldest live record (b) goes, not the re-stored a
+        // behind the stale entry of its predecessor.
+        let third = store
+            .store_response(StoredResponse::new(None))
+            .await
+            .unwrap();
+        assert!(
+            store.get_response(&b).await.unwrap().is_none(),
+            "b was the oldest"
+        );
+        assert_eq!(
+            store.get_response(&a).await.unwrap().map(|r| r.input),
+            Some(json!("again"))
+        );
+        assert!(store.get_response(&third).await.unwrap().is_some());
+        assert_eq!(store.stored_record_count(), Some(2));
+    }
+
+    /// A background response still running is passed over by the count bound
+    /// (its client is still to read it); once terminal it goes like any other.
+    #[tokio::test]
+    async fn a_running_background_response_is_not_dropped_by_the_count_bound() {
+        let config = MemoryConfig {
+            max_responses: 2,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let store = MemoryResponseStorage::with_config(&config);
+        let running: ResponseId = "resp_bg".into();
+        let mut queued = StoredResponse::new(None);
+        queued.id = running.clone();
+        queued.raw_response = json!({"id": "resp_bg", "status": "queued"});
+        store.store_response(queued).await.unwrap();
+        let mut done = Vec::new();
+        for i in 0..3 {
+            let mut response = StoredResponse::new(None);
+            response.raw_response = json!({"status": "completed", "n": i});
+            done.push(store.store_response(response).await.unwrap());
+        }
+        assert!(
+            store.get_response(&running).await.unwrap().is_some(),
+            "the queued record outlived three stores past the bound"
+        );
+        assert!(store.get_response(&done[0]).await.unwrap().is_none());
+        assert!(store.get_response(&done[1]).await.unwrap().is_none());
+        assert!(store.get_response(&done[2]).await.unwrap().is_some());
+        assert_eq!(store.stored_record_count(), Some(2));
+        // Terminal now: the next write past the bound drops it (it is the oldest).
+        let mut completed = StoredResponse::new(None);
+        completed.id = running.clone();
+        completed.raw_response = json!({"id": "resp_bg", "status": "completed"});
+        store.store_response(completed).await.unwrap();
+        store
+            .store_response(StoredResponse::new(None))
+            .await
+            .unwrap();
+        assert!(store.get_response(&running).await.unwrap().is_none());
+        assert_eq!(store.stored_record_count(), Some(2));
+        // A store of running responses only: the pass ends, the bound yields.
+        let store = MemoryResponseStorage::with_config(&config);
+        for i in 0..4 {
+            let mut response = StoredResponse::new(None);
+            response.raw_response = json!({"status": "in_progress", "n": i});
+            store.store_response(response).await.unwrap();
+        }
+        assert_eq!(store.stored_record_count(), Some(4));
+    }
+
+    /// Deletes leave entries behind in the order; they are compacted away, so
+    /// a store-then-delete workload under no retention does not grow it.
+    #[tokio::test]
+    async fn the_order_is_compacted_when_deletes_leave_entries_behind() {
+        let config = MemoryConfig {
+            max_responses: 10_000,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let store = MemoryResponseStorage::with_config(&config);
+        for _ in 0..1_000 {
+            let id = store
+                .store_response(StoredResponse::new(None))
+                .await
+                .unwrap();
+            store.delete_response(&id).await.unwrap();
+        }
+        assert_eq!(store.stored_record_count(), Some(0));
+        assert!(
+            store.order_len() <= 128,
+            "{} entries left",
+            store.order_len()
+        );
+        let conversations = MemoryConversationStorage::with_config(&config);
+        for _ in 0..1_000 {
+            let conversation = conversations
+                .create_conversation(NewConversation::default())
+                .await
+                .unwrap();
+            conversations
+                .delete_conversation(&conversation.id)
+                .await
+                .unwrap();
+        }
+        assert_eq!(conversations.stored_record_count(), Some(0));
+        assert!(conversations.inner.read().order.queue.len() <= 128);
+    }
+
+    /// A conversation's retention counts from its last use: a read or an
+    /// update moves its stamp, so one in use outlives one created with it.
+    #[tokio::test]
+    async fn a_conversation_in_use_outlives_the_retention_counted_from_its_creation() {
+        let config = MemoryConfig {
+            max_responses: 10,
+            max_items: 10,
+            retention_secs: Some(3_600),
+        };
+        let conversations = MemoryConversationStorage::with_config(&config);
+        let idle = conversations
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        let used = conversations
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        let created = conversations.stamp_of(&used.id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(conversations
+            .get_conversation(&used.id)
+            .await
+            .unwrap()
+            .is_some());
+        let read = conversations.stamp_of(&used.id).unwrap();
+        assert!(read > created, "the read moved the stamp");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        conversations
+            .update_conversation(&used.id, None)
+            .await
+            .unwrap();
+        let updated = conversations.stamp_of(&used.id).unwrap();
+        assert!(updated > read, "the update moved the stamp");
+        // An hour after the used one's creation the idle one (created before
+        // it) goes; the used one stays until an hour after its last use.
+        assert_eq!(
+            conversations.evict_at(created + TimeDelta::seconds(3_600)),
+            1
+        );
+        assert!(conversations
+            .get_conversation(&idle.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(conversations
+            .get_conversation(&used.id)
+            .await
+            .unwrap()
+            .is_some());
+        let last = conversations.stamp_of(&used.id).unwrap();
+        assert_eq!(conversations.evict_at(last + TimeDelta::seconds(3_600)), 1);
+        assert_eq!(conversations.stored_record_count(), Some(0));
     }
 }

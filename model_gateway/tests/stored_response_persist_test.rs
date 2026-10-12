@@ -93,6 +93,7 @@ async fn app() -> (Router, tokio::task::AbortHandle) {
         oracle: None,
         postgres: None,
         redis: Some(&redis),
+        memory: None,
         hook: None,
     })
     .await
