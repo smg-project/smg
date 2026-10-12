@@ -27,6 +27,10 @@ use crate::routers::{
 
 pub const MAX_METADATA_PROPERTIES: usize = 16;
 const MAX_ITEMS_PER_REQUEST: usize = 20;
+/// The longest item id a client may supply, in bytes: the id columns of the
+/// SQL stores are 64 wide, and every backend gives the same refusal before any
+/// store is asked, where one of them used to fail the insert instead.
+pub const MAX_ITEM_ID_LENGTH: usize = 64;
 
 const SUPPORTED_ITEM_TYPES: &[&str] = &[
     "message",
@@ -89,6 +93,20 @@ fn item_already_in_conversation() -> Response {
         "type": "invalid_request_error",
         "param": "items",
         "code": "item_already_in_conversation"
+    }))
+}
+
+/// The refusal of a client-supplied item id longer than the stores keep, under
+/// the public API's code for a string over its bound.
+fn item_id_above_max_length(id: &str) -> Response {
+    bad_request_structured(json!({
+        "message": format!(
+            "Item id must be at most {MAX_ITEM_ID_LENGTH} characters long, got {}",
+            id.len()
+        ),
+        "type": "invalid_request_error",
+        "param": "items[].id",
+        "code": "string_above_max_length"
     }))
 }
 
@@ -446,6 +464,11 @@ async fn process_item_with_id(
     item_val: &Value,
     id_str: &str,
 ) -> Result<(ConversationItem, Option<String>), Response> {
+    // Bounded before any store is asked: the stores' id columns are this wide,
+    // and an id over the bound must be the same 400 on every backend.
+    if id_str.len() > MAX_ITEM_ID_LENGTH {
+        return Err(item_id_above_max_length(id_str));
+    }
     let item_id = ConversationItemId::from(id_str);
 
     // Check if already linked
@@ -710,8 +733,77 @@ pub fn conversation_to_json(conversation: &Conversation) -> Value {
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
+    use smg_data_connector::{MemoryConversationItemStorage, MemoryConversationStorage};
 
     use super::*;
+
+    /// A client-supplied item id longer than the stores' id columns is refused
+    /// at the handler, before any store is asked, so every backend answers the
+    /// same 400 under the public API's code; an id at the bound is kept and
+    /// linked under that id.
+    #[tokio::test]
+    async fn an_item_id_over_the_bound_is_refused_before_the_store_and_one_at_the_bound_is_kept() {
+        let conversation_storage: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let item_storage: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let conversation = conversation_storage
+            .create_conversation(NewConversation {
+                id: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let conv_id = conversation.id.0.clone();
+        let items = |id: &str| json!({"items": [{"type": "message", "role": "user", "content": "x", "id": id}]});
+
+        // 65 and 64 characters: one over the stores' 64-character id columns, one at the bound.
+        let over = format!("msg_{}", "a".repeat(61));
+        assert_eq!(over.len(), 65);
+        let response =
+            create_conversation_items(&conversation_storage, &item_storage, &conv_id, items(&over))
+                .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "string_above_max_length", "{json}");
+        assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
+        assert_eq!(json["error"]["param"], "items[].id", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("64"),
+            "the message names the bound: {json}"
+        );
+        let over_id = ConversationItemId::from(over.as_str());
+        assert!(
+            item_storage.get_item(&over_id).await.unwrap().is_none(),
+            "nothing is stored under the refused id"
+        );
+        assert!(!item_storage
+            .is_item_linked(&conversation.id, &over_id)
+            .await
+            .unwrap());
+
+        let at_bound = format!("msg_{}", "a".repeat(60));
+        assert_eq!(at_bound.len(), 64);
+        let response = create_conversation_items(
+            &conversation_storage,
+            &item_storage,
+            &conv_id,
+            items(&at_bound),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(item_storage
+            .is_item_linked(
+                &conversation.id,
+                &ConversationItemId::from(at_bound.as_str())
+            )
+            .await
+            .unwrap());
+    }
 
     /// The CRUD helpers answer with the gateway's envelope, an object an SDK
     /// decodes (`type` from the public vocabulary, a string `code`, `param`),
