@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::core::{
     make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-    ConversationStorage, ConversationStorageError, ListParams, NewConversation,
+    ConversationStorage, ConversationStorageError, Failure, ListParams, NewConversation,
     NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError, SortOrder,
     StoredResponse,
 };
@@ -115,16 +115,16 @@ impl OracleStore {
     }
 
     /// Execute function with a connection from the pool
-    pub async fn execute<F, T>(&self, func: F) -> Result<T, String>
+    /// Runs `func` on a pooled connection. A connection the pool cannot give
+    /// is the store being unavailable; what `func` answers is the store's
+    /// own failure (classifying the statement's errors further is left to
+    /// the caller's text).
+    pub async fn execute<F, T>(&self, func: F) -> Result<T, Failure>
     where
         F: FnOnce(&Connection) -> Result<T, String> + Send + 'static,
         T: Send + 'static,
     {
-        let connection = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("Failed to get Oracle connection: {e}"))?;
+        let connection = self.pool.get().await.map_err(|e| Failure::pool(&e))?;
 
         tokio::task::spawn_blocking(move || {
             let result = func(&connection);
@@ -132,7 +132,8 @@ impl OracleStore {
             result
         })
         .await
-        .map_err(|e| format!("Task execution failed: {e}"))?
+        .map_err(|e| Failure::Storage(format!("Task execution failed: {e}")))?
+        .map_err(Failure::Storage)
     }
 }
 
@@ -399,7 +400,7 @@ impl ConversationStorage for OracleConversationStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)?;
+            .map_err(ConversationStorageError::from_failure)?;
 
         Ok(conversation)
     }
@@ -465,7 +466,7 @@ impl ConversationStorage for OracleConversationStorage {
                 }
             })
             .await
-            .map_err(ConversationStorageError::StorageError)
+            .map_err(ConversationStorageError::from_failure)
     }
 
     async fn update_conversation(
@@ -502,7 +503,7 @@ impl ConversationStorage for OracleConversationStorage {
                 stmt.row_count().map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)?;
+            .map_err(ConversationStorageError::from_failure)?;
         if rows == 0 {
             return Ok(None);
         }
@@ -533,7 +534,7 @@ impl ConversationStorage for OracleConversationStorage {
                 .map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)?;
+            .map_err(ConversationStorageError::from_failure)?;
 
         Ok(res
             .row_count()
@@ -727,7 +728,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)?;
+            .map_err(ConversationItemStorageError::from_failure)?;
 
         Ok(ConversationItem {
             id,
@@ -782,7 +783,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn link_items(
@@ -860,7 +861,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn list_items(
@@ -966,7 +967,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn get_item(
@@ -1012,7 +1013,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn is_item_linked(
@@ -1039,7 +1040,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(count > 0)
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn delete_item(
@@ -1066,7 +1067,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 }
 
@@ -1455,7 +1456,7 @@ impl ResponseStorage for OracleResponseStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)?;
+            .map_err(ResponseStorageError::from_failure)?;
 
         Ok(return_id)
     }
@@ -1483,7 +1484,7 @@ impl ResponseStorage for OracleResponseStorage {
                 }
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn find_response_by_output_item(
@@ -1509,7 +1510,7 @@ impl ResponseStorage for OracleResponseStorage {
                 }
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> Result<(), ResponseStorageError> {
@@ -1527,7 +1528,7 @@ impl ResponseStorage for OracleResponseStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn list_identifier_responses(
@@ -1592,7 +1593,7 @@ impl ResponseStorage for OracleResponseStorage {
                 Ok(results)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn delete_unstored_older_than(
@@ -1636,7 +1637,7 @@ impl ResponseStorage for OracleResponseStorage {
                 .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)?;
+            .map_err(ResponseStorageError::from_failure)?;
 
         let deleted = affected
             .row_count()
@@ -1676,7 +1677,7 @@ impl ResponseStorage for OracleResponseStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)?;
+            .map_err(ResponseStorageError::from_failure)?;
 
         let deleted = affected
             .row_count()

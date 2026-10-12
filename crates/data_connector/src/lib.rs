@@ -34,9 +34,10 @@ pub(crate) mod versioning;
 // Re-export core types and traits
 pub use core::{
     is_unstored, tenant_scope_allows, visible_chain, AddedAtSequence, Conversation, ConversationId,
-    ConversationItem, ConversationItemId, ConversationItemStorage, ConversationStorage, ListParams,
-    NewConversation, NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError,
-    SortOrder, StorageFailure, StoredResponse,
+    ConversationItem, ConversationItemId, ConversationItemStorage, ConversationItemStorageError,
+    ConversationStorage, ConversationStorageError, Failure, ListParams, NewConversation,
+    NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError, SortOrder,
+    StorageFailure, StoredResponse,
 };
 
 pub use config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};

@@ -27,7 +27,8 @@ use crate::{
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Run the before-hook, returning the extra columns on success or mapping
-/// `Reject` / errors to the appropriate storage error via `map_err`.
+/// `Reject` to the store's `Rejected` error via `map_err` (a refusal on purpose,
+/// never the store being unavailable); a hook that fails is logged and skipped.
 async fn run_before<E>(
     hook: &dyn StorageHook,
     op: StorageOperation,
@@ -85,7 +86,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::CreateConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -114,7 +115,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::GetConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -143,7 +144,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::UpdateConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -169,7 +170,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::DeleteConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -215,7 +216,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::CreateItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -245,7 +246,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::LinkItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -278,7 +279,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::LinkItems,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -308,7 +309,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::ListItems,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -336,7 +337,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::GetItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -365,7 +366,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::IsItemLinked,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -394,7 +395,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::DeleteItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -436,7 +437,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::StoreResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -464,7 +465,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::GetResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -489,7 +490,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::DeleteResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -517,7 +518,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::GetResponseChain,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -558,7 +559,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::GetResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await
         else {
@@ -591,7 +592,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::ListIdentifierResponses,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -638,7 +639,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::DeleteIdentifierResponses,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -674,6 +675,7 @@ mod tests {
     use super::*;
     use crate::{
         context::{with_request_context, RequestContext},
+        core::StorageFailure,
         hooks::HookError,
         memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage},
     };
@@ -768,6 +770,13 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("not allowed"));
+        // A refusal on purpose: the store is fine, so it is not the 503 of a
+        // store that is not available.
+        assert!(
+            matches!(err, ConversationStorageError::Rejected(_)),
+            "{err:?}"
+        );
+        assert!(!err.is_unavailable(), "{err}");
         assert_eq!(hook.before_calls(), 1);
         assert_eq!(hook.after_calls(), 0); // after not called on rejection
     }

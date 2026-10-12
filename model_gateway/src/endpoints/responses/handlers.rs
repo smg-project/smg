@@ -172,9 +172,10 @@ mod tests {
         }
     }
 
-    /// A store that did not answer within its bound makes the GET, the DELETE
-    /// and the input-items listing a 503 `storage_unavailable`; any other store
-    /// failure stays the 500 `storage_error` it was.
+    /// A store that did not answer within its bound, or is not available at
+    /// all, makes the GET, the DELETE and the input-items listing a 503
+    /// `storage_unavailable`; a failure the store answered stays the 500
+    /// `storage_error` it was.
     #[tokio::test]
     async fn a_store_that_timed_out_is_answered_as_unavailable() {
         fn timed_out() -> ResponseStorageError {
@@ -183,7 +184,10 @@ mod tests {
             )
         }
         fn refused() -> ResponseStorageError {
-            ResponseStorageError::StorageError("connection refused".to_string())
+            ResponseStorageError::Unavailable("connection refused".to_string())
+        }
+        fn answered() -> ResponseStorageError {
+            ResponseStorageError::StorageError("duplicate key".to_string())
         }
         for (failure, status, code) in [
             (
@@ -191,7 +195,12 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage_unavailable",
             ),
-            (refused, StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
+            (
+                refused,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+            ),
+            (answered, StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
         ] {
             let storage: Arc<dyn ResponseStorage> = Arc::new(FailingReads(failure));
             for response in [

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use smg_data_connector::{
     with_request_context, AddedAtSequence, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationStorage, NewConversationItem,
-    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
+    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, StorageFailure,
     StoredResponse,
 };
 use tracing::{debug, info, warn};
@@ -566,7 +566,7 @@ async fn persist_conversation_items_inner(
         .map_err(|e| {
             PersistError::new(
                 PersistStep::ResponseRecord,
-                matches!(e, ResponseStorageError::StorageError(_)),
+                e.is_unavailable(),
                 format!("Failed to store response: {e}"),
             )
         })?;
