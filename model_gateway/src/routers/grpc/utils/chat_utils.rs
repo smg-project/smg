@@ -128,10 +128,15 @@ const TOKENIZER_NOT_READY_RETRY_AFTER_SECS: u32 = 1;
 /// tokenizer load, which `/readiness` reports as not ready ("tokenizer not
 /// yet registered"). A planned, transient state, so the answer is the
 /// retryable class with a `Retry-After`, like a pool with no available
-/// worker, not a 500. One WARN per model and second, rate-limited; the
-/// response is marked [`ReportedRefusal`], so the pipeline's and the access
-/// log's lines for it stay at DEBUG (three ERROR lines per request were the
-/// storm of the 500).
+/// worker, not a 500. One WARN per request, capped per model at
+/// [`TOKENIZER_NOT_READY_LINES_PER_SECOND`] a second (the overflow is counted
+/// as `suppressed` on the next admitted line); the response is marked
+/// [`ReportedRefusal`], so the pipeline's and the access log's lines for it
+/// stay at DEBUG (three ERROR lines per request were the storm of the 500).
+/// A served model whose tokenizer autoload was skipped (no path to load it
+/// from) or failed is answered the same until the gateway records failed
+/// loads per model: a model stuck on this answer has the one WARN or ERROR
+/// line of its registration to look for.
 pub(crate) fn tokenizer_not_ready(function: &str, model_id: &str) -> Response {
     let mut response = error::service_unavailable(
         TOKENIZER_NOT_READY_CODE,
