@@ -5,10 +5,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, info};
-use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    worker::{overload::OverloadThresholds, BasicWorker, BasicWorkerBuilder, Worker},
+    worker::{
+        overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder,
+        Worker,
+    },
     workflow::data::WorkerUpdateWorkflowData,
 };
 
@@ -52,6 +55,19 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 for (key, value) in new_labels {
                     updated_labels.insert(key.clone(), value.clone());
                 }
+            }
+            // The admin check held the cap against the labels the worker had
+            // when the request arrived; updates queued together each passed
+            // it, so it is held again here, over the labels actually merged.
+            if updated_labels.len() > MAX_WORKER_LABELS {
+                return Err(WorkflowError::StepFailed {
+                    step_id: StepId::new("update_worker_properties"),
+                    message: format!(
+                        "{} labels on worker {} after this update; at most {MAX_WORKER_LABELS} are accepted",
+                        updated_labels.len(),
+                        worker.url()
+                    ),
+                });
             }
 
             // Resolve priority and cost: use update value if specified, otherwise keep existing
@@ -290,6 +306,42 @@ mod tests {
             updated_workers: None,
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    /// The cap is held where the labels are merged, not only at the admin
+    /// check: a worker already at the cap refuses an update with a new key
+    /// (updates queued together each passed the early check), while one that
+    /// rewrites keys the worker has goes through.
+    #[tokio::test]
+    async fn the_label_cap_holds_over_the_labels_the_step_merges() {
+        let mut builder = BasicWorkerBuilder::new("http://full:8000").status(WorkerStatus::Ready);
+        for i in 0..MAX_WORKER_LABELS {
+            builder = builder.label(format!("k{i}"), "v");
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut over = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("k_new".to_string(), "v".to_string())]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut over)
+            .await
+            .expect_err("a 129th label at merge time");
+        assert!(err.to_string().contains("129 labels on worker"), "{err}");
+        let mut rewrite = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("k0".to_string(), "w".to_string())]),
+        );
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut rewrite)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
     }
 
     #[tokio::test]

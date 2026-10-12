@@ -37,7 +37,9 @@ fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
 /// derived from the URL would carry them.
 const MAX_WORKER_URL_BYTES: usize = 2048;
 /// Most labels one worker carries; an engine reports a few dozen.
-const MAX_WORKER_LABELS: usize = 128;
+/// Most labels a worker carries; held at registration, at the admin check of a
+/// PATCH and again where the PATCH merges into the worker.
+pub(crate) const MAX_WORKER_LABELS: usize = 128;
 const MAX_LABEL_KEY_BYTES: usize = 128;
 const MAX_LABEL_VALUE_BYTES: usize = 4096;
 /// Labels the routers read as the decode window, a count from 1 to 65535
@@ -128,7 +130,11 @@ fn shown_key(key: &str) -> String {
 /// The labels a PATCH would leave on the worker: the request's merged into
 /// the existing ones (`UpdateWorkerPropertiesStep` keeps every key it does not
 /// name), held to the same cap as a registration, so repeated updates cannot
-/// grow a worker past it.
+/// grow a worker past it. This is the early check against the labels the
+/// worker has when the request arrives, for a clear 400; the merge runs later
+/// in the queued job, where `UpdateWorkerPropertiesStep` holds the cap again
+/// over the labels it actually merges, so PATCHes queued together cannot
+/// pass it between them.
 fn validate_merged_labels(
     existing: &HashMap<String, String>,
     update: &HashMap<String, String>,
