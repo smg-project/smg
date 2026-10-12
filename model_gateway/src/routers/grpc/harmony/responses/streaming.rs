@@ -372,10 +372,10 @@ async fn execute_mcp_tool_loop_streaming(
                     });
                     let final_response =
                         emitter.finalize_failed(Some(usage.clone()), error.clone());
-                    // The terminal below carries the run's own error and is
-                    // counted by emit_terminal; a record that could not be
-                    // written is logged (the background poll then finds no
-                    // result, as before this exit stored one).
+                    // A foreground record that could not be written is already
+                    // logged and counted by persist; the terminal keeps the
+                    // run's own error, as the regular stream does, and the
+                    // leftover is noted at debug.
                     if let Err(not_stored) = persist_response_if_needed(
                         ctx.conversation_storage.clone(),
                         ctx.conversation_item_storage.clone(),
@@ -386,9 +386,9 @@ async fn execute_mcp_tool_loop_streaming(
                     )
                     .await
                     {
-                        warn!(
+                        debug!(
                             error = ?not_stored.error_object(),
-                            "The failed object of the tool-call-limit exit could not be stored"
+                            "The tool-call-limit exit keeps its own error over the store failure"
                         );
                     }
                     let usage_json = json!(ResponseUsage::from(&usage));
