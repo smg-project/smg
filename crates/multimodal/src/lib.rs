@@ -14,6 +14,7 @@ pub mod registry;
 pub mod tracker;
 pub mod types;
 pub mod vision;
+pub mod webp_native;
 
 pub use audio::AudioPreProcessor;
 pub use encoder_inputs::{

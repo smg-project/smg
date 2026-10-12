@@ -826,6 +826,10 @@ pub(crate) fn init_metrics() {
         "smg_mm_turbojpeg_available",
         "1 when JPEGs decode through libjpeg-turbo (PIL's pixels), 0 through the pure-Rust fallback"
     );
+    describe_gauge!(
+        "smg_mm_webp_available",
+        "1 when WebP files decode through libwebp, 0 through the pure-Rust fallback"
+    );
     // The router-side pixel cache (--mm-pixel-cache-mb): one per process,
     // shared by every model, keyed by image and model configuration.
     describe_counter!(
@@ -1382,6 +1386,10 @@ impl Metrics {
 
     pub fn set_mm_turbojpeg_available(available: bool) {
         gauge!("smg_mm_turbojpeg_available").set(if available { 1.0 } else { 0.0 });
+    }
+
+    pub fn set_mm_webp_available(available: bool) {
+        gauge!("smg_mm_webp_available").set(if available { 1.0 } else { 0.0 });
     }
 
     /// The pixel cache's occupancy and eviction series, at zero: called when

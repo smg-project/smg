@@ -11,7 +11,10 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bytes::{Bytes, BytesMut};
-use image::{codecs::jpeg::JpegDecoder, ImageDecoder as _};
+use image::{
+    codecs::{jpeg::JpegDecoder, webp::WebPDecoder},
+    ImageDecoder as _,
+};
 #[cfg(feature = "opencv-video")]
 use opencv::{
     core::{Mat, Vector},
@@ -4714,6 +4717,10 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// also treats the ink values as Adobe-inverted and multiplies them the same
 /// way for plain CMYK, but its DCT and upsampling are its own and YCCK goes
 /// through its own YCbCr step, so those pixels are close to PIL's, not equal.
+/// A still WebP decodes through libwebp when it is present
+/// (`webp_native::decode_webp`, the library the reference loaders use, in
+/// the JPEG class of cost); without it, or for an animation, the `image`
+/// crate's decoder takes it, with the same pixels on the files checked.
 pub(crate) fn decode_image_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
@@ -4726,27 +4733,35 @@ pub(crate) fn decode_image_bytes(
             image.apply_orientation(jpeg_orientation(bytes));
             image
         }
-        None => {
-            let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
-                .with_guessed_format()
-                .map_err(MediaConnectorError::Io)?
-                .into_decoder()?;
-            // `ImageReader::decode` reserves the decoded buffer against the
-            // crate's allocation limit (512 MiB by default) before it decodes;
-            // `into_decoder` does not, so the reservation is made here. A file
-            // whose header declares more than the limit (a decompression bomb,
-            // or a JPEG the turbojpeg path handed over for its size) is refused
-            // without the allocation.
-            let mut limits = image::Limits::default();
-            limits.reserve(decoder.total_bytes())?;
-            decoder.set_limits(limits)?;
-            let orientation = decoder
-                .orientation()
-                .unwrap_or(image::metadata::Orientation::NoTransforms);
-            let mut image = image::DynamicImage::from_decoder(decoder)?;
-            image.apply_orientation(orientation);
-            image
-        }
+        None => match crate::webp_native::decode_webp(bytes) {
+            Some(mut image) => {
+                // libwebp yields pixels only; the tag comes from the file's
+                // metadata chunk, read as the fallback decoder reads it.
+                image.apply_orientation(webp_orientation(bytes));
+                image
+            }
+            None => {
+                let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+                    .with_guessed_format()
+                    .map_err(MediaConnectorError::Io)?
+                    .into_decoder()?;
+                // `ImageReader::decode` reserves the decoded buffer against the
+                // crate's allocation limit (512 MiB by default) before it
+                // decodes; `into_decoder` does not, so the reservation is made
+                // here. A file whose header declares more than the limit (a
+                // decompression bomb, or a JPEG the turbojpeg path handed over
+                // for its size) is refused without the allocation.
+                let mut limits = image::Limits::default();
+                limits.reserve(decoder.total_bytes())?;
+                decoder.set_limits(limits)?;
+                let orientation = decoder
+                    .orientation()
+                    .unwrap_or(image::metadata::Orientation::NoTransforms);
+                let mut image = image::DynamicImage::from_decoder(decoder)?;
+                image.apply_orientation(orientation);
+                image
+            }
+        },
     };
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
@@ -4781,6 +4796,15 @@ pub(crate) fn encoded_image_size(
 /// unreadable metadata means no transform.
 fn jpeg_orientation(bytes: &[u8]) -> image::metadata::Orientation {
     JpegDecoder::new(std::io::Cursor::new(bytes))
+        .and_then(|mut decoder| decoder.orientation())
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+/// The orientation tag of a WebP file, from its metadata chunk, as the
+/// `image` crate's decoder reads it (`NoTransforms` when there is none or
+/// the header does not parse).
+fn webp_orientation(bytes: &[u8]) -> image::metadata::Orientation {
+    WebPDecoder::new(std::io::Cursor::new(bytes))
         .and_then(|mut decoder| decoder.orientation())
         .unwrap_or(image::metadata::Orientation::NoTransforms)
 }

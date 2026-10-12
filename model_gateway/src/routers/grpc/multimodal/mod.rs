@@ -250,6 +250,15 @@ pub(crate) fn report_jpeg_decoder() {
                  an engine that decodes with PIL"
             );
         }
+        let webp = llm_multimodal::webp_native::webp_available();
+        Metrics::set_mm_webp_available(webp);
+        match llm_multimodal::webp_native::webp_version() {
+            Some(version) => tracing::info!(%version, "WebP decode uses libwebp"),
+            None => tracing::info!(
+                "libwebp not found: WebP files decode with the pure-Rust decoder (the same \
+                 pixels, several times the cost); install libwebp for the faster decode"
+            ),
+        }
     });
 }
 
