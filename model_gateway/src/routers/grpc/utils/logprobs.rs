@@ -1,9 +1,6 @@
 //! Proto-to-OpenAI logprob conversion functions.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::common::{ChatLogProbs, ChatLogProbsContent, LogProbs, TopLogProb};
@@ -100,12 +97,16 @@ fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
 /// Legacy `/v1/completions` logprobs of one choice, built token by token.
 ///
 /// Every token is its own decode with special tokens kept, its logprob, the
-/// alternatives the engine ranked for its position (at most `logprobs`,
-/// most likely first; `null` where none were asked for and at the first
-/// prompt position, which has no logprob), and its character offset in the
-/// choice's text (the sum of the earlier tokens' lengths). Prompt tokens
-/// (`echo`) come before the generated ones. Two alternatives that decode to
-/// the same text keep the more likely one.
+/// alternatives the engine ranked for its position (its first `logprobs`, in
+/// rank order; `null` where none were asked for and at the first prompt
+/// position, which has no logprob), and its character offset in the choice's
+/// text (the sum of the earlier tokens' lengths). Prompt tokens (`echo`) come
+/// before the generated ones. Two alternatives that decode to the same text
+/// share one entry, as a Python dict built in rank order holds them: at the
+/// first one's place, with the later (less likely) one's value. A client that
+/// builds the same map from the ranked ids with a Python dict gets the same
+/// entries, so per-text comparisons agree (byte-fallback pieces all decode to
+/// U+FFFD).
 pub(crate) struct CompletionLogprobs<'t> {
     tokenizer: &'t dyn Tokenizer,
     top_k: usize,
@@ -164,18 +165,16 @@ impl<'t> CompletionLogprobs<'t> {
         let token = self.text(id).to_owned();
         let top_k = self.top_k;
         let top = (logprob.is_some() && top_k > 0).then(|| {
-            let mut seen = HashSet::with_capacity(top_k);
-            let mut ranked = Vec::with_capacity(top_k);
+            let mut ranked: Vec<(String, f32)> = Vec::with_capacity(top_k);
             let candidates = alternatives
                 .into_iter()
-                .flat_map(|top| top.token_ids.iter().zip(&top.values));
+                .flat_map(|top| top.token_ids.iter().zip(&top.values))
+                .take(top_k);
             for (&alternative, &value) in candidates {
-                if ranked.len() == top_k {
-                    break;
-                }
                 let text = self.text(alternative).to_owned();
-                if seen.insert(text.clone()) {
-                    ranked.push((text, value));
+                match ranked.iter_mut().find(|(seen, _)| *seen == text) {
+                    Some(entry) => entry.1 = value,
+                    None => ranked.push((text, value)),
                 }
             }
             ranked.into_iter().collect()
@@ -432,10 +431,12 @@ mod tests {
     }
 
     #[test]
-    fn alternatives_that_decode_alike_keep_the_more_likely_one() {
+    fn alternatives_that_decode_alike_share_the_first_place_with_the_later_value() {
         let tokenizer = llm_tokenizer::MockTokenizer::new();
         let mut logprobs = CompletionLogprobs::new(&tokenizer, 3);
-        // 77 and 78 are not in the mock vocabulary: both decode to "".
+        // 77 and 78 are not in the mock vocabulary: both decode to "". Only
+        // the first 3 alternatives count, as `{text: value for ...}` over the
+        // engine's top 3 would hold them.
         logprobs.push_output(&ProtoOutputLogProbs {
             token_logprobs: vec![-0.1],
             token_ids: vec![77],
@@ -444,11 +445,7 @@ mod tests {
         let logprobs = logprobs.finish();
         assert_eq!(
             alternatives_of(&logprobs),
-            vec![Some(vec![
-                (String::new(), -0.1),
-                ("test".into(), -0.3),
-                ("token".into(), -0.4)
-            ])]
+            vec![Some(vec![(String::new(), -0.2), ("test".into(), -0.3)])]
         );
     }
 
