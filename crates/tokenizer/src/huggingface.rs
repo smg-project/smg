@@ -753,6 +753,12 @@ impl HuggingFaceTokenizer {
 /// collapsed run holds three replacement characters for it, not one. Nothing
 /// already emitted is retracted: a reader sees the emitted text, then the
 /// remainder as the batch decode would end.
+///
+/// Cold: it runs only when the decode no longer starts with the emitted text
+/// (an invalid byte collapsed a run), never on the step's regular path, and
+/// it is kept out of that path's text.
+#[cold]
+#[inline(never)]
 fn remainder_after_rewrite(decoded: &str, emitted: &str, run_start: usize) -> (String, bool) {
     let common = decoded
         .char_indices()
@@ -776,6 +782,9 @@ impl HuggingFaceTokenizer {
     /// `prefix`, the emitted text of `ids[..prefix_index]`: the length of the
     /// text the ids before the run's first byte piece decode to; `prefix.len()`
     /// when the emitted ids end in no byte piece, or the vocabulary has none.
+    /// Cold, like [`remainder_after_rewrite`], its only caller's companion.
+    #[cold]
+    #[inline(never)]
     fn streamed_run_start(
         &self,
         ids: &[TokenIdType],
