@@ -4339,6 +4339,13 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// engine that decodes with PIL bit for bit; the pure-Rust decoder differs by
 /// a few levels, which the vision encoder amplifies), everything else and any
 /// turbojpeg failure through the `image` crate; then the long-side cap.
+///
+/// CMYK and YCCK JPEGs follow the same rule: with libjpeg-turbo they are
+/// decompressed as CMYK and converted with PIL's arithmetic
+/// (`jpeg_turbo::pil_cmyk_to_rgb`); without it the `image` crate's decoder
+/// also treats the ink values as Adobe-inverted and multiplies them the same
+/// way for plain CMYK, but its DCT and upsampling are its own and YCCK goes
+/// through its own YCbCr step, so those pixels are close to PIL's, not equal.
 pub(crate) fn decode_image_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
