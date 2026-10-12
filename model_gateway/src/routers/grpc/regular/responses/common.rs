@@ -324,9 +324,10 @@ pub(super) async fn load_conversation_history(
             .get_conversation(&conv_id)
             .await
             .map_err(|e| {
-                error::internal_error(
+                error::storage_failure(
                     "check_conversation_failed",
-                    format!("Failed to check conversation: {e}"),
+                    "Failed to check conversation",
+                    &e,
                 )
             })?;
 
@@ -480,9 +481,10 @@ pub(super) async fn resolve_item_references(
             .find_response_by_output_item(id)
             .await
             .map_err(|e| {
-                error::internal_error(
+                error::storage_failure(
                     "resolve_item_reference_failed",
-                    format!("Failed to resolve item '{id}': {e}"),
+                    format!("Failed to resolve item '{id}'"),
+                    &e,
                 )
             })?
             // The items of a response its client asked not to store are not

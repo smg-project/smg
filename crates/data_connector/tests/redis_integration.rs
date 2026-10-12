@@ -7,6 +7,8 @@
 //!   DATA_CONNECTOR_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 //!       cargo test -p data-connector --test redis_integration -- --ignored
 
+use std::time::{Duration, Instant};
+
 use chrono::{TimeDelta, Utc};
 use data_connector::{
     create_storage, ConversationItemId, HistoryBackend, ListParams, NewConversation,
@@ -14,6 +16,9 @@ use data_connector::{
     StoredResponse,
 };
 use serde_json::json;
+
+mod common;
+use common::Relay;
 
 fn test_redis_url() -> Option<String> {
     std::env::var("DATA_CONNECTOR_TEST_REDIS_URL").ok()
@@ -23,6 +28,7 @@ async fn redis_bundle(url: &str) -> Result<StorageBundle, String> {
     let redis_cfg = RedisConfig {
         url: url.to_string(),
         pool_max: 4,
+        op_timeout_secs: RedisConfig::default_op_timeout_secs(),
         schema: None,
         retention_days: Some(1),
     };
@@ -246,4 +252,112 @@ async fn deleting_a_conversation_answers_once_whether_it_existed() {
         .await
         .expect("lookup after delete")
         .is_none());
+}
+
+/// A store that accepts the connection and then stops answering (a frozen or
+/// partitioned server, a stalled proxy) fails the call at the configured
+/// bound, with an error that names the backend, the call and the bound; once
+/// the store answers again, the same pool serves the next call.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_store_that_stops_answering_fails_the_call_at_its_bound() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let (relay, relayed_url) = Relay::in_front_of(&url, 6379).expect("start the relay");
+    // The bound as an operator configures it; one second here.
+    let redis_cfg: RedisConfig = serde_json::from_value(json!({
+        "url": relayed_url,
+        "pool_max": 4,
+        "op_timeout_secs": 1,
+        "retention_days": 1,
+    }))
+    .expect("a Redis config with a call bound");
+    let resp = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Redis,
+        oracle: None,
+        postgres: None,
+        redis: Some(&redis_cfg),
+        hook: None,
+    })
+    .await
+    .expect("failed to initialize Redis storage")
+    .response_storage;
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({"id": stored.id.0, "status": "completed"});
+    let id = resp.store_response(stored).await.expect("store response");
+
+    relay.hold();
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), resp.get_response(&id)).await;
+    let elapsed = started.elapsed();
+    relay.release();
+    let result = outcome.unwrap_or_else(|_| {
+        panic!("the read was still waiting on the store after 10 s: nothing bounds a store call")
+    });
+    let err = result.expect_err("a store that does not answer must fail the call");
+    assert!(
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+        "the call failed after {elapsed:?}; the bound is 1 s"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("redis get_response") && message.contains("bound of 1 s"),
+        "{message}"
+    );
+
+    // The store answers again: the pool serves the next call.
+    let read_back = tokio::time::timeout(Duration::from_secs(10), resp.get_response(&id))
+        .await
+        .expect("the read after the release must return")
+        .expect("the read after the release must succeed");
+    assert_eq!(read_back.map(|r| r.id), Some(id));
+}
+
+/// A store a few hundred milliseconds away still answers: the configured
+/// call bound, not the client library's own defaults, decides how slow is
+/// too slow.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_store_a_few_hundred_milliseconds_away_still_answers() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let (relay, relayed_url) = Relay::in_front_of(&url, 6379).expect("start the relay");
+    // 400 ms on each direction: about 0.8 s per round trip, connecting included.
+    relay.delay(Duration::from_millis(400));
+    // The default bound.
+    let redis_cfg: RedisConfig = serde_json::from_value(json!({
+        "url": relayed_url,
+        "pool_max": 4,
+        "retention_days": 1,
+    }))
+    .expect("a Redis config with the default call bound");
+    let resp = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Redis,
+        oracle: None,
+        postgres: None,
+        redis: Some(&redis_cfg),
+        hook: None,
+    })
+    .await
+    .expect("failed to initialize Redis storage")
+    .response_storage;
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({"id": stored.id.0, "status": "completed"});
+    let started = Instant::now();
+    let id = resp
+        .store_response(stored)
+        .await
+        .expect("a store a few hundred milliseconds away must take the write");
+    let read_back = resp
+        .get_response(&id)
+        .await
+        .expect("a store a few hundred milliseconds away must answer the read");
+    assert_eq!(read_back.map(|r| r.id), Some(id));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "two calls took {:?}",
+        started.elapsed()
+    );
 }

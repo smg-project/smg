@@ -123,6 +123,11 @@ pub enum ConversationStorageError {
     #[error("Storage error: {0}")]
     StorageError(String),
 
+    /// The call exceeded the store's bound (`op_timeout_secs`): the store did
+    /// not answer in time.
+    #[error("Storage timeout: {0}")]
+    Timeout(String),
+
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 }
@@ -246,6 +251,11 @@ pub enum ConversationItemStorageError {
 
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    /// The call exceeded the store's bound (`op_timeout_secs`): the store did
+    /// not answer in time.
+    #[error("Storage timeout: {0}")]
+    Timeout(String),
 
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
@@ -453,11 +463,43 @@ pub enum ResponseStorageError {
     #[error("Storage error: {0}")]
     StorageError(String),
 
+    /// The call exceeded the store's bound (`op_timeout_secs`): the store did
+    /// not answer in time.
+    #[error("Storage timeout: {0}")]
+    Timeout(String),
+
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 }
 
 pub type ResponseResult<T> = Result<T, ResponseStorageError>;
+
+/// What a caller can tell about a failed store call without reading the
+/// backend's text.
+pub trait StorageFailure {
+    /// The call exceeded the store's bound (`op_timeout_secs`): the store is
+    /// not answering for now, which the API reports as a 503 the client may
+    /// retry, where any other failure is an internal error.
+    fn timed_out(&self) -> bool;
+}
+
+impl StorageFailure for ResponseStorageError {
+    fn timed_out(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
+}
+
+impl StorageFailure for ConversationStorageError {
+    fn timed_out(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
+}
+
+impl StorageFailure for ConversationItemStorageError {
+    fn timed_out(&self) -> bool {
+        matches!(self, Self::Timeout(_))
+    }
+}
 
 /// Trait for response storage
 #[async_trait]

@@ -12,6 +12,7 @@
 //! - Postgres
 //! - Redis
 
+mod bounded;
 mod common;
 pub mod config;
 pub mod context;
@@ -35,7 +36,7 @@ pub use core::{
     is_unstored, AddedAtSequence, Conversation, ConversationId, ConversationItem,
     ConversationItemId, ConversationItemStorage, ConversationStorage, ListParams, NewConversation,
     NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError, SortOrder,
-    StoredResponse,
+    StorageFailure, StoredResponse,
 };
 
 pub use config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};

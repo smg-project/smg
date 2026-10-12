@@ -47,6 +47,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_data_connector::{
     with_request_context, RequestContext as StorageRequestContext, ResponseId, ResponseStorage,
+    ResponseStorageError,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -226,17 +227,13 @@ pub(crate) async fn store_record(
     response: &ResponsesResponse,
     request: &ResponsesRequest,
     request_context: Option<StorageRequestContext>,
-) -> Result<(), String> {
-    let raw = serde_json::to_value(response).map_err(|e| e.to_string())?;
+) -> Result<(), ResponseStorageError> {
+    let raw = serde_json::to_value(response)?;
     let mut stored = build_stored_response(raw, request);
-    stored.input = Value::Array(extract_input_items(&request.input)?);
-    let store = async {
-        storage
-            .store_response(stored)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    };
+    stored.input = Value::Array(
+        extract_input_items(&request.input).map_err(ResponseStorageError::StorageError)?,
+    );
+    let store = async { storage.store_response(stored).await.map(|_| ()) };
     match request_context {
         Some(ctx) => with_request_context(ctx, store).await,
         None => store.await,
@@ -281,7 +278,7 @@ pub(crate) async fn set_stored_status(
     status: &str,
     error: Option<Value>,
     request_context: Option<StorageRequestContext>,
-) -> Result<Transition, String> {
+) -> Result<Transition, ResponseStorageError> {
     transition(storage, id, request_context, |raw| {
         with_status(raw, status, error)
     })
@@ -340,14 +337,10 @@ async fn transition(
     id: &str,
     request_context: Option<StorageRequestContext>,
     next: impl FnOnce(Value) -> Value,
-) -> Result<Transition, String> {
+) -> Result<Transition, ResponseStorageError> {
     let update = async {
         let response_id = ResponseId::from(id);
-        let Some(mut stored) = storage
-            .get_response(&response_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
+        let Some(mut stored) = storage.get_response(&response_id).await? else {
             return Ok(Transition::Missing);
         };
         if is_terminal(stored.raw_response["status"].as_str().unwrap_or("")) {
@@ -355,13 +348,10 @@ async fn transition(
         }
         stored.raw_response = next(stored.raw_response);
         let raw = stored.raw_response.clone();
-        storage
-            .store_response(stored)
-            .await
-            .map_err(|e| e.to_string())?;
+        storage.store_response(stored).await?;
         Ok(Transition::Moved(raw))
     };
-    let transition: Result<Transition, String> = match request_context.clone() {
+    let transition: Result<Transition, ResponseStorageError> = match request_context.clone() {
         Some(ctx) => with_request_context(ctx, update).await,
         None => update.await,
     };
@@ -503,7 +493,7 @@ pub(crate) async fn set_stored_status_retrying(
     request_context: Option<StorageRequestContext>,
     every: Duration,
     window: Duration,
-) -> Result<Transition, String> {
+) -> Result<Transition, ResponseStorageError> {
     let deadline = tokio::time::Instant::now() + window;
     let mut attempts = 0u32;
     loop {
@@ -560,7 +550,7 @@ async fn close(
     status: &str,
     error: Option<Value>,
     request_context: Option<StorageRequestContext>,
-) -> Result<Transition, String> {
+) -> Result<Transition, ResponseStorageError> {
     let outcome = set_stored_status(storage, id, status, error, request_context).await;
     match &outcome {
         Ok(Transition::Moved(_)) => {}
@@ -1013,9 +1003,10 @@ pub(crate) async fn cancel(ctx: &ResponsesContext, response_id: &str) -> Respons
             )
         }
         Err(e) => {
-            return error::internal_error(
+            return error::storage_failure(
                 "retrieve_response_failed",
-                format!("Failed to retrieve response: {e}"),
+                "Failed to retrieve response",
+                &e,
             )
         }
     };
@@ -1044,9 +1035,10 @@ pub(crate) async fn cancel(ctx: &ResponsesContext, response_id: &str) -> Respons
                     "response_not_found",
                     format!("Response with id '{response_id}' not found"),
                 ),
-                Err(e) => error::internal_error(
+                Err(e) => error::storage_failure(
                     "cancel_response_failed",
-                    format!("Failed to cancel response: {e}"),
+                    "Failed to cancel response",
+                    &e,
                 ),
             }
         }

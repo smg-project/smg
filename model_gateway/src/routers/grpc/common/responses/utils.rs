@@ -363,7 +363,8 @@ impl NotStored {
 /// client asked not to store (a background run's record, kept for its
 /// polling window only: a chain built on it would break when it goes, so it
 /// is no previous response, as the public API answers for an unstored id);
-/// `load_previous_response_chain_failed` for a store that failed.
+/// `load_previous_response_chain_failed` for a store that failed (a 503
+/// `storage_unavailable` when it timed out, see `error::storage_failure`).
 pub(crate) async fn previous_response_chain(
     storage: &Arc<dyn ResponseStorage>,
     prev_id_str: &str,
@@ -385,9 +386,10 @@ pub(crate) async fn previous_response_chain(
                 error = %e,
                 "Failed to load previous response chain from storage"
             );
-            Err(error::internal_error(
+            Err(error::storage_failure(
                 "load_previous_response_chain_failed",
-                format!("Failed to load previous response chain for {prev_id_str}: {e}"),
+                format!("Failed to load previous response chain for {prev_id_str}"),
+                &e,
             ))
         }
     }

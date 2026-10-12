@@ -108,6 +108,7 @@ from JSON/YAML). Each database backend has a dedicated config struct.
 |-------|------|-------------|
 | `db_url` | `String` | Connection URL (`postgres://user:pass@host:port/dbname`). Validated for scheme, host, and database name. |
 | `pool_max` | `usize` | Maximum connections in the deadpool pool (default helper: 16). Must be > 0. |
+| `op_timeout_secs` | `u64` | Bound in seconds on one call to the store (pool wait, connect and the statement; default 5, must be > 0). A call past it fails as a `Timeout` error, which the gateway answers `503 storage_unavailable`. |
 | `schema` | `Option<SchemaConfig>` | Optional schema customization. See [Schema Configuration](#schema-configuration). |
 
 Call `validate()` to check the URL before use.
@@ -119,6 +120,7 @@ Call `validate()` to check the URL before use.
 | `url` | `String` | -- | Connection URL (`redis://` or `rediss://`). |
 | `pool_max` | `usize` | 16 | Maximum pool connections. |
 | `retention_days` | `Option<u64>` | `Some(30)` | TTL in days for stored data. `None` disables expiration. |
+| `op_timeout_secs` | `u64` | 5 | Bound in seconds on one call to the store (pool wait, connect and the command; must be > 0). Replaces the client library's own 500 ms response / 1 s connection defaults. A call past it fails as a `Timeout` error, which the gateway answers `503 storage_unavailable`. |
 | `schema` | `Option<SchemaConfig>` | `None` | Optional schema customization. See [Schema Configuration](#schema-configuration). |
 
 Call `validate()` to check the URL before use.

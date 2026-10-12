@@ -4,8 +4,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use deadpool_redis::{Config, Connection, Pool, Runtime};
-use redis::AsyncCommands;
+use deadpool_redis::{Connection, Manager, Pool, PoolConfig, Runtime, Timeouts};
+use redis::{AsyncCommands, AsyncConnectionConfig};
 use serde_json::Value;
 
 use crate::{
@@ -34,11 +34,31 @@ impl RedisStore {
         schema.validate()?;
         let schema = Arc::new(schema);
 
-        let mut cfg = Config::from_url(config.url);
-        cfg.pool = Some(deadpool_redis::PoolConfig::new(config.pool_max));
-        let pool = cfg
-            .create_pool(Some(Runtime::Tokio1))
-            .map_err(|e| e.to_string())?;
+        // Each call as a whole is bounded by the `bounded` wrappers the
+        // factory installs. The pool and the client library bound their own
+        // steps (connecting, a response, waiting for a pooled connection,
+        // creating one, recycling one) at twice that bound: backstops that
+        // clean up after a call the wrapper has already answered, never the
+        // first to fire. Left to its defaults the library bounded a response
+        // at 500 ms and a connection at 1 s, which failed every call to a
+        // store a few hundred milliseconds away.
+        let backstop = config.op_timeout() * 2;
+        let connection = AsyncConnectionConfig::new()
+            .set_connection_timeout(Some(backstop))
+            .set_response_timeout(Some(backstop));
+        let manager = Manager::new_with_config(config.url.as_str(), connection)
+            .map_err(|e| format!("Invalid Redis connection URL: {e}"))?;
+        let mut pool_config = PoolConfig::new(config.pool_max);
+        pool_config.timeouts = Timeouts {
+            wait: Some(backstop),
+            create: Some(backstop),
+            recycle: Some(backstop),
+        };
+        let pool = Pool::builder(manager)
+            .config(pool_config)
+            .runtime(Runtime::Tokio1)
+            .build()
+            .map_err(|e| format!("Failed to build Redis connection pool: {e}"))?;
         Ok(Self {
             pool,
             retention_days: config.retention_days,

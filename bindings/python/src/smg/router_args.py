@@ -192,9 +192,11 @@ class RouterArgs:
     oracle_pool_timeout_secs: int = 30
     postgres_db_url: str | None = None
     postgres_pool_max: int = 16
+    postgres_op_timeout_secs: int = 5
     redis_url: str | None = None
     redis_pool_max: int = 16
     redis_retention_days: int = 30
+    redis_op_timeout_secs: int = 5
     schema_config: str | None = None
     # mTLS configuration for worker communication
     client_cert_path: str | None = None
@@ -2021,6 +2023,13 @@ class RouterArgs:
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
         )
+        postgres_group.add_argument(
+            f"--{prefix}postgres-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("POSTGRES_OP_TIMEOUT_SECS", RouterArgs.postgres_op_timeout_secs)),
+            help="Bound in seconds on each call to the PostgreSQL store (pool wait, connect and the statement); "
+            "a call past it is answered 503 storage_unavailable (default: 5, env: POSTGRES_OP_TIMEOUT_SECS)",
+        )
 
         # Redis configuration
         redis_group.add_argument(
@@ -2040,6 +2049,14 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
             help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("REDIS_OP_TIMEOUT_SECS", RouterArgs.redis_op_timeout_secs)),
+            help="Bound in seconds on each call to the Redis store (pool wait, connect and the command; replaces the "
+            "client library's 500 ms / 1 s defaults); a call past it is answered 503 storage_unavailable "
+            "(default: 5, env: REDIS_OP_TIMEOUT_SECS)",
         )
 
         # Schema configuration

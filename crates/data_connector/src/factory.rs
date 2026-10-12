@@ -6,6 +6,10 @@ use tracing::info;
 use url::Url;
 
 use crate::{
+    bounded::{
+        BoundedConversationItemStorage, BoundedConversationStorage, BoundedResponseStorage,
+        CallBound,
+    },
     config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig},
     core::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     hooked::{HookedConversationItemStorage, HookedConversationStorage, HookedResponseStorage},
@@ -94,11 +98,14 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             };
 
             info!(
-                "Initializing data connector: Postgres (db_url: {}, pool_max: {})",
-                log_db_url, postgres_cfg.pool_max
+                "Initializing data connector: Postgres (db_url: {}, pool_max: {}, op_timeout_secs: {})",
+                log_db_url, postgres_cfg.pool_max, postgres_cfg.op_timeout_secs
             );
 
-            let storages = create_postgres_storage(postgres_cfg).await?;
+            let storages = bounded(
+                create_postgres_storage(postgres_cfg).await?,
+                CallBound::new("postgres", postgres_cfg.op_timeout()),
+            );
 
             info!("Data connector initialized successfully: Postgres");
             storages
@@ -119,11 +126,14 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             };
 
             info!(
-                "Initializing data connector: Redis (url: {}, pool_max: {})",
-                log_redis_url, redis_cfg.pool_max
+                "Initializing data connector: Redis (url: {}, pool_max: {}, op_timeout_secs: {})",
+                log_redis_url, redis_cfg.pool_max, redis_cfg.op_timeout_secs
             );
 
-            let storages = create_redis_storage(redis_cfg)?;
+            let storages = bounded(
+                create_redis_storage(redis_cfg)?,
+                CallBound::new("redis", redis_cfg.op_timeout()),
+            );
 
             info!("Data connector initialized successfully: Redis");
             storages
@@ -149,6 +159,23 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
         })
     } else {
         Ok(bundle)
+    }
+}
+
+/// Every call to a remote store under the backend's call bound (see the
+/// `bounded` module); the hook wrappers go around these, so a hook's own time
+/// does not count against the bound.
+fn bounded(bundle: StorageBundle, bound: CallBound) -> StorageBundle {
+    StorageBundle {
+        response_storage: Arc::new(BoundedResponseStorage::new(bundle.response_storage, bound)),
+        conversation_storage: Arc::new(BoundedConversationStorage::new(
+            bundle.conversation_storage,
+            bound,
+        )),
+        conversation_item_storage: Arc::new(BoundedConversationItemStorage::new(
+            bundle.conversation_item_storage,
+            bound,
+        )),
     }
 }
 

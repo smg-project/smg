@@ -1,6 +1,6 @@
 //! Conversation CRUD handlers for the /v1/conversations API - shared across routers
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 
 use axum::{
     http::StatusCode,
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use smg_data_connector::{
     AddedAtSequence, Conversation, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationStorage, ListParams, NewConversation, NewConversationItem,
-    SortOrder,
+    SortOrder, StorageFailure,
 };
 use tracing::info;
 
@@ -77,8 +77,11 @@ fn not_found(message: impl Into<String>) -> Response {
     route_error::not_found("not_found", message)
 }
 
-fn internal_error(message: impl Into<String>) -> Response {
-    route_error::internal_error("internal_error", message)
+/// A failed store call: `503 storage_unavailable` when the store did not
+/// answer within its bound, else the `500 internal_error` these handlers
+/// answer; `context` opens the message.
+fn store_error(context: &str, error: &(impl StorageFailure + Display)) -> Response {
+    route_error::storage_failure("internal_error", context, error)
 }
 
 fn bad_request_structured(error_obj: Value) -> Response {
@@ -121,7 +124,7 @@ async fn ensure_conversation_exists(
     match storage.get_conversation(conv_id).await {
         Ok(Some(conv)) => Ok(conv),
         Ok(None) => Err(not_found("Conversation not found")),
-        Err(e) => Err(internal_error(format!("Failed to get conversation: {e}"))),
+        Err(e) => Err(store_error("Failed to get conversation", &e)),
     }
 }
 
@@ -194,7 +197,7 @@ pub async fn create_conversation(storage: &Arc<dyn ConversationStorage>, body: V
             info!(conversation_id = %conversation.id.0, "Created conversation");
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Err(e) => internal_error(format!("Failed to create conversation: {e}")),
+        Err(e) => store_error("Failed to create conversation", &e),
     }
 }
 
@@ -206,7 +209,7 @@ pub async fn get_conversation(storage: &Arc<dyn ConversationStorage>, conv_id: &
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
         Ok(None) => not_found("Conversation not found"),
-        Err(e) => internal_error(format!("Failed to get conversation: {e}")),
+        Err(e) => store_error("Failed to get conversation", &e),
     }
 }
 
@@ -236,7 +239,7 @@ pub async fn update_conversation(
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
         Ok(None) => not_found("Conversation not found"),
-        Err(e) => internal_error(format!("Failed to update conversation: {e}")),
+        Err(e) => store_error("Failed to update conversation", &e),
     }
 }
 
@@ -260,7 +263,7 @@ pub async fn delete_conversation(
                 .into_response()
         }
         Ok(false) => not_found("Conversation not found"),
-        Err(e) => internal_error(format!("Failed to delete conversation: {e}")),
+        Err(e) => store_error("Failed to delete conversation", &e),
     }
 }
 
@@ -313,7 +316,7 @@ pub async fn list_conversation_items(
             )
                 .into_response()
         }
-        Err(e) => internal_error(format!("Failed to list items: {e}")),
+        Err(e) => store_error("Failed to list items", &e),
     }
 }
 
@@ -377,7 +380,7 @@ pub async fn create_conversation_items(
 
     // Batch-link all items in a single operation
     if let Err(e) = item_storage.link_items(&conversation_id, &link_pairs).await {
-        return internal_error(format!("Failed to link items to conversation: {e}"));
+        return store_error("Failed to link items to conversation", &e);
     }
 
     let mut response = json!({
@@ -448,7 +451,7 @@ async fn process_item_reference(
     let is_linked = item_storage
         .is_item_linked(conversation_id, &item_id)
         .await
-        .map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
+        .map_err(|e| store_error("Failed to check item link", &e))?;
     if is_linked {
         return Err(item_already_in_conversation());
     }
@@ -456,11 +459,7 @@ async fn process_item_reference(
     let existing_item = match item_storage.get_item(&item_id).await {
         Ok(Some(item)) => item,
         Ok(None) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
-        Err(e) => {
-            return Err(internal_error(format!(
-                "Failed to get referenced item: {e}"
-            )))
-        }
+        Err(e) => return Err(store_error("Failed to get referenced item", &e)),
     };
 
     let item_id = existing_item.id.clone();
@@ -485,7 +484,7 @@ async fn process_item_with_id(
     let is_linked = item_storage
         .is_item_linked(conversation_id, &item_id)
         .await
-        .map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
+        .map_err(|e| store_error("Failed to check item link", &e))?;
 
     if is_linked {
         return Err(item_already_in_conversation());
@@ -502,13 +501,11 @@ async fn process_item_with_id(
             let created = item_storage
                 .create_item(new_item)
                 .await
-                .map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+                .map_err(|e| store_error("Failed to create item", &e))?;
 
             Ok((created, warning))
         }
-        Err(e) => Err(internal_error(format!(
-            "Failed to check item existence: {e}"
-        ))),
+        Err(e) => Err(store_error("Failed to check item existence", &e)),
     }
 }
 
@@ -522,7 +519,7 @@ async fn process_new_item(
     let created = item_storage
         .create_item(new_item)
         .await
-        .map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+        .map_err(|e| store_error("Failed to create item", &e))?;
 
     Ok((created, warning))
 }
@@ -598,7 +595,7 @@ pub async fn get_conversation_item(
         .await
     {
         Ok(linked) => linked,
-        Err(e) => return internal_error(format!("Failed to check item link: {e}")),
+        Err(e) => return store_error("Failed to check item link", &e),
     };
 
     if !is_linked {
@@ -608,7 +605,7 @@ pub async fn get_conversation_item(
     match item_storage.get_item(&item_id).await {
         Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(&item))).into_response(),
         Ok(None) => not_found("Item not found"),
-        Err(e) => internal_error(format!("Failed to get item: {e}")),
+        Err(e) => store_error("Failed to get item", &e),
     }
 }
 
@@ -636,7 +633,7 @@ pub async fn delete_conversation_item(
             );
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Err(e) => internal_error(format!("Failed to delete item: {e}")),
+        Err(e) => store_error("Failed to delete item", &e),
     }
 }
 
@@ -867,7 +864,20 @@ mod tests {
                 "not_found",
             ),
             (
-                internal_error("boom"),
+                store_error(
+                    "Failed to get conversation",
+                    &smg_data_connector::ResponseStorageError::Timeout(
+                        "the redis get_conversation call exceeded its bound of 5 s".to_string(),
+                    ),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+            ),
+            (
+                store_error(
+                    "Failed to get conversation",
+                    &smg_data_connector::ResponseStorageError::StorageError("db error".to_string()),
+                ),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
             ),

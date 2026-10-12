@@ -537,9 +537,10 @@ impl GrpcRouter {
         )
         .await
         {
-            return error::internal_error(
+            return error::storage_failure(
                 "store_response_failed",
-                format!("Failed to store the queued response: {e}"),
+                "Failed to store the queued response",
+                &e,
             );
         }
         debug!(response_id = %id, harmony = is_harmony, "Background response queued");

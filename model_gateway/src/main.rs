@@ -1349,6 +1349,10 @@ struct CliArgs {
     #[arg(long, help_heading = "PostgreSQL Database")]
     postgres_pool_max_size: Option<usize>,
 
+    /// Bound in seconds on each call to the PostgreSQL store (pool wait, connect and the statement); a call past it is answered 503 storage_unavailable (default: 5)
+    #[arg(long, help_heading = "PostgreSQL Database")]
+    postgres_op_timeout_secs: Option<u64>,
+
     // ==================== Redis Database ====================
     /// Redis connection URL
     #[arg(long, help_heading = "Redis Database")]
@@ -1361,6 +1365,10 @@ struct CliArgs {
     /// Redis data retention in days (-1 for persistent, default 30)
     #[arg(long, allow_negative_numbers = true, help_heading = "Redis Database")]
     redis_retention_days: Option<i64>,
+
+    /// Bound in seconds on each call to the Redis store (pool wait, connect and the command; replaces the client library's 500 ms / 1 s defaults); a call past it is answered 503 storage_unavailable (default: 5)
+    #[arg(long, help_heading = "Redis Database")]
+    redis_op_timeout_secs: Option<u64>,
 
     // ==================== TLS/mTLS Security ====================
     /// Path to server TLS certificate (PEM format)
@@ -2050,6 +2058,9 @@ impl CliArgs {
         let pcf = PostgresConfig {
             db_url,
             pool_max,
+            op_timeout_secs: self
+                .postgres_op_timeout_secs
+                .unwrap_or_else(PostgresConfig::default_op_timeout_secs),
             schema,
         };
         pcf.validate().map_err(|e| ConfigError::ValidationFailed {
@@ -2071,6 +2082,9 @@ impl CliArgs {
         let rcf = RedisConfig {
             url,
             pool_max,
+            op_timeout_secs: self
+                .redis_op_timeout_secs
+                .unwrap_or_else(RedisConfig::default_op_timeout_secs),
             retention_days,
             schema,
         };
@@ -3082,6 +3096,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The bound on a history store call is five seconds unless the flag of
+    /// the backend sets it; zero is refused with the backend's other checks.
+    #[test]
+    fn store_call_bounds_default_to_five_seconds_and_follow_their_flags() {
+        let stores = [
+            "--postgres-db-url",
+            "postgres://u:p@h:5432/d",
+            "--redis-url",
+            "redis://h:6379",
+        ];
+        let args = cli_args_from(&stores);
+        assert_eq!(args.build_postgres_config(None).unwrap().op_timeout_secs, 5);
+        assert_eq!(args.build_redis_config(None).unwrap().op_timeout_secs, 5);
+
+        let mut argv = stores.to_vec();
+        argv.extend([
+            "--postgres-op-timeout-secs",
+            "12",
+            "--redis-op-timeout-secs",
+            "3",
+        ]);
+        let args = cli_args_from(&argv);
+        assert_eq!(
+            args.build_postgres_config(None).unwrap().op_timeout_secs,
+            12
+        );
+        assert_eq!(args.build_redis_config(None).unwrap().op_timeout_secs, 3);
+
+        let mut argv = stores.to_vec();
+        argv.extend([
+            "--postgres-op-timeout-secs",
+            "0",
+            "--redis-op-timeout-secs",
+            "0",
+        ]);
+        let args = cli_args_from(&argv);
+        let err = args.build_postgres_config(None).unwrap_err().to_string();
+        assert!(err.contains("op_timeout_secs"), "{err}");
+        let err = args.build_redis_config(None).unwrap_err().to_string();
+        assert!(err.contains("op_timeout_secs"), "{err}");
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so

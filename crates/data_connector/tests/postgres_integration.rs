@@ -33,6 +33,7 @@ use std::{
         Arc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use chrono::{TimeDelta, Utc};
@@ -44,6 +45,9 @@ use data_connector::{
 use serde_json::json;
 use tokio::task::JoinSet;
 
+mod common;
+use common::Relay;
+
 fn test_db_url() -> Option<String> {
     std::env::var("DATA_CONNECTOR_TEST_POSTGRES_URL").ok()
 }
@@ -52,6 +56,7 @@ async fn postgres_bundle(db_url: &str) -> Result<StorageBundle, String> {
     let postgres_cfg = PostgresConfig {
         db_url: db_url.to_string(),
         pool_max: 4,
+        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
         // The shared test database starts with no migrations applied; opt in
         // to auto-migrate so `create_storage` doesn't require a human to run
         // the pending migrations by hand first.
@@ -391,6 +396,7 @@ async fn configured_table_bundle(db_url: &str, table: &str) -> Result<StorageBun
     let postgres_cfg = PostgresConfig {
         db_url: db_url.to_string(),
         pool_max: 4,
+        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
         schema: Some(SchemaConfig {
             auto_migrate: true,
             responses,
@@ -1358,6 +1364,7 @@ async fn a_database_ahead_of_this_build_is_refused_at_startup() {
     let allowed_cfg = PostgresConfig {
         db_url: scratch.url.clone(),
         pool_max: 4,
+        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
         schema: Some(SchemaConfig {
             auto_migrate: true,
             version: Some(99),
@@ -1423,4 +1430,64 @@ async fn a_database_ahead_of_this_build_is_refused_before_its_tables_are_touched
         vec![99],
         "nothing stamped next to the future version"
     );
+}
+
+/// A store that accepts the connection and then stops answering (a frozen or
+/// partitioned server, a stalled proxy) fails the call at the configured
+/// bound, with an error that names the backend, the call and the bound; once
+/// the store answers again, the same pool serves the next call.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_store_that_stops_answering_fails_the_call_at_its_bound() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let (relay, relayed_url) = Relay::in_front_of(&db_url, 5432).expect("start the relay");
+    // The bound as an operator configures it; one second here.
+    let postgres_cfg: PostgresConfig = serde_json::from_value(json!({
+        "db_url": relayed_url,
+        "pool_max": 4,
+        "op_timeout_secs": 1,
+        "schema": {"auto_migrate": true},
+    }))
+    .expect("a Postgres config with a call bound");
+    let resp = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&postgres_cfg),
+        redis: None,
+        hook: None,
+    })
+    .await
+    .expect("failed to initialize Postgres storage")
+    .response_storage;
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({"id": stored.id.0, "status": "completed"});
+    let id = resp.store_response(stored).await.expect("store response");
+
+    relay.hold();
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), resp.get_response(&id)).await;
+    let elapsed = started.elapsed();
+    relay.release();
+    let result = outcome.unwrap_or_else(|_| {
+        panic!("the read was still waiting on the store after 10 s: nothing bounds a store call")
+    });
+    let err = result.expect_err("a store that does not answer must fail the call");
+    assert!(
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+        "the call failed after {elapsed:?}; the bound is 1 s"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("postgres get_response") && message.contains("bound of 1 s"),
+        "{message}"
+    );
+
+    // The store answers again: the pool serves the next call.
+    let read_back = tokio::time::timeout(Duration::from_secs(10), resp.get_response(&id))
+        .await
+        .expect("the read after the release must return")
+        .expect("the read after the release must succeed");
+    assert_eq!(read_back.map(|r| r.id), Some(id));
 }

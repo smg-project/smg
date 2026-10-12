@@ -21,7 +21,7 @@ rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time"] }
 tracing.workspace = true
 ulid = "1.2.1"
 url = "2.5"

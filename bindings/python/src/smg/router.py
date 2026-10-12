@@ -422,6 +422,7 @@ class Router:
             postgres_config = PyPostgresConfig(
                 db_url=args_dict.get("postgres_db_url"),
                 pool_max=args_dict.get("postgres_pool_max", 16),
+                op_timeout_secs=args_dict.get("postgres_op_timeout_secs", 5),
             )
         args_dict["postgres_config"] = postgres_config
 
@@ -436,6 +437,7 @@ class Router:
                 url=args_dict.get("redis_url"),
                 pool_max=args_dict.get("redis_pool_max", 16),
                 retention_days=retention_arg,
+                op_timeout_secs=args_dict.get("redis_op_timeout_secs", 5),
             )
         args_dict["redis_config"] = redis_config
 
@@ -455,9 +457,11 @@ class Router:
             "oracle_pool_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
+            "postgres_op_timeout_secs",
             "redis_url",
             "redis_pool_max",
             "redis_retention_days",
+            "redis_op_timeout_secs",
             # Control plane auth fields (converted to control_plane_auth)
             "control_plane_api_keys",
             "control_plane_audit_enabled",

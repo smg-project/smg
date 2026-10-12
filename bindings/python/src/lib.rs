@@ -330,21 +330,30 @@ pub struct PyRedisConfig {
     pub pool_max: usize,
     #[pyo3(get, set)]
     pub retention_days: Option<u64>,
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyRedisConfig {
     #[new]
-    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30), op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+    fn new(
+        url: String,
+        pool_max: usize,
+        retention_days: Option<u64>,
+        op_timeout_secs: u64,
+    ) -> PyResult<Self> {
         Ok(PyRedisConfig {
             url,
             pool_max,
             retention_days,
+            op_timeout_secs,
         })
     }
 }
@@ -354,6 +363,7 @@ impl PyRedisConfig {
         config::RedisConfig {
             url: self.url.clone(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             retention_days: self.retention_days,
             schema: None,
         }
@@ -368,18 +378,26 @@ pub struct PyPostgresConfig {
 
     #[pyo3(get, set)]
     pub pool_max: usize,
+
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyPostgresConfig {
     #[new]
-    #[pyo3(signature = (db_url = None,pool_max = 16,))]
+    #[pyo3(signature = (db_url = None, pool_max = 16, op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(db_url: Option<String>, pool_max: usize) -> PyResult<Self> {
-        Ok(PyPostgresConfig { db_url, pool_max })
+    fn new(db_url: Option<String>, pool_max: usize, op_timeout_secs: u64) -> PyResult<Self> {
+        Ok(PyPostgresConfig {
+            db_url,
+            pool_max,
+            op_timeout_secs,
+        })
     }
 }
 
@@ -388,6 +406,7 @@ impl PyPostgresConfig {
         config::PostgresConfig {
             db_url: self.db_url.clone().unwrap_or_default(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             schema: None,
         }
     }

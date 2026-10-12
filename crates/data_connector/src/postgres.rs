@@ -4,7 +4,7 @@ use std::{str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use deadpool_postgres::{ClientWrapper, Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{ClientWrapper, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use serde_json::Value;
 use tokio_postgres::{types::ToSql, IsolationLevel, NoTls, Row};
 
@@ -43,14 +43,28 @@ impl PostgresStore {
         schema.validate()?;
         let schema = Arc::new(schema);
 
-        let pg_config = tokio_postgres::Config::from_str(config.db_url.as_str())
+        let mut pg_config = tokio_postgres::Config::from_str(config.db_url.as_str())
             .map_err(|e| format!("Invalid PostgreSQL connection URL: {e}"))?;
+        // Each call as a whole is bounded by the `bounded` wrappers the
+        // factory installs. The pool and the driver bound their own steps
+        // (connecting, unless the URL sets its own `connect_timeout`; waiting
+        // for a pooled connection; creating one; recycling one) at twice that
+        // bound: backstops that clean up after a call the wrapper has already
+        // answered, never the first to fire.
+        let backstop = config.op_timeout() * 2;
+        if pg_config.get_connect_timeout().is_none() {
+            pg_config.connect_timeout(backstop);
+        }
         let mgr_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
         let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
         let pool = Pool::builder(mgr)
             .max_size(config.pool_max)
+            .wait_timeout(Some(backstop))
+            .create_timeout(Some(backstop))
+            .recycle_timeout(Some(backstop))
+            .runtime(Runtime::Tokio1)
             .build()
             .map_err(|e| format!("Failed to build PostgreSQL connection pool: {e}"))?;
 
