@@ -1819,12 +1819,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .map_err(|e| format!("Invalid address: {e}"))?;
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before the mesh server
-    // below has joined the cluster. Its accept loop starts at `serve`.
-    let listener = std::net::TcpListener::bind(addr)
+    // below has joined the cluster. Bound through tokio, as axum-server
+    // binds (the same socket options and accept backlog; std's bind would
+    // queue 128 connections instead of 1024), and served from the socket at
+    // `serve` below.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .and_then(tokio::net::TcpListener::into_std)
         .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("Failed to configure the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
 
     // The mesh server starts once every listener is bound: a member that
