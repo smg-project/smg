@@ -596,7 +596,10 @@ impl Encoder for HuggingFaceTokenizer {
         // A batch takes the path a single input takes: the direct encoder when
         // the vocabulary has one (an input it declines goes through the
         // `tokenizers` path on its own), so a batch never runs on the model
-        // whose word cache the direct encoder replaced.
+        // whose word cache the direct encoder replaced. The loop is serial on
+        // the calling thread (the `tokenizers` batch fanned out with rayon):
+        // the gateway reaches a batch through `CachedTokenizer::encode_batch`,
+        // which fans out over `encode` itself.
         if self.native.is_some() {
             return inputs
                 .iter()
