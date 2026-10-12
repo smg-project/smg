@@ -118,12 +118,15 @@ fn opens_a_reason(text: &str) -> bool {
 /// Serde's message without axum's prefix (split at the prefix's first copy:
 /// axum's comes before serde's text, a client's value after it), as the path
 /// serde puts in front of a nested value (`messages[0].content`) and the
-/// reason. The reason is found by serde's own words: the first `: ` split
-/// whose remainder opens with one. Serde quotes the value the client sent
-/// after its words, never before, so the value cannot move the split; and a
-/// key with a space, a colon or a letter outside ASCII stays a path. A reason
-/// that opens with none of them (a custom error) keeps the first split's head
-/// as its path when that head reads as one.
+/// reason. The path is the first `: ` split's head when that head reads as a
+/// path (field names and indexes); the reason is the rest, serde's own words
+/// or a custom error's, and a value a custom error repeats cannot move the
+/// split, whatever it says. A key that is no plain path (a space, a colon, a
+/// letter outside ASCII) is a path all the same: the reason is then found by
+/// serde's own words, at the first split whose remainder opens with one
+/// (serde quotes the value it refused after its words, never before). A key
+/// with a colon and a space in it, in front of a custom error, is the one
+/// case this order reads wrong: its path is cut at the colon.
 #[cfg(feature = "axum")]
 fn deserialize_detail(message: &str) -> (Option<&str>, &str) {
     let detail = message
@@ -132,25 +135,21 @@ fn deserialize_detail(message: &str) -> (Option<&str>, &str) {
     if opens_a_reason(detail) {
         return (None, detail);
     }
-    let splits = || {
-        detail
-            .match_indices(": ")
-            .map(|(at, _)| (&detail[..at], &detail[at + 2..]))
-    };
-    // A custom error (`Error::custom`, `duplicate field`) opens with none of
-    // serde's words: its path is still the first split's head when that head
-    // reads as a path. A value cannot reach this fallback, since a split that
-    // opens with serde's words is always tried first.
+    let mut splits = detail
+        .match_indices(": ")
+        .map(|(at, _)| (&detail[..at], &detail[at + 2..]));
     let is_path_char =
         |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '-');
-    splits()
-        .find(|(_, reason)| opens_a_reason(reason))
-        .or_else(|| {
-            splits()
-                .next()
-                .filter(|(head, _)| !head.is_empty() && head.chars().all(is_path_char))
-        })
-        .map_or((None, detail), |(head, reason)| (Some(head), reason))
+    match splits.next() {
+        Some((head, reason)) if !head.is_empty() && head.chars().all(is_path_char) => {
+            (Some(head), reason)
+        }
+        Some(first) => std::iter::once(first)
+            .chain(splits)
+            .find(|(_, reason)| opens_a_reason(reason))
+            .map_or((None, detail), |(head, reason)| (Some(head), reason)),
+        None => (None, detail),
+    }
 }
 
 /// The public API's `code` for a body the deserializer refused: the code of
@@ -847,14 +846,27 @@ mod tests {
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: metadata.user id: invalid type: integer `5`, expected a string at line 1 column 40",
                 "invalid_type",
             ),
-            (
-                "Invalid JSON data: Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
-                "unknown_parameter",
-            ),
             // A custom error opens with none of serde's words: no code of
             // the table, as before.
             (
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: reasoning_effort: reasoning_effort must be a string, number, or null at line 1 column 42",
+                "json_parse_error",
+            ),
+            // A custom error that repeats the client's value does not hand
+            // the value the code: the reason starts after the path.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: invalid type\" at line 1 column 44",
+                "json_parse_error",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
+                "json_parse_error",
+            ),
+            // The one key this order reads wrong: a colon and a space in it,
+            // in front of serde's words, is cut at the colon, and what follows
+            // is no reason of serde's.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
                 "json_parse_error",
             ),
         ] {
@@ -912,14 +924,25 @@ mod tests {
                 "Failed to deserialize the JSON body into the target type: metadata.user id: invalid type: integer `5`, expected a string at line 1 column 40",
                 Some("metadata.user id"),
             ),
-            (
-                "Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
-                Some("a: b"),
-            ),
-            // A custom error keeps its path.
+            // A custom error keeps its path, and a value it repeats cannot
+            // move the split that reads the path.
             (
                 "Failed to deserialize the JSON body into the target type: reasoning_effort: reasoning_effort must be a string, number, or null at line 1 column 42",
                 Some("reasoning_effort"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: invalid type\" at line 1 column 44",
+                Some("function_call"),
+            ),
+            (
+                "Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
+                Some("function_call"),
+            ),
+            // The one key read wrong: a colon and a space in it is cut at the
+            // colon.
+            (
+                "Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
+                Some("a"),
             ),
             ("JSON syntax error: expected value at line 1 column 1", None),
             ("Missing Content-Type: application/json header", None),
