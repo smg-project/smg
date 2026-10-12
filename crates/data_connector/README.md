@@ -42,7 +42,7 @@ pub type StorageTuple = (
 
 | Backend | Variant | Description |
 |---------|---------|-------------|
-| **Memory** | `HistoryBackend::Memory` | In-process `HashMap`/`BTreeMap` storage. Default. No persistence across restarts. Suitable for development and testing. |
+| **Memory** | `HistoryBackend::Memory` | In-process `HashMap`/`BTreeMap` storage. Default. No persistence across restarts. Bounded by [`MemoryConfig`](#memoryconfig): the oldest records go when a count bound is crossed or a record is older than the retention. Suitable for development, testing and small deployments. |
 | **None / NoOp** | `HistoryBackend::None` | Accepts all writes silently, returns empty on reads. Use when persistence is intentionally disabled. |
 | **PostgreSQL** | `HistoryBackend::Postgres` | Production backend using `tokio-postgres` with `deadpool` connection pooling. Fully async. Tables are auto-created on first connection. |
 | **Redis** | `HistoryBackend::Redis` | Production backend using `deadpool-redis`. Supports optional TTL-based data retention (`retention_days`). |
@@ -101,6 +101,21 @@ items.link_item(&conv.id, &item.id, chrono::Utc::now()).await.unwrap();
 Backend selection is controlled by the `HistoryBackend` enum
 (`"memory"`, `"none"`, `"oracle"`, `"postgres"`, `"redis"` when deserialized
 from JSON/YAML). Each database backend has a dedicated config struct.
+
+### `MemoryConfig`
+
+The memory backend keeps its records in the gateway's own memory, so it is
+bounded; the bounds are checked on every write and the oldest records go first.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_responses` | `usize` | `10_000` | Most stored responses kept (a stored response of a short exchange takes about 12 KB). |
+| `max_items` | `usize` | `100_000` | Most conversation items kept; an evicted item leaves every conversation that listed it (an item takes about 1.5 KB). |
+| `retention_secs` | `Option<u64>` | `Some(86_400)` | How long a record is kept; `None` or `0` keeps a record until a count bound drops it. Conversations follow the retention only. |
+
+The stores report their record counts through `stored_record_count()` (the
+gateway samples them into `smg_history_memory_records{kind}`); the other
+backends answer `None`.
 
 ### `PostgresConfig`
 
@@ -398,6 +413,20 @@ characters, so the canonical key fits the column.
 | `mcp_list_tools` | `mcpl` |
 | `function_call` | `fc` |
 | (other) | first 3 chars of the type, or `itm` if empty |
+
+## Start-up Contact
+
+With a Postgres or Redis history backend configured, `create_storage` makes one
+bounded contact with the store before anything else: a connection and one round
+trip (`SELECT 1` / `PING`) within the backend's store-call bound
+(`op_timeout_secs`, 5 s by default). A store that refuses the connection is a
+named error at once (the backend, the URL with its password masked, the cause);
+a store that accepts the connection and never answers is one when the bound
+passes (`did not answer within the start-up bound of 5 s`): the client library
+and the pool bound their own steps at twice the store-call bound, so the
+contact's verdict is the first to fire for either backend. The gateway exits
+before it binds its API port: it does not start without a history backend it
+cannot reach. Oracle's contact is bounded by its own `pool_timeout_secs`.
 
 ## Database Schema
 

@@ -196,7 +196,9 @@ impl ProbeState {
         // up, but the gateway autoloads each gRPC-pipeline worker's tokenizer
         // asynchronously afterward (`SubmitTokenizerJobStep`,
         // fire-and-forget). Until that lands, generation requests are answered
-        // 503 `tokenizer_not_ready`, so `/readiness` must not report ready yet.
+        // 503 `tokenizer_not_ready` (503 `tokenizer_load_failed` once a load
+        // was skipped or failed for good, or the tokenizer was removed), so
+        // `/readiness` must not report ready yet.
         // Hold readiness until every healthy gRPC and ZMQ worker's tokenizer
         // is registered — both ride the gRPC pipeline and speak tokens on the
         // wire. HTTP/proxy workers never autoload a local tokenizer and are

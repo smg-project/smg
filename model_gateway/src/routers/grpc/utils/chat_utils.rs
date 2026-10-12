@@ -40,6 +40,7 @@ use crate::{
         error,
         grpc::{context::RequestContext, multimodal::PlaceholderTokens, ProcessedMessages},
     },
+    workflow::TokenizerLoadFailure,
 };
 
 /// Type alias for the SSE channel sender used across streaming endpoints.
@@ -89,11 +90,13 @@ pub(crate) fn resolve_tokenizer(
         .get(model_id)
         .ok_or_else(|| {
             let served = ctx.components.worker_registry.contains_model(model_id);
+            let failure = ctx.components.tokenizer_load_failures.get(model_id);
             Box::new(missing_tokenizer_response(
                 stage_name,
                 model_id,
                 served,
                 ctx.components.tokenizer_autoload,
+                failure.as_ref(),
             ))
         })?;
 
@@ -133,10 +136,8 @@ const TOKENIZER_NOT_READY_RETRY_AFTER_SECS: u32 = 1;
 /// as `suppressed` on the next admitted line); the response is marked
 /// [`ReportedRefusal`], so the pipeline's and the access log's lines for it
 /// stay at DEBUG (three ERROR lines per request were the storm of the 500).
-/// A served model whose tokenizer autoload was skipped (no path to load it
-/// from) or failed is answered the same until the gateway records failed
-/// loads per model: a model stuck on this answer has the one WARN or ERROR
-/// line of its registration to look for.
+/// A served model whose tokenizer load was skipped or failed for good is
+/// answered [`tokenizer_load_failed`] instead.
 pub(crate) fn tokenizer_not_ready(function: &str, model_id: &str) -> Response {
     let mut response = error::service_unavailable(
         TOKENIZER_NOT_READY_CODE,
@@ -158,21 +159,64 @@ pub(crate) fn tokenizer_not_ready(function: &str, model_id: &str) -> Response {
     response
 }
 
+/// The client-visible code of [`tokenizer_load_failed`].
+pub(crate) const TOKENIZER_LOAD_FAILED_CODE: &str = "tokenizer_load_failed";
+
+/// The 503 for a served model whose tokenizer the gateway will not register
+/// on its own: its load was skipped (no path to load it from) or failed for
+/// good, or its tokenizer was removed, as the registration recorded for the
+/// model (a load in flight is pending, not this). The envelope
+/// of [`tokenizer_not_ready`] without the `Retry-After`: a retry changes
+/// nothing until a tokenizer registers for the model (a worker re-registering
+/// with a usable path, an operator's `POST /v1/tokenizers`), which clears
+/// the record. The message names the reason class, not the path or the
+/// error: the gateway's log has those, in the one line written when the
+/// model entered the state, not per request. Marked [`ReportedRefusal`], so
+/// the pipeline's and the access log's lines for it stay at DEBUG.
+pub(crate) fn tokenizer_load_failed(
+    function: &str,
+    model_id: &str,
+    failure: &TokenizerLoadFailure,
+) -> Response {
+    debug!(
+        function = %function,
+        model = %model_id,
+        reason = failure.reason(),
+        "Tokenizer load failed for a served model"
+    );
+    let mut response = error::service_unavailable(
+        TOKENIZER_LOAD_FAILED_CODE,
+        format!(
+            "Tokenizer for model '{model_id}' could not be loaded: {}",
+            failure.reason()
+        ),
+    );
+    response.extensions_mut().insert(ReportedRefusal);
+    response
+}
+
 /// The error for a model without a registered tokenizer: a model nobody
-/// serves is the client's mistake (404); a served model whose tokenizer the
-/// gateway is still loading is not ready yet (503, the state `/readiness`
-/// reports); a served model with no tokenizer when the gateway does not load
-/// tokenizers itself (`--disable-tokenizer-autoload`) is a gateway fault
-/// (500): nothing will register one.
-fn missing_tokenizer_response(
+/// serves is the client's mistake (404); a served model whose tokenizer load
+/// was skipped or failed for good, or whose tokenizer was removed, gets none
+/// on its own (503 without a retry hint, [`tokenizer_load_failed`]); a
+/// served model whose tokenizer the
+/// gateway is still loading is not ready yet (503 with a `Retry-After`, the
+/// state `/readiness` reports); a served model with no tokenizer when the
+/// gateway does not load tokenizers itself (`--disable-tokenizer-autoload`)
+/// is a gateway fault (500): nothing will register one.
+pub(crate) fn missing_tokenizer_response(
     function: &str,
     model_id: &str,
     served: bool,
     tokenizer_autoload: bool,
+    failure: Option<&TokenizerLoadFailure>,
 ) -> Response {
     if !served {
         debug!(function = %function, model = %model_id, "Unknown model");
         return error::model_not_found(model_id);
+    }
+    if let Some(failure) = failure {
+        return tokenizer_load_failed(function, model_id, failure);
     }
     if tokenizer_autoload {
         return tokenizer_not_ready(function, model_id);
@@ -2314,10 +2358,10 @@ mod tests {
     #[test]
     fn a_missing_tokenizer_is_a_404_a_503_while_it_loads_or_a_500_without_autoload() {
         assert_eq!(
-            missing_tokenizer_response("stage", "nonexistent-model", false, true).status(),
+            missing_tokenizer_response("stage", "nonexistent-model", false, true, None).status(),
             http::StatusCode::NOT_FOUND
         );
-        let not_ready = missing_tokenizer_response("stage", "served-model", true, true);
+        let not_ready = missing_tokenizer_response("stage", "served-model", true, true, None);
         assert_eq!(not_ready.status(), http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error::extract_error_code_from_response(&not_ready),
@@ -2332,8 +2376,46 @@ mod tests {
         );
         assert!(not_ready.extensions().get::<ReportedRefusal>().is_some());
         assert_eq!(
-            missing_tokenizer_response("stage", "served-model", true, false).status(),
+            missing_tokenizer_response("stage", "served-model", true, false, None).status(),
             http::StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A served model whose tokenizer load was skipped or failed for good is
+    /// a 503 of its own code without a `Retry-After`, marked as reported,
+    /// whether or not the gateway loads tokenizers itself; the message names
+    /// the reason class, never the path or the error.
+    #[tokio::test]
+    async fn a_served_model_whose_tokenizer_load_failed_is_a_503_without_retry_after() {
+        let failed = TokenizerLoadFailure::Failed(
+            "Workflow failed at step load_tokenizer: File not found: /models/secret".to_string(),
+        );
+        for (failure, autoload, reason) in [
+            (&TokenizerLoadFailure::NoSource, true, "no tokenizer path"),
+            (
+                &TokenizerLoadFailure::Removed,
+                true,
+                "the tokenizer was removed",
+            ),
+            (&failed, true, "the load failed"),
+            (&failed, false, "the load failed"),
+        ] {
+            let response =
+                missing_tokenizer_response("stage", "served-model", true, autoload, Some(failure));
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                TOKENIZER_LOAD_FAILED_CODE
+            );
+            assert!(response.headers().get(RETRY_AFTER).is_none());
+            assert!(response.extensions().get::<ReportedRefusal>().is_some());
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let message = String::from_utf8_lossy(&body);
+            assert!(message.contains("served-model"), "{message}");
+            assert!(message.contains(reason), "{message}");
+            assert!(!message.contains("/models/secret"), "{message}");
+        }
     }
 }

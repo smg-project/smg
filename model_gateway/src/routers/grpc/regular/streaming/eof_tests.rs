@@ -184,7 +184,7 @@ pub(super) async fn gated_stream(
 }
 
 /// One length-prefixed gRPC data frame carrying `response`.
-fn data_frame(response: &proto::GenerateResponse) -> Frame<Bytes> {
+pub(super) fn data_frame<M: ProstMessage>(response: &M) -> Frame<Bytes> {
     let encoded = response.encode_to_vec();
     let mut frame = Vec::with_capacity(encoded.len() + 5);
     frame.put_u8(0);
@@ -194,10 +194,26 @@ fn data_frame(response: &proto::GenerateResponse) -> Frame<Bytes> {
 }
 
 /// The trailers frame that ends a gRPC response with `grpc_status`.
-fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
+pub(super) fn trailers_frame(grpc_status: &'static str) -> Frame<Bytes> {
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", HeaderValue::from_static(grpc_status));
     Frame::trailers(trailers)
+}
+
+/// A decoded gRPC response stream of `M` frames over `body`.
+pub(super) fn decoded_stream<M, S>(body: S) -> tonic::Streaming<M>
+where
+    M: ProstMessage + Default + Send + 'static,
+    S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
+{
+    let mut codec = tonic_prost::ProstCodec::<M, M>::default();
+    tonic::Streaming::new_response(
+        codec.decoder(),
+        StreamBody::new(body),
+        StatusCode::OK,
+        None,
+        None,
+    )
 }
 
 /// A decoded response stream over `body`, owned by `client` as a worker
@@ -206,28 +222,20 @@ fn response_stream<S>(body: S, client: VllmEngineClient) -> ProtoStream
 where
     S: futures::Stream<Item = Result<Frame<Bytes>, tonic::Status>> + Send + 'static,
 {
-    let mut codec =
-        tonic_prost::ProstCodec::<proto::GenerateResponse, proto::GenerateResponse>::default();
-    let stream = tonic::Streaming::new_response(
-        codec.decoder(),
-        StreamBody::new(body),
-        StatusCode::OK,
-        None,
-        None,
-    );
-    let stream = AbortOnDropStream::new(stream, "eof-test".to_string(), client);
+    let stream = AbortOnDropStream::new(decoded_stream(body), "eof-test".to_string(), client);
     // No generation was sent to the mock, so there is nothing to cancel.
     stream.mark_completed();
     ProtoStream::Vllm(stream)
 }
 
-/// The mock worker a test's client connects to. The test supplies the
-/// response frames itself; the server only accepts the connection.
+/// The mock worker a test's client connects to, as its URL and its server
+/// task. The test supplies the response frames itself; the server only
+/// accepts the connection.
 #[expect(
     clippy::disallowed_methods,
     reason = "bounded test fixture; server task is explicitly aborted"
 )]
-async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
+pub(super) async fn mock_worker_endpoint() -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock worker");
@@ -252,7 +260,12 @@ async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
         ..mock_worker::config::Config::default()
     });
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
-    let client = VllmEngineClient::connect(&format!("http://127.0.0.1:{port}"))
+    (format!("http://127.0.0.1:{port}"), server)
+}
+
+async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
+    let (url, server) = mock_worker_endpoint().await;
+    let client = VllmEngineClient::connect(&url)
         .await
         .expect("connect mock worker");
     (client, server)

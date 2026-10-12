@@ -463,9 +463,9 @@ async fn process_item(
 
 /// Process an item_reference - resolve an existing item for linking.
 /// Linking is deferred to the caller for batch operation. A reference to an item the
-/// conversation already has is refused, as an item arriving under such an id is: linked
-/// again, the item would be listed twice by one backend, moved by another and rejected
-/// by a third.
+/// conversation already has is refused, as an item arriving under such an id is: the
+/// public API does not re-add an item a conversation has (the stores would move it to the
+/// new position).
 async fn process_item_reference(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,

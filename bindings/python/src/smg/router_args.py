@@ -366,6 +366,12 @@ class RouterArgs:
     # operation included); appended last for positional callers
     postgres_op_timeout_secs: int = 5
     redis_op_timeout_secs: int = 5
+    # Bounds of the memory history backend: the most stored responses and
+    # conversation items kept (the oldest go first) and how long a record is
+    # kept (0 = until a count bound drops it); appended last for the same reason
+    history_memory_max_responses: int = 10000
+    history_memory_max_items: int = 100000
+    history_memory_retention_secs: int = 86400
 
     @staticmethod
     def add_cli_args(
@@ -603,7 +609,10 @@ class RouterArgs:
             f"--{prefix}prefix-hash-load-factor",
             type=float,
             default=RouterArgs.prefix_hash_load_factor,
-            help="Load factor above which prefix_hash walks the ring (multiple of average load)",
+            help=(
+                "Load factor above which prefix_hash walks the ring (multiple of"
+                " average load; finite, at least 1.0)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}prefix-hash-balance-abs-threshold",
@@ -678,6 +687,7 @@ class RouterArgs:
             help=(
                 "Spill gate, relative part: a matched worker is skipped when its load exceeds"
                 " this multiple of the healthy-fleet mean AND the absolute threshold is also met."
+                " Finite, at least 1.0."
             ),
         )
         routing_group.add_argument(
@@ -689,7 +699,8 @@ class RouterArgs:
                 " coldest backend KV utilization above which cache affinity is"
                 " abandoned for shortest-queue. Catches long-context KV imbalance that"
                 " in-flight request counts miss, and is invariant to gateway replica"
-                " count. Backend must report token_usage. Defaults to 1.0 (disabled)."
+                " count. Backend must report token_usage. Finite and > 0.0; >= 1.0"
+                " disables it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -700,7 +711,8 @@ class RouterArgs:
                 "Cache-aware KV-utilization CEILING (0.0-1.0): when the hottest backend"
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
-                " Backend must report token_usage. Defaults to 1.0 (disabled)."
+                " Backend must report token_usage. Finite and > 0.0; >= 1.0 disables"
+                " it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -832,7 +844,10 @@ class RouterArgs:
             f"--{prefix}worker-warmup-share",
             type=float,
             default=RouterArgs.worker_warmup_share,
-            help="Share of cache misses offered to warming workers (0.0 to 1.0). Defaults to 0.25.",
+            help=(
+                "Share of cache misses offered to warming workers (a finite value from"
+                " 0.0 to 1.0). Defaults to 0.25."
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}worker-warmup-blocks",
@@ -850,8 +865,8 @@ class RouterArgs:
             help=(
                 "A worker whose index holds less than this share of the fleet's"
                 " median (or nothing) is thin and receives the warm-up slice until"
-                " it has grown by --worker-warmup-blocks, whatever emptied it. 0"
-                " keeps the age rule alone. Defaults to 0.5."
+                " it has grown by --worker-warmup-blocks, whatever emptied it. A"
+                " finite value from 0.0 to 1.0; 0 keeps the age rule alone. Defaults to 0.5."
             ),
         )
         routing_group.add_argument(
@@ -1239,7 +1254,8 @@ class RouterArgs:
                 " once; a request that fits waits briefly for room, then gets"
                 " 429, and one larger than the whole budget gets 413 straight"
                 " away. A waiting request still holds its media, so size memory"
-                " for about twice this value. Zero is refused, not read as unset"
+                " for about twice this value. Counted in whole KiB: a value under 1024 (one"
+                " 1 KiB unit, zero included) is refused, not read as unset"
             ),
         )
         parser.add_argument(
@@ -1320,8 +1336,8 @@ class RouterArgs:
             type=_non_negative_int,
             default=RouterArgs.rdma_slot_ttl_s,
             help=(
-                "Seconds a leased RDMA pixel slot lives without a free notification;"
-                " must exceed the worker's hold or it is ignored. Falls back to"
+                "Seconds a leased RDMA pixel slot lives without a free notification"
+                " (at least 1); must exceed the worker's hold or it is ignored. Falls back to"
                 " SMG_RDMA_SLOT_TTL_S"
             ),
         )
@@ -1493,10 +1509,7 @@ class RouterArgs:
             f"--{prefix}prometheus-port",
             type=int,
             default=29000,
-            help=(
-                "Port to expose Prometheus metrics (default: 29000)."
-                " 0 binds an OS-assigned ephemeral port, logged at startup."
-            ),
+            help="Port to expose Prometheus metrics (at least 1; default: 29000)",
         )
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
@@ -1746,7 +1759,7 @@ class RouterArgs:
             f"--{prefix}retry-backoff-multiplier",
             type=float,
             default=RouterArgs.retry_backoff_multiplier,
-            help="Multiplier for exponential backoff between retries",
+            help="Multiplier for exponential backoff between retries (finite, at least 1.0)",
         )
         retry_group.add_argument(
             f"--{prefix}retry-jitter-factor",
@@ -1859,19 +1872,29 @@ class RouterArgs:
             f"--{prefix}model",
             type=str,
             default=None,
-            help="Model path for loading tokenizer (HuggingFace model ID or local path)",
+            help=(
+                "Model path for loading tokenizer (HuggingFace model ID, fetched lazily, or a"
+                " local path: one that exists must hold a tokenizer layout; one that does not"
+                " is left to the worker's tokenizer where a gRPC worker can still register"
+                " (gRPC worker URLs, IGW mode, worker discovery)"
+                " and refused otherwise). Not read as a tokenizer source when tokenizer_path"
+                " is set."
+            ),
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-path",
             type=str,
             default=None,
-            help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+            help=(
+                "Explicit tokenizer path (overrides model_path tokenizer if provided); a local"
+                " path follows the same rule as model_path"
+            ),
         )
         tokenizer_group.add_argument(
             f"--{prefix}chat-template",
             type=str,
             default=None,
-            help="Chat template path (optional)",
+            help="Chat template path (optional): an existing, non-empty template file",
         )
         tokenizer_group.add_argument(
             f"--{prefix}disable-tokenizer-autoload",
@@ -1976,6 +1999,38 @@ class RouterArgs:
             choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
         )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-max-responses",
+            type=int,
+            default=RouterArgs.history_memory_max_responses,
+            help=(
+                "Most stored responses the memory history backend keeps; the oldest go"
+                " first, on every write (memory backend only; a stored response takes"
+                " about 12 KB)."
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-max-items",
+            type=int,
+            default=RouterArgs.history_memory_max_items,
+            help=(
+                "Most conversation items the memory history backend keeps; the oldest go"
+                " first and leave every conversation that listed them (memory backend"
+                " only; an item takes about 1.5 KB)."
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-retention-secs",
+            type=int,
+            default=RouterArgs.history_memory_retention_secs,
+            help=(
+                "How long the memory history backend keeps a record, in seconds, checked"
+                " on every write; 0 keeps a record until a count bound drops it. A"
+                " conversation is kept that long after its last use (created, read or"
+                " updated); a background response still running is not dropped by a"
+                " count bound."
+            ),
+        )
 
         # Oracle configuration
         oracle_group.add_argument(
@@ -2071,7 +2126,10 @@ class RouterArgs:
             f"--{prefix}redis-retention-days",
             type=int,
             default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
-            help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
+            help=(
+                "Redis data retention in days (at least 1; -1 for persistent, default: 30,"
+                " env: REDIS_RETENTION_DAYS)"
+            ),
         )
         redis_group.add_argument(
             f"--{prefix}redis-op-timeout-secs",

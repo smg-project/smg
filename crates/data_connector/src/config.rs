@@ -19,6 +19,55 @@ pub enum HistoryBackend {
     Redis,
 }
 
+/// Bounds of the in-memory history backend. Its records live in the
+/// gateway's own memory, so it keeps at most `max_responses` stored responses
+/// and `max_items` conversation items and drops a record older than
+/// `retention_secs`: the oldest go first, checked on every write. The
+/// defaults hold a default deployment at a few hundred MB (a stored response
+/// of a short exchange takes about 12 KB, a conversation item about 1.5 KB).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Most stored responses kept; the oldest go first.
+    pub max_responses: usize,
+    /// Most conversation items kept; the oldest go first, unlinked from every
+    /// conversation that lists them.
+    pub max_items: usize,
+    /// How long a record is kept, in seconds; `None` (or 0) keeps a record
+    /// until a count bound drops it. Conversations follow the retention only,
+    /// counted from their last use (created, read or updated); a background
+    /// response still running is not dropped by a count bound.
+    pub retention_secs: Option<u64>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_responses: 10_000,
+            max_items: 100_000,
+            retention_secs: Some(24 * 60 * 60),
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_responses == 0 || self.max_items == 0 {
+            return Err(
+                "memory history: max_responses and max_items must be at least 1".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The retention as a duration; `None` for no retention.
+    pub fn retention(&self) -> Option<Duration> {
+        self.retention_secs
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+    }
+}
+
 /// Oracle history backend configuration
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OracleConfig {
@@ -224,6 +273,13 @@ impl RedisConfig {
         }
         if self.op_timeout_secs == 0 {
             return Err("op_timeout_secs must be greater than 0".to_string());
+        }
+        // A retention of 0 days would expire every record the moment it is
+        // written; persistent records are spelled by leaving the retention unset.
+        if self.retention_days == Some(0) {
+            return Err(
+                "retention_days must be at least 1; persistent records are spelled -1 on the command line and in Python (unset in Rust)".to_string(),
+            );
         }
         Ok(())
     }
@@ -537,6 +593,22 @@ mod tests {
         let err = redis.validate().expect_err("op_timeout_secs=0 should fail");
         assert!(
             err.contains("op_timeout_secs"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn redis_retention_zero_fails() {
+        let cfg = RedisConfig {
+            url: "redis://localhost:6379/0".to_string(),
+            pool_max: 16,
+            op_timeout_secs: 5,
+            retention_days: Some(0),
+            schema: None,
+        };
+        let err = cfg.validate().expect_err("retention_days=0 should fail");
+        assert!(
+            err.contains("retention_days must be at least 1"),
             "unexpected error message: {err}"
         );
     }

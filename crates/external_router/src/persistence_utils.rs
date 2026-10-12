@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use smg_data_connector::{
     with_request_context, AddedAtSequence, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationStorage, NewConversationItem,
-    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
+    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, StorageFailure,
     StoredResponse,
 };
 use tracing::{debug, info, warn};
@@ -473,10 +473,10 @@ pub enum PersistStep {
 }
 
 /// A failed persist: the step that failed, whether the same persist can
-/// succeed later and the message. Retryable is a storage error at the record
-/// write: an unreachable store, and also a write a storage hook rejected, which
-/// the store reports the same way; a record the input itself makes unstorable
-/// (no id, no output) is not retried.
+/// succeed later and the message. Retryable is a record write that failed
+/// because the store is not available (`is_unavailable`: unreachable or past
+/// its bound); a refusal the store or a storage hook answered, and a record the
+/// input itself makes unstorable (no id, no output), are not retried.
 #[derive(Debug, Clone)]
 pub struct PersistError {
     pub step: PersistStep,
@@ -566,7 +566,7 @@ async fn persist_conversation_items_inner(
         .map_err(|e| {
             PersistError::new(
                 PersistStep::ResponseRecord,
-                matches!(e, ResponseStorageError::StorageError(_)),
+                e.is_unavailable(),
                 format!("Failed to store response: {e}"),
             )
         })?;

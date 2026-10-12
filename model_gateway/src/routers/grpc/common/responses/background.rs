@@ -1294,7 +1294,7 @@ mod tests {
             let left = self.failures_left.load(Ordering::SeqCst);
             if left > 0 {
                 self.failures_left.store(left - 1, Ordering::SeqCst);
-                return Err(ResponseStorageError::StorageError(
+                return Err(ResponseStorageError::Unavailable(
                     "connection refused".to_string(),
                 ));
             }

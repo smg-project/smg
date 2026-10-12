@@ -66,8 +66,9 @@ pub use steps::{
     WorkerRemovalRequest,
 };
 pub use tokenizer_registration::{
-    create_tokenizer_registration_workflow, create_tokenizer_workflow_data, LoadTokenizerStep,
-    TokenizerConfigRequest, TokenizerRemovalRequest,
+    create_tokenizer_registration_workflow, create_tokenizer_workflow_data,
+    note_tokenizer_load_outcome, note_tokenizer_removed, LoadTokenizerStep, TokenizerConfigRequest,
+    TokenizerLoadFailure, TokenizerLoadFailures, TokenizerRemovalRequest,
 };
 pub use wasm_module_registration::{
     create_wasm_module_registration_workflow, create_wasm_registration_workflow_data,

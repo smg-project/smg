@@ -38,9 +38,9 @@ use std::{
 
 use chrono::{TimeDelta, Utc};
 use data_connector::{
-    create_storage, ConversationItemId, HistoryBackend, ListParams, NewConversation,
-    NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
-    StorageFactoryConfig, StoredResponse, TableConfig,
+    create_storage, ConversationItemId, ConversationItemStorageError, HistoryBackend, ListParams,
+    NewConversation, NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
+    StorageFactoryConfig, StorageFailure, StoredResponse, TableConfig,
 };
 use serde_json::json;
 use tokio::task::JoinSet;
@@ -70,6 +70,7 @@ async fn postgres_bundle(db_url: &str) -> Result<StorageBundle, String> {
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await
@@ -412,6 +413,7 @@ async fn configured_table_bundle(db_url: &str, table: &str) -> Result<StorageBun
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await
@@ -791,7 +793,7 @@ async fn conversation_items_linked_a_microsecond_apart_list_in_link_order() {
 
 #[tokio::test]
 #[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
-async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once() {
+async fn a_second_link_of_an_item_moves_it_and_the_item_lists_once() {
     let Some(db_url) = test_db_url() else {
         return;
     };
@@ -809,41 +811,49 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
         .expect("create conversation");
     let items = bundle.conversation_item_storage;
 
-    // One item, its id unique to this run (the database is shared) and within the 64
+    // Two items, their ids unique to this run (the database is shared) and within the 64
     // characters of the id column.
-    let id = ConversationItemId::from(format!("msg_r_{}", conversation.id.0).as_str());
+    let nonce = &conversation.id.0;
+    let ids: Vec<ConversationItemId> = ["a", "b"]
+        .iter()
+        .map(|s| ConversationItemId::from(format!("msg_{s}_{nonce}").as_str()))
+        .collect();
+    for id in &ids {
+        items
+            .create_item(NewConversationItem {
+                id: Some(id.clone()),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([]),
+                status: Some("completed".to_string()),
+                tenant: None,
+            })
+            .await
+            .expect("create item");
+    }
+    let base = Utc::now();
+    let at = |seconds: i64| base + TimeDelta::seconds(seconds);
     items
-        .create_item(NewConversationItem {
-            id: Some(id.clone()),
-            response_id: None,
-            item_type: "message".to_string(),
-            role: Some("user".to_string()),
-            content: json!([]),
-            status: Some("completed".to_string()),
-            tenant: None,
-        })
-        .await
-        .expect("create item");
-    let first = Utc::now();
-    items
-        .link_item(&conversation.id, &id, first)
+        .link_item(&conversation.id, &ids[0], at(0))
         .await
         .expect("link item");
-    assert!(items
-        .is_item_linked(&conversation.id, &id)
+    items
+        .link_item(&conversation.id, &ids[1], at(1))
         .await
-        .expect("is linked"));
+        .expect("link item");
 
-    // The links table keys one row per (conversation, item): a second link of the same item is
-    // refused by the database. The gateway refuses a duplicate before it gets here, so a client
-    // sees the same 400 on every backend rather than this error.
-    let again = items
-        .link_item(&conversation.id, &id, first + TimeDelta::seconds(1))
-        .await;
-    assert!(
-        again.is_err(),
-        "a second link of the same item is refused by the key"
-    );
+    // The links table keys one row per (conversation, item): a second link of the first item,
+    // through either link path, moves it to the new stamp instead of being refused by the key,
+    // the contract every backend answers. The gateway refuses a duplicate before it gets here.
+    items
+        .link_item(&conversation.id, &ids[0], at(2))
+        .await
+        .expect("a second link moves the item");
+    items
+        .link_items(&conversation.id, &[(ids[0].clone(), at(3))])
+        .await
+        .expect("a second batch link moves the item");
 
     let list = |order: SortOrder| {
         let items = items.clone();
@@ -863,18 +873,22 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
                 .collect::<Vec<_>>()
         }
     };
-    assert_eq!(list(SortOrder::Asc).await, std::slice::from_ref(&id));
+    assert_eq!(list(SortOrder::Asc).await, [ids[1].clone(), ids[0].clone()]);
+    assert_eq!(
+        list(SortOrder::Desc).await,
+        [ids[0].clone(), ids[1].clone()]
+    );
 
-    // One link per item: the delete takes the item out of the conversation.
+    // One row per item: the delete takes the item out of the conversation.
     items
-        .delete_item(&conversation.id, &id)
+        .delete_item(&conversation.id, &ids[0])
         .await
         .expect("delete item");
     assert!(!items
-        .is_item_linked(&conversation.id, &id)
+        .is_item_linked(&conversation.id, &ids[0])
         .await
         .expect("is linked"));
-    assert!(list(SortOrder::Asc).await.is_empty());
+    assert_eq!(list(SortOrder::Asc).await, std::slice::from_ref(&ids[1]));
 }
 
 /// A database of its own on the test server, for the tests of a first start:
@@ -1028,6 +1042,7 @@ async fn six_gateways_start_together(
                 oracle: None,
                 postgres: Some(&postgres_cfg),
                 redis: None,
+                memory: None,
                 hook: None,
             })
             .await
@@ -1086,6 +1101,7 @@ async fn a_fresh_database_bootstraps_at_the_latest_version_without_auto_migrate(
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await;
@@ -1389,6 +1405,7 @@ async fn a_database_ahead_of_this_build_is_refused_at_startup() {
         oracle: None,
         postgres: Some(&allowed_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await
@@ -1469,6 +1486,7 @@ async fn a_store_that_stops_answering_fails_the_call_at_its_bound() {
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await
@@ -1612,4 +1630,44 @@ async fn responses_and_conversations_keep_their_tenant_and_the_identifier_querie
         .delete_conversation(&created.id)
         .await
         .expect("delete conversation"));
+}
+
+/// A failure the store answers (here a unique key refusing a second item under
+/// a client-supplied id) is the store's own error, not the store being
+/// unavailable: the gateway keeps the endpoint's answer for it rather than a
+/// 503 that asks the client to retry a request that will fail again.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_constraint_the_store_refuses_is_its_answer_not_unavailable() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let items = bundle.conversation_item_storage;
+    let id = ConversationItemId::from(format!(
+        "item_dup_{}",
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let item = || NewConversationItem {
+        id: Some(id.clone()),
+        response_id: None,
+        item_type: "message".to_string(),
+        role: Some("user".to_string()),
+        content: json!([{"type": "input_text", "text": "once"}]),
+        status: Some("completed".to_string()),
+        tenant: None,
+    };
+    items.create_item(item()).await.expect("the first item");
+    let err = items
+        .create_item(item())
+        .await
+        .expect_err("a second item under the same id");
+    assert!(
+        matches!(err, ConversationItemStorageError::StorageError(_)),
+        "{err:?}"
+    );
+    assert!(!err.is_unavailable(), "{err}");
+    assert!(err.to_string().contains("duplicate key"), "{err}");
 }

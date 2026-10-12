@@ -61,7 +61,17 @@ fn is_probe_path(path: &str) -> bool {
     matches!(path, "/health" | "/readiness" | "/liveness")
 }
 
-/// Custom span maker that includes request ID
+/// Opens the `http_request` span: method, path, HTTP version, and the
+/// request id, trace id, status and latency recorded as they become known.
+///
+/// The span carries the request's path, never its query string. The query
+/// is where a client mistakenly puts a credential (`?api_key=...`): the
+/// request is refused, but a logged URI would keep the key in every access
+/// log record of the request. Routing rarely needs the query (`/v1/realtime`'s
+/// `?model=` is the exception, and that handler reads it itself; the list
+/// routes page on it the same way), so the access log gives it up: a
+/// trade-off, not permission to route on query parameters, and not a
+/// field to widen back to the URI.
 #[derive(Clone, Debug)]
 pub struct RequestSpan;
 
@@ -77,7 +87,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             target: "smg::otel-trace",
             "http_request",
             method = %request.method(),
-            uri = %request.uri(),
+            path = %request.uri().path(),
             version = ?request.version(),
             request_id = Empty,  // Will be set later
             trace_id = Empty,
@@ -477,7 +487,7 @@ impl Drop for SpannedBody {
 mod tests {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     use axum::{
@@ -605,6 +615,87 @@ mod tests {
                 "ERROR lines written for {path}"
             );
         }
+    }
+
+    /// Every field a span is opened with, recorded later, or carried by an
+    /// event on this thread's subscriber, as `name=value`.
+    #[derive(Clone, Default)]
+    struct Fields(Arc<Mutex<Vec<String>>>);
+
+    impl Fields {
+        fn visit(&self, record: &dyn Fn(&mut dyn tracing::field::Visit)) {
+            struct Collect<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Collect<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push(format!("{}={value:?}", field.name()));
+                }
+            }
+            record(&mut Collect(&mut self.0.lock().expect("fields")));
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Fields {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.visit(&|visitor| attrs.record(visitor));
+        }
+
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.visit(&|visitor| values.record(visitor));
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.visit(&|visitor| event.record(visitor));
+        }
+    }
+
+    /// The access log keeps the request's path and never its query string: a
+    /// credential a client mistakenly puts in the URL stays out of the logs,
+    /// even though the request itself is refused.
+    #[tokio::test]
+    async fn the_access_log_carries_the_path_without_the_query_string() {
+        let fields = Fields::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(fields.clone()));
+        let app = Router::new()
+            .route("/v1/models", get(|| async { "ok" }))
+            .layer(create_logging_layer());
+        let key = "sk-test-7f3a9c0e11";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/models?api_key={key}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let recorded = fields.0.lock().expect("fields").clone();
+        assert!(
+            !recorded.iter().any(|field| field.contains(key)),
+            "the credential reached the log fields: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|field| field == "path=/v1/models"),
+            "the request path is missing from the log fields: {recorded:?}"
+        );
     }
 }
 

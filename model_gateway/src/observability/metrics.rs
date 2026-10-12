@@ -856,6 +856,7 @@ pub(crate) fn init_metrics() {
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
+    super::history_metrics::describe();
 
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();

@@ -14,8 +14,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{middleware::SHED_RETRY_AFTER_SECS, observability::metrics::Metrics, routers::error};
 
-/// Granularity of the budget, so the permit count stays within the semaphore's range.
-const UNIT_BYTES: usize = 1024;
+/// Granularity of the budget, so the permit count stays within the semaphore's range;
+/// a budget below one unit rounds to nothing, which the configuration refuses.
+pub(crate) const UNIT_BYTES: usize = 1024;
 /// How long a request waits for bytes to free up before it is refused.
 const WAIT: Duration = Duration::from_secs(2);
 

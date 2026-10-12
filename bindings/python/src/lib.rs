@@ -499,6 +499,9 @@ struct Router {
     rate_limit_tokens_per_second: Option<i32>,
     max_background_responses: usize,
     sse_keepalive_secs: u64,
+    history_memory_max_responses: usize,
+    history_memory_max_items: usize,
+    history_memory_retention_secs: u64,
     connection_mode: worker::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -1092,6 +1095,12 @@ impl Router {
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .history_backend(history_backend)
+            .memory_config(config::MemoryConfig {
+                max_responses: self.history_memory_max_responses,
+                max_items: self.history_memory_max_items,
+                retention_secs: (self.history_memory_retention_secs > 0)
+                    .then_some(self.history_memory_retention_secs),
+            })
             .maybe_api_key(self.api_key.as_ref())
             .tenant_api_keys(
                 self.tenant_api_keys
@@ -1374,6 +1383,9 @@ impl Router {
         mm_allowed_media_domains = None,
         mm_allow_private_media_hosts = false,
         sse_keepalive_secs = 15,
+        history_memory_max_responses = 10000,
+        history_memory_max_items = 100000,
+        history_memory_retention_secs = 86400,
         // Keyword-only, so it never takes a positional slot.
         *,
         mesh_tls_ca_cert = None,
@@ -1573,6 +1585,9 @@ impl Router {
         mm_allowed_media_domains: Option<Vec<String>>,
         mm_allow_private_media_hosts: bool,
         sse_keepalive_secs: u64,
+        history_memory_max_responses: usize,
+        history_memory_max_items: usize,
+        history_memory_retention_secs: u64,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
@@ -1696,6 +1711,9 @@ impl Router {
             rate_limit_tokens_per_second,
             max_background_responses,
             sse_keepalive_secs,
+            history_memory_max_responses,
+            history_memory_max_items,
+            history_memory_retention_secs,
             connection_mode,
             model_path,
             tokenizer_path,

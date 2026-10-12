@@ -74,16 +74,19 @@ pub fn method_not_allowed(code: impl Into<String>, message: impl Into<String>) -
     create_error(StatusCode::METHOD_NOT_ALLOWED, code, message)
 }
 
-/// The answer to a failed history store call. A call that exceeded the
-/// store's bound (`op_timeout_secs`) is a `503 storage_unavailable`: the store
-/// is not answering for now and the client may retry. Any other failure keeps
-/// the endpoint's own 500 `code`. `context` opens the message.
+/// The answer to a failed history store call. A store that is not available
+/// (a call that exceeded the store's bound, no connection to be had, the
+/// connection gone or timed out, the server shutting down or refusing
+/// connections) is a `503 storage_unavailable`: the client may retry and the
+/// metric label names the dependency. Any other failure (the store's own
+/// refusal, a hook's rejection, a record that cannot be decoded, an invalid
+/// chain) keeps the endpoint's own 500 `code`. `context` opens the message.
 pub fn storage_failure(
     code: &str,
     context: impl Display,
     error: &(impl StorageFailure + Display),
 ) -> Response {
-    if error.timed_out() {
+    if error.is_unavailable() {
         service_unavailable("storage_unavailable", format!("{context}: {error}"))
     } else {
         internal_error(code, format!("{context}: {error}"))
@@ -260,7 +263,22 @@ mod tests {
                 "storage_unavailable",
             ),
             (
+                ResponseStorageError::Unavailable(
+                    "no connection from the pool: error connecting to server: Connection refused"
+                        .to_string(),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+            ),
+            // The store answered (a constraint, a refused statement, a hook's
+            // refusal): the endpoint's own failure, not an outage to retry.
+            (
                 ResponseStorageError::StorageError("db error".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+            ),
+            (
+                ResponseStorageError::Rejected("tenant".to_string()),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "storage_error",
             ),

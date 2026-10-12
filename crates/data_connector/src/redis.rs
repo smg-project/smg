@@ -1,6 +1,6 @@
 //! Redis storage implementation using RedisStore helper
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -19,6 +19,7 @@ use crate::{
         ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult,
         ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
     },
+    factory::StoreContactError,
     schema::SchemaConfig,
 };
 
@@ -64,6 +65,25 @@ impl RedisStore {
             retention_days: config.retention_days,
             schema,
         })
+    }
+
+    /// The start-up contact: one connection and one round trip within
+    /// `bound`, so a store that refuses the connection, or accepts it and never
+    /// answers, is a verdict before the gateway serves.
+    pub(crate) async fn contact(&self, bound: Duration) -> Result<(), StoreContactError> {
+        let round_trip = async {
+            let mut conn = self.pool.get().await.map_err(|e| e.to_string())?;
+            redis::cmd("PING")
+                .query_async::<String>(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        };
+        match tokio::time::timeout(bound, round_trip).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(cause)) => Err(StoreContactError::Failed(cause)),
+            Err(_elapsed) => Err(StoreContactError::NoAnswer),
+        }
     }
 }
 
@@ -113,7 +133,7 @@ impl RedisConversationStorage {
         }
         conn.hget(key, s.col("tenant"))
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))
+            .map_err(ConversationStorageError::from_redis)
     }
 }
 
@@ -139,7 +159,7 @@ impl ConversationStorage for RedisConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
         let key = self.conversation_key(id_str);
 
         let mut pipe = redis::pipe();
@@ -172,7 +192,7 @@ impl ConversationStorage for RedisConversationStorage {
 
         pipe.query_async::<()>(&mut conn)
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationStorageError::from_redis)?;
 
         Ok(conversation)
     }
@@ -190,12 +210,12 @@ impl ConversationStorage for RedisConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
 
         let exists: bool = conn
             .exists(&key)
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationStorageError::from_redis)?;
         if !exists {
             return Ok(None);
         }
@@ -206,7 +226,7 @@ impl ConversationStorage for RedisConversationStorage {
             let created_at_str: String = conn
                 .hget(&key, s.col("created_at"))
                 .await
-                .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+                .map_err(ConversationStorageError::from_redis)?;
             DateTime::parse_from_rfc3339(&created_at_str)
                 .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?
                 .with_timezone(&Utc)
@@ -218,7 +238,7 @@ impl ConversationStorage for RedisConversationStorage {
             let metadata_json: Option<String> = conn
                 .hget(&key, s.col("metadata"))
                 .await
-                .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+                .map_err(ConversationStorageError::from_redis)?;
             Self::parse_metadata(metadata_json)?
         };
 
@@ -245,12 +265,12 @@ impl ConversationStorage for RedisConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
 
         let exists: bool = conn
             .exists(&key)
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationStorageError::from_redis)?;
         if !exists {
             return Ok(None);
         }
@@ -262,11 +282,11 @@ impl ConversationStorage for RedisConversationStorage {
             if let Some(meta) = metadata_json {
                 conn.hset::<_, _, _, ()>(&key, col_meta, meta)
                     .await
-                    .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+                    .map_err(ConversationStorageError::from_redis)?;
             } else {
                 conn.hdel::<_, _, ()>(&key, col_meta)
                     .await
-                    .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+                    .map_err(ConversationStorageError::from_redis)?;
             }
         }
 
@@ -277,7 +297,7 @@ impl ConversationStorage for RedisConversationStorage {
             let created_at_str: String = conn
                 .hget(&key, col_created)
                 .await
-                .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+                .map_err(ConversationStorageError::from_redis)?;
             DateTime::parse_from_rfc3339(&created_at_str)
                 .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?
                 .with_timezone(&Utc)
@@ -302,7 +322,7 @@ impl ConversationStorage for RedisConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
 
         // The pipeline answers one count per DEL (the conversation key, then
         // its item index); the conversation existed if its key was deleted.
@@ -311,7 +331,7 @@ impl ConversationStorage for RedisConversationStorage {
             .del(&items_key)
             .query_async(&mut conn)
             .await
-            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationStorageError::from_redis)?;
 
         Ok(deleted > 0)
     }
@@ -482,7 +502,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
 
         let mut pipe = redis::pipe();
 
@@ -531,7 +551,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
 
         pipe.query_async::<()>(&mut conn)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationItemStorageError::from_redis)?;
 
         Ok(conversation_item)
     }
@@ -553,10 +573,10 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         conn.zadd::<_, _, _, ()>(&key, iid, score)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationItemStorageError::from_redis)?;
 
         Ok(())
     }
@@ -578,7 +598,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
 
         let mut pipe = redis::pipe();
         for (item_id, added_at) in items {
@@ -587,7 +607,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         }
         pipe.query_async::<()>(&mut *conn)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationItemStorageError::from_redis)?;
 
         Ok(())
     }
@@ -604,7 +624,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
 
         let mut min = "-inf".to_string();
         let mut max = "+inf".to_string();
@@ -615,7 +635,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             let score: Option<f64> = conn
                 .zscore(&key, after_id)
                 .await
-                .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+                .map_err(ConversationItemStorageError::from_redis)?;
             if let Some(s) = score {
                 cursor_score = Some(s);
                 cursor_id = Some(after_id.clone());
@@ -636,11 +656,11 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             SortOrder::Asc => conn
                 .zrangebyscore_limit(&key, min, max, 0, fetch_limit)
                 .await
-                .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?,
+                .map_err(ConversationItemStorageError::from_redis)?,
             SortOrder::Desc => conn
                 .zrevrangebyscore_limit(&key, max, min, 0, fetch_limit)
                 .await
-                .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?,
+                .map_err(ConversationItemStorageError::from_redis)?,
         };
 
         let item_ids: Vec<String> = if let (Some(_), Some(ref c_id)) = (cursor_score, &cursor_id) {
@@ -666,7 +686,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         let results: Vec<HashMap<String, String>> = pipe
             .query_async(&mut conn)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationItemStorageError::from_redis)?;
 
         let mut items: Vec<ConversationItem> = Vec::with_capacity(results.len());
         for (i, map) in results.into_iter().enumerate() {
@@ -691,12 +711,12 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
 
         let map: HashMap<String, String> = conn
             .hgetall(&key)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationItemStorageError::from_redis)?;
 
         if map.is_empty() {
             return Ok(None);
@@ -719,11 +739,11 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         let score: Option<f64> = conn
             .zscore(&key, iid)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationItemStorageError::from_redis)?;
 
         Ok(score.is_some())
     }
@@ -742,10 +762,10 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         conn.zrem::<_, _, ()>(&key, iid)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(e.to_string()))?;
+            .map_err(ConversationItemStorageError::from_redis)?;
 
         Ok(())
     }
@@ -803,7 +823,7 @@ impl RedisResponseStorage {
         let raws: Vec<Option<String>> = pipe
             .query_async(conn)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
         let mut out = Vec::new();
         for raw in raws {
             let raw = parse_raw_response(raw).map_err(ResponseStorageError::StorageError)?;
@@ -923,7 +943,7 @@ impl RedisResponseStorage {
         let results: Vec<HashMap<String, String>> = pipe
             .query_async(conn)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
 
         let mut out: Vec<StoredResponse> = Vec::with_capacity(results.len());
         let mut gone: Vec<String> = Vec::new();
@@ -960,7 +980,7 @@ impl ResponseStorage for RedisResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
         let mut pipe = redis::pipe();
 
@@ -1030,7 +1050,7 @@ impl ResponseStorage for RedisResponseStorage {
 
         pipe.query_async::<()>(&mut conn)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
 
         // Index by safety identifier if present
         if !sr.is_skipped("safety_identifier") {
@@ -1039,7 +1059,7 @@ impl ResponseStorage for RedisResponseStorage {
                 let score = response.created_at.timestamp_millis() as f64;
                 conn.zadd::<_, _, _, ()>(safety_key, response_id_str, score)
                     .await
-                    .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+                    .map_err(ResponseStorageError::from_redis)?;
             }
         }
 
@@ -1057,12 +1077,12 @@ impl ResponseStorage for RedisResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
         let map: HashMap<String, String> = conn
             .hgetall(&key)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
 
         if map.is_empty() {
             return Ok(None);
@@ -1083,12 +1103,12 @@ impl ResponseStorage for RedisResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
         let response_id: Option<String> = conn
             .get(self.output_item_key(item_id))
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
         match response_id {
             Some(id) => self.get_response(&ResponseId(id)).await,
             None => Ok(None),
@@ -1105,7 +1125,7 @@ impl ResponseStorage for RedisResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
         let output_item_keys = self
             .output_item_keys_of_many(&mut conn, std::slice::from_ref(&key))
@@ -1114,7 +1134,7 @@ impl ResponseStorage for RedisResponseStorage {
         if sr.is_skipped("safety_identifier") {
             conn.del::<_, ()>(&key)
                 .await
-                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+                .map_err(ResponseStorageError::from_redis)?;
         } else {
             let col_safety = sr.col("safety_identifier");
 
@@ -1124,19 +1144,19 @@ impl ResponseStorage for RedisResponseStorage {
                 .del(&key)
                 .query_async(&mut conn)
                 .await
-                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+                .map_err(ResponseStorageError::from_redis)?;
 
             if let Some(s) = safety {
                 conn.zrem::<_, _, ()>(self.safety_key(&s), id)
                     .await
-                    .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+                    .map_err(ResponseStorageError::from_redis)?;
             }
         }
 
         if !output_item_keys.is_empty() {
             conn.del::<_, ()>(output_item_keys)
                 .await
-                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+                .map_err(ResponseStorageError::from_redis)?;
         }
 
         Ok(())
@@ -1145,7 +1165,7 @@ impl ResponseStorage for RedisResponseStorage {
     async fn expire_response(
         &self,
         response_id: &ResponseId,
-        after: std::time::Duration,
+        after: Duration,
     ) -> ResponseResult<()> {
         let key = self.response_key(response_id.0.as_str());
         let mut conn = self
@@ -1153,7 +1173,7 @@ impl ResponseStorage for RedisResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
         // The record and the output-item keys pointing at it go together;
         // the identifier index tolerates a member whose record is gone.
@@ -1169,7 +1189,7 @@ impl ResponseStorage for RedisResponseStorage {
         let _: () = pipe
             .query_async(&mut conn)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
         Ok(())
     }
 
@@ -1190,7 +1210,7 @@ impl ResponseStorage for RedisResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
         // The whole index, newest first: the tenant is a field of each
         // record, so the limit applies after the records the caller may not
@@ -1198,7 +1218,7 @@ impl ResponseStorage for RedisResponseStorage {
         let response_ids: Vec<String> = conn
             .zrevrange(&key, 0, -1)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
 
         let (mut out, gone) = self
             .visible_responses(&mut conn, &response_ids, tenant)
@@ -1207,7 +1227,7 @@ impl ResponseStorage for RedisResponseStorage {
         if !gone.is_empty() {
             conn.zrem::<_, _, ()>(&key, &gone)
                 .await
-                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+                .map_err(ResponseStorageError::from_redis)?;
         }
         if let Some(limit) = limit {
             out.truncate(limit);
@@ -1231,12 +1251,12 @@ impl ResponseStorage for RedisResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
         let response_ids: Vec<String> = conn
             .zrange(&key, 0, -1)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
         if response_ids.is_empty() {
             return Ok(0);
         }
@@ -1252,7 +1272,7 @@ impl ResponseStorage for RedisResponseStorage {
             if !gone.is_empty() {
                 conn.zrem::<_, _, ()>(&key, &gone)
                     .await
-                    .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+                    .map_err(ResponseStorageError::from_redis)?;
             }
             return Ok(0);
         }
@@ -1277,7 +1297,7 @@ impl ResponseStorage for RedisResponseStorage {
 
         pipe.query_async::<()>(&mut conn)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_redis)?;
 
         Ok(count)
     }

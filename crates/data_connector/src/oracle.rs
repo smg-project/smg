@@ -1,6 +1,6 @@
 //! Oracle storage implementation using OracleStore helper.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::core::{
     make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
     ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-    ConversationStorage, ConversationStorageError, ListParams, NewConversation,
+    ConversationStorage, ConversationStorageError, Failure, ListParams, NewConversation,
     NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError, SortOrder,
     StoredResponse,
 };
@@ -115,16 +115,16 @@ impl OracleStore {
     }
 
     /// Execute function with a connection from the pool
-    pub async fn execute<F, T>(&self, func: F) -> Result<T, String>
+    /// Runs `func` on a pooled connection. A connection the pool cannot give
+    /// is the store being unavailable; what `func` answers is the store's
+    /// own failure (classifying the statement's errors further is left to
+    /// the caller's text).
+    pub async fn execute<F, T>(&self, func: F) -> Result<T, Failure>
     where
         F: FnOnce(&Connection) -> Result<T, String> + Send + 'static,
         T: Send + 'static,
     {
-        let connection = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("Failed to get Oracle connection: {e}"))?;
+        let connection = self.pool.get().await.map_err(|e| Failure::pool(&e))?;
 
         tokio::task::spawn_blocking(move || {
             let result = func(&connection);
@@ -132,7 +132,8 @@ impl OracleStore {
             result
         })
         .await
-        .map_err(|e| format!("Task execution failed: {e}"))?
+        .map_err(|e| Failure::Storage(format!("Task execution failed: {e}")))?
+        .map_err(Failure::Storage)
     }
 }
 
@@ -399,7 +400,7 @@ impl ConversationStorage for OracleConversationStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)?;
+            .map_err(ConversationStorageError::from_failure)?;
 
         Ok(conversation)
     }
@@ -465,7 +466,7 @@ impl ConversationStorage for OracleConversationStorage {
                 }
             })
             .await
-            .map_err(ConversationStorageError::StorageError)
+            .map_err(ConversationStorageError::from_failure)
     }
 
     async fn update_conversation(
@@ -502,7 +503,7 @@ impl ConversationStorage for OracleConversationStorage {
                 stmt.row_count().map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)?;
+            .map_err(ConversationStorageError::from_failure)?;
         if rows == 0 {
             return Ok(None);
         }
@@ -533,7 +534,7 @@ impl ConversationStorage for OracleConversationStorage {
                 .map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)?;
+            .map_err(ConversationStorageError::from_failure)?;
 
         Ok(res
             .row_count()
@@ -727,7 +728,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)?;
+            .map_err(ConversationItemStorageError::from_failure)?;
 
         Ok(ConversationItem {
             id,
@@ -771,18 +772,17 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     params.push(val);
                 }
 
-                let placeholders: Vec<String> =
-                    (1..=params.len()).map(|i| format!(":{i}")).collect();
-                let sql = format!(
-                    "INSERT INTO {table} ({}) VALUES ({})",
-                    columns.join(", "),
-                    placeholders.join(", ")
-                );
-                conn.execute(&sql, &params[..]).map_err(map_oracle_error)?;
+                let (sql, binds) = link_sql(&table, &columns);
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn link_items(
@@ -797,8 +797,11 @@ impl ConversationItemStorage for OracleConversationItemStorage {
         let cid = conversation_id.0.clone();
         let schema = self.store.schema.clone();
         let hook_extra = current_extra_columns().unwrap_or_default();
-        let owned_items: Vec<(String, DateTime<Utc>)> =
-            items.iter().map(|(id, ts)| (id.0.clone(), *ts)).collect();
+        // One source row per item: a repeated id keeps its last stamp, as the
+        // other backends' per-item links leave it (two rows under one key
+        // would fail the MERGE).
+        let owned_items =
+            last_stamp_per_item(items.iter().map(|(id, ts)| (id.0.clone(), *ts)).collect());
 
         self.store
             .execute(move |conn| {
@@ -817,25 +820,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     columns.push(*name);
                 }
 
-                let col_list = columns.join(", ");
-
-                // Build INSERT ALL ... SELECT 1 FROM DUAL
-                let mut sql = String::from("INSERT ALL");
-                for (idx, _) in owned_items.iter().enumerate() {
-                    let mut placeholders = vec![
-                        ":cid".to_string(),
-                        format!(":iid{idx}"),
-                        format!(":ts{idx}"),
-                    ];
-                    for (ei, _) in extra_cols.iter().enumerate() {
-                        placeholders.push(format!(":ex{ei}"));
-                    }
-                    sql.push_str(&format!(
-                        " INTO {table} ({col_list}) VALUES ({})",
-                        placeholders.join(", ")
-                    ));
-                }
-                sql.push_str(" SELECT 1 FROM DUAL");
+                let sql = link_items_sql(&table, &columns, owned_items.len());
 
                 let mut params_vec: Vec<(&str, &dyn ToSql)> = vec![("cid", &cid)];
 
@@ -860,7 +845,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn list_items(
@@ -966,7 +951,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn get_item(
@@ -1012,7 +997,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn is_item_linked(
@@ -1039,7 +1024,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(count > 0)
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn delete_item(
@@ -1066,7 +1051,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 }
 
@@ -1379,6 +1364,133 @@ fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
     (sql, binds)
 }
 
+/// The statement of a link: a MERGE on the (conversation, item) key, the
+/// first two columns, so the row takes the new stamp and the new values of
+/// any extra column when it exists and is inserted when it does not. A second
+/// link of an item moves it, the contract of
+/// [`ConversationItemStorage::link_item`], where the key used to refuse the
+/// insert. Named binds, one per column, so an extra column's two occurrences
+/// (UPDATE SET and INSERT VALUES) are bound once.
+fn link_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
+    let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
+    let placeholders: Vec<String> = binds.iter().map(|bind| format!(":{bind}")).collect();
+    let keyed = placeholders.len().min(LINK_KEY_COLUMNS);
+    let (key_binds, extra_binds) = placeholders.split_at(keyed);
+    (
+        merge_links_sql(table, columns, &[key_binds.to_vec()], extra_binds),
+        binds,
+    )
+}
+
+/// The statement of a batch link: one MERGE whose source is the batch's rows
+/// (ids and stamps, far under the source's size limit), keyed as [`link_sql`]
+/// is. The binds are `:cid` (the conversation, once), `:iid<n>` and `:ts<n>`
+/// per row, `:ex<n>` per extra column (one value for the whole batch, bound
+/// outside the source). The batch must hold distinct item ids: two source
+/// rows under one key are refused by the MERGE (ORA-30926, or ORA-00001 when
+/// both insert), so the caller keeps the last stamp of a repeated id.
+fn link_items_sql(table: &str, columns: &[&str], rows: usize) -> String {
+    let extra = columns.len().saturating_sub(LINK_KEY_COLUMNS);
+    let key_rows: Vec<Vec<String>> = (0..rows)
+        .map(|idx| {
+            vec![
+                ":cid".to_string(),
+                format!(":iid{idx}"),
+                format!(":ts{idx}"),
+            ]
+        })
+        .collect();
+    let extra_binds: Vec<String> = (0..extra).map(|ei| format!(":ex{ei}")).collect();
+    merge_links_sql(table, columns, &key_rows, &extra_binds)
+}
+
+/// The columns a link's source row carries: the key (conversation, item) and
+/// the stamp. Any further column is an extra column of the table.
+const LINK_KEY_COLUMNS: usize = 3;
+
+/// One MERGE into the links `table` with one source row per entry of
+/// `key_rows` (one bind per key column, in the columns' order), matched on
+/// the first two columns: the stamp and the extra columns of a matched row
+/// take the new values, an unmatched row is inserted. The extra columns'
+/// values (`extra_binds`, one per column after the first three) are bound in
+/// UPDATE SET and INSERT VALUES, outside the source: a string above 4,000
+/// bytes is accepted there for a CLOB column, as in an INSERT, while the same
+/// bind in a subquery's select list fails with ORA-01461 (the rule
+/// [`store_response_sql`] follows); an extra column is user-configured and
+/// may well be a CLOB.
+fn merge_links_sql(
+    table: &str,
+    columns: &[&str],
+    key_rows: &[Vec<String>],
+    extra_binds: &[String],
+) -> String {
+    let keyed = columns.len().min(LINK_KEY_COLUMNS);
+    let (key_columns, extra_columns) = columns.split_at(keyed);
+    let source: Vec<String> = key_rows
+        .iter()
+        .map(|binds| {
+            let selected: Vec<String> = key_columns
+                .iter()
+                .zip(binds)
+                .map(|(col, bind)| format!("{bind} AS {col}"))
+                .collect();
+            format!("SELECT {} FROM dual", selected.join(", "))
+        })
+        .collect();
+    let on: Vec<String> = key_columns
+        .iter()
+        .take(2)
+        .map(|col| format!("t.{col} = s.{col}"))
+        .collect();
+    let updates: Vec<String> = key_columns
+        .iter()
+        .skip(2)
+        .map(|col| format!("t.{col} = s.{col}"))
+        .chain(
+            extra_columns
+                .iter()
+                .zip(extra_binds)
+                .map(|(col, bind)| format!("t.{col} = {bind}")),
+        )
+        .collect();
+    let matched = if updates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
+    };
+    let values: Vec<String> = key_columns
+        .iter()
+        .map(|col| format!("s.{col}"))
+        .chain(extra_binds.iter().cloned())
+        .collect();
+    format!(
+        "MERGE INTO {table} t USING ({}) s ON ({}){matched} \
+         WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
+        source.join(" UNION ALL "),
+        on.join(" AND "),
+        columns.join(", "),
+        values.join(", ")
+    )
+}
+
+/// The batch with one row per item id, the last stamp of a repeated id kept
+/// in the position of its first occurrence: the result of linking the items
+/// one by one, which the other backends give a repeated id.
+fn last_stamp_per_item(items: Vec<(String, DateTime<Utc>)>) -> Vec<(String, DateTime<Utc>)> {
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut rows: Vec<(String, DateTime<Utc>)> = Vec::with_capacity(items.len());
+    for (id, ts) in items {
+        match positions.get(&id) {
+            Some(&at) => rows[at].1 = ts,
+            None => {
+                positions.insert(id.clone(), rows.len());
+                rows.push((id, ts));
+            }
+        }
+    }
+    rows
+}
+
 #[async_trait]
 impl ResponseStorage for OracleResponseStorage {
     async fn store_response(
@@ -1455,7 +1567,7 @@ impl ResponseStorage for OracleResponseStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)?;
+            .map_err(ResponseStorageError::from_failure)?;
 
         Ok(return_id)
     }
@@ -1483,7 +1595,7 @@ impl ResponseStorage for OracleResponseStorage {
                 }
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn find_response_by_output_item(
@@ -1509,7 +1621,7 @@ impl ResponseStorage for OracleResponseStorage {
                 }
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> Result<(), ResponseStorageError> {
@@ -1527,7 +1639,7 @@ impl ResponseStorage for OracleResponseStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn list_identifier_responses(
@@ -1592,7 +1704,7 @@ impl ResponseStorage for OracleResponseStorage {
                 Ok(results)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn delete_unstored_older_than(
@@ -1636,7 +1748,7 @@ impl ResponseStorage for OracleResponseStorage {
                 .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)?;
+            .map_err(ResponseStorageError::from_failure)?;
 
         let deleted = affected
             .row_count()
@@ -1676,7 +1788,7 @@ impl ResponseStorage for OracleResponseStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)?;
+            .map_err(ResponseStorageError::from_failure)?;
 
         let deleted = affected
             .row_count()
@@ -1757,6 +1869,77 @@ mod tests {
             .skip_columns
             .insert("raw_response".to_string());
         assert!(find_by_output_item_sql(&schema, "SELECT 1 FROM dual").is_none());
+    }
+
+    #[test]
+    fn link_sql_merges_on_the_conversation_and_item_key() {
+        let (sql, binds) = link_sql(
+            "links",
+            &["conversation_id", "item_id", "added_at", "tenant"],
+        );
+        assert_eq!(
+            sql,
+            "MERGE INTO links t USING (SELECT :v1 AS conversation_id, :v2 AS item_id, \
+             :v3 AS added_at FROM dual) s \
+             ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
+             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = :v4 \
+             WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
+             VALUES (s.conversation_id, s.item_id, s.added_at, :v4)"
+        );
+        assert_eq!(binds, ["v1", "v2", "v3", "v4"]);
+        // An extra column may be a CLOB: its value is never bound inside the
+        // source (ORA-01461 above 4,000 bytes there), as in `store_response_sql`.
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(!source.contains(":v4"), "{source}");
+        // The key alone leaves nothing to move.
+        let (sql, _) = link_sql("l", &["conversation_id", "item_id"]);
+        assert!(!sql.contains("WHEN MATCHED"), "{sql}");
+        assert!(
+            sql.ends_with("VALUES (s.conversation_id, s.item_id)"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn link_items_sql_merges_the_batch_in_one_statement() {
+        let sql = link_items_sql(
+            "links",
+            &["conversation_id", "item_id", "added_at", "tenant"],
+            2,
+        );
+        assert_eq!(
+            sql,
+            "MERGE INTO links t USING (\
+             SELECT :cid AS conversation_id, :iid0 AS item_id, :ts0 AS added_at FROM dual \
+             UNION ALL \
+             SELECT :cid AS conversation_id, :iid1 AS item_id, :ts1 AS added_at FROM dual) s \
+             ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
+             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = :ex0 \
+             WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
+             VALUES (s.conversation_id, s.item_id, s.added_at, :ex0)"
+        );
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(!source.contains(":ex0"), "{source}");
+    }
+
+    #[test]
+    fn a_batch_keeps_the_last_stamp_of_a_repeated_item() {
+        let t = |secs: i64| DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
+        let rows = last_stamp_per_item(vec![
+            ("a".to_string(), t(1)),
+            ("b".to_string(), t(2)),
+            ("a".to_string(), t(3)),
+            ("c".to_string(), t(4)),
+            ("b".to_string(), t(5)),
+        ]);
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), t(3)),
+                ("b".to_string(), t(5)),
+                ("c".to_string(), t(4)),
+            ]
+        );
     }
 
     #[test]

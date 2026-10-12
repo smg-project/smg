@@ -48,6 +48,126 @@ pub fn validate_mesh_listener_port(
     validate_distinct_listener_ports(&listeners)
 }
 
+/// Whether a tokenizer source names a path on this host rather than a hub
+/// id: absolute or explicitly relative, more than one separator (a hub id is
+/// `owner/name`), or simply present on disk.
+fn names_a_local_path(source: &str) -> bool {
+    source.starts_with('/')
+        || source.starts_with("./")
+        || source.starts_with("../")
+        || source.starts_with('~')
+        || source.matches('/').count() > 1
+        || Path::new(source).exists()
+}
+
+/// Whether a gRPC worker can still bring the tokenizer when the local source
+/// is missing: the connection mode is gRPC; IGW mode takes registrations at
+/// run time (`POST /workers` with `grpc://` URLs); a discovery provider adds
+/// workers later (bare `host:port` URLs whose mode is probed when they
+/// register); or a start-up URL names a gRPC worker itself. The connection
+/// mode alone misses the middle two: it follows the start-up URLs only.
+fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
+    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+        || config.enable_igw
+        || config.discovery.is_some()
+    {
+        return true;
+    }
+    let grpc = |url: &str| url.starts_with("grpc://") || url.starts_with("grpcs://");
+    match &config.mode {
+        RoutingMode::Regular { worker_urls } => worker_urls.iter().any(|url| grpc(url)),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        }
+        | RoutingMode::EncodePrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => {
+            prefill_urls.iter().any(|(url, _)| grpc(url)) || decode_urls.iter().any(|url| grpc(url))
+        }
+        // External providers: no worker of ours registers.
+        RoutingMode::OpenAI { .. } | RoutingMode::Anthropic { .. } | RoutingMode::Gemini { .. } => {
+            false
+        }
+    }
+}
+
+/// Why a local tokenizer source cannot serve.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceProblem {
+    /// Nothing at the path on this host.
+    Missing,
+    /// The path is there and cannot serve, for the reason given.
+    Unusable(String),
+}
+
+impl SourceProblem {
+    fn reason(self) -> String {
+        match self {
+            Self::Missing => "does not exist".to_string(),
+            Self::Unusable(reason) => reason,
+        }
+    }
+}
+
+/// Why `path` cannot serve as a local tokenizer source, if it cannot: it
+/// must exist and be readable; a directory must hold one of the layouts the
+/// tokenizer loader recognizes, a file must not be empty.
+fn local_tokenizer_source_error(path: &Path) -> Result<(), SourceProblem> {
+    let unusable = |reason: String| SourceProblem::Unusable(reason);
+    let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => SourceProblem::Missing,
+        _ => unusable(format!("cannot be read: {error}")),
+    })?;
+    if !metadata.is_dir() {
+        std::fs::File::open(path).map_err(|error| unusable(format!("cannot be read: {error}")))?;
+        if metadata.len() == 0 {
+            return Err(unusable("is empty".to_string()));
+        }
+        return Ok(());
+    }
+    let mut entries =
+        std::fs::read_dir(path).map_err(|error| unusable(format!("cannot be read: {error}")))?;
+    // The loader's own rule: one of the single files, or the vocab.json +
+    // merges.txt pair (vocab.json alone is not a layout it loads).
+    let holds_a_tokenizer = entries.any(|entry| {
+        entry.is_ok_and(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == "tokenizer.json" || name == "tiktoken.model" || name.ends_with(".tiktoken")
+        })
+    }) || (path.join("vocab.json").is_file()
+        && path.join("merges.txt").is_file());
+    if holds_a_tokenizer {
+        Ok(())
+    } else {
+        Err(unusable(
+            "contains no tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json with merges.txt)"
+                .to_string(),
+        ))
+    }
+}
+
+/// Why `path` is not a readable, non-empty text file, if it is not.
+fn text_file_error(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "does not exist".to_string(),
+        _ => format!("cannot be read: {error}"),
+    })?;
+    if metadata.is_dir() {
+        return Err("is a directory, not a file".to_string());
+    }
+    let content =
+        std::fs::read_to_string(path).map_err(|error| format!("cannot be read: {error}"))?;
+    if content.trim().is_empty() {
+        return Err("is empty".to_string());
+    }
+    Ok(())
+}
+
 /// Validate a user-supplied mesh server name. The name keys rate-limit
 /// shards as `rl:{counter}:{name}`, so an empty name or one containing the
 /// separator would corrupt shard keys; rejecting at config time avoids a
@@ -162,6 +282,7 @@ pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
+        bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
@@ -170,6 +291,7 @@ impl ConfigValidator {
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
+        Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
         Self::validate_prefill_admission(config)?;
@@ -204,8 +326,28 @@ impl ConfigValidator {
                 Self::validate_oracle(oracle)?;
             }
         }
+        // The Redis and Postgres configurations carry their own rules (the
+        // URL, the pool size, a retention of 0 days that would expire every
+        // record as it is written); the command line ran them while building
+        // its config, the bindings and a directly built RouterConfig did not,
+        // so they run here for every start-up.
+        if config.history_backend == HistoryBackend::Redis {
+            if let Some(redis) = &config.redis {
+                redis
+                    .validate()
+                    .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+            }
+        }
+        if config.history_backend == HistoryBackend::Postgres {
+            if let Some(postgres) = &config.postgres {
+                postgres
+                    .validate()
+                    .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+            }
+        }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+        Self::validate_tokenizer_sources(config)?;
 
         Ok(())
     }
@@ -328,6 +470,16 @@ impl ConfigValidator {
                     "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
                 ),
             })?;
+        }
+        Ok(())
+    }
+
+    /// The memory history backend's bounds: at least one record of each kind.
+    fn validate_memory_history(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(memory) = &config.memory {
+            memory
+                .validate()
+                .map_err(|reason| ConfigError::ValidationFailed { reason })?;
         }
         Ok(())
     }
@@ -678,19 +830,25 @@ impl ConfigValidator {
                     });
                 }
 
-                if *balance_token_usage_threshold <= 0.0 {
+                // NaN passes every comparison and an infinite threshold is a typo
+                // for "disabled": both are refused with the sign errors.
+                if !balance_token_usage_threshold.is_finite()
+                    || *balance_token_usage_threshold <= 0.0
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_token_usage_threshold".to_string(),
                         value: balance_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
-                if *overload_token_usage_threshold <= 0.0 {
+                if !overload_token_usage_threshold.is_finite()
+                    || *overload_token_usage_threshold <= 0.0
+                {
                     return Err(ConfigError::InvalidValue {
                         field: "overload_token_usage_threshold".to_string(),
                         value: overload_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
+                        reason: "Must be finite and > 0.0 (use >= 1.0 to disable)".to_string(),
                     });
                 }
 
@@ -702,11 +860,11 @@ impl ConfigValidator {
                     });
                 }
 
-                if *balance_rel_threshold < 1.0 {
+                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_rel_threshold".to_string(),
                         value: balance_rel_threshold.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
                     });
                 }
 
@@ -782,11 +940,11 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
             } => {
-                if *balance_rel_threshold < 1.0 {
+                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "balance_rel_threshold".to_string(),
                         value: balance_rel_threshold.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
                     });
                 }
 
@@ -819,11 +977,11 @@ impl ConfigValidator {
                     });
                 }
 
-                if *load_factor < 1.0 {
+                if !load_factor.is_finite() || *load_factor < 1.0 {
                     return Err(ConfigError::InvalidValue {
                         field: "load_factor".to_string(),
                         value: load_factor.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
+                        reason: "Must be finite and >= 1.0".to_string(),
                     });
                 }
 
@@ -1262,7 +1420,8 @@ impl ConfigValidator {
             return Err(ConfigError::InvalidValue {
                 field: "metrics.port".to_string(),
                 value: metrics.port.to_string(),
-                reason: "Port must be > 0".to_string(),
+                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
+                    .to_string(),
             });
         }
 
@@ -1373,11 +1532,11 @@ impl ConfigValidator {
                 reason: "Must be >= initial_backoff_ms".to_string(),
             });
         }
-        if retry.backoff_multiplier < 1.0 {
+        if !retry.backoff_multiplier.is_finite() || retry.backoff_multiplier < 1.0 {
             return Err(ConfigError::InvalidValue {
                 field: "retry.backoff_multiplier".to_string(),
                 value: retry.backoff_multiplier.to_string(),
-                reason: "Must be >= 1.0".to_string(),
+                reason: "Must be finite and >= 1.0".to_string(),
             });
         }
         if !(0.0..=1.0).contains(&retry.jitter_factor) {
@@ -1491,6 +1650,54 @@ impl ConfigValidator {
             });
         }
 
+        Ok(())
+    }
+
+    /// The tokenizer source the gateway will load is checked before anything
+    /// binds: `tokenizer_path`, else `model_path` (the source start-up and
+    /// worker registration read, so a `model_path` beside an explicit
+    /// tokenizer path is never read as one and not checked), when it names a
+    /// path on this host (absolute, explicitly relative, more than one
+    /// separator, or present on disk; anything else is a hub id the loader
+    /// fetches lazily, as before), and `chat_template` always. A path that
+    /// exists must be readable, a directory must hold a layout the loader
+    /// knows, a file must not be empty. A path that does not exist is left
+    /// alone when a gRPC worker can still register (the gateway then loads
+    /// the tokenizer from the first one, and a model path that exists on the
+    /// worker hosts only is a supported layout; see
+    /// [`a_grpc_worker_may_register`]) and is a configuration error when
+    /// none can. The load itself stays where it was, a background job at
+    /// start-up and at worker registration: this is the part of it that can
+    /// be known before serving. With autoload disabled the paths are never
+    /// read and are not checked.
+    fn validate_tokenizer_sources(config: &RouterConfig) -> ConfigResult<()> {
+        if config.disable_tokenizer_autoload {
+            return Ok(());
+        }
+        let (field, source) = match config.tokenizer_path.as_deref() {
+            Some(tokenizer_path) => ("tokenizer_path", Some(tokenizer_path)),
+            None => ("model_path", config.model_path.as_deref()),
+        };
+        if let Some(source) = source.filter(|source| names_a_local_path(source)) {
+            match local_tokenizer_source_error(Path::new(source)) {
+                Ok(()) => {}
+                Err(SourceProblem::Missing) if a_grpc_worker_may_register(config) => {}
+                Err(problem) => {
+                    return Err(ConfigError::InvalidValue {
+                        field: field.to_string(),
+                        value: source.to_string(),
+                        reason: problem.reason(),
+                    });
+                }
+            }
+        }
+        if let Some(template) = config.chat_template.as_deref() {
+            text_file_error(Path::new(template)).map_err(|reason| ConfigError::InvalidValue {
+                field: "chat_template".to_string(),
+                value: template.to_string(),
+                reason,
+            })?;
+        }
         Ok(())
     }
 
@@ -2076,6 +2283,47 @@ mod tests {
         assert!(!under.exists());
     }
 
+    /// The Redis configuration's own rules run through the shared validation
+    /// too, so the bindings and a directly built configuration refuse a
+    /// retention of 0 days (every record expired as it is written) as the
+    /// command line does; unset, the retention is persistent and passes.
+    #[test]
+    fn a_redis_retention_of_zero_days_is_refused_through_the_shared_validation() {
+        let redis = |retention_days| RedisConfig {
+            url: "redis://localhost:6379".to_string(),
+            pool_max: 4,
+            op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+            schema: None,
+            retention_days,
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(Some(0))),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(
+                    reason.contains("retention_days must be at least 1"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected the Redis rule, got {other:?}"),
+        }
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(None)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        // Another backend leaves the Redis block unread.
+        let config = RouterConfig {
+            redis: Some(redis(Some(0))),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
     #[test]
     fn mesh_server_name_with_colon_is_rejected() {
         assert!(matches!(
@@ -2553,6 +2801,155 @@ mod tests {
         assert!(ConfigValidator::validate(&make(0.0, -1.0)).is_err());
         assert!(ConfigValidator::validate(&make(f32::NAN, 0.0)).is_err());
         assert!(ConfigValidator::validate(&make(0.0, f32::INFINITY)).is_err());
+    }
+
+    /// NaN passes every `<` and `<=` comparison and an infinity passes the
+    /// ones written as a lower bound, so the thresholds a policy compares
+    /// that way are checked for finiteness first: a spill gate, token-usage
+    /// threshold or load factor that is NaN never fires, which reads as a
+    /// quiet routing change instead of the typo it is.
+    #[test]
+    fn non_finite_policy_thresholds_are_rejected() {
+        fn refused_field(config: &RouterConfig) -> String {
+            match ConfigValidator::validate(config) {
+                Err(ConfigError::InvalidValue { field, .. }) => field,
+                other => panic!("accepted, or refused for another reason: {other:?}"),
+            }
+        }
+        let two_workers = || RoutingMode::Regular {
+            worker_urls: vec![
+                "http://worker1:8000".to_string(),
+                "http://worker2:8000".to_string(),
+            ],
+        };
+        let cache_aware = |balance_rel_threshold: f32,
+                           balance_token_usage_threshold: f32,
+                           overload_token_usage_threshold: f32| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold,
+                    overload_token_usage_threshold,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
+                },
+            )
+        };
+        let bucket = |balance_rel_threshold: f32| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    bucket_adjust_interval_secs: 60,
+                },
+            )
+        };
+        let prefix_hash = |load_factor: f64| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::PrefixHash {
+                    prefix_token_count: 256,
+                    load_factor,
+                    balance_abs_threshold: 10,
+                    cache_boundaries: Vec::new(),
+                },
+            )
+        };
+        assert!(ConfigValidator::validate(&cache_aware(1.5, 1.0, 1.0)).is_ok());
+        assert!(ConfigValidator::validate(&bucket(1.5)).is_ok());
+        assert!(ConfigValidator::validate(&prefix_hash(1.25)).is_ok());
+        for bad in [f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                refused_field(&cache_aware(bad, 1.0, 1.0)),
+                "balance_rel_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&cache_aware(1.5, bad, 1.0)),
+                "balance_token_usage_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&cache_aware(1.5, 1.0, bad)),
+                "overload_token_usage_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&bucket(bad)),
+                "balance_rel_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&prefix_hash(f64::from(bad))),
+                "load_factor",
+                "{bad}"
+            );
+        }
+    }
+
+    /// The retry backoff multiplier is a lower bound too.
+    #[test]
+    fn a_non_finite_retry_backoff_multiplier_is_rejected() {
+        let with_multiplier = |backoff_multiplier: f32| {
+            let mut config = regular_mode_config();
+            config.retry = RetryConfig {
+                backoff_multiplier,
+                ..Default::default()
+            };
+            config
+        };
+        assert!(ConfigValidator::validate(&with_multiplier(1.5)).is_ok());
+        for bad in [f32::NAN, f32::INFINITY, 0.5] {
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&with_multiplier(bad)),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "retry.backoff_multiplier"
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The metrics port is a stable, operator-configured port like the other
+    /// listeners' ports: 0 (an OS-assigned ephemeral port) is refused naming
+    /// the field, as the flag help says.
+    #[test]
+    fn a_metrics_port_of_zero_is_rejected() {
+        let mut config = regular_mode_config();
+        config.metrics = Some(MetricsConfig {
+            port: 0,
+            host: "127.0.0.1".to_string(),
+        });
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "metrics.port");
+                assert_eq!(value, "0");
+                assert!(reason.contains("ephemeral"), "{reason}");
+            }
+            other => panic!("a metrics port of 0 was accepted: {other:?}"),
+        }
+        config.metrics = Some(MetricsConfig {
+            port: 29000,
+            host: "127.0.0.1".to_string(),
+        });
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
@@ -3058,10 +3455,264 @@ mod tests {
         );
 
         config.connection_mode = ConnectionMode::Grpc;
-        config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, "{}").unwrap();
+        config.tokenizer_path = Some(tokenizer.to_string_lossy().into_owned());
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    /// A directory with the one file the tokenizer loader looks for first.
+    fn tokenizer_dir(dir: &tempfile::TempDir) -> String {
+        let tok = dir.path().join("tok");
+        std::fs::create_dir(&tok).unwrap();
+        std::fs::write(tok.join("tokenizer.json"), "{}").unwrap();
+        tok.to_str().unwrap().to_string()
+    }
+
+    /// The `(value, reason)` of the `expected_field` error a configuration
+    /// is refused with.
+    fn refused_source(config: &RouterConfig, expected_field: &str) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == expected_field => (value, reason),
+            other => panic!("expected a {expected_field} error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tokenizer_or_model_path_that_cannot_be_read_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let empty_dir = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty_dir).unwrap();
+        let empty_file = dir.path().join("empty.json");
+        std::fs::write(&empty_file, "").unwrap();
+        let cases = [
+            (missing.to_str().unwrap(), "does not exist"),
+            (empty_dir.to_str().unwrap(), "contains no tokenizer file"),
+            (empty_file.to_str().unwrap(), "is empty"),
+        ];
+        for (path, expected) in cases {
+            let as_tokenizer = RouterConfig {
+                tokenizer_path: Some(path.to_string()),
+                ..Default::default()
+            };
+            let as_model = RouterConfig {
+                model_path: Some(path.to_string()),
+                ..Default::default()
+            };
+            for (field, config) in [("tokenizer_path", as_tokenizer), ("model_path", as_model)] {
+                let (value, reason) = refused_source(&config, field);
+                assert_eq!(value, path);
+                assert!(reason.contains(expected), "{field} {path}: {reason}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_tokenizer_path_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("unreadable.json");
+        std::fs::write(&unreadable, "{}").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged process reads regardless of the mode: nothing to test.
+        let privileged = std::fs::File::open(&unreadable).is_ok();
+        let config = RouterConfig {
+            tokenizer_path: Some(unreadable.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let verdict = ConfigValidator::validate(&config);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if privileged {
+            return;
+        }
+        match verdict {
+            Err(ConfigError::InvalidValue { field, reason, .. }) if field == "tokenizer_path" => {
+                assert!(reason.contains("cannot be read"), "{reason}");
+            }
+            other => panic!("expected a tokenizer_path error, got {other:?}"),
+        }
+    }
+
+    /// Only the source the gateway loads is checked: a `model_path` beside an
+    /// explicit tokenizer path is never read as a tokenizer source.
+    #[test]
+    fn a_model_path_beside_an_explicit_tokenizer_path_is_not_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let config = RouterConfig {
+            tokenizer_path: Some(tok),
+            model_path: Some(format!("{}/missing", dir.path().to_str().unwrap())),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// A source that does not exist on this host is left to the worker
+    /// fallback wherever a gRPC worker can still register: gRPC start-up
+    /// URLs, IGW mode, a discovery provider; it is refused where none can
+    /// (http URLs only, no IGW, no discovery), and one that exists and cannot
+    /// serve is refused everywhere.
+    #[test]
+    fn a_missing_source_is_left_to_the_worker_fallback_where_a_grpc_worker_may_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("{}/models/on-the-worker", dir.path().to_str().unwrap());
+        let regular = |urls: &[&str]| RoutingMode::Regular {
+            worker_urls: urls.iter().map(|u| u.to_string()).collect(),
+        };
+        let with =
+            |mode: RoutingMode, igw: bool, discovery: Option<DiscoveryConfig>| RouterConfig {
+                mode,
+                enable_igw: igw,
+                discovery,
+                model_path: Some(missing.clone()),
+                ..Default::default()
+            };
+        let discovery = DiscoveryConfig::File(FileDiscoveryConfig {
+            path: dir.path().join("workers.json"),
+            check_interval_secs: 5,
+        });
+        for (name, config) in [
+            ("igw", with(regular(&[]), true, None)),
+            ("discovery", with(regular(&[]), false, Some(discovery))),
+            (
+                "a grpcs url",
+                with(regular(&["grpcs://b:50051"]), false, None),
+            ),
+            (
+                "a grpc url beside an http one",
+                with(regular(&["http://a:8000", "grpc://b:50051"]), false, None),
+            ),
+        ] {
+            assert!(ConfigValidator::validate(&config).is_ok(), "{name}");
+        }
+        for (name, config) in [
+            (
+                "explicit http urls only",
+                with(regular(&["http://a:8000", "https://b:8443"]), false, None),
+            ),
+            (
+                "no urls, no igw, no discovery",
+                with(regular(&[]), false, None),
+            ),
+        ] {
+            let (value, reason) = refused_source(&config, "model_path");
+            assert_eq!(value, missing, "{name}");
+            assert!(reason.contains("does not exist"), "{name}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_missing_source_is_left_to_the_worker_fallback_in_grpc_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("{}/models/on-the-worker", dir.path().to_str().unwrap());
+        let empty_dir = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty_dir).unwrap();
+        let grpc = |model_path: &str| {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["grpc://worker:50051".to_string()],
+                },
+                PolicyConfig::Random,
+            );
+            config.connection_mode = ConnectionMode::Grpc;
+            config.model_path = Some(model_path.to_string());
+            config
+        };
+        assert!(ConfigValidator::validate(&grpc(&missing)).is_ok());
+        let (value, reason) = refused_source(&grpc(empty_dir.to_str().unwrap()), "model_path");
+        assert_eq!(value, empty_dir.to_str().unwrap());
+        assert!(reason.contains("contains no tokenizer file"), "{reason}");
+        let http = RouterConfig {
+            model_path: Some(missing.clone()),
+            ..Default::default()
+        };
+        let (value, reason) = refused_source(&http, "model_path");
+        assert_eq!(value, missing);
+        assert!(reason.contains("does not exist"), "{reason}");
+    }
+
+    /// The directory rule is the loader's: `vocab.json` counts with
+    /// `merges.txt` beside it, not alone.
+    #[test]
+    fn a_directory_with_vocab_json_alone_is_not_a_tokenizer_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let bpe = dir.path().join("bpe");
+        std::fs::create_dir(&bpe).unwrap();
+        std::fs::write(bpe.join("vocab.json"), "{}").unwrap();
+        let config = RouterConfig {
+            tokenizer_path: Some(bpe.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let (_, reason) = refused_source(&config, "tokenizer_path");
+        assert!(reason.contains("vocab.json with merges.txt"), "{reason}");
+        std::fs::write(bpe.join("merges.txt"), "#version: 0.2\n").unwrap();
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_hub_id_or_a_present_local_tokenizer_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let sources = [
+            tok.clone(),
+            format!("{tok}/tokenizer.json"),
+            "some-org/some-model".to_string(),
+        ];
+        for source in sources {
+            let config = RouterConfig {
+                tokenizer_path: Some(source.clone()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{source}");
+            let config = RouterConfig {
+                model_path: Some(source.clone()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{source}");
+        }
+        // With autoload disabled the paths are never read, so not checked.
+        let config = RouterConfig {
+            tokenizer_path: Some(format!("{}/missing", dir.path().to_str().unwrap())),
+            disable_tokenizer_autoload: true,
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_chat_template_that_cannot_be_used_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let missing = dir.path().join("missing.jinja");
+        let blank = dir.path().join("blank.jinja");
+        std::fs::write(&blank, " \n").unwrap();
+        let template = dir.path().join("template.jinja");
+        std::fs::write(&template, "{{ messages }}").unwrap();
+        let with_template = |path: &str| RouterConfig {
+            tokenizer_path: Some(tok.clone()),
+            chat_template: Some(path.to_string()),
+            ..Default::default()
+        };
+        let cases = [
+            (missing.to_str().unwrap(), "does not exist"),
+            (blank.to_str().unwrap(), "is empty"),
+            (dir.path().to_str().unwrap(), "is a directory"),
+        ];
+        for (path, expected) in cases {
+            let (value, reason) = refused_source(&with_template(path), "chat_template");
+            assert_eq!(value, path);
+            assert!(reason.contains(expected), "{path}: {reason}");
+        }
+        assert!(ConfigValidator::validate(&with_template(template.to_str().unwrap())).is_ok());
     }
 
     #[test]

@@ -25,9 +25,9 @@ use crate::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        create_worker_workflow_data, McpServerConfigRequest, TokenizerConfigRequest,
-        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode,
+        create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
+        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
+        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode,
     },
 };
 
@@ -256,39 +256,51 @@ impl JobQueue {
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
-        if self.context.upgrade().is_none() {
+        let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
-        }
+        };
 
         // Extract values before moving job
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
+        let tokenizer_load = match &job {
+            Job::AddTokenizer { config } => Some(config.name.clone()),
+            _ => None,
+        };
+
+        // A slot in the queue first: the wait for one (a full queue) can be
+        // cancelled with the caller and must leave nothing behind, so nothing
+        // is recorded before a slot is held; from the slot on, the hand-over
+        // is synchronous and cannot fail.
+        let Ok(permit) = self.tx.reserve().await else {
+            let (queue_depth, _) = self.get_load_info();
+            return Err(format!(
+                "Job queue full: {} jobs pending (capacity: {})",
+                queue_depth,
+                self.tx.max_capacity()
+            ));
+        };
 
         // Record pending status
         self.status_map.insert(
             worker_url.clone(),
             JobStatus::pending(job_type, &worker_url),
         );
-
-        match self.tx.send(job).await {
-            Ok(()) => {
-                let (queue_depth, available_permits) = self.get_load_info();
-                debug!(
-                    "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
-                    job_type, worker_url, queue_depth, available_permits
-                );
-                Ok(())
-            }
-            Err(_) => {
-                self.status_map.remove(&worker_url);
-                let (queue_depth, _) = self.get_load_info();
-                Err(format!(
-                    "Job queue full: {} jobs pending (capacity: {})",
-                    queue_depth,
-                    self.tx.max_capacity()
-                ))
-            }
+        // A tokenizer load counts as in flight for its model from here (the
+        // model is pending until the job ends, whatever was recorded): with
+        // the slot held, the job is handed over right after the count, so a
+        // job that ends at once finds its count to release.
+        if let Some(model) = &tokenizer_load {
+            context.tokenizer_load_failures.load_started(model);
         }
+        permit.send(job);
+
+        let (queue_depth, available_permits) = self.get_load_info();
+        debug!(
+            "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
+            job_type, worker_url, queue_depth, available_permits
+        );
+        Ok(())
     }
 
     /// Get job status by worker URL
@@ -701,39 +713,58 @@ impl JobQueue {
                     .await
             }
             Job::AddTokenizer { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                // The load was counted in flight at submission; its end is
+                // noted for the model (a failure of the model's last load
+                // answers its requests 503 tokenizer_load_failed).
+                let result = async {
+                    let engines = context
+                        .workflow_engines
+                        .get()
+                        .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let workflow_data =
-                    create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
+                    let workflow_data =
+                        create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
 
-                let instance_id = engines
-                    .tokenizer
-                    .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_data)
-                    .await
-                    .map_err(|e| {
-                        format!("Failed to start tokenizer registration workflow: {e:?}")
-                    })?;
+                    let instance_id = engines
+                        .tokenizer
+                        .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_data)
+                        .await
+                        .map_err(|e| {
+                            format!("Failed to start tokenizer registration workflow: {e:?}")
+                        })?;
 
-                debug!(
-                    "Started tokenizer registration workflow for '{}' id={} (instance: {})",
-                    config.name, config.id, instance_id
+                    debug!(
+                        "Started tokenizer registration workflow for '{}' id={} (instance: {})",
+                        config.name, config.id, instance_id
+                    );
+
+                    // Allow up to 10 minutes for HuggingFace downloads
+                    let timeout_duration = Duration::from_secs(600);
+
+                    engines
+                        .tokenizer
+                        .wait_for_completion(instance_id, &config.id, timeout_duration)
+                        .await
+                }
+                .await;
+                note_tokenizer_load_outcome(
+                    &context.tokenizer_load_failures,
+                    &context.tokenizer_registry,
+                    &context.worker_registry,
+                    &config.name,
+                    &result,
                 );
-
-                // Allow up to 10 minutes for HuggingFace downloads
-                let timeout_duration = Duration::from_secs(600);
-
-                engines
-                    .tokenizer
-                    .wait_for_completion(instance_id, &config.id, timeout_duration)
-                    .await
+                result
             }
             Job::RemoveTokenizer { request } => {
                 // Tokenizer removal is synchronous and fast
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
                     context.multimodal_config_registry.remove(&entry.id);
+                    note_tokenizer_removed(
+                        &context.tokenizer_load_failures,
+                        &context.worker_registry,
+                        &entry.name,
+                    );
                     info!(
                         "Successfully removed tokenizer '{}' (id: {})",
                         entry.name, entry.id

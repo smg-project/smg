@@ -739,7 +739,7 @@ mod tests {
             &self,
             _response: StoredResponse,
         ) -> Result<ResponseId, ResponseStorageError> {
-            Err(ResponseStorageError::StorageError(
+            Err(ResponseStorageError::Unavailable(
                 "connection refused".to_string(),
             ))
         }
@@ -748,7 +748,7 @@ mod tests {
             &self,
             _response_id: &ResponseId,
         ) -> Result<Option<StoredResponse>, ResponseStorageError> {
-            Err(ResponseStorageError::StorageError(
+            Err(ResponseStorageError::Unavailable(
                 "connection refused".to_string(),
             ))
         }
@@ -757,7 +757,7 @@ mod tests {
             &self,
             _response_id: &ResponseId,
         ) -> Result<(), ResponseStorageError> {
-            Err(ResponseStorageError::StorageError(
+            Err(ResponseStorageError::Unavailable(
                 "connection refused".to_string(),
             ))
         }
@@ -768,7 +768,7 @@ mod tests {
             _tenant: Option<&str>,
             _limit: Option<usize>,
         ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
-            Err(ResponseStorageError::StorageError(
+            Err(ResponseStorageError::Unavailable(
                 "connection refused".to_string(),
             ))
         }
@@ -778,7 +778,7 @@ mod tests {
             _identifier: &str,
             _tenant: Option<&str>,
         ) -> Result<usize, ResponseStorageError> {
-            Err(ResponseStorageError::StorageError(
+            Err(ResponseStorageError::Unavailable(
                 "connection refused".to_string(),
             ))
         }

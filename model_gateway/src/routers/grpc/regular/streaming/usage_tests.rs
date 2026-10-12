@@ -1,16 +1,32 @@
 //! The usage object of a request is the same whether its answer is streamed
 //! or not. For a chat completion and for a legacy completion, the final usage
 //! of a stream driven over scripted engine frames equals, field for field, the
-//! usage of the non-streamed answer built from the same frames.
+//! usage of the non-streamed answer built from the same frames; the frames of
+//! the scheduler proto, whose terminal frame carries the engine's own
+//! reasoning count, drive the same comparison.
 
+use futures::stream;
 use openai_protocol::{chat::ChatCompletionRequest, completion::CompletionRequest};
-use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
+use smg_grpc_client::{
+    sglang_scheduler::{
+        proto as scheduler, proto::generate_response::Response as SchedulerEvent,
+        AbortOnDropStream as SchedulerStream, SglangSchedulerClient,
+    },
+    vllm_engine::{proto, proto::generate_response::Response as GenerationEvent},
+};
+use tokio::task::JoinHandle;
 
 use super::{
-    eof_tests::{chunk, collect_events, processor, scripted_stream, CharacterTokenizer},
+    eof_tests::{
+        chunk, collect_events, data_frame, decoded_stream, mock_worker_endpoint, processor,
+        scripted_stream, trailers_frame, CharacterTokenizer,
+    },
     *,
 };
 use crate::{routers::grpc::regular::processor::ResponseProcessor, worker::WorkerRegistry};
+
+/// A scripted worker stream and the mock server that owns its connection.
+type Scripted = (ProtoStream, JoinHandle<()>);
 
 /// The engine's counters for one request, as its `Complete` frames carry them.
 #[derive(Clone, Copy)]
@@ -50,6 +66,92 @@ fn frames(texts: &[&str], choices: u32, counters: Counters) -> Vec<proto::Genera
         .collect()
 }
 
+/// [`frames`] as a scripted stream of the engine proto.
+async fn engine_stream(frames: Vec<proto::GenerateResponse>) -> Scripted {
+    scripted_stream(frames, "0").await
+}
+
+/// The frames of one choice in the scheduler proto, the one shape whose
+/// terminal frame carries the engine's own reasoning count: `texts` as
+/// delta chunks with the running count, then the terminal frame with
+/// `counters`, `reasoning` and the whole text as `output_ids`.
+fn scheduler_choice_frames(
+    index: u32,
+    texts: &[&str],
+    counters: Counters,
+    reasoning: u32,
+) -> Vec<scheduler::GenerateResponse> {
+    let output_ids: Vec<u32> = texts.concat().chars().map(u32::from).collect();
+    let mut generated = 0;
+    let mut frames: Vec<_> = texts
+        .iter()
+        .map(|text| {
+            let token_ids: Vec<u32> = text.chars().map(u32::from).collect();
+            generated += token_ids.len() as u32;
+            scheduler::GenerateResponse {
+                request_id: String::new(),
+                response: Some(SchedulerEvent::Chunk(scheduler::GenerateStreamChunk {
+                    index,
+                    completion_tokens: generated,
+                    token_ids,
+                    ..Default::default()
+                })),
+            }
+        })
+        .collect();
+    frames.push(scheduler::GenerateResponse {
+        request_id: String::new(),
+        response: Some(SchedulerEvent::Complete(scheduler::GenerateComplete {
+            index,
+            finish_reason: "stop".to_string(),
+            prompt_tokens: counters.prompt,
+            completion_tokens: output_ids.len() as u32,
+            cached_tokens: counters.cached,
+            reasoning_tokens: reasoning,
+            spec_accepted_tokens: counters.spec_accepted,
+            spec_draft_tokens: counters.spec_drafted,
+            output_ids,
+            ..Default::default()
+        })),
+    });
+    frames
+}
+
+/// The scheduler-proto frames of `choices` choices that each generate
+/// `texts`, every one reporting `reasoning` reasoning tokens of its own.
+fn scheduler_frames(
+    texts: &[&str],
+    choices: u32,
+    counters: Counters,
+    reasoning: u32,
+) -> Vec<scheduler::GenerateResponse> {
+    (0..choices)
+        .flat_map(|index| scheduler_choice_frames(index, texts, counters, reasoning))
+        .collect()
+}
+
+/// [`scheduler_frames`] as a scripted stream of the scheduler proto, owned
+/// by a scheduler client as a worker stream that was never dispatched.
+async fn scheduler_stream(frames: Vec<scheduler::GenerateResponse>) -> Scripted {
+    let body: Vec<Result<_, tonic::Status>> = frames
+        .iter()
+        .map(|frame| Ok(data_frame(frame)))
+        .chain(std::iter::once(Ok(trailers_frame("0"))))
+        .collect();
+    let (url, server) = mock_worker_endpoint().await;
+    let client = SglangSchedulerClient::connect(&url)
+        .await
+        .expect("connect mock worker");
+    let stream = SchedulerStream::new(
+        decoded_stream(stream::iter(body)),
+        "cmpl-usage".to_string(),
+        client,
+    );
+    // No generation was sent to the mock, so there is nothing to cancel.
+    stream.mark_completed();
+    (ProtoStream::Sglang(stream), server)
+}
+
 fn dispatch() -> context::DispatchMetadata {
     context::DispatchMetadata {
         request_id: "cmpl-usage".to_string(),
@@ -86,11 +188,7 @@ fn usage_chunk(events: &[Value]) -> Value {
     event["usage"].clone()
 }
 
-async fn streamed_chat_usage(
-    frames: Vec<proto::GenerateResponse>,
-    request: &ChatCompletionRequest,
-) -> Value {
-    let (stream, server) = scripted_stream(frames, "0").await;
+async fn streamed_chat_usage((stream, server): Scripted, request: &ChatCompletionRequest) -> Value {
     let (tx, rx) = sse_channel();
     let result = processor(false)
         .process_streaming_chunks(
@@ -111,10 +209,9 @@ async fn streamed_chat_usage(
 }
 
 async fn non_streamed_chat_usage(
-    frames: Vec<proto::GenerateResponse>,
+    (stream, server): Scripted,
     request: &ChatCompletionRequest,
 ) -> Value {
-    let (stream, server) = scripted_stream(frames, "0").await;
     let tokenizer = tokenizer();
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let response = response_processor()
@@ -133,10 +230,9 @@ async fn non_streamed_chat_usage(
 }
 
 async fn streamed_completion_usage(
-    frames: Vec<proto::GenerateResponse>,
+    (stream, server): Scripted,
     request: &CompletionRequest,
 ) -> Value {
-    let (stream, server) = scripted_stream(frames, "0").await;
     let dispatch = dispatch();
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_COMPLETIONS);
     let response = Arc::new(processor(false))
@@ -164,10 +260,9 @@ async fn streamed_completion_usage(
 }
 
 async fn non_streamed_completion_usage(
-    frames: Vec<proto::GenerateResponse>,
+    (stream, server): Scripted,
     request: &CompletionRequest,
 ) -> Value {
-    let (stream, server) = scripted_stream(frames, "0").await;
     let tokenizer = tokenizer();
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let response = response_processor()
@@ -237,9 +332,16 @@ async fn chat_usage_is_the_same_streamed_and_not() {
             }
             serde_json::from_value(request).expect("chat request")
         };
-        let streamed = streamed_chat_usage(frames(&texts, choices, counters), &request(true)).await;
-        let whole =
-            non_streamed_chat_usage(frames(&texts, choices, counters), &request(false)).await;
+        let streamed = streamed_chat_usage(
+            engine_stream(frames(&texts, choices, counters)).await,
+            &request(true),
+        )
+        .await;
+        let whole = non_streamed_chat_usage(
+            engine_stream(frames(&texts, choices, counters)).await,
+            &request(false),
+        )
+        .await;
         assert_eq!(
             streamed, whole,
             "{name}: the streamed usage chunk vs the non-streamed usage"
@@ -289,11 +391,16 @@ async fn completion_usage_is_the_same_streamed_and_not() {
             }
             serde_json::from_value(request).expect("completion request")
         };
-        let streamed =
-            streamed_completion_usage(frames(&["ok"], choices, counters), &request(true)).await;
-        let whole =
-            non_streamed_completion_usage(frames(&["ok"], choices, counters), &request(false))
-                .await;
+        let streamed = streamed_completion_usage(
+            engine_stream(frames(&["ok"], choices, counters)).await,
+            &request(true),
+        )
+        .await;
+        let whole = non_streamed_completion_usage(
+            engine_stream(frames(&["ok"], choices, counters)).await,
+            &request(false),
+        )
+        .await;
         assert_eq!(
             streamed, whole,
             "{name}: the streamed usage chunk vs the non-streamed usage"
@@ -303,4 +410,95 @@ async fn completion_usage_is_the_same_streamed_and_not() {
             "{name}: {whole}"
         );
     }
+}
+
+/// The engine's own reasoning count (the scheduler proto's terminal frame
+/// carries one; the engine proto's does not) reaches
+/// `completion_tokens_details.reasoning_tokens` on both shapes, streamed and
+/// not, summed over the choices: on the chat shape whether or not the
+/// gateway's parser ran (an engine that counts reasoning itself is not
+/// overruled, even when it counts fewer tokens than the parser split off),
+/// on the legacy completion shape through the non-streamed answer's sum of
+/// the terminal frames' counts.
+#[tokio::test]
+async fn the_engines_own_reasoning_count_is_the_same_streamed_and_not() {
+    let counters = Counters {
+        prompt: 10,
+        cached: 4,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let choices = 2;
+    for (name, texts, separate_reasoning, reasoning) in [
+        ("the gateway's parser off", vec!["ab", "cd"], false, 3),
+        // The parser splits two tokens off per choice; the engine's count of
+        // one stands, below the parser's, so a rule that took the higher of
+        // the two would be caught here.
+        (
+            "the gateway's parser on",
+            vec!["<think>", "ab", "</think>", "de"],
+            true,
+            1,
+        ),
+    ] {
+        let summed = json!(reasoning * choices);
+        let request = |stream: bool| -> ChatCompletionRequest {
+            let mut request = json!({
+                "model": "eof-test", "messages": [], "n": choices,
+                "separate_reasoning": separate_reasoning, "stream": stream,
+            });
+            if stream {
+                request["stream_options"] = json!({"include_usage": true});
+            }
+            serde_json::from_value(request).expect("chat request")
+        };
+        let streamed = streamed_chat_usage(
+            scheduler_stream(scheduler_frames(&texts, choices, counters, reasoning)).await,
+            &request(true),
+        )
+        .await;
+        let whole = non_streamed_chat_usage(
+            scheduler_stream(scheduler_frames(&texts, choices, counters, reasoning)).await,
+            &request(false),
+        )
+        .await;
+        assert_eq!(
+            streamed, whole,
+            "chat, {name}: the streamed usage chunk vs the non-streamed usage"
+        );
+        assert_eq!(
+            streamed["completion_tokens_details"]["reasoning_tokens"], summed,
+            "chat, {name}: {streamed}"
+        );
+    }
+
+    let reasoning = 3;
+    let summed = json!(reasoning * choices);
+    let request = |stream: bool| -> CompletionRequest {
+        let mut request = json!({
+            "model": "eof-test", "prompt": "hi", "n": choices, "stream": stream,
+        });
+        if stream {
+            request["stream_options"] = json!({"include_usage": true});
+        }
+        serde_json::from_value(request).expect("completion request")
+    };
+    let streamed = streamed_completion_usage(
+        scheduler_stream(scheduler_frames(&["ok"], choices, counters, reasoning)).await,
+        &request(true),
+    )
+    .await;
+    let whole = non_streamed_completion_usage(
+        scheduler_stream(scheduler_frames(&["ok"], choices, counters, reasoning)).await,
+        &request(false),
+    )
+    .await;
+    assert_eq!(
+        streamed, whole,
+        "completion: the streamed usage chunk vs the non-streamed usage"
+    );
+    assert_eq!(
+        whole["completion_tokens_details"]["reasoning_tokens"], summed,
+        "completion: {whole}"
+    );
 }

@@ -55,7 +55,7 @@ use crate::{
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
     observability::{
-        heap_profile,
+        heap_profile, history_metrics,
         inflight_tracker::InFlightRequestTracker,
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -1550,6 +1550,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         )
         .await?,
     );
+    // The history store's size on /metrics, from the stores that can count.
+    if config.prometheus_config.is_some() {
+        history_metrics::spawn_sampler(Arc::clone(&app_context));
+    }
 
     // Register the CRDT namespaces and start the inbound sync adapters now;
     // gossip starts further down, after the metrics and probe listeners are

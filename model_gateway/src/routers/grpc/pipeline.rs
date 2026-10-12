@@ -1662,6 +1662,7 @@ mod alias_pipeline_tests {
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
             tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
         });
         let request: GenerateRequest = serde_json::from_value(json!({
             "model": MODEL_ALIAS,
@@ -2181,6 +2182,7 @@ mod request_release_tests {
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal,
             tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
         })
     }
 
@@ -3728,6 +3730,7 @@ mod request_release_tests {
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal,
             tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
         })
     }
 
@@ -4203,6 +4206,7 @@ mod rate_limit_reserve_tests {
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
             tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
         })
     }
 

@@ -30,8 +30,8 @@ use smg::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
         HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
-        ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
-        PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, PdPairingMode,
+        PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
@@ -318,8 +318,8 @@ struct CliArgs {
     )]
     balance_abs_threshold: usize,
 
-    /// Spill gate, relative part (multiple of the healthy-fleet mean); fires
-    /// only together with --balance-abs-threshold
+    /// Spill gate, relative part (multiple of the healthy-fleet mean; finite,
+    /// at least 1.0); fires only together with --balance-abs-threshold
     #[arg(
         long,
         visible_alias = "spill-rel-threshold",
@@ -331,13 +331,14 @@ struct CliArgs {
     /// Abandon cache affinity for shortest-queue when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
     /// long-context KV imbalance that request counts miss. Backend must
-    /// report token_usage. >= 1.0 disables it.
+    /// report token_usage. Finite and > 0.0; >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     balance_token_usage_threshold: f32,
 
     /// Safety valve for critically-saturated engines: when the hottest
     /// backend's KV utilization (0.0-1.0) exceeds this, shed load off it
-    /// regardless of spread. Best set high (e.g. 0.9). >= 1.0 disables it.
+    /// regardless of spread. Best set high (e.g. 0.9). Finite and > 0.0;
+    /// >= 1.0 disables it.
     #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
     overload_token_usage_threshold: f32,
 
@@ -469,7 +470,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 256, help_heading = "Routing Policy")]
     prefix_token_count: usize,
 
-    /// Load factor threshold for prefix_hash policy
+    /// Load factor threshold for prefix_hash policy (finite, at least 1.0)
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
 
@@ -687,7 +688,8 @@ struct CliArgs {
     #[arg(long, default_value_t = 60, help_heading = "Routing Policy")]
     worker_warmup_secs: u64,
 
-    /// Share of cache misses offered to warming workers (0.0 to 1.0).
+    /// Share of cache misses offered to warming workers (a finite value from
+    /// 0.0 to 1.0).
     #[arg(long, default_value_t = 0.25, help_heading = "Routing Policy")]
     worker_warmup_share: f32,
 
@@ -700,7 +702,8 @@ struct CliArgs {
     /// (or nothing) is thin and receives the warm-up slice until it has grown
     /// by --worker-warmup-blocks, whatever emptied it (a resync after a
     /// publisher restart, an out-of-range or data-loss resubscription, an
-    /// engine that came back empty). 0 keeps the age rule alone.
+    /// engine that came back empty). A finite value from 0.0 to 1.0; 0 keeps
+    /// the age rule alone.
     #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
     worker_warmup_thin_ratio: f32,
 
@@ -774,7 +777,8 @@ struct CliArgs {
     /// at once; a request that fits waits briefly, then gets 429, and one
     /// larger than the whole budget gets 413 straight away. A waiting request
     /// still holds its media, so size memory for about twice this value.
-    /// Unset: unbounded. Zero is refused rather than read as unset.
+    /// Unset: unbounded. Counted in whole KiB: a value under 1024 (one 1 KiB
+    /// unit, zero included) is refused rather than read as unset.
     #[arg(long, help_heading = "Multimodal")]
     multimodal_max_inflight_bytes: Option<usize>,
 
@@ -826,8 +830,9 @@ struct CliArgs {
     #[arg(long, help_heading = "Multimodal")]
     rdma_listen_ip: Option<String>,
 
-    /// Seconds a leased RDMA pixel slot lives without a free notification;
-    /// must exceed the worker's hold or it is ignored for the derived TTL.
+    /// Seconds a leased RDMA pixel slot lives without a free notification (at
+    /// least 1); must exceed the worker's hold or it is ignored for the derived
+    /// TTL.
     /// Falls back to `SMG_RDMA_SLOT_TTL_S`.
     #[arg(long, help_heading = "Multimodal")]
     rdma_slot_ttl_s: Option<u64>,
@@ -945,7 +950,7 @@ struct CliArgs {
     log_json: bool,
 
     // ==================== Prometheus Metrics ====================
-    /// Port to expose Prometheus metrics. Each listener (--port,
+    /// Port to expose Prometheus metrics (at least 1). Each listener (--port,
     /// --prometheus-port, --health-check-port, --mesh-port) needs its own
     /// port.
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
@@ -1145,7 +1150,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 30000, help_heading = "Retry Configuration")]
     retry_max_backoff_ms: u64,
 
-    /// Multiplier for exponential backoff
+    /// Multiplier for exponential backoff (finite, at least 1.0)
     #[arg(long, default_value_t = 1.5, help_heading = "Retry Configuration")]
     retry_backoff_multiplier: f32,
 
@@ -1235,15 +1240,20 @@ struct CliArgs {
     drain_settle_secs: u64,
 
     // ==================== Tokenizer ====================
-    /// Model path for loading tokenizer (HuggingFace ID or local path)
+    /// Model path for loading tokenizer (HuggingFace ID, fetched lazily, or a
+    /// local path: one that exists must hold a tokenizer layout; one that
+    /// does not is left to the worker's tokenizer where a gRPC worker can
+    /// still register, refused otherwise); not read as a tokenizer source
+    /// beside --tokenizer-path
     #[arg(long, alias = "model", help_heading = "Tokenizer")]
     model_path: Option<String>,
 
-    /// Explicit tokenizer path (overrides model_path)
+    /// Explicit tokenizer path (overrides model_path); a local path follows
+    /// the same rule as --model-path
     #[arg(long, help_heading = "Tokenizer")]
     tokenizer_path: Option<String>,
 
-    /// Chat template path
+    /// Chat template path: an existing, non-empty template file
     #[arg(long, help_heading = "Tokenizer")]
     chat_template: Option<String>,
 
@@ -1292,6 +1302,26 @@ struct CliArgs {
     /// History storage backend
     #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle", "postgres", "redis"], help_heading = "Backend")]
     history_backend: String,
+
+    /// Most stored responses the memory history backend keeps; the oldest go
+    /// first, on every write (memory backend only; a stored response takes
+    /// about 12 KB).
+    #[arg(long, default_value_t = 10_000, help_heading = "Backend")]
+    history_memory_max_responses: usize,
+
+    /// Most conversation items the memory history backend keeps; the oldest
+    /// go first and leave every conversation that listed them (memory backend
+    /// only; an item takes about 1.5 KB).
+    #[arg(long, default_value_t = 100_000, help_heading = "Backend")]
+    history_memory_max_items: usize,
+
+    /// How long the memory history backend keeps a record, in seconds, checked
+    /// on every write; 0 keeps a record until a count bound drops it. A
+    /// conversation is kept that long after its last use (created, read or
+    /// updated); a background response still running is not dropped by a
+    /// count bound.
+    #[arg(long, default_value_t = 86_400, help_heading = "Backend")]
+    history_memory_retention_secs: u64,
 
     /// Enable WebAssembly support
     #[arg(long, default_value_t = false, help_heading = "Backend")]
@@ -1379,7 +1409,7 @@ struct CliArgs {
     #[arg(long, help_heading = "Redis Database")]
     redis_pool_max_size: Option<usize>,
 
-    /// Redis data retention in days (-1 for persistent, default 30)
+    /// Redis data retention in days (at least 1; -1 for persistent; default 30)
     #[arg(long, allow_negative_numbers = true, help_heading = "Redis Database")]
     redis_retention_days: Option<i64>,
 
@@ -2094,6 +2124,14 @@ impl CliArgs {
 
         let retention_days = match self.redis_retention_days {
             Some(d) if d < 0 => None, // Persistent
+            // A retention of 0 days would expire every record as it is written.
+            Some(0) => {
+                return Err(ConfigError::InvalidValue {
+                    field: "redis_retention_days".to_string(),
+                    value: "0".to_string(),
+                    reason: "Must be at least 1 (-1 keeps records persistent)".to_string(),
+                });
+            }
             Some(d) => Some(d as u64),
             None => Some(30), // Default 30 days
         };
@@ -2617,6 +2655,12 @@ impl CliArgs {
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .history_backend(history_backend)
+            .memory_config(MemoryConfig {
+                max_responses: self.history_memory_max_responses,
+                max_items: self.history_memory_max_items,
+                retention_secs: (self.history_memory_retention_secs > 0)
+                    .then_some(self.history_memory_retention_secs),
+            })
             .log_level(&self.log_level)
             .maybe_api_key(self.api_key.as_ref())
             .tenant_api_keys(tenant_api_keys)

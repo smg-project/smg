@@ -20,7 +20,7 @@ use std::{
 use anyhow::{Context, Result as AnyhowResult};
 use ndarray::{Array, ArrayD, ArrayViewD, Axis, Dimension, Slice};
 
-use crate::{types::FieldLayout, vision::execution};
+use crate::{pixel_convert, types::FieldLayout, vision::execution};
 
 /// The dtypes an encoder input is written in for the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,13 +126,25 @@ pub fn f32_to_f16_bits(value: f32) -> u16 {
 }
 
 /// The per-channel map from a pixel byte to the normalized value a float
-/// destination takes: `value * scale[c] + bias[c]`, the HF processor's
-/// rescale and normalize folded into one step, in `f32` exactly as the
-/// processors computed it before the bytes were kept instead.
+/// destination takes: `(value * scale - offset[c]) / divisor[c]` in `f32`,
+/// the arithmetic of the reference image processors (the torchvision-backed
+/// ones the serving engines run). They fuse rescale and normalize by scaling
+/// the mean and std into byte units and then subtract once and divide once,
+/// so a byte maps to the same `f32` here as there, and so to the same
+/// narrower float when the engine casts it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PixelNorm {
-    pub scale: [f32; 3],
-    pub bias: [f32; 3],
+    /// Multiplies the byte first: the rescale factor when the bytes are
+    /// rescaled but not normalized, else 1.
+    pub scale: f32,
+    /// Subtracted next, per channel: the mean, in byte units when the bytes
+    /// are rescaled as well (`f32(mean) * f32(1 / rescale_factor)`, the
+    /// reference's own rounding, as `pixel_norm` in the Qwen base builds it);
+    /// 0 without normalization.
+    pub offset: [f32; 3],
+    /// Divides last, per channel: the std in the same units and the same
+    /// rounding as `offset`; 1 without normalization.
+    pub divisor: [f32; 3],
     /// Consecutive elements of one channel within a row of the encoder
     /// input: for a patch layout `[C, temporal, patch_h, patch_w]` the
     /// temporal × patch_h × patch_w product. Channel `c` owns elements
@@ -144,7 +156,9 @@ impl PixelNorm {
     /// The `f32` each byte maps to, per channel.
     pub fn table_f32(&self) -> [[f32; 256]; 3] {
         std::array::from_fn(|channel| {
-            std::array::from_fn(|value| value as f32 * self.scale[channel] + self.bias[channel])
+            std::array::from_fn(|value| {
+                (value as f32 * self.scale - self.offset[channel]) / self.divisor[channel]
+            })
         })
     }
 
@@ -449,28 +463,21 @@ impl<'a> EncoderInputView<'a> {
                 match dtype {
                     EncoderDtype::Uint8 => out.copy_from_slice(src),
                     EncoderDtype::Float32 => {
-                        let table = norm.table_f32();
+                        let table = norm.table_f32().map(|channel| channel.map(f32::to_bits));
                         fill_rows_bytes(out, src, row, 4, |dst, src| {
-                            for (i, (d, &v)) in
-                                dst.as_chunks_mut::<4>().0.iter_mut().zip(src).enumerate()
-                            {
-                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
-                            }
+                            pixel_convert::write_f32(dst, src, block, norm, &table);
                         });
                     }
-                    EncoderDtype::BFloat16 | EncoderDtype::Float16 => {
-                        let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
-                            f32_to_bf16_bits
-                        } else {
-                            f32_to_f16_bits
-                        };
-                        let table = norm.table_u16(convert);
+                    EncoderDtype::BFloat16 => {
+                        let table = norm.table_u16(f32_to_bf16_bits);
                         fill_rows_bytes(out, src, row, 2, |dst, src| {
-                            for (i, (d, &v)) in
-                                dst.as_chunks_mut::<2>().0.iter_mut().zip(src).enumerate()
-                            {
-                                *d = table[(i / block) % 3][v as usize].to_le_bytes();
-                            }
+                            pixel_convert::write_bf16(dst, src, block, norm, &table);
+                        });
+                    }
+                    EncoderDtype::Float16 => {
+                        let table = norm.table_u16(f32_to_f16_bits);
+                        fill_rows_bytes(out, src, row, 2, |dst, src| {
+                            pixel_convert::write_u16(dst, src, block, &table);
                         });
                     }
                 }
@@ -1247,5 +1254,106 @@ mod tests {
             PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0), wrong_width], &layouts)
                 .is_err()
         );
+    }
+
+    /// Every pixel byte of every channel, written to each float wire dtype,
+    /// equals the per-element arithmetic of the reference processors,
+    /// `(byte * scale - offset[c]) / divisor[c]` in `f32`, rounded to the
+    /// narrower floats as the scalar conversions round: the table lookups
+    /// move those values and nothing else, whatever the channel block.
+    #[test]
+    fn pixel_bytes_write_the_per_element_normalization_for_every_byte_and_channel() {
+        let into_bytes = (1.0_f64 / (1.0 / 255.0)) as f32;
+        let norms = [
+            // mean 0.5 / std 0.5 with rescale, in byte units
+            PixelNorm {
+                scale: 1.0,
+                offset: [0.5_f64 as f32 * into_bytes; 3],
+                divisor: [0.5_f64 as f32 * into_bytes; 3],
+                channel_block: 512,
+            },
+            // the CLIP mean / std with rescale, in byte units
+            PixelNorm {
+                scale: 1.0,
+                offset: [
+                    0.481_454_66_f64 as f32 * into_bytes,
+                    0.457_827_5_f64 as f32 * into_bytes,
+                    0.408_210_73_f64 as f32 * into_bytes,
+                ],
+                divisor: [
+                    0.268_629_54_f64 as f32 * into_bytes,
+                    0.261_302_58_f64 as f32 * into_bytes,
+                    0.275_777_11_f64 as f32 * into_bytes,
+                ],
+                channel_block: 392,
+            },
+            // rescale only
+            PixelNorm {
+                scale: (1.0_f64 / 255.0) as f32,
+                offset: [0.0; 3],
+                divisor: [1.0; 3],
+                channel_block: 17,
+            },
+            // normalize only, blocks shorter than a vector
+            PixelNorm {
+                scale: 1.0,
+                offset: [0.5, 0.4, 0.3],
+                divisor: [0.25, 0.2, 0.3],
+                channel_block: 7,
+            },
+        ];
+        for norm in norms {
+            let block = norm.channel_block;
+            // 256 rows of three channel blocks: row r holds the byte
+            // (r + 85 c) % 256 in channel c, so each channel sees every byte.
+            let bytes: Vec<u8> = (0..256)
+                .flat_map(|r| {
+                    (0..3).flat_map(move |c| std::iter::repeat_n(((r + 85 * c) % 256) as u8, block))
+                })
+                .collect();
+            let patches = ndarray::Array2::from_shape_vec((256, 3 * block), bytes.clone())
+                .unwrap()
+                .into_dyn();
+            let input = EncoderInput::bytes(patches, norm);
+            let value = |i: usize, v: u8| {
+                let c = (i / block) % 3;
+                (f32::from(v) * norm.scale - norm.offset[c]) / norm.divisor[c]
+            };
+            let f32_bytes: Vec<u8> = bytes
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &v)| value(i, v).to_le_bytes())
+                .collect();
+            assert_eq!(
+                input.write_as(EncoderDtype::Float32),
+                f32_bytes,
+                "f32, block {block}"
+            );
+            let bf16_bytes: Vec<u8> = bytes
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &v)| f32_to_bf16_bits(value(i, v)).to_le_bytes())
+                .collect();
+            assert_eq!(
+                input.write_as(EncoderDtype::BFloat16),
+                bf16_bytes,
+                "bf16, block {block}"
+            );
+            let f16_bytes: Vec<u8> = bytes
+                .iter()
+                .enumerate()
+                .flat_map(|(i, &v)| f32_to_f16_bits(value(i, v)).to_le_bytes())
+                .collect();
+            assert_eq!(
+                input.write_as(EncoderDtype::Float16),
+                f16_bytes,
+                "f16, block {block}"
+            );
+            assert_eq!(
+                input.write_as(EncoderDtype::Uint8),
+                bytes,
+                "u8, block {block}"
+            );
+        }
     }
 }
