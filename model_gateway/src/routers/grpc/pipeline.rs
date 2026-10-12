@@ -3676,6 +3676,9 @@ mod request_release_tests {
     #[test]
     fn a_dispatch_the_engine_throttled_is_counted_as_a_rate_limit_error() {
         let worker_registry = Arc::new(WorkerRegistry::new());
+        // The model is served: its errors are counted under its own id (an
+        // unserved name is counted under `other`).
+        register_worker(&worker_registry, 1, WorkerType::Regular);
         let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
         let failure = Status::resource_exhausted("kv cache full")
             .to_http_error("engine_busy", "kv cache full".to_string());
