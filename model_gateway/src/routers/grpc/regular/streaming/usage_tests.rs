@@ -417,8 +417,9 @@ async fn completion_usage_is_the_same_streamed_and_not() {
 /// `completion_tokens_details.reasoning_tokens` on both shapes, streamed and
 /// not, summed over the choices: on the chat shape whether or not the
 /// gateway's parser ran (an engine that counts reasoning itself is not
-/// overruled), on the legacy completion shape through the non-streamed
-/// answer's sum of the terminal frames' counts.
+/// overruled, even when it counts fewer tokens than the parser split off),
+/// on the legacy completion shape through the non-streamed answer's sum of
+/// the terminal frames' counts.
 #[tokio::test]
 async fn the_engines_own_reasoning_count_is_the_same_streamed_and_not() {
     let counters = Counters {
@@ -427,17 +428,20 @@ async fn the_engines_own_reasoning_count_is_the_same_streamed_and_not() {
         spec_accepted: 0,
         spec_drafted: 0,
     };
-    let (choices, reasoning) = (2, 3);
-    let summed = json!(reasoning * choices);
-    for (name, texts, separate_reasoning) in [
-        ("the gateway's parser off", vec!["ab", "cd"], false),
-        // The parser splits two tokens off; the engine's count stands.
+    let choices = 2;
+    for (name, texts, separate_reasoning, reasoning) in [
+        ("the gateway's parser off", vec!["ab", "cd"], false, 3),
+        // The parser splits two tokens off per choice; the engine's count of
+        // one stands, below the parser's, so a rule that took the higher of
+        // the two would be caught here.
         (
             "the gateway's parser on",
             vec!["<think>", "ab", "</think>", "de"],
             true,
+            1,
         ),
     ] {
+        let summed = json!(reasoning * choices);
         let request = |stream: bool| -> ChatCompletionRequest {
             let mut request = json!({
                 "model": "eof-test", "messages": [], "n": choices,
@@ -468,6 +472,8 @@ async fn the_engines_own_reasoning_count_is_the_same_streamed_and_not() {
         );
     }
 
+    let reasoning = 3;
+    let summed = json!(reasoning * choices);
     let request = |stream: bool| -> CompletionRequest {
         let mut request = json!({
             "model": "eof-test", "prompt": "hi", "n": choices, "stream": stream,
