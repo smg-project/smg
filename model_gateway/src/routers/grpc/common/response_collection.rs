@@ -94,8 +94,10 @@ pub(crate) async fn collect_responses(
             // Collect prefill for input_logprobs (don't mark completed yet)
             let mut prefill_responses = Vec::new();
             // The leg's worker, when its stream is tracked (the parallel
-            // dispatch books the leg on it): a failure met here is the
-            // worker's, counted once, as a streamed answer's reader counts it.
+            // dispatch books the leg on it and leaves the leg's breaker
+            // sample to its reader): a failure met here is the worker's,
+            // sampled on its breaker and counted once, as a streamed
+            // answer's reader does it.
             let prefill_worker = prefill.worker().cloned();
             drain_prefill(&mut prefill, prefill_guards, false, |complete| {
                 prefill_responses.push(complete);
@@ -103,6 +105,9 @@ pub(crate) async fn collect_responses(
             .await
             .map_err(|e| {
                 if let Some(worker) = &prefill_worker {
+                    if let Some(sample) = UpstreamClass::of(&e).breaker_sample {
+                        worker.record_outcome(sample);
+                    }
                     UpstreamClass::account_collected_failure(worker.as_ref(), &e);
                 }
                 e.to_http_error(
