@@ -124,9 +124,11 @@ fn opens_a_reason(text: &str) -> bool {
 /// split, whatever it says. A key that is no plain path (a space, a colon, a
 /// letter outside ASCII) is a path all the same: the reason is then found by
 /// serde's own words, at the first split whose remainder opens with one
-/// (serde quotes the value it refused after its words, never before). A key
-/// with a colon and a space in it, in front of a custom error, is the one
-/// case this order reads wrong: its path is cut at the colon.
+/// (serde quotes the value it refused after its words, never before). This
+/// order reads two cases wrong: a key with a colon and a space in it, whose
+/// part before the colon reads as a path, is cut at the colon whatever
+/// follows; and a key that is no plain path, in front of a custom error,
+/// keeps no path.
 #[cfg(feature = "axum")]
 fn deserialize_detail(message: &str) -> (Option<&str>, &str) {
     let detail = message
@@ -862,9 +864,9 @@ mod tests {
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
                 "json_parse_error",
             ),
-            // The one key this order reads wrong: a colon and a space in it,
-            // in front of serde's words, is cut at the colon, and what follows
-            // is no reason of serde's.
+            // A key this order reads wrong: a colon and a space in it, after a
+            // part that reads as a path, is cut at the colon whatever follows;
+            // here what follows the cut is no reason of serde's.
             (
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
                 "json_parse_error",
@@ -938,8 +940,8 @@ mod tests {
                 "Failed to deserialize the JSON body into the target type: function_call: unknown function_call value: \"x: missing field `y`\" at line 1 column 48",
                 Some("function_call"),
             ),
-            // The one key read wrong: a colon and a space in it is cut at the
-            // colon.
+            // A key read wrong: a colon and a space in it, after a part that
+            // reads as a path, is cut at the colon.
             (
                 "Failed to deserialize the JSON body into the target type: a: b: unknown field `a: b`, expected one of `model`, `input` at line 1 column 12",
                 Some("a"),
