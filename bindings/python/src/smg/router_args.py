@@ -654,8 +654,11 @@ class RouterArgs:
             type=int,
             default=RouterArgs.balance_abs_threshold,
             help=(
-                "Spill gate, absolute part. Balancing is triggered if"
-                " `(max_load - min_load) > abs_threshold` and the relative threshold is also met."
+                "Spill gate, absolute part: a matched worker is skipped for the least-loaded one"
+                " when its load exceeds the healthy-fleet mean by this many requests AND by the"
+                " relative threshold. The margin is capped at the in-flight count's natural swing"
+                " at the pool's current mean (two standard deviations, never under four), so a"
+                " small pool can spill at all."
             ),
         )
         routing_group.add_argument(
@@ -664,8 +667,8 @@ class RouterArgs:
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help=(
-                "Spill gate, relative part. Balancing is triggered if"
-                " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
+                "Spill gate, relative part: a matched worker is skipped when its load exceeds"
+                " this multiple of the healthy-fleet mean AND the absolute threshold is also met."
             ),
         )
         routing_group.add_argument(

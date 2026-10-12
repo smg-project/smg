@@ -199,12 +199,15 @@ class Router:
             a worker must also exceed before prefix_hash treats it as
             overloaded. Guards the load factor against sampling noise when each
             router replica sees only a share of a worker's load. Default: 10
-        balance_abs_threshold: Load balancing is triggered when (max_load - min_load) >
-            abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
-            aware. Default: 32
-        balance_rel_threshold: Load balancing is triggered when (max_load - min_load) >
-            abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
-            aware. Default: 1.0001
+        balance_abs_threshold: Spill gate, absolute part: a matched worker is skipped
+            for the least-loaded one when its load exceeds the healthy-fleet mean by
+            this many requests AND by balance_rel_threshold; the margin is capped at
+            the in-flight count's natural swing at the pool's current mean (two
+            standard deviations, never under four requests), so a small pool can
+            spill at all. Default: 64
+        balance_rel_threshold: Spill gate, relative part: the multiple of the
+            healthy-fleet mean a matched worker's load must exceed, together with
+            the absolute part. Default: 1.5
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
