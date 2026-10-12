@@ -217,7 +217,7 @@ impl RedisConfig {
     /// Python bindings, a config built by hand), checked by the factory
     /// before any connection. The connection string's shape is left to the
     /// driver here: [`Self::validate`] checks it for the CLI's URLs, while a
-    /// socket path or a key=value string the driver understands passes.
+    /// socket path the driver understands passes.
     pub fn validate_bounds(&self) -> Result<(), String> {
         if self.pool_max == 0 {
             return Err("pool_max must be greater than 0".to_string());

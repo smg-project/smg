@@ -87,9 +87,10 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
                 .postgres
                 .ok_or("Postgres configuration is required when history_backend=postgres")?;
             // Every entry path (the CLI, the Python bindings, a RouterConfig
-            // built by hand) reaches this point: the config's own checks run
-            // here, so a bound of 0 s or a bad URL is refused by name instead
-            // of failing every call once the gateway is up.
+            // built by hand) reaches this point: the numeric bounds are checked
+            // here, so a bound of 0 s is refused by name instead of failing
+            // every call once the gateway is up. The connection string is left
+            // to the driver (the CLI's `validate()` checks its URL shape).
             postgres_cfg
                 .validate_bounds()
                 .map_err(|e| format!("Invalid Postgres configuration: {e}"))?;
@@ -121,6 +122,8 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             let redis_cfg = config
                 .redis
                 .ok_or("Redis configuration is required when history_backend=redis")?;
+            // The same numeric bounds as the Postgres path; the URL is the
+            // driver's (a socket path included).
             redis_cfg
                 .validate_bounds()
                 .map_err(|e| format!("Invalid Redis configuration: {e}"))?;
