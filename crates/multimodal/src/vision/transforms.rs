@@ -441,41 +441,44 @@ pub(crate) fn resize_catmull_rom_rgb(src: &RgbImage, width: u32, height: u32) ->
     if dst.set_color_space(src.color_space()).is_err() {
         return image::imageops::resize(src, width, height, FilterType::CatmullRom);
     }
-    let rows = (height as usize).div_ceil(task_count(dst.len(), height as usize, 16));
-    parallel_scope(|scope| {
-        for (chunk, output) in dst.as_mut().chunks_mut(rows * dst_stride).enumerate() {
-            let xs = &xs;
-            let ys = &ys;
-            scope.spawn(move |_| {
-                let mut row = vec![0.0f32; src_stride];
-                for (index, dst_row) in output.chunks_mut(dst_stride).enumerate() {
-                    row.fill(0.0);
-                    let (top, weights) = &ys[chunk * rows + index];
-                    for (dy, w) in weights.iter().enumerate() {
-                        let start = (top + dy) * src_stride;
-                        for (out, &value) in
-                            row.iter_mut().zip(&src.as_raw()[start..start + src_stride])
-                        {
-                            *out += value as f32 * w;
-                        }
-                    }
-                    for (pixel, (left, weights)) in
-                        dst_row.as_chunks_mut::<3>().0.iter_mut().zip(xs)
-                    {
-                        let mut sums = [0.0f32; 3];
-                        for (dx, w) in weights.iter().enumerate() {
-                            for c in 0..3 {
-                                sums[c] += row[(left + dx) * 3 + c] * w;
-                            }
-                        }
-                        for c in 0..3 {
-                            pixel[c] = sums[c].clamp(0.0, 255.0).round() as u8;
-                        }
+    let resize_rows = |first_row: usize, output: &mut [u8]| {
+        let mut row = vec![0.0f32; src_stride];
+        for (index, dst_row) in output.chunks_mut(dst_stride).enumerate() {
+            row.fill(0.0);
+            let (top, weights) = &ys[first_row + index];
+            for (dy, w) in weights.iter().enumerate() {
+                let start = (top + dy) * src_stride;
+                for (out, &value) in row.iter_mut().zip(&src.as_raw()[start..start + src_stride]) {
+                    *out += value as f32 * w;
+                }
+            }
+            for (pixel, (left, weights)) in dst_row.as_chunks_mut::<3>().0.iter_mut().zip(&xs) {
+                let mut sums = [0.0f32; 3];
+                for (dx, w) in weights.iter().enumerate() {
+                    for c in 0..3 {
+                        sums[c] += row[(left + dx) * 3 + c] * w;
                     }
                 }
-            });
+                for c in 0..3 {
+                    pixel[c] = sums[c].clamp(0.0, 255.0).round() as u8;
+                }
+            }
         }
-    });
+    };
+    let tasks = task_count(dst.len(), height as usize, 16);
+    if tasks == 1 {
+        // Keep independent requests on their callers instead of serializing
+        // them through a one-thread pool when this resize cannot split.
+        resize_rows(0, dst.as_mut());
+    } else {
+        let rows = (height as usize).div_ceil(tasks);
+        parallel_scope(|scope| {
+            for (chunk, output) in dst.as_mut().chunks_mut(rows * dst_stride).enumerate() {
+                let resize_rows = &resize_rows;
+                scope.spawn(move |_| resize_rows(chunk * rows, output));
+            }
+        });
+    }
     dst
 }
 
