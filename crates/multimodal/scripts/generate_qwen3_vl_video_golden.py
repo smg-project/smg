@@ -18,9 +18,9 @@ Usage (from the repository root):
     python crates/multimodal/scripts/generate_qwen3_vl_video_golden.py
 """
 
-import math
 import argparse
 import json
+import math
 from pathlib import Path
 
 import cv2
