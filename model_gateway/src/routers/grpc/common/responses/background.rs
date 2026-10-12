@@ -1408,6 +1408,7 @@ mod tests {
             &response,
             &request,
             None,
+            None,
         )
         .await
         .expect("nothing is reported to the caller here");
@@ -1490,6 +1491,7 @@ mod tests {
             storage.clone(),
             &response,
             &request,
+            None,
             None,
         )
         .await
@@ -2207,6 +2209,7 @@ mod tests {
             &queued_response("resp_u", &request),
             &request,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2265,9 +2268,15 @@ mod tests {
         let storage = storage();
         let request = unstored_request();
         for id in ["resp_cancelled", "resp_running"] {
-            store_record(&storage, &queued_response(id, &request), &request, None)
-                .await
-                .unwrap();
+            store_record(
+                &storage,
+                &queued_response(id, &request),
+                &request,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         }
         store_queued(&storage, "resp_stored").await;
 
