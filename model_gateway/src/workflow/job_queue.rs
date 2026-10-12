@@ -263,49 +263,44 @@ impl JobQueue {
         // Extract values before moving job
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
-        // A tokenizer load counts as in flight for its model before the job
-        // is handed over (the model is pending until the job ends, whatever
-        // was recorded): counted after the send, a job that ends first would
-        // leave the count behind for good. A refused send takes the count
-        // back and restores the record it displaced.
         let tokenizer_load = match &job {
             Job::AddTokenizer { config } => Some(config.name.clone()),
             _ => None,
         };
-        let displaced = tokenizer_load
-            .as_deref()
-            .and_then(|model| context.tokenizer_load_failures.load_started(model));
+
+        // A slot in the queue first: the wait for one (a full queue) can be
+        // cancelled with the caller and must leave nothing behind, so nothing
+        // is recorded before a slot is held; from the slot on, the hand-over
+        // is synchronous and cannot fail.
+        let Ok(permit) = self.tx.reserve().await else {
+            let (queue_depth, _) = self.get_load_info();
+            return Err(format!(
+                "Job queue full: {} jobs pending (capacity: {})",
+                queue_depth,
+                self.tx.max_capacity()
+            ));
+        };
 
         // Record pending status
         self.status_map.insert(
             worker_url.clone(),
             JobStatus::pending(job_type, &worker_url),
         );
-
-        match self.tx.send(job).await {
-            Ok(()) => {
-                let (queue_depth, available_permits) = self.get_load_info();
-                debug!(
-                    "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
-                    job_type, worker_url, queue_depth, available_permits
-                );
-                Ok(())
-            }
-            Err(_) => {
-                if let Some(model) = &tokenizer_load {
-                    context
-                        .tokenizer_load_failures
-                        .load_refused(model, displaced);
-                }
-                self.status_map.remove(&worker_url);
-                let (queue_depth, _) = self.get_load_info();
-                Err(format!(
-                    "Job queue full: {} jobs pending (capacity: {})",
-                    queue_depth,
-                    self.tx.max_capacity()
-                ))
-            }
+        // A tokenizer load counts as in flight for its model from here (the
+        // model is pending until the job ends, whatever was recorded): with
+        // the slot held, the job is handed over right after the count, so a
+        // job that ends at once finds its count to release.
+        if let Some(model) = &tokenizer_load {
+            context.tokenizer_load_failures.load_started(model);
         }
+        permit.send(job);
+
+        let (queue_depth, available_permits) = self.get_load_info();
+        debug!(
+            "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
+            job_type, worker_url, queue_depth, available_permits
+        );
+        Ok(())
     }
 
     /// Get job status by worker URL
