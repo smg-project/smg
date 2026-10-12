@@ -3178,30 +3178,11 @@ mod tests {
     };
     /// The label of a worker without a vision encoder, of one with it, and
     /// of one whose servicer gave no verdict.
-    const LANGUAGE_MODEL_ONLY: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "false")];
-    const WITH_VISION: &[(&str, &str)] = &[(multimodal::SUPPORTS_VISION_LABEL, "true")];
-    const NO_VERDICT: &[(&str, &str)] = &[];
 
-    fn labeled_grpc_worker(url: &str, model_id: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
-        let mut builder = BasicWorkerBuilder::new(url)
-            .model(ModelCard::new(model_id))
-            .worker_type(WorkerType::Regular)
-            .runtime_type(RuntimeType::Vllm)
-            .connection_mode(ConnectionMode::Grpc)
-            .health_config(no_health_check());
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        Arc::new(builder.build())
-    }
-
-    fn regular_round_robin_stage(worker_registry: &Arc<WorkerRegistry>) -> WorkerSelectionStage {
-        WorkerSelectionStage::new(
-            Arc::clone(worker_registry),
-            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
-            WorkerSelectionMode::Regular,
-            None,
-        )
+    /// A regular worker with `labels`, built as [`labeled_worker`] builds every
+    /// worker of these tests.
+    fn regular_worker(url: &str, model_id: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+        labeled_worker(url, model_id, WorkerType::Regular, labels)
     }
 
     fn urls_seen(stage: &WorkerSelectionStage, model_id: &str, media: MediaDemands) -> Vec<String> {
@@ -3227,15 +3208,15 @@ mod tests {
         let model_id = "test-model-pixel-media-mixed";
         let worker_registry = Arc::new(WorkerRegistry::new());
         for (url, labels) in [
-            ("grpc://127.0.0.1:8760", LANGUAGE_MODEL_ONLY),
-            ("grpc://127.0.0.1:8761", WITH_VISION),
-            ("grpc://127.0.0.1:8762", NO_VERDICT),
+            ("grpc://127.0.0.1:8760", NO_VISION_ENCODER),
+            ("grpc://127.0.0.1:8761", VISION_ENCODER),
+            ("grpc://127.0.0.1:8762", UNLABELED),
         ] {
             worker_registry
-                .register(labeled_grpc_worker(url, model_id, labels))
+                .register(regular_worker(url, model_id, labels))
                 .unwrap();
         }
-        let stage = regular_round_robin_stage(&worker_registry);
+        let stage = regular_stage(Arc::clone(&worker_registry));
 
         assert_eq!(
             urls_seen(&stage, model_id, VISION),
@@ -3263,13 +3244,13 @@ mod tests {
         let model_id = "test-model-pixel-media-none";
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry
-            .register(labeled_grpc_worker(
+            .register(regular_worker(
                 "grpc://127.0.0.1:8770",
                 model_id,
-                LANGUAGE_MODEL_ONLY,
+                NO_VISION_ENCODER,
             ))
             .unwrap();
-        let stage = regular_round_robin_stage(&worker_registry);
+        let stage = regular_stage(Arc::clone(&worker_registry));
 
         assert!(stage
             .select_single_worker(
@@ -3314,15 +3295,15 @@ mod tests {
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry.set_overload_shed(true);
         worker_registry
-            .register(labeled_grpc_worker(
+            .register(regular_worker(
                 "grpc://127.0.0.1:8780",
                 model_id,
-                LANGUAGE_MODEL_ONLY,
+                NO_VISION_ENCODER,
             ))
             .unwrap();
-        let capable = labeled_grpc_worker("grpc://127.0.0.1:8781", model_id, WITH_VISION);
+        let capable = regular_worker("grpc://127.0.0.1:8781", model_id, VISION_ENCODER);
         worker_registry.register(Arc::clone(&capable)).unwrap();
-        let stage = regular_round_robin_stage(&worker_registry);
+        let stage = regular_stage(Arc::clone(&worker_registry));
         worker_registry.set_worker_overloaded(&capable, true);
 
         assert!(stage
@@ -3367,16 +3348,16 @@ mod tests {
             (multimodal::SUPPORTS_VISION_LABEL, "false"),
         ];
         let worker_registry = Arc::new(WorkerRegistry::new());
-        let stage = regular_round_robin_stage(&worker_registry);
+        let stage = regular_stage(Arc::clone(&worker_registry));
 
         let mixed = "test-model-pixel-refs-mixed";
         for (url, labels) in [
             ("grpc://127.0.0.1:8790", &refs_with_vision[..]),
             ("grpc://127.0.0.1:8791", &refs_without_vision[..]),
-            ("grpc://127.0.0.1:8792", WITH_VISION),
+            ("grpc://127.0.0.1:8792", VISION_ENCODER),
         ] {
             worker_registry
-                .register(labeled_grpc_worker(url, mixed, labels))
+                .register(regular_worker(url, mixed, labels))
                 .unwrap();
         }
         assert_eq!(urls_seen(&stage, mixed, both), ["grpc://127.0.0.1:8790"]);
@@ -3384,10 +3365,10 @@ mod tests {
         let no_capable_refs = "test-model-pixel-refs-shed";
         for (url, labels) in [
             ("grpc://127.0.0.1:8793", &refs_without_vision[..]),
-            ("grpc://127.0.0.1:8794", WITH_VISION),
+            ("grpc://127.0.0.1:8794", VISION_ENCODER),
         ] {
             worker_registry
-                .register(labeled_grpc_worker(url, no_capable_refs, labels))
+                .register(regular_worker(url, no_capable_refs, labels))
                 .unwrap();
         }
         let response = stage.selection_failure(no_capable_refs, &[WorkerType::Regular], None, both);
@@ -3399,7 +3380,7 @@ mod tests {
 
         let no_vision = "test-model-pixel-refs-refused";
         worker_registry
-            .register(labeled_grpc_worker(
+            .register(regular_worker(
                 "grpc://127.0.0.1:8795",
                 no_vision,
                 &refs_without_vision,
@@ -3420,20 +3401,20 @@ mod tests {
         let model_id = "test-model-pixel-media-reselect";
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry
-            .register(labeled_grpc_worker(
+            .register(regular_worker(
                 "grpc://127.0.0.1:8800",
                 model_id,
-                LANGUAGE_MODEL_ONLY,
+                NO_VISION_ENCODER,
             ))
             .unwrap();
         worker_registry
-            .register(labeled_grpc_worker(
+            .register(regular_worker(
                 "grpc://127.0.0.1:8801",
                 model_id,
-                WITH_VISION,
+                VISION_ENCODER,
             ))
             .unwrap();
-        let stage = regular_round_robin_stage(&worker_registry);
+        let stage = regular_stage(Arc::clone(&worker_registry));
         let wire = WireConstraint {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
@@ -3487,7 +3468,7 @@ mod tests {
                 (multimodal::SUPPORTS_VISION_LABEL, verdict),
             ];
             registry
-                .register(labeled_grpc_worker(url, "test-model", &labels))
+                .register(regular_worker(url, "test-model", &labels))
                 .unwrap();
         }
         let stage = regular_stage(Arc::clone(&registry));
@@ -3916,15 +3897,15 @@ mod tests {
         assert!(!stage(WorkerSelectionMode::Regular).prefill_leg_needs_vision(true));
         assert!(!stage(WorkerSelectionMode::PrefillDecode).prefill_leg_needs_vision(false));
 
-        let prefill = pd_worker("grpc://127.0.0.1:9000", "m", WorkerType::Prefill, UNLABELED);
-        let decode = pd_worker("grpc://127.0.0.1:9001", "m", WorkerType::Decode, UNLABELED);
+        let prefill = labeled_worker("grpc://127.0.0.1:9000", "m", WorkerType::Prefill, UNLABELED);
+        let decode = labeled_worker("grpc://127.0.0.1:9001", "m", WorkerType::Decode, UNLABELED);
         let image = VisionDemand::new(true, false);
         assert!(image.on(prefill.as_ref()));
         assert!(!image.on(decode.as_ref()));
         assert!(prefill_vision_capable(decode.as_ref()));
         assert!(prefill_vision_capable(prefill.as_ref()));
         assert!(!prefill_vision_capable(
-            pd_worker(
+            labeled_worker(
                 "grpc://127.0.0.1:9002",
                 "m",
                 WorkerType::Prefill,
@@ -3955,7 +3936,7 @@ mod tests {
             ("grpc://127.0.0.1:9020", WorkerType::Decode, VISION_ENCODER),
         ] {
             worker_registry
-                .register(pd_worker(url, model_id, worker_type, labels))
+                .register(labeled_worker(url, model_id, worker_type, labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
@@ -3988,7 +3969,7 @@ mod tests {
             ("grpc://127.0.0.1:9040", WorkerType::Decode, VISION_ENCODER),
         ] {
             worker_registry
-                .register(pd_worker(url, uniform, worker_type, labels))
+                .register(labeled_worker(url, uniform, worker_type, labels))
                 .unwrap();
         }
         let failure = stage
@@ -4012,7 +3993,7 @@ mod tests {
         // A leg nobody serves is named before the encoder is asked for.
         let halved = "test-model-vision-prefill-leg-no-decode";
         worker_registry
-            .register(pd_worker(
+            .register(labeled_worker(
                 "grpc://127.0.0.1:9050",
                 halved,
                 WorkerType::Prefill,
@@ -4071,7 +4052,7 @@ mod tests {
             ),
         ] {
             worker_registry
-                .register(pd_worker(url, model_id, worker_type, &labels))
+                .register(labeled_worker(url, model_id, worker_type, &labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
@@ -4129,7 +4110,7 @@ mod tests {
             ),
         ] {
             worker_registry
-                .register(pd_worker(url, model_id, worker_type, &labels))
+                .register(labeled_worker(url, model_id, worker_type, &labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
@@ -4180,7 +4161,7 @@ mod tests {
             ("grpc://127.0.0.1:9090", WorkerType::Decode, VISION_ENCODER),
         ] {
             worker_registry
-                .register(pd_worker(url, model_id, worker_type, labels))
+                .register(labeled_worker(url, model_id, worker_type, labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
@@ -4235,7 +4216,7 @@ mod tests {
             ("grpc://127.0.0.1:9110", WorkerType::Decode, VISION_ENCODER),
         ] {
             registry
-                .register(pd_worker(url, "test-model", worker_type, labels))
+                .register(labeled_worker(url, "test-model", worker_type, labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&registry));
@@ -4299,7 +4280,7 @@ mod tests {
             ("grpc://127.0.0.1:9130", WorkerType::Decode, VISION_ENCODER),
         ] {
             registry
-                .register(pd_worker(url, "test-model", worker_type, labels))
+                .register(labeled_worker(url, "test-model", worker_type, labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&registry));
@@ -4382,7 +4363,7 @@ mod tests {
     const UNLABELED: &[(&str, &str)] = &[];
 
     /// A gRPC worker of a disaggregated pool, with `labels`.
-    fn pd_worker(
+    fn labeled_worker(
         url: &str,
         model_id: &str,
         worker_type: WorkerType,
@@ -4602,7 +4583,7 @@ mod tests {
             ("grpc://127.0.0.1:8912", WorkerType::Decode, UNLABELED),
         ] {
             worker_registry
-                .register(pd_worker(url, model_id, worker_type, labels))
+                .register(labeled_worker(url, model_id, worker_type, labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
@@ -4633,7 +4614,7 @@ mod tests {
             ),
         ] {
             worker_registry
-                .register(pd_worker(url, uniform, worker_type, labels))
+                .register(labeled_worker(url, uniform, worker_type, labels))
                 .unwrap();
         }
         assert_eq!(
@@ -4682,7 +4663,7 @@ mod tests {
             ),
         ] {
             worker_registry
-                .register(pd_worker(url, model_id, worker_type, &labels))
+                .register(labeled_worker(url, model_id, worker_type, &labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
@@ -4720,7 +4701,7 @@ mod tests {
             ),
         ] {
             worker_registry
-                .register(pd_worker(url, model_id, worker_type, labels))
+                .register(labeled_worker(url, model_id, worker_type, labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
@@ -4775,7 +4756,7 @@ mod tests {
             ),
         ] {
             registry
-                .register(pd_worker(url, "test-model", worker_type, labels))
+                .register(labeled_worker(url, "test-model", worker_type, labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&registry));
