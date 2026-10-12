@@ -1175,8 +1175,9 @@ mod tests {
         }
     }
 
-    /// A completed Response object under `id`, as a run's result.
-    fn completed_response(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
+    /// A completed Response object under `id`, as a run's result, built from
+    /// the queued record.
+    fn completed_after_queued(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
         let mut raw = serde_json::to_value(queued_response(id, request)).unwrap();
         raw["status"] = json!("completed");
         serde_json::from_value(raw).unwrap()
@@ -1219,7 +1220,7 @@ mod tests {
         let flaky = Arc::new(FlakyStorage::new());
         let storage: Arc<dyn ResponseStorage> = flaky.clone();
         let request = store_queued(&storage, "resp_1").await;
-        let response = completed_response("resp_1", &request);
+        let response = completed_after_queued("resp_1", &request);
         // Two refused calls: the is_closed read and the first persist.
         flaky.fail_next(2);
         super::super::utils::persist_response_if_needed(
@@ -1296,7 +1297,7 @@ mod tests {
         let flaky = Arc::new(FlakyStorage::new());
         let storage: Arc<dyn ResponseStorage> = flaky.clone();
         let request = store_queued(&storage, "resp_1").await;
-        let response = completed_response("resp_1", &request);
+        let response = completed_after_queued("resp_1", &request);
         // The record is cancelled (by a client, through another gateway) while
         // the store refuses this gateway's calls.
         set_stored_status(&storage, "resp_1", "cancelled", None, None)
