@@ -1926,3 +1926,18 @@ class TestPrometheusHostDefault:
         RouterArgs.add_cli_args(parser, use_router_prefix=True)
         args = RouterArgs.from_cli_args(parser.parse_args([]), use_router_prefix=True)
         assert args.prometheus_host is None
+
+
+class TestControlPlaneApiKeyEntryErrors:
+    """A malformed entry is refused without the entry in the message: it carries the credential."""
+
+    @pytest.mark.parametrize(
+        "entry", ["bad", "i:n:bogus:s3cr3t", "ops:Ops Key:sk-live-abc123:admin"]
+    )
+    def test_the_error_does_not_echo_the_entry(self, entry):
+        with pytest.raises(ValueError) as excinfo:
+            RouterArgs._parse_control_plane_api_keys([entry])
+        text = str(excinfo.value)
+        assert "s3cr3t" not in text
+        assert "sk-live-abc123" not in text
+        assert "'bad'" not in text

@@ -1492,31 +1492,32 @@ fn parse_model_alias(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-/// Parse role mapping from CLI format "idp_role=gateway_role"
-#[expect(
-    clippy::print_stderr,
-    reason = "pre-logger CLI argument parsing warnings"
-)]
-fn parse_role_mapping(mapping: &str) -> Option<(String, Role)> {
+/// Parse a JWT role mapping from CLI format "idp_role=gateway_role". A
+/// malformed entry is a configuration error, never a dropped mapping: with
+/// the mapping dropped the map can end up empty, and an empty map grants the
+/// gateway's admin role to any token whose roles claim says `admin`.
+fn parse_role_mapping(mapping: &str) -> ConfigResult<(String, Role)> {
     let parts: Vec<&str> = mapping.splitn(2, '=').collect();
     if parts.len() != 2 {
-        eprintln!(
-            "WARNING: Invalid role mapping format '{mapping}'. Expected 'idp_role=gateway_role'"
-        );
-        return None;
+        return Err(ConfigError::InvalidValue {
+            field: "jwt-role-mapping".to_string(),
+            value: mapping.to_string(),
+            reason: "expected 'idp_role=gateway_role'".to_string(),
+        });
     }
     let idp_role = parts[0].to_string();
     let gateway_role = match parts[1].to_lowercase().as_str() {
         "admin" => Role::Admin,
         "user" => Role::User,
-        other => {
-            eprintln!(
-                "WARNING: Invalid gateway role '{other}' in mapping. Valid roles: admin, user"
-            );
-            return None;
+        _ => {
+            return Err(ConfigError::InvalidValue {
+                field: "jwt-role-mapping".to_string(),
+                value: mapping.to_string(),
+                reason: "the gateway role must be 'admin' or 'user'".to_string(),
+            });
         }
     };
-    Some((idp_role, gateway_role))
+    Ok((idp_role, gateway_role))
 }
 
 /// Parse a control-plane API key from CLI format "id:name:role:key". A
@@ -1541,11 +1542,12 @@ fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
     let role = match role_str.to_lowercase().as_str() {
         "admin" => Role::Admin,
         "user" => Role::User,
-        other => {
+        // The field is not named either: with the fields out of order it is the credential.
+        _ => {
             return Err(ConfigError::InvalidValue {
                 field: "control-plane-api-keys".to_string(),
                 value: "<redacted>".to_string(),
-                reason: format!("unknown role '{other}'; valid roles: admin, user"),
+                reason: "the role must be 'admin' or 'user'".to_string(),
             });
         }
     };
@@ -1583,11 +1585,12 @@ impl CliArgs {
         // Build JWT config if issuer and audience are provided
         let jwt = match (&self.jwt_issuer, &self.jwt_audience) {
             (Some(issuer), Some(audience)) => {
-                let role_mapping: HashMap<String, Role> = self
+                // One malformed mapping refuses the start: dropped, it could widen access
+                let role_mapping = self
                     .jwt_role_mapping
                     .iter()
-                    .filter_map(|m| parse_role_mapping(m))
-                    .collect();
+                    .map(|m| parse_role_mapping(m))
+                    .collect::<ConfigResult<HashMap<String, Role>>>()?;
 
                 let mut jwt_config = JwtConfig::new(issuer.clone(), audience.clone());
                 jwt_config.role_claim.clone_from(&self.jwt_role_claim);
@@ -2736,6 +2739,11 @@ mod tests {
         for bad in [
             &["--control-plane-api-keys", "bad"][..],
             &["--control-plane-api-keys", "i:n:bogus:s3cr3t"][..],
+            // the fields out of order: the role field is the credential
+            &[
+                "--control-plane-api-keys",
+                "ops:Ops Key:sk-live-abc123:admin",
+            ][..],
             &["--control-plane-api-keys", ""][..],
             &[
                 "--control-plane-api-keys",
@@ -2750,7 +2758,9 @@ mod tests {
             let text = err.to_string();
             assert!(text.contains("control-plane-api-keys"), "{bad:?}: {text}");
             assert!(
-                !text.contains("s3cr3t") && !text.contains("'bad'"),
+                !text.contains("s3cr3t")
+                    && !text.contains("sk-live-abc123")
+                    && !text.contains("'bad'"),
                 "the entry (it carries the credential) must not be echoed: {text}"
             );
         }
@@ -2787,6 +2797,43 @@ mod tests {
             .expect("no auth configured")
             .jwt
             .is_none());
+    }
+
+    /// A malformed `--jwt-role-mapping` entry used to be dropped with a stderr
+    /// line; an empty map grants the gateway's admin role to any token whose
+    /// roles claim says `admin`, so every such entry is a configuration error.
+    #[test]
+    fn jwt_role_mapping_entries_fail_closed() {
+        let jwt = [
+            "--jwt-issuer",
+            "https://issuer.example",
+            "--jwt-audience",
+            "aud",
+        ];
+        for bad in ["admin:user", "gw-admins=root", "gw-admins"] {
+            let args: Vec<&str> = jwt
+                .iter()
+                .copied()
+                .chain(["--jwt-role-mapping", bad])
+                .collect();
+            let err = cli_args_from(&args)
+                .build_control_plane_auth_config()
+                .expect_err("a malformed role mapping must refuse the start");
+            assert!(err.to_string().contains("jwt-role-mapping"), "{bad}: {err}");
+        }
+        let args: Vec<&str> = jwt
+            .iter()
+            .copied()
+            .chain(["--jwt-role-mapping", "gw-admins=admin"])
+            .collect();
+        let config = cli_args_from(&args)
+            .build_control_plane_auth_config()
+            .expect("a valid role mapping");
+        let jwt_config = config.jwt.expect("JWT configured");
+        assert!(matches!(
+            jwt_config.role_mapping.get("gw-admins"),
+            Some(Role::Admin)
+        ));
     }
 
     /// A grouped ZMQ handshake needs at least one engine, so `0` (and any

@@ -2463,13 +2463,13 @@ class RouterArgs:
         for key_str in api_keys_list:
             parts = key_str.split(":", 3)  # Split into at most 4 parts
             if len(parts) != 4:
-                raise ValueError(
-                    f"Invalid API key format: '{key_str}'. Expected 'id:name:role:key'"
-                )
+                # The entry is not shown: it carries the credential.
+                raise ValueError("Invalid control-plane API key entry: expected 'id:name:role:key'")
             key_id, name, role, key = parts
             role_lower = role.lower()
             if role_lower not in ("admin", "user"):
-                raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
+                # Nor the role field: with the fields out of order it is the credential.
+                raise ValueError("Invalid control-plane API key role: must be 'admin' or 'user'")
             parsed_keys.append((key_id, name, key, role_lower))
         return parsed_keys
 

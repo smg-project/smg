@@ -96,6 +96,14 @@ def build_control_plane_auth_config(
     jwt_audience = args_dict.get("jwt_audience")
     audit_enabled = args_dict.get("control_plane_audit_enabled", False)
 
+    # Half a JWT configuration is an error, not a silently disabled JWT auth:
+    # the control plane would start open where authentication was asked for.
+    if (jwt_issuer is None) != (jwt_audience is None):
+        raise ValueError(
+            "--jwt-issuer and --jwt-audience are required together: "
+            "control-plane JWT authentication would otherwise be silently disabled"
+        )
+
     # Check if any auth is configured
     has_api_keys = bool(api_keys)
     has_jwt = jwt_issuer is not None and jwt_audience is not None
