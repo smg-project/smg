@@ -975,7 +975,9 @@ struct CliArgs {
     jemalloc_prof_dir: Option<String>,
 
     // ==================== Request Handling ====================
-    /// Custom HTTP headers to check for request IDs
+    /// Custom HTTP headers to check for request IDs. The first one present
+    /// is honoured when its value is 1 to 128 visible-ASCII characters;
+    /// otherwise a fresh id is generated
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     request_id_headers: Vec<String>,
 
