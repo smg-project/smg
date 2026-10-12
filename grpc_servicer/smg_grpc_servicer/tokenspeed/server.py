@@ -18,7 +18,7 @@ from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
-from smg_grpc_servicer.rust_lifecycle import guarded_exit
+from smg_grpc_servicer.rust_lifecycle import EXIT_GRACE_SECS, guarded_exit
 from smg_grpc_servicer.tokenspeed import engine_watchdog
 from smg_grpc_servicer.tokenspeed.engine_watchdog import EngineProcessWatch
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
@@ -99,7 +99,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
     launched = threading.Event()
-    engine_exit: dict[str, int | None] = {}
+    engine_exit: dict[str, SystemExit] = {}
 
     def on_engine_exit(pid: int, code: int | None) -> None:
         logger.error(
@@ -114,7 +114,10 @@ async def serve_grpc(server_args: ServerArgs) -> None:
             watch.terminate_seen()
             engine_watchdog.exit_process(1)
             return
-        engine_exit["code"] = code
+        # The guard is armed here, the moment the exit is known and ahead of
+        # the shutdown (the servicer's own tear-down can block), with a grace
+        # that covers its bounded steps.
+        engine_exit["exit"] = guarded_exit(1, grace_secs=EXIT_GRACE_SECS + 10.0)
         loop.call_soon_threadsafe(stop_event.set)
 
     # The engine's processes are watched from before the first one starts: one
@@ -126,11 +129,18 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     logger.info("Launching TokenSpeed scheduler + AsyncLLM...")
     try:
         async_llm, scheduler_info = launch_engine(server_args)
-    except RuntimeError as error:
+    except RuntimeError:
+        # The engine's launcher raised (a rank that reported a failure, or
+        # anything else on its way up): the traceback is kept, the engine
+        # processes it had started are terminated, and the servicer exits 1.
         watch.stop()
-        logger.error("The TokenSpeed engine did not start: %s", error)
+        watch.terminate_seen()
+        logger.error("The TokenSpeed engine did not start", exc_info=True)
         raise guarded_exit(1) from None
     launched.set()
+    # The engine's processes are all up by now: later children (a process
+    # pool, a manager) are not the engine.
+    watch.freeze()
 
     max_message_bytes = _grpc_max_message_bytes()
     server = grpc.aio.server(
@@ -248,7 +258,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         # so an orchestrator restarts the pod instead of keeping a worker that
         # can no longer serve.
         logger.error("The TokenSpeed engine exited on its own; the servicer exits with code 1")
-        raise guarded_exit(1)
+        raise engine_exit["exit"]
 
 
 def _wait_and_warmup(

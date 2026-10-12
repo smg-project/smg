@@ -55,6 +55,20 @@ def test_a_living_engine_is_not_reported_and_stop_ends_the_watch():
         child.join(5.0)
 
 
+def test_freeze_admits_no_later_children():
+    """Once the launch has returned, a process pool or a manager the servicer
+    starts later is not the engine: it is neither watched nor reported."""
+    rank = SimpleNamespace(pid=4242, exitcode=None, terminate=lambda: None)
+    children = [rank]
+    watch = engine_watchdog.EngineProcessWatch(lambda *_: None, children=lambda: list(children))
+    assert watch.freeze() == 1
+    later = SimpleNamespace(pid=4343, exitcode=0, terminate=lambda: None)
+    children.append(later)
+    assert watch.poll() is None
+    rank.exitcode = 1
+    assert watch.poll() == (4242, 1)
+
+
 def test_the_watch_reads_the_children_it_is_given():
     process = SimpleNamespace(pid=4242, exitcode=None, terminated=0)
     process.terminate = lambda: setattr(process, "terminated", process.terminated + 1)

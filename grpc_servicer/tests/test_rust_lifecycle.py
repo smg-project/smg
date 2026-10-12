@@ -561,8 +561,9 @@ def test_guarded_exit_ends_a_hung_shutdown_after_the_grace(monkeypatch):
     ended = threading.Event()
     codes: list[int] = []
 
-    def end_process(code: int) -> None:
+    def end_process(code: int, grace_secs: float) -> None:
         codes.append(code)
+        assert grace_secs == 0.05
         ended.set()
 
     monkeypatch.setattr(rust_lifecycle, "_end_process", end_process)
@@ -572,3 +573,24 @@ def test_guarded_exit_ends_a_hung_shutdown_after_the_grace(monkeypatch):
     # The guard is a daemon timer: it never keeps a finished interpreter alive.
     guard = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
     assert all(t.daemon for t in guard)
+
+
+def test_the_guard_says_it_fired_and_terminates_the_children(monkeypatch, caplog):
+    """When the guard ends the process it says so, dumps every thread's stack
+    (the cause of the hang, for the next reader) and terminates the children
+    the interpreter's own exit would have joined, before ending the process."""
+    terminated: list[int] = []
+    child = types.SimpleNamespace(pid=4242, terminate=lambda: terminated.append(4242))
+    monkeypatch.setattr(rust_lifecycle.multiprocessing, "active_children", lambda: [child])
+    dumped: list[bool] = []
+    monkeypatch.setattr(
+        rust_lifecycle.faulthandler,
+        "dump_traceback",
+        lambda all_threads=False: dumped.append(all_threads),
+    )
+    ended: list[int] = []
+    monkeypatch.setattr(rust_lifecycle.os, "_exit", ended.append)
+    caplog.set_level(logging.ERROR)
+    rust_lifecycle._end_process(1, 15.0)
+    assert "did not finish within 15 s; ending the process with code 1" in caplog.text
+    assert dumped == [True] and terminated == [4242] and ended == [1]

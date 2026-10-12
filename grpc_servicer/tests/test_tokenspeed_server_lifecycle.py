@@ -123,6 +123,10 @@ class _FakeWatch:
     def start(self):
         self.started = True
 
+    def freeze(self):
+        self.frozen = True
+        return 1
+
     def stop(self):
         self.stopped = True
 
@@ -249,6 +253,9 @@ def test_an_engine_that_does_not_start_is_a_named_exit(monkeypatch, server_mod, 
     with pytest.raises(SystemExit) as raised:
         asyncio.run(server_mod.serve_grpc(server_args))
     assert raised.value.code == 1
-    assert _FakeWatch.instances[0].stopped
-    assert "did not start: launch_engine() returned no AsyncLLM" in caplog.text
+    watch = _FakeWatch.instances[0]
+    assert watch.stopped and watch.terminated == 1
+    # The traceback stays with the log line: the only clue to an unexpected failure.
+    assert "The TokenSpeed engine did not start" in caplog.text
+    assert "launch_engine() returned no AsyncLLM" in caplog.text
     assert events == []

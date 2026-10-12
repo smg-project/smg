@@ -23,7 +23,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_POLL_SECS = 0.5
+# Short, so a rank that dies early in its start is seen alive at least once
+# (a child that exits before any poll saw it is reaped unseen).
+DEFAULT_POLL_SECS = 0.1
 
 
 class EngineProcessWatch(threading.Thread):
@@ -31,7 +33,10 @@ class EngineProcessWatch(threading.Thread):
     and calls ``on_exit(pid, exit_code)`` once, for the first one seen alive
     that has exited; :meth:`stop` ends it (an orderly shutdown terminates the
     engine itself). ``children`` is the source of the processes
-    (``multiprocessing.active_children`` by default)."""
+    (``multiprocessing.active_children`` by default). The engine's processes
+    all start inside the launch: :meth:`freeze`, called once the launch has
+    returned, stops admitting new children, so a process pool or a manager the
+    servicer starts later is not mistaken for the engine."""
 
     def __init__(
         self,
@@ -45,6 +50,7 @@ class EngineProcessWatch(threading.Thread):
         self._poll_secs = poll_secs
         self._children = children
         self._stopping = threading.Event()
+        self._frozen = threading.Event()
         self._seen: dict[int, Any] = {}
 
     def run(self) -> None:
@@ -56,14 +62,16 @@ class EngineProcessWatch(threading.Thread):
             self._stopping.wait(self._poll_secs)
 
     def poll(self) -> tuple[int, int | None] | None:
-        """Note the engine processes alive now; the pid and exit code of the
-        first one noted earlier that has exited, else ``None``."""
-        try:
-            for process in self._children():
-                if process.pid is not None:
-                    self._seen.setdefault(process.pid, process)
-        except RuntimeError:  # the children set changed under the iteration
-            return None
+        """Note the engine processes alive now (until :meth:`freeze`); the pid
+        and exit code of the first one noted earlier that has exited, else
+        ``None``."""
+        if not self._frozen.is_set():
+            try:
+                for process in self._children():
+                    if process.pid is not None:
+                        self._seen.setdefault(process.pid, process)
+            except RuntimeError:  # the children set changed under the iteration
+                return None
         for pid, process in self._seen.items():
             code = process.exitcode
             if code is not None:
@@ -81,6 +89,13 @@ class EngineProcessWatch(threading.Thread):
                 except (OSError, ValueError, AttributeError):
                     pass
         return count
+
+    def freeze(self) -> int:
+        """Admit no further children: the engine's processes are the ones seen
+        so far. Returns how many are watched."""
+        self.poll()
+        self._frozen.set()
+        return len(self._seen)
 
     def stop(self) -> None:
         self._stopping.set()

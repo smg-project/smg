@@ -748,11 +748,6 @@ def require_upstream_hook() -> None:
         )
 
 
-def _env_int(name: str) -> int | None:
-    value = os.environ.get(name)
-    return int(value) if value else None
-
-
 def configure_logging() -> None:
     """Route this package's logs through vLLM's handlers when vLLM configured
     them, else a plain stderr handler: the Rust path's lifecycle messages

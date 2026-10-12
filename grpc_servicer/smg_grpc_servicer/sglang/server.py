@@ -28,7 +28,12 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
-from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit, guarded_exit
+from smg_grpc_servicer.rust_lifecycle import (
+    EXIT_GRACE_SECS,
+    ServicerConfigError,
+    configuration_exit,
+    guarded_exit,
+)
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, serve_rust, servicer_impl_source
@@ -397,7 +402,7 @@ async def serve_grpc(
         raise
 
     warmup_thread = None
-    scheduler_exited = False
+    scheduler_exit: SystemExit | None = None
     try:
         # Start warmup in a separate thread
         warmup_thread = threading.Thread(
@@ -417,7 +422,13 @@ async def serve_grpc(
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, signal_handler)
 
-        scheduler_exited = await wait_for_scheduler_shutdown(scheduler_procs, stop_event)
+        if await wait_for_scheduler_shutdown(scheduler_procs, stop_event):
+            # The engine ended on its own: the servicer exits with it, non-zero,
+            # so an orchestrator restarts the pod instead of keeping a worker
+            # that can no longer serve. The guard is armed here, ahead of the
+            # shutdown below (the request manager's own tear-down can block),
+            # with a grace that covers its bounded steps.
+            scheduler_exit = guarded_exit(1, grace_secs=EXIT_GRACE_SECS + 10.0)
     finally:
         logger.info("Shutting down gRPC server")
 
@@ -441,12 +452,9 @@ async def serve_grpc(
         # The scheduler processes have SIGINT ignored, so they won't get KeyboardInterrupt
         terminate_scheduler_processes(scheduler_procs)
 
-    if scheduler_exited:
-        # The engine ended on its own (the watchdog stopped the server): the
-        # servicer exits with it, non-zero, so an orchestrator restarts the pod
-        # instead of keeping a worker that can no longer serve.
+    if scheduler_exit is not None:
         logger.error("A scheduler process exited on its own; the servicer exits with code 1")
-        raise guarded_exit(1)
+        raise scheduler_exit
 
 
 def _execute_grpc_server_warmup(server_args: ServerArgs):
