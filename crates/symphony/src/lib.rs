@@ -27,6 +27,7 @@ pub mod engine;
 pub mod event;
 pub mod format;
 pub mod formats;
+pub mod gemma;
 pub mod grammar;
 pub mod input;
 pub mod json;

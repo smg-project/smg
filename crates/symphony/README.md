@@ -51,7 +51,7 @@ and a client that wants the raw text back can have it.
 | `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
-| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `plain()`. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `gemma4()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
@@ -59,7 +59,7 @@ and a client that wants the raw text back can have it.
 
 ### The modules
 
-- `format`, `formats`: the table type and the twenty tables. A table is data, read by the engine
+- `format`, `formats`: the table type and the twenty-one tables. A table is data, read by the engine
   and by the grammar derivation alike; it says what the template writes and nothing about how to
   parse it.
 - `engine`, `markers`, `tokens`: the engine, its scanner and its token ledger.
@@ -129,7 +129,7 @@ aliases is an open question of the design.
 
 <!-- models: begin -->
 78 groups, 107 checkpoints, newest first.
-56 ready, 6 replaying a recorded set, 0 on main awaiting fixtures, 16 pending.
+57 ready, 6 replaying a recorded set, 0 on main awaiting fixtures, 15 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -157,7 +157,7 @@ aliases is an open question of the design.
 | 2026-04-15 | [qwen3.6-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-35b-a3b) | Qwen/Qwen3.6-35B-A3B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
 | 2026-04-09 | [minimax-m2.7](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m2.7) | MiniMaxAI/MiniMax-M2.7 |  | `minimax_m2` | 12,821 | replaying the set | `minimax_m2`, `minimax` |
 | 2026-04-06 | [granite-4.1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-4.1-3b) | ibm-granite/granite-4.1-3b |  | `qwen2.5` | 41,533 | ready | none |
-| 2026-03-02 | [gemma-4-e4b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/gemma-4-e4b-it) | google/gemma-4-E4B-it |  | — | — | pending | `json`, none |
+| 2026-03-02 | [gemma-4-e4b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/gemma-4-e4b-it) | google/gemma-4-E4B-it |  | `gemma4` | 54,416 | ready | `json`, none |
 | 2026-02-28 | [qwen3.5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-2b) | Qwen/Qwen3.5-2B | Qwen3.5-0.8B | `qwen3`, tagged calls | 41,360 | ready | `qwen_xml`, `qwen3` |
 | 2026-02-27 | [qwen3.5-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-9b) | Qwen/Qwen3.5-9B | Qwen3.5-4B | `qwen3`, tagged calls | 54,179 | ready | `qwen_xml`, `qwen3` |
 | 2026-02-24 | [qwen3.5-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-27b) | Qwen/Qwen3.5-27B |  | `qwen3`, tagged calls | 54,179 | ready | `qwen_xml`, `qwen3` |

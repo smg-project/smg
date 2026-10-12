@@ -80,8 +80,8 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, dots3, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5, ling,
-        minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5,
+        ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -541,6 +541,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // Laguna writes GLM 4.5's spelling (a newline after the name, each key and each value) under
     // its own turn opener; its prompt ends in the thought's opener or its closer alone.
     ("laguna-xs.2", Family::Glm4, GenerationPrompt::MarkerAlone),
+    // Gemma 4: the prompt is the turn's opener alone, whatever the request says (the template opens
+    // the thought channel only after a tool response); the model writes `<|channel>thought` or not.
+    (
+        "gemma-4-e4b-it",
+        Family::Gemma4,
+        GenerationPrompt::ModelDecides,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -599,6 +606,8 @@ enum Family {
     MiniCpm5,
     /// [`dots3`]: MiniMax M2's tags in a block per call, every value on a line of its own.
     Dots3,
+    /// [`gemma4`]: `call:NAME{…}` calls in Gemma's spelling, the thought a channel.
+    Gemma4,
     /// [`plain`]: content and nothing else.
     Plain,
 }
@@ -613,6 +622,7 @@ impl Family {
             Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
             Self::KimiK3 => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
             Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
+            Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
             _ => ("<think>", "</think>"),
         }
@@ -623,7 +633,7 @@ impl Family {
     /// separators=(",", ":"))` does: a case whose arguments differ from the reference's only so,
     /// equal as values, is counted as respelled, not as a difference.
     fn respells_arguments(self) -> bool {
-        matches!(self, Self::Inkling)
+        matches!(self, Self::Inkling | Self::Gemma4)
     }
 
     /// The engine for one of the model's cases: the family's table, with the model's own turn
@@ -659,6 +669,7 @@ impl Family {
             Self::Inkling => inkling(),
             Self::MiniCpm5 => minicpm5(),
             Self::Dots3 => dots3(),
+            Self::Gemma4 => gemma4(),
             Self::Plain => plain(),
         }
     }
@@ -670,9 +681,9 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::MiMo => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3, K2-Horizon, Inkling and the plain table read
-            // neither of the probes' Qwen markers: `</think>` stays reasoning text and the fenced
-            // `<tool_call>` block stays content, as the reference says.
+            // Seed-OSS, Hy4, Olmo 3, xLAM, Kimi K3, K2-Horizon, Inkling, Gemma 4 and the plain
+            // table read neither of the probes' Qwen markers: `</think>` stays reasoning text and
+            // the fenced `<tool_call>` block stays content, as the reference says.
             Self::SeedOss
             | Self::Hy4
             | Self::Olmo3
@@ -680,6 +691,7 @@ impl Family {
             | Self::KimiK3
             | Self::K2Horizon
             | Self::Inkling
+            | Self::Gemma4
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,

@@ -93,6 +93,11 @@ pub enum CallSyntax {
     /// terminals that leave the state are the message's own; the object's close is the call's end,
     /// and the message's closing terminal is the region's.
     NamedJson(&'static str),
+    /// Gemma 4's `call:NAME{key:value,…}`: keys bare, a string between `<|"|>` tokens, numbers and
+    /// words bare, lists and objects nested the same way, the keys sorted by the template. The
+    /// terminals that enter and leave the state are the call's own markers, and the call's end
+    /// carries the closing one.
+    Gemma,
 }
 
 /// What the text inside a state is.

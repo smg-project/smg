@@ -23,7 +23,9 @@
 //! [`minicpm5()`] is MiniCPM5: `<think>` blocks and, with no block around them, `<function
 //! name="…">` calls of `<param name="…">` tags, a value a CDATA section when it holds `<`, `&` or
 //! a newline. [`dots3()`] is dots3: MiniMax M2's invoke and parameter tags in a
-//! `<dots_function_call>` block per call, every value on a line of its own.
+//! `<dots_function_call>` block per call, every value on a line of its own. [`gemma4()`] is
+//! Gemma 4: `<|channel>thought` blocks and `<|tool_call>call:NAME{…}<tool_call|>` calls in Gemma's
+//! own spelling of the arguments.
 //! [`plain()`] is the table for a template that writes the message's content and nothing else: one
 //! state, no marker.
 //!
@@ -32,6 +34,7 @@
 
 pub mod deepseek_v4_1;
 pub mod dots3;
+pub mod gemma4;
 pub mod glm;
 pub mod glm4;
 pub mod hy4;
@@ -53,6 +56,7 @@ pub mod xlam;
 
 pub use deepseek_v4_1::deepseek_v4_1;
 pub use dots3::dots3;
+pub use gemma4::gemma4;
 pub use glm::glm;
 pub use glm4::glm4;
 pub use hy4::hy4;

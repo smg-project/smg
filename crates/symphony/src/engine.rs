@@ -59,6 +59,7 @@
 use crate::{
     event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallSyntax, Emits, Format},
+    gemma,
     input::{EngineFinish, Input},
     json,
     markers::{Piece, Scanner},
@@ -111,6 +112,7 @@ enum Call {
     Xtml(tagged::xtml::Assembler),
     Attributed(tagged::attributed::Assembler),
     NamedJson(json::named::Assembler),
+    Gemma(gemma::Assembler),
 }
 
 impl Call {
@@ -137,6 +139,7 @@ impl Call {
             Some(CallSyntax::NamedJson(marker)) => {
                 Self::NamedJson(json::named::Assembler::new(index, id, marker))
             }
+            Some(CallSyntax::Gemma) => Self::Gemma(gemma::Assembler::new(index, id)),
         }
     }
 
@@ -173,6 +176,10 @@ impl Call {
                 text.len()
             }
             Self::NamedJson(assembler) => assembler.feed(text, out),
+            Self::Gemma(assembler) => {
+                assembler.feed(text, out);
+                text.len()
+            }
         }
     }
 
@@ -255,6 +262,12 @@ impl Call {
             // object closed the call at its brace.
             (Self::NamedJson(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::NamedJson(assembler), Closed::ByEnd) => assembler.finish(out),
+            // Gemma 4's closing marker is the call's own, carried by its end.
+            (Self::Gemma(assembler), Closed::ByMarker) => {
+                assembler.close(terminal, out);
+                return true;
+            }
+            (Self::Gemma(assembler), Closed::ByEnd) => assembler.finish(out),
         }
         false
     }
