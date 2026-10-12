@@ -1,6 +1,6 @@
 //! Oracle storage implementation using OracleStore helper.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -796,8 +796,11 @@ impl ConversationItemStorage for OracleConversationItemStorage {
         let cid = conversation_id.0.clone();
         let schema = self.store.schema.clone();
         let hook_extra = current_extra_columns().unwrap_or_default();
-        let owned_items: Vec<(String, DateTime<Utc>)> =
-            items.iter().map(|(id, ts)| (id.0.clone(), *ts)).collect();
+        // One source row per item: a repeated id keeps its last stamp, as the
+        // other backends' per-item links leave it (two rows under one key
+        // would fail the MERGE).
+        let owned_items =
+            last_stamp_per_item(items.iter().map(|(id, ts)| (id.0.clone(), *ts)).collect());
 
         self.store
             .execute(move |conn| {
@@ -1370,38 +1373,62 @@ fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
 fn link_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
     let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
     let placeholders: Vec<String> = binds.iter().map(|bind| format!(":{bind}")).collect();
-    (merge_links_sql(table, columns, &[placeholders]), binds)
+    let keyed = placeholders.len().min(LINK_KEY_COLUMNS);
+    let (key_binds, extra_binds) = placeholders.split_at(keyed);
+    (
+        merge_links_sql(table, columns, &[key_binds.to_vec()], extra_binds),
+        binds,
+    )
 }
 
 /// The statement of a batch link: one MERGE whose source is the batch's rows
 /// (ids and stamps, far under the source's size limit), keyed as [`link_sql`]
 /// is. The binds are `:cid` (the conversation, once), `:iid<n>` and `:ts<n>`
-/// per row, `:ex<n>` per extra column (one value for the whole batch).
+/// per row, `:ex<n>` per extra column (one value for the whole batch, bound
+/// outside the source). The batch must hold distinct item ids: two source
+/// rows under one key are refused by the MERGE (ORA-30926, or ORA-00001 when
+/// both insert), so the caller keeps the last stamp of a repeated id.
 fn link_items_sql(table: &str, columns: &[&str], rows: usize) -> String {
-    let extra = columns.len().saturating_sub(3);
-    let row_binds: Vec<Vec<String>> = (0..rows)
+    let extra = columns.len().saturating_sub(LINK_KEY_COLUMNS);
+    let key_rows: Vec<Vec<String>> = (0..rows)
         .map(|idx| {
-            let mut binds = vec![
+            vec![
                 ":cid".to_string(),
                 format!(":iid{idx}"),
                 format!(":ts{idx}"),
-            ];
-            binds.extend((0..extra).map(|ei| format!(":ex{ei}")));
-            binds
+            ]
         })
         .collect();
-    merge_links_sql(table, columns, &row_binds)
+    let extra_binds: Vec<String> = (0..extra).map(|ei| format!(":ex{ei}")).collect();
+    merge_links_sql(table, columns, &key_rows, &extra_binds)
 }
 
+/// The columns a link's source row carries: the key (conversation, item) and
+/// the stamp. Any further column is an extra column of the table.
+const LINK_KEY_COLUMNS: usize = 3;
+
 /// One MERGE into the links `table` with one source row per entry of
-/// `row_binds` (one bind per column, in the columns' order), matched on the
-/// first two columns: the stamp and the extra columns of a matched row take
-/// the source's values, an unmatched row is inserted.
-fn merge_links_sql(table: &str, columns: &[&str], row_binds: &[Vec<String>]) -> String {
-    let source: Vec<String> = row_binds
+/// `key_rows` (one bind per key column, in the columns' order), matched on
+/// the first two columns: the stamp and the extra columns of a matched row
+/// take the new values, an unmatched row is inserted. The extra columns'
+/// values (`extra_binds`, one per column after the first three) are bound in
+/// UPDATE SET and INSERT VALUES, outside the source: a string above 4,000
+/// bytes is accepted there for a CLOB column, as in an INSERT, while the same
+/// bind in a subquery's select list fails with ORA-01461 (the rule
+/// [`store_response_sql`] follows); an extra column is user-configured and
+/// may well be a CLOB.
+fn merge_links_sql(
+    table: &str,
+    columns: &[&str],
+    key_rows: &[Vec<String>],
+    extra_binds: &[String],
+) -> String {
+    let keyed = columns.len().min(LINK_KEY_COLUMNS);
+    let (key_columns, extra_columns) = columns.split_at(keyed);
+    let source: Vec<String> = key_rows
         .iter()
         .map(|binds| {
-            let selected: Vec<String> = columns
+            let selected: Vec<String> = key_columns
                 .iter()
                 .zip(binds)
                 .map(|(col, bind)| format!("{bind} AS {col}"))
@@ -1409,22 +1436,32 @@ fn merge_links_sql(table: &str, columns: &[&str], row_binds: &[Vec<String>]) -> 
             format!("SELECT {} FROM dual", selected.join(", "))
         })
         .collect();
-    let on: Vec<String> = columns
+    let on: Vec<String> = key_columns
         .iter()
         .take(2)
         .map(|col| format!("t.{col} = s.{col}"))
         .collect();
-    let updates: Vec<String> = columns
+    let updates: Vec<String> = key_columns
         .iter()
         .skip(2)
         .map(|col| format!("t.{col} = s.{col}"))
+        .chain(
+            extra_columns
+                .iter()
+                .zip(extra_binds)
+                .map(|(col, bind)| format!("t.{col} = {bind}")),
+        )
         .collect();
     let matched = if updates.is_empty() {
         String::new()
     } else {
         format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
     };
-    let values: Vec<String> = columns.iter().map(|col| format!("s.{col}")).collect();
+    let values: Vec<String> = key_columns
+        .iter()
+        .map(|col| format!("s.{col}"))
+        .chain(extra_binds.iter().cloned())
+        .collect();
     format!(
         "MERGE INTO {table} t USING ({}) s ON ({}){matched} \
          WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
@@ -1433,6 +1470,24 @@ fn merge_links_sql(table: &str, columns: &[&str], row_binds: &[Vec<String>]) -> 
         columns.join(", "),
         values.join(", ")
     )
+}
+
+/// The batch with one row per item id, the last stamp of a repeated id kept
+/// in the position of its first occurrence: the result of linking the items
+/// one by one, which the other backends give a repeated id.
+fn last_stamp_per_item(items: Vec<(String, DateTime<Utc>)>) -> Vec<(String, DateTime<Utc>)> {
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut rows: Vec<(String, DateTime<Utc>)> = Vec::with_capacity(items.len());
+    for (id, ts) in items {
+        match positions.get(&id) {
+            Some(&at) => rows[at].1 = ts,
+            None => {
+                positions.insert(id.clone(), rows.len());
+                rows.push((id, ts));
+            }
+        }
+    }
+    rows
 }
 
 #[async_trait]
@@ -1824,13 +1879,17 @@ mod tests {
         assert_eq!(
             sql,
             "MERGE INTO links t USING (SELECT :v1 AS conversation_id, :v2 AS item_id, \
-             :v3 AS added_at, :v4 AS tenant FROM dual) s \
+             :v3 AS added_at FROM dual) s \
              ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
-             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = s.tenant \
+             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = :v4 \
              WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
-             VALUES (s.conversation_id, s.item_id, s.added_at, s.tenant)"
+             VALUES (s.conversation_id, s.item_id, s.added_at, :v4)"
         );
         assert_eq!(binds, ["v1", "v2", "v3", "v4"]);
+        // An extra column may be a CLOB: its value is never bound inside the
+        // source (ORA-01461 above 4,000 bytes there), as in `store_response_sql`.
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(!source.contains(":v4"), "{source}");
         // The key alone leaves nothing to move.
         let (sql, _) = link_sql("l", &["conversation_id", "item_id"]);
         assert!(!sql.contains("WHEN MATCHED"), "{sql}");
@@ -1850,13 +1909,35 @@ mod tests {
         assert_eq!(
             sql,
             "MERGE INTO links t USING (\
-             SELECT :cid AS conversation_id, :iid0 AS item_id, :ts0 AS added_at, :ex0 AS tenant FROM dual \
+             SELECT :cid AS conversation_id, :iid0 AS item_id, :ts0 AS added_at FROM dual \
              UNION ALL \
-             SELECT :cid AS conversation_id, :iid1 AS item_id, :ts1 AS added_at, :ex0 AS tenant FROM dual) s \
+             SELECT :cid AS conversation_id, :iid1 AS item_id, :ts1 AS added_at FROM dual) s \
              ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
-             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = s.tenant \
+             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = :ex0 \
              WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
-             VALUES (s.conversation_id, s.item_id, s.added_at, s.tenant)"
+             VALUES (s.conversation_id, s.item_id, s.added_at, :ex0)"
+        );
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(!source.contains(":ex0"), "{source}");
+    }
+
+    #[test]
+    fn a_batch_keeps_the_last_stamp_of_a_repeated_item() {
+        let t = |secs: i64| DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
+        let rows = last_stamp_per_item(vec![
+            ("a".to_string(), t(1)),
+            ("b".to_string(), t(2)),
+            ("a".to_string(), t(3)),
+            ("c".to_string(), t(4)),
+            ("b".to_string(), t(5)),
+        ]);
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), t(3)),
+                ("b".to_string(), t(5)),
+                ("c".to_string(), t(4)),
+            ]
         );
     }
 
