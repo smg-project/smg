@@ -6,6 +6,7 @@
 
 use std::{
     fs::{self, File},
+    io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::Path,
     process::{Command, ExitStatus, Stdio},
@@ -22,7 +23,7 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
 struct Launch {
     /// The exit status; `None` when the gateway had to be killed.
     status: Option<ExitStatus>,
-    /// Whether its port accepted a connection at any point.
+    /// Whether the gateway answered `GET /health` on its port at any point.
     listened: bool,
     /// Its stdout and stderr.
     log: String,
@@ -61,7 +62,7 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
         if let Some(status) = child.try_wait().expect("poll the gateway") {
             break Some(status);
         }
-        listened = TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok();
+        listened = answers_health(&address);
         if listened || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
@@ -74,6 +75,26 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
         listened,
         log: fs::read_to_string(log_path).unwrap_or_default(),
     }
+}
+
+/// Whether the gateway answers `GET /health` with 200 on `address`: the
+/// positive proof that the gateway itself serves there, where a bare connect
+/// would also pass for another process that took the port in the gap after
+/// `free_ports` released it.
+fn answers_health(address: &SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(address, Duration::from_millis(200)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut head = [0u8; 64];
+    let read = stream.read(&mut head).unwrap_or(0);
+    head[..read].starts_with(b"HTTP/1.1 200")
 }
 
 /// Zero is refused before anything listens, with the field in the error and
