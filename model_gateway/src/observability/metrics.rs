@@ -844,6 +844,10 @@ pub(crate) fn init_metrics() {
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
     );
+    describe_counter!(
+        "smg_responses_not_stored_total",
+        "Responses with store: true whose record or conversation linking was not written, by mode (foreground: the request was answered with the failure; background: the record keeps what it had) and step (record: nothing is stored; linking: the record is stored, its items are not in the conversation)"
+    );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
@@ -1410,6 +1414,18 @@ impl Metrics {
             "smg_responses_stream_failures_total",
             "model" => model,
             "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// A `store: true` response whose record (`step` record: nothing is
+    /// stored) or conversation linking (`step` linking) was not written, by
+    /// `mode` (foreground, background).
+    pub fn record_response_not_stored(mode: &'static str, step: &'static str) {
+        counter!(
+            "smg_responses_not_stored_total",
+            "mode" => mode,
+            "step" => step
         )
         .increment(1);
     }

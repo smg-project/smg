@@ -1231,7 +1231,8 @@ mod tests {
             &request,
             None,
         )
-        .await;
+        .await
+        .expect("nothing is reported to the caller here");
         assert_eq!(
             stored_status(&storage, "resp_1").await,
             "completed",
@@ -1313,7 +1314,8 @@ mod tests {
             &request,
             None,
         )
-        .await;
+        .await
+        .expect("nothing is reported to the caller here");
         assert_eq!(
             stored_status(&storage, "resp_1").await,
             "cancelled",

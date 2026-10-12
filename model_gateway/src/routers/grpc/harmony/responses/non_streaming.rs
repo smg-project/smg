@@ -34,7 +34,7 @@ use crate::{
         grpc::{
             common::responses::{
                 collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
-                utils::resolve_function_identity, ResponsesContext,
+                utils::resolve_function_identity, NotStored, ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
@@ -90,7 +90,8 @@ pub(crate) async fn serve_harmony_responses(
         response.id = response_id;
     }
 
-    // Persist response to storage if store=true
+    // Persist response to storage if store=true; a foreground response the
+    // client expects stored is answered as stored or not at all.
     persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
@@ -99,7 +100,8 @@ pub(crate) async fn serve_harmony_responses(
         &original_request,
         ctx.request_context.clone(),
     )
-    .await;
+    .await
+    .map_err(NotStored::into_response)?;
 
     Ok(response)
 }

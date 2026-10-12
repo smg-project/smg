@@ -34,7 +34,7 @@ use crate::{
         error,
         grpc::common::responses::{
             collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
-            ResponsesContext,
+            NotStored, ResponsesContext,
         },
     },
 };
@@ -72,7 +72,8 @@ pub(super) async fn route_responses_internal(
         execute_without_mcp(ctx, &modified_request, &request, params).await?
     };
 
-    // 5. Persist response to storage if store=true
+    // 5. Persist response to storage if store=true; a foreground response the
+    // client expects stored is answered as stored or not at all.
     persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
@@ -81,7 +82,8 @@ pub(super) async fn route_responses_internal(
         &request,
         ctx.request_context.clone(),
     )
-    .await;
+    .await
+    .map_err(NotStored::into_response)?;
 
     Ok(responses_response)
 }

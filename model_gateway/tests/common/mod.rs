@@ -39,7 +39,7 @@ use smg::{
     workflow::Job,
 };
 use smg_data_connector::{
-    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, StorageBundle,
 };
 #[allow(unused_imports)]
 pub use test_config::{TestRouterConfig, TestWorkerConfig};
@@ -411,6 +411,7 @@ async fn build_test_app_context(
     tool_parser_factory: Option<ToolParserFactory>,
     rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
     mcp_config: smg_mcp::McpConfig,
+    storages: Option<StorageBundle>,
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
 
@@ -442,10 +443,17 @@ async fn build_test_app_context(
         config.routing_key_override.clone(),
     ));
 
-    // Initialize storage backends (Memory for tests).
-    let response_storage = Arc::new(MemoryResponseStorage::new());
-    let conversation_storage = Arc::new(MemoryConversationStorage::new());
-    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+    // Initialize storage backends (Memory for tests, unless the caller brought
+    // its own: a history store that is down, for one).
+    let StorageBundle {
+        response_storage,
+        conversation_storage,
+        conversation_item_storage,
+    } = storages.unwrap_or_else(|| StorageBundle {
+        response_storage: Arc::new(MemoryResponseStorage::new()),
+        conversation_storage: Arc::new(MemoryConversationStorage::new()),
+        conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
+    });
 
     // Initialize load monitor
     let worker_monitor = Some(Arc::new(WorkerMonitor::new(
@@ -590,6 +598,34 @@ pub fn create_test_context_with_tokenizer_registry(
             Some(ToolParserFactory::new()),
             tenant_rate_limit_manager,
             empty_mcp_config(),
+            None,
+        )
+        .await
+    })
+}
+
+/// `create_test_context_with_tokenizer_registry` over the caller's storage
+/// backends instead of the in-memory ones.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+pub fn create_test_context_with_storages(
+    config: RouterConfig,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    storages: StorageBundle,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    Box::pin(async move {
+        let tenant_rate_limit_manager = smg::rate_limit::RateLimitManager::from_config(&config)
+            .expect("tenant rate limit config should be valid");
+        build_test_app_context(
+            config,
+            tokenizer_registry,
+            Some(ReasoningParserFactory::new()),
+            Some(ToolParserFactory::new()),
+            tenant_rate_limit_manager,
+            empty_mcp_config(),
+            Some(storages),
         )
         .await
     })
@@ -606,6 +642,7 @@ pub fn create_test_context_with_parsers(
         Some(ToolParserFactory::new()),
         None,
         empty_mcp_config(),
+        None,
     ))
 }
 
@@ -630,6 +667,7 @@ pub fn create_test_context_with_mcp_config(
             None,
             None,
             mcp_config,
+            None,
         )
         .await
     })
