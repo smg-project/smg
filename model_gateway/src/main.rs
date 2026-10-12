@@ -1519,18 +1519,19 @@ fn parse_role_mapping(mapping: &str) -> Option<(String, Role)> {
     Some((idp_role, gateway_role))
 }
 
-/// Parse control plane API key from CLI format "id:name:role:key"
-#[expect(
-    clippy::print_stderr,
-    reason = "pre-logger CLI argument parsing warnings"
-)]
-fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
+/// Parse a control-plane API key from CLI format "id:name:role:key". A
+/// malformed entry is a configuration error, never a dropped key: a dropped
+/// key would leave the control plane open (or lock an operator out) with
+/// nothing but a stderr line to show for it. The entry is not echoed, since
+/// it carries the credential.
+fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
     let parts: Vec<&str> = key_str.splitn(4, ':').collect();
     if parts.len() != 4 {
-        eprintln!(
-            "WARNING: Invalid control-plane-api-key format '{key_str}'. Expected 'id:name:role:key'"
-        );
-        return None;
+        return Err(ConfigError::InvalidValue {
+            field: "control-plane-api-keys".to_string(),
+            value: "<redacted>".to_string(),
+            reason: "expected 'id:name:role:key'".to_string(),
+        });
     }
     let id = parts[0];
     let name = parts[1];
@@ -1541,14 +1542,15 @@ fn parse_control_plane_api_key(key_str: &str) -> Option<ApiKeyEntry> {
         "admin" => Role::Admin,
         "user" => Role::User,
         other => {
-            eprintln!(
-                "WARNING: Invalid role '{other}' in control-plane-api-key. Valid roles: admin, user"
-            );
-            return None;
+            return Err(ConfigError::InvalidValue {
+                field: "control-plane-api-keys".to_string(),
+                value: "<redacted>".to_string(),
+                reason: format!("unknown role '{other}'; valid roles: admin, user"),
+            });
         }
     };
 
-    Some(ApiKeyEntry::new(id, name, key, role))
+    Ok(ApiKeyEntry::new(id, name, key, role))
 }
 
 /// Parse a tenant-scoped data-plane API key from CLI format "tenant_id:key".
@@ -1573,9 +1575,11 @@ fn parse_tenant_api_key(key_str: &str) -> ConfigResult<TenantApiKeyEntry> {
 }
 
 impl CliArgs {
-    /// Build control plane authentication configuration from CLI args.
-    #[expect(clippy::print_stderr, reason = "pre-logger CLI configuration warnings")]
-    fn build_control_plane_auth_config(&self) -> ControlPlaneAuthConfig {
+    /// Build control plane authentication configuration from CLI args. A
+    /// configuration that asks for authentication but cannot be honoured
+    /// (a malformed key entry, an issuer without an audience or the reverse)
+    /// is an error: silently dropping it would start the control plane open.
+    fn build_control_plane_auth_config(&self) -> ConfigResult<ControlPlaneAuthConfig> {
         // Build JWT config if issuer and audience are provided
         let jwt = match (&self.jwt_issuer, &self.jwt_audience) {
             (Some(issuer), Some(audience)) => {
@@ -1594,28 +1598,30 @@ impl CliArgs {
                 Some(jwt_config)
             }
             (Some(_), None) => {
-                eprintln!("WARNING: --jwt-issuer provided but --jwt-audience is missing. JWT auth disabled.");
-                None
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--jwt-issuer requires --jwt-audience (control-plane JWT authentication would otherwise be silently disabled)".to_string(),
+                });
             }
             (None, Some(_)) => {
-                eprintln!("WARNING: --jwt-audience provided but --jwt-issuer is missing. JWT auth disabled.");
-                None
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--jwt-audience requires --jwt-issuer (control-plane JWT authentication would otherwise be silently disabled)".to_string(),
+                });
             }
             (None, None) => None,
         };
 
-        // Build API keys from CLI args
-        let api_keys: Vec<ApiKeyEntry> = self
+        // Build API keys from CLI args; one malformed entry refuses the start
+        let api_keys = self
             .control_plane_api_keys
             .iter()
-            .filter_map(|k| parse_control_plane_api_key(k))
-            .collect();
+            .map(|k| parse_control_plane_api_key(k))
+            .collect::<ConfigResult<Vec<ApiKeyEntry>>>()?;
 
-        ControlPlaneAuthConfig {
+        Ok(ControlPlaneAuthConfig {
             jwt,
             api_keys,
             audit_enabled: !self.disable_audit_logging,
-        }
+        })
     }
 
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
@@ -2396,7 +2402,7 @@ impl CliArgs {
 
         // Build control plane auth config
         let control_plane_auth = {
-            let config = self.build_control_plane_auth_config();
+            let config = self.build_control_plane_auth_config()?;
             if config.is_enabled() {
                 Some(config)
             } else {
@@ -2720,6 +2726,67 @@ mod tests {
                 "args {args:?}"
             );
         }
+    }
+
+    /// A malformed `--control-plane-api-keys` entry or an unknown role used to
+    /// be dropped with a stderr line, which started the control plane open:
+    /// every such entry is now a configuration error, a valid one still works.
+    #[test]
+    fn control_plane_api_key_entries_fail_closed() {
+        for bad in [
+            &["--control-plane-api-keys", "bad"][..],
+            &["--control-plane-api-keys", "i:n:bogus:s3cr3t"][..],
+            &["--control-plane-api-keys", ""][..],
+            &[
+                "--control-plane-api-keys",
+                "i:n:admin:s3cr3t",
+                "--control-plane-api-keys",
+                "bad",
+            ][..],
+        ] {
+            let err = cli_args_from(bad)
+                .build_control_plane_auth_config()
+                .expect_err("a malformed control-plane key entry must refuse the start");
+            let text = err.to_string();
+            assert!(text.contains("control-plane-api-keys"), "{bad:?}: {text}");
+            assert!(
+                !text.contains("s3cr3t") && !text.contains("'bad'"),
+                "the entry (it carries the credential) must not be echoed: {text}"
+            );
+        }
+        let config = cli_args_from(&["--control-plane-api-keys", "i:n:admin:s3cr3t"])
+            .build_control_plane_auth_config()
+            .expect("a valid entry");
+        assert!(config.is_enabled());
+        assert_eq!(config.api_keys.len(), 1);
+    }
+
+    /// `--jwt-issuer` without `--jwt-audience` (and the reverse) used to
+    /// disable JWT authentication silently; both halves are required together.
+    #[test]
+    fn jwt_issuer_and_audience_are_required_together() {
+        assert!(cli_args_from(&["--jwt-issuer", "https://issuer.example"])
+            .build_control_plane_auth_config()
+            .is_err());
+        assert!(cli_args_from(&["--jwt-audience", "aud"])
+            .build_control_plane_auth_config()
+            .is_err());
+        let config = cli_args_from(&[
+            "--jwt-issuer",
+            "https://issuer.example",
+            "--jwt-audience",
+            "aud",
+            "--jwt-jwks-uri",
+            "https://issuer.example/jwks",
+        ])
+        .build_control_plane_auth_config()
+        .expect("a complete JWT configuration");
+        assert!(config.jwt.is_some());
+        assert!(cli_args_from(&[])
+            .build_control_plane_auth_config()
+            .expect("no auth configured")
+            .jwt
+            .is_none());
     }
 
     /// A grouped ZMQ handshake needs at least one engine, so `0` (and any
