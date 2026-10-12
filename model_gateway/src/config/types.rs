@@ -80,6 +80,17 @@ pub struct RouterConfig {
     /// `0` disables the watchdog.
     #[serde(default = "default_stream_body_stall_timeout_secs")]
     pub stream_body_stall_timeout_secs: u64,
+    /// Close a connection that has not delivered a complete request head
+    /// within this many seconds of being accepted, and a keep-alive
+    /// connection whose next request head stalls for this long after its
+    /// first byte. `0` disables the bound.
+    #[serde(default = "default_header_read_timeout_secs")]
+    pub header_read_timeout_secs: u64,
+    /// Close a keep-alive connection that has had no request in flight for
+    /// this many seconds; an open streaming response counts as in flight.
+    /// `0` keeps idle connections until the client closes them.
+    #[serde(default = "default_idle_connection_timeout_secs")]
+    pub idle_connection_timeout_secs: u64,
     pub request_timeout_secs: u64,
     /// Idle timeout for pooled upstream connections. Must stay below the
     /// backend HTTP server's keep-alive timeout (the engines default to
@@ -1151,6 +1162,14 @@ fn default_stream_body_stall_timeout_secs() -> u64 {
     300
 }
 
+fn default_header_read_timeout_secs() -> u64 {
+    30
+}
+
+fn default_idle_connection_timeout_secs() -> u64 {
+    90
+}
+
 fn default_max_buffered_request_bytes() -> u64 {
     1_048_576
 }
@@ -1529,6 +1548,8 @@ impl Default for RouterConfig {
             max_payload_size: 536_870_912, // 512MB
             max_buffered_request_bytes: default_max_buffered_request_bytes(),
             stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
+            header_read_timeout_secs: default_header_read_timeout_secs(),
+            idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             request_timeout_secs: 1800, // 30 minutes
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -1957,6 +1978,29 @@ mod tests {
                 .build_unchecked();
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn test_connection_timeouts_serde_default_and_roundtrip() {
+        // Config files predating the fields deserialize to the defaults.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("header_read_timeout_secs").unwrap();
+        object.remove("idle_connection_timeout_secs").unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.header_read_timeout_secs, 30);
+        assert_eq!(without.idle_connection_timeout_secs, 90);
+
+        // The disabling zero round-trips instead of reverting to the default.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .header_read_timeout_secs(0)
+            .idle_connection_timeout_secs(0)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.header_read_timeout_secs, 0);
+        assert_eq!(with.idle_connection_timeout_secs, 0);
     }
 
     #[test]

@@ -1805,6 +1805,8 @@ class TestRouterArgsFieldOrder:
         "discovery_check_interval_secs",
         "max_background_responses",
         "power_of_two_load_metric",
+        "header_read_timeout_secs",
+        "idle_connection_timeout_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1867,11 +1869,35 @@ class TestRouterArgsFieldOrder:
             "tokenizer_cache_l0_max_memory",
             "max_background_responses",
             "power_of_two_load_metric",
+            "header_read_timeout_secs",
+            "idle_connection_timeout_secs",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"
             )
+
+
+class TestConnectionTimeouts:
+    """The HTTP edge's connection-level timeouts: their defaults and the
+    disabling zero."""
+
+    def test_defaults(self):
+        args = parse_router_args([])
+        assert args.header_read_timeout_secs == 30
+        assert args.idle_connection_timeout_secs == 90
+
+    def test_flags_parse_and_zero_disables(self):
+        args = parse_router_args(
+            [
+                "--header-read-timeout-secs",
+                "5",
+                "--idle-connection-timeout-secs",
+                "0",
+            ]
+        )
+        assert args.header_read_timeout_secs == 5
+        assert args.idle_connection_timeout_secs == 0
 
 
 class TestPrometheusHostDefault:

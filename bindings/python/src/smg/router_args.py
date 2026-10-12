@@ -348,6 +348,10 @@ class RouterArgs:
     # the foreground); appended last for the same reason
     max_background_responses: int = 1024
     power_of_two_load_metric: str = "expected_wait"
+    # HTTP edge: seconds to receive a complete request head, and seconds a
+    # keep-alive connection may sit with no request in flight (0 disables)
+    header_read_timeout_secs: int = 30
+    idle_connection_timeout_secs: int = 90
 
     @staticmethod
     def add_cli_args(
@@ -1500,6 +1504,28 @@ class RouterArgs:
             type=int,
             default=RouterArgs.shutdown_grace_period_secs,
             help="Grace period in seconds to wait for in-flight requests during shutdown",
+        )
+        request_group.add_argument(
+            f"--{prefix}header-read-timeout-secs",
+            type=int,
+            default=RouterArgs.header_read_timeout_secs,
+            help=(
+                "Close a connection that has not sent a complete request head"
+                " within this many seconds of being accepted (and a keep-alive"
+                " connection whose next request head stalls for this long after"
+                " its first byte). 0 disables"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}idle-connection-timeout-secs",
+            type=int,
+            default=RouterArgs.idle_connection_timeout_secs,
+            help=(
+                "Close a keep-alive connection that has had no request in flight"
+                " for this many seconds; an open streaming response counts as in"
+                " flight. 0 keeps idle connections open until the client closes"
+                " them"
+            ),
         )
         request_group.add_argument(
             f"--{prefix}trust-tenant-header",

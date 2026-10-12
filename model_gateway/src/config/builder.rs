@@ -227,6 +227,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn header_read_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.header_read_timeout_secs = secs;
+        self
+    }
+
+    pub fn idle_connection_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.idle_connection_timeout_secs = secs;
+        self
+    }
+
     pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.upstream_pool_idle_timeout_secs = secs;
         self

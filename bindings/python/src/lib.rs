@@ -539,6 +539,8 @@ struct Router {
     cache_boundaries: Vec<usize>,
     cache_index: String,
     cache_ttl_secs: u64,
+    header_read_timeout_secs: u64,
+    idle_connection_timeout_secs: u64,
     job_queue_capacity: usize,
     job_queue_concurrency: usize,
     worker_overload_waiting_requests: Option<usize>,
@@ -1110,6 +1112,8 @@ impl Router {
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
@@ -1340,6 +1344,8 @@ impl Router {
         jemalloc_prof_dir = None,
         tokenizer_cache_l0_max_memory = 268435456,
         max_background_responses = 1024,
+        header_read_timeout_secs = 30,
+        idle_connection_timeout_secs = 90,
         // Keyword-only, so it never takes a positional slot.
         *,
         mesh_tls_ca_cert = None,
@@ -1534,6 +1540,8 @@ impl Router {
         jemalloc_prof_dir: Option<String>,
         tokenizer_cache_l0_max_memory: usize,
         max_background_responses: usize,
+        header_read_timeout_secs: u64,
+        idle_connection_timeout_secs: u64,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
@@ -1711,6 +1719,8 @@ impl Router {
             cache_boundaries,
             cache_index,
             cache_ttl_secs,
+            header_read_timeout_secs,
+            idle_connection_timeout_secs,
             job_queue_capacity,
             job_queue_concurrency,
             worker_overload_waiting_requests,

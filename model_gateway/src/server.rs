@@ -45,6 +45,8 @@ use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
+pub mod connection_timeouts;
+
 use crate::{
     app_context::AppContext,
     config::RouterConfig,
@@ -66,6 +68,7 @@ use crate::{
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
+    server::connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
@@ -1844,6 +1847,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         // Phase 3: Teardown proceeds after axum server stops (in the main task)
     });
 
+    // Bounds on connections that carry no request (a head that never
+    // arrives or stalls, an idle keep-alive connection); a request in flight,
+    // an open streaming response included, is never cut here.
+    let connection_timeouts = ConnectionTimeouts::from_secs(
+        config.router_config.header_read_timeout_secs,
+        config.router_config.idle_connection_timeout_secs,
+    );
+    info!(
+        header_read_timeout_secs = config.router_config.header_read_timeout_secs,
+        idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
+        "HTTP connection timeouts (0 = disabled)"
+    );
+
     let server_result = if let (Some(cert), Some(key)) = (
         &config.router_config.server_cert,
         &config.router_config.server_key,
@@ -1854,11 +1870,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| format!("Failed to create TLS config: {e}"))?;
 
         axum_server::bind_rustls(addr, tls_config)
+            .map(|acceptor| ConnectionTimeoutAcceptor::new(acceptor, connection_timeouts))
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
-        bind_http_server(addr)
+        bind_http_server(addr, connection_timeouts)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -1882,12 +1899,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 }
 
 /// Disable Nagle buffering on accepted plain-HTTP sockets so small streaming
-/// writes need not wait for outstanding data to be acknowledged. This changes
-/// neither HTTP payloads nor the separately configured TLS listener.
+/// writes need not wait for outstanding data to be acknowledged, and bound the
+/// connections that carry no request (see [`connection_timeouts`]). This
+/// changes no HTTP payload; the separately configured TLS listener applies the
+/// same bounds around its handshake acceptor.
 fn bind_http_server(
     addr: std::net::SocketAddr,
-) -> axum_server::Server<std::net::SocketAddr, axum_server::accept::NoDelayAcceptor> {
-    axum_server::bind(addr).acceptor(axum_server::accept::NoDelayAcceptor::new())
+    timeouts: ConnectionTimeouts,
+) -> axum_server::Server<
+    std::net::SocketAddr,
+    ConnectionTimeoutAcceptor<axum_server::accept::NoDelayAcceptor>,
+> {
+    axum_server::bind(addr).acceptor(ConnectionTimeoutAcceptor::new(
+        axum_server::accept::NoDelayAcceptor::new(),
+        timeouts,
+    ))
 }
 
 #[expect(
@@ -2426,14 +2452,14 @@ mod tests {
             socket.set_nodelay(false).unwrap();
             assert!(!socket.nodelay().unwrap());
             let service = Arc::new(());
-            let server = bind_http_server(addr);
+            let server = bind_http_server(addr, ConnectionTimeouts::disabled());
             let (socket, returned_service) = server
                 .get_ref()
                 .accept(socket, service.clone())
                 .await
                 .unwrap();
-            assert!(socket.nodelay().unwrap());
-            assert!(Arc::ptr_eq(&service, &returned_service));
+            assert!(socket.get_ref().nodelay().unwrap());
+            assert!(Arc::ptr_eq(&service, &returned_service.into_inner()));
         })
         .await
         .expect("plain HTTP acceptor test timed out");
@@ -2457,9 +2483,12 @@ mod tests {
                         ]))
                     }),
                 );
-            let serving = bind_http_server("127.0.0.1:0".parse().unwrap())
-                .handle(handle.clone())
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
+            let serving = bind_http_server(
+                "127.0.0.1:0".parse().unwrap(),
+                ConnectionTimeouts::disabled(),
+            )
+            .handle(handle.clone())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>());
             let checking = async {
                 let addr = handle.listening().await.expect("HTTP server did not bind");
                 let client = crate::http_client::client_builder()

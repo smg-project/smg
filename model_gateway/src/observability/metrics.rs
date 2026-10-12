@@ -270,6 +270,10 @@ pub(crate) fn init_metrics() {
         "Currently active HTTP connections"
     );
     describe_counter!(
+        "smg_http_connection_timeouts_total",
+        "HTTP connections closed for carrying no request, by the timeout that closed them (header_read, idle)"
+    );
+    describe_counter!(
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
@@ -1302,6 +1306,16 @@ impl Metrics {
             "path" => path_interned,
             "status_code" => status_str,
             "error_code" => error_interned
+        )
+        .increment(1);
+    }
+
+    /// Record a connection closed by one of the HTTP edge's connection
+    /// timeouts (`header_read` or `idle`).
+    pub fn record_http_connection_timeout(timeout: &'static str) {
+        counter!(
+            "smg_http_connection_timeouts_total",
+            "timeout" => timeout
         )
         .increment(1);
     }

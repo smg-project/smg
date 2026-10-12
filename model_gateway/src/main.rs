@@ -986,6 +986,19 @@ struct CliArgs {
     #[arg(long, default_value_t = 300, help_heading = "Request Handling")]
     stream_body_stall_timeout_secs: u64,
 
+    /// Close a connection that has not sent a complete request head within
+    /// this many seconds of being accepted (and a keep-alive connection whose
+    /// next request head stalls for this long after its first byte). 0
+    /// disables
+    #[arg(long, default_value_t = 30, help_heading = "Request Handling")]
+    header_read_timeout_secs: u64,
+
+    /// Close a keep-alive connection that has had no request in flight for
+    /// this many seconds; an open streaming response counts as in flight. 0
+    /// keeps idle connections open until the client closes them
+    #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
+    idle_connection_timeout_secs: u64,
+
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
@@ -2210,6 +2223,8 @@ impl CliArgs {
             .max_payload_size(self.max_payload_size)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .request_timeout_secs(self.request_timeout_secs)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -2855,6 +2870,25 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
+    }
+
+    /// The connection-level timeouts of the HTTP edge are router settings
+    /// and must flow into `RouterConfig`, with zero kept as "disabled".
+    #[test]
+    fn connection_timeout_flags_flow_into_router_config() {
+        let cli = cli_args_from(&[
+            "--header-read-timeout-secs",
+            "5",
+            "--idle-connection-timeout-secs",
+            "0",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.header_read_timeout_secs, 5);
+        assert_eq!(router_config.idle_connection_timeout_secs, 0);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.header_read_timeout_secs, 30);
+        assert_eq!(defaults.idle_connection_timeout_secs, 90);
     }
 
     #[test]
