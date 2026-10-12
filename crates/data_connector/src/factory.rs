@@ -402,6 +402,7 @@ mod tests {
                 oracle: None,
                 postgres,
                 redis,
+                memory: None,
                 hook: None,
             }),
         )
