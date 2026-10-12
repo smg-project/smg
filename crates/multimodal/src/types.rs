@@ -770,6 +770,89 @@ mod tests {
     }
 
     #[test]
+    fn capped_decode_does_not_wait_for_its_own_pool() {
+        use std::{
+            process::Command,
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        const CHILD: &str = "SMG_CAPPED_DECODE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate the process-wide pool and bound a deadlock regression.
+            let mut child = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "types::tests::capped_decode_does_not_wait_for_its_own_pool",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .spawn()
+                .expect("start child");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().expect("child status") {
+                    assert!(status.success(), "shared capped decode failed: {status}");
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().expect("kill blocked child");
+                    child.wait().expect("reap child");
+                    panic!("shared capped decode blocked the vision pool");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        execution::configure_parallelism(execution::Parallelism::Pool(
+            std::num::NonZeroUsize::new(2).expect("two threads"),
+        ))
+        .expect("configure isolated pool");
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(2048, 1024)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode RGB fixture");
+        let frame = ImageFrame::encoded(
+            encoded.into_inner().into(),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(1008, 504),
+            Some(1008),
+        );
+        let (initializing_tx, initializing_rx) = mpsc::channel();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let frame = &frame;
+            let initializer = threads.spawn(move || {
+                frame
+                    .decoded
+                    .get_or_try_init(|| {
+                        initializing_tx.send(()).expect("initializer ready");
+                        for _ in 0..2 {
+                            waiting_rx.recv().expect("pool waiter ready");
+                        }
+                        decode_image_bytes(&frame.raw_bytes, frame.max_long_side_pixel)
+                    })
+                    .expect("decode and cap")
+            });
+            initializing_rx.recv().expect("initializer owns the cell");
+            // Independent callers can wait on the same frame even though
+            // decode_all deduplicates frames within each individual batch.
+            execution::scope(|spawner| {
+                for _ in 0..2 {
+                    let waiting_tx = &waiting_tx;
+                    spawner.spawn(move |_| {
+                        waiting_tx.send(()).expect("pool waiter ready");
+                        assert_eq!(frame.image().expect("shared decode").width(), 1008);
+                    });
+                }
+            });
+            assert_eq!(initializer.join().expect("initializer").height(), 504);
+        });
+    }
+
+    #[test]
     fn decode_all_decodes_a_repeated_frame_once() {
         let first = Arc::new(encoded_fixture());
         let second = Arc::new(encoded_fixture());
