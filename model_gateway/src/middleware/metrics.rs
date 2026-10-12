@@ -301,7 +301,7 @@ mod tests {
         for (body, code) in [
             (
                 r#"{"model":"m","messages":[{"role":"user","con"#,
-                "json_parse_error",
+                "invalid_json",
             ),
             (
                 r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#,
