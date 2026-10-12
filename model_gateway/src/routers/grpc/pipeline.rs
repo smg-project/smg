@@ -2910,6 +2910,162 @@ mod request_release_tests {
         );
     }
 
+    /// The one `smg_worker_errors_total` sample of the gRPC workers of
+    /// `worker_type`, if any.
+    fn leg_worker_error_line<'a>(rendered: &'a str, worker_type: &str) -> Option<&'a str> {
+        let worker_label = format!("worker_type=\"{worker_type}\"");
+        rendered.lines().find(|line| {
+            line.starts_with("smg_worker_errors_total{")
+                && line.contains(&worker_label)
+                && line.contains("connection_mode=\"grpc\"")
+        })
+    }
+
+    /// A decode leg's stream that fails after its first frame while a
+    /// non-streamed disaggregated answer is collected is the decode worker's
+    /// failure, as it is for a streamed answer: one sample of
+    /// `smg_worker_errors_total` under the leg's labels per attempt
+    /// (`engine_error` for the engine's own report), none for the prefill leg
+    /// that completed.
+    #[test]
+    fn a_decode_leg_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed_answer() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let attempts = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let decode_calls = Arc::new(Mutex::new(Vec::new()));
+                let prefill_port = spawn_stub(GatedScheduler::default()).await;
+                let decode_port = spawn_stub(GatedScheduler {
+                    fail_mid_stream: true,
+                    seen_request_ids: Arc::clone(&decode_calls),
+                    ..Default::default()
+                })
+                .await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+                register_worker(&worker_registry, decode_port, WorkerType::Decode);
+                let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+                let components = components(worker_registry).await;
+
+                let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
+
+                assert_eq!(
+                    response.status(),
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "the engine's error ends a non-streamed answer with a 500"
+                );
+                let attempts = calls_seen(&decode_calls);
+                assert!(attempts >= 1, "the decode leg was dispatched");
+                attempts
+            })
+        });
+        let rendered = handle.render();
+        let line = leg_worker_error_line(&rendered, "decode")
+            .unwrap_or_else(|| panic!("the decode worker's failure is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"engine_error\""), "{line}");
+        assert!(
+            line.ends_with(&format!(" {attempts}")),
+            "one sample per attempt ({attempts}): {line}"
+        );
+        assert!(
+            leg_worker_error_line(&rendered, "prefill").is_none(),
+            "the prefill leg completed:\n{rendered}"
+        );
+    }
+
+    /// The prefill leg's stream, drained before the answer, counts the same
+    /// way under its own labels when it fails after its first frame; the
+    /// decode leg, dropped unread, is not charged.
+    #[test]
+    fn a_prefill_leg_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed_answer() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let prefill_port = spawn_stub(GatedScheduler {
+                    fail_mid_stream: true,
+                    ..Default::default()
+                })
+                .await;
+                let decode_port = spawn_stub(GatedScheduler::default()).await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+                register_worker(&worker_registry, decode_port, WorkerType::Decode);
+                let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+                let components = components(worker_registry).await;
+
+                let response = run_completion(pipeline, components, &fast_retry_config(1)).await;
+
+                assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+            });
+        });
+        let rendered = handle.render();
+        let line = leg_worker_error_line(&rendered, "prefill")
+            .unwrap_or_else(|| panic!("the prefill worker's failure is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"engine_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+        assert!(
+            leg_worker_error_line(&rendered, "decode").is_none(),
+            "the decode leg did not fail:\n{rendered}"
+        );
+    }
+
+    /// The streamed answer's accounting is unchanged by the legs' attribution:
+    /// a decode leg that fails mid-way is one sample, counted where the stream
+    /// is written, not a second time where it is read.
+    #[test]
+    fn a_decode_leg_that_fails_mid_way_is_counted_once_for_a_streamed_answer() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let prefill_port = spawn_stub(GatedScheduler::default()).await;
+                let decode_port = spawn_stub(GatedScheduler {
+                    fail_mid_stream: true,
+                    ..Default::default()
+                })
+                .await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+                register_worker(&worker_registry, decode_port, WorkerType::Decode);
+                let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+                let components = components(worker_registry).await;
+
+                let body = run_and_drain(
+                    pipeline,
+                    components,
+                    completion_request(true),
+                    &format!("grpc://127.0.0.1:{decode_port}"),
+                )
+                .await;
+
+                let body = String::from_utf8_lossy(&body);
+                assert!(
+                    body.contains("\"error\""),
+                    "the stream ends with the error event: {body}"
+                );
+                assert!(body.contains("data: [DONE]"), "{body}");
+            });
+        });
+        let rendered = handle.render();
+        let line = leg_worker_error_line(&rendered, "decode")
+            .unwrap_or_else(|| panic!("the decode worker's failure is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"engine_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "counted once: {line}");
+    }
+
     /// A failed first dispatch retries from the retained plan: the second
     /// attempt must send identical token ids without re-tokenizing, under a
     /// fresh per-attempt engine id, and the parsed request must already be

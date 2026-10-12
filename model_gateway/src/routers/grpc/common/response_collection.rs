@@ -237,10 +237,16 @@ async fn collect_stream_responses<S: FanoutChild>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use super::*;
-    use crate::routers::grpc::proto_wrapper::ProtoGenerateResponse;
+    use crate::{
+        routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+        worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerType},
+    };
 
     /// A stream that is already at EOF, as sequential PD hands to the
     /// streaming layer after draining prefill in the execution stage.
@@ -348,6 +354,57 @@ mod tests {
                 && counted[0].ends_with(" 1"),
             "{rendered}"
         );
+    }
+
+    /// A leg's stream failure read into a non-streamed answer is counted
+    /// under the leg's own labels, and only when it is the worker's failure.
+    #[test]
+    fn a_collected_leg_failure_counts_against_the_legs_worker_when_it_is_the_workers_failure() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-under-test:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            UpstreamClass::account_collected_failure(
+                decode.as_ref(),
+                &tonic::Status::internal(ENGINE_ERROR_MESSAGE),
+            );
+            UpstreamClass::account_collected_failure(
+                decode.as_ref(),
+                &tonic::Status::unavailable("gone"),
+            );
+            // Capacity pushback and the request's own fault are not the worker's.
+            UpstreamClass::account_collected_failure(
+                decode.as_ref(),
+                &tonic::Status::resource_exhausted("full"),
+            );
+            UpstreamClass::account_collected_failure(
+                decode.as_ref(),
+                &tonic::Status::invalid_argument("bad"),
+            );
+        }
+        let rendered = handle.render();
+        let decode_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("smg_worker_errors_total{")
+                    && line.contains(r#"worker_type="decode""#)
+                    && line.contains(r#"connection_mode="grpc""#)
+            })
+            .collect();
+        assert_eq!(decode_lines.len(), 2, "{rendered}");
+        for (error_type, count) in [("engine_error", " 1"), ("backend_error", " 1")] {
+            let line = decode_lines
+                .iter()
+                .find(|line| line.contains(&format!(r#"error_type="{error_type}""#)))
+                .unwrap_or_else(|| panic!("{error_type} is counted:\n{rendered}"));
+            assert!(line.ends_with(count), "{line}");
+        }
     }
 
     #[tokio::test]

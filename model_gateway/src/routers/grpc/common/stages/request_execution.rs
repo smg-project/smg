@@ -511,7 +511,7 @@ async fn execute_pd_dispatch(
     // `PdProtocol::for_runtime`): sequential legs relay the KV handoff
     // through the router, parallel legs rendezvous on bootstrap info
     // carried in the request.
-    match protocol.dispatch {
+    let result = match protocol.dispatch {
         PdDispatch::Sequential => {
             execute_sequential_pd(
                 proto_request,
@@ -548,6 +548,41 @@ async fn execute_pd_dispatch(
                 .await
             }
         },
+    }?;
+    Ok(attribute_pd_legs(result, workers))
+}
+
+/// Pair each leg's stream of a disaggregated dispatch with the worker it was
+/// sent to, so a failure of the stream can be charged to that worker wherever
+/// the stream is read: the streamed answer knows its legs from the request's
+/// selection, the buffered one reads the streams alone and had no worker to
+/// charge. Each response then counts as that worker's token progress for the
+/// liveness monitor, as a regular dispatch's does. The legs join no tracked
+/// pile and add no prefill backlog: those are the regular dispatch's rules,
+/// and a disaggregated request is admitted through its prefill guard. The
+/// sequential dispatch's prefill stream is drained already; the wrapper is a
+/// no-op on it.
+fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> ExecutionResult {
+    let ExecutionResult::PrefillDecode {
+        prefill,
+        decode,
+        prefill_guards,
+        pd_timing,
+        prefill_input_logprobs,
+    } = result
+    else {
+        return result;
+    };
+    let attribute = |stream: ProtoStream, worker: Option<&Arc<dyn Worker>>| match worker {
+        Some(worker) => stream.tracked(Arc::clone(worker), 0, false),
+        None => stream,
+    };
+    ExecutionResult::PrefillDecode {
+        prefill: attribute(prefill, workers.prefill_worker()),
+        decode: Box::new(attribute(*decode, workers.decode_worker())),
+        prefill_guards,
+        pd_timing,
+        prefill_input_logprobs,
     }
 }
 
