@@ -123,13 +123,15 @@ pub(crate) fn non_public_address_class(address: IpAddr) -> Option<&'static str> 
 /// translator or a relay turns into an IPv4 connection: IPv4-mapped
 /// (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`; `::` and `::1` are
 /// addresses of their own), NAT64 on the well-known prefix `64:ff9b::/96`
-/// and on the local-use `64:ff9b:1::/48` carved as a /96 (the IPv4 address
-/// in the low 32 bits, nothing between the prefix and it), and 6to4
-/// (`2002::/16`, the IPv4 address in the next 32 bits). The local-use prefix
-/// carved any other way (RFC 6052's /48, /56 and /64 layouts put the IPv4
-/// address higher, where the address alone does not say) carries no readable
-/// address here: [`non_public_address_class`] refuses it outright rather
-/// than read the low bits as a public address.
+/// and on `64:ff9b:1::/96` of the local-use `64:ff9b:1::/48`, and 6to4
+/// (`2002::/16`, the IPv4 address in the next 32 bits). The rest of the
+/// local-use prefix carries no readable address here: RFC 6052's /48, /56
+/// and /64 layouts put the IPv4 address higher, a translator ignores the
+/// suffix bits, and the address alone does not say which layout is in use,
+/// so the low 32 bits of such an address can be made to spell any public
+/// address; [`non_public_address_class`] refuses it outright. (A /96 carved
+/// elsewhere in the local-use prefix is refused with it, under the strict
+/// policy.)
 fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(mapped) = address.to_ipv4_mapped() {
         return Some(mapped);
@@ -139,7 +141,7 @@ fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
         [0, 0, 0, 0, 0, 0, 0, 0 | 1] => None,
         [0, 0, 0, 0, 0, 0, high, low] => Some(low_32(high, low)),
         [0x64, 0xff9b, 0, 0, 0, 0, high, low] => Some(low_32(high, low)),
-        [0x64, 0xff9b, 1, _, 0, 0, high, low] => Some(low_32(high, low)),
+        [0x64, 0xff9b, 1, 0, 0, 0, high, low] => Some(low_32(high, low)),
         [0x2002, high, low, ..] => Some(low_32(high, low)),
         _ => None,
     }
@@ -428,12 +430,12 @@ mod tests {
             ("64:ff9b::a9fe:a9fe", "link-local"),
             ("64:ff9b::7f00:1", "loopback"),
             ("64:ff9b:1::a00:5", "private"),
-            ("64:ff9b:1:abcd::c0a8:101", "private"),
-            // The local-use prefix in a /64 or /48 layout: the IPv4 address
-            // sits where the address alone does not say, so it is refused
-            // whatever the low bits look like (10.0.0.1 and 127.0.0.1 in the
-            // /64 layout read 1.0.0.0 from the low bits; a public address in
-            // that layout is refused too).
+            // The local-use prefix anywhere but 64:ff9b:1::/96: the IPv4
+            // address sits where the address alone does not say, so it is
+            // refused whatever the low bits spell (10.0.0.1 and 127.0.0.1 in
+            // the /64 layout read 1.0.0.0 from the low bits; 10.1.0.0 in the
+            // /48 layout with a public address in the suffix; a public
+            // address in the /64 layout; a /96 carved at a non-zero /64).
             (
                 "64:ff9b:1:1:a:0:100:0",
                 "NAT64 local-use with an unreadable layout",
@@ -443,11 +445,15 @@ mod tests {
                 "NAT64 local-use with an unreadable layout",
             ),
             (
+                "64:ff9b:1:a01::5db8:d822",
+                "NAT64 local-use with an unreadable layout",
+            ),
+            (
                 "64:ff9b:1:1:5d:b8d8:2200:0",
                 "NAT64 local-use with an unreadable layout",
             ),
             (
-                "64:ff9b:1:a00:1:0:0:0",
+                "64:ff9b:1:abcd::c0a8:101",
                 "NAT64 local-use with an unreadable layout",
             ),
             ("2002:a00:5::", "private"),
