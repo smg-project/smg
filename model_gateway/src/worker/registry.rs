@@ -1071,9 +1071,13 @@ impl WorkerRegistry {
     /// request that names `model_id`: the id itself while a worker serves it
     /// (an alias included), else [`metrics_labels::MODEL_OTHER`], so a client
     /// cannot mint label values with names the gateway does not serve.
-    /// Routing keeps the request's own id; only the label is bounded.
+    /// [`UNKNOWN_MODEL_ID`], the gateway's own wildcard for a request that
+    /// names no model and is routed to every worker, keeps its own value: it
+    /// is one fixed label, and the recorders of that traffic that run after
+    /// routing write it as it is. Routing keeps the request's own id; only
+    /// the label is bounded.
     pub fn metric_model_label<'a>(&self, model_id: &'a str) -> &'a str {
-        if self.contains_model(model_id) {
+        if model_id == UNKNOWN_MODEL_ID || self.contains_model(model_id) {
             model_id
         } else {
             metrics_labels::MODEL_OTHER
@@ -4209,7 +4213,11 @@ mod tests {
             registry.metric_model_label("ghost-1"),
             metrics_labels::MODEL_OTHER
         );
-        assert_eq!(registry.metric_model_label(UNKNOWN_MODEL_ID), "other");
+        // The gateway's own wildcard is one fixed value, kept as it is.
+        assert_eq!(
+            registry.metric_model_label(UNKNOWN_MODEL_ID),
+            UNKNOWN_MODEL_ID
+        );
 
         assert!(registry.remove(&worker_id).is_some());
         assert_eq!(registry.metric_model_label("GLM-5.2"), "other");
