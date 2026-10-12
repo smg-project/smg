@@ -782,7 +782,8 @@ impl HuggingFaceTokenizer {
     /// `prefix`, the emitted text of `ids[..prefix_index]`: the length of the
     /// text the ids before the run's first byte piece decode to; `prefix.len()`
     /// when the emitted ids end in no byte piece, or the vocabulary has none.
-    /// Cold, like [`remainder_after_rewrite`], its only caller's companion.
+    /// Cold, like [`remainder_after_rewrite`], which both of its callers (the
+    /// step and the end-of-input path) call right after it, on the rewrite path only.
     #[cold]
     #[inline(never)]
     fn streamed_run_start(
