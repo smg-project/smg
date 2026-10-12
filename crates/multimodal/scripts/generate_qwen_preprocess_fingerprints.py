@@ -5,11 +5,16 @@ The reference processors are the torchvision-backed image and video processors
 the serving engines run, constructed locally, so this script does not download
 model weights or configuration. Its output is checked into the Rust integration
 test as an external correctness oracle for resize, normalization, and patchify.
+The resize oracle is torch's antialiased `uint8` bicubic reached through
+torchvision; the document records the torch and torchvision versions it was
+generated with, since that kernel's dispatch has changed across releases.
 """
 
 import json
 
 import numpy as np
+import torch
+import torchvision
 from PIL import Image
 from PIL import __version__ as pillow_version
 from transformers import __version__ as transformers_version
@@ -127,6 +132,8 @@ def main() -> None:
     document = {
         "generator": "generate_qwen_preprocess_fingerprints.py",
         "transformers": transformers_version,
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
         "pillow": pillow_version,
         "cases": processor_cases("qwen2_vl", qwen2) + processor_cases("qwen3_vl", qwen3),
         "video_cases": [qwen3_video_case(qwen3_video)],

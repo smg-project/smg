@@ -63,6 +63,8 @@
   ],
   "generator": "generate_qwen_preprocess_fingerprints.py",
   "pillow": "12.3.0",
+  "torch": "2.13.0+cu130",
+  "torchvision": "0.28.0+cu130",
   "transformers": "5.17.0",
   "video_cases": [
     {

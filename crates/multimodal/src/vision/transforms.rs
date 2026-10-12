@@ -1506,9 +1506,9 @@ mod tests {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
     }
 
-    /// The raw-RGB video resizer must be byte-for-byte identical to the
-    /// DynamicImage PIL-bicubic resizer used for images. Guards the video resize
-    /// path used by `preprocess_video_rgb`.
+    /// The raw-RGB torchvision `uint8` resizer must be byte-for-byte identical
+    /// to the `DynamicImage` form the Qwen image path uses (the raw-RGB form
+    /// serves `preprocess_video_rgb`).
     #[test]
     fn resize_bicubic_torch_aa_rgb_matches_dynamic_path() {
         let (src_w, src_h) = (37u32, 23u32);
@@ -1538,6 +1538,9 @@ mod tests {
         );
     }
 
+    /// The raw-RGB video resizer must be byte-for-byte identical to the
+    /// DynamicImage PIL-bicubic resizer used for images. Guards the video resize
+    /// path used by `preprocess_video_rgb`.
     #[test]
     fn resize_bicubic_pil_rgb_matches_dynamic_path() {
         let (src_w, src_h) = (37u32, 23u32); // non-aligned source, non-trivial ratios

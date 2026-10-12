@@ -45,7 +45,7 @@ use crate::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-        transforms::{pil_to_filter, resize, resize_bicubic_pil, TransformError},
+        transforms::{pil_to_filter, resize, resize_bicubic_torch_aa, TransformError},
     },
 };
 
@@ -363,14 +363,17 @@ impl MiniMaxM3VisionProcessor {
             self.inner
                 .smart_resize(image.height() as usize, image.width() as usize)?;
         }
-        // The base's grid stage picks its kernel the same way, so both stages use one filter.
+        // The base's grid stage picks its kernel the same way, so both stages use
+        // one filter and, for BICUBIC, the same torchvision `uint8` kernel (the
+        // reference image processor is torchvision-backed and resizes once; this
+        // raise is the port's staging step before that resize).
         let filter = pil_to_filter(config.resampling.or(Some(3)));
         let mut staged = Vec::with_capacity(images.len());
         for image in images {
             staged.push(
                 match self.staging_dimensions(image.width(), image.height())? {
                     Some((width, height)) if filter == FilterType::CatmullRom => {
-                        resize_bicubic_pil(image, width, height)
+                        resize_bicubic_torch_aa(image, width, height)
                     }
                     Some((width, height)) => resize(image, width, height, filter),
                     None => image.clone(),
