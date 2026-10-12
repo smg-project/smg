@@ -3174,6 +3174,7 @@ mod tests {
             reasoning_parser_factory: Default::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
+            tokenizer_autoload: true,
         });
         let mut ctx = RequestContext::for_generate(
             Arc::new(request),

@@ -199,6 +199,11 @@ pub(crate) struct SharedComponents {
     pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
+    /// Whether the gateway loads tokenizers itself, at start-up and when a
+    /// worker registers. While it does, a served model without a registered
+    /// tokenizer is a transient not-ready state (the one `/readiness` reports
+    /// as "tokenizer not yet registered"), not a fault of the gateway.
+    pub tokenizer_autoload: bool,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
