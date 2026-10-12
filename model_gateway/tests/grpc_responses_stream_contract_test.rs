@@ -150,9 +150,8 @@ async fn responses_result_with_finishes(
     // (its final object is read before the terminal event): exercise real
     // storage on all of them, so a stored status that disagrees with the wire
     // (a failed tool loop stored as completed) is caught here.
-    let check_persistence = true;
     let request = serde_json::from_value(json!({
-        "model": MODEL, "input": "Hello", "stream": stream, "store": check_persistence,
+        "model": MODEL, "input": "Hello", "stream": stream, "store": true,
         "max_output_tokens": 16, "tools": tools, "max_tool_calls": max_tool_calls,
     }))
     .unwrap();
@@ -236,21 +235,19 @@ async fn responses_result_with_finishes(
         .all(|pair| pair[0]["sequence_number"].as_u64().unwrap()
             < pair[1]["sequence_number"].as_u64().unwrap()));
     let response = events.last().unwrap()["response"].clone();
-    if check_persistence {
-        let saved = context
-            .response_storage
-            .get_response(&smg_data_connector::ResponseId::from(
-                response["id"].as_str().unwrap(),
-            ))
-            .await
-            .unwrap()
-            .expect("response must be persisted");
-        assert_eq!(saved.raw_response["status"], response["status"]);
-        assert_eq!(
-            saved.raw_response["error"], response["error"],
-            "persisted error must match the wire response"
-        );
-    }
+    let saved = context
+        .response_storage
+        .get_response(&smg_data_connector::ResponseId::from(
+            response["id"].as_str().unwrap(),
+        ))
+        .await
+        .unwrap()
+        .expect("response must be persisted");
+    assert_eq!(saved.raw_response["status"], response["status"]);
+    assert_eq!(
+        saved.raw_response["error"], response["error"],
+        "persisted error must match the wire response"
+    );
     (response, events)
 }
 
