@@ -182,8 +182,9 @@ router:
   #    no healthy worker, while a tokenizer is not yet registered and while it
   #    drains after SIGTERM, so traffic is steered away from such a pod. A
   #    router whose workers are registered at runtime through the admin API
-  #    (none configured below) stays unready until the first one is: set
-  #    `path: /health` there, or register through a port-forward to the pod.
+  #    (no `workers`, `router.workerUrls` or `router.serviceDiscovery`
+  #    configured) stays unready until the first one is: set `path: /health`
+  #    there, or register through a port-forward to the pod.
   readinessProbe:
     path: /readiness
     initialDelaySeconds: 5
