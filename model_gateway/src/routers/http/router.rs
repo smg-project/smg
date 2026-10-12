@@ -4195,20 +4195,7 @@ mod tests {
     /// the success first closes it and the cut leaves it closed (one failure
     /// under the threshold of two); the cut first opens it again.
     fn half_open_worker(url: &str) -> crate::worker::BasicWorker {
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(WorkerType::Regular)
-            .health_config(no_health_check())
-            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
-                failure_threshold: 2,
-                success_threshold: 1,
-                timeout_duration: Duration::ZERO,
-                ..Default::default()
-            })
-            .build();
-        worker.record_circuit_breaker_outcome(false);
-        worker.record_circuit_breaker_outcome(false);
-        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
-        worker
+        half_open_worker_closing_after(url, 1)
     }
 
     /// A half-open worker at `url` whose breaker closes only after `successes`
