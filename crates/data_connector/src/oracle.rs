@@ -1215,6 +1215,31 @@ impl OracleResponseStorage {
                 &[],
             )
             .map_err(map_oracle_error)?;
+
+            // The index behind `delete_unstored_older_than`: the object's status
+            // over the unstored records only (NULL, hence absent, for the rest).
+            // Built with the table, while it is empty; an existing table gets it
+            // from its operator (see the release note), and a build that fails
+            // (a busy object, an identifier too long for the release, no
+            // temporary space) leaves the sweep a scan rather than failing the
+            // start, as on Postgres.
+            if !s.is_skipped("raw_response") {
+                let col_raw = s.col("raw_response");
+                let unstored_idx = format!("{}_UNSTORED_IDX", s.table);
+                if let Err(e) = create_index_if_missing(
+                    conn,
+                    &s.table,
+                    &unstored_idx,
+                    &format!(
+                        "CREATE INDEX {unstored_idx} ON {table}({})",
+                        unstored_status_expr(col_raw)
+                    ),
+                ) {
+                    tracing::warn!(
+                        "unstored response index not created (the sweep of unstored background records scans the table): {e}"
+                    );
+                }
+            }
         }
 
         if !s.is_skipped("previous_response_id") {
@@ -1236,22 +1261,6 @@ impl OracleResponseStorage {
                 &s.table,
                 &user_idx,
                 &format!("CREATE INDEX {user_idx} ON {table}({safety})"),
-            )?;
-        }
-
-        // The index behind `delete_unstored_older_than`: the object's status
-        // over the unstored records only (NULL, hence absent, for the rest).
-        if !s.is_skipped("raw_response") {
-            let col_raw = s.col("raw_response");
-            let unstored_idx = format!("{}_UNSTORED_IDX", s.table);
-            create_index_if_missing(
-                conn,
-                &s.table,
-                &unstored_idx,
-                &format!(
-                    "CREATE INDEX {unstored_idx} ON {table}({})",
-                    unstored_status_expr(col_raw)
-                ),
             )?;
         }
 

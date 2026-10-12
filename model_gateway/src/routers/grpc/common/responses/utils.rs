@@ -586,14 +586,10 @@ mod tests {
             .build()
     }
 
-    /// `background: true` with `store: false`, the public API's probe: the
-    /// result is written over the record the client polls and nothing is
-    /// linked to the conversation; a foreground `store: false` response
-    /// stores nothing at all.
     /// A chain ending in a record its client asked not to store is no
-    /// previous response (the loaders of both model families and the
-    /// item-reference resolver share the rule); a stored chain is returned,
-    /// an unknown id refused the same way.
+    /// previous response (the loaders of both model families call this; the
+    /// item-reference resolver shares its predicate); a stored chain is
+    /// returned, an unknown id refused the same way.
     #[tokio::test]
     async fn an_unstored_record_is_no_previous_response() {
         let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
@@ -618,6 +614,11 @@ mod tests {
             .expect_err("an unknown id is refused");
         assert_eq!(unknown.status(), http::StatusCode::BAD_REQUEST);
     }
+
+    /// `background: true` with `store: false`, the public API's probe: the
+    /// result is written over the record the client polls and nothing is
+    /// linked to the conversation; a foreground `store: false` response
+    /// stores nothing at all.
 
     #[tokio::test]
     async fn an_unstored_background_response_finishes_in_its_record_and_the_history_keeps_nothing()
