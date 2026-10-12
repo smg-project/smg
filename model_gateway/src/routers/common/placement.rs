@@ -418,8 +418,12 @@ pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
 /// filter that admits only vetoed workers reads as a vetoed leg (steered,
 /// or shed under `--worker-overload-shed`) and not as an unavailable one
 /// because a worker the request may not use is idle. A narrowing that
-/// admits nothing is left out: the wire's exclusion keeps the leg's own
-/// verdict as before, and a filter's is the caller's to name.
+/// admits nothing is left out: a wire no worker of the leg is on keeps the
+/// leg's own verdict as before, judged over every worker and without the
+/// filter (a filter narrowed over workers the retry cannot use would turn
+/// that verdict into a shed over another wire's overloaded workers), and a
+/// filter that admits none of the workers on the wire is the caller's to
+/// name.
 fn admitted_leg(
     leg: &[Arc<dyn Worker>],
     wire: Option<WireConstraint>,
@@ -430,18 +434,17 @@ fn admitted_leg(
     }
     let narrowed = |workers: &[Arc<dyn Worker>], keep: &dyn Fn(&Arc<dyn Worker>) -> bool| {
         let kept: Vec<Arc<dyn Worker>> = workers.iter().filter(|w| keep(w)).cloned().collect();
-        if kept.is_empty() {
-            workers.to_vec()
-        } else {
-            kept
-        }
+        (!kept.is_empty()).then_some(kept)
     };
-    let on_wire = narrowed(leg, &|w| WireConstraint::admits(wire, w.as_ref()));
+    let Some(on_wire) = narrowed(leg, &|w| WireConstraint::admits(wire, w.as_ref())) else {
+        return leg.to_vec();
+    };
     narrowed(&on_wire, &|w| {
         inputs
             .candidate_filter
             .is_none_or(|accepts| accepts(w.as_ref()))
     })
+    .unwrap_or(on_wire)
 }
 
 /// The steering default for a disaggregated placement whose failed leg is
@@ -1445,6 +1448,51 @@ mod tests {
         assert!(
             matches!(failure.verdict, PlacementFailure::AllOverloaded(_)),
             "{:?}",
+            failure.verdict
+        );
+    }
+
+    /// A retry whose pinned wire no prefill worker is on keeps the leg's own
+    /// verdict (unavailable: nothing the retry can use), whatever the filter
+    /// would keep of the other wire's workers: an overloaded worker the retry
+    /// cannot use is no reason to shed.
+    #[test]
+    fn a_leg_with_no_worker_on_the_pinned_wire_keeps_its_verdict_under_a_filter() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let p1 = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&p1, true);
+        registry.set_overload_shed(true);
+        // The retry's plan was built for a runtime none of the workers run.
+        let other_wire = Some(WireConstraint {
+            runtime: RuntimeType::Sglang,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+        });
+        let only_p1 = |w: &dyn Worker| w.url() == "grpc://p:1";
+        let failure = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs_of(&registry, &policies),
+            other_wire,
+            true,
+            None,
+            PlacementInputs {
+                candidate_filter: Some(&only_p1),
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("no worker on the wire: the pair fails");
+        assert_eq!(failure.leg, WorkerLeg::Prefill);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::Unavailable),
+            "the verdict is the leg's own, not a shed over the other wire's overloaded worker: {:?}",
             failure.verdict
         );
     }
