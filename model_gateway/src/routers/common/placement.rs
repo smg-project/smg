@@ -408,14 +408,38 @@ pub(crate) const NO_AVAILABLE_WORKERS_CODE: &str = "no_available_workers";
 /// hammer a fleet that is down and gets the same bounded hint on every path.
 pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
     let message = message.into();
-    let mut response = error::service_unavailable(NO_AVAILABLE_WORKERS_CODE, message.clone());
-    response.extensions_mut().insert(RefusalReason(message));
+    let reason = message.clone();
+    no_available_workers_because(message, reason)
+}
+
+/// [`no_available_workers`] whose line names a reason other than the
+/// client's message: the message stays the one the client has always read
+/// under the code, the line gets the verdict the router has (the policy
+/// that declined a leg, the leg at its admission limit), so the reason on
+/// the line never contradicts the pool state next to it.
+pub(crate) fn no_available_workers_because(
+    message: impl Into<String>,
+    reason: impl Into<String>,
+) -> Response {
+    let mut response = error::service_unavailable(NO_AVAILABLE_WORKERS_CODE, message.into());
+    response
+        .extensions_mut()
+        .insert(RefusalReason(reason.into()));
     mark_non_retryable(&mut response);
     response.headers_mut().insert(
         RETRY_AFTER,
         HeaderValue::from(NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS),
     );
     response
+}
+
+/// The reason a refusal's line names, when the router gave one (a
+/// `no_available_workers` 503; a 404 names none).
+pub(crate) fn refusal_reason(response: &Response) -> Option<&str> {
+    response
+        .extensions()
+        .get::<RefusalReason>()
+        .map(|reason| reason.0.as_str())
 }
 
 /// The workers of `leg` a placement may use: those on `wire` when a retry
@@ -531,17 +555,20 @@ impl Refusal {
         }
     }
 
-    /// The key the refusal's line is throttled under. A 503 is keyed by its
-    /// model: the model has workers registered, so the keys are bounded by
-    /// the registry, and one storming model never silences another's first
-    /// line. A 404's "model" is whatever name the client sent, so every
-    /// unknown name shares one allowance: a client varying the name gets no
-    /// fresh lines per name, and the one line still names one of them while
-    /// `suppressed` carries the rest.
-    fn key(self, model_id: &str) -> &str {
+    /// The key the refusal's line is throttled under. A 503 for a model with
+    /// workers registered on some leg is keyed by the model: those keys are
+    /// bounded by the registry, and one storming model never silences
+    /// another's first line. A 404's "model" is whatever name the client
+    /// sent, so every unknown name shares one allowance: a client varying
+    /// the name gets no fresh lines per name, and the one line still names
+    /// one of them while `suppressed` carries the rest. A 503 for a name
+    /// with no workers on any leg (the HTTP PD router answers a name nobody
+    /// serves with its leg's 503, not a 404) is an unknown name too and
+    /// shares one allowance with every other such name, for the same reason.
+    fn key(self, model_id: &str, registered: bool) -> &str {
         match self {
-            Self::NoAvailableWorkers => model_id,
-            Self::ModelNotFound => "",
+            Self::NoAvailableWorkers if registered => model_id,
+            Self::NoAvailableWorkers | Self::ModelNotFound => "",
         }
     }
 }
@@ -552,8 +579,9 @@ impl Refusal {
 /// with the request id, the model and the state of the pools `site` draws
 /// from, and the reason the refusal names when it has one (the leg that is
 /// down, the policy that declined), capped at [`REFUSAL_LINES_PER_SECOND`]
-/// per model for the 503 and for all unknown names together for the 404
-/// (see [`Refusal::key`]); a line past the cap is counted and the next
+/// per model with workers for the 503 and for all unknown names together
+/// (the 404, and a 503 for a name with no workers at all; see
+/// [`Refusal::key`]); a line past the cap is counted and the next
 /// admitted line of its key carries the count as `suppressed`. The response
 /// is marked [`ReportedRefusal`], so the
 /// pipeline's stage line and the access log's response line drop to DEBUG
@@ -599,12 +627,16 @@ pub(crate) fn report_refusal_under(
     };
     let message = kind.message();
     refusal.extensions_mut().insert(ReportedRefusal);
-    if let Some(admitted) = throttle.admit(kind.key(model_id)) {
+    // Whether some leg has workers for the model (see `Refusal::key`): one
+    // pool lookup per leg, no walk over the workers; the 404 needs none.
+    let registered = matches!(kind, Refusal::NoAvailableWorkers)
+        && site
+            .legs
+            .iter()
+            .any(|(_, pool)| !registry.get_routing_pool(model_id, *pool).is_empty());
+    if let Some(admitted) = throttle.admit(kind.key(model_id, registered)) {
         let pool = PoolState::of(registry, model_id, site.legs);
-        let reason = refusal
-            .extensions()
-            .get::<RefusalReason>()
-            .map(|reason| reason.0.as_str());
+        let reason = refusal_reason(&refusal);
         // The request's span carries the id too; the field is for a line
         // written outside it (a retry's re-selection) and is omitted when
         // the router has no id of its own to give.
@@ -1036,11 +1068,7 @@ pub(crate) fn select_pair(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeMap,
-        sync::Mutex,
-        time::{Duration, Instant},
-    };
+    use std::{collections::BTreeMap, sync::Mutex, time::Duration};
 
     use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
@@ -2110,7 +2138,6 @@ mod tests {
         let line = |i: usize| lines.lock().unwrap()[i].clone();
 
         // The 503, five times in one window: two lines, the model's own.
-        let opened = Instant::now();
         for _ in 0..5 {
             let refused = refuse("m1", no_available_workers("every worker is down"));
             assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2179,8 +2206,10 @@ mod tests {
         assert_eq!(count(), 4, "a new unknown name opens no fresh allowance");
 
         // The next window: the model's 503 line carries its three hidden
-        // refusals, the unknown names' line carries the one of theirs.
-        std::thread::sleep(window.saturating_sub(opened.elapsed()) + Duration::from_millis(10));
+        // refusals, the unknown names' line carries the one of theirs. A full
+        // window from here: both keys' windows opened before this point, so
+        // both are over however long the assertions above took.
+        std::thread::sleep(window + Duration::from_millis(10));
         refuse("m1", no_available_workers("every worker is down"));
         assert!(line(4).contains("suppressed=3"), "{:?}", line(4));
         refuse("m5", error::model_not_found("m5"));
@@ -2202,5 +2231,135 @@ mod tests {
         );
         assert!(unrelated.extensions().get::<ReportedRefusal>().is_none());
         assert_eq!(count(), 6);
+    }
+
+    /// A `no_available_workers` 503 for a name with no workers on any leg
+    /// (the HTTP PD router's answer for a name nobody serves) is an unknown
+    /// name: it shares one allowance with every other such name, as the 404
+    /// does, so a client rotating names opens no fresh lines per name and
+    /// the counts are not lost to the key eviction; a model with workers
+    /// keeps a key of its own.
+    #[test]
+    fn a_503_for_a_name_without_workers_shares_one_allowance_with_the_other_unknown_names() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(EventLines(tracing::Level::WARN, Arc::clone(&lines))),
+        );
+        let registry = WorkerRegistry::new();
+        let down = BasicWorkerBuilder::new("http://worker-down:8080")
+            .model(ModelCard::new("m1"))
+            .worker_type(WorkerType::Regular)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        down.set_status(WorkerStatus::NotReady);
+        registry.register(Arc::new(down)).unwrap();
+        let site = RefusalSite {
+            function: "PDRouter::execute_dual_dispatch_attempt",
+            mode: "PrefillDecode",
+            legs: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let window = Duration::from_millis(100);
+        let throttle = KeyedLogThrottle::new(2, window, REFUSAL_LOG_MODELS);
+        let refuse = |model: &str| {
+            report_refusal_under(
+                &throttle,
+                &registry,
+                site,
+                None,
+                model,
+                no_available_workers("No available servers: No prefill workers available"),
+            )
+        };
+        let count = || lines.lock().unwrap().len();
+        let line = |i: usize| lines.lock().unwrap()[i].clone();
+
+        // Three names nobody serves in one window: two lines, the third counted.
+        for name in ["x1", "x2", "x3"] {
+            let refused = refuse(name);
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(refused.extensions().get::<ReportedRefusal>().is_some());
+        }
+        assert_eq!(
+            count(),
+            2,
+            "a new name opens no fresh allowance: {:?}",
+            line(1)
+        );
+        assert!(line(0).contains("model_id=x1"), "{:?}", line(0));
+        assert!(line(1).contains("model_id=x2"), "{:?}", line(1));
+        assert!(
+            line(0).contains("pool=regular 0/0 available (0 healthy)"),
+            "{:?}",
+            line(0)
+        );
+
+        // The model with a worker registered keeps an allowance of its own.
+        refuse("m1");
+        assert_eq!(count(), 3, "{:?}", line(2));
+        assert!(line(2).contains("model_id=m1"), "{:?}", line(2));
+        assert!(
+            line(2).contains("pool=regular 0/1 available (0 healthy)"),
+            "{:?}",
+            line(2)
+        );
+
+        // The next window: the unknown names' line carries the one counted.
+        std::thread::sleep(window + Duration::from_millis(10));
+        refuse("x4");
+        assert!(line(3).contains("model_id=x4"), "{:?}", line(3));
+        assert!(line(3).contains("suppressed=1"), "{:?}", line(3));
+    }
+
+    /// A refusal's line names the reason the router gives, which may differ
+    /// from the message the client reads: the message stays the one under
+    /// the code, the line gets the verdict (here the policy that declined a
+    /// leg), so the reason never contradicts the pool state next to it.
+    #[test]
+    fn the_refusal_line_names_the_reason_the_router_gives_not_the_clients_message() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(EventLines(tracing::Level::WARN, Arc::clone(&lines))),
+        );
+        let registry = WorkerRegistry::new();
+        let idle = BasicWorkerBuilder::new("http://worker-idle:8080")
+            .model(ModelCard::new("m1"))
+            .worker_type(WorkerType::Regular)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        registry.register(Arc::new(idle)).unwrap();
+        let site = RefusalSite {
+            function: "WorkerSelectionStage::execute",
+            mode: "PrefillDecode",
+            legs: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let throttle = KeyedLogThrottle::new(2, Duration::from_secs(60), REFUSAL_LOG_MODELS);
+        let refused = no_available_workers_because(
+            "All workers for model 'm1' are unavailable (unhealthy or circuit breaker open)",
+            "Policy cache_aware failed to select a prefill worker",
+        );
+        assert_eq!(
+            refusal_reason(&refused),
+            Some("Policy cache_aware failed to select a prefill worker")
+        );
+        assert_eq!(
+            refusal_reason(&no_available_workers("every worker is down")),
+            Some("every worker is down"),
+            "without a reason of its own the line names the message"
+        );
+        assert_eq!(refusal_reason(&error::model_not_found("m2")), None);
+
+        report_refusal_under(&throttle, &registry, site, Some("req-2"), "m1", refused);
+        let line = lines.lock().unwrap()[0].clone();
+        assert!(
+            line.contains("reason=\"Policy cache_aware failed to select a prefill worker\""),
+            "{line:?}"
+        );
+        assert!(line.contains("workers=1"), "{line:?}");
     }
 }

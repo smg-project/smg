@@ -1027,9 +1027,20 @@ impl WorkerSelectionStage {
     /// per refusal and rate-limited, not here; so is the 404 of a model
     /// nobody serves.
     fn workers_unavailable(model_id: &str) -> Response {
-        placement::no_available_workers(format!(
+        placement::no_available_workers(Self::workers_unavailable_message(model_id))
+    }
+
+    /// [`Self::workers_unavailable`] with the verdict the stage has as its
+    /// line's reason (the policy that declined a leg, the leg at its
+    /// admission limit); the client's message stays the one above.
+    fn workers_unavailable_because(model_id: &str, reason: String) -> Response {
+        placement::no_available_workers_because(Self::workers_unavailable_message(model_id), reason)
+    }
+
+    fn workers_unavailable_message(model_id: &str) -> String {
+        format!(
             "All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"
-        ))
+        )
     }
 
     /// The line and marker of a refusal the stage answers on its own: a
@@ -1155,12 +1166,25 @@ impl WorkerSelectionStage {
     /// as it was built and counted once; a leg nobody serves is a 404, and a
     /// leg whose workers are all unavailable is the 503 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
+        let leg = match failure.leg {
+            WorkerLeg::Prefill => "prefill",
+            WorkerLeg::Decode => "decode",
+            WorkerLeg::Single => "worker",
+        };
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => shed,
+            PlacementFailure::Unavailable => Self::workers_unavailable(model_id),
+            // The client reads the 503's usual message; the line names the
+            // policy and the leg, as the HTTP PD router's does.
+            PlacementFailure::PolicyDeclined(policy) => Self::workers_unavailable_because(
+                model_id,
+                format!("Policy {policy} failed to select a {leg} worker"),
+            ),
             // Admission turns a capacity verdict into a wait before it gets here.
-            PlacementFailure::Unavailable
-            | PlacementFailure::PolicyDeclined(_)
-            | PlacementFailure::PrefillAtCapacity => Self::workers_unavailable(model_id),
+            PlacementFailure::PrefillAtCapacity => Self::workers_unavailable_because(
+                model_id,
+                format!("No {leg} workers below their Prefill admission limit"),
+            ),
             PlacementFailure::NoCompatiblePair {
                 prefill,
                 decode,
@@ -5147,6 +5171,68 @@ mod tests {
             errors.load(Ordering::Relaxed),
             0,
             "a model nobody serves is the client's mistake, not an error of the gateway"
+        );
+    }
+
+    /// A pair placement the policy declined, or one every prefill is at its
+    /// admission limit for, is refused with the 503's usual message for the
+    /// client and the verdict as its line's reason, naming the policy and
+    /// the leg: the fixed "unavailable" message said the workers were down
+    /// while the pool state on the same line showed them available.
+    #[tokio::test]
+    async fn a_pair_the_policy_declined_is_refused_with_the_policy_as_the_lines_reason() {
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+
+        let declined = stage.pair_failure(
+            "test-model",
+            PairFailure {
+                leg: WorkerLeg::Prefill,
+                verdict: PlacementFailure::PolicyDeclined("cache_aware"),
+            },
+        );
+        assert_eq!(declined.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&declined),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert_eq!(
+            placement::refusal_reason(&declined),
+            Some("Policy cache_aware failed to select a prefill worker")
+        );
+
+        let at_capacity = stage.pair_failure(
+            "test-model",
+            PairFailure {
+                leg: WorkerLeg::Prefill,
+                verdict: PlacementFailure::PrefillAtCapacity,
+            },
+        );
+        assert_eq!(
+            placement::refusal_reason(&at_capacity),
+            Some("No prefill workers below their Prefill admission limit")
+        );
+
+        let unavailable = stage.pair_failure(
+            "test-model",
+            PairFailure {
+                leg: WorkerLeg::Decode,
+                verdict: PlacementFailure::Unavailable,
+            },
+        );
+        assert_eq!(
+            placement::refusal_reason(&unavailable),
+            Some("All workers for model 'test-model' are unavailable (unhealthy or circuit breaker open)"),
+            "a leg that is down keeps the message as its reason"
+        );
+
+        let body = axum::body::to_bytes(declined.into_body(), usize::MAX)
+            .await
+            .expect("the body is in memory");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON error envelope");
+        assert_eq!(
+            body["error"]["message"],
+            "All workers for model 'test-model' are unavailable (unhealthy or circuit breaker open)",
+            "the client's message is unchanged"
         );
     }
 }
