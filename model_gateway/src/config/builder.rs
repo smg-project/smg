@@ -1124,6 +1124,7 @@ impl RouterConfigBuilder {
                 })?;
                 self.config.server_cert = Some(cert);
                 self.config.server_key = Some(key);
+                self.config.server_key_path = Some(key_path.clone());
             }
             (None, None) => {}
             _ => {

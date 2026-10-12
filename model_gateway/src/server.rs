@@ -1493,6 +1493,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "Tokio runtime sized"
     );
 
+    // Who else can read the private key files: checked here, once the
+    // subscriber exists, so the line reaches the log (the configuration is
+    // validated before logging starts).
+    if let Some(path) = &config.router_config.server_key_path {
+        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
+    }
+    if let Some(mtls) = config
+        .mesh_server_config
+        .as_ref()
+        .and_then(|mesh| mesh.mtls_config.as_ref())
+    {
+        crate::tls::warn_if_private_key_is_shared(&mtls.server_key_path, "--mesh-tls-key");
+    }
+
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{
