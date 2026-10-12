@@ -4,8 +4,9 @@
 //! completed response whose id is unknown afterwards, and a stream ends with
 //! `response.failed` carrying the same code after its deltas; a `store: false`
 //! request stores nothing and is unaffected. Through the real app over an
-//! in-process scripted engine, with a history backend whose server is not
-//! there (a Redis URL nothing listens on: the client connects per call).
+//! in-process scripted engine, with a history backend whose server went away
+//! after start-up (a stand-in Redis answers the start-up contact and is then
+//! dropped; the client connects per call, and nothing listens any more).
 
 #[path = "common/mod.rs"]
 mod common;
@@ -29,13 +30,52 @@ use smg::{
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use smg_data_connector::{create_storage, HistoryBackend, RedisConfig, StorageFactoryConfig};
-use tokio::net::TcpListener;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 use tower::ServiceExt;
 
 const MODEL: &str = "stored-response-model";
 
-/// The app over one scripted engine, its history on a store whose server is
-/// not there. The engine's task is aborted when the handle drops.
+/// A stand-in Redis for the start-up contact: one connection at a time, every
+/// command answered `+PONG` (the contact is one `PING`), until the task is
+/// aborted; the port then refuses every connection, the store that went away
+/// after start-up.
+#[expect(
+    clippy::unwrap_used,
+    clippy::disallowed_methods,
+    reason = "test helper: failures should panic; the stand-in is aborted by its caller"
+)]
+fn redis_stand_in(listener: TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                // One answer per command: a command is a RESP array, `*<n>`
+                // at the start of a line.
+                let commands = buf[..n]
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, byte)| *byte == b'*' && (i == 0 || buf[i - 1] == b'\n'))
+                    .count();
+                for _ in 0..commands {
+                    if socket.write_all(b"+PONG\r\n").await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// The app over one scripted engine, its history on a store whose server went
+/// away after start-up. The engine's task is aborted when the handle drops.
 #[expect(
     clippy::unwrap_used,
     clippy::disallowed_methods,
@@ -86,8 +126,13 @@ async fn app() -> (Router, tokio::task::AbortHandle) {
         )
         .await
         .unwrap();
-    // Port 1 of the loopback: nothing listens, every call is refused.
-    let redis: RedisConfig = serde_json::from_value(json!({"url": "redis://127.0.0.1:1"})).unwrap();
+    // The store answers the start-up contact and is then gone: nothing
+    // listens on its port, every call is refused.
+    let store = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let store_port = store.local_addr().unwrap().port();
+    let stand_in = redis_stand_in(store);
+    let redis: RedisConfig =
+        serde_json::from_value(json!({"url": format!("redis://127.0.0.1:{store_port}")})).unwrap();
     let storages = create_storage(StorageFactoryConfig {
         backend: &HistoryBackend::Redis,
         oracle: None,
@@ -97,6 +142,10 @@ async fn app() -> (Router, tokio::task::AbortHandle) {
     })
     .await
     .unwrap();
+    stand_in.abort();
+    // Awaited so the listener and its connection are closed before the first
+    // request.
+    let _ = stand_in.await;
     let context = common::create_test_context_with_storages(config, tokenizers, storages).await;
     context.worker_registry.register(worker).unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
