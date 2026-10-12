@@ -8,7 +8,8 @@ repos:
       - id: destroyed-symlinks
       - id: trailing-whitespace
         # Patch files keep their whitespace: a blank context line is a single space.
-        exclude: \.patch$
+        # Chat-template fixtures are kept as published; their whitespace is part of the template.
+        exclude: \.patch$|tests/fixtures/.*\.jinja$
       - id: end-of-file-fixer
         # Recorded SSE streams end with the protocol's blank line, and the
         # streaming tests compare them byte for byte.
