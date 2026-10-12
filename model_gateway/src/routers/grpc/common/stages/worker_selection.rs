@@ -4325,7 +4325,7 @@ mod tests {
             ),
         ] {
             worker_registry
-                .register(pd_worker(url, model_id, worker_type, labels))
+                .register(labeled_worker(url, model_id, worker_type, labels))
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
