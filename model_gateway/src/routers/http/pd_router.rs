@@ -6012,10 +6012,6 @@ mod tests {
         assert_eq!(decode_ref.load(), 0);
     }
 
-    /// A decode engine's server on `path`: answers `content_type` with
-    /// `chunks`, one write each, and with `cut` ends the body with an error,
-    /// so the server closes the connection before the transfer's end, as an
-    /// engine's own server that dies mid-stream does.
     /// [`spawn_cut_stub`] without the pauses: the head and one chunk leave
     /// the engine's server, and the cut follows as soon as the server has
     /// flushed them (one yield of its task), so the body's error is right
@@ -6039,6 +6035,10 @@ mod tests {
         spawn_stub(app).await
     }
 
+    /// A decode engine's server on `path`: answers `content_type` with
+    /// `chunks`, one write each, and with `cut` ends the body with an error,
+    /// so the server closes the connection before the transfer's end, as an
+    /// engine's own server that dies mid-stream does.
     async fn spawn_cut_stub(
         path: &'static str,
         content_type: &'static str,
