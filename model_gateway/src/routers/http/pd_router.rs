@@ -33,9 +33,12 @@ use serde_json::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, Instrument};
 
-use super::request_body::RawBody;
+use super::{
+    request_body::RawBody,
+    stream_failure::{note_sent, on_frame_boundary, RelaySource, UpstreamCut},
+};
 use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
@@ -923,13 +926,12 @@ impl PDRouter {
             );
             let error_stream = tokio_stream::once(Ok(Bytes::from(sse_data)));
 
-            let decode_url = decode.url().to_string();
             self.create_streaming_response(
                 error_stream,
                 status,
                 None,
                 context.return_logprob,
-                Some(decode_url),
+                RelaySource::decode_leg(context.model_id, context.route, decode),
                 Some(response_headers),
                 decode_guard,
             )
@@ -1901,7 +1903,7 @@ impl PDRouter {
                 status,
                 prefill_logprobs,
                 context.return_logprob,
-                None,
+                RelaySource::decode_leg(context.model_id, context.route, decode),
                 Some(response_headers),
                 decode_guard,
             )
@@ -2052,6 +2054,10 @@ impl PDRouter {
         }
     }
 
+    /// The client's streaming response, read from the decode leg's body. A
+    /// body the decode worker ends with an error after a successful head is
+    /// accounted to `source` and, when the head was SSE, ended with the typed
+    /// error event, as the regular relay ends one.
     #[expect(clippy::too_many_arguments)]
     #[expect(
         clippy::unused_self,
@@ -2063,7 +2069,7 @@ impl PDRouter {
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
-        decode_url: Option<String>,
+        source: RelaySource,
         headers: Option<HeaderMap>,
         decode_guard: WorkerLoadGuard,
     ) -> Response {
@@ -2071,55 +2077,102 @@ impl PDRouter {
 
         let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
 
+        // The same rule as the regular relay: a successful stream with no
+        // content type is relayed as SSE. Read from the decode leg's own
+        // headers, before the response's content type is set below.
+        let upstream_sse = match headers
+            .as_ref()
+            .and_then(|headers| headers.get(CONTENT_TYPE))
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(content_type) => content_type.starts_with("text/event-stream"),
+            None => status.is_success(),
+        };
+        // The relay runs under the request's span, so a failure after the
+        // head went out is logged with the request's id.
+        let span = tracing::Span::current();
+
         #[expect(
             clippy::disallowed_methods,
             reason = "fire-and-forget stream relay; gateway shutdown need not wait for decode stream forwarding"
         )]
-        tokio::spawn(async move {
-            futures_util::pin_mut!(stream);
-            // Reusable SSE encoder for the logprob-merge re-encode path.
-            let mut encoder = SseEncoder::new();
-            // Whether the next chunk begins at an SSE line boundary (i.e. the
-            // previous chunk ended with an EOL); used to anchor the [DONE]
-            // sentinel detection when the match sits at the start of a chunk.
-            let mut at_line_start = true;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-                        if let Some(&last) = chunk.last() {
-                            at_line_start = last == b'\n' || last == b'\r';
+        tokio::spawn(
+            async move {
+                futures_util::pin_mut!(stream);
+                // Reusable SSE encoder for the logprob-merge re-encode path.
+                let mut encoder = SseEncoder::new();
+                // Whether the next chunk begins at an SSE line boundary (i.e. the
+                // previous chunk ended with an EOL); used to anchor the [DONE]
+                // sentinel detection when the match sits at the start of a chunk.
+                let mut at_line_start = true;
+                // What the client has been sent, for the record of a cut, and
+                // its last bytes, so the event that ends a cut SSE body is
+                // written on a frame boundary.
+                let mut relayed: u64 = 0;
+                let mut sent_tail: Vec<u8> = Vec::with_capacity(4);
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
+                            if let Some(&last) = chunk.last() {
+                                at_line_start = last == b'\n' || last == b'\r';
+                            }
+
+                            let result = if return_logprob && prefill_logprobs.is_some() {
+                                Self::merge_streaming_logprobs(
+                                    prefill_logprobs.as_ref(),
+                                    &chunk,
+                                    &mut encoder,
+                                )
+                                .unwrap_or(chunk)
+                            } else {
+                                chunk
+                            };
+
+                            relayed += result.len() as u64;
+                            note_sent(&mut sent_tail, &result);
+                            if tx.send(Ok(result)).await.is_err() {
+                                break;
+                            }
+
+                            if is_done {
+                                break;
+                            }
                         }
-
-                        let result = if return_logprob && prefill_logprobs.is_some() {
-                            Self::merge_streaming_logprobs(
-                                prefill_logprobs.as_ref(),
-                                &chunk,
-                                &mut encoder,
-                            )
-                            .unwrap_or(chunk)
-                        } else {
-                            chunk
-                        };
-
-                        if tx.send(Ok(result)).await.is_err() {
+                        Err(e) => {
+                            // A head that was a success was answered as one; the
+                            // decode body ending in an error after it is the decode
+                            // worker's failure, counted here, and an SSE response is
+                            // ended with the typed event and the stream's own end. A
+                            // failed head was counted when it arrived; its body is
+                            // cut as before.
+                            if status.is_success() {
+                                let cut = UpstreamCut::of(&e);
+                                source.account(&cut, relayed);
+                                if upstream_sse {
+                                    // On its own frame: a cut inside a frame leaves
+                                    // a partial line the event must not merge into.
+                                    let event = source.error_event(&cut);
+                                    let event = if on_frame_boundary(&sent_tail) {
+                                        event
+                                    } else {
+                                        let mut framed = Vec::with_capacity(event.len() + 2);
+                                        framed.extend_from_slice(b"\n\n");
+                                        framed.extend_from_slice(&event);
+                                        Bytes::from(framed)
+                                    };
+                                    let _ = tx.send(Ok(event)).await;
+                                    break;
+                                }
+                            }
+                            let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                             break;
                         }
-
-                        if is_done {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(ref url) = decode_url {
-                            error!("Stream error from decode server {}: {}", url, e);
-                        }
-                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                        break;
                     }
                 }
             }
-        });
+            .instrument(span),
+        );
 
         let stream = ReceiverStream::new(rx);
         let body = Body::from_stream(stream);
@@ -5585,7 +5638,7 @@ mod tests {
                 StatusCode::OK,
                 None,
                 false,
-                None,
+                RelaySource::decode_leg(UNKNOWN_MODEL_ID, "/generate", Arc::clone(&decode_ref)),
                 None,
                 decode_guard,
             );
@@ -5612,5 +5665,287 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    /// A decode engine's server on `path`: answers `content_type` with
+    /// `chunks`, one write each, and with `cut` ends the body with an error,
+    /// so the server closes the connection before the transfer's end, as an
+    /// engine's own server that dies mid-stream does.
+    async fn spawn_cut_stub(
+        path: &'static str,
+        content_type: &'static str,
+        chunks: &'static [&'static str],
+        cut: bool,
+    ) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let items: Vec<Result<Bytes, std::io::Error>> = chunks
+                    .iter()
+                    .map(|chunk| Ok(Bytes::from_static(chunk.as_bytes())))
+                    .chain(cut.then(|| Err(std::io::Error::other("the engine went away"))))
+                    .collect();
+                let body = futures_util::stream::iter(items).then(|item| async move {
+                    // One write per chunk: the relay reads them before the cut.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    item
+                });
+                ([(CONTENT_TYPE, content_type)], Body::from_stream(body))
+            }),
+        );
+        spawn_stub(app).await
+    }
+
+    /// A worker of `worker_type` at `url` whose circuit breaker opens on the
+    /// first failure, ready to be paired.
+    fn fragile_worker(url: String, worker_type: WorkerType) -> Arc<dyn Worker> {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        worker
+    }
+
+    /// The router's one pair: a prefill worker whose server answers `{}` and
+    /// a decode worker at `decode_url`, both with threshold-1 breakers, so a
+    /// charge to either leg shows.
+    async fn register_fragile_pair(
+        router: &PDRouter,
+        decode_url: String,
+    ) -> (Arc<dyn Worker>, Arc<dyn Worker>) {
+        let (prefill_url, _seen) = spawn_recording_stub("{}").await;
+        let prefill = fragile_worker(prefill_url, WorkerType::Prefill);
+        let decode = fragile_worker(decode_url, WorkerType::Decode);
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&prefill));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&decode));
+        (prefill, decode)
+    }
+
+    async fn stream_chat_through(router: &PDRouter) -> Response {
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        router
+            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .await
+    }
+
+    /// The events of an SSE body, blank-line separated.
+    fn sse_events(body: &str) -> Vec<&str> {
+        body.split("\n\n")
+            .filter(|event| !event.is_empty())
+            .collect()
+    }
+
+    const CHAT_SSE_CHUNKS: &[&str] = &[
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+    ];
+
+    const MESSAGES_SSE_CHUNKS: &[&str] = &[
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\
+         \"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\
+         \"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\
+         \"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\
+         \"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    ];
+
+    /// A decode engine's server that closes the connection mid-stream used
+    /// to leave the client a transfer that ended in an error: no event said
+    /// why, and nothing counted the decode worker's failure. The relay ends
+    /// the SSE response the way the regular relay and the gRPC path do, with
+    /// a `stream_error` event and `[DONE]`, and the decode worker is charged;
+    /// the prefill worker, whose leg completed, is not.
+    #[tokio::test]
+    async fn a_decode_cut_mid_stream_ends_the_sse_response_with_a_typed_error_event_and_done() {
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            true,
+        )
+        .await;
+        let router = create_test_pd_router();
+        let (prefill, decode) = register_fragile_pair(&router, decode_url).await;
+
+        let response = stream_chat_through(&router).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events[0], CHAT_SSE_CHUNKS[0].trim_end());
+        assert_eq!(events[1], CHAT_SSE_CHUNKS[1].trim_end());
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stream error: "),
+            "{body}"
+        );
+        assert_eq!(events[3], "data: [DONE]");
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "the cut is the decode worker's failure: its threshold-1 breaker opens"
+        );
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "the prefill leg completed and is not charged"
+        );
+    }
+
+    /// A cut that lands inside a frame (the decode engine died mid-write)
+    /// leaves the partial line as it is and writes the error event on its
+    /// own frame, so a client that parses frame by frame still reads the
+    /// typed error.
+    #[tokio::test]
+    async fn a_decode_cut_inside_a_frame_writes_the_error_event_on_its_own_frame() {
+        const CHUNKS: &[&str] = &[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"con",
+        ];
+        let decode_url =
+            spawn_cut_stub("/v1/chat/completions", "text/event-stream", CHUNKS, true).await;
+        let router = create_test_pd_router();
+        let (_prefill, decode) = register_fragile_pair(&router, decode_url).await;
+
+        let response = stream_chat_through(&router).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events[0], CHUNKS[0].trim_end());
+        assert_eq!(events[1], CHUNKS[1], "the partial frame stands alone");
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[3], "data: [DONE]");
+        assert!(!decode.circuit_breaker_can_execute());
+    }
+
+    /// On the Messages API the same cut ends the stream with the API's own
+    /// error event, typed `api_error` as the gRPC path types a worker's
+    /// failure there; the protocol has no `[DONE]`.
+    #[tokio::test]
+    async fn a_decode_cut_on_a_messages_stream_ends_it_with_the_api_s_error_event() {
+        let decode_url = spawn_cut_stub(
+            "/v1/messages",
+            "text/event-stream",
+            MESSAGES_SSE_CHUNKS,
+            true,
+        )
+        .await;
+        let router = create_test_pd_router();
+        let (_prefill, decode) = register_fragile_pair(&router, decode_url).await;
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_messages(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        let (name, data) = events[2].split_once("\ndata: ").unwrap();
+        assert_eq!(name, "event: error", "{body}");
+        let error: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "api_error");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stream error: "),
+            "{body}"
+        );
+        assert!(!body.contains("[DONE]"), "{body}");
+        assert!(!decode.circuit_breaker_can_execute());
+    }
+
+    /// A body the decode engine streams under any other content type is cut
+    /// as before, so a partial document is not taken for a complete one, and
+    /// the decode worker is charged the same.
+    #[tokio::test]
+    async fn a_decode_cut_on_a_non_sse_body_still_ends_the_transfer_in_error_and_is_counted() {
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "application/json",
+            &["{\"choices\":[{\"message\":{\"content\":\"par"],
+            true,
+        )
+        .await;
+        let router = create_test_pd_router();
+        let (_prefill, decode) = register_fragile_pair(&router, decode_url).await;
+
+        let response = stream_chat_through(&router).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .is_err(),
+            "a cut JSON body is not made to look complete"
+        );
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "the cut is the decode worker's failure: its threshold-1 breaker opens"
+        );
+    }
+
+    /// A stream the decode engine completes is relayed as it was: nothing is
+    /// added and neither worker is charged.
+    #[tokio::test]
+    async fn a_decode_stream_that_completes_is_relayed_unchanged() {
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = create_test_pd_router();
+        let (prefill, decode) = register_fragile_pair(&router, decode_url).await;
+
+        let response = stream_chat_through(&router).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            CHAT_SSE_CHUNKS.concat()
+        );
+        assert!(decode.circuit_breaker_can_execute());
+        assert!(prefill.circuit_breaker_can_execute());
     }
 }

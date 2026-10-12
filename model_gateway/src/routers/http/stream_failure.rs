@@ -1,6 +1,7 @@
 //! A relayed streaming response whose upstream body ended with an error
 //! before its natural end: what the client is told and what the gateway
-//! counts. The HTTP relay's counterpart of the gRPC path's `stream_failure`.
+//! counts. The HTTP relay's counterpart of the gRPC path's `stream_failure`,
+//! shared by the regular relay and the disaggregated router's decode relay.
 //!
 //! Once the response head is out, a failure cannot change the status code.
 //! The relay ends an SSE response the way the gRPC path ends one: a typed
@@ -72,20 +73,56 @@ fn cause(error: &reqwest::Error) -> String {
 }
 
 /// Where a relayed response comes from, kept by the relay task for the
-/// accounting of a failure after the response head went out.
+/// accounting of a failure after the response head went out: the worker,
+/// and the `worker_type` and `backend_type` labels its failure is counted
+/// under.
 pub(crate) struct RelaySource {
     model: String,
     route: &'static str,
     worker: Arc<dyn Worker>,
+    worker_type: &'static str,
+    backend: &'static str,
 }
 
 impl RelaySource {
-    /// The response to `route` for `model`, read from `worker`.
+    /// The response to `route` for `model`, read from `worker` by the regular
+    /// relay.
     pub(crate) fn new(model: &str, route: &'static str, worker: Arc<dyn Worker>) -> Self {
+        Self::with_labels(
+            model,
+            route,
+            worker,
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::BACKEND_REGULAR,
+        )
+    }
+
+    /// The response to `route` for `model`, read from the decode leg `worker`
+    /// of a disaggregated prefill/decode pair: a cut is the decode worker's
+    /// failure, counted under the disaggregated router's labels.
+    pub(crate) fn decode_leg(model: &str, route: &'static str, worker: Arc<dyn Worker>) -> Self {
+        Self::with_labels(
+            model,
+            route,
+            worker,
+            metrics_labels::WORKER_DECODE,
+            metrics_labels::BACKEND_PD,
+        )
+    }
+
+    fn with_labels(
+        model: &str,
+        route: &'static str,
+        worker: Arc<dyn Worker>,
+        worker_type: &'static str,
+        backend: &'static str,
+    ) -> Self {
         Self {
             model: model.to_string(),
             route,
             worker,
+            worker_type,
+            backend,
         }
     }
 
@@ -97,14 +134,16 @@ impl RelaySource {
     /// Log and count `cut`, the upstream body error that ended the response
     /// after `bytes_relayed` bytes of a successful head: the worker's circuit
     /// breaker samples the status of its class, the worker-error and
-    /// router-error families count it under the class's `error_type`, and one
-    /// WARN names the worker, the route, how far the response had come and
+    /// router-error families count it under the source's labels and the
+    /// class's `error_type`, and one WARN names the worker, its type, the
+    /// route, how far the response had come and
     /// the cause. The task runs under the request's span, so the line carries
     /// the request's id as every line of the request does.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
         let error_type = error_type_from_status(cut.status);
         warn!(
             worker = self.worker.url(),
+            worker_type = self.worker_type,
             route = self.route,
             bytes_relayed,
             http_status = cut.status.as_u16(),
@@ -114,13 +153,13 @@ impl RelaySource {
         );
         self.worker.record_outcome(cut.status.as_u16());
         Metrics::record_worker_error(
-            metrics_labels::WORKER_REGULAR,
+            self.worker_type,
             metrics_labels::CONNECTION_HTTP,
             error_type,
         );
         Metrics::record_router_error(
             metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_REGULAR,
+            self.backend,
             metrics_labels::CONNECTION_HTTP,
             &self.model,
             route_to_endpoint(self.route),
@@ -290,6 +329,61 @@ mod tests {
             )
             .is_some(),
             "{rendered}"
+        );
+    }
+
+    /// The decode leg of a disaggregated pair is charged as the decode
+    /// worker's failure, under the disaggregated router's labels.
+    #[test]
+    fn a_cut_on_the_decode_leg_is_counted_under_the_disaggregated_router_s_labels() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = worker();
+        let source =
+            RelaySource::decode_leg("relay-test", "/v1/chat/completions", Arc::clone(&worker));
+
+        metrics::with_local_recorder(&recorder, || {
+            source.account(&cut(StatusCode::BAD_GATEWAY), 839);
+        });
+
+        let rendered = handle.render();
+        assert!(
+            !worker.circuit_breaker_can_execute(),
+            "the decode worker's threshold-1 breaker samples the cut"
+        );
+        let worker_errors = sample(
+            &rendered,
+            "smg_worker_errors_total",
+            &[
+                "worker_type=\"decode\"",
+                "connection_mode=\"http\"",
+                "error_type=\"backend_error\"",
+            ],
+        )
+        .unwrap_or_else(|| panic!("a decode worker error is counted:\n{rendered}"));
+        assert!(worker_errors.ends_with(" 1"), "{worker_errors}");
+        let router_errors = sample(
+            &rendered,
+            "smg_router_request_errors_total",
+            &[
+                "router_type=\"http\"",
+                "backend_type=\"pd\"",
+                "connection_mode=\"http\"",
+                "model=\"relay-test\"",
+                "endpoint=\"chat\"",
+                "error_type=\"backend_error\"",
+            ],
+        )
+        .unwrap_or_else(|| panic!("a disaggregated router error is counted:\n{rendered}"));
+        assert!(router_errors.ends_with(" 1"), "{router_errors}");
+        assert!(
+            sample(
+                &rendered,
+                "smg_worker_errors_total",
+                &["worker_type=\"regular\""]
+            )
+            .is_none(),
+            "nothing is charged to a regular worker:\n{rendered}"
         );
     }
 
