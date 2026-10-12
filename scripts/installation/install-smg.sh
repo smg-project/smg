@@ -15,10 +15,11 @@ SMG_SRC="${1:-/tmp/smg-src}"
 # differ by a few levels (the gateway warns about it at start-up). The runtime
 # package is libturbojpeg on Ubuntu bases and libturbojpeg0 on Debian bases:
 # take whichever this base offers instead of guessing from the distribution.
+# apt-cache's output is translated, so it is read in the C locale.
 turbojpeg_runtime_package() {
     local pkg
     for pkg in libturbojpeg libturbojpeg0; do
-        if apt-cache policy "$pkg" 2>/dev/null | grep -q '^  Candidate: [^(]'; then
+        if LC_ALL=C apt-cache policy "$pkg" 2>/dev/null | grep -q '^  Candidate: [^(]'; then
             echo "$pkg"
             return 0
         fi
