@@ -149,15 +149,17 @@ RUN apt update -y \
 # rust-toolchain.toml selects the release once the source is in place
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
 
-# copy source code
-COPY --from=local_src /src /opt/smg
-
 # working directory
 WORKDIR /opt/smg
 
-# install the pinned toolchain (rust-toolchain.toml)
+# install the pinned toolchain from rust-toolchain.toml alone, before the
+# source is copied: the layer is rebuilt only when the pin changes
+COPY --from=local_src /src/rust-toolchain.toml /opt/smg/rust-toolchain.toml
 RUN rustup toolchain install \
     && rustc --version && cargo --version && protoc --version
+
+# copy source code
+COPY --from=local_src /src /opt/smg
 
 # install maturin and build the wheel with vendored OpenSSL
 RUN uv pip install maturin \

@@ -58,8 +58,9 @@ jobs:
           tag="ci-tokenspeed-${version##*post}"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           # ubuntu:24.04 matches the runner pods (see the Dockerfile's
-          # portability contract); the dispatch input can override it.
-          base="${BASE_OVERRIDE:-ubuntu:24.04}"
+          # portability contract), pinned by the digest docker/Dockerfile
+          # uses; the dispatch input can override it.
+          base="${BASE_OVERRIDE:-ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55}"
           image="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "base=${base}" >> "$GITHUB_OUTPUT"
