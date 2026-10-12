@@ -773,7 +773,7 @@ mod tests {
         }
         // The identifier index lost the one entry with the record.
         let listed = store
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert_eq!(listed.len(), 3);

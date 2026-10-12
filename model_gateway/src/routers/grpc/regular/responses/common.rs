@@ -760,7 +760,7 @@ mod usage_tests {
         unstored.raw_response["store"] = json!(false);
         storage.store_response(unstored).await.unwrap();
 
-        let refused = resolve_item_references(&storage, vec![reference("msg_unstored")])
+        let refused = resolve_item_references(&storage, vec![reference("msg_unstored")], None)
             .await
             .expect_err("an unstored response's item is no stored item");
 

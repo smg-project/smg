@@ -875,6 +875,7 @@ mod tests {
             &background::queued_response("resp_d", &request),
             &request,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -889,6 +890,7 @@ mod tests {
             response_storage.clone(),
             &completed_response("resp_d", &request),
             &request,
+            None,
             None,
         )
         .await
