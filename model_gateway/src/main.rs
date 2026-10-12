@@ -891,7 +891,8 @@ struct CliArgs {
     model_alias: Vec<String>,
 
     // ==================== Logging ====================
-    /// Directory to store log files
+    /// Directory for the log files, created when missing; an existing path
+    /// must be a writable directory (unset: console only)
     #[arg(long, help_heading = "Logging")]
     log_dir: Option<String>,
 

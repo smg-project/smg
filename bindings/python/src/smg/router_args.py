@@ -1284,7 +1284,8 @@ class RouterArgs:
             type=str,
             default=None,
             help=(
-                "Directory to store log files. If not specified, logs are only output to console."
+                "Directory for the log files, created when missing; an existing path must be a"
+                " writable directory. If not specified, logs are only output to console."
             ),
         )
         logging_group.add_argument(

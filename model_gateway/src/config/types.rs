@@ -285,6 +285,9 @@ pub struct RouterConfig {
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
+    /// Directory for the gateway's log files, created when missing; an
+    /// existing path must be a directory the gateway can write (checked at
+    /// configuration validation). `None` logs to the console only.
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     /// Directory for the heap profiles `POST /heap_profile` writes, on a

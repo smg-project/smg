@@ -1,4 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::Path,
+};
 
 use axum::http::HeaderName;
 use sha2::{Digest, Sha256};
@@ -123,6 +126,7 @@ impl ConfigValidator {
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
+        Self::validate_log_dir(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
@@ -961,6 +965,63 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// `log_dir` names the directory the file log appender writes to, so it
+    /// is checked before anything binds: a path that exists must be a
+    /// directory the gateway can write; one that does not exist is created
+    /// here, as logging start-up always did. Anything else is a configuration
+    /// error naming the path and the reason, where the appender used to
+    /// panic (an existing file) or the gateway started without any log
+    /// output at all (a path it could not create).
+    fn validate_log_dir(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(log_dir) = config.log_dir.as_deref() else {
+            return Ok(());
+        };
+        let invalid = |reason: String| ConfigError::InvalidValue {
+            field: "log_dir".to_string(),
+            value: log_dir.to_string(),
+            reason,
+        };
+        if log_dir.trim().is_empty() {
+            return Err(invalid("must name a directory".to_string()));
+        }
+        let path = Path::new(log_dir);
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(invalid("exists and is not a directory".to_string())),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                std::fs::create_dir_all(path).map_err(|error| {
+                    // The nearest existing ancestor explains the failure
+                    // better than the OS error for the leaf when it is a
+                    // file in the way.
+                    let file_in_the_way = path
+                        .ancestors()
+                        .skip(1)
+                        .find(|ancestor| ancestor.exists())
+                        .filter(|ancestor| !ancestor.is_dir());
+                    match file_in_the_way {
+                        Some(file) => invalid(format!(
+                            "cannot be created: {} is not a directory",
+                            file.display()
+                        )),
+                        None => invalid(format!("cannot be created: {error}")),
+                    }
+                })?;
+            }
+            Err(error) => return Err(invalid(format!("cannot be read: {error}"))),
+        }
+        // The appender opens a file for writing in this directory; an unnamed
+        // temporary file is the same permission check with nothing left
+        // behind.
+        tempfile::tempfile_in(path)
+            .map(drop)
+            .map_err(|error| invalid(format!("is not writable: {error}")))
+    }
+
     fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
         config
             .rl
@@ -1735,6 +1796,90 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    fn log_dir_config(log_dir: &str) -> RouterConfig {
+        RouterConfig {
+            log_dir: Some(log_dir.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The `(value, reason)` of the `log_dir` error a configuration is
+    /// refused with.
+    fn refused_log_dir(config: &RouterConfig) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == "log_dir" => (value, reason),
+            other => panic!("expected a log_dir error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_log_dir_that_is_a_file_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let file = file.to_str().unwrap();
+        let (value, reason) = refused_log_dir(&log_dir_config(file));
+        assert_eq!(value, file);
+        assert!(reason.contains("not a directory"), "{reason}");
+    }
+
+    #[test]
+    fn a_log_dir_that_cannot_be_created_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let under_a_file = file.join("logs");
+        let file = file.to_str().unwrap();
+        let under = under_a_file.to_str().unwrap();
+        let (value, reason) = refused_log_dir(&log_dir_config(under));
+        assert_eq!(value, under);
+        assert!(
+            reason.contains("cannot be created") && reason.contains(file),
+            "the reason names the file in the way: {reason}"
+        );
+        assert!(!under_a_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_dir_the_gateway_cannot_write_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let writable = std::fs::metadata(&locked).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(&locked, read_only).unwrap();
+        // A privileged process writes regardless of the mode: nothing to test.
+        let privileged = std::fs::File::create(locked.join("probe")).is_ok();
+        let verdict = ConfigValidator::validate(&log_dir_config(locked.to_str().unwrap()));
+        std::fs::set_permissions(&locked, writable).unwrap();
+        if privileged {
+            return;
+        }
+        match verdict {
+            Err(ConfigError::InvalidValue { field, reason, .. }) if field == "log_dir" => {
+                assert!(reason.contains("not writable"), "{reason}");
+            }
+            other => panic!("expected a log_dir error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_log_dir_is_created_and_an_existing_one_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("created").join("logs");
+        assert!(ConfigValidator::validate(&log_dir_config(fresh.to_str().unwrap())).is_ok());
+        assert!(fresh.is_dir(), "the missing directory is created");
+        assert!(ConfigValidator::validate(&log_dir_config(dir.path().to_str().unwrap())).is_ok());
+        assert!(ConfigValidator::validate(&RouterConfig::default()).is_ok());
     }
 
     #[test]
