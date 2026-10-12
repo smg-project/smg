@@ -873,10 +873,7 @@ fn pair_admitted_by(
     accepts: &dyn Fn(&dyn Worker) -> bool,
 ) -> bool {
     let admitted = |worker: &Arc<dyn Worker>| {
-        wire.is_none_or(|wire| {
-            worker.metadata().spec.runtime_type == wire.runtime
-                && *worker.connection_mode() == wire.connection
-        }) && accepts(worker.as_ref())
+        WireConstraint::admits(wire, worker.as_ref()) && accepts(worker.as_ref())
     };
     pairs
         .prefill

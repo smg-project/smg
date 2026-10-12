@@ -51,6 +51,19 @@ pub(crate) struct WireConstraint {
     pub requires_media_refs: bool,
 }
 
+impl WireConstraint {
+    /// Whether `worker` is on `wire`: its runtime and its transport when a
+    /// retry pins one, any worker when none is pinned. The one predicate
+    /// every narrowing to a retained plan's wire goes through, so the legs
+    /// a placement searches and the ones it judges cannot drift apart.
+    pub(crate) fn admits(wire: Option<Self>, worker: &dyn Worker) -> bool {
+        wire.is_none_or(|wire| {
+            worker.metadata().spec.runtime_type == wire.runtime
+                && *worker.connection_mode() == wire.connection
+        })
+    }
+}
+
 /// Whether Prefill admission may drop full workers from the candidate set
 /// before the policy runs. An explicit target under consistent hashing is
 /// exempt: it indexes the unfiltered set and stays strict, so the request
@@ -179,12 +192,9 @@ pub(crate) fn candidates(
     let pool = registry.get_routing_pool(model_id, pool);
     match wire {
         None => Candidates::Shared(pool),
-        Some(wire) => Candidates::Pinned(
+        Some(_) => Candidates::Pinned(
             pool.iter()
-                .filter(|w| {
-                    w.metadata().spec.runtime_type == wire.runtime
-                        && *w.connection_mode() == wire.connection
-                })
+                .filter(|w| WireConstraint::admits(wire, w.as_ref()))
                 .cloned()
                 .collect(),
         ),
@@ -415,6 +425,9 @@ fn admitted_leg(
     wire: Option<WireConstraint>,
     inputs: &PlacementInputs<'_>,
 ) -> Vec<Arc<dyn Worker>> {
+    if wire.is_none() && inputs.candidate_filter.is_none() {
+        return leg.to_vec();
+    }
     let narrowed = |workers: &[Arc<dyn Worker>], keep: &dyn Fn(&Arc<dyn Worker>) -> bool| {
         let kept: Vec<Arc<dyn Worker>> = workers.iter().filter(|w| keep(w)).cloned().collect();
         if kept.is_empty() {
@@ -423,12 +436,7 @@ fn admitted_leg(
             kept
         }
     };
-    let on_wire = narrowed(leg, &|w| {
-        wire.is_none_or(|wire| {
-            w.metadata().spec.runtime_type == wire.runtime
-                && *w.connection_mode() == wire.connection
-        })
-    });
+    let on_wire = narrowed(leg, &|w| WireConstraint::admits(wire, w.as_ref()));
     narrowed(&on_wire, &|w| {
         inputs
             .candidate_filter
@@ -463,10 +471,7 @@ fn relaxed_pair(
     let eligible = |w: &Arc<dyn Worker>| {
         w.is_healthy()
             && w.circuit_breaker_can_execute()
-            && wire.is_none_or(|wire| {
-                w.metadata().spec.runtime_type == wire.runtime
-                    && *w.connection_mode() == wire.connection
-            })
+            && WireConstraint::admits(wire, w.as_ref())
             && inputs
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
@@ -569,10 +574,7 @@ pub(crate) fn select_pair(
 ) -> Result<Pair, Box<PairFailure>> {
     let eligible = |w: &Arc<dyn Worker>| {
         w.is_available()
-            && wire.is_none_or(|wire| {
-                w.metadata().spec.runtime_type == wire.runtime
-                    && *w.connection_mode() == wire.connection
-            })
+            && WireConstraint::admits(wire, w.as_ref())
             && inputs
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
