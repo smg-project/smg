@@ -121,16 +121,33 @@ impl TokenizerLoadFailures {
         Self::default()
     }
 
-    /// A load for the model was accepted: the model is pending until it
-    /// ends, whatever was recorded.
-    pub fn load_started(&self, model: &str) {
+    /// A load for the model is being submitted: the model is pending until
+    /// it ends, whatever was recorded. Counted before the submission is
+    /// handed over, so a job that ends at once cannot release a count that
+    /// was not taken yet. The record it displaces comes back, for a
+    /// submission refused after the count (see [`Self::load_refused`]).
+    pub fn load_started(&self, model: &str) -> Option<TokenizerLoadFailure> {
         let mut state = self.by_model.entry(model.to_string()).or_default();
         state.in_flight += 1;
-        state.failure = None;
+        state.failure.take()
+    }
+
+    /// The submission counted by [`Self::load_started`] was refused: the
+    /// count comes back off and, with no other load in flight, the record it
+    /// displaced goes back.
+    pub fn load_refused(&self, model: &str, displaced: Option<TokenizerLoadFailure>) {
+        if let Some(mut state) = self.by_model.get_mut(model) {
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if state.in_flight == 0 && state.failure.is_none() {
+                state.failure = displaced;
+            }
+        }
+        self.forget_if_blank(model);
     }
 
     /// A load for the model ended; `true` when it was the last one in flight
-    /// (the moment its failure counts).
+    /// (the moment its failure counts). A load that was never counted (none
+    /// is, outside [`Self::load_started`]) leaves no state behind.
     pub fn load_ended(&self, model: &str) -> bool {
         let Some(mut state) = self.by_model.get_mut(model) else {
             return true;
@@ -862,6 +879,48 @@ mod tests {
     /// A failed load of a name no served model carries (the start-up load,
     /// named by its source; an operator's registration of another name) is
     /// nobody's request: nothing is recorded.
+    /// The count is taken before the submission is handed over, so a job that
+    /// ends first releases a count that exists; a submission refused after
+    /// the count takes it back and restores the record it displaced, unless
+    /// another load of the model is still in flight.
+    #[test]
+    fn a_refused_submission_restores_the_record_it_displaced() {
+        let failures = TokenizerLoadFailures::new();
+        assert!(failures.record("m", TokenizerLoadFailure::NoSource));
+        let displaced = failures.load_started("m");
+        assert_eq!(displaced, Some(TokenizerLoadFailure::NoSource));
+        assert_eq!(
+            failures.get("m"),
+            None,
+            "pending while the load is in flight"
+        );
+        failures.load_refused("m", displaced);
+        assert_eq!(
+            failures.get("m"),
+            Some(TokenizerLoadFailure::NoSource),
+            "the refused submission gives the record back"
+        );
+
+        // With another load of the model in flight, that load decides.
+        let first = failures.load_started("m");
+        assert_eq!(first, Some(TokenizerLoadFailure::NoSource));
+        let second = failures.load_started("m");
+        assert_eq!(second, None);
+        failures.load_refused("m", second);
+        assert_eq!(failures.get("m"), None, "the first load is still in flight");
+        assert!(failures.load_ended("m"));
+        assert_eq!(
+            failures.get("m"),
+            None,
+            "the load that ended left no record"
+        );
+
+        // A load that ends before any count was taken leaves nothing behind.
+        assert!(failures.load_ended("other"));
+        assert!(failures.record("other", TokenizerLoadFailure::NoSource));
+        assert_eq!(failures.get("other"), Some(TokenizerLoadFailure::NoSource));
+    }
+
     #[test]
     fn a_failed_load_of_a_name_nobody_serves_is_not_recorded() {
         let failures = TokenizerLoadFailures::new();

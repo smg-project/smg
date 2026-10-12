@@ -263,12 +263,18 @@ impl JobQueue {
         // Extract values before moving job
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
-        // A tokenizer load accepted for its model counts as in flight from
-        // here: the model is pending until the job ends, whatever was recorded.
+        // A tokenizer load counts as in flight for its model before the job
+        // is handed over (the model is pending until the job ends, whatever
+        // was recorded): counted after the send, a job that ends first would
+        // leave the count behind for good. A refused send takes the count
+        // back and restores the record it displaced.
         let tokenizer_load = match &job {
             Job::AddTokenizer { config } => Some(config.name.clone()),
             _ => None,
         };
+        let displaced = tokenizer_load
+            .as_deref()
+            .and_then(|model| context.tokenizer_load_failures.load_started(model));
 
         // Record pending status
         self.status_map.insert(
@@ -278,9 +284,6 @@ impl JobQueue {
 
         match self.tx.send(job).await {
             Ok(()) => {
-                if let Some(model) = &tokenizer_load {
-                    context.tokenizer_load_failures.load_started(model);
-                }
                 let (queue_depth, available_permits) = self.get_load_info();
                 debug!(
                     "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
@@ -289,6 +292,11 @@ impl JobQueue {
                 Ok(())
             }
             Err(_) => {
+                if let Some(model) = &tokenizer_load {
+                    context
+                        .tokenizer_load_failures
+                        .load_refused(model, displaced);
+                }
                 self.status_map.remove(&worker_url);
                 let (queue_depth, _) = self.get_load_info();
                 Err(format!(
