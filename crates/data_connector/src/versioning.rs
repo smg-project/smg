@@ -154,7 +154,7 @@ fn pending_migrations_error(
 /// then fail its first read of a changed column. The schema config's
 /// `version` at or above the store's version is the operator's word that this
 /// build may run against it; it is logged once.
-fn schema_ahead_check(
+pub(crate) fn schema_ahead_check(
     backend: &str,
     current: u32,
     migrations: &[Migration],
@@ -361,7 +361,6 @@ pub async fn run_postgres_migrations(
     auto_migrate: bool,
 ) -> Result<Vec<u32>, String> {
     let current = postgres_current_version(tx).await?;
-    schema_ahead_check("postgres", current, migrations, config_version)?;
     let skip_up_to = config_version.unwrap_or(0);
     let effective_start = current.max(skip_up_to);
 
@@ -497,7 +496,7 @@ pub async fn postgres_table_exists(
 }
 
 /// Read the current (highest) schema version from the Postgres versions table.
-async fn postgres_current_version(client: &impl GenericClient) -> Result<u32, String> {
+pub(crate) async fn postgres_current_version(client: &impl GenericClient) -> Result<u32, String> {
     let row = client
         .query_one(
             &format!("SELECT COALESCE(MAX(version), 0) FROM {VERSIONS_TABLE}"),
