@@ -170,8 +170,10 @@ fn an_unreadable_tokenizer_source_refuses_to_start() {
     }
 }
 
-/// A usable local layout with a template, and a hub id (fetched lazily, not
-/// a path): the gateway serves.
+/// A usable local layout with a template, a hub id (fetched lazily, not a
+/// path), and, in gRPC connection mode, a model path that is not on this
+/// host (the tokenizer comes from the first worker that registers): the
+/// gateway serves.
 #[test]
 fn a_present_tokenizer_source_or_a_hub_id_serves() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -179,12 +181,26 @@ fn a_present_tokenizer_source_or_a_hub_id_serves() {
     let template = dir.path().join("template.jinja");
     fs::write(&template, "{{ messages }}").expect("the template");
     let template = template.to_str().expect("a UTF-8 path");
-    let cases: [(&str, Vec<&str>); 2] = [
+    let on_the_worker = dir.path().join("models").join("on-the-worker");
+    let on_the_worker = on_the_worker.to_str().expect("a UTF-8 path");
+    let cases: [(&str, Vec<&str>); 3] = [
         (
             "local-layout",
             vec!["--tokenizer-path", &tok, "--chat-template", template],
         ),
         ("hub-id", vec!["--tokenizer-path", "some-org/some-model"]),
+        // The connection mode follows the worker URLs; a gRPC worker that is
+        // not there yet is the shape of a deployment whose workers register
+        // later and bring the tokenizer with them.
+        (
+            "grpc-model-on-the-worker",
+            vec![
+                "--worker-urls",
+                "grpc://127.0.0.1:1",
+                "--model-path",
+                on_the_worker,
+            ],
+        ),
     ];
     for (name, args) in cases {
         let launch = launch(&args, &dir.path().join(format!("{name}.log")));

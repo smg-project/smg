@@ -1820,7 +1820,9 @@ class RouterArgs:
             default=None,
             help=(
                 "Model path for loading tokenizer (HuggingFace model ID, fetched lazily, or a"
-                " local path, which must exist and hold a tokenizer file)"
+                " local path: one that exists must hold a tokenizer layout; one that does not"
+                " is refused in HTTP connection mode and left to the worker's tokenizer in"
+                " gRPC mode). Not read as a tokenizer source when tokenizer_path is set."
             ),
         )
         tokenizer_group.add_argument(
@@ -1829,7 +1831,7 @@ class RouterArgs:
             default=None,
             help=(
                 "Explicit tokenizer path (overrides model_path tokenizer if provided); a local"
-                " path must exist and hold a tokenizer file"
+                " path follows the same rule as model_path"
             ),
         )
         tokenizer_group.add_argument(

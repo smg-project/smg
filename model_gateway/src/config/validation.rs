@@ -27,7 +27,6 @@ fn validate_distinct_listener_ports(listeners: &[(&str, &str, u16)]) -> ConfigRe
     Ok(())
 }
 
-
 /// The mesh listener's port against the HTTP, metrics and probe ports. The
 /// mesh configuration lives beside the router configuration, out of
 /// [`ConfigValidator`]'s sight, so `server::startup` runs this check: it is
@@ -61,40 +60,59 @@ fn names_a_local_path(source: &str) -> bool {
         || Path::new(source).exists()
 }
 
+/// Why a local tokenizer source cannot serve.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceProblem {
+    /// Nothing at the path on this host.
+    Missing,
+    /// The path is there and cannot serve, for the reason given.
+    Unusable(String),
+}
+
+impl SourceProblem {
+    fn reason(self) -> String {
+        match self {
+            Self::Missing => "does not exist".to_string(),
+            Self::Unusable(reason) => reason,
+        }
+    }
+}
+
 /// Why `path` cannot serve as a local tokenizer source, if it cannot: it
-/// must exist and be readable; a directory must hold one of the files the
+/// must exist and be readable; a directory must hold one of the layouts the
 /// tokenizer loader recognizes, a file must not be empty.
-fn local_tokenizer_source_error(path: &Path) -> Result<(), String> {
+fn local_tokenizer_source_error(path: &Path) -> Result<(), SourceProblem> {
+    let unusable = |reason: String| SourceProblem::Unusable(reason);
     let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
-        std::io::ErrorKind::NotFound => "does not exist".to_string(),
-        _ => format!("cannot be read: {error}"),
+        std::io::ErrorKind::NotFound => SourceProblem::Missing,
+        _ => unusable(format!("cannot be read: {error}")),
     })?;
     if !metadata.is_dir() {
-        std::fs::File::open(path).map_err(|error| format!("cannot be read: {error}"))?;
+        std::fs::File::open(path).map_err(|error| unusable(format!("cannot be read: {error}")))?;
         if metadata.len() == 0 {
-            return Err("is empty".to_string());
+            return Err(unusable("is empty".to_string()));
         }
         return Ok(());
     }
     let mut entries =
-        std::fs::read_dir(path).map_err(|error| format!("cannot be read: {error}"))?;
+        std::fs::read_dir(path).map_err(|error| unusable(format!("cannot be read: {error}")))?;
+    // The loader's own rule: one of the single files, or the vocab.json +
+    // merges.txt pair (vocab.json alone is not a layout it loads).
     let holds_a_tokenizer = entries.any(|entry| {
         entry.is_ok_and(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name == "tokenizer.json"
-                || name == "tiktoken.model"
-                || name.ends_with(".tiktoken")
-                || name == "vocab.json"
+            name == "tokenizer.json" || name == "tiktoken.model" || name.ends_with(".tiktoken")
         })
-    });
+    }) || (path.join("vocab.json").is_file()
+        && path.join("merges.txt").is_file());
     if holds_a_tokenizer {
         Ok(())
     } else {
-        Err(
-            "contains no tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken or vocab.json)"
+        Err(unusable(
+            "contains no tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json with merges.txt)"
                 .to_string(),
-        )
+        ))
     }
 }
 
@@ -1472,33 +1490,43 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// The tokenizer sources named in the configuration are checked before
-    /// anything binds: `tokenizer_path` and `model_path` when they name a
+    /// The tokenizer source the gateway will load is checked before anything
+    /// binds: `tokenizer_path`, else `model_path` (the source start-up and
+    /// worker registration read, so a `model_path` beside an explicit
+    /// tokenizer path is never read as one and not checked), when it names a
     /// path on this host (absolute, explicitly relative, more than one
     /// separator, or present on disk; anything else is a hub id the loader
-    /// fetches lazily, as before), and `chat_template` always. A path must
-    /// exist and be readable, a directory must hold a tokenizer file the
-    /// loader knows, a file must not be empty. The load itself stays where it
-    /// was, a background job at start-up and at worker registration: this is
-    /// the part of it that can be known before serving. With autoload
-    /// disabled the paths are never read and are not checked.
+    /// fetches lazily, as before), and `chat_template` always. A path that
+    /// exists must be readable, a directory must hold a layout the loader
+    /// knows, a file must not be empty. A path that does not exist is a
+    /// configuration error in HTTP connection mode; in gRPC mode the gateway
+    /// loads the tokenizer from the first worker that registers when the
+    /// local load fails, and a model path that exists on the worker hosts
+    /// only is a supported layout, so it is left to that fallback. The load
+    /// itself stays where it was, a background job at start-up and at worker
+    /// registration: this is the part of it that can be known before
+    /// serving. With autoload disabled the paths are never read and are not
+    /// checked.
     fn validate_tokenizer_sources(config: &RouterConfig) -> ConfigResult<()> {
         if config.disable_tokenizer_autoload {
             return Ok(());
         }
-        let sources = [
-            ("tokenizer_path", config.tokenizer_path.as_deref()),
-            ("model_path", config.model_path.as_deref()),
-        ];
-        for (field, source) in sources {
-            if let Some(source) = source.filter(|source| names_a_local_path(source)) {
-                local_tokenizer_source_error(Path::new(source)).map_err(|reason| {
-                    ConfigError::InvalidValue {
+        let (field, source) = match config.tokenizer_path.as_deref() {
+            Some(tokenizer_path) => ("tokenizer_path", Some(tokenizer_path)),
+            None => ("model_path", config.model_path.as_deref()),
+        };
+        if let Some(source) = source.filter(|source| names_a_local_path(source)) {
+            match local_tokenizer_source_error(Path::new(source)) {
+                Ok(()) => {}
+                Err(SourceProblem::Missing)
+                    if config.connection_mode == crate::worker::ConnectionMode::Grpc => {}
+                Err(problem) => {
+                    return Err(ConfigError::InvalidValue {
                         field: field.to_string(),
                         value: source.to_string(),
-                        reason,
-                    }
-                })?;
+                        reason: problem.reason(),
+                    });
+                }
             }
         }
         if let Some(template) = config.chat_template.as_deref() {
@@ -3015,6 +3043,72 @@ mod tests {
             }
             other => panic!("expected a tokenizer_path error, got {other:?}"),
         }
+    }
+
+    /// Only the source the gateway loads is checked: a `model_path` beside an
+    /// explicit tokenizer path is never read as a tokenizer source.
+    #[test]
+    fn a_model_path_beside_an_explicit_tokenizer_path_is_not_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let config = RouterConfig {
+            tokenizer_path: Some(tok),
+            model_path: Some(format!("{}/missing", dir.path().to_str().unwrap())),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// In gRPC connection mode a source that does not exist on this host is
+    /// left to the worker fallback (the tokenizer fetched from the first
+    /// worker that registers); one that exists and cannot serve is refused
+    /// there too, and a missing one is refused in HTTP mode.
+    #[test]
+    fn a_missing_source_is_left_to_the_worker_fallback_in_grpc_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("{}/models/on-the-worker", dir.path().to_str().unwrap());
+        let empty_dir = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty_dir).unwrap();
+        let grpc = |model_path: &str| {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["grpc://worker:50051".to_string()],
+                },
+                PolicyConfig::Random,
+            );
+            config.connection_mode = ConnectionMode::Grpc;
+            config.model_path = Some(model_path.to_string());
+            config
+        };
+        assert!(ConfigValidator::validate(&grpc(&missing)).is_ok());
+        let (value, reason) = refused_source(&grpc(empty_dir.to_str().unwrap()), "model_path");
+        assert_eq!(value, empty_dir.to_str().unwrap());
+        assert!(reason.contains("contains no tokenizer file"), "{reason}");
+        let http = RouterConfig {
+            model_path: Some(missing.clone()),
+            ..Default::default()
+        };
+        let (value, reason) = refused_source(&http, "model_path");
+        assert_eq!(value, missing);
+        assert!(reason.contains("does not exist"), "{reason}");
+    }
+
+    /// The directory rule is the loader's: `vocab.json` counts with
+    /// `merges.txt` beside it, not alone.
+    #[test]
+    fn a_directory_with_vocab_json_alone_is_not_a_tokenizer_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let bpe = dir.path().join("bpe");
+        std::fs::create_dir(&bpe).unwrap();
+        std::fs::write(bpe.join("vocab.json"), "{}").unwrap();
+        let config = RouterConfig {
+            tokenizer_path: Some(bpe.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let (_, reason) = refused_source(&config, "tokenizer_path");
+        assert!(reason.contains("vocab.json with merges.txt"), "{reason}");
+        std::fs::write(bpe.join("merges.txt"), "#version: 0.2\n").unwrap();
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

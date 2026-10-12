@@ -389,9 +389,12 @@ pub struct RouterConfig {
     #[serde(default)]
     pub rl: smg_rl::RlConfig,
     /// Can be a HuggingFace model ID or local path. A local path (absolute,
-    /// explicitly relative, or present on disk) must exist and hold a
-    /// tokenizer file at configuration validation; a model ID is fetched
-    /// lazily. Not checked with `disable_tokenizer_autoload`.
+    /// explicitly relative, or present on disk) that exists must hold a
+    /// tokenizer layout at configuration validation; one that does not exist
+    /// is refused in HTTP connection mode and left to the worker fallback in
+    /// gRPC mode; a model ID is fetched lazily. Not read as a tokenizer
+    /// source when `tokenizer_path` is set; not checked with
+    /// `disable_tokenizer_autoload`.
     pub model_path: Option<String>,
     /// Overrides model_path tokenizer if provided; the same rule applies.
     pub tokenizer_path: Option<String>,
