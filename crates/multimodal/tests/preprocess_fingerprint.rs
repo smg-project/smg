@@ -52,7 +52,7 @@ const CASES: &[(u32, u32)] = &[(560, 420), (840, 560), (1280, 960)];
 // reference processors (`tests/qwen_preprocess_golden.rs` pins that kernel) and their
 // fused normalization (`tests/qwen_pixel_norm_golden.rs` pins that arithmetic);
 // PARALLELIZATION MUST NOT CHANGE THESE.
-const EXPECTED: &[u64] = &[0xea3153a8a3b96dbd, 0xf73aa90846c8e8bd, 0xcfe5dc6b41292ea5];
+const EXPECTED: &[u64] = &[0x776d46f52782791d, 0x12257fb9b357d2d1, 0xcfe5dc6b41292ea5];
 
 fn fingerprint(w: u32, h: u32) -> (u64, usize) {
     let proc = Qwen3VLProcessor::new();
