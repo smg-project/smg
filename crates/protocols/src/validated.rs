@@ -86,10 +86,31 @@ fn rejection(status: StatusCode, code: &str, param: Option<String>, message: Str
 #[cfg(feature = "axum")]
 const DESERIALIZE_PREFIX: &str = "Failed to deserialize the JSON body into the target type: ";
 
+/// Serde's message without axum's prefix, split into the path serde puts in
+/// front of a nested value (`messages[0].content`) and its reason. The reason
+/// starts with serde's own words and quotes the value the client sent after
+/// them, never before, so a match anchored at its start cannot be steered by
+/// a value that repeats those words.
+#[cfg(feature = "axum")]
+fn deserialize_detail(message: &str) -> (Option<&str>, &str) {
+    let detail = message
+        .rsplit_once(DESERIALIZE_PREFIX)
+        .map_or(message, |(_, detail)| detail);
+    let is_path_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '-');
+    match detail.split_once(": ") {
+        Some((head, reason)) if !head.is_empty() && head.chars().all(is_path_char) => {
+            (Some(head), reason)
+        }
+        _ => (None, detail),
+    }
+}
+
 /// The public API's `code` for a body the deserializer refused, read from
-/// serde's message: `missing_required_parameter` for a field that is not
-/// there, `unknown_parameter` for one the type does not know, `invalid_type`
-/// for a value of the wrong shape (a body that is not an object included),
+/// the start of serde's reason (see [`deserialize_detail`]):
+/// `missing_required_parameter` for a field that is not there,
+/// `unknown_parameter` for one the type does not know, `invalid_type` for a
+/// value of the wrong shape (a body that is not an object included),
 /// `invalid_value` for a value outside an enumeration, and
 /// `integer_below_min_value` for a negative integer where the field cannot be
 /// negative; `json_parse_error` for anything else. A JSON array where an
@@ -97,22 +118,20 @@ const DESERIALIZE_PREFIX: &str = "Failed to deserialize the JSON body into the t
 /// or the length of the sequence.
 #[cfg(feature = "axum")]
 fn deserialize_code(message: &str) -> &'static str {
-    let detail = message
-        .rsplit_once(DESERIALIZE_PREFIX)
-        .map_or(message, |(_, detail)| detail);
-    if detail.contains("missing field `") {
+    let (_, reason) = deserialize_detail(message);
+    if reason.starts_with("missing field `") {
         "missing_required_parameter"
-    } else if detail.contains("unknown field `") {
+    } else if reason.starts_with("unknown field `") {
         "unknown_parameter"
-    } else if detail.contains("unknown variant `") {
+    } else if reason.starts_with("unknown variant `") {
         "invalid_value"
-    } else if detail.contains("invalid value: integer `-") {
+    } else if reason.starts_with("invalid value: integer `-") {
         "integer_below_min_value"
-    } else if detail.contains("invalid value") {
+    } else if reason.starts_with("invalid value") {
         "invalid_value"
-    } else if detail.contains("invalid type")
-        || detail.contains("invalid length")
-        || detail.contains("did not match any variant")
+    } else if reason.starts_with("invalid type")
+        || reason.starts_with("invalid length")
+        || reason.starts_with("data did not match any variant")
     {
         "invalid_type"
     } else {
@@ -122,22 +141,14 @@ fn deserialize_code(message: &str) -> &'static str {
 
 /// The field a deserialization error is about, as the public API's `param`:
 /// the path serde recorded, the field a `missing field` / `unknown field`
-/// error names, or both (`items[0].role`); None for a syntax error.
+/// reason names, or both (`items[0].role`); None for a syntax error.
 #[cfg(feature = "axum")]
 fn param_from_deserialize_message(message: &str) -> Option<String> {
-    let detail = message
-        .rsplit_once(DESERIALIZE_PREFIX)
-        .map_or(message, |(_, detail)| detail);
-    let is_path_char =
-        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | '-');
-    let path = detail
-        .split_once(": ")
-        .map(|(head, _)| head)
-        .filter(|head| !head.is_empty() && head.chars().all(is_path_char));
+    let (path, reason) = deserialize_detail(message);
     let field = ["missing field `", "unknown field `"]
         .iter()
-        .find_map(|marker| detail.split_once(marker))
-        .and_then(|(_, rest)| rest.split_once('`'))
+        .find_map(|marker| reason.strip_prefix(marker))
+        .and_then(|rest| rest.split_once('`'))
         .map(|(field, _)| field);
     match (path, field) {
         // A refused unknown key is already the last segment of serde's path.
@@ -776,6 +787,20 @@ mod tests {
                 "invalid_type",
             ),
             ("Missing Content-Type: application/json header", "json_parse_error"),
+            // A value that repeats serde's words does not steer the code: the
+            // reason is read at its start, after the path.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: reasoning_effort: unknown variant `missing field `x`, expected one of `low`, `medium`, `high` at line 1 column 60",
+                "invalid_value",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: messages: invalid type: string \"an invalid value\", expected a sequence at line 1 column 42",
+                "invalid_type",
+            ),
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: invalid type: string \"unknown field `x`\", expected struct ChatCompletionRequest at line 1 column 20",
+                "invalid_type",
+            ),
         ] {
             assert_eq!(deserialize_code(message), code, "{message}");
         }
@@ -807,6 +832,11 @@ mod tests {
             (
                 "Failed to deserialize the JSON body into the target type: invalid type: integer `5`, expected a string at line 1 column 10",
                 None,
+            ),
+            // A value that repeats a field marker does not steer the param.
+            (
+                "Failed to deserialize the JSON body into the target type: reasoning_effort: unknown variant `missing field `x`, expected one of `low`, `medium`, `high` at line 1 column 60",
+                Some("reasoning_effort"),
             ),
             ("JSON syntax error: expected value at line 1 column 1", None),
             ("Missing Content-Type: application/json header", None),
