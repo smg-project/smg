@@ -1121,18 +1121,21 @@ struct CliArgs {
 
     // ==================== Health Checks ====================
     /// Consecutive probe failures before a worker is taken out of rotation
+    /// (at least 1)
     #[arg(long, default_value_t = 3, help_heading = "Health Checks")]
     health_failure_threshold: u32,
 
-    /// Consecutive probe successes before a worker returns to rotation
+    /// Consecutive probe successes before a worker returns to rotation (at
+    /// least 1)
     #[arg(long, default_value_t = 2, help_heading = "Health Checks")]
     health_success_threshold: u32,
 
-    /// Timeout in seconds for a single health probe
+    /// Timeout in seconds for a single health probe (at least 1)
     #[arg(long, default_value_t = 5, help_heading = "Health Checks")]
     health_check_timeout_secs: u64,
 
-    /// Interval in seconds between health probes of each worker
+    /// Interval in seconds between health probes of each worker (at least
+    /// 1; --disable-health-check turns probing off)
     #[arg(long, default_value_t = 60, help_heading = "Health Checks")]
     health_check_interval_secs: u64,
 

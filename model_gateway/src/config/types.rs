@@ -1395,12 +1395,19 @@ pub struct FileDiscoveryConfig {
 
 pub use smg_external_router::RetryConfig;
 
-/// Health check configuration for worker monitoring
+/// Health check configuration for worker monitoring. The four counts and
+/// periods are at least 1 (checked at configuration validation): none of
+/// them has a meaning at 0, and a zero interval would make the checker a
+/// busy loop. `disable_health_check` turns probing off.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheckConfig {
+    /// Consecutive failed probes before a worker leaves rotation; at least 1.
     pub failure_threshold: u32,
+    /// Consecutive passed probes before a worker returns; at least 1.
     pub success_threshold: u32,
+    /// Seconds a single probe may take; at least 1.
     pub timeout_secs: u64,
+    /// Seconds between the probes of a worker; at least 1.
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,

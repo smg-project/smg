@@ -149,6 +149,7 @@ impl ConfigValidator {
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
+        Self::validate_health_check(&config.health_check)?;
 
         if config.history_backend == HistoryBackend::Oracle {
             if config.oracle.is_none() {
@@ -1268,6 +1269,50 @@ impl ConfigValidator {
                 value: cb.window_duration_secs.to_string(),
                 reason: "Must be > 0".to_string(),
             });
+        }
+        Ok(())
+    }
+
+    /// The worker health checker's knobs: the interval and the timeout are
+    /// periods in whole seconds, the thresholds counts of consecutive
+    /// probes, and none of them means anything at 0. An interval of 0 made
+    /// the checker a busy loop (thousands of probes per second against every
+    /// worker, one core at 100 %); a timeout of 0 times every probe out at
+    /// once; a threshold of 0 flips a worker's state without a probe. The
+    /// interval is refused with probing disabled too: the checker's loop
+    /// still sleeps on it between connect signals.
+    fn validate_health_check(health_check: &HealthCheckConfig) -> ConfigResult<()> {
+        let knobs = [
+            (
+                "health_check.check_interval_secs",
+                health_check.check_interval_secs,
+                "--health-check-interval-secs 0 would probe every worker in a busy loop; \
+                 --disable-health-check turns probing off",
+            ),
+            (
+                "health_check.timeout_secs",
+                health_check.timeout_secs,
+                "--health-check-timeout-secs 0 would time every probe out at once",
+            ),
+            (
+                "health_check.failure_threshold",
+                u64::from(health_check.failure_threshold),
+                "--health-failure-threshold 0 would fail a worker without a probe",
+            ),
+            (
+                "health_check.success_threshold",
+                u64::from(health_check.success_threshold),
+                "--health-success-threshold 0 would pass a worker without a probe",
+            ),
+        ];
+        for (field, value, consequence) in knobs {
+            if value == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                    reason: format!("Must be >= 1 ({consequence})"),
+                });
+            }
         }
         Ok(())
     }
@@ -2796,6 +2841,89 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// Every health-check knob at 0 is refused naming the field; the smallest
+    /// values pass; a zero interval is refused with probing disabled too.
+    #[test]
+    fn zero_health_check_knobs_are_rejected() {
+        let zeroed = [
+            (
+                "health_check.check_interval_secs",
+                HealthCheckConfig {
+                    check_interval_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.timeout_secs",
+                HealthCheckConfig {
+                    timeout_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.failure_threshold",
+                HealthCheckConfig {
+                    failure_threshold: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.success_threshold",
+                HealthCheckConfig {
+                    success_threshold: 0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, health_check) in zeroed {
+            let config = RouterConfig {
+                health_check,
+                ..Default::default()
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, name);
+                    assert_eq!(value, "0");
+                    assert!(reason.starts_with("Must be >= 1"), "{name}: {reason}");
+                }
+                other => panic!("{name}: expected an InvalidValue, got {other:?}"),
+            }
+        }
+
+        let smallest = RouterConfig {
+            health_check: HealthCheckConfig {
+                check_interval_secs: 1,
+                timeout_secs: 1,
+                failure_threshold: 1,
+                success_threshold: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&smallest).is_ok());
+        assert!(ConfigValidator::validate(&RouterConfig::default()).is_ok());
+
+        let disabled_but_zero = RouterConfig {
+            health_check: HealthCheckConfig {
+                check_interval_secs: 0,
+                disable_health_check: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                ConfigValidator::validate(&disabled_but_zero),
+                Err(ConfigError::InvalidValue { ref field, .. }) if field == "health_check.check_interval_secs"
+            ),
+            "the checker's loop sleeps on the interval with probing disabled too"
+        );
     }
 
     /// The CLI parsers reject these, but TOML/JSON and the Python bindings

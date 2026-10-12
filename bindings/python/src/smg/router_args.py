@@ -1730,25 +1730,34 @@ class RouterArgs:
             f"--{prefix}health-failure-threshold",
             type=int,
             default=RouterArgs.health_failure_threshold,
-            help=("Number of consecutive health check failures before marking worker unhealthy"),
+            help=(
+                "Number of consecutive health check failures before marking worker unhealthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-success-threshold",
             type=int,
             default=RouterArgs.health_success_threshold,
-            help=("Number of consecutive health check successes before marking worker healthy"),
+            help=(
+                "Number of consecutive health check successes before marking worker healthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-timeout-secs",
             type=int,
             default=RouterArgs.health_check_timeout_secs,
-            help="Timeout in seconds for health check requests",
+            help="Timeout in seconds for health check requests (at least 1)",
         )
         health_group.add_argument(
             f"--{prefix}health-check-interval-secs",
             type=int,
             default=RouterArgs.health_check_interval_secs,
-            help="Interval in seconds between runtime health checks",
+            help=(
+                "Interval in seconds between runtime health checks (at least 1;"
+                " --disable-health-check turns probing off)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-endpoint",
