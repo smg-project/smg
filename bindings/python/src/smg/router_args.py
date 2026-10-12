@@ -1756,7 +1756,7 @@ class RouterArgs:
             default=RouterArgs.health_check_interval_secs,
             help=(
                 "Interval in seconds between runtime health checks (at least 1;"
-                " --disable-health-check turns probing off)"
+                f" --{prefix}disable-health-check turns probing off)"
             ),
         )
         health_group.add_argument(
