@@ -13,96 +13,12 @@
     clippy::allow_attributes
 )]
 
-use std::{
-    fs::{self, File},
-    net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
-    path::Path,
-    process::{Command, ExitStatus, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+#[path = "common/gateway_launch.rs"]
+mod gateway_launch;
 
-const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
-/// How long the gateway gets to refuse; one that serves instead is killed as
-/// soon as a watched port answers, one that hangs at this deadline.
-const EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+use std::{fs, net::TcpListener};
 
-/// What became of a gateway launched with a configuration it should refuse.
-struct Launch {
-    /// The exit status; `None` when the gateway had to be killed.
-    status: Option<ExitStatus>,
-    /// The first watched port that accepted a connection, if any did.
-    listened: Option<u16>,
-    /// Its stdout and stderr.
-    log: String,
-}
-
-/// Three distinct free ports: bound at once so the kernel hands out
-/// different ones, then released for the gateway to bind moments later.
-fn free_ports() -> [u16; 3] {
-    let listeners = [
-        TcpListener::bind((IP, 0)).expect("a free port"),
-        TcpListener::bind((IP, 0)).expect("a free port"),
-        TcpListener::bind((IP, 0)).expect("a free port"),
-    ];
-    listeners.map(|listener| listener.local_addr().expect("the bound address").port())
-}
-
-/// Runs the gateway with `args` (the complete flag list), its output in
-/// `log_path`, until it exits, one of the `watch`ed ports accepts a
-/// connection, or `EXIT_TIMEOUT` passes. The ports are polled tightly: a
-/// listener that is up for a tenth of a second must not go unnoticed.
-fn launch(args: &[String], watch: &[u16], log_path: &Path) -> Launch {
-    let log = File::create(log_path).expect("log file");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_smg"))
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone().expect("log handle")))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn the gateway");
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    let mut listened = None;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll the gateway") {
-            break Some(status);
-        }
-        listened = watch.iter().copied().find(|port| {
-            let address = SocketAddr::from((IP, *port));
-            TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok()
-        });
-        if listened.is_some() || Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(5));
-    };
-    Launch {
-        status,
-        listened,
-        log: fs::read_to_string(log_path).unwrap_or_default(),
-    }
-}
-
-/// The common flags: the HTTP listener on `port`, the metrics listener on
-/// `metrics_port`, both on the loopback.
-fn base_args(port: u16, metrics_port: u16) -> Vec<String> {
-    let ip = IP.to_string();
-    [
-        "--enable-igw",
-        "--host",
-        &ip,
-        "--port",
-        &port.to_string(),
-        "--prometheus-host",
-        &ip,
-        "--prometheus-port",
-        &metrics_port.to_string(),
-    ]
-    .map(str::to_string)
-    .to_vec()
-}
+use gateway_launch::{base_args, free_ports, launch_with, serial, Launch, Until, EXIT_TIMEOUT, IP};
 
 /// The mesh server on `mesh_port`, bound and advertised on the loopback.
 fn mesh_args(mesh_port: u16) -> Vec<String> {
@@ -123,9 +39,9 @@ fn mesh_args(mesh_port: u16) -> Vec<String> {
 fn assert_refused(name: &str, launch: &Launch, named: &[&str]) {
     let log = &launch.log;
     assert!(
-        launch.listened.is_none(),
+        launch.bound.is_none(),
         "{name}: port {:?} answered although the configuration is unusable\n{log}",
-        launch.listened
+        launch.bound
     );
     let status = launch.status.unwrap_or_else(|| {
         panic!("{name}: the gateway neither exited nor listened within {EXIT_TIMEOUT:?}\n{log}")
@@ -151,6 +67,7 @@ fn assert_refused(name: &str, launch: &Launch, named: &[&str]) {
 /// answering.
 #[test]
 fn equal_listener_ports_refuse_to_start() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("a temp dir");
     let [port, metrics_port, _] = free_ports();
     let p = port.to_string();
@@ -187,9 +104,10 @@ fn equal_listener_ports_refuse_to_start() {
         ),
     ];
     for (name, args, flags) in cases {
-        let launch = launch(
+        let launch = launch_with(
             &args,
             &[port, metrics_port],
+            Until::Bound,
             &dir.path().join(format!("{name}.log")),
         );
         assert_refused(name, &launch, &flags);
@@ -206,6 +124,7 @@ fn equal_listener_ports_refuse_to_start() {
 /// before any listener binds: the metrics port never answers either.
 #[test]
 fn a_late_configuration_error_binds_nothing() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("a temp dir");
     let empty = dir.path().join("empty.pem");
     fs::write(&empty, "").expect("write the file");
@@ -228,9 +147,10 @@ fn a_late_configuration_error_binds_nothing() {
         ("storage-hook-missing", hook, vec![missing_hook.as_str()]),
     ];
     for (name, args, named) in cases {
-        let launch = launch(
+        let launch = launch_with(
             &args,
             &[metrics_port, port],
+            Until::Bound,
             &dir.path().join(format!("{name}.log")),
         );
         assert_refused(name, &launch, &named);
@@ -243,6 +163,7 @@ fn a_late_configuration_error_binds_nothing() {
 /// port held (the first bind), then the HTTP port (the last one).
 #[test]
 fn a_held_listener_port_starts_no_mesh_member() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("a temp dir");
     for hold_http_port in [false, true] {
         let held = TcpListener::bind((IP, 0)).expect("a port to hold");
@@ -264,7 +185,12 @@ fn a_held_listener_port_starts_no_mesh_member() {
         let mut args = base_args(port, metrics_port);
         args.extend(mesh_args(mesh_port));
 
-        let launch = launch(&args, &watch, &dir.path().join(format!("{name}.log")));
+        let launch = launch_with(
+            &args,
+            &watch,
+            Until::Bound,
+            &dir.path().join(format!("{name}.log")),
+        );
         assert_refused(name, &launch, &["Address already in use"]);
         drop(held);
     }

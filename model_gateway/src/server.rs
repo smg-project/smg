@@ -1412,6 +1412,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         ))
     };
 
+    // The runtime was built in `main`, before the subscriber existed: its
+    // size is logged here, where the line reaches the log, with whether an
+    // operator pinned it.
+    info!(
+        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
+        pinned = config.runtime_worker_threads.is_some(),
+        "Tokio runtime sized"
+    );
+
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{

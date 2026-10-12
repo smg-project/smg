@@ -49,7 +49,6 @@ use smg::{
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
-use tracing::info;
 
 /// Parse repeated `<flag> <url> [bootstrap_port|none]` occurrences into
 /// (url, optional bootstrap port) pairs. The trailing port is optional, so
@@ -2790,21 +2789,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rust 1.95+ already honors the cgroup CPU quota, so the default is
     // container-aware. Only build the runtime explicitly when an operator pins a
     // worker-thread count.
+    // The runtime's size is logged by `startup`, once the log subscriber is
+    // up: a line emitted here would reach no subscriber.
     let runtime = match server_config.runtime_worker_threads {
-        Some(n) => {
-            info!(
-                worker_threads = n,
-                "Sizing tokio runtime (explicit override)"
-            );
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(n)
-                .enable_all()
-                .build()?
-        }
-        None => {
-            info!("Sizing tokio runtime (default, container-aware)");
-            tokio::runtime::Runtime::new()?
-        }
+        Some(n) => tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(n)
+            .enable_all()
+            .build()?,
+        None => tokio::runtime::Runtime::new()?,
     };
     let served = runtime.block_on(Box::pin(server::startup(server_config)));
     // The writer threads outlive `startup` (a process may start more than one
