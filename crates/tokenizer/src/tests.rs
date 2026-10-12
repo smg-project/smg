@@ -743,14 +743,12 @@ fn byte_fallback_literal_replacement_characters_are_not_a_lost_run() {
 fn byte_fallback_lost_run_after_a_literal_replacement_character_counts_bytes() {
     // "\u{FFFD}A" streamed as byte tokens, then invalid bytes, then a regular
     // token. With fewer than four invalid bytes the run closes through the
-    // remainder path, which aligns the streamed text with the batch decode by
-    // characters and takes the streamed literal U+FFFD for one byte: two
-    // replacement characters more than the run has bytes. From four invalid
-    // bytes on, the lost-run path streams one replacement character per byte.
-    // Both keep "\u{FFFD}A" and count one recovery; the difference is
-    // smg-lab #330.
+    // remainder path, from four on through the lost-run path; both count the
+    // streamed literal U+FFFD as its three bytes, so the tail has one
+    // replacement character per invalid byte on either path. Both keep
+    // "\u{FFFD}A" and count one recovery.
     let tokenizer = byte_fallback_full_tokenizer(vec![]);
-    for (invalid, expected_tail) in [(3, 5), (4, 4), (8, 8)] {
+    for (invalid, expected_tail) in [(3, 3), (4, 4), (8, 8)] {
         let mut ids = byte_ids("\u{FFFD}A");
         ids.extend(vec![0xFF + 2; invalid]);
         ids.push(1);
