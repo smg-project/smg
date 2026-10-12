@@ -119,8 +119,10 @@ fn turbojpeg() -> Option<&'static TurboJpeg> {
     TJ.get_or_init(load_turbojpeg).as_ref()
 }
 
-/// Cap on the decoded buffer. Matches the `image` crate's default 512 MiB
-/// limit, which the pure-Rust fallback decoder already enforces.
+/// Cap on the decoded buffer (RGB, or CMYK for a four-component JPEG). Matches
+/// the `image` crate's default 512 MiB limit, which `decode_image_bytes`
+/// reserves against before the pure-Rust fallback decodes (on the RGB size, so
+/// a CMYK JPEG refused here for its 4-byte buffer may still decode there).
 const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
 
 /// Byte length of a `w` x `h` buffer of `channels` bytes per pixel, or `None`
