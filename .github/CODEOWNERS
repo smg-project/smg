@@ -1,51 +1,51 @@
 # Default owners for everything
-* @slin1237 @CatherineSue @key4ng
+* @slin1237 @CatherineSue @key4ng @smg-project-bot
 
 # Benchmarks
-/model_gateway/benches @slin1237
+/model_gateway/benches @slin1237 @smg-project-bot
 
 # Python bindings
-/bindings/python @CatherineSue @key4ng @gongwei-130 @slin1237
-/bindings/golang @slin1237
+/bindings/python @CatherineSue @key4ng @gongwei-130 @slin1237 @smg-project-bot
+/bindings/golang @slin1237 @smg-project-bot
 
 # E2E tests
-/e2e_test @CatherineSue @key4ng @XinyueZhang369 @slin1237
+/e2e_test @CatherineSue @key4ng @XinyueZhang369 @slin1237 @smg-project-bot
 
 # Github workflows
-/.github/workflows @CatherineSue @key4ng @XinyueZhang369 @slin1237
+/.github/workflows @CatherineSue @key4ng @XinyueZhang369 @slin1237 @smg-project-bot
 
 # Docker, Installation
-/docker @gongwei-130 @CatherineSue @slin1237
-/scripts @gongwei-130 @CatherineSue @key4ng @XinyueZhang369 @slin1237
+/docker @gongwei-130 @CatherineSue @slin1237 @smg-project-bot
+/scripts @gongwei-130 @CatherineSue @key4ng @XinyueZhang369 @slin1237 @smg-project-bot
 
 # Main source code (model_gateway)
-/model_gateway/src/config @slin1237 @CatherineSue
-/model_gateway/src/core @slin1237 @CatherineSue
-/model_gateway/src/policies @slin1237
-/model_gateway/src/routers @CatherineSue @key4ng @slin1237
-/model_gateway/src/service_discovery @slin1237 @CatherineSue @key4ng @XinyueZhang369
+/model_gateway/src/config @slin1237 @CatherineSue @smg-project-bot
+/model_gateway/src/core @slin1237 @CatherineSue @smg-project-bot
+/model_gateway/src/policies @slin1237 @smg-project-bot
+/model_gateway/src/routers @CatherineSue @key4ng @slin1237 @smg-project-bot
+/model_gateway/src/service_discovery @slin1237 @CatherineSue @key4ng @XinyueZhang369 @smg-project-bot
 
 # Workspace crates
-/crates/auth @slin1237
-/crates/data_connector @key4ng @zhoug9127
-/crates/grpc_client @CatherineSue @slin1237
-/crates/grpc_client/proto/vllm_engine.proto @njhill @CatherineSue @slin1237
-/crates/grpc_client/proto/common.proto @njhill @CatherineSue @slin1237
-/crates/kv_index @slin1237
-/crates/mcp @key4ng @CatherineSue @slin1237 @zhoug9127
-/crates/mesh @tonyluj @llfl @slin1237
-/crates/multimodal @slin1237 @CatherineSue
-/crates/protocols @CatherineSue @key4ng
-/crates/reasoning_parser @CatherineSue
-/crates/symphony @slin1237 @CatherineSue
-/crates/tokenizer @slin1237 @CatherineSue
-/crates/tool_parser @slin1237 @CatherineSue
-/crates/wasm @slin1237 @tonyluj
-/crates/workflow @slin1237 @CatherineSue
+/crates/auth @slin1237 @smg-project-bot
+/crates/data_connector @key4ng @zhoug9127 @smg-project-bot
+/crates/grpc_client @CatherineSue @slin1237 @smg-project-bot
+/crates/grpc_client/proto/vllm_engine.proto @njhill @CatherineSue @slin1237 @smg-project-bot
+/crates/grpc_client/proto/common.proto @njhill @CatherineSue @slin1237 @smg-project-bot
+/crates/kv_index @slin1237 @smg-project-bot
+/crates/mcp @key4ng @CatherineSue @slin1237 @zhoug9127 @smg-project-bot
+/crates/mesh @tonyluj @llfl @slin1237 @smg-project-bot
+/crates/multimodal @slin1237 @CatherineSue @smg-project-bot
+/crates/protocols @CatherineSue @key4ng @smg-project-bot
+/crates/reasoning_parser @CatherineSue @smg-project-bot
+/crates/symphony @slin1237 @CatherineSue @smg-project-bot
+/crates/tokenizer @slin1237 @CatherineSue @smg-project-bot
+/crates/tool_parser @slin1237 @CatherineSue @smg-project-bot
+/crates/wasm @slin1237 @tonyluj @smg-project-bot
+/crates/workflow @slin1237 @CatherineSue @smg-project-bot
 
 # gRPC servicer
-/grpc_servicer @CatherineSue @slin1237
-/grpc_servicer/smg_grpc_servicer/vllm @njhill @CatherineSue @slin1237
+/grpc_servicer @CatherineSue @slin1237 @smg-project-bot
+/grpc_servicer/smg_grpc_servicer/vllm @njhill @CatherineSue @slin1237 @smg-project-bot
 
 # Examples
-/examples/wasm @tonyluj @slin1237
+/examples/wasm @tonyluj @slin1237 @smg-project-bot
