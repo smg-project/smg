@@ -86,6 +86,16 @@ class ImageTagTests(unittest.TestCase):
         for name in BUILD_INPUTS:
             self.assertIn(f"- '{name}'", workflow)
 
+    def test_workflow_defaults_produce_a_valid_recipe_without_repo_variables(self):
+        workflow = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()
+        defaults = []
+        for variable in ("BASE_IMAGE", "CUDA_DRIVER_VERSION"):
+            default = re.search(rf"vars\.SMG_CI_GPU_RUNNER_{variable} \|\| '([^']+)'", workflow)
+            self.assertIsNotNone(default, f"Missing workflow fallback for {variable}")
+            defaults.append(default.group(1))
+        self.assertTrue(defaults[0].startswith("ghcr.io/actions/actions-runner:"))
+        self.assertTrue(helper.image_tag(ROOT, *defaults).startswith("ci-gpu-runner-"))
+
     def test_cuda_layout_probe_requires_the_compatible_toolkit_alias(self):
         workflow = (ROOT / ".github/workflows/ci-gpu-runner-image.yml").read_text()
         guard = re.search(

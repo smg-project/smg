@@ -40,8 +40,8 @@ jobs:
     runs-on: ${{ vars.SMG_RUNNER_DOCKER || 'cpu-e5' }}
     timeout-minutes: 120
     env:
-      BASE_IMAGE: ${{ vars.SMG_CI_GPU_RUNNER_BASE_IMAGE }}
-      UV_CUDA_DRIVER_VERSION: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION }}
+      BASE_IMAGE: ${{ vars.SMG_CI_GPU_RUNNER_BASE_IMAGE || 'ghcr.io/actions/actions-runner:2.337.0@sha256:5036480998280bb21e32ade9fe1b02b493861ac314b62ba1aea320b94f56ec97' }}
+      UV_CUDA_DRIVER_VERSION: ${{ vars.SMG_CI_GPU_RUNNER_CUDA_DRIVER_VERSION || '580.65.06' }}
       IMAGE_REPOSITORY: ${{ vars.SMG_CI_GPU_RUNNER_IMAGE_REPOSITORY || format('ghcr.io/{0}/smg', github.repository_owner) }}
     steps:
       - name: Checkout code
