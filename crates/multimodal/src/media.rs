@@ -80,7 +80,10 @@ pub struct MediaConnectorConfig {
     /// loopback, link-local, private or otherwise non-public address. Off,
     /// such a URL is refused before anything is connected: a gateway that
     /// fetches on a client's behalf must not be made to reach what only it
-    /// can reach. On, for a deployment whose media origin is internal.
+    /// can reach. On, for a deployment whose media origin is internal, a
+    /// host is admitted by its name alone (the allow-list still holds) and
+    /// resolved by the HTTP client as before, through an egress proxy where
+    /// there is one.
     pub allow_private_hosts: bool,
     pub allowed_local_media_path: Option<PathBuf>,
     /// Budget for one image or audio fetch by URL, connect to last byte;
@@ -542,13 +545,26 @@ impl MediaConnector {
             url: url.to_string(),
             budget,
         };
+        // What is left of the budget (`None` without one), or its end.
+        let remaining = || -> Result<Option<Duration>, MediaConnectorError> {
+            if budget.is_zero() {
+                return Ok(None);
+            }
+            budget
+                .checked_sub(started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .map(Some)
+                .ok_or_else(timed_out)
+        };
         let mut current = url.clone();
         let mut redirects = 0;
         loop {
-            let _hop = self
-                .resolver
-                .admit(&self.policy, &current)
+            // The admission spends the budget too: the lookup it makes for a
+            // name is part of "connect to last byte", and a lookup that
+            // stalls past the budget's end is the timeout it is.
+            let _hop = within_budget(remaining()?, self.resolver.admit(&self.policy, &current))
                 .await
+                .ok_or_else(timed_out)?
                 .map_err(|reason| {
                     if redirects == 0 {
                         reason
@@ -561,11 +577,7 @@ impl MediaConnector {
                     }
                 })?;
             let mut req = self.client.get(current.as_str());
-            if budget > Duration::ZERO {
-                let remaining = budget
-                    .checked_sub(started.elapsed())
-                    .filter(|remaining| !remaining.is_zero())
-                    .ok_or_else(timed_out)?;
+            if let Some(remaining) = remaining()? {
                 req = req.timeout(remaining);
             }
 
@@ -748,8 +760,6 @@ impl MediaConnector {
     }
 }
 
-/// The local file the request names, up to `limit` bytes. Its I/O is the
-/// request's own ([`MediaConnectorError::Io`]).
 /// A redirect the client cannot follow: where to, and why.
 struct RefusedRedirect {
     target: String,
@@ -795,6 +805,45 @@ fn redirect_target(response: &reqwest::Response) -> Option<Result<Url, RefusedRe
     Some(Ok(target))
 }
 
+/// `future` under what is left of the fetch budget: its output, or `None`
+/// when the budget ran out first. Without a budget, its output.
+async fn within_budget<T>(
+    remaining: Option<Duration>,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    match remaining {
+        Some(remaining) => time::timeout(remaining, future).await.ok(),
+        None => Some(future.await),
+    }
+}
+
+#[cfg(test)]
+mod hop_budget_tests {
+    use super::*;
+
+    /// The admission of a hop is held to the fetch budget: an answer in time
+    /// is the answer, one that stalls past the budget's end is the budget's
+    /// end, and without a budget the answer is waited for.
+    #[tokio::test]
+    async fn an_admission_is_held_to_the_fetch_budget() {
+        assert_eq!(within_budget(None, async { 7 }).await, Some(7));
+        assert_eq!(
+            within_budget(Some(Duration::from_secs(5)), async { 7 }).await,
+            Some(7)
+        );
+        assert_eq!(
+            within_budget(
+                Some(Duration::from_millis(10)),
+                std::future::pending::<i32>()
+            )
+            .await,
+            None
+        );
+    }
+}
+
+/// The local file the request names, up to `limit` bytes. Its I/O is the
+/// request's own ([`MediaConnectorError::Io`]).
 async fn read_file_with_limit(
     path: &Path,
     limit: usize,

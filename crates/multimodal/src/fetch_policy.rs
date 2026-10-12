@@ -11,7 +11,10 @@
 //! the HTTP client's resolver for as long as the hop is in flight
 //! ([`MediaHostResolver`]), so a DNS answer cannot change between the check
 //! and the connect. Behind an egress proxy the proxy resolves the name; the
-//! check still happens here, on this side's answer.
+//! check still happens here, on this side's answer. With private media hosts
+//! allowed there is no address to refuse, so a host is admitted by name
+//! alone: no lookup here and no pin, and the client (or the proxy) resolves
+//! it as it did before there was a policy.
 
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -35,16 +38,28 @@ pub(crate) struct MediaHostPolicy {
 }
 
 impl MediaHostPolicy {
+    /// `allowed_domains` by name, each trimmed and lowercased, empty entries
+    /// dropped (a list spelled with a space after each comma names the same
+    /// hosts); `None` is any host.
     pub(crate) fn new(allowed_domains: Option<Vec<String>>, allow_private_hosts: bool) -> Self {
         Self {
             allowed_domains: allowed_domains.map(|domains| {
                 domains
-                    .into_iter()
-                    .map(|domain| domain.to_ascii_lowercase())
+                    .iter()
+                    .map(|domain| domain.trim().to_ascii_lowercase())
+                    .filter(|domain| !domain.is_empty())
                     .collect()
             }),
             allow_private_hosts,
         }
+    }
+
+    /// Whether hosts are judged by address at all. With private hosts
+    /// allowed there is no address to refuse, so a host is admitted by name
+    /// alone and left to the client to resolve, as it was before there was
+    /// a policy (through an egress proxy, where there is one).
+    fn checks_addresses(&self) -> bool {
+        !self.allow_private_hosts
     }
 
     /// The URL's host against the allow-list, by name as the URL spells it
@@ -61,20 +76,19 @@ impl MediaHostPolicy {
         }
         Ok(host)
     }
+}
 
-    /// One address of `host` against the address policy.
-    fn check_address(&self, host: &str, address: IpAddr) -> Result<(), MediaConnectorError> {
-        if self.allow_private_hosts {
-            return Ok(());
-        }
-        match non_public_address_class(address) {
-            Some(class) => Err(MediaConnectorError::DisallowedAddress {
-                host: host.to_string(),
-                address,
-                class,
-            }),
-            None => Ok(()),
-        }
+/// One address of `host` against the address policy, asked only when the
+/// policy checks addresses: a non-public address is refused, named with its
+/// class.
+fn check_address(host: &str, address: IpAddr) -> Result<(), MediaConnectorError> {
+    match non_public_address_class(address) {
+        Some(class) => Err(MediaConnectorError::DisallowedAddress {
+            host: host.to_string(),
+            address,
+            class,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -147,30 +161,35 @@ struct Pin {
 
 impl MediaHostResolver {
     /// Admit one hop of a fetch under `policy`: the host by name against the
-    /// allow-list, then its address (an IP literal) or every address it
-    /// resolves to against the address policy. The guard keeps the checked
-    /// addresses pinned for this resolver until the hop is over, so the
-    /// client connects to what was checked.
+    /// allow-list, then, when the policy checks addresses, its address (an
+    /// IP literal) or every address it resolves to against the address
+    /// policy. The guard keeps the checked addresses pinned for this resolver
+    /// until the hop is over, so the client connects to what was checked. A
+    /// policy that checks no address (private hosts allowed) admits the host
+    /// by name alone, with no lookup and nothing to pin.
     pub(crate) async fn admit(
         self: &Arc<Self>,
         policy: &MediaHostPolicy,
         url: &Url,
     ) -> Result<HostPin, MediaConnectorError> {
         let name = policy.check_name(url)?;
+        if !policy.checks_addresses() {
+            return Ok(HostPin { pinned: None });
+        }
         match url.host() {
             Some(Host::Domain(domain)) => {
                 let addresses = resolve(domain).await?;
                 for &address in &addresses {
-                    policy.check_address(domain, address)?;
+                    check_address(domain, address)?;
                 }
                 Ok(self.pin(domain, addresses))
             }
             Some(Host::Ipv4(address)) => {
-                policy.check_address(&name, IpAddr::V4(address))?;
+                check_address(&name, IpAddr::V4(address))?;
                 Ok(HostPin { pinned: None })
             }
             Some(Host::Ipv6(address)) => {
-                policy.check_address(&name, IpAddr::V6(address))?;
+                check_address(&name, IpAddr::V6(address))?;
                 Ok(HostPin { pinned: None })
             }
             None => Err(MediaConnectorError::InvalidUrl(url.to_string())),
@@ -381,9 +400,10 @@ mod tests {
         assert!(pin.pinned.is_none(), "a literal needs no pin");
     }
 
-    /// A name is judged on the addresses it resolves to, and the client's
-    /// resolver is handed those addresses while the hop is in flight; after
-    /// the hop it resolves as the system does.
+    /// A name is judged on the addresses it resolves to; the addresses a hop
+    /// was admitted with are handed to the client's resolver for as long as
+    /// the hop is in flight, and after it the name resolves as the system
+    /// does.
     #[tokio::test]
     async fn a_resolved_name_is_judged_and_pinned_for_the_client() {
         let resolver = Arc::new(MediaHostResolver::default());
@@ -402,40 +422,101 @@ mod tests {
             "{error}"
         );
 
-        let allowed = MediaHostPolicy::new(None, true);
-        let pin = resolver
-            .admit(&allowed, &url)
-            .await
-            .expect("private hosts allowed");
-        let name = Name::from_str("localhost").expect("a name");
+        // The pin of an admitted hop, with the addresses a public name would
+        // have resolved to (none resolves here): the client is handed the
+        // checked addresses, nothing else, until the hop is over.
+        let checked = vec![
+            ip("93.184.216.34"),
+            ip("2606:2800:21f:cb07:6820:80da:af6b:8b2c"),
+        ];
+        let pin = resolver.pin("media.example", checked.clone());
+        let name = Name::from_str("media.example").expect("a name");
         let pinned: Vec<SocketAddr> = resolver.resolve(name).await.expect("pinned").collect();
-        assert!(!pinned.is_empty());
-        assert!(
-            pinned
-                .iter()
-                .all(|address| address.ip().is_loopback() && address.port() == 0),
-            "{pinned:?}"
-        );
-        let checked = resolver
-            .pinned("localhost")
-            .expect("pinned while the hop is in flight");
         assert_eq!(
             pinned.iter().map(SocketAddr::ip).collect::<Vec<_>>(),
             checked
         );
+        assert!(pinned.iter().all(|address| address.port() == 0));
+        assert_eq!(resolver.pinned("media.example"), Some(checked.clone()));
         drop(pin);
         assert!(
-            resolver.pinned("localhost").is_none(),
+            resolver.pinned("media.example").is_none(),
             "released with the hop"
         );
 
         // Two hops of the same host in flight: the pin outlives the first.
-        let first = resolver.admit(&allowed, &url).await.expect("first");
-        let second = resolver.admit(&allowed, &url).await.expect("second");
+        let first = resolver.pin("media.example", checked.clone());
+        let second = resolver.pin("media.example", checked);
         drop(first);
-        assert!(resolver.pinned("localhost").is_some());
+        assert!(resolver.pinned("media.example").is_some());
         drop(second);
-        assert!(resolver.pinned("localhost").is_none());
+        assert!(resolver.pinned("media.example").is_none());
+    }
+
+    /// With private hosts allowed there is no address to judge, so a host is
+    /// admitted by name alone: no lookup, no pin. A deployment that resolves
+    /// external names only at its egress proxy keeps fetching that way.
+    #[tokio::test]
+    async fn a_name_is_admitted_without_a_lookup_when_private_hosts_are_allowed() {
+        let resolver = Arc::new(MediaHostResolver::default());
+        // A label over 63 characters: no resolver answers it, wherever the
+        // test runs, so a lookup here would fail.
+        let host = format!("{}.invalid", "a".repeat(64));
+        let url = Url::parse(&format!("http://{host}/a.png")).expect("url");
+
+        let strict = MediaHostPolicy::new(None, false);
+        let error = resolver
+            .admit(&strict, &url)
+            .await
+            .expect_err("judged by address: the lookup fails");
+        assert!(
+            matches!(&error, MediaConnectorError::UnresolvableHost { host: named, .. } if named == &host),
+            "{error}"
+        );
+
+        let open = MediaHostPolicy::new(None, true);
+        let pin = resolver
+            .admit(&open, &url)
+            .await
+            .expect("admitted by name alone");
+        assert!(pin.pinned.is_none(), "nothing was resolved, nothing to pin");
+        assert!(resolver.pinned(&host).is_none());
+
+        // The allow-list still holds, by name.
+        let listed = MediaHostPolicy::new(Some(vec!["media.example".to_string()]), true);
+        assert!(matches!(
+            resolver.admit(&listed, &url).await,
+            Err(MediaConnectorError::DisallowedDomain(named)) if named == host
+        ));
+    }
+
+    /// An allow-list entry is matched by its name alone: surrounding blanks
+    /// (a space after the comma of a list) do not make a host unmatchable,
+    /// and an empty entry lists nothing.
+    #[tokio::test]
+    async fn allow_list_entries_are_trimmed_and_empty_ones_dropped() {
+        let resolver = Arc::new(MediaHostResolver::default());
+        let listed = MediaHostPolicy::new(
+            Some(vec![
+                "media.example".to_string(),
+                " cdn.example".to_string(),
+                String::new(),
+                "  ".to_string(),
+            ]),
+            true,
+        );
+        for host in ["media.example", "cdn.example", "CDN.example"] {
+            let url = Url::parse(&format!("http://{host}/a.png")).expect("url");
+            resolver
+                .admit(&listed, &url)
+                .await
+                .unwrap_or_else(|error| panic!("{host}: {error}"));
+        }
+        let url = Url::parse("http://other.example/a.png").expect("url");
+        assert!(matches!(
+            resolver.admit(&listed, &url).await,
+            Err(MediaConnectorError::DisallowedDomain(named)) if named == "other.example"
+        ));
     }
 
     /// A name nothing resolves is the request's error, named. A label over
