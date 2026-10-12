@@ -395,6 +395,10 @@ impl Deref for MiniMaxM3VisionProcessor {
 }
 
 impl VisionPreProcessor for MiniMaxM3VisionProcessor {
+    fn supports_per_image_preprocessing(&self) -> bool {
+        true
+    }
+
     fn emits_pixel_bytes(&self) -> bool {
         true
     }
@@ -423,6 +427,25 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
             .map(|image| (image.width(), image.height()))
             .collect();
         Ok(out)
+    }
+
+    fn preprocess_image_items(
+        &self,
+        images: &[&DynamicImage],
+        config: &PreProcessorConfig,
+    ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
+        if images.is_empty() {
+            return Some(Err(TransformError::EmptyBatch));
+        }
+        // Reuse the existing single-image implementation, including short-side
+        // staging and metadata. Borrow decoded images and allocate only the
+        // independently owned outputs.
+        Some(
+            images
+                .iter()
+                .map(|image| self.preprocess(std::slice::from_ref(*image), config))
+                .collect(),
+        )
     }
 
     fn preprocess_video(
@@ -1169,6 +1192,106 @@ mod tests {
         ];
         let out = processor.preprocess(&images, &config).unwrap();
         assert_eq!(out.feature_token_counts, vec![64, 160, 64]);
+    }
+
+    /// Exercise short-side staging, mixed sizes, repeated images and request
+    /// overrides: opting in must preserve every pixel bit and all metadata.
+    #[test]
+    fn per_image_concat_matches_batch() {
+        use std::collections::HashMap;
+
+        use crate::{types::FieldLayout, ModelSpecificValue};
+
+        let processor = MiniMaxM3VisionProcessor::new();
+        assert!(processor.supports_per_image_preprocessing());
+        let layouts = HashMap::from([
+            ("image_grid_thw".to_string(), FieldLayout::Batched),
+            ("patches_per_image".to_string(), FieldLayout::Batched),
+        ]);
+        assert!(processor
+            .preprocess_image_items(&[], &m3_config())
+            .unwrap()
+            .is_err());
+        let mut images: Vec<_> = [(224, 224), (400, 40), (40, 400), (960, 540), (224, 224)]
+            .into_iter()
+            .map(|(width, height)| {
+                DynamicImage::ImageRgb8(image::RgbImage::from_fn(width, height, |x, y| {
+                    image::Rgb([(x % 251) as u8, (y % 239) as u8, ((x + y) % 253) as u8])
+                }))
+            })
+            .collect();
+        images[2] = DynamicImage::ImageLuma8(images[2].to_luma8());
+        images[4] = DynamicImage::ImageRgba8(images[4].to_rgba8());
+        let mut configs = vec![m3_config()];
+        let mut limited = m3_config();
+        limited.max_pixels = Some(112 * 112);
+        configs.push(limited.clone());
+        let mut no_resize = m3_config();
+        no_resize.do_resize = Some(false);
+        configs.push(no_resize);
+        let mut custom = m3_config();
+        custom.image_mean = Some(vec![0.1, 0.2, 0.3]);
+        custom.image_std = Some(vec![0.7, 0.8, 0.9]);
+        custom.resampling = Some(0);
+        configs.push(custom);
+        let mut cases: Vec<_> = configs.into_iter().map(|config| (config, 5)).collect();
+        cases.extend([2, 31, 32, 70].map(|count| (limited.clone(), count)));
+        for (config, count) in cases {
+            // Without resizing, input dimensions must already lie on the patch grid.
+            let aligned: Vec<_> = images
+                .iter()
+                .map(|image| {
+                    DynamicImage::ImageRgb8(image::imageops::resize(
+                        &image.to_rgb8(),
+                        224,
+                        112,
+                        FilterType::Nearest,
+                    ))
+                })
+                .collect();
+            let source = if config.do_resize == Some(false) {
+                &aligned
+            } else {
+                &images
+            };
+            let images: Vec<_> = source.iter().cycle().take(count).cloned().collect();
+            let batch = processor.preprocess(&images, &config).unwrap();
+            let references = images.iter().collect::<Vec<_>>();
+            let parts = processor
+                .preprocess_image_items(&references, &config)
+                .unwrap()
+                .unwrap();
+            let joined = PreprocessedEncoderInputs::concat(parts, &layouts).unwrap();
+            assert_eq!(joined.encoder_input_shape(), batch.encoder_input_shape());
+            assert_eq!(joined.feature_token_counts, batch.feature_token_counts);
+            assert_eq!(joined.item_sizes, batch.item_sizes);
+            for (got, want) in joined
+                .encoder_input_flat()
+                .iter()
+                .zip(batch.encoder_input_flat().iter())
+            {
+                assert_eq!(got.to_bits(), want.to_bits());
+            }
+            assert_eq!(joined.model_specific.len(), batch.model_specific.len());
+            for (key, want) in &batch.model_specific {
+                match (&joined.model_specific[key], want) {
+                    (
+                        ModelSpecificValue::IntTensor {
+                            data: got,
+                            shape: got_shape,
+                        },
+                        ModelSpecificValue::IntTensor {
+                            data: want,
+                            shape: want_shape,
+                        },
+                    ) => {
+                        assert_eq!(got, want, "{key}");
+                        assert_eq!(got_shape, want_shape, "{key}");
+                    }
+                    _ => panic!("unexpected metadata {key}"),
+                }
+            }
+        }
     }
 
     #[test]

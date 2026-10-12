@@ -51,6 +51,7 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+mod image_cache;
 mod inflight;
 mod item_limits;
 mod pixel_cache;

@@ -122,6 +122,19 @@ pub trait VisionPreProcessor: Send + Sync {
         )))
     }
 
+    /// Optionally produce independently owned image outputs in input order.
+    /// Concatenating them must be equivalent to `preprocess` for the batch.
+    /// This lets caches avoid allocating and then splitting an intermediate
+    /// batch. Return `None` to use the ordinary batch path instead.
+    /// Only used for processors opting into per-image preprocessing.
+    fn preprocess_image_items(
+        &self,
+        _images: &[&DynamicImage],
+        _config: &PreProcessorConfig,
+    ) -> Option<Result<Vec<PreprocessedEncoderInputs>, TransformError>> {
+        None
+    }
+
     /// Preprocess one decoded video clip represented as borrowed RGB frame
     /// buffers. Implementations can override this to avoid materializing
     /// `DynamicImage` objects after media decode.

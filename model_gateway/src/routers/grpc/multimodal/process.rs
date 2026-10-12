@@ -7,12 +7,11 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result};
-use futures::{future::try_join_all, StreamExt, TryStreamExt};
+use futures::future::try_join_all;
 use llm_multimodal::{
     AsyncMultiModalTracker, AudioClip, EncoderFieldLayouts, ImageFrame, MediaItemInfo, Modality,
     ModelMetadata, ModelProcessorSpec, PlaceholderRange, PreProcessorConfig,
     PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput, VideoClip,
-    VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
 use rayon::prelude::*;
@@ -21,12 +20,10 @@ use tracing::{debug, info, warn};
 use super::{
     config::{MultimodalComponents, MultimodalModelConfig},
     log_mm_timing_enabled,
-    pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
     MediaBatch, MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
     PromptBinding, RegistryTokenizer,
 };
-use crate::observability::metrics::Metrics;
 
 struct PreparedMultimodalPart {
     preprocessed: PreprocessedEncoderInputs,
@@ -366,88 +363,25 @@ async fn preprocess_modality(
     let pp_config = preprocessor_config_for(model_config, modality).clone();
 
     if let MediaBatch::Images(images) = media {
-        if let Some(cache) = &components.pixel_cache {
-            let processor = components
-                .vision_processor_registry
-                .find(model_id, model_type);
-            // Retaining individual tensors plus their concatenation is costly
-            // for large requests. Keep their whole-batch allocation path.
-            if images.len() == 1
-                || (images.len() < 32
-                    && processor.is_some_and(|p| p.supports_per_image_preprocessing()))
+        if components.pixel_cache.is_some()
+            && (images.len() == 1
+                || components
+                    .vision_processor_registry
+                    .find(model_id, model_type)
+                    .is_some_and(|processor| processor.supports_per_image_preprocessing()))
+        {
+            if let Some(output) = super::image_cache::preprocess_images_cached_batch(
+                images,
+                components,
+                model_id,
+                model_type,
+                tokenizer_id,
+                model_config,
+                &spec.encoder_field_layouts_for(Modality::Image),
+            )
+            .await?
             {
-                let mut config = serde_json::json!({
-                    "model_id": model_id,
-                    "model_type": model_type,
-                    "model_config": model_config.config,
-                    "preprocessor_config": pp_config,
-                });
-                config.sort_all_objects();
-                let fingerprint = config_fingerprint(tokenizer_id, &config);
-                // Deduplicate within the request even if the result cannot fit
-                // in the cache. Record every position before scheduling work.
-                let mut unique = HashMap::new();
-                let mut positions: Vec<Vec<usize>> = Vec::new();
-                let tasks = images
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, image)| {
-                        let next = unique.len();
-                        let index = *unique
-                            .entry(PixelCacheKey {
-                                image_hash: image.hash.clone(),
-                                config_fingerprint: fingerprint,
-                            })
-                            .or_insert(next);
-                        if index == next {
-                            positions.push(vec![position]);
-                            Some(image)
-                        } else {
-                            positions[index].push(position);
-                            None
-                        }
-                    })
-                    .map(|image| {
-                        preprocess_image_cached(
-                            cache.clone(),
-                            image.clone(),
-                            components.vision_processor_registry.clone(),
-                            model_id.to_string(),
-                            model_type.map(String::from),
-                            pp_config.clone(),
-                            fingerprint,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let parts = futures::stream::iter(tasks)
-                    // Keep unique results aligned with their recorded positions.
-                    .buffered(4)
-                    .try_collect::<Vec<_>>()
-                    .await?;
-                let layouts = spec
-                    .encoder_field_layouts_for(Modality::Image)
-                    .model_specific;
-                let image_count = images.len();
-                return tokio::task::spawn_blocking(move || -> Result<_> {
-                    let mut ordered = vec![None; image_count];
-                    for (part, positions) in parts.into_iter().zip(positions) {
-                        let (&last, repeats) = positions
-                            .split_last()
-                            .context("Unique image has no position")?;
-                        for &position in repeats {
-                            ordered[position] = Some(part.clone());
-                        }
-                        ordered[last] = Some(part);
-                    }
-                    let parts = ordered
-                        .into_iter()
-                        .collect::<Option<Vec<_>>>()
-                        .context("Missing image output position")?;
-                    PreprocessedEncoderInputs::concat(parts, &layouts)
-                })
-                .await
-                .context("Image batch assembly task panicked")?
-                .context("Image batch assembly failed");
+                return Ok(output);
             }
         }
     }
@@ -611,72 +545,6 @@ fn media_item_infos(media: &MediaBatch) -> Vec<MediaItemInfo> {
             vec![MediaItemInfo::default(); media.len()]
         }
     }
-}
-
-/// Pixel-cache lookup and preprocessing for one image.
-async fn preprocess_image_cached(
-    cache: Arc<PixelCache>,
-    image: Arc<ImageFrame>,
-    registry: Arc<VisionProcessorRegistry>,
-    model_id: String,
-    model_type: Option<String>,
-    pp_config: PreProcessorConfig,
-    fingerprint: u64,
-) -> Result<PreprocessedEncoderInputs> {
-    let key = PixelCacheKey {
-        image_hash: image.hash.clone(),
-        config_fingerprint: fingerprint,
-    };
-    if let Some(cached) = cache.get(&key) {
-        Metrics::record_mm_pixel_cache_lookup(&model_id, true);
-        return Ok(cached.preprocessed.clone());
-    }
-    Metrics::record_mm_pixel_cache_lookup(&model_id, false);
-
-    let preprocessed = preprocess_image_batch(
-        registry,
-        model_id,
-        model_type,
-        pp_config,
-        std::slice::from_ref(&image),
-    )
-    .await?;
-    cache.insert(
-        key,
-        Arc::new(CachedPreprocessedItem {
-            preprocessed: preprocessed.clone(),
-        }),
-    );
-    Ok(preprocessed)
-}
-
-async fn preprocess_image_batch(
-    registry: Arc<VisionProcessorRegistry>,
-    model_id: String,
-    model_type: Option<String>,
-    pp_config: PreProcessorConfig,
-    images: &[Arc<ImageFrame>],
-) -> Result<PreprocessedEncoderInputs> {
-    let images = images.to_vec();
-    tokio::task::spawn_blocking(move || {
-        let raw_images: Vec<image::DynamicImage> = images
-            .iter()
-            .map(|frame| {
-                frame
-                    .image()
-                    .cloned()
-                    .map_err(llm_multimodal::MultiModalError::Media)
-            })
-            .collect::<Result<_, _>>()?;
-        let processor = registry
-            .find(&model_id, model_type.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;
-        processor
-            .preprocess(&raw_images, &pp_config)
-            .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
 }
 
 struct ModalityExpansion<'a> {

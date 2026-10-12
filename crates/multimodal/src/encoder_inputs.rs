@@ -20,7 +20,10 @@ use std::{
 use anyhow::{Context, Result as AnyhowResult};
 use ndarray::{Array, ArrayD, ArrayViewD, Axis, Dimension, Slice};
 
-use crate::{types::FieldLayout, vision::execution};
+use crate::{
+    types::{EncoderFieldLayouts, FieldLayout},
+    vision::execution,
+};
 
 /// The dtypes an encoder input is written in for the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -969,6 +972,15 @@ impl PreprocessedEncoderInputs {
         if parts.len() == 1 {
             return parts.into_iter().next().context("cannot join zero batches");
         }
+        Self::concat_refs(&parts.iter().collect::<Vec<_>>(), layouts)
+    }
+
+    /// Join borrowed outputs, copying pixels only into the final allocation.
+    pub fn concat_refs(
+        parts: &[&Self],
+        layouts: &HashMap<String, FieldLayout>,
+    ) -> AnyhowResult<Self> {
+        anyhow::ensure!(!parts.is_empty(), "cannot join zero batches");
         let inputs = parts
             .iter()
             .map(|part| &part.encoder_input)
@@ -1026,13 +1038,83 @@ impl PreprocessedEncoderInputs {
         let mut feature_token_counts = Vec::new();
         let mut item_sizes = Vec::new();
         for part in parts {
-            feature_token_counts.extend(part.feature_token_counts);
-            item_sizes.extend(part.item_sizes);
+            feature_token_counts.extend_from_slice(&part.feature_token_counts);
+            item_sizes.extend_from_slice(&part.item_sizes);
         }
         Ok(Self {
             encoder_input,
             feature_token_counts,
             item_sizes,
+            model_specific,
+        })
+    }
+
+    /// Split a batch into independently owned items so cache eviction releases
+    /// each image without retaining the rest of the original batch.
+    pub fn slice_items(&self, layouts: &EncoderFieldLayouts) -> AnyhowResult<Vec<Self>> {
+        (0..self.batch_size())
+            .map(|item| self.slice_item(item, layouts))
+            .collect()
+    }
+
+    /// Copy one item's pixels and metadata into independent storage for a cache.
+    /// No view of the original batch is retained by the returned item.
+    fn slice_item(&self, item: usize, layouts: &EncoderFieldLayouts) -> AnyhowResult<Self> {
+        let count = self.feature_token_counts.len();
+        anyhow::ensure!(
+            item < count && self.item_sizes.len() == count,
+            "invalid item metadata"
+        );
+        let span = |layout: &FieldLayout| -> AnyhowResult<(usize, usize, usize)> {
+            match layout {
+                FieldLayout::Batched => Ok((item, 1, count)),
+                FieldLayout::Flat { sizes_key } => {
+                    let sizes = self
+                        .model_specific
+                        .get(sizes_key)
+                        .with_context(|| format!("missing sizes key {sizes_key}"))?
+                        .as_flat_sizes()?;
+                    anyhow::ensure!(sizes.len() == count, "flat sizes disagree with item count");
+                    let sum = |sizes: &[usize]| {
+                        sizes.iter().try_fold(0usize, |a, b| {
+                            a.checked_add(*b).context("flat size overflow")
+                        })
+                    };
+                    Ok((sum(&sizes[..item])?, sizes[item], sum(&sizes)?))
+                }
+            }
+        };
+        let (start, len, total) = span(&layouts.encoder_input)?;
+        anyhow::ensure!(
+            self.encoder_input.shape().first() == Some(&total),
+            "encoder layout does not cover batch"
+        );
+        let encoder_input = self.encoder_input.slice_axis0(start, len)?;
+        let mut model_specific = HashMap::new();
+        for (key, value) in &self.model_specific {
+            let value = if let Some(layout) = layouts.model_specific.get(key) {
+                let (start, len, total) = span(layout)?;
+                let rows = match value {
+                    ModelSpecificValue::Tensor { shape, .. }
+                    | ModelSpecificValue::IntTensor { shape, .. }
+                    | ModelSpecificValue::UintTensor { shape, .. } => shape.first().copied(),
+                    ModelSpecificValue::IntVec(v) => Some(v.len()),
+                    ModelSpecificValue::UintVec(v) => Some(v.len()),
+                    ModelSpecificValue::FloatVec(v) => Some(v.len()),
+                    ModelSpecificValue::TupleVec(v) => Some(v.len()),
+                    _ => None,
+                };
+                anyhow::ensure!(rows == Some(total), "metadata layout does not cover {key}");
+                value.slice_first_dim(start, len)?
+            } else {
+                value.clone()
+            };
+            model_specific.insert(key.clone(), value);
+        }
+        Ok(Self {
+            encoder_input,
+            feature_token_counts: vec![self.feature_token_counts[item]],
+            item_sizes: vec![self.item_sizes[item]],
             model_specific,
         })
     }
@@ -1065,6 +1147,44 @@ mod tests {
     use ndarray::Array4;
 
     use super::*;
+
+    #[test]
+    fn cache_items_own_pixels_and_round_trip_bytes_and_floats() {
+        let layouts = EncoderFieldLayouts::new(FieldLayout::Batched, HashMap::new());
+        for input in [
+            EncoderInput::from(ndarray::arr2(&[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])),
+            EncoderInput::bytes(
+                ndarray::arr2(&[[1u8, 2, 3], [4, 5, 6]]),
+                PixelNorm {
+                    scale: [1.0; 3],
+                    bias: [0.0; 3],
+                    channel_block: 1,
+                },
+            ),
+        ] {
+            let batch = PreprocessedEncoderInputs {
+                encoder_input: input,
+                feature_token_counts: vec![1, 2],
+                item_sizes: vec![(1, 1), (2, 1)],
+                model_specific: HashMap::new(),
+            };
+            let items = batch.slice_items(&layouts).unwrap();
+            let expected = batch.encoder_input.write_as(EncoderDtype::Float32);
+            drop(batch);
+            let joined = PreprocessedEncoderInputs::concat_refs(
+                &items.iter().collect::<Vec<_>>(),
+                &layouts.model_specific,
+            )
+            .unwrap();
+            assert_eq!(
+                joined.encoder_input.write_as(EncoderDtype::Float32),
+                expected
+            );
+            assert_eq!(joined.feature_token_counts, [1, 2]);
+            assert_eq!(items[0].encoder_input.len(), 3);
+            assert_eq!(items[1].encoder_input.len(), 3);
+        }
+    }
 
     #[test]
     fn encoder_input_accessors_are_modality_neutral() {
