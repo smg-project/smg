@@ -467,8 +467,6 @@ mod tests {
         );
     }
 
-    /// A batch link is forwarded as one call, so a backend that links the
-    /// batch in one round trip keeps doing so behind the bound.
     /// The sweep of unstored records and the expiry of one reach the inner
     /// store through the wrapper: left to the trait's defaults, a deployment
     /// built through the factory swept nothing and expired nothing.
@@ -547,6 +545,8 @@ mod tests {
         );
     }
 
+    /// A batch link is forwarded as one call, so a backend that links the
+    /// batch in one round trip keeps doing so behind the bound.
     #[tokio::test]
     async fn a_batch_link_is_forwarded_as_one_call() {
         struct CountingLinks {

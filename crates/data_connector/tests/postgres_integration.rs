@@ -1710,7 +1710,8 @@ async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earli
             let mut stored = StoredResponse::new(None);
             stored.raw_response = json!({
                 "id": stored.id.0, "store": store, "status": status,
-                "completed_at": completed_at, "instructions": "a\u{0}b", "output": [],
+                "completed_at": completed_at, "instructions": "a\u{0}b",
+                "output": [{"type": "message", "id": format!("msg_{}", stored.id.0)}],
             });
             stored
         };
@@ -1737,6 +1738,14 @@ async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earli
         let kept_left = left(&kept.id).await.map_err(|e| e.to_string())?;
         let swept_left = left(&swept.id).await.map_err(|e| e.to_string())?;
         let fresh_left = left(&fresh.id).await.map_err(|e| e.to_string())?;
+        // The lookup by an output item's id scans past the rows that carry a
+        // NUL escape; its predicate reads the document the same way.
+        let found_by_item = storage
+            .find_response_by_output_item(&format!("msg_{}", kept.id.0))
+            .await
+            .map_err(|e| format!("the lookup by output item over NUL rows: {e}"))?
+            .map(|r| r.id);
+        let found_by_item_is_kept = found_by_item == Some(kept.id.clone());
 
         let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
             .await
@@ -1777,12 +1786,25 @@ async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earli
             .collect();
         drop(client);
         let _ = driver.await;
-        Ok::<_, String>((deleted, kept_left, swept_left, fresh_left, indexes, plan))
+        Ok::<_, String>((
+            deleted,
+            kept_left,
+            swept_left,
+            fresh_left,
+            found_by_item_is_kept,
+            indexes,
+            plan,
+        ))
     }
     .await;
     scratch.drop().await;
 
-    let (deleted, kept_left, swept_left, fresh_left, indexes, plan) = outcome.unwrap();
+    let (deleted, kept_left, swept_left, fresh_left, found_by_item_is_kept, indexes, plan) =
+        outcome.unwrap();
+    assert!(
+        found_by_item_is_kept,
+        "the stored record is found by its output item's id past the NUL rows"
+    );
     assert_eq!(
         deleted, 1,
         "the one unstored terminal record past the window"
