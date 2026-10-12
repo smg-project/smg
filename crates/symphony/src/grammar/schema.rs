@@ -5,6 +5,11 @@
 //! over a tool's properties the syntaxes share: one argument per property, in the schema's order,
 //! optional unless the schema requires it; and the rule for pairs a separator joins, which stands
 //! between two present pairs only (Olmo 3's `, `, Gemma 4's `,`).
+//!
+//! A JSON schema leaf goes to the engine as a document of its own, and the grammars copy it (a pair
+//! into every start before it), so the document is kept small: only the definitions its pointers
+//! reach travel with it, and the annotations JSON Schema defines as such (`title`, `description`,
+//! `examples`, `$comment`), which constrain nothing, are dropped at every schema position.
 
 use serde_json::{json, Value};
 
@@ -250,14 +255,16 @@ impl<'a> Definitions<'a> {
         }
     }
 
-    /// The property's schema with the root's definitions attached, so a local pointer in it still
-    /// resolves when the engine compiles it on its own. A definition the schema declares itself
-    /// stays; the root's fill in the names it lacks. A schema with no local pointer goes as it is.
+    /// The property's schema as the engine gets it: its annotations dropped, and the root's
+    /// definitions its pointers reach attached, so a local pointer in it still resolves when the
+    /// engine compiles it on its own. A definition the schema declares itself stays; the root's
+    /// fill in the names it lacks, those reached and no other, since the grammars copy the leaf.
     fn attached_to(self, schema: &Value) -> Value {
-        let mut attached = schema.clone();
+        let mut attached = without_annotations(schema);
         if self.defs.is_none() && self.definitions.is_none() || !has_local_reference(schema) {
             return attached;
         }
+        let reached = self.reached_from(schema);
         let Some(object) = attached.as_object_mut() else {
             return attached;
         };
@@ -265,19 +272,164 @@ impl<'a> Definitions<'a> {
             let Some(Value::Object(entries)) = block else {
                 continue;
             };
+            let entries: Vec<(&String, Value)> = entries
+                .iter()
+                .filter(|(key, _)| reached.contains(&(name, key.as_str())))
+                .map(|(key, value)| (key, without_annotations(value)))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
             match object.get_mut(name) {
                 Some(Value::Object(own)) => {
                     for (key, value) in entries {
-                        own.entry(key.clone()).or_insert_with(|| value.clone());
+                        own.entry(key.clone()).or_insert(value);
                     }
                 }
                 Some(_) => {}
                 None => {
-                    object.insert(name.to_string(), Value::Object(entries.clone()));
+                    object.insert(
+                        name.to_string(),
+                        Value::Object(entries.into_iter().map(|(k, v)| (k.clone(), v)).collect()),
+                    );
                 }
             }
         }
         attached
+    }
+
+    /// The root's definitions the pointers in `schema` reach, directly or through one another:
+    /// each as its block (`$defs` or `definitions`) and its name, the first segment after the
+    /// block, since a pointer deeper into an entry needs the whole entry.
+    fn reached_from(self, schema: &Value) -> Vec<(&'static str, &'a str)> {
+        let mut reached: Vec<(&'static str, &'a str)> = Vec::new();
+        let mut pending: Vec<&Value> = vec![schema];
+        while let Some(node) = pending.pop() {
+            for pointer in local_pointers(node) {
+                let Some((block, name, entry)) = self.entry_of(pointer) else {
+                    continue;
+                };
+                if reached.contains(&(block, name)) {
+                    continue;
+                }
+                reached.push((block, name));
+                pending.push(entry);
+            }
+        }
+        reached
+    }
+
+    /// The block, the entry name and the entry a local pointer names, with the pointer's escapes
+    /// undone (`~1` for `/`, `~0` for `~`), so an entry named `a/b` is followed by its name.
+    fn entry_of(self, pointer: &str) -> Option<(&'static str, &'a str, &'a Value)> {
+        let mut segments = pointer.strip_prefix("#/")?.split('/');
+        let (block, entries) = match segments.next()? {
+            "$defs" => ("$defs", self.defs?),
+            "definitions" => ("definitions", self.definitions?),
+            _ => return None,
+        };
+        let name = segments.next()?.replace("~1", "/").replace("~0", "~");
+        let (key, entry) = entries.as_object()?.get_key_value(name.as_str())?;
+        Some((block, key.as_str(), entry))
+    }
+}
+
+/// The keywords that annotate a schema and constrain nothing.
+const ANNOTATIONS: [&str; 4] = ["title", "description", "examples", "$comment"];
+/// The keywords whose value is one schema, or a list of schemas (`items` in its tuple form).
+const ONE_SCHEMA: [&str; 11] = [
+    "items",
+    "additionalItems",
+    "additionalProperties",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "contains",
+    "propertyNames",
+    "not",
+    "if",
+    "then",
+    "else",
+];
+/// The keywords whose value maps names to schemas (`dependencies` to a schema or a list of
+/// names, which passes as it is).
+const NAMED_SCHEMAS: [&str; 6] = [
+    "properties",
+    "patternProperties",
+    "dependentSchemas",
+    "dependencies",
+    "$defs",
+    "definitions",
+];
+/// The keywords whose value lists schemas.
+const LISTED_SCHEMAS: [&str; 4] = ["anyOf", "oneOf", "allOf", "prefixItems"];
+
+/// `schema` with its annotations dropped at every schema position (a property named
+/// `description` is a name, not an annotation, and stays), as the engine gets it.
+fn without_annotations(schema: &Value) -> Value {
+    let Value::Object(map) = schema else {
+        return schema.clone();
+    };
+    let mut stripped = serde_json::Map::with_capacity(map.len());
+    for (key, value) in map {
+        if ANNOTATIONS.contains(&key.as_str()) {
+            continue;
+        }
+        let value = if ONE_SCHEMA.contains(&key.as_str()) {
+            match value {
+                Value::Array(items) => {
+                    Value::Array(items.iter().map(without_annotations).collect())
+                }
+                one => without_annotations(one),
+            }
+        } else if NAMED_SCHEMAS.contains(&key.as_str()) {
+            match value {
+                Value::Object(named) => Value::Object(
+                    named
+                        .iter()
+                        .map(|(name, schema)| (name.clone(), without_annotations(schema)))
+                        .collect(),
+                ),
+                other => other.clone(),
+            }
+        } else if LISTED_SCHEMAS.contains(&key.as_str()) {
+            match value {
+                Value::Array(items) => {
+                    Value::Array(items.iter().map(without_annotations).collect())
+                }
+                other => other.clone(),
+            }
+        } else {
+            value.clone()
+        };
+        stripped.insert(key.clone(), value);
+    }
+    Value::Object(stripped)
+}
+
+/// The local pointers in `schema`, at any depth, in document order.
+fn local_pointers(schema: &Value) -> Vec<&str> {
+    let mut pointers = Vec::new();
+    collect_local_pointers(schema, &mut pointers);
+    pointers
+}
+
+fn collect_local_pointers<'v>(schema: &'v Value, pointers: &mut Vec<&'v str>) {
+    match schema {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if is_reference(key) {
+                    if let Some(pointer) = value.as_str().filter(|pointer| pointer.starts_with('#'))
+                    {
+                        pointers.push(pointer);
+                    }
+                }
+                collect_local_pointers(value, pointers);
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .for_each(|item| collect_local_pointers(item, pointers)),
+        _ => {}
     }
 }
 
@@ -298,5 +450,137 @@ fn has_local_reference(schema: &Value) -> bool {
         }),
         Value::Array(items) => items.iter().any(has_local_reference),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json as value;
+
+    use super::*;
+
+    #[test]
+    fn a_leaf_carries_the_definitions_its_pointers_reach_and_no_other() {
+        // `count` reaches `Count` alone; `chain` reaches `Chain`, and through it `Deep`; `Unused`
+        // travels with neither, and a `definitions` block is read the same way.
+        let root = value!({
+            "type": "object",
+            "properties": {
+                "count": {"$ref": "#/$defs/Count"},
+                "chain": {"$ref": "#/$defs/Chain"},
+                "old": {"$ref": "#/definitions/Old"},
+            },
+            "$defs": {
+                "Count": {"type": "integer"},
+                "Chain": {"type": "object", "properties": {"deep": {"$ref": "#/$defs/Deep"}}},
+                "Deep": {"type": "number"},
+                "Unused": {"type": "string"},
+            },
+            "definitions": {"Old": {"type": "integer"}, "Older": {"type": "integer"}},
+        });
+        let definitions = Definitions::of(&root);
+        assert_eq!(
+            definitions.attached_to(&root["properties"]["count"]),
+            value!({"$ref": "#/$defs/Count", "$defs": {"Count": {"type": "integer"}}})
+        );
+        assert_eq!(
+            definitions.attached_to(&root["properties"]["chain"]),
+            value!({"$ref": "#/$defs/Chain", "$defs": {
+                "Chain": {"type": "object", "properties": {"deep": {"$ref": "#/$defs/Deep"}}},
+                "Deep": {"type": "number"},
+            }})
+        );
+        assert_eq!(
+            definitions.attached_to(&root["properties"]["old"]),
+            value!({"$ref": "#/definitions/Old", "definitions": {"Old": {"type": "integer"}}})
+        );
+    }
+
+    #[test]
+    fn annotations_are_dropped_at_schema_positions_and_kept_as_property_names() {
+        let root = value!({"$defs": {"Count": {
+            "type": "integer", "title": "Count", "description": "how many", "examples": [1, 2],
+        }}});
+        let definitions = Definitions::of(&root);
+        let schema = value!({
+            "type": "object",
+            "description": "a long one",
+            "$comment": "noted",
+            "properties": {
+                "description": {"type": "string", "description": "the field named so"},
+                "n": {"$ref": "#/$defs/Count"},
+            },
+            "anyOf": [{"title": "a", "required": ["n"]}],
+            "items": {"description": "x", "type": "string"},
+        });
+        assert_eq!(
+            definitions.attached_to(&schema),
+            value!({
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "n": {"$ref": "#/$defs/Count"},
+                },
+                "anyOf": [{"required": ["n"]}],
+                "items": {"type": "string"},
+                "$defs": {"Count": {"type": "integer"}},
+            })
+        );
+    }
+
+    #[test]
+    fn an_entry_whose_name_holds_a_slash_is_followed_to_what_it_points_at() {
+        // A pointer spells `a/b` as `a~1b`; the entry is followed by its name, so what it points
+        // at travels too.
+        let root = value!({"$defs": {
+            "a/b": {"type": "object", "properties": {"x": {"$ref": "#/$defs/Inner"}}},
+            "Inner": {"type": "integer"},
+            "Unused": {"type": "string"},
+        }});
+        let definitions = Definitions::of(&root);
+        assert_eq!(
+            definitions.attached_to(&value!({"$ref": "#/$defs/a~1b"})),
+            value!({"$ref": "#/$defs/a~1b", "$defs": {
+                "a/b": {"type": "object", "properties": {"x": {"$ref": "#/$defs/Inner"}}},
+                "Inner": {"type": "integer"},
+            }})
+        );
+    }
+
+    #[test]
+    fn annotations_drop_from_tuple_items_additional_items_and_dependencies() {
+        let root = value!({});
+        let definitions = Definitions::of(&root);
+        let schema = value!({
+            "type": "array",
+            "items": [
+                {"type": "string", "title": "first"},
+                {"type": "integer", "description": "d"},
+            ],
+            "additionalItems": {"type": "null", "examples": [null]},
+            "dependencies": {
+                "a": {"required": ["b"], "description": "needs b"},
+                "b": ["c"],
+            },
+        });
+        assert_eq!(
+            definitions.attached_to(&schema),
+            value!({
+                "type": "array",
+                "items": [{"type": "string"}, {"type": "integer"}],
+                "additionalItems": {"type": "null"},
+                "dependencies": {"a": {"required": ["b"]}, "b": ["c"]},
+            })
+        );
+    }
+
+    #[test]
+    fn a_schema_without_pointers_still_loses_its_annotations_and_gains_no_definitions() {
+        let root = value!({"$defs": {"Unused": {"type": "string"}}});
+        let definitions = Definitions::of(&root);
+        assert_eq!(
+            definitions.attached_to(&value!({"type": "integer", "description": "d"})),
+            value!({"type": "integer"})
+        );
     }
 }

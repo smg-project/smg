@@ -600,7 +600,8 @@ mod tests {
     #[test]
     fn a_string_enum_behind_a_reference_takes_the_tokens_and_a_number_keeps_its_definitions() {
         // Pydantic writes an `Enum` field as a `$ref` to a definition holding the `enum`; a
-        // number's schema goes to the engine as a document of its own, its definitions attached.
+        // number's schema goes to the engine as a document of its own, the definition it reaches
+        // attached and no other.
         let root = value!({
             "type": "object",
             "properties": {
@@ -639,7 +640,7 @@ mod tests {
             .to_json(),
             value!({"type": "json_schema", "json_schema": {
                 "$ref": "#/$defs/Count",
-                "$defs": root["$defs"],
+                "$defs": {"Count": {"type": "integer"}},
             }})
         );
         // A list without an item schema takes strings or bare literals.
@@ -891,9 +892,10 @@ mod tests {
             "one of the pairs"
         );
 
-        // A number behind a reference carries the root's definitions in its JSON schema, which
-        // every copy repeats: the leaf counts by its size, so ten such pairs pass the cap and the
-        // largest values give way until the members fit, every key kept.
+        // A number behind a reference carries the definition it reaches in its JSON schema, which
+        // every copy repeats: the leaf counts by its size, so ten pairs reaching a definition of
+        // two thousand enum values pass the cap and the largest values give way until the members
+        // fit, every key kept; a definition no pointer reaches travels with none of them.
         let mut defs = serde_json::Map::new();
         for i in 0..400 {
             defs.insert(
@@ -901,17 +903,25 @@ mod tests {
                 value!({"type": "string", "minLength": i}),
             );
         }
-        defs.insert("Count".to_string(), value!({"type": "integer"}));
+        defs.insert(
+            "Big".to_string(),
+            value!({"type": "integer", "enum": (0..2000).collect::<Vec<i32>>()}),
+        );
         let mut properties = serde_json::Map::new();
         for i in 0..10 {
-            properties.insert(format!("n{i}"), value!({"$ref": "#/$defs/Count"}));
+            properties.insert(format!("n{i}"), value!({"$ref": "#/$defs/Big"}));
         }
         let heavy = value!({"type": "object", "properties": properties, "$defs": defs});
         let grammar = ends.members(&heavy, Definitions::of(&heavy), DEPTH, &mut Walk::new());
         let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
         assert!(grammar.nodes() <= NODES, "{} nodes", grammar.nodes());
-        let copies = written.matches("\"Unused399\"").count();
+        let copies = written.matches("\"Big\"").count();
         assert!((2..55).contains(&copies), "{copies} copies");
+        assert_eq!(
+            written.matches("Unused").count(),
+            0,
+            "an unreached definition travels"
+        );
         for i in 0..10 {
             assert!(written.contains(&format!("\"n{i}:\"")), "every key stays");
         }
