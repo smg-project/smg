@@ -37,7 +37,9 @@ use tracing::{debug, error, warn, Instrument};
 
 use super::{
     request_body::RawBody,
-    stream_failure::{note_sent, RelaySource, UpstreamCut},
+    stream_failure::{
+        head_success_recorded, mark_head_success_recorded, note_sent, RelaySource, UpstreamCut,
+    },
 };
 use crate::{
     config::types::RetryConfig,
@@ -857,6 +859,7 @@ impl PDRouter {
             decode.as_ref(),
             response.status(),
             prefill_outcome,
+            head_success_recorded(&response),
         );
         response
     }
@@ -864,18 +867,23 @@ impl PDRouter {
     /// Record an attempt's outcome on both legs. On the early-commit path the
     /// drain records the prefill's once its body is known: the attempt's
     /// status is the decode's there, and recording it on the prefill would
-    /// reset the failures the drain counts.
+    /// reset the failures the drain counts. A streamed decode head's success
+    /// was recorded before its relay task was spawned
+    /// (`create_streaming_response`), so it is not recorded again.
     fn record_attempt_outcomes(
         prefill: &dyn Worker,
         decode: &dyn Worker,
         status: StatusCode,
         prefill_outcome: PrefillOutcome,
+        decode_head_recorded: bool,
     ) {
         let attempt_records_prefill = prefill_outcome == PrefillOutcome::FromStatus;
         if attempt_records_prefill {
             prefill.record_outcome(status.as_u16());
         }
-        decode.record_outcome(status.as_u16());
+        if !(decode_head_recorded && status.is_success()) {
+            decode.record_outcome(status.as_u16());
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -1569,7 +1577,12 @@ impl PDRouter {
 
         let status = StatusCode::from_u16(decode_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        // A streamed decode head's success is the relay's to record, before
+        // it spawns its task (`create_streaming_response`); the leg's other
+        // outcomes are recorded here, before the body is forwarded.
+        if !(context.is_stream && status.is_success()) {
+            Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        }
         if !status.is_success() {
             error!(
                 "Decode server returned error status decode_url={} status={}",
@@ -1808,7 +1821,12 @@ impl PDRouter {
         events::RequestReceivedEvent {}.emit();
         let status = StatusCode::from_u16(decode_response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        // A streamed decode head's success is the relay's to record, before
+        // it spawns its task (`create_streaming_response`); the leg's other
+        // outcomes are recorded here, before the body is forwarded.
+        if !(context.is_stream && status.is_success()) {
+            Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        }
         if !status.is_success() {
             error!(
                 "Decode server returned error status decode_url={} status={}",
@@ -2088,6 +2106,18 @@ impl PDRouter {
             Some(content_type) => content_type.starts_with("text/event-stream"),
             None => status.is_success(),
         };
+        // The head's success is the decode worker's before the relay can
+        // sample the body's failure: on a multi-threaded runtime the task may
+        // run first with a body error already buffered behind the head, and
+        // the head's success recorded by the attempt afterwards would reset
+        // the breaker's failure streak and erase the cut's sample. A failed
+        // head stays the attempt's to record; the relay never accounts its
+        // body.
+        let head_success_recorded = status.is_success();
+        if head_success_recorded {
+            source.worker().record_outcome(status.as_u16());
+        }
+
         // The relay runs under the request's span, so a failure after the
         // head went out is logged with the request's id.
         let span = tracing::Span::current();
@@ -2176,6 +2206,9 @@ impl PDRouter {
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
+        if head_success_recorded {
+            mark_head_success_recorded(&mut response);
+        }
 
         AttachedBody::wrap_response(response, decode_guard)
     }
@@ -3663,6 +3696,7 @@ mod tests {
                     decode.as_ref(),
                     StatusCode::OK,
                     outcome,
+                    false,
                 );
             }
             assert_eq!(!prefill.circuit_breaker_can_execute(), trips, "{outcome:?}");
@@ -5586,6 +5620,324 @@ mod tests {
         }
     }
 
+    /// A breaker that opens on two failures, whose timeout is over at once
+    /// and which closes again after `successes` successes.
+    fn breaker_closing_after(successes: u32) -> crate::worker::CircuitBreakerConfig {
+        crate::worker::CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: successes,
+            timeout_duration: std::time::Duration::ZERO,
+            ..Default::default()
+        }
+    }
+
+    /// A ready decode worker built from `builder` whose breaker is half-open:
+    /// it opened on two failures, its timeout is over, and `successes`
+    /// successes close it, so the order of a head's success and a cut's
+    /// failure is readable from its state.
+    fn half_open_decode_worker_closing_after(
+        builder: BasicWorkerBuilder,
+        successes: u32,
+    ) -> Arc<dyn Worker> {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            builder
+                .worker_type(WorkerType::Decode)
+                .circuit_breaker_config(breaker_closing_after(successes))
+                .build(),
+        );
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        worker.record_circuit_breaker_outcome(false);
+        worker.record_circuit_breaker_outcome(false);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        worker
+    }
+
+    /// A decode worker whose half-open breaker closes on one success.
+    fn half_open_decode_worker() -> Arc<dyn Worker> {
+        half_open_decode_worker_closing_after(BasicWorkerBuilder::new("http://decode:8000"), 1)
+    }
+
+    /// A ready prefill worker at `url`, a regular engine's.
+    fn ready_prefill_worker(url: String) -> Arc<dyn Worker> {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        worker
+    }
+
+    /// The successful head of a decode stream is recorded on the decode
+    /// worker before the relay task is spawned, so a body the worker cuts
+    /// right behind the head is sampled after the head's success and stands.
+    /// Read on a current-thread runtime, where the relay cannot run before
+    /// the body is polled: the half-open breaker is closed by the head as
+    /// soon as the head is relayed, the response is marked so the attempt
+    /// does not record it again, and the cut read afterwards is the one
+    /// standing failure.
+    #[tokio::test]
+    async fn a_decode_heads_success_is_recorded_before_the_relay_can_sample_a_cut() {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        let router = create_test_pd_router();
+        let decode = half_open_decode_worker();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let sample = |family: &str| {
+            handle
+                .render()
+                .lines()
+                .find(|line| {
+                    line.starts_with(family) && line.contains(r#"worker="http://decode:8000""#)
+                })
+                .map(str::to_string)
+        };
+        let items: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            )),
+            Err(std::io::Error::other("the engine went away")),
+        ];
+        let upstream = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                items,
+            )))
+            .unwrap();
+
+        let response = router.create_streaming_response(
+            reqwest::Response::from(upstream).bytes_stream(),
+            StatusCode::OK,
+            None,
+            false,
+            RelaySource::decode_leg(
+                UNKNOWN_MODEL_ID,
+                "/v1/chat/completions",
+                Arc::clone(&decode),
+            ),
+            None,
+            WorkerLoadGuard::new(Arc::clone(&decode), None),
+        );
+
+        // The head is out and the relay has not run: the success is recorded.
+        assert!(head_success_recorded(&response));
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+        assert!(
+            sample("smg_worker_cb_outcomes_total{")
+                .is_some_and(|line| line.contains(r#"outcome="success""#) && line.ends_with(" 1")),
+            "{}",
+            handle.render()
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains("stream_error") && body.ends_with("data: [DONE]\n\n"),
+            "{body}"
+        );
+        // The cut is the one failure after the success: sampled and standing.
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+        assert_eq!(
+            sample("smg_worker_cb_consecutive_failures{").as_deref(),
+            Some(r#"smg_worker_cb_consecutive_failures{worker="http://decode:8000"} 1"#),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// The attempt does not record a decode head the relay already recorded:
+    /// a second success sample would count twice toward closing a half-open
+    /// breaker.
+    #[test]
+    fn the_attempt_skips_a_decode_head_the_relay_recorded() {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:8000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let recorded = half_open_decode_worker();
+        PDRouter::record_attempt_outcomes(
+            prefill.as_ref(),
+            recorded.as_ref(),
+            StatusCode::OK,
+            PrefillOutcome::FromStatus,
+            true,
+        );
+        assert_eq!(recorded.circuit_breaker_state(), CircuitState::HalfOpen);
+
+        let unrecorded = half_open_decode_worker();
+        PDRouter::record_attempt_outcomes(
+            prefill.as_ref(),
+            unrecorded.as_ref(),
+            StatusCode::OK,
+            PrefillOutcome::FromStatus,
+            false,
+        );
+        assert_eq!(unrecorded.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// The head's success is recorded once per request on each PD path: with
+    /// a breaker that closes after two successes, one clean streamed request
+    /// leaves the decode worker half-open with one success sample. On the
+    /// parallel path the attempt skips the head the relay recorded; the
+    /// sequential path, which records the decode leg before it forwards the
+    /// body, leaves a streamed head's success to the relay.
+    #[tokio::test]
+    async fn a_streamed_decode_heads_success_is_recorded_once_on_the_parallel_and_sequential_paths()
+    {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let success_samples = |url: &str| {
+            handle
+                .render()
+                .lines()
+                .find(|line| {
+                    line.starts_with("smg_worker_cb_outcomes_total{")
+                        && line.contains(&format!(r#"worker="{url}""#))
+                        && line.contains(r#"outcome="success""#)
+                })
+                .map(str::to_string)
+        };
+
+        // The parallel path: a regular prefill engine's server.
+        let (prefill_url, _seen) = spawn_recording_stub("{}").await;
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let decode =
+            half_open_decode_worker_closing_after(BasicWorkerBuilder::new(decode_url.clone()), 2);
+        let router = create_test_pd_router();
+        router
+            .worker_registry
+            .register_or_replace(ready_prefill_worker(prefill_url));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&decode));
+        let response = stream_chat_through(&router).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(CHAT_SSE_CHUNKS[0].as_bytes()), "{body:?}");
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the parallel path recorded the head's success once"
+        );
+        assert!(
+            success_samples(&decode_url).is_some_and(|line| line.ends_with(" 1")),
+            "{}",
+            handle.render()
+        );
+
+        // The sequential path: a prefill engine whose leg must finish first,
+        // its server answering the handoff the decode leg carries.
+        let (prefill_url, _seen) = spawn_recording_stub(
+            r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
+        )
+        .await;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .build(),
+        );
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let decode = half_open_decode_worker_closing_after(
+            BasicWorkerBuilder::new(decode_url.clone()).runtime_type(RuntimeType::Vllm),
+            2,
+        );
+        let router = create_test_pd_router();
+        router.worker_registry.register_or_replace(prefill);
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&decode));
+        let response = stream_chat_through(&router).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(CHAT_SSE_CHUNKS[0].as_bytes()), "{body:?}");
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the sequential path recorded the head's success once"
+        );
+        assert!(
+            success_samples(&decode_url).is_some_and(|line| line.ends_with(" 1")),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// Through the chat route on a multi-threaded runtime, against a decode
+    /// engine's server that writes the head and dies at once (the body's
+    /// error waits behind the head): the relay task could sample the cut
+    /// before the attempt recorded the head, and the head's success then
+    /// erased the sample. With the head recorded before the relay is spawned,
+    /// the half-open decode breaker is closed by the head and left closed by
+    /// the cut, every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cut_right_behind_the_decode_head_is_sampled_after_the_heads_success() {
+        use crate::worker::circuit_breaker::CircuitState;
+
+        const ROUNDS: usize = 40;
+        let decode_url = spawn_abrupt_cut_stub("/v1/chat/completions", CHAT_SSE_CHUNKS[0]).await;
+        let (prefill_url, _seen) = spawn_recording_stub("{}").await;
+        let mut reopened = Vec::new();
+        for round in 0..ROUNDS {
+            let router = create_test_pd_router();
+            let decode = half_open_decode_worker_closing_after(
+                BasicWorkerBuilder::new(decode_url.clone()),
+                1,
+            );
+            router
+                .worker_registry
+                .register_or_replace(ready_prefill_worker(prefill_url.clone()));
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(&decode));
+            let response = stream_chat_through(&router).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let state = decode.circuit_breaker_state();
+            if state != CircuitState::Closed {
+                reopened.push((round, state));
+            }
+        }
+        assert!(
+            reopened.is_empty(),
+            "the cut was sampled before the head's success in {} of {ROUNDS} rounds: {reopened:?}",
+            reopened.len()
+        );
+    }
+
     #[tokio::test]
     async fn test_streaming_load_tracking() {
         use futures_util::StreamExt;
@@ -5664,6 +6016,29 @@ mod tests {
     /// `chunks`, one write each, and with `cut` ends the body with an error,
     /// so the server closes the connection before the transfer's end, as an
     /// engine's own server that dies mid-stream does.
+    /// [`spawn_cut_stub`] without the pauses: the head and one chunk leave
+    /// the engine's server, and the cut follows as soon as the server has
+    /// flushed them (one yield of its task), so the body's error is right
+    /// behind the head when the relay starts.
+    async fn spawn_abrupt_cut_stub(path: &'static str, chunk: &'static str) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let head =
+                    futures_util::stream::iter(vec![Ok(Bytes::from_static(chunk.as_bytes()))]);
+                let cut = futures_util::stream::once(async {
+                    tokio::task::yield_now().await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::other("the engine went away"))
+                });
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(head.chain(cut)),
+                )
+            }),
+        );
+        spawn_stub(app).await
+    }
+
     async fn spawn_cut_stub(
         path: &'static str,
         content_type: &'static str,
