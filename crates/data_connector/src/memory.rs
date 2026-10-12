@@ -65,7 +65,8 @@ enum Fate {
     Removed,
     /// There was no record under the id.
     Absent,
-    /// The store keeps the record for now; it is queued again, as of now.
+    /// The store keeps the record for now; it is queued again behind the
+    /// others with its original stamp (the retention still counts from it).
     Stays,
 }
 
