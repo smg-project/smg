@@ -23,7 +23,7 @@ use std::{
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::header::CONTENT_TYPE,
+    http::header::{CONTENT_LENGTH, CONTENT_TYPE},
     middleware::Next,
     response::Response,
 };
@@ -65,14 +65,19 @@ impl SseKeepAlive {
     }
 
     /// Wraps the body of an SSE `response` whose length is not known up
-    /// front (a complete SSE answer has nothing to wait for); `messages`
-    /// selects the Messages API's ping over the comment. Anything else is
-    /// returned as it came.
+    /// front (a complete SSE answer has nothing to wait for, and a body sent
+    /// under a `Content-Length` header must not grow past it: the relays copy
+    /// an upstream's header onto a streamed body); `messages` selects the
+    /// Messages API's ping over the comment. Anything else is returned as it
+    /// came.
     pub(crate) fn apply(self, response: Response, messages: bool) -> Response {
         let Some(interval) = self.interval else {
             return response;
         };
-        if !is_event_stream(&response) || response.body().size_hint().exact().is_some() {
+        if !is_event_stream(&response)
+            || response.headers().contains_key(CONTENT_LENGTH)
+            || response.body().size_hint().exact().is_some()
+        {
             return response;
         }
         let frame = Bytes::from_static(if messages { MESSAGES_PING } else { COMMENT });
@@ -382,6 +387,23 @@ mod tests {
                 .unwrap()
         };
         let response = call(app(json), "/v1/chat/completions").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        assert_eq!(next_within(&mut body, 10 * SECS).await, Read::Silence);
+    }
+
+    /// A streamed body under an upstream's `Content-Length` (the relays copy
+    /// the header) is left alone: a keep-alive would push it past the length.
+    #[tokio::test(start_paused = true)]
+    async fn an_sse_answer_under_a_content_length_header_passes_untouched() {
+        let declared = || {
+            Response::builder()
+                .header(CONTENT_TYPE, "text/event-stream")
+                .header(CONTENT_LENGTH, "14")
+                .body(Body::from_stream(futures::stream::pending::<Chunk>()))
+                .unwrap()
+        };
+        let response = call(app(declared), "/v1/chat/completions").await;
         assert_eq!(response.status(), StatusCode::OK);
         let mut body = response.into_body();
         assert_eq!(next_within(&mut body, 10 * SECS).await, Read::Silence);
