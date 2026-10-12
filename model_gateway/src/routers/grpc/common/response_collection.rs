@@ -93,11 +93,18 @@ pub(crate) async fn collect_responses(
         } => {
             // Collect prefill for input_logprobs (don't mark completed yet)
             let mut prefill_responses = Vec::new();
+            // The leg's worker, when its stream is tracked (the parallel
+            // dispatch books the leg on it): a failure met here is the
+            // worker's, counted once, as a streamed answer's reader counts it.
+            let prefill_worker = prefill.worker().cloned();
             drain_prefill(&mut prefill, prefill_guards, false, |complete| {
                 prefill_responses.push(complete);
             })
             .await
             .map_err(|e| {
+                if let Some(worker) = &prefill_worker {
+                    UpstreamClass::account_collected_failure(worker.as_ref(), &e);
+                }
                 e.to_http_error(
                     "worker_stream_failed",
                     format!("Prefill stream failed: {}", e.message()),
