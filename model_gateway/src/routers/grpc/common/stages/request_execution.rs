@@ -1091,16 +1091,20 @@ async fn execute_parallel_pd(
             };
             if let Some(worker) = partner_worker {
                 // The partner of a prefill that fell silent is retired with
-                // its abort deferred: that prefill may yet start the handoff
-                // the decode is waiting for.
+                // its abort deferred (that prefill may yet start the handoff
+                // the decode is waiting for) and uncharged: a late failure
+                // of a handoff that never came is not the decode's fault.
+                let retirement = if is_prefill_silence(&error) {
+                    Retirement::PartnerSilent
+                } else {
+                    Retirement::PartnerFailed
+                };
                 retire_pd_leg(
                     leg.partner(),
                     partner_label,
                     Arc::clone(worker),
                     partner,
-                    Retirement::PartnerFailed {
-                        defer_abort: is_prefill_silence(&error),
-                    },
+                    retirement,
                 );
             }
             Err(pd_leg_error(leg, label, &error, workers))
@@ -1205,12 +1209,16 @@ fn pd_leg_error(
 /// record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Retirement {
-    /// Its partner failed, and the request with it. The leg's own late
-    /// result is still this request's one word on its worker: sampled on
-    /// the breaker and counted as a dispatch's is. `defer_abort`: the
-    /// partner fell silent rather than failed to start, so a KV handoff it
-    /// may yet start must not be torn down mid-write.
-    PartnerFailed { defer_abort: bool },
+    /// Its partner failed to start, and the request with it. The leg's own
+    /// late result is still this request's one word on its worker: sampled
+    /// on the breaker and counted as a dispatch's is.
+    PartnerFailed,
+    /// Its partner, the prefill, fell silent: the request charged that
+    /// prefill where its bound passed, and this leg's late result is not its
+    /// worker's fault (the handoff it waited for never came), so it is
+    /// neither sampled nor counted. Its abort is deferred: the prefill may
+    /// yet start the handoff, which must not be torn down mid-write.
+    PartnerSilent,
     /// Its own silence bound passed. The request charged its worker once,
     /// where the bound passed (the breaker sample through the ledger, the
     /// `timeout` worker error): its late result is neither sampled nor
@@ -1221,18 +1229,19 @@ enum Retirement {
 impl Retirement {
     fn cause(self) -> &'static str {
         match self {
-            Self::PartnerFailed { .. } => "its partner failed",
+            Self::PartnerFailed => "its partner failed",
+            Self::PartnerSilent => "its partner fell silent",
             Self::Silent => "its silence bound passed",
         }
     }
 
     fn defer_abort(self) -> bool {
-        matches!(self, Self::PartnerFailed { defer_abort: true })
+        matches!(self, Self::PartnerSilent)
     }
 
     /// Whether the late result is this request's word on the worker.
     fn charges(self) -> bool {
-        matches!(self, Self::PartnerFailed { .. })
+        matches!(self, Self::PartnerFailed)
     }
 }
 
@@ -1298,7 +1307,7 @@ fn retire_pd_leg(
                     worker = worker.url(),
                     cause,
                     error = %error,
-                    "Abandoned PD leg failed late; its request charged the worker when it gave up on it"
+                    "Abandoned PD leg failed late; its request had charged what it gave up on"
                 );
             }
         }
@@ -1322,10 +1331,10 @@ impl PrefillLegBound {
     /// The bound for a leg of `prompt_tokens` dispatched to `worker` at
     /// `dispatched`; `None` when the rule is off.
     fn at(worker: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
-        liveness::prefill_leg_bound(worker, prompt_tokens).map(|bound| Self {
-            deadline: dispatched + bound,
-            bound,
-        })
+        let bound = liveness::prefill_leg_bound(worker, prompt_tokens)?;
+        // A bound past the clock's range never expires: the leg stays unbounded.
+        let deadline = dispatched.checked_add(bound)?;
+        Some(Self { deadline, bound })
     }
 }
 
@@ -2022,8 +2031,48 @@ mod tests {
     use super::*;
     use crate::{
         routers::common::{attempt_ledger::FailedLeg, retry::is_retryable_response},
-        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+        worker::{
+            BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
+            WorkerType,
+        },
     };
+
+    /// A decode leg retired because its prefill fell silent is not charged
+    /// for failing late: the handoff it waited for never came, and the
+    /// request charged the prefill where the bound passed. A partner that
+    /// failed to start still charges, as before.
+    #[tokio::test]
+    async fn the_partner_of_a_silent_prefill_is_not_charged_for_its_late_failure() {
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30001")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let late: PdLegDispatch =
+            Box::pin(async { Err(tonic::Status::unavailable("the handoff never came")) });
+        retire_pd_leg(
+            PdLeg::Decode,
+            "grpc",
+            Arc::clone(&decode),
+            late,
+            Retirement::PartnerSilent,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "a late failure after the prefill fell silent is not the decode worker's fault"
+        );
+        assert!(Retirement::PartnerSilent.defer_abort());
+        assert!(!Retirement::PartnerSilent.charges());
+        assert!(Retirement::PartnerFailed.charges());
+        assert!(!Retirement::PartnerFailed.defer_abort());
+        assert!(!Retirement::Silent.charges());
+    }
 
     fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
         ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
