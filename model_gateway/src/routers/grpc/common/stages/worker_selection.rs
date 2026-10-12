@@ -314,7 +314,7 @@ impl WorkerSelectionStage {
         let intermediate = ctx.state.multimodal_intermediate.as_ref();
         // Media references only go to workers that advertise worker-side processing.
         let media_refs = ctx.state.multimodal_refs.is_some();
-        // A disaggregated leg a worker without a vision encoder cannot take
+        // A disaggregated leg a worker that accepts no vision input cannot take
         // is kept off such workers (see `VisionDemand`).
         let pixel_media =
             self.prefill_leg_needs_vision(intermediate, ctx.state.multimodal_refs.as_ref());
@@ -777,7 +777,7 @@ fn vision_capable(worker: &dyn Worker) -> bool {
 }
 
 /// Whether a request's disaggregated decode leg cannot be served by a decode
-/// worker without a vision encoder: the shapes dispatch refuses with a
+/// worker that accepts no vision input: the shapes dispatch refuses with a
 /// non-retryable 400 once such a worker is selected (media references, which
 /// each leg expands itself; a multimodal request with `n > 1`, whose decode
 /// leg recomputes the prompt locally; grid tensors, which the leg derives
@@ -1178,13 +1178,14 @@ impl WorkerSelectionStage {
             function = "WorkerSelectionStage::execute",
             mode = ?self.mode,
             model_id = %model_id,
-            "No prefill worker with a vision encoder for a request carrying pixel media"
+            "No prefill worker that accepts vision input for a request carrying pixel media"
         );
         error::bad_request(
             "multimodal_not_supported",
             format!(
-                "image or video input is not supported by model '{model_id}': its prefill \
-                 workers run as a language model only, without a vision encoder"
+                "image or video input is not supported by model '{model_id}': none of its \
+                 prefill workers accept vision input (the engine runs as a language model only, \
+                 or its servicer does not carry media to it)"
             ),
         )
     }
