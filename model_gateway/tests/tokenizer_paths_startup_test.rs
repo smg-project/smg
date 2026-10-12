@@ -1,11 +1,13 @@
 //! The gateway refuses to start on a tokenizer, model or chat-template path
-//! it cannot read (a path that does not exist, a directory without a
-//! tokenizer file, an empty template): the configuration error names the
-//! field and the path, the process exits non-zero without a panic, and its
-//! port is never bound. They used to be one ERROR line and a gateway that
-//! served without the configured tokenizer. A hub id and a usable local
-//! layout still start. The gateway runs as a process on purpose: the check
-//! belongs before the runtime and the listener exist.
+//! it cannot use (a directory without a tokenizer file, an empty template,
+//! and a path that does not exist when no gRPC worker can register later to
+//! bring the tokenizer): the configuration error names the field and the
+//! path, the process exits non-zero without a panic, and its port is never
+//! bound. They used to be one ERROR line and a gateway that served without
+//! the configured tokenizer. A hub id, a usable local layout, and a missing
+//! path under IGW mode or gRPC worker URLs still start. The gateway runs as
+//! a process on purpose: the check belongs before the runtime and the
+//! listener exist.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::allow_attributes)]
 
 use std::{
@@ -50,7 +52,7 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
     let ip = IP.to_string();
     let log = File::create(log_path).expect("log file");
     let mut child = Command::new(env!("CARGO_BIN_EXE_smg"))
-        .args(["--enable-igw", "--host", &ip, "--port", &port.to_string()])
+        .args(["--host", &ip, "--port", &port.to_string()])
         .args(["--prometheus-host", &ip])
         .args(["--prometheus-port", &metrics_port.to_string()])
         .args(args)
@@ -91,9 +93,9 @@ fn tokenizer_dir(dir: &Path) -> String {
 }
 
 /// A directory without a tokenizer file, a missing and an empty chat
-/// template: each refused before anything listens, with the field and the
-/// path in the error, no panic. (A missing source is left to the worker
-/// fallback under IGW mode, which the launcher uses; see the serving cases.)
+/// template, and a missing model path where no gRPC worker can register
+/// (http worker URLs, no IGW): each refused before anything listens, with
+/// the field and the path in the error, no panic.
 #[test]
 fn an_unreadable_tokenizer_source_refuses_to_start() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -106,17 +108,20 @@ fn an_unreadable_tokenizer_source_refuses_to_start() {
     let empty_dir = empty_dir.to_str().expect("a UTF-8 path");
     let missing_template = missing_template.to_str().expect("a UTF-8 path");
     let empty_template = empty_template.to_str().expect("a UTF-8 path");
+    let missing_model = dir.path().join("models").join("missing");
+    let missing_model = missing_model.to_str().expect("a UTF-8 path");
 
-    let cases: [(&str, Vec<&str>, &str, &str); 3] = [
+    let cases: [(&str, Vec<&str>, &str, &str); 4] = [
         (
             "tokenizer-empty-dir",
-            vec!["--tokenizer-path", empty_dir],
+            vec!["--enable-igw", "--tokenizer-path", empty_dir],
             "tokenizer_path",
             empty_dir,
         ),
         (
             "chat-template-missing",
             vec![
+                "--enable-igw",
                 "--tokenizer-path",
                 &tok,
                 "--chat-template",
@@ -127,9 +132,28 @@ fn an_unreadable_tokenizer_source_refuses_to_start() {
         ),
         (
             "chat-template-empty",
-            vec!["--tokenizer-path", &tok, "--chat-template", empty_template],
+            vec![
+                "--enable-igw",
+                "--tokenizer-path",
+                &tok,
+                "--chat-template",
+                empty_template,
+            ],
             "chat_template",
             empty_template,
+        ),
+        // No IGW, http worker URLs only: no gRPC worker can bring the
+        // tokenizer later, so a missing model path is refused end to end.
+        (
+            "model-missing-http-only",
+            vec![
+                "--worker-urls",
+                "http://127.0.0.1:1",
+                "--model-path",
+                missing_model,
+            ],
+            "model_path",
+            missing_model,
         ),
     ];
     for (name, args, field, path) in cases {
@@ -173,28 +197,41 @@ fn a_present_tokenizer_source_or_a_hub_id_serves() {
     let cases: [(&str, Vec<&str>); 5] = [
         (
             "local-layout",
-            vec!["--tokenizer-path", &tok, "--chat-template", template],
+            vec![
+                "--enable-igw",
+                "--tokenizer-path",
+                &tok,
+                "--chat-template",
+                template,
+            ],
         ),
-        ("hub-id", vec!["--tokenizer-path", "some-org/some-model"]),
+        (
+            "hub-id",
+            vec!["--enable-igw", "--tokenizer-path", "some-org/some-model"],
+        ),
         // The connection mode follows the worker URLs; a gRPC worker that is
         // not there yet is the shape of a deployment whose workers register
         // later and bring the tokenizer with them.
         (
             "grpc-model-on-the-worker",
             vec![
+                "--enable-igw",
                 "--worker-urls",
                 "grpc://127.0.0.1:1",
                 "--model-path",
                 on_the_worker,
             ],
         ),
-        // IGW mode (the launcher's shape) takes gRPC registrations at run
-        // time, so a missing source, model path or explicit tokenizer path,
-        // is left to the worker fallback too.
-        ("igw-model-missing", vec!["--model-path", on_the_worker]),
+        // IGW mode takes gRPC registrations at run time, so a missing source,
+        // model path or explicit tokenizer path, is left to the worker
+        // fallback too.
+        (
+            "igw-model-missing",
+            vec!["--enable-igw", "--model-path", on_the_worker],
+        ),
         (
             "igw-tokenizer-missing",
-            vec!["--tokenizer-path", on_the_worker],
+            vec!["--enable-igw", "--tokenizer-path", on_the_worker],
         ),
     ];
     for (name, args) in cases {
