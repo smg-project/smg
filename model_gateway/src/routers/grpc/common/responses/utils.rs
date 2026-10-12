@@ -803,7 +803,8 @@ mod tests {
             &request,
             None,
         )
-        .await;
+        .await
+        .expect("a deleted record is not a store failure");
 
         assert!(
             response_storage
