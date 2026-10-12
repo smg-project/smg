@@ -14,6 +14,7 @@ use crate::tenant::TenantKey;
 /// runtime form pre-converts seconds into [`Duration`] so hot paths
 /// don't repeat the conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassConfig {
     /// Absolute minimum slots reserved for this class — the value the
     /// effective reservation never drops below while the pool can hold
@@ -117,6 +118,7 @@ impl ClassRuntimeConfig {
 /// them is non-breaking because the trait
 /// [`super::policy::TenantPolicyResolver`] returns the whole struct.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TenantPolicyConfig {
     pub max_class: Class,
 }
@@ -127,7 +129,13 @@ pub struct TenantPolicyConfig {
 /// `PrioritySchedulerYaml::default()`, and downstream
 /// [`SchedulerSettings::from_cli_and_yaml`] fills in built-in defaults
 /// for any class that wasn't overridden.
+///
+/// A key none of these types know (a misspelt `tenant_polices:`, a class
+/// field of another version) is a parse error naming it, as for the tenant
+/// rate-limit YAML: a typo must not silently yield a scheduler without the
+/// policies the operator wrote.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrioritySchedulerYaml {
     #[serde(default)]
     pub classes: HashMap<Class, ClassConfig>,
@@ -368,6 +376,41 @@ tenant_policies:
 "#;
         let result: Result<PrioritySchedulerYaml, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "expected serde error for unknown class");
+    }
+
+    #[test]
+    fn test_yaml_unknown_key_is_serde_error_naming_it() {
+        // The top level, a class entry and a tenant policy each refuse a key
+        // they do not know: a misspelt key must not silently drop a section.
+        let documents = [
+            (
+                "extra_field",
+                "classes: {}\ntenant_policies: {}\nextra_field: 1\n".to_owned(),
+            ),
+            (
+                "tenant_polices",
+                "tenant_polices:\n  \"auth:acme\":\n    max_class: bulk\n".to_owned(),
+            ),
+            (
+                "queue_sized",
+                "classes:\n  bulk:\n    reserved_floor: 0\n    queue_sized: 8\n    queue_size: 8\n    \
+                 queue_timeout_secs: 1\n    starvation_threshold_secs: 1\n    can_preempt: false\n"
+                    .to_owned(),
+            ),
+            (
+                "weight",
+                "tenant_policies:\n  \"auth:acme\":\n    max_class: bulk\n    weight: 2\n".to_owned(),
+            ),
+        ];
+        for (key, yaml) in documents {
+            let err = serde_yaml::from_str::<PrioritySchedulerYaml>(&yaml)
+                .expect_err(key)
+                .to_string();
+            assert!(
+                err.contains(key),
+                "the error names the unknown key `{key}`: {err}"
+            );
+        }
     }
 
     #[test]

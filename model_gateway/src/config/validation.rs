@@ -392,20 +392,22 @@ impl ConfigValidator {
     }
 
     /// With the priority scheduler enabled, the optional YAML file must be
-    /// readable, parsable and valid: an operator who asked for tenant
-    /// priorities gets a start-up error naming the file instead of a gateway
-    /// that serves with the legacy admission (the contract of
-    /// `tenant_rate_limit_config`). Without the flag the path is not read.
+    /// readable, parsable (no key the scheduler does not know) and valid, and
+    /// the default max class must name one of the four classes: an operator
+    /// who asked for tenant priorities gets a start-up error naming the field
+    /// instead of a gateway that serves with the legacy admission or with a
+    /// policy they did not write (the contract of `tenant_rate_limit_config`).
+    /// Without the flag neither is read.
     fn validate_priority_scheduler(config: &RouterConfig) -> ConfigResult<()> {
         if !config.priority_scheduler_enabled {
             return Ok(());
         }
         scheduler::settings_from_config(config)
             .map(drop)
-            .map_err(|reason| ConfigError::InvalidValue {
-                field: "priority_scheduler_config".to_string(),
-                value: config.priority_scheduler_config.clone().unwrap_or_default(),
-                reason,
+            .map_err(|e| ConfigError::InvalidValue {
+                field: e.field.to_string(),
+                value: e.value,
+                reason: e.reason,
             })
     }
 
@@ -2095,6 +2097,77 @@ mod tests {
         assert!(
             reason.contains("queue_timeout_secs must be > 0"),
             "the reason is the scheduler's own: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_priority_scheduler_default_max_class_is_a_configuration_error() {
+        for unknown in ["gold", "urgent"] {
+            let config = RouterConfig {
+                priority_scheduler_default_max_class: unknown.to_owned(),
+                ..scheduler_config(None)
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) if field == "priority_scheduler_default_max_class" => {
+                    assert_eq!(value, unknown);
+                    assert!(
+                        ["system", "interactive", "default", "bulk"]
+                            .iter()
+                            .all(|class| reason.contains(class)),
+                        "the reason names the four classes: {reason}"
+                    );
+                }
+                other => panic!(
+                    "`{unknown}` was not refused as a priority_scheduler_default_max_class error: {other:?}"
+                ),
+            }
+        }
+        // The four names in any case are accepted.
+        for known in ["system", "Interactive", " default ", "BULK"] {
+            let config = RouterConfig {
+                priority_scheduler_default_max_class: known.to_owned(),
+                ..scheduler_config(None)
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{known}");
+        }
+        // Not enabled: the flag is not read, like the path.
+        let config = RouterConfig {
+            priority_scheduler_default_max_class: "gold".to_owned(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_priority_scheduler_config_with_an_unknown_key_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let unknown_key = dir.path().join("unknown-key.yaml");
+        std::fs::write(
+            &unknown_key,
+            "classes: {}\ntenant_policies: {}\nextra_field: 1\n",
+        )
+        .unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(unknown_key.to_str()));
+        assert_eq!(value, unknown_key.to_str().unwrap());
+        assert!(
+            reason.starts_with("parsing ") && reason.contains("extra_field"),
+            "the reason names the file and the unknown key: {reason}"
+        );
+        // A misspelt section is an unknown key, not an empty section.
+        let misspelt = dir.path().join("misspelt.yaml");
+        std::fs::write(
+            &misspelt,
+            "tenant_polices:\n  \"header:a\":\n    max_class: bulk\n",
+        )
+        .unwrap();
+        let (_, reason) = refused_scheduler_config(&scheduler_config(misspelt.to_str()));
+        assert!(
+            reason.contains("tenant_polices"),
+            "the reason names the misspelt section: {reason}"
         );
     }
 
