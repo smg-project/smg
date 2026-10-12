@@ -996,8 +996,12 @@ struct CliArgs {
     /// Close a keep-alive connection that has had no request in flight for
     /// this many seconds; an open streaming response counts as in flight. The
     /// bound starts with the connection's first request (a connection that
-    /// never sends one is bounded by --header-read-timeout-secs alone). 0
-    /// keeps idle connections open until the client closes them
+    /// never sends one is bounded by --header-read-timeout-secs alone). Keep
+    /// it above the idle timeout of any proxy or load balancer in front of the
+    /// gateway, so that side closes an idle connection first; otherwise a
+    /// request can be sent on a connection the gateway is closing and fail
+    /// with a reset. 0 keeps idle connections open until the client closes
+    /// them
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
 
