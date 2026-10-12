@@ -15,6 +15,7 @@ import dataclasses
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import signal
 import sys
@@ -976,3 +977,90 @@ def test_the_spawn_start_method_is_forced_when_the_engines_setup_left_it_unset(
     rust.launch_scheduler_ranks(rust.headless_server_args(FakeServerArgs(), handshake_port=1))
 
     assert recorded["start_method_calls"] == [("spawn", True)]
+
+
+# ── the knobs are validated before the bind (smg-lab #292) ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "name, value, text",
+    [
+        ("SMG_TOKENSPEED_SERVICER_DRAIN_SECS", "abc", "is not a number"),
+        ("SMG_TOKENSPEED_SERVICER_DRAIN_SECS", "-5", "must be at least 0"),
+        ("SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS", "abc", "is not a number"),
+        ("SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS", "-1", "must be greater than 0"),
+        ("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", "70000", "must be between 1 and 65535"),
+        ("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", "abc", "is not a port number"),
+    ],
+)
+def test_serve_rust_refuses_a_bad_knob_before_the_server_binds(
+    monkeypatch, tmp_path, name, value, text
+):
+    """smg-lab #292: every knob is read and validated first; a value the
+    servicer cannot use is a named error before any engine work, before the
+    server is constructed (and so before the port is bound), and before the
+    scheduler ranks start. The drain was read only once the engine ran."""
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    _stub_servicer_module(monkeypatch)
+
+    def no_engine_work(*_args, **_kwargs):
+        raise AssertionError("no engine work before the knobs are validated")
+
+    monkeypatch.setattr(rust, "model_facts", no_engine_work)
+    monkeypatch.setattr(rust, "server_facts", no_engine_work)
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", no_engine_work)
+    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
+        asyncio.run(rust.serve_rust(FakeServerArgs(port=50123)))
+    assert created == {}
+
+
+def test_serve_rust_refuses_a_socket_dir_that_is_a_file_before_the_server_binds(
+    monkeypatch, tmp_path
+):
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    _stub_servicer_module(monkeypatch)
+    a_file = tmp_path / "a-file"
+    a_file.write_text("not a directory")
+    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(a_file))
+
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="SMG_ZMQ_SOCKET_DIR=.*not a dir"):
+        asyncio.run(rust.serve_rust(FakeServerArgs(port=50123)))
+    assert created == {}
+
+
+def test_the_launcher_answers_a_configuration_error_with_exit_code_2(launcher, monkeypatch, caplog):
+    """smg-lab #292: a knob the servicer cannot use ends the launcher with one
+    ERROR line naming it and exit code 2, not a traceback."""
+    module, calls = launcher
+    caplog.set_level(logging.ERROR)
+    monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_IMPL", "bogus")
+    with pytest.raises(SystemExit) as raised:
+        module.main(["--model", "org/m"])
+    assert raised.value.code == 2 and calls["served"] is None
+    assert "SMG_TOKENSPEED_SERVICER_IMPL must be one of" in caplog.text
+
+    async def failing_serve_rust(server_args):
+        raise rust_lifecycle.ServicerConfigError(
+            "SMG_TOKENSPEED_SERVICER_DRAIN_SECS='abc' is not a number"
+        )
+
+    monkeypatch.setattr(module, "serve_rust", failing_serve_rust)
+    with pytest.raises(SystemExit) as raised:
+        module.main(["--servicer-impl", "rust", "--model", "org/m"])
+    assert raised.value.code == 2
+    assert "SMG_TOKENSPEED_SERVICER_DRAIN_SECS='abc' is not a number" in caplog.text

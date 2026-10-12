@@ -1,0 +1,251 @@
+"""Engine-free tests for the TokenSpeed Python servicer's lifecycle (smg-lab
+#292): the servicer exits non-zero when its engine dies, during the launch or
+later, instead of running on as a worker that cannot serve."""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import logging
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+
+
+def _module(name, **attrs):
+    module = ModuleType(name)
+    for attr, value in attrs.items():
+        setattr(module, attr, value)
+    return module
+
+
+class _HardExit(BaseException):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+@pytest.fixture
+def server_mod(monkeypatch):
+    """Load the TokenSpeed server.py with stand-ins for the engine, gRPC and
+    the proto package; the servicer classes are recording fakes."""
+
+    class ServerArgs:
+        pass
+
+    class SchedulerServicer:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.shutdown = AsyncMock()
+
+    class HealthServicer:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.set_not_serving = Mock()
+
+    stubs = {
+        "grpc": _module("grpc", aio=SimpleNamespace(), insecure_channel=Mock()),
+        "grpc_health": _module("grpc_health"),
+        "grpc_health.v1": _module(
+            "grpc_health.v1",
+            health_pb2_grpc=SimpleNamespace(add_HealthServicer_to_server=Mock()),
+        ),
+        "grpc_reflection": _module("grpc_reflection"),
+        "grpc_reflection.v1alpha": _module(
+            "grpc_reflection.v1alpha",
+            reflection=SimpleNamespace(SERVICE_NAME="reflection", enable_server_reflection=Mock()),
+        ),
+        "smg_grpc_proto": _module(
+            "smg_grpc_proto",
+            tokenspeed_scheduler_pb2_grpc=SimpleNamespace(
+                add_TokenSpeedSchedulerServicer_to_server=Mock(),
+                TokenSpeedSchedulerStub=Mock(),
+            ),
+        ),
+        "smg_grpc_proto.generated": _module(
+            "smg_grpc_proto.generated",
+            tokenspeed_scheduler_pb2=SimpleNamespace(
+                DESCRIPTOR=SimpleNamespace(
+                    services_by_name={
+                        "TokenSpeedScheduler": SimpleNamespace(full_name="test.TokenSpeedScheduler")
+                    }
+                ),
+                GenerateResponse=object,
+            ),
+        ),
+        "tokenspeed": _module("tokenspeed"),
+        "tokenspeed.runtime": _module("tokenspeed.runtime"),
+        "tokenspeed.runtime.utils": _module("tokenspeed.runtime.utils"),
+        "tokenspeed.runtime.utils.server_args": _module(
+            "tokenspeed.runtime.utils.server_args", ServerArgs=ServerArgs
+        ),
+        "smg_grpc_servicer.tokenspeed.health_servicer": _module(
+            "smg_grpc_servicer.tokenspeed.health_servicer",
+            TokenSpeedHealthServicer=HealthServicer,
+        ),
+        "smg_grpc_servicer.tokenspeed.scheduler_launcher": _module(
+            "smg_grpc_servicer.tokenspeed.scheduler_launcher",
+            launch_engine=lambda _args: (object(), {}),
+        ),
+        "smg_grpc_servicer.tokenspeed.servicer": _module(
+            "smg_grpc_servicer.tokenspeed.servicer",
+            TokenSpeedSchedulerServicer=SchedulerServicer,
+        ),
+    }
+    for name, module in stubs.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    path = Path(__file__).parents[1] / "smg_grpc_servicer" / "tokenspeed" / "server.py"
+    spec = importlib.util.spec_from_file_location("test_tokenspeed_grpc_server", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeWatch:
+    """The engine-process watch as the server drives it: `start` keeps the
+    `on_exit` callback for the test to fire, `stop` is recorded."""
+
+    instances: list = []
+
+    def __init__(self, on_exit, **_kwargs):
+        self.on_exit = on_exit
+        self.started = False
+        self.stopped = False
+        self.terminated = 0
+        _FakeWatch.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def terminate_seen(self):
+        self.terminated += 1
+        return 1
+
+
+def _wire(monkeypatch, server_mod, events):
+    _FakeWatch.instances.clear()
+    monkeypatch.setattr(server_mod, "EngineProcessWatch", _FakeWatch)
+
+    async def stop_server(grace):
+        events.append(("server-stop", grace))
+
+    grpc_server = SimpleNamespace(
+        add_insecure_port=Mock(),
+        start=AsyncMock(side_effect=lambda: events.append("server-start")),
+        stop=AsyncMock(side_effect=stop_server),
+    )
+    monkeypatch.setattr(
+        server_mod.grpc.aio, "server", Mock(return_value=grpc_server), raising=False
+    )
+    monkeypatch.setattr(
+        server_mod.threading,
+        "Thread",
+        Mock(return_value=SimpleNamespace(start=Mock(), is_alive=Mock(return_value=False))),
+    )
+    return SimpleNamespace(host="127.0.0.1", port=50051, disaggregation_mode="null")
+
+
+def test_an_engine_that_exits_after_start_up_ends_the_server_with_exit_code_1(
+    monkeypatch, server_mod, caplog
+):
+    """The watch reports an engine process gone: the server stops as on a
+    signal (health down, servicer shut down, server stopped) and the servicer
+    exits with code 1, so an orchestrator restarts it."""
+    events = []
+    server_args = _wire(monkeypatch, server_mod, events)
+    caplog.set_level(logging.ERROR)
+
+    async def exercise():
+        task = asyncio.create_task(server_mod.serve_grpc(server_args))
+        while "server-start" not in events:
+            await asyncio.sleep(0)
+        watch = _FakeWatch.instances[0]
+        assert watch.started
+        # The watch thread reports from outside the loop; here from inside,
+        # which the thread-safe hand-over tolerates.
+        watch.on_exit(4242, 1)
+        await task
+
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(exercise())
+    assert raised.value.code == 1
+    assert _FakeWatch.instances[0].stopped
+    assert events == ["server-start", ("server-stop", 5.0)]
+    assert "engine process 4242 exited with code 1" in caplog.text
+
+
+def test_a_signal_shutdown_still_returns_normally(monkeypatch, server_mod):
+    events = []
+    server_args = _wire(monkeypatch, server_mod, events)
+
+    async def exercise():
+        task = asyncio.create_task(server_mod.serve_grpc(server_args))
+        while "server-start" not in events:
+            await asyncio.sleep(0)
+        # What the signal handler does.
+        for handler_task in asyncio.all_tasks():
+            pass
+        stop = next(
+            frame.f_locals["stop_event"]
+            for frame in [task.get_coro().cr_frame]
+            if "stop_event" in frame.f_locals
+        )
+        stop.set()
+        return await task
+
+    assert asyncio.run(exercise()) is None
+    assert _FakeWatch.instances[0].stopped
+    assert events == ["server-start", ("server-stop", 5.0)]
+
+
+def test_an_engine_that_exits_during_the_launch_ends_the_process_at_once(
+    monkeypatch, server_mod, caplog
+):
+    """While the launch still waits on the engine's ready report (the main
+    thread is inside the engine's launcher), the watch ends the process: the
+    other engine processes terminated, one ERROR line, exit code 1."""
+    events = []
+    server_args = _wire(monkeypatch, server_mod, events)
+    caplog.set_level(logging.ERROR)
+
+    def hard_exit(code):
+        raise _HardExit(code)
+
+    monkeypatch.setattr(server_mod.engine_watchdog, "exit_process", hard_exit)
+
+    def launch_that_sees_the_engine_die(_args):
+        # The watch thread fires while the launch is still waiting.
+        _FakeWatch.instances[0].on_exit(4242, 0)
+        raise AssertionError("the launch does not return")
+
+    monkeypatch.setattr(server_mod, "launch_engine", launch_that_sees_the_engine_die)
+
+    with pytest.raises(_HardExit) as raised:
+        asyncio.run(server_mod.serve_grpc(server_args))
+    assert raised.value.code == 1
+    assert _FakeWatch.instances[0].terminated == 1
+    assert "engine process 4242 exited with code 0" in caplog.text
+    assert events == []
+
+
+def test_an_engine_that_does_not_start_is_a_named_exit(monkeypatch, server_mod, caplog):
+    events = []
+    server_args = _wire(monkeypatch, server_mod, events)
+    caplog.set_level(logging.ERROR)
+
+    def failing_launch(_args):
+        raise RuntimeError("launch_engine() returned no AsyncLLM")
+
+    monkeypatch.setattr(server_mod, "launch_engine", failing_launch)
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(server_mod.serve_grpc(server_args))
+    assert raised.value.code == 1
+    assert _FakeWatch.instances[0].stopped
+    assert "did not start: launch_engine() returned no AsyncLLM" in caplog.text
+    assert events == []

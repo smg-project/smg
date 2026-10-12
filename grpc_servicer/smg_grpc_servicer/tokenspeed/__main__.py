@@ -20,6 +20,7 @@ import sys
 
 from tokenspeed.runtime.utils.server_args import prepare_server_args
 
+from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
 from smg_grpc_servicer.tokenspeed.rust import (
     add_servicer_impl_argument,
     serve_rust,
@@ -70,10 +71,15 @@ def main(argv: list[str] | None = None) -> None:
     # One flag selects the Rust request path (--servicer-impl, else the
     # environment); the entrypoint and every ServerArgs flag stay the same,
     # and the Router cannot tell them apart.
-    impl, origin = servicer_impl_source(ours)
-    logger.info("Servicer implementation: %s (source=%s)", impl, origin)
-    if impl == "rust":
-        raise SystemExit(asyncio.run(serve_rust(server_args)))
+    try:
+        impl, origin = servicer_impl_source(ours)
+        logger.info("Servicer implementation: %s (source=%s)", impl, origin)
+        if impl == "rust":
+            raise SystemExit(asyncio.run(serve_rust(server_args)))
+    except ServicerConfigError as error:
+        # A knob the servicer cannot use: one named ERROR line and exit code
+        # 2, before any engine work, not a traceback.
+        raise configuration_exit(error, logger) from None
     asyncio.run(serve_grpc(server_args))
 
 

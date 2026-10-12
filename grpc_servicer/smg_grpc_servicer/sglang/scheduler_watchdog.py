@@ -26,29 +26,33 @@ async def watch_scheduler_processes(
     stop_event: asyncio.Event,
     *,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
-) -> None:
-    """Request server shutdown after every scheduler process has exited."""
+) -> bool:
+    """Request server shutdown once a scheduler process has exited on its own:
+    one exited rank (of a tensor-parallel group, or the only one) leaves an
+    engine that cannot serve. Returns whether that happened (``False`` when
+    the stop event was set first, by a signal)."""
     if not scheduler_processes:
-        return
+        return False
 
     while not stop_event.is_set():
         exit_codes = [process.exitcode for process in scheduler_processes]
-        if all(exit_code is not None for exit_code in exit_codes):
-            if any(exit_code != 0 for exit_code in exit_codes):
+        if any(exit_code is not None for exit_code in exit_codes):
+            if any(exit_code not in (None, 0) for exit_code in exit_codes):
                 logger.error(
-                    "All scheduler processes exited; non-zero exit codes detected: %s. "
+                    "A scheduler process exited; non-zero exit codes detected: %s. "
                     "Shutting down gRPC server",
                     exit_codes,
                 )
             else:
-                logger.warning(
-                    "All scheduler processes exited with codes %s; shutting down gRPC server",
+                logger.error(
+                    "A scheduler process exited (exit codes %s); shutting down gRPC server",
                     exit_codes,
                 )
             stop_event.set()
-            return
+            return True
 
         await asyncio.sleep(poll_interval_seconds)
+    return False
 
 
 async def wait_for_scheduler_shutdown(
@@ -56,11 +60,13 @@ async def wait_for_scheduler_shutdown(
     stop_event: asyncio.Event,
     *,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
-) -> None:
-    """Wait for a signal or scheduler exit while owning the watchdog task."""
+) -> bool:
+    """Wait for a signal or a scheduler exit while owning the watchdog task;
+    returns whether a scheduler process exited on its own (the servicer then
+    exits non-zero)."""
     if not scheduler_processes:
         await stop_event.wait()
-        return
+        return False
 
     watchdog_task = asyncio.create_task(
         watch_scheduler_processes(
@@ -76,3 +82,4 @@ async def wait_for_scheduler_shutdown(
         watchdog_task.cancel()
         with suppress(asyncio.CancelledError):
             await watchdog_task
+    return not watchdog_task.cancelled() and bool(watchdog_task.result())

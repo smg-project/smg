@@ -37,7 +37,9 @@ from typing import Any
 from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
-from smg_grpc_servicer.rust_lifecycle import (
+
+# The lifecycle's defaults, re-exported: this launcher's own documented defaults.
+from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
@@ -45,11 +47,12 @@ from smg_grpc_servicer.rust_lifecycle import (
     EngineProcessGroup,
     FaultLatch,
     SchedulerProcesses,
+    ServicerConfigError,
     default_socket_dir,
     ensure_spawn_start_method,
-    env_float,
     free_port,
     on_fault_signal,
+    read_launcher_knobs,
     resolve_tokenizer_dir,
     supervise,
 )
@@ -110,7 +113,7 @@ def servicer_impl_source(
         origin = SOURCE_ENV if value else SOURCE_DEFAULT
     value = str(value or "python").strip().lower()
     if value not in IMPLS:
-        raise ValueError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
+        raise ServicerConfigError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
     if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
         source[SERVICER_IMPL_ENV] = value
     return value, origin
@@ -425,12 +428,12 @@ def refuse_disaggregation(server_args: Any) -> None:
     worker must not start rather than report SERVING and hang requests."""
     mode = getattr(server_args, "disaggregation_mode", "null") or "null"
     if mode != "null":
-        raise ValueError(
+        raise ServicerConfigError(
             f"{SERVICER_IMPL_ENV}=rust does not support PD disaggregation "
             f"(disaggregation_mode={mode!r}); unset it for this worker"
         )
     if getattr(server_args, "language_only", False) or getattr(server_args, "encoder_only", False):
-        raise ValueError(
+        raise ServicerConfigError(
             f"{SERVICER_IMPL_ENV}=rust does not support EPD disaggregation "
             "(language_only / encoder_only); unset it for this worker"
         )
@@ -441,6 +444,15 @@ async def serve_rust(server_args: Any) -> int:
     start the scheduler ranks against its handshake, and supervise both
     until a signal or a failure. Returns the process exit code."""
     refuse_disaggregation(server_args)
+    # The launcher's own knobs first, validated together: a bad value is a
+    # named error before any engine work and before the port is bound.
+    knobs = read_launcher_knobs(
+        handshake_port_env=HANDSHAKE_PORT_ENV,
+        drain_secs_env=DRAIN_SECS_ENV,
+        startup_timeout_secs_env=STARTUP_TIMEOUT_SECS_ENV,
+        startup_ceiling_secs_env=STARTUP_CEILING_SECS_ENV,
+        socket_dir=default_socket_dir(),
+    )
     from smg.servicer import SglangGrpcServer, init_servicer_tracing
 
     init_servicer_tracing(None)
@@ -451,9 +463,8 @@ async def serve_rust(server_args: Any) -> int:
             "--kv-events-config to configure it, or set %s=0 to leave it off",
             KV_EVENTS_ENV,
         )
-    handshake_port = int(os.environ.get(HANDSHAKE_PORT_ENV) or 0) or free_port()
-    socket_dir = default_socket_dir()
-    os.makedirs(socket_dir, mode=0o700, exist_ok=True)
+    handshake_port = knobs.handshake_port or free_port()
+    socket_dir = knobs.socket_dir
     host = getattr(server_args, "host", None) or "0.0.0.0"
     port = int(getattr(server_args, "port", 0) or 0)
     facts = {**model_facts(server_args), **server_facts(server_args)}
@@ -479,8 +490,8 @@ async def serve_rust(server_args: Any) -> int:
             "No local tokenizer directory for %s; GetTokenizer will be unavailable",
             getattr(server_args, "model_path", ""),
         )
-    startup_timeout_secs = env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
-    startup_ceiling_secs = env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
+    startup_timeout_secs = knobs.startup_timeout_secs
+    startup_ceiling_secs = knobs.startup_ceiling_secs
     server = SglangGrpcServer(
         bind_address=host_port(host, port),
         ipc_base_url=f"ipc://{socket_dir}/sglang-servicer-{os.getpid()}",
@@ -505,4 +516,4 @@ async def serve_rust(server_args: Any) -> int:
         STARTUP_CEILING_SECS_ENV,
     )
     engine = launch_scheduler_ranks(server_args, handshake_port=handshake_port)
-    return await supervise(server, engine, drain_secs=env_float(DRAIN_SECS_ENV, DEFAULT_DRAIN_SECS))
+    return await supervise(server, engine, drain_secs=knobs.drain_secs)
