@@ -1,4 +1,4 @@
-//! Keep-alives on SSE streams whose upstream has gone quiet.
+//! A keep-alive on SSE streams whose upstream has gone quiet.
 //!
 //! A streamed response is answered with its headers as soon as the request
 //! is dispatched; its first token may follow a long prefill tens of seconds
