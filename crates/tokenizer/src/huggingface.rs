@@ -715,7 +715,9 @@ impl HuggingFaceTokenizer {
             Some("") => return Ok(DecodeStep::default()),
             Some(rest) => (rest.to_string(), false),
             None => {
-                let (rest, byte_run) = remainder_after_rewrite(&string, prefix);
+                let run_start =
+                    self.streamed_run_start(ids, *prefix_index, skip_special_tokens, prefix)?;
+                let (rest, byte_run) = remainder_after_rewrite(&string, prefix, run_start);
                 debug!(
                     ?token_id,
                     emitted = prefix.len(),
@@ -741,18 +743,23 @@ impl HuggingFaceTokenizer {
 }
 
 /// The part of `decoded` that follows what `emitted` already covers, when the
-/// decoder chain rewrote `emitted`. The common character prefix is skipped;
-/// beyond it, a ByteFallback run collapsed by an invalid byte decodes to one
-/// replacement character per byte, so one such character is skipped for every
-/// byte of the emitted characters (the second value says that applied).
-/// Nothing already emitted is retracted: a reader sees the emitted text, then
-/// the remainder as the batch decode would end.
-fn remainder_after_rewrite(decoded: &str, emitted: &str) -> (String, bool) {
+/// decoder chain rewrote `emitted`. The common character prefix is skipped, up
+/// to `run_start`, where the text streamed from the open ByteFallback run
+/// begins in `emitted`; beyond it, a run collapsed by an invalid byte decodes
+/// to one replacement character per byte, so one such character is skipped
+/// for every byte of the emitted characters (the second value says that
+/// applied). The run's own characters are never matched by equality: a
+/// literal U+FFFD streamed from the run stands for its three bytes, and the
+/// collapsed run holds three replacement characters for it, not one. Nothing
+/// already emitted is retracted: a reader sees the emitted text, then the
+/// remainder as the batch decode would end.
+fn remainder_after_rewrite(decoded: &str, emitted: &str, run_start: usize) -> (String, bool) {
     let common = decoded
         .char_indices()
         .zip(emitted.chars())
         .find(|((_, a), b)| a != b)
-        .map_or_else(|| decoded.len().min(emitted.len()), |((index, _), _)| index);
+        .map_or_else(|| decoded.len().min(emitted.len()), |((index, _), _)| index)
+        .min(run_start);
     let rewritten_bytes = emitted.len() - common;
     let rest = &decoded[common..];
     let replacement_run = rest.chars().take_while(|&c| c == '\u{FFFD}').count();
@@ -765,6 +772,32 @@ fn remainder_after_rewrite(decoded: &str, emitted: &str) -> (String, bool) {
 }
 
 impl HuggingFaceTokenizer {
+    /// Where the text streamed from the open ByteFallback run begins in
+    /// `prefix`, the emitted text of `ids[..prefix_index]`: the length of the
+    /// text the ids before the run's first byte piece decode to; `prefix.len()`
+    /// when the emitted ids end in no byte piece, or the vocabulary has none.
+    fn streamed_run_start(
+        &self,
+        ids: &[TokenIdType],
+        prefix_index: usize,
+        skip_special_tokens: bool,
+        prefix: &str,
+    ) -> Result<usize> {
+        if !self.has_byte_fallback {
+            return Ok(prefix.len());
+        }
+        let emitted = &ids[..prefix_index.min(ids.len())];
+        let stable_end = emitted
+            .iter()
+            .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
+            .map_or(0, |index| index + 1);
+        if stable_end == emitted.len() {
+            return Ok(prefix.len());
+        }
+        let stable = self.decode(&emitted[..stable_end], skip_special_tokens)?;
+        Ok(stable.len().min(prefix.len()))
+    }
+
     /// The client-visible step (see [`Decoder::decode_step`]): a seeded
     /// sequence's prompt is decode context, never emitted; a ByteFallback run
     /// streams each complete character as it closes; `eager` is the
@@ -1026,7 +1059,9 @@ impl Decoder for HuggingFaceTokenizer {
         let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
-                let (pending, byte_run) = remainder_after_rewrite(&decoded, prefix);
+                let run_start =
+                    self.streamed_run_start(ids, *prefix_index, skip_special_tokens, prefix)?;
+                let (pending, byte_run) = remainder_after_rewrite(&decoded, prefix, run_start);
                 debug!(
                     emitted = prefix.len(),
                     decoded = decoded.len(),

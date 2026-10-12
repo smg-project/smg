@@ -285,7 +285,8 @@ fn stream_all(
 /// Bytes of text accounted as the engine produced them: a replacement
 /// character stands for one byte of a collapsed run, any other character for
 /// its own UTF-8 bytes. Equal for the streamed and the batch text of one
-/// sequence whatever the stream kept.
+/// sequence whatever the stream kept, unless the stream carried a literal
+/// U+FFFD (three bytes, counted as one here) before the run collapsed.
 fn run_bytes(text: &str) -> usize {
     text.chars()
         .map(|c| if c == '\u{FFFD}' { 1 } else { c.len_utf8() })
@@ -320,6 +321,44 @@ fn byte_fallback_streaming_matches_batch_until_an_invalid_byte_follows_sent_text
             assert_eq!(run_bytes(&deltas.concat()), run_bytes(&batch), "{ids:?}");
         }
     }
+}
+
+#[test]
+fn byte_fallback_remainder_after_a_literal_replacement_character_counts_its_bytes() {
+    // "\u{FFFD}A" streamed as byte tokens (a literal replacement character is
+    // a valid three-byte sequence), then invalid bytes, then a regular token:
+    // the batch decode turns the whole run into one replacement character per
+    // byte, and the stream, which keeps "\u{FFFD}A", sends one for every byte
+    // it has not covered. The literal counts as its three bytes, not as one:
+    // the tail is as long as the run of invalid bytes, whatever its length.
+    let tokenizer = byte_fallback_full_tokenizer(vec![]);
+    for invalid in [1, 3, 4, 8] {
+        let mut ids = byte_ids("\u{FFFD}A");
+        ids.extend(vec![0xFF + 2; invalid]);
+        ids.push(1);
+        let (deltas, batch, recoveries) =
+            stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+        assert_eq!(batch, format!("{}x", "\u{FFFD}".repeat(4 + invalid)));
+        assert_eq!(deltas[0], "\u{FFFD}A", "{invalid} invalid bytes");
+        assert_eq!(
+            deltas.concat(),
+            format!("\u{FFFD}A{}x", "\u{FFFD}".repeat(invalid)),
+            "{invalid} invalid bytes"
+        );
+        assert_eq!(recoveries, 1, "{invalid} invalid bytes");
+    }
+    // The same run cut by the end of input: the end-of-input path aligns the
+    // same way.
+    let mut ids = byte_ids("\u{FFFD}A");
+    ids.extend(vec![0xFF + 2; 3]);
+    let (deltas, batch, recoveries) =
+        stream_all(&tokenizer, &ids, crate::StopSequenceConfig::default(), true);
+    assert_eq!(batch, "\u{FFFD}".repeat(7));
+    assert_eq!(
+        deltas.concat(),
+        format!("\u{FFFD}A{}", "\u{FFFD}".repeat(3))
+    );
+    assert_eq!(recoveries, 1);
 }
 
 #[test]
