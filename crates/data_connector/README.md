@@ -414,12 +414,17 @@ subsystem schema (for example skills metadata or background-mode queue tables)
 must be managed by the subsystem that actually uses those tables rather than
 being forced on every history-backed deployment.
 
-On startup:
-1. Tables are created if they don't exist (`CREATE TABLE` / `CREATE TABLE IF NOT EXISTS`)
-2. The `_schema_versions` tracking table is created
-3. Pending migrations are checked:
+On startup (Postgres: in one transaction under an advisory lock, so gateways
+starting together on one database take turns and all come up):
+1. The `_schema_versions` tracking table is created
+2. Tables are created if they don't exist (`CREATE TABLE` / `CREATE TABLE IF NOT EXISTS`)
+3. A fresh database (no responses table before this start) is recorded at the
+   latest version: its tables were just created in their final shape, so no
+   migration is pending and no `auto_migrate` is needed
+4. Otherwise pending migrations are checked:
    - If `auto_migrate: true` → migrations are applied automatically
    - If `auto_migrate: false` (default) → startup fails with actionable SQL if migrations are pending
+5. Indexes are created last, once the columns they cover exist
 
 Current core history migrations:
 
@@ -433,7 +438,7 @@ Current core history migrations:
 
 | Config field | Type | Default | Description |
 |---|---|---|---|
-| `auto_migrate` | `bool` | `false` | Set to `true` to apply migrations automatically on startup. When `false`, startup fails with the exact SQL if migrations are pending. |
+| `auto_migrate` | `bool` | `false` | Set to `true` to apply migrations automatically on startup (the environment variable `DB_AUTO_MIGRATE=true` sets the default). When `false`, startup fails with the exact SQL if migrations are pending. |
 | `version` | `u32` (optional) | `None` | Starting version — migrations up to this number are skipped. Use when your database is already at a known version. |
 
 Example: opt in to automatic migration:

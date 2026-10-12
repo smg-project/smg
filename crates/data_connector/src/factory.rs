@@ -174,24 +174,18 @@ fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, Str
 
 async fn create_postgres_storage(postgres_cfg: &PostgresConfig) -> Result<StorageBundle, String> {
     let store = PostgresStore::new(postgres_cfg.clone())?;
+    // The tables, the schema version and the indexes: once per database, in
+    // one transaction under the schema lock, so gateways starting together
+    // take turns and a fresh database starts at the latest version.
+    store
+        .bootstrap()
+        .await
+        .map_err(|err| format!("failed to initialize the Postgres schema: {err}"))?;
     let postgres_resp = PostgresResponseStorage::new(store.clone())
         .await
         .map_err(|err| format!("failed to initialize Postgres response storage: {err}"))?;
-    let postgres_conv = PostgresConversationStorage::new(store.clone())
-        .await
-        .map_err(|err| format!("failed to initialize Postgres conversation storage: {err}"))?;
-    let postgres_item = PostgresConversationItemStorage::new(store.clone())
-        .await
-        .map_err(|err| format!("failed to initialize Postgres conversation item storage: {err}"))?;
-
-    // Run versioned migrations after all tables are created
-    let applied = store.run_migrations().await?;
-
-    // Re-create indexes that were deferred during init because
-    // migration-added columns did not yet exist.
-    if !applied.is_empty() {
-        store.ensure_response_indexes().await?;
-    }
+    let postgres_conv = PostgresConversationStorage::new(store.clone());
+    let postgres_item = PostgresConversationItemStorage::new(store);
 
     Ok(StorageBundle {
         response_storage: Arc::new(postgres_resp),

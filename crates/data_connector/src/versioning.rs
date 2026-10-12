@@ -30,6 +30,8 @@
 //!     auto_migrate: true    # opt in to automatic migration
 //! ```
 
+use tokio_postgres::GenericClient;
+
 use crate::schema::SchemaConfig;
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -53,6 +55,14 @@ pub struct Migration {
 
 /// Name of the schema-versions tracking table.
 pub const VERSIONS_TABLE: &str = "_schema_versions";
+
+/// The advisory lock key under which a gateway creates and migrates the
+/// Postgres history schema (`"smg_migr"`). The whole bootstrap of a
+/// gateway runs in one transaction that holds it, so gateways starting
+/// together on one database take turns; the key is the one earlier builds
+/// hold at session level while they migrate, and the two kinds exclude each
+/// other.
+pub(crate) const POSTGRES_SCHEMA_LOCK_ID: i64 = 0x736D_675F_6D69_6772;
 
 /// Oracle-qualified name for the versions table (always quoted since `_` prefix
 /// is invalid for unquoted Oracle identifiers).
@@ -126,8 +136,10 @@ fn pending_migrations_error(
     }
 
     msg.push_str(&format!(
-        "\nTo apply automatically, set `auto_migrate: true` in your {backend} schema config.\n\
-         To skip, set `version: {}` to mark your schema as already up to date.",
+        "\nTo apply automatically, set `auto_migrate: true` in your {backend} schema config \
+         (the YAML file given by `--schema-config`, or the `{backend}.schema` block of the \
+         gateway's config), or set the environment variable `DB_AUTO_MIGRATE=true`.\n\
+         To skip, set `version: {}` in that schema config to mark your schema as already up to date.",
         pending.last().map_or(current, |m| m.version)
     ));
 
@@ -300,24 +312,19 @@ fn oracle_current_version(conn: &oracle::Connection, schema: &SchemaConfig) -> R
 
 // ── Postgres helpers ───────────────────────────────────────────────────────
 
-/// Run pending Postgres migrations on a `tokio_postgres::Client`.
-///
-/// Uses a transaction per migration for atomicity. Returns the list of
+/// Run pending Postgres migrations inside `tx`, the caller's bootstrap
+/// transaction (which holds [`POSTGRES_SCHEMA_LOCK_ID`] and created the
+/// versions table). Every pending migration and its version record go in
+/// that one transaction: a failure leaves the database as it was. Returns the
 /// newly applied version numbers.
 pub async fn run_postgres_migrations(
-    client: &mut tokio_postgres::Client,
+    tx: &tokio_postgres::Transaction<'_>,
     schema: &SchemaConfig,
     migrations: &[Migration],
     config_version: Option<u32>,
     auto_migrate: bool,
 ) -> Result<Vec<u32>, String> {
-    // Ensure the versions table exists (needed to check current version)
-    client
-        .batch_execute(&postgres_create_versions_table())
-        .await
-        .map_err(|e| format!("failed to create {VERSIONS_TABLE} table: {e}"))?;
-
-    let current = postgres_current_version(client).await?;
+    let current = postgres_current_version(tx).await?;
     let skip_up_to = config_version.unwrap_or(0);
     let effective_start = current.max(skip_up_to);
 
@@ -341,55 +348,6 @@ pub async fn run_postgres_migrations(
         ));
     }
 
-    // Acquire session-level advisory lock to serialize migrations across
-    // concurrent application instances. Released explicitly below (or
-    // automatically when the connection is closed).
-    const MIGRATION_LOCK_ID: i64 = 0x736D675F6D696772; // "smg_migr"
-    client
-        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_ID])
-        .await
-        .map_err(|e| format!("failed to acquire migration lock: {e}"))?;
-
-    let result =
-        apply_postgres_migrations(client, schema, migrations, config_version, effective_start)
-            .await;
-
-    // Always release the lock, even on error
-    let _ = client
-        .execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_ID])
-        .await;
-
-    result
-}
-
-/// Inner migration logic, separated so the caller can manage the advisory lock.
-///
-/// Re-reads the current version under the advisory lock to handle the case
-/// where another instance applied migrations between our initial check and
-/// acquiring the lock.
-async fn apply_postgres_migrations(
-    client: &mut tokio_postgres::Client,
-    schema: &SchemaConfig,
-    migrations: &[Migration],
-    config_version: Option<u32>,
-    pre_lock_start: u32,
-) -> Result<Vec<u32>, String> {
-    // Re-read under lock — another instance may have migrated since our
-    // initial check (before lock acquisition).
-    let current = postgres_current_version(client).await?;
-    let skip_up_to = config_version.unwrap_or(0);
-    let effective_start = current.max(skip_up_to).max(pre_lock_start);
-
-    let pending: Vec<&Migration> = migrations
-        .iter()
-        .filter(|m| m.version > effective_start)
-        .collect();
-
-    if pending.is_empty() {
-        tracing::debug!(current_version = effective_start, "schema is up to date");
-        return Ok(Vec::new());
-    }
-
     tracing::info!(
         current_version = effective_start,
         pending = pending.len(),
@@ -398,13 +356,8 @@ async fn apply_postgres_migrations(
 
     let mut applied = Vec::new();
     for migration in pending {
-        // Run each migration in a transaction for atomicity.
-        // Note: DDL in Postgres is transactional (unlike Oracle).
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| format!("failed to begin transaction: {e}"))?;
-
+        // DDL in Postgres is transactional (unlike Oracle): the statements
+        // and the version record commit with the bootstrap or not at all.
         let stmts = (migration.up)(schema);
         for stmt in &stmts {
             if stmt.is_empty() {
@@ -413,7 +366,9 @@ async fn apply_postgres_migrations(
             tx.batch_execute(stmt).await.map_err(|e| {
                 format!(
                     "migration v{} ({}) failed: {}",
-                    migration.version, migration.description, e
+                    migration.version,
+                    migration.description,
+                    crate::common::describe_error(&e)
                 )
             })?;
         }
@@ -424,11 +379,13 @@ async fn apply_postgres_migrations(
             &[&(migration.version as i32), &migration.description],
         )
         .await
-        .map_err(|e| format!("failed to record migration v{}: {}", migration.version, e))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| format!("commit failed: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "failed to record migration v{}: {}",
+                migration.version,
+                crate::common::describe_error(&e)
+            )
+        })?;
 
         tracing::info!(
             version = migration.version,
@@ -438,7 +395,7 @@ async fn apply_postgres_migrations(
         applied.push(migration.version);
     }
 
-    let final_version = postgres_current_version(client).await?;
+    let final_version = postgres_current_version(tx).await?;
     tracing::info!(
         schema_version = final_version,
         "schema version after migrations"
@@ -447,15 +404,75 @@ async fn apply_postgres_migrations(
     Ok(applied)
 }
 
+/// The statement that records one migration as applied unless a record
+/// exists: a fresh database is stamped with every migration at once, and a
+/// database another gateway stamped first is left as it is.
+pub fn postgres_stamp_version_sql() -> String {
+    format!(
+        "INSERT INTO {VERSIONS_TABLE} (version, description) VALUES ($1, $2) \
+         ON CONFLICT (version) DO NOTHING"
+    )
+}
+
+/// Records every migration in `migrations` as applied, inside `tx`: the
+/// tables a first start just created are in their final shape, so the
+/// migrations that describe that shape have nothing left to do.
+pub async fn stamp_postgres_versions(
+    tx: &tokio_postgres::Transaction<'_>,
+    migrations: &[Migration],
+) -> Result<(), String> {
+    let sql = postgres_stamp_version_sql();
+    for migration in migrations {
+        tx.execute(&sql, &[&(migration.version as i32), &migration.description])
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to record migration v{} on the fresh database: {}",
+                    migration.version,
+                    crate::common::describe_error(&e)
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// The query that tells whether a (possibly schema-qualified) table exists,
+/// as `$1`, resolved against the connection's search path.
+pub fn postgres_table_exists_sql() -> &'static str {
+    "SELECT to_regclass($1) IS NOT NULL"
+}
+
+/// Whether `table` exists in the database `tx` is connected to.
+pub async fn postgres_table_exists(
+    tx: &tokio_postgres::Transaction<'_>,
+    table: &str,
+) -> Result<bool, String> {
+    let row = tx
+        .query_one(postgres_table_exists_sql(), &[&table])
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to check for the {table} table: {}",
+                crate::common::describe_error(&e)
+            )
+        })?;
+    Ok(row.get(0))
+}
+
 /// Read the current (highest) schema version from the Postgres versions table.
-async fn postgres_current_version(client: &tokio_postgres::Client) -> Result<u32, String> {
+async fn postgres_current_version(client: &impl GenericClient) -> Result<u32, String> {
     let row = client
         .query_one(
             &format!("SELECT COALESCE(MAX(version), 0) FROM {VERSIONS_TABLE}"),
             &[],
         )
         .await
-        .map_err(|e| format!("failed to read current schema version: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "failed to read current schema version: {}",
+                crate::common::describe_error(&e)
+            )
+        })?;
 
     let version: i32 = row.get(0);
     Ok(version as u32)
@@ -502,6 +519,20 @@ mod tests {
         };
         let ddl = oracle_create_versions_table(&schema);
         assert!(ddl.contains("ADMIN.\"_schema_versions\""), "got: {ddl}");
+    }
+
+    /// A fresh database is stamped with every migration; a stamp that meets a
+    /// record (another gateway, a table re-created under a stamped database)
+    /// leaves it as it is.
+    #[test]
+    fn fresh_database_stamp_leaves_an_existing_record_as_it_is() {
+        let sql = postgres_stamp_version_sql();
+        assert!(sql.starts_with("INSERT INTO _schema_versions"), "{sql}");
+        assert!(sql.ends_with("ON CONFLICT (version) DO NOTHING"), "{sql}");
+        assert_eq!(
+            postgres_table_exists_sql(),
+            "SELECT to_regclass($1) IS NOT NULL"
+        );
     }
 
     #[test]
@@ -575,6 +606,30 @@ mod tests {
             err.contains("version: 2"),
             "should hint version skip: {err}"
         );
+    }
+
+    /// The refusal names every way to opt in: the YAML key with the flag
+    /// that loads its file, and the environment variable.
+    #[test]
+    fn pending_migrations_error_names_every_way_to_opt_in() {
+        let schema = SchemaConfig::default();
+        let migrations = [Migration {
+            version: 1,
+            description: "test",
+            up: |_| vec!["SELECT 1".to_string()],
+        }];
+        let pending: Vec<&Migration> = migrations.iter().collect();
+        let err = pending_migrations_error("postgres", 0, &pending, &schema);
+        for needle in [
+            "auto_migrate: true",
+            "--schema-config",
+            "DB_AUTO_MIGRATE=true",
+        ] {
+            assert!(
+                err.contains(needle),
+                "the refusal should name {needle}: {err}"
+            );
+        }
     }
 
     #[test]

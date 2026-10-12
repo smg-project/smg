@@ -1954,7 +1954,9 @@ class RouterArgs:
             f"--{prefix}schema-config",
             type=str,
             default=None,
-            help="Path to a YAML schema config file for storage table/column remapping",
+            help="Path to a YAML schema config file for storage table/column remapping; "
+            "auto_migrate: true in it applies pending schema migrations at start-up "
+            "(the environment variable DB_AUTO_MIGRATE=true does the same without a file)",
         )
 
         # TLS/mTLS configuration

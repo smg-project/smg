@@ -1209,7 +1209,7 @@ struct CliArgs {
     #[arg(long, help_heading = "Backend")]
     storage_hook_wasm_path: Option<String>,
 
-    /// Path to a YAML schema config file for storage table/column remapping
+    /// Path to a YAML schema config file for storage table/column remapping; `auto_migrate: true` in it applies pending schema migrations at start-up (the environment variable DB_AUTO_MIGRATE=true does the same without a file)
     #[arg(long, help_heading = "Backend")]
     schema_config: Option<String>,
 

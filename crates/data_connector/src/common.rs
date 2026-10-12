@@ -6,6 +6,24 @@ use crate::{
     schema::{SchemaConfig, TableConfig},
 };
 
+/// An error with its sources after it: the database driver's errors print
+/// only their kind (`db error`) and keep the server's message in the source,
+/// and the pool wraps the driver's error once more. A source whose text the
+/// error already printed is not repeated.
+pub(crate) fn describe_error(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.ends_with(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 /// Logical column names for the responses table, in canonical SELECT order.
 ///
 /// Shared between Oracle and Postgres backends to build dynamic SELECT queries.
@@ -148,6 +166,44 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn describe_error_prints_the_sources_once() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>, bool);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match (&self.1, self.2) {
+                    (Some(inner), true) => write!(f, "{}: {inner}", self.0),
+                    _ => f.write_str(self.0),
+                }
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_deref()
+                    .map(|inner| inner as &(dyn std::error::Error + 'static))
+            }
+        }
+        let server = Layer("ERROR: relation \"responses\" already exists", None, false);
+        let driver = Layer("db error", Some(Box::new(server)), false);
+        assert_eq!(
+            describe_error(&driver),
+            "db error: ERROR: relation \"responses\" already exists"
+        );
+        // A wrapper that already printed its source does not repeat it.
+        let server = Layer("timed out", None, false);
+        let pool = Layer(
+            "Error occurred while creating a new object",
+            Some(Box::new(server)),
+            true,
+        );
+        assert_eq!(
+            describe_error(&pool),
+            "Error occurred while creating a new object: timed out"
+        );
+    }
 
     #[test]
     fn parse_raw_response_handles_null() {
