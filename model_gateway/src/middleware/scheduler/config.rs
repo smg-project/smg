@@ -16,9 +16,13 @@ use crate::tenant::TenantKey;
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ClassConfig {
     /// Absolute minimum slots reserved for this class — the value the
-    /// effective reservation never drops below. Higher-class reservations
-    /// are honored by lower-class admissions via the packed-CAS slot
-    /// accounting in [`super::slots`].
+    /// effective reservation never drops below while the pool can hold
+    /// every class's reservation. On a pool smaller than the sum of the
+    /// reservations, every class keeps the same fraction of its reservation
+    /// and the rest of the pool is shared (the scheduler's proportional
+    /// clamp), so a small pool is never reserved whole for one class.
+    /// Higher-class reservations are honored by lower-class admissions via
+    /// the packed-CAS slot accounting in [`super::slots`].
     pub reserved_floor: u16,
     /// Share of backend capacity reserved for this class, on top of the
     /// floor: `effective = max(reserved_floor, ceil(reserved_per_slot ×
