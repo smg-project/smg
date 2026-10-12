@@ -1,6 +1,6 @@
 //! Postgres storage implementation using PostgresStore helper
 
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -21,6 +21,7 @@ use crate::{
         ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult,
         ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
     },
+    factory::StoreContactError,
     postgres_migrations::POSTGRES_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
     versioning::{
@@ -69,6 +70,25 @@ impl PostgresStore {
             .map_err(|e| format!("Failed to build PostgreSQL connection pool: {e}"))?;
 
         Ok(Self { pool, schema })
+    }
+
+    /// The start-up contact: one connection and one round trip within
+    /// `bound`, so a store that refuses the connection, or accepts it and never
+    /// answers, is a verdict before the gateway serves.
+    pub(crate) async fn contact(&self, bound: Duration) -> Result<(), StoreContactError> {
+        let round_trip = async {
+            let client = self.pool.get().await.map_err(|e| e.to_string())?;
+            client
+                .simple_query("SELECT 1")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        };
+        match tokio::time::timeout(bound, round_trip).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(cause)) => Err(StoreContactError::Failed(cause)),
+            Err(_elapsed) => Err(StoreContactError::NoAnswer),
+        }
     }
 
     /// Brings the database to the schema this build expects, once per

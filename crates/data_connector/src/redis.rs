@@ -1,6 +1,6 @@
 //! Redis storage implementation using RedisStore helper
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -19,6 +19,7 @@ use crate::{
         ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult,
         ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
     },
+    factory::StoreContactError,
     schema::SchemaConfig,
 };
 
@@ -64,6 +65,25 @@ impl RedisStore {
             retention_days: config.retention_days,
             schema,
         })
+    }
+
+    /// The start-up contact: one connection and one round trip within
+    /// `bound`, so a store that refuses the connection, or accepts it and never
+    /// answers, is a verdict before the gateway serves.
+    pub(crate) async fn contact(&self, bound: Duration) -> Result<(), StoreContactError> {
+        let round_trip = async {
+            let mut conn = self.pool.get().await.map_err(|e| e.to_string())?;
+            redis::cmd("PING")
+                .query_async::<String>(&mut *conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        };
+        match tokio::time::timeout(bound, round_trip).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(cause)) => Err(StoreContactError::Failed(cause)),
+            Err(_elapsed) => Err(StoreContactError::NoAnswer),
+        }
     }
 }
 

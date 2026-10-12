@@ -399,6 +399,17 @@ characters, so the canonical key fits the column.
 | `function_call` | `fc` |
 | (other) | first 3 chars of the type, or `itm` if empty |
 
+## Start-up Contact
+
+With a Postgres or Redis history backend configured, `create_storage` makes one
+bounded contact with the store before anything else: a connection and one round
+trip (`SELECT 1` / `PING`) within `STARTUP_CONTACT_TIMEOUT` (10 s). A store that
+refuses the connection, or that accepts it and never answers, is a named error
+(the backend, the URL with its password masked, the bound) and the gateway exits
+before it binds its API port: it does not start without a history backend it
+cannot reach, for either backend alike. Oracle's contact is bounded by its own
+`pool_timeout_secs`.
+
 ## Database Schema
 
 All database backends auto-create their schemas on first connection. The
