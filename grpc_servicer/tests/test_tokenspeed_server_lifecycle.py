@@ -37,14 +37,32 @@ def server_mod(monkeypatch):
         pass
 
     class SchedulerServicer:
+        instances: list = []
+
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.shutdown = AsyncMock()
+            SchedulerServicer.instances.append(self)
 
     class HealthServicer:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.set_not_serving = Mock()
+
+    class EncoderServicer:
+        """The encode worker's servicer: its shutdown takes no arguments."""
+
+        instances: list = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.shutdown_calls = 0
+            EncoderServicer.instances.append(self)
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+    EncoderServicer.instances.clear()
 
     stubs = {
         "grpc": _module("grpc", aio=SimpleNamespace(), insecure_channel=Mock()),
@@ -75,6 +93,20 @@ def server_mod(monkeypatch):
                 ),
                 GenerateResponse=object,
             ),
+            tokenspeed_encoder_pb2=SimpleNamespace(
+                DESCRIPTOR=SimpleNamespace(
+                    services_by_name={
+                        "TokenSpeedEncoder": SimpleNamespace(full_name="test.TokenSpeedEncoder")
+                    }
+                ),
+            ),
+            tokenspeed_encoder_pb2_grpc=SimpleNamespace(
+                add_TokenSpeedEncoderServicer_to_server=Mock(),
+            ),
+        ),
+        "smg_grpc_servicer.tokenspeed.encoder_servicer": _module(
+            "smg_grpc_servicer.tokenspeed.encoder_servicer",
+            TokenSpeedEncoderServicer=EncoderServicer,
         ),
         "tokenspeed": _module("tokenspeed"),
         "tokenspeed.runtime": _module("tokenspeed.runtime"),
@@ -219,6 +251,57 @@ def test_a_signal_shutdown_still_returns_normally(monkeypatch, server_mod):
     assert asyncio.run(exercise()) is None
     assert _FakeWatch.instances[0].stopped
     assert events == ["server-start", ("server-stop", 5.0)]
+
+
+def _stop_event_of(task):
+    return next(
+        frame.f_locals["stop_event"]
+        for frame in [task.get_coro().cr_frame]
+        if "stop_event" in frame.f_locals
+    )
+
+
+def test_an_encode_worker_shuts_its_encoder_servicer_down(monkeypatch, server_mod, caplog):
+    """In encode mode the servicer is the encoder servicer, whose shutdown takes
+    no drain bound (encode is fire-and-forget): the bound goes to the scheduler
+    servicer only, and the encoder's own tear-down runs on a signal."""
+    events = []
+    server_args = _wire(monkeypatch, server_mod, events)
+    server_args.disaggregation_mode = "encode"
+    caplog.set_level(logging.ERROR)
+    encoder_servicer = sys.modules["smg_grpc_servicer.tokenspeed.encoder_servicer"]
+
+    async def exercise():
+        task = asyncio.create_task(server_mod.serve_grpc(server_args))
+        while "server-start" not in events:
+            await asyncio.sleep(0)
+        _stop_event_of(task).set()
+        return await task
+
+    assert asyncio.run(exercise()) is None
+    encoder = encoder_servicer.TokenSpeedEncoderServicer.instances[-1]
+    assert encoder.shutdown_calls == 1, "the encoder servicer's own tear-down ran"
+    assert "servicer.shutdown() raised" not in caplog.text
+    assert events == ["server-start", ("server-stop", 5.0)]
+
+
+def test_a_generation_worker_hands_its_servicer_the_drain_bound(monkeypatch, server_mod):
+    events = []
+    server_args = _wire(monkeypatch, server_mod, events)
+
+    async def exercise():
+        task = asyncio.create_task(server_mod.serve_grpc(server_args))
+        while "server-start" not in events:
+            await asyncio.sleep(0)
+        _stop_event_of(task).set()
+        return await task
+
+    assert asyncio.run(exercise()) is None
+    servicer_module = sys.modules["smg_grpc_servicer.tokenspeed.servicer"]
+    scheduler_servicer = servicer_module.TokenSpeedSchedulerServicer.instances[-1]
+    scheduler_servicer.shutdown.assert_awaited_once_with(
+        drain_timeout_secs=server_mod.SHUTDOWN_DRAIN_SECS
+    )
 
 
 def test_an_engine_that_exits_during_the_launch_ends_the_process_at_once(

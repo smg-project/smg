@@ -27,10 +27,12 @@ from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
 
 logger = logging.getLogger(__name__)
 
-# The servicer's own shutdown waits for the in-flight requests up to this
-# long (`TokenSpeedSchedulerServicer.shutdown`'s drain bound) before it ends
-# the engine processes; the exit guard's grace covers it, the server's stop
-# (5 s) and the warmup thread's join (5 s) on top of the lifecycle's grace.
+# The scheduler servicer's own shutdown waits for the in-flight requests up
+# to this long (`TokenSpeedSchedulerServicer.shutdown`'s drain bound) before
+# it ends the engine processes; the exit guard's grace covers it, the
+# server's stop (5 s) and the warmup thread's join (5 s) on top of the
+# lifecycle's grace. An encode worker's servicer drains nothing; the same
+# grace serves it as a ceiling (a shorter one would buy nothing).
 SHUTDOWN_DRAIN_SECS = 30.0
 ENGINE_EXIT_GRACE_SECS = EXIT_GRACE_SECS + SHUTDOWN_DRAIN_SECS + 10.0
 
@@ -199,6 +201,9 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         primary_service = tokenspeed_encoder_pb2.DESCRIPTOR.services_by_name[
             "TokenSpeedEncoder"
         ].full_name
+        # Encode is fire-and-forget: the encoder servicer has nothing to drain
+        # and its shutdown takes no bound.
+        servicer_shutdown_kwargs: dict[str, float] = {}
     else:
         servicer = TokenSpeedSchedulerServicer(
             async_llm=async_llm,
@@ -210,6 +215,10 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         primary_service = tokenspeed_scheduler_pb2.DESCRIPTOR.services_by_name[
             "TokenSpeedScheduler"
         ].full_name
+        # The scheduler servicer drains its in-flight requests for up to this
+        # long before it ends the engine processes; the exit guard's grace
+        # covers it.
+        servicer_shutdown_kwargs = {"drain_timeout_secs": SHUTDOWN_DRAIN_SECS}
 
     service_names = (
         primary_service,
@@ -249,7 +258,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         watch.stop()
         logger.info("Shutting down TokenSpeed gRPC server")
         try:
-            await servicer.shutdown(drain_timeout_secs=SHUTDOWN_DRAIN_SECS)
+            await servicer.shutdown(**servicer_shutdown_kwargs)
         except Exception:  # noqa: BLE001
             logger.exception("servicer.shutdown() raised")
         if discovery_servicer is not None:
