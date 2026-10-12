@@ -1400,13 +1400,17 @@ impl WorkerSelectionStage {
         // prefill worker lacks the encoder and whose encoder-bearing one
         // takes no references can never pair the request, and the verdict
         // of the unfiltered pool would be a retryable 503 over healthy
-        // workers.
+        // workers. A pool with no pair that takes the references at all is
+        // not this refusal: the placement's media-references verdict names
+        // that gap, and the fix that applies to it.
+        let takes_refs = |worker: &dyn Worker| !demand.refs || accepts_media_refs(worker);
         if demand.prefill
             && !pairs.prefill_pool.is_empty()
             && !pairs.decode_pool.is_empty()
             && pairs.refusal.is_none()
+            && pair_admitted_by(&pairs, wire, &takes_refs)
             && !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
-                prefill_vision_capable(worker) && (!demand.refs || accepts_media_refs(worker))
+                prefill_vision_capable(worker) && takes_refs(worker)
             })
         {
             return Err(PdSelectionFailure::NoVisionCapablePrefill);
@@ -3270,6 +3274,55 @@ mod tests {
         assert_ne!(
             error::extract_error_code_from_response(&response),
             "no_media_ref_capable_worker"
+        );
+    }
+
+    /// With the demand an image reference builds, a pool with no pair that
+    /// takes the references keeps the placement's media-references verdict
+    /// (its message names the fix that applies), not the vision refusal:
+    /// every worker here may have the encoder.
+    #[test]
+    fn media_refs_with_no_pair_that_takes_them_keep_the_media_refs_verdict() {
+        let model_id = "test-model-media-refs-pd-vision";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, refs) in [
+            ("grpc://127.0.0.1:8740", WorkerType::Prefill, false),
+            ("grpc://127.0.0.1:8741", WorkerType::Prefill, true),
+            ("grpc://127.0.0.1:8750", WorkerType::Decode, false),
+        ] {
+            worker_registry
+                .register(vllm_grpc_worker(url, model_id, worker_type, refs))
+                .unwrap();
+        }
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry
+            .set_prefill_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        policy_registry
+            .set_decode_policy(PolicyFactory::create_from_config(&PolicyConfig::RoundRobin));
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&worker_registry),
+            Arc::clone(&policy_registry),
+            WorkerSelectionMode::PrefillDecode,
+            None,
+        );
+
+        let response = stage
+            .select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(ACCEPTS_MEDIA_REFS),
+                    ..Default::default()
+                },
+                None,
+                None,
+                VisionDemand::new(true, true).with_media_refs(true),
+            )
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+            .expect_err("no pair takes the references");
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_media_ref_capable_worker",
+            "the media-references verdict, not the vision refusal"
         );
     }
 
