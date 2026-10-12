@@ -27,7 +27,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Instrument, Spa
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::{
-    metrics::{matched_path_label, CLIENT_CLOSED_REQUEST_STATUS},
+    metrics::{declared_body_length, matched_path_label, CLIENT_CLOSED_REQUEST_STATUS},
     request_id::RequestId,
 };
 use crate::observability::{
@@ -310,12 +310,15 @@ where
             };
             ResponseLogger.on_response(&response, start.elapsed(), &span);
             close_log.head_sent();
+            let declared = declared_body_length(&response);
             Ok(response.map(|body| {
                 Body::new(SpannedBody {
                     inner: body,
                     span,
                     close_log,
                     polled: false,
+                    declared,
+                    sent: 0,
                 })
             }))
         })
@@ -327,7 +330,10 @@ where
 /// a proxy cutting an idle stream) is a normal outcome, which the metrics
 /// layer counts as status 499; nothing on the gateway's side failed. Logged
 /// when the request's future is dropped before the handler answered, or when
-/// the response body is dropped before its end.
+/// the response body is dropped before its end (its last frame, or the length
+/// the response declared). The rare request the server dropped itself (a
+/// handler panic, a forced shutdown) gets the same line: from here the two
+/// are one event.
 struct ClientCloseLog {
     span: Span,
     start: Instant,
@@ -407,6 +413,11 @@ struct SpannedBody {
     /// one the server never meant to send (the answer to a HEAD request), not
     /// one the client cut short.
     polled: bool,
+    /// The length the response declared for its body, and the data bytes out
+    /// so far: once they add up the body has gone out in full (an HTTP/1.1
+    /// server asks for no more after that).
+    declared: Option<u64>,
+    sent: u64,
 }
 
 impl http_body::Body for SpannedBody {
@@ -430,10 +441,18 @@ impl http_body::Body for SpannedBody {
                 this.close_log.done();
             }
             Poll::Ready(None) => this.close_log.done(),
-            Poll::Ready(Some(Ok(_))) if http_body::Body::is_end_stream(&this.inner) => {
-                this.close_log.done();
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.sent = this.sent.saturating_add(data.len() as u64);
+                }
+                // At its end: the last frame, or the declared length out.
+                if http_body::Body::is_end_stream(&this.inner)
+                    || this.declared.is_some_and(|declared| this.sent >= declared)
+                {
+                    this.close_log.done();
+                }
             }
-            _ => {}
+            Poll::Pending => {}
         }
         poll
     }
@@ -611,6 +630,7 @@ mod client_closed_tests {
         routing::get,
         Router,
     };
+    use http::header::CONTENT_LENGTH;
     use http_body_util::BodyExt;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
@@ -694,6 +714,56 @@ mod client_closed_tests {
                 }),
             )
             .layer(create_logging_layer())
+    }
+
+    /// `/relay` answers with `body` under a `Content-Length` of nine bytes,
+    /// as the HTTP relay answers an upstream that declared one.
+    fn relay_app(body: Body) -> Router {
+        let slot = Arc::new(Mutex::new(Some(body)));
+        Router::new()
+            .route(
+                "/relay",
+                get(move || {
+                    let body = slot
+                        .lock()
+                        .expect("slot")
+                        .take()
+                        .expect("handler called once");
+                    async move {
+                        Response::builder()
+                            .header(CONTENT_LENGTH, 9)
+                            .body(body)
+                            .expect("response")
+                    }
+                }),
+            )
+            .layer(create_logging_layer())
+    }
+
+    #[tokio::test]
+    async fn a_body_under_a_content_length_dropped_after_its_declared_bytes_logs_no_client_close() {
+        // On HTTP/1.1 the server stops asking for frames once the declared
+        // bytes are out and drops the body: sent in full, not a client that
+        // left.
+        let sink = ResponseLines::default();
+        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+        let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
+            .oneshot(request("/relay"))
+            .await
+            .expect("response");
+        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
+            .await
+            .expect("send");
+        let mut body = response.into_body();
+        let frame = body.frame().await.expect("one frame").expect("frame ok");
+        assert_eq!(frame.data_ref().map(Bytes::len), Some(9));
+        drop(body);
+        drop(tx);
+        assert_eq!(
+            sink.lines(),
+            vec![line(Level::INFO, "finished processing request")]
+        );
     }
 
     #[tokio::test]

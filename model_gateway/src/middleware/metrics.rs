@@ -12,6 +12,15 @@
 //! its body was still streaming. Counted at the head, a stream the client
 //! cut was a 200 and a request the client abandoned before its answer was
 //! nothing at all.
+//!
+//! A body has gone out in full at its last frame, or once its data frames
+//! add up to the length the response declared (`Content-Length`): an
+//! HTTP/1.1 server writes that many bytes and asks for no more, so a relayed
+//! upstream answer that declared its length is never polled for its trailing
+//! end. The 499 also covers the rare request the server itself dropped
+//! before it answered: a handler that panicked (the edge stack catches no
+//! panic) and a connection cut by a forced shutdown after the drain timeout
+//! look the same from here, a request's future dropped without a response.
 
 use std::{
     pin::Pin,
@@ -58,6 +67,18 @@ pub(crate) fn error_code_label(response: &Response) -> &str {
 /// names the outcome on the same sample.
 pub const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
 pub const CLIENT_CLOSED_REQUEST_CODE: &str = "client_closed_request";
+
+/// The length a response declares for its body: its `Content-Length`, or
+/// else what the body itself knows exactly. An HTTP/1.1 server writes that
+/// many bytes and stops asking for frames, so a body that has sent them has
+/// gone out in full whether or not its trailing `None` is ever polled.
+pub(super) fn declared_body_length(response: &Response) -> Option<u64> {
+    response
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()?.trim().parse().ok())
+        .or_else(|| response.body().size_hint().exact())
+}
 
 /// Tower Layer for HTTP metrics collection (SMG Layer 1 metrics)
 #[derive(Clone)]
@@ -141,12 +162,14 @@ where
             // The outcome rides along: the response counts when its body
             // ends, and as a client-closed request when the body is dropped
             // before that.
+            let declared = declared_body_length(&response);
             let (parts, body) = response.into_parts();
             let body = Body::new(TrackedBody::new(
                 body,
                 guard,
                 in_flight_request_tracker,
                 outcome,
+                declared,
             ));
             Ok(Response::from_parts(parts, body))
         })
@@ -212,7 +235,8 @@ impl Drop for ResponseOutcome {
     fn drop(&mut self) {
         // Still pending at drop: the request's future went away before the
         // handler answered, which is what the server does with a request
-        // whose client closed the connection.
+        // whose client closed the connection (and, rarely, with one whose
+        // handler panicked or that a forced shutdown cut: the module doc).
         self.client_closed();
     }
 }
@@ -234,6 +258,12 @@ struct TrackedBody {
     /// one the server never meant to send (the answer to a HEAD request), not
     /// one the client cut short.
     polled: bool,
+    /// The length the response declared for its body, and the data bytes out
+    /// so far: once they add up the body has gone out in full, whether or
+    /// not it is ever polled for its trailing `None` (an HTTP/1.1 server
+    /// stops at the declared length).
+    declared: Option<u64>,
+    sent: u64,
 }
 
 impl TrackedBody {
@@ -242,6 +272,7 @@ impl TrackedBody {
         guard: InFlightGuard,
         tracker: Arc<InFlightRequestTracker>,
         outcome: ResponseOutcome,
+        declared: Option<u64>,
     ) -> Self {
         let mut body = Self {
             inner,
@@ -249,6 +280,8 @@ impl TrackedBody {
             tracker,
             outcome,
             polled: false,
+            declared,
+            sent: 0,
         };
         // An already-complete body (e.g. an empty unary response) may never be
         // polled at all; do not retain the guard past construction for it,
@@ -273,6 +306,12 @@ impl TrackedBody {
         self.release();
         self.outcome.completed();
     }
+
+    /// Whether the data frames so far add up to the length the response
+    /// declared for its body.
+    fn declared_length_sent(&self) -> bool {
+        self.declared.is_some_and(|declared| self.sent >= declared)
+    }
 }
 
 impl http_body::Body for TrackedBody {
@@ -287,14 +326,23 @@ impl http_body::Body for TrackedBody {
         this.polled = true;
         let poll = Pin::new(&mut this.inner).poll_frame(cx);
         // Release as soon as the end of the stream is knowable: at the
-        // trailing None, on error, or right after a successful final frame
-        // when the inner body reports end-of-stream - per the http_body
-        // contract, consumers may stop polling at that point and never ask
-        // for the None. Drop still covers client disconnect.
+        // trailing None, on error, right after a successful final frame
+        // when the body reports is_end_stream(), or once the data frames add
+        // up to the length the response declared. Under the http_body
+        // contract, consumers may stop polling at those points and never ask
+        // for the None (an HTTP/1.1 server stops at the declared length).
+        // Drop still covers client disconnect.
         match &poll {
             Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.ended(),
-            Poll::Ready(Some(Ok(_))) if this.inner.is_end_stream() => this.ended(),
-            _ => {}
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.sent = this.sent.saturating_add(data.len() as u64);
+                }
+                if this.inner.is_end_stream() || this.declared_length_sent() {
+                    this.ended();
+                }
+            }
+            Poll::Pending => {}
         }
         poll
     }
@@ -710,6 +758,7 @@ mod client_closed_tests {
         routing::get,
         Router,
     };
+    use http::header::CONTENT_LENGTH;
     use http_body_util::BodyExt;
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
     use tokio::sync::mpsc;
@@ -822,6 +871,67 @@ mod client_closed_tests {
                 }),
             )
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
+    }
+
+    /// A router whose `/relay` handler answers `status` with `body` under a
+    /// `Content-Length` of `length`, as the HTTP relay answers an upstream
+    /// that declared one.
+    fn relay_app(status: u16, length: u64, body: Body) -> Router {
+        let slot = Arc::new(Mutex::new(Some(body)));
+        Router::new()
+            .route(
+                "/relay",
+                get(move || {
+                    let body = slot
+                        .lock()
+                        .expect("slot")
+                        .take()
+                        .expect("handler called once");
+                    async move {
+                        Response::builder()
+                            .status(status)
+                            .header(CONTENT_LENGTH, length)
+                            .body(body)
+                            .expect("response")
+                    }
+                }),
+            )
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
+    }
+
+    #[test]
+    fn a_body_under_a_content_length_counts_as_the_response_once_its_declared_bytes_are_out() {
+        // A relayed upstream answer that declared its length: on HTTP/1.1
+        // the server writes the declared bytes and stops asking for frames,
+        // dropping the body before its trailing None. Sent in full, it counts
+        // as its head's status, once the last declared byte is out.
+        let rendered = render(|handle| async move {
+            let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
+            let app = relay_app(503, 12, Body::from_stream(ReceiverStream::new(rx)));
+            let response = app.oneshot(request("/relay")).await.expect("response");
+            assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            let mut body = response.into_body();
+            tx.send(Ok(Bytes::from_static(b"{\"error\":")))
+                .await
+                .expect("send");
+            let frame = body.frame().await.expect("a frame").expect("frame ok");
+            assert_eq!(frame.data_ref().map(Bytes::len), Some(9));
+            // Nine of the twelve bytes out: the response is still being sent.
+            assert!(responses(&handle.render(), "/relay").is_empty());
+            tx.send(Ok(Bytes::from_static(b"{}}"))).await.expect("send");
+            let frame = body.frame().await.expect("a frame").expect("frame ok");
+            assert_eq!(frame.data_ref().map(Bytes::len), Some(3));
+            // The declared bytes are out: the server drops the body here,
+            // without asking for the stream's end.
+            assert_eq!(responses(&handle.render(), "/relay"), sample("503", ""));
+            drop(body);
+            drop(tx);
+        });
+        assert_eq!(
+            responses(&rendered, "/relay"),
+            sample("503", ""),
+            "{rendered}"
+        );
     }
 
     #[test]
