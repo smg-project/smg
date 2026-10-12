@@ -28,7 +28,7 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
-from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
+from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit, guarded_exit
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, serve_rust, servicer_impl_source
@@ -178,7 +178,7 @@ async def serve_grpc(
         # failed start: there is no engine to serve, so the servicer exits
         # (code 1) instead of waiting on it, and says why without a traceback.
         logger.error("The scheduler process(es) did not start: %s", error)
-        raise SystemExit(1) from None
+        raise guarded_exit(1) from None
 
     server = None
     health_servicer = None
@@ -446,7 +446,7 @@ async def serve_grpc(
         # servicer exits with it, non-zero, so an orchestrator restarts the pod
         # instead of keeping a worker that can no longer serve.
         logger.error("A scheduler process exited on its own; the servicer exits with code 1")
-        raise SystemExit(1)
+        raise guarded_exit(1)
 
 
 def _execute_grpc_server_warmup(server_args: ServerArgs):

@@ -110,6 +110,9 @@ def server_mod(monkeypatch):
     spec = importlib.util.spec_from_file_location("test_sglang_grpc_server", module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    # The exit over a dead engine without its guard: the guard would end the
+    # test process after its grace.
+    monkeypatch.setattr(module, "guarded_exit", lambda code, **_kwargs: SystemExit(code))
     return module
 
 

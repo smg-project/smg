@@ -251,6 +251,31 @@ def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger)
     return SystemExit(CONFIG_ERROR_EXIT_CODE)
 
 
+# How long a servicer that decided to exit over its engine may spend in the
+# interpreter's shutdown before the process is ended anyway.
+EXIT_GRACE_SECS = 15.0
+
+
+def _end_process(code: int) -> None:
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    os._exit(code)
+
+
+def guarded_exit(code: int, *, grace_secs: float = EXIT_GRACE_SECS) -> SystemExit:
+    """The ``SystemExit`` a Python servicer raises to end over its engine
+    (the engine died, or never started), with a guard: the orderly exit runs
+    first (the launcher's own clean-up, the interpreter's shutdown), and
+    should that shutdown hang (a thread that never joins, a messaging context
+    waiting on an unclosed socket: a servicer was seen stuck there for
+    minutes with its engine already gone), a daemon timer ends the process
+    with ``code`` after ``grace_secs``."""
+    timer = threading.Timer(grace_secs, _end_process, args=(code,))
+    timer.daemon = True
+    timer.start()
+    return SystemExit(code)
+
+
 class EngineProcess:
     """A ``Popen``-shaped view of the spawned headless-engine process, so the
     lifecycle loop and :func:`terminate_engine` need no second code path.

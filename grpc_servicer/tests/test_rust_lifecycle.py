@@ -553,3 +553,22 @@ def test_configuration_exit_is_one_error_line_and_exit_code_2(caplog):
     assert isinstance(exit_, SystemExit)
     assert exit_.code == rust_lifecycle.CONFIG_ERROR_EXIT_CODE == 2
     assert "servicer configuration error: X_DRAIN='abc' is not a number" in caplog.text
+
+
+def test_guarded_exit_ends_a_hung_shutdown_after_the_grace(monkeypatch):
+    """The exit over a dead engine is a normal SystemExit first; a shutdown
+    that hangs past the grace is ended by the guard with the same code."""
+    ended = threading.Event()
+    codes: list[int] = []
+
+    def end_process(code: int) -> None:
+        codes.append(code)
+        ended.set()
+
+    monkeypatch.setattr(rust_lifecycle, "_end_process", end_process)
+    exit_ = rust_lifecycle.guarded_exit(1, grace_secs=0.05)
+    assert isinstance(exit_, SystemExit) and exit_.code == 1
+    assert ended.wait(5.0) and codes == [1]
+    # The guard is a daemon timer: it never keeps a finished interpreter alive.
+    guard = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+    assert all(t.daemon for t in guard)

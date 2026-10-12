@@ -18,6 +18,7 @@ from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
+from smg_grpc_servicer.rust_lifecycle import guarded_exit
 from smg_grpc_servicer.tokenspeed import engine_watchdog
 from smg_grpc_servicer.tokenspeed.engine_watchdog import EngineProcessWatch
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
@@ -128,7 +129,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     except RuntimeError as error:
         watch.stop()
         logger.error("The TokenSpeed engine did not start: %s", error)
-        raise SystemExit(1) from None
+        raise guarded_exit(1) from None
     launched.set()
 
     max_message_bytes = _grpc_max_message_bytes()
@@ -247,7 +248,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         # so an orchestrator restarts the pod instead of keeping a worker that
         # can no longer serve.
         logger.error("The TokenSpeed engine exited on its own; the servicer exits with code 1")
-        raise SystemExit(1)
+        raise guarded_exit(1)
 
 
 def _wait_and_warmup(
