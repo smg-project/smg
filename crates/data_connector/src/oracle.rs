@@ -573,13 +573,14 @@ impl OracleConversationItemStorage {
 
         if exists_items == 0 {
             let mut col_defs = vec![format!("{} VARCHAR2(64) PRIMARY KEY", si.col("id"))];
-            let item_core_cols: [(&str, &str); 6] = [
+            let item_core_cols: [(&str, &str); 7] = [
                 ("response_id", "VARCHAR2(64)"),
                 ("item_type", "VARCHAR2(32) NOT NULL"),
                 ("role", "VARCHAR2(32)"),
                 ("content", "CLOB"),
                 ("status", "VARCHAR2(32)"),
                 ("created_at", "TIMESTAMP WITH TIME ZONE"),
+                ("tenant", "VARCHAR2(255)"),
             ];
             for (logical, sql_type) in &item_core_cols {
                 if !si.is_skipped(logical) {
@@ -656,6 +657,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             role,
             content,
             status,
+            tenant,
         } = item;
         let id = opt_id.unwrap_or_else(|| make_item_id(&item_type));
         let created_at = Utc::now();
@@ -666,6 +668,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
         let cl_item_type = item_type.clone();
         let cl_role = role.clone();
         let cl_status = status.clone();
+        let cl_tenant = tenant.clone();
         let schema = self.store.schema.clone();
         let hook_extra = current_extra_columns().unwrap_or_default();
 
@@ -700,6 +703,10 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     columns.push(si.col("created_at"));
                     params.push(&created_at);
                 }
+                if !si.is_skipped("tenant") {
+                    columns.push(si.col("tenant"));
+                    params.push(&cl_tenant);
+                }
 
                 // Append extra columns from hooks or defaults
                 let extra_cols: Vec<(&str, Option<String>)> =
@@ -730,6 +737,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             content,
             status,
             created_at,
+            tenant,
         })
     }
 
@@ -888,6 +896,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                         "content",
                         "status",
                         "created_at",
+                        "tenant",
                     ] {
                         if !si.is_skipped(field) {
                             select_cols.push(format!("i.{}", si.col(field)));
@@ -981,6 +990,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     "content",
                     "status",
                     "created_at",
+                    "tenant",
                 ] {
                     if !si.is_skipped(field) {
                         select_cols.push(si.col(field).to_string());
@@ -1105,6 +1115,11 @@ fn build_item_from_oracle_row(
     } else {
         row.get(si.col("created_at")).map_err(map_oracle_error)?
     };
+    let tenant: Option<String> = if si.is_skipped("tenant") {
+        None
+    } else {
+        row.get(si.col("tenant")).map_err(map_oracle_error)?
+    };
 
     Ok(ConversationItem {
         id: ConversationItemId(id),
@@ -1114,6 +1129,7 @@ fn build_item_from_oracle_row(
         content,
         status,
         created_at,
+        tenant,
     })
 }
 

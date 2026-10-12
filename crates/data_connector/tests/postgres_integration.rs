@@ -285,6 +285,7 @@ async fn conversation_item_content_round_trips_json_column() {
             role: Some("user".to_string()),
             content: content.clone(),
             status: Some("completed".to_string()),
+            tenant: None,
         })
         .await
         .expect("create_item");
@@ -741,6 +742,7 @@ async fn conversation_items_linked_a_microsecond_apart_list_in_link_order() {
                 role: Some("user".to_string()),
                 content: json!([]),
                 status: Some("completed".to_string()),
+                tenant: None,
             })
             .await
             .expect("create item");
@@ -818,6 +820,7 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
             role: Some("user".to_string()),
             content: json!([]),
             status: Some("completed".to_string()),
+            tenant: None,
         })
         .await
         .expect("create item");

@@ -301,6 +301,7 @@ fn core_columns_for(label: &str) -> &'static [&'static str] {
             "content",
             "status",
             "created_at",
+            "tenant",
         ],
         "conversation_item_links" => &["conversation_id", "item_id", "added_at"],
         _ => &[],

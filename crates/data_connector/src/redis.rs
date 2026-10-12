@@ -416,6 +416,11 @@ impl RedisConversationItemStorage {
                     ))
                 })?
         };
+        let tenant = if si.is_skipped("tenant") {
+            None
+        } else {
+            map.get(si.col("tenant")).cloned()
+        };
 
         Ok(ConversationItem {
             id,
@@ -425,6 +430,7 @@ impl RedisConversationItemStorage {
             content,
             status,
             created_at,
+            tenant,
         })
     }
 }
@@ -450,6 +456,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             role,
             content,
             status,
+            tenant,
         } = item;
         let id = opt_id.unwrap_or_else(|| make_item_id(&item_type));
         let created_at = Utc::now();
@@ -463,6 +470,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             content,
             status,
             created_at,
+            tenant,
         };
 
         let si = &self.store.schema.conversation_items;
@@ -502,6 +510,11 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         }
         if !si.is_skipped("created_at") {
             pipe.hset(&key, si.col("created_at"), created_at.to_rfc3339());
+        }
+        if !si.is_skipped("tenant") {
+            if let Some(tenant) = &conversation_item.tenant {
+                pipe.hset(&key, si.col("tenant"), tenant);
+            }
         }
 
         // Append extra columns from hooks or defaults
@@ -892,15 +905,16 @@ impl RedisResponseStorage {
     }
 
     /// The responses stored under `response_ids`, in that order, those the
-    /// caller's `tenant` may see.
+    /// caller's `tenant` may see; with them the ids whose hash is gone (the
+    /// retention took it), which belong in no index any more.
     async fn visible_responses(
         &self,
         conn: &mut Connection,
         response_ids: &[String],
         tenant: Option<&str>,
-    ) -> ResponseResult<Vec<StoredResponse>> {
+    ) -> ResponseResult<(Vec<StoredResponse>, Vec<String>)> {
         if response_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut pipe = redis::pipe();
         for id in response_ids {
@@ -912,8 +926,10 @@ impl RedisResponseStorage {
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
 
         let mut out: Vec<StoredResponse> = Vec::with_capacity(results.len());
+        let mut gone: Vec<String> = Vec::new();
         for (i, map) in results.into_iter().enumerate() {
             if map.is_empty() {
+                gone.push(response_ids[i].clone());
                 continue;
             }
             let response = self.build_response_from_map(map, &response_ids[i])?;
@@ -921,7 +937,7 @@ impl RedisResponseStorage {
                 out.push(response);
             }
         }
-        Ok(out)
+        Ok((out, gone))
     }
 }
 
@@ -1184,9 +1200,15 @@ impl ResponseStorage for RedisResponseStorage {
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
 
-        let mut out = self
+        let (mut out, gone) = self
             .visible_responses(&mut conn, &response_ids, tenant)
             .await?;
+        // The ids whose hash the retention took leave the index here.
+        if !gone.is_empty() {
+            conn.zrem::<_, _, ()>(&key, &gone)
+                .await
+                .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        }
         if let Some(limit) = limit {
             out.truncate(limit);
         }
@@ -1220,15 +1242,18 @@ impl ResponseStorage for RedisResponseStorage {
         }
 
         // Only the records the caller may see go; the others keep their
-        // place in the index.
-        let visible_ids: Vec<String> = self
+        // place in the index; the ids whose hash is already gone leave it too.
+        let (visible, gone) = self
             .visible_responses(&mut conn, &response_ids, tenant)
-            .await?
-            .into_iter()
-            .map(|response| response.id.0)
-            .collect();
+            .await?;
+        let visible_ids: Vec<String> = visible.into_iter().map(|response| response.id.0).collect();
         let count = visible_ids.len();
         if count == 0 {
+            if !gone.is_empty() {
+                conn.zrem::<_, _, ()>(&key, &gone)
+                    .await
+                    .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            }
             return Ok(0);
         }
 
@@ -1246,7 +1271,9 @@ impl ResponseStorage for RedisResponseStorage {
             pipe.del(item_key);
         }
         // An index left empty goes with its last member.
-        pipe.zrem(&key, &visible_ids);
+        let mut leaving = visible_ids;
+        leaving.extend(gone);
+        pipe.zrem(&key, &leaving);
 
         pipe.query_async::<()>(&mut conn)
             .await

@@ -166,6 +166,7 @@ async fn a_second_link_of_an_item_moves_it_and_the_item_lists_once() {
                 role: Some("user".to_string()),
                 content: json!([]),
                 status: Some("completed".to_string()),
+                tenant: None,
             })
             .await
             .expect("create item");

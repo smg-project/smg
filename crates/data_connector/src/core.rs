@@ -234,6 +234,21 @@ pub struct ConversationItem {
     pub content: Value,
     pub status: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// The tenant the item is scoped to: the identity the gateway resolved
+    /// for the request that created it (a conversation write, a stored
+    /// response), when it resolved one. An item is referenced by id (an
+    /// `item_reference`, an item added under its own id) only by its tenant;
+    /// one stored under none is served as before (see [`tenant_scope_allows`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+}
+
+impl ConversationItem {
+    /// Whether a caller the gateway resolved `tenant` for may reference or
+    /// adopt this item by its id (see [`tenant_scope_allows`]).
+    pub fn is_visible_to(&self, tenant: Option<&str>) -> bool {
+        tenant_scope_allows(self.tenant.as_deref(), tenant)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +260,9 @@ pub struct NewConversationItem {
     pub role: Option<String>,
     pub content: Value,
     pub status: Option<String>,
+    /// The tenant the item is scoped to (see [`ConversationItem::tenant`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

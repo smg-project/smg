@@ -24,7 +24,7 @@ const POSTGRES_V3: Migration = Migration {
 };
 const POSTGRES_V4: Migration = Migration {
     version: 4,
-    description: "Add tenant column to responses and conversations",
+    description: "Add tenant column to responses, conversations and conversation items",
     up: pg_v4_up,
 };
 
@@ -97,19 +97,23 @@ fn pg_v3_up(schema: &SchemaConfig) -> Vec<String> {
     vec![format!("ALTER TABLE {table} {}", cols_to_drop.join(", "))]
 }
 
-/// The nullable `tenant` column of responses and conversations: the tenant a
-/// record is scoped to. Rows from before the column stay NULL and are served
-/// to every caller, as they were.
+/// The nullable `tenant` column of responses, conversations and conversation
+/// items: the tenant a record is scoped to. Rows from before the column stay
+/// NULL and are served to every caller, as they were.
 fn pg_v4_up(schema: &SchemaConfig) -> Vec<String> {
-    [&schema.responses, &schema.conversations]
-        .into_iter()
-        .filter(|s| !s.is_skipped("tenant"))
-        .map(|s| {
-            let table = s.qualified_table(schema.owner.as_deref());
-            let col = s.col("tenant");
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} VARCHAR(255)")
-        })
-        .collect()
+    [
+        &schema.responses,
+        &schema.conversations,
+        &schema.conversation_items,
+    ]
+    .into_iter()
+    .filter(|s| !s.is_skipped("tenant"))
+    .map(|s| {
+        let table = s.qualified_table(schema.owner.as_deref());
+        let col = s.col("tenant");
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} VARCHAR(255)")
+    })
+    .collect()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -206,6 +210,7 @@ mod tests {
             vec![
                 "ALTER TABLE responses ADD COLUMN IF NOT EXISTS tenant VARCHAR(255)",
                 "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tenant VARCHAR(255)",
+                "ALTER TABLE conversation_items ADD COLUMN IF NOT EXISTS tenant VARCHAR(255)",
             ]
         );
         // A mapped column name and a skipped table are respected.
@@ -221,7 +226,10 @@ mod tests {
         let stmts = pg_v4_up(&schema);
         assert_eq!(
             stmts,
-            vec!["ALTER TABLE responses ADD COLUMN IF NOT EXISTS tenant_key VARCHAR(255)"]
+            vec![
+                "ALTER TABLE responses ADD COLUMN IF NOT EXISTS tenant_key VARCHAR(255)",
+                "ALTER TABLE conversation_items ADD COLUMN IF NOT EXISTS tenant VARCHAR(255)",
+            ]
         );
     }
 

@@ -285,6 +285,53 @@ async fn another_tenant_cannot_read_continue_write_into_or_delete_stored_state()
             );
         }
     }
+    // Tenant b's own conversation cannot take a's item either: an
+    // `item_reference` to it is as unknown as a missing id, and an item
+    // arriving under a's item id is refused rather than served or overwritten.
+    let (status, own) = call(
+        &app,
+        Method::POST,
+        "/v1/conversations",
+        Some("tenant-b"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{own}");
+    let conv_b = own["id"].as_str().expect("b's conversation").to_string();
+    let (status, answer) = call(
+        &app,
+        Method::POST,
+        &format!("/v1/conversations/{conv_b}/items"),
+        Some("tenant-b"),
+        Some(json!({"items": [{"type": "item_reference", "id": item_id}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    assert_eq!(answer["error"]["code"], "not_found", "{answer}");
+    let (status, answer) = call(
+        &app,
+        Method::POST,
+        &format!("/v1/conversations/{conv_b}/items"),
+        Some("tenant-b"),
+        Some(json!({"items": [{"type": "message", "id": item_id, "role": "user", "content": "mine now"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    let (status, listed) = call(
+        &app,
+        Method::GET,
+        &format!("/v1/conversations/{conv_b}/items"),
+        Some("tenant-b"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(
+        listed["data"].as_array().map(Vec::len),
+        Some(0),
+        "nothing of a's reached b's conversation: {listed}"
+    );
+
     // The refusal is the answer an unknown id gets.
     let (status, unknown) = call(
         &app,

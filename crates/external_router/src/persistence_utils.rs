@@ -340,6 +340,7 @@ fn item_to_new_conversation_item(
     item_value: &Value,
     response_id: Option<String>,
     _is_input: bool,
+    tenant: Option<&str>,
 ) -> NewConversationItem {
     let item_type = item_value
         .get("type")
@@ -381,16 +382,19 @@ fn item_to_new_conversation_item(
             .get("status")
             .and_then(|v| v.as_str())
             .map(String::from),
+        tenant: tenant.map(str::to_string),
     }
 }
 
-/// Link all input and output items to a conversation
+/// Link all input and output items to a conversation; the items carry the
+/// caller's `tenant`.
 async fn link_items_to_conversation(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &ConversationId,
     input_items: &[Value],
     output_items: &[Value],
     response_id: &str,
+    tenant: Option<&str>,
 ) -> Result<(), String> {
     let response_id_opt = Some(response_id.to_string());
     // The inputs, then the outputs, each stamped later than the one before: the conversation
@@ -398,7 +402,7 @@ async fn link_items_to_conversation(
     let mut stamps = AddedAtSequence::new();
 
     for item in input_items {
-        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), true);
+        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), true, tenant);
         create_and_link_item(
             item_storage,
             Some(conv_id),
@@ -409,7 +413,7 @@ async fn link_items_to_conversation(
     }
 
     for item in output_items {
-        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), false);
+        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), false, tenant);
         create_and_link_item(
             item_storage,
             Some(conv_id),
@@ -600,6 +604,7 @@ async fn persist_conversation_items_inner(
             &input_items,
             &output_items,
             &response_id_str,
+            tenant,
         )
         .await
         .map_err(|e| PersistError::new(PersistStep::Linking, false, e))?;
@@ -637,6 +642,7 @@ mod tests {
             content,
             status: Some("completed".to_string()),
             created_at: Utc::now(),
+            tenant: None,
         }
     }
 
@@ -680,7 +686,8 @@ mod tests {
             "revised_prompt": "cat",
         });
 
-        let new_item = item_to_new_conversation_item(&input_item, None, /* is_input */ true);
+        let new_item =
+            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
         assert_eq!(new_item.item_type, "image_generation_call");
         assert_eq!(
             new_item
@@ -705,7 +712,8 @@ mod tests {
             "status": "completed",
         });
 
-        let new_item = item_to_new_conversation_item(&input_item, None, /* is_input */ true);
+        let new_item =
+            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
         assert_eq!(new_item.item_type, "message");
         assert_eq!(
             new_item.content,

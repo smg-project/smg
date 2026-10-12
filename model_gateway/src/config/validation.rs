@@ -387,6 +387,17 @@ impl ConfigValidator {
                     ),
                 });
             }
+            // The canonical key is stored with every response and
+            // conversation, in a 255-character column on the SQL backends.
+            if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "tenant_api_keys tenant_id '{}' is longer than {} characters",
+                        entry.tenant_id,
+                        crate::tenant::MAX_TENANT_ID_LEN
+                    ),
+                });
+            }
             let trimmed_key = entry.key.trim();
             if trimmed_key.is_empty() {
                 return Err(ConfigError::ValidationFailed {

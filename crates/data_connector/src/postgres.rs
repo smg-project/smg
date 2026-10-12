@@ -579,13 +579,14 @@ impl PostgresConversationItemStorage {
 
         // ── conversation_items DDL ──
         let mut item_col_defs = vec![format!("{} VARCHAR(64) PRIMARY KEY", si.col("id"))];
-        let item_core_cols: [(&str, &str); 6] = [
+        let item_core_cols: [(&str, &str); 7] = [
             ("response_id", "VARCHAR(64)"),
             ("item_type", "VARCHAR(32) NOT NULL"),
             ("role", "VARCHAR(32)"),
             ("content", "JSON"),
             ("status", "VARCHAR(32)"),
             ("created_at", "TIMESTAMPTZ"),
+            ("tenant", "VARCHAR(255)"),
         ];
         for (logical, sql_type) in &item_core_cols {
             if !si.is_skipped(logical) {
@@ -644,6 +645,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             role,
             content,
             status,
+            tenant,
         } = item;
         let id = opt_id.unwrap_or_else(|| make_item_id(&item_type));
         let created_at = Utc::now();
@@ -681,6 +683,10 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             col_names.push(si.col("created_at"));
             params.push(&created_at);
         }
+        if !si.is_skipped("tenant") {
+            col_names.push(si.col("tenant"));
+            params.push(&tenant);
+        }
 
         // Append extra columns from hooks or defaults
         let hook_extra = current_extra_columns().unwrap_or_default();
@@ -716,6 +722,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             content,
             status,
             created_at,
+            tenant,
         })
     }
 
@@ -816,6 +823,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             "content",
             "status",
             "created_at",
+            "tenant",
         ] {
             if !si.is_skipped(field) {
                 select_cols.push(format!("i.{}", si.col(field)));
@@ -891,6 +899,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             "content",
             "status",
             "created_at",
+            "tenant",
         ] {
             if !si.is_skipped(field) {
                 select_cols.push(si.col(field).to_string());
@@ -1022,6 +1031,11 @@ fn build_item_from_row(
     } else {
         row.get(si.col("created_at"))
     };
+    let tenant: Option<String> = if si.is_skipped("tenant") {
+        None
+    } else {
+        row.get(si.col("tenant"))
+    };
 
     Ok(ConversationItem {
         id: ConversationItemId(id),
@@ -1031,6 +1045,7 @@ fn build_item_from_row(
         content,
         status,
         created_at,
+        tenant,
     })
 }
 

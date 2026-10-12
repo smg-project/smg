@@ -375,7 +375,10 @@ Redis). The rule, `tenant_scope_allows`, is the same for both record types:
   served to every caller, as before.
 
 The listing and the deletion by `safety_identifier` take the caller's tenant
-and apply the same rule in the store's own query.
+and apply the same rule in the store's own query. Conversation items carry the
+tenant as well: an existing item is referenced (`item_reference`) or added
+under its own id only by its tenant. The gateway bounds a tenant id to 200
+characters, so the canonical key fits the column.
 
 ## ID Generation
 

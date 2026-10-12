@@ -391,7 +391,7 @@ pub async fn create_conversation_items(
 
     for item_val in items_array {
         let added_at = stamps.next_added_at();
-        match process_item(item_storage, &conversation_id, item_val, added_at).await {
+        match process_item(item_storage, &conversation_id, item_val, added_at, tenant).await {
             Ok((item_json, item_id, warning)) => {
                 if seen_ids.insert(item_id.0.clone()) {
                     link_pairs.push((item_id, added_at));
@@ -428,12 +428,15 @@ pub async fn create_conversation_items(
 }
 
 /// Process a single item for creation. Returns (json, item_id, warning).
-/// Linking is deferred to the caller for batch operation.
+/// Linking is deferred to the caller for batch operation. An item that exists
+/// already (an `item_reference`, an item arriving under its own id) is taken
+/// only when the caller's `tenant` may see it; a new item is scoped to it.
 async fn process_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conversation_id: &ConversationId,
     item_val: &Value,
     added_at: chrono::DateTime<Utc>,
+    tenant: Option<&str>,
 ) -> Result<(Value, ConversationItemId, Option<String>), Response> {
     let item_type = item_val
         .get("type")
@@ -442,15 +445,16 @@ async fn process_item(
 
     // Handle item_reference specially - just resolve existing item
     if item_type == "item_reference" {
-        return process_item_reference(item_storage, conversation_id, item_val, added_at).await;
+        return process_item_reference(item_storage, conversation_id, item_val, added_at, tenant)
+            .await;
     }
 
     let user_provided_id = item_val.get("id").and_then(|v| v.as_str());
 
     let (item, warning) = if let Some(id_str) = user_provided_id {
-        process_item_with_id(item_storage, conversation_id, item_val, id_str).await?
+        process_item_with_id(item_storage, conversation_id, item_val, id_str, tenant).await?
     } else {
-        process_new_item(item_storage, item_val).await?
+        process_new_item(item_storage, item_val, tenant).await?
     };
 
     let item_id = item.id.clone();
@@ -467,6 +471,7 @@ async fn process_item_reference(
     conversation_id: &ConversationId,
     item_val: &Value,
     _added_at: chrono::DateTime<Utc>,
+    tenant: Option<&str>,
 ) -> Result<(Value, ConversationItemId, Option<String>), Response> {
     let ref_id = item_val
         .get("id")
@@ -483,9 +488,10 @@ async fn process_item_reference(
         return Err(item_already_in_conversation());
     }
 
+    // An item of another tenant is as unknown as a missing one.
     let existing_item = match item_storage.get_item(&item_id).await {
-        Ok(Some(item)) => item,
-        Ok(None) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
+        Ok(Some(item)) if item.is_visible_to(tenant) => item,
+        Ok(_) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
         Err(e) => return Err(store_error("Failed to get referenced item", &e)),
     };
 
@@ -499,6 +505,7 @@ async fn process_item_with_id(
     conversation_id: &ConversationId,
     item_val: &Value,
     id_str: &str,
+    tenant: Option<&str>,
 ) -> Result<(ConversationItem, Option<String>), Response> {
     // Bounded before any store is asked: the stores' id columns are this wide,
     // and an id over the bound must be the same 400 on every backend.
@@ -517,12 +524,15 @@ async fn process_item_with_id(
         return Err(item_already_in_conversation());
     }
 
-    // Check if item exists globally
+    // Check if item exists globally: the caller's own (or an untenanted one)
+    // is taken as it is; another tenant's is neither served nor overwritten.
     match item_storage.get_item(&item_id).await {
-        Ok(Some(existing)) => Ok((existing, None)),
+        Ok(Some(existing)) if existing.is_visible_to(tenant) => Ok((existing, None)),
+        Ok(Some(_)) => Err(bad_request(format!("Item id '{id_str}' cannot be used"))),
         Ok(None) => {
             // Create new item with the provided ID
-            let (mut new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
+            let (mut new_item, warning) =
+                parse_item_from_value(item_val, tenant).map_err(bad_request)?;
             new_item.id = Some(item_id);
 
             let created = item_storage
@@ -540,8 +550,9 @@ async fn process_item_with_id(
 async fn process_new_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
     item_val: &Value,
+    tenant: Option<&str>,
 ) -> Result<(ConversationItem, Option<String>), Response> {
-    let (new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
+    let (new_item, warning) = parse_item_from_value(item_val, tenant).map_err(bad_request)?;
 
     let created = item_storage
         .create_item(new_item)
@@ -673,6 +684,7 @@ pub async fn delete_conversation_item(
 
 fn parse_item_from_value(
     item_val: &Value,
+    tenant: Option<&str>,
 ) -> Result<(NewConversationItem, Option<String>), String> {
     let item_type = item_val
         .get("type")
@@ -732,6 +744,7 @@ fn parse_item_from_value(
             role,
             content,
             status,
+            tenant: tenant.map(str::to_string),
         },
         warning,
     ))
@@ -999,6 +1012,44 @@ mod tests {
             get_conversation(&conversations, A, &conv_id).await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// An item of another tenant is as unknown as a missing one to an
+    /// `item_reference`, and an item arriving under that id is refused rather
+    /// than served or overwritten; the owner references its own item freely.
+    #[tokio::test]
+    async fn another_tenants_item_cannot_be_referenced_or_adopted() {
+        let (conversations, items, _conv_a, item_a) = conversation_of_a().await;
+        let created = json_of(create_conversation(&conversations, B, json!({})).await).await;
+        let conv_b = created["id"].as_str().unwrap().to_string();
+
+        let reference = json!({"items": [{"type": "item_reference", "id": item_a}]});
+        let answer = create_conversation_items(&conversations, &items, B, &conv_b, reference).await;
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+        let adopt = json!({"items": [{"type": "message", "id": item_a, "role": "user", "content": "mine now"}]});
+        let answer = create_conversation_items(&conversations, &items, B, &conv_b, adopt).await;
+        assert_eq!(answer.status(), StatusCode::BAD_REQUEST);
+        // a's item is untouched and still a's.
+        let stored = items
+            .get_item(&ConversationItemId::from(item_a.as_str()))
+            .await
+            .unwrap()
+            .expect("still there");
+        assert_eq!(stored.tenant.as_deref(), A);
+        assert_eq!(stored.content[0]["text"], "secret");
+        let listed = json_of(
+            list_conversation_items(&conversations, &items, B, &conv_b, None, None, None).await,
+        )
+        .await;
+        assert_eq!(listed["data"].as_array().map(Vec::len), Some(0));
+
+        // The owner references its own item into a second conversation of its own.
+        let created = json_of(create_conversation(&conversations, A, json!({})).await).await;
+        let conv_a2 = created["id"].as_str().unwrap().to_string();
+        let reference = json!({"items": [{"type": "item_reference", "id": item_a}]});
+        let answer =
+            create_conversation_items(&conversations, &items, A, &conv_a2, reference).await;
+        assert_eq!(answer.status(), StatusCode::OK);
     }
 
     /// Without tenant identity nothing changes: a conversation created by a

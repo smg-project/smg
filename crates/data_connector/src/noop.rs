@@ -82,6 +82,7 @@ impl ConversationItemStorage for NoOpConversationItemStorage {
             content: item.content,
             status: item.status,
             created_at: Utc::now(),
+            tenant: item.tenant,
         })
     }
 
@@ -277,6 +278,7 @@ mod tests {
             role: role.map(|r| r.to_string()),
             content: json!([]),
             status: Some("completed".to_string()),
+            tenant: None,
         }
     }
 
@@ -305,6 +307,7 @@ mod tests {
             role: Some("assistant".to_string()),
             content: json!(["hello"]),
             status: Some("completed".to_string()),
+            tenant: None,
         };
         let item = store
             .create_item(input)

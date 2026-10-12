@@ -3,6 +3,12 @@
 use std::{net::IpAddr, sync::Arc};
 
 pub const DEFAULT_TENANT_HEADER_NAME: &str = "x-smg-tenant-id";
+
+/// The longest tenant id accepted from a trusted header or a tenant API key:
+/// the canonical key built from it (`header:<id>`, `auth:<id>`) is stored
+/// with every response and conversation, in a 255-character column on the
+/// SQL backends.
+pub const MAX_TENANT_ID_LEN: usize = 200;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
