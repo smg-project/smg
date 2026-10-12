@@ -170,7 +170,8 @@ async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Re
 }
 
 async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    models::list_models(&state.context, req.headers()).await
+    let request_id = middleware::request_id_of(&req);
+    models::list_models(&state.context, req.headers(), request_id).await
 }
 
 async fn v1_model(
