@@ -4215,6 +4215,7 @@ mod request_release_tests {
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
             tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
         });
 
         let response = pipeline
