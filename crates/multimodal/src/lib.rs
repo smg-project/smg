@@ -2,6 +2,7 @@ pub mod audio;
 pub mod encoder_inputs;
 pub mod error;
 mod fetch_policy;
+pub use fetch_policy::effective_allowed_domains;
 pub mod hasher;
 pub mod hub;
 pub mod jpeg_turbo;

@@ -37,24 +37,32 @@ pub(crate) struct MediaHostPolicy {
     allow_private_hosts: bool,
 }
 
+/// An allow-list as the policy reads it: each entry trimmed and lowercased,
+/// empty entries dropped (a list spelled with a space after each comma names
+/// the same hosts), and a list left with no names is no allow-list (`None`):
+/// any host the address policy passes, the meaning the gateway's settings and
+/// its Python parser already give an empty list. Sorted, without repeats, so
+/// the start-up line that prints it reads the same way every start. The one
+/// reading for every way a list arrives (the CLI, a configuration file, a
+/// worker's flag) and for what is logged about it.
+pub fn effective_allowed_domains(allowed_domains: Option<&[String]>) -> Option<Vec<String>> {
+    let mut domains: Vec<String> = allowed_domains?
+        .iter()
+        .map(|domain| domain.trim().to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
+        .collect();
+    domains.sort();
+    domains.dedup();
+    (!domains.is_empty()).then_some(domains)
+}
+
 impl MediaHostPolicy {
-    /// `allowed_domains` by name, each trimmed and lowercased, empty entries
-    /// dropped (a list spelled with a space after each comma names the same
-    /// hosts). A list with no names left is no allow-list, the meaning the
-    /// gateway's settings and its Python parser already give an empty list:
-    /// any host the address policy passes. Decided here, once, for every
-    /// way a list arrives (the CLI, a configuration file, a worker's flag).
+    /// `allowed_domains` by name, as [`effective_allowed_domains`] reads it:
+    /// decided here, once, for every way a list arrives.
     pub(crate) fn new(allowed_domains: Option<Vec<String>>, allow_private_hosts: bool) -> Self {
         Self {
-            allowed_domains: allowed_domains
-                .map(|domains| {
-                    domains
-                        .iter()
-                        .map(|domain| domain.trim().to_ascii_lowercase())
-                        .filter(|domain| !domain.is_empty())
-                        .collect::<HashSet<String>>()
-                })
-                .filter(|domains| !domains.is_empty()),
+            allowed_domains: effective_allowed_domains(allowed_domains.as_deref())
+                .map(|domains| domains.into_iter().collect::<HashSet<String>>()),
             allow_private_hosts,
         }
     }
@@ -572,6 +580,33 @@ mod tests {
             "{error}"
         );
         assert!(resolver.pinned("mixed.example").is_none());
+    }
+
+    /// The allow-list a start-up line prints is the one the policy enforces:
+    /// trimmed, lowercased, without empties or repeats, sorted, and `None`
+    /// for a list left with no names.
+    #[test]
+    fn the_effective_allow_list_is_the_one_logged_and_enforced() {
+        let spelled: Vec<String> = [" Media.Example", "", "cdn.example", "cdn.example ", "  "]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            effective_allowed_domains(Some(&spelled)),
+            Some(vec!["cdn.example".to_string(), "media.example".to_string()])
+        );
+        let blank: Vec<String> = vec![" ".to_string(), String::new()];
+        assert_eq!(effective_allowed_domains(Some(&blank)), None);
+        assert_eq!(effective_allowed_domains(Some(&[])), None);
+        assert_eq!(effective_allowed_domains(None), None);
+        let policy = MediaHostPolicy::new(Some(spelled), false);
+        assert_eq!(
+            policy.allowed_domains,
+            Some(HashSet::from([
+                "cdn.example".to_string(),
+                "media.example".to_string()
+            ]))
+        );
     }
 
     /// An allow-list entry is matched by its name alone: surrounding blanks

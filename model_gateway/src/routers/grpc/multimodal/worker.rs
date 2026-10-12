@@ -435,8 +435,11 @@ impl WorkerMediaPipeline {
             fetch_timeout: settings.fetch_timeout,
             video_fetch_timeout: settings.video_fetch_timeout,
         };
+        // The line shows the allow-list as the connector enforces it (trimmed,
+        // a list with no names being none), not as it was spelled.
         info!(
-            allowed_media_domains = ?connector_config.allowed_domains,
+            allowed_media_domains =
+                ?llm_multimodal::effective_allowed_domains(connector_config.allowed_domains.as_deref()),
             allow_private_media_hosts = connector_config.allow_private_hosts,
             "media fetch policy for worker-side processing"
         );

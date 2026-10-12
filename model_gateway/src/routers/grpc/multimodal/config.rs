@@ -277,8 +277,11 @@ impl MultimodalComponents {
             allow_private_hosts: settings.allow_private_media_hosts.value,
             ..MediaConnectorConfig::default()
         };
+        // The line shows the allow-list as the connector enforces it (trimmed,
+        // a list with no names being none), not as it was spelled.
         tracing::info!(
-            allowed_media_domains = ?connector_config.allowed_domains,
+            allowed_media_domains =
+                ?llm_multimodal::effective_allowed_domains(connector_config.allowed_domains.as_deref()),
             allow_private_media_hosts = connector_config.allow_private_hosts,
             allow_private_media_hosts_source = settings.allow_private_media_hosts.source.as_str(),
             "media fetch policy for router-side processing"
