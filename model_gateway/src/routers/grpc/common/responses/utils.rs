@@ -765,6 +765,7 @@ mod tests {
         async fn list_identifier_responses(
             &self,
             _identifier: &str,
+            _tenant: Option<&str>,
             _limit: Option<usize>,
         ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
             Err(ResponseStorageError::StorageError(
@@ -775,6 +776,7 @@ mod tests {
         async fn delete_identifier_responses(
             &self,
             _identifier: &str,
+            _tenant: Option<&str>,
         ) -> Result<usize, ResponseStorageError> {
             Err(ResponseStorageError::StorageError(
                 "connection refused".to_string(),
@@ -807,6 +809,7 @@ mod tests {
             &completed_response("resp_s", &request),
             &request,
             None,
+            None,
         )
         .await
         .expect_err("the record was not written");
@@ -838,6 +841,7 @@ mod tests {
             down,
             &completed_response("resp_n", &unstored),
             &unstored,
+            None,
             None,
         )
         .await
