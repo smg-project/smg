@@ -6,8 +6,9 @@
 //! and the start of a partial match. The syntax accepted is what the templates
 //! of transformers' tests and of `transformers serve` and the public
 //! checkpoint shapes the parity fixtures record use, plus positive classes,
-//! ranges in classes and `\w` and `\s` in classes (listed in the README);
-//! anything else is refused with the construct's name.
+//! ranges in classes, `\w` and `\s` in classes, and lookahead in patterns
+//! only used with `finditer` (listed in the README); anything else is refused
+//! with the construct's name.
 
 use crate::error::Unsupported;
 
@@ -157,7 +158,7 @@ fn first_sets(node: &Node, chars: &mut Vec<char>, sets: &mut Vec<Set>) -> bool {
             }
             true
         }
-        Node::Look(_) => true,
+        Node::Look(_) | Node::Ahead(_) => true,
         Node::Backref(_) => false,
         Node::Group(_, inner) | Node::Opt(inner) => first_sets(inner, chars, sets),
         Node::Alt(branches) => branches
@@ -213,6 +214,8 @@ enum Rep {
 enum Node {
     One(Set),
     Look(Look),
+    /// `(?=...)`, without groups or backreferences in it.
+    Ahead(Box<Node>),
     Group(Option<usize>, Box<Node>),
     Alt(Vec<Node>),
     Cat(Vec<Node>),
@@ -269,7 +272,7 @@ impl Node {
     fn nullable(&self) -> bool {
         match self {
             Self::One(_) => false,
-            Self::Look(_) | Self::Backref(_) => true,
+            Self::Look(_) | Self::Ahead(_) | Self::Backref(_) => true,
             Self::Group(_, node) => node.nullable(),
             Self::Repeat(_, rep) => *rep != Rep::Plus,
             Self::Opt(_) => true,
@@ -290,6 +293,11 @@ enum Inst {
         memo: usize,
     },
     Look(Look),
+    /// `(?=...)`: its body follows, ending in a `Match`; when the body
+    /// matches, continue at `end` from where the lookahead started.
+    Ahead {
+        end: usize,
+    },
     /// Try the next instruction, then the one at `second`. `memo` as for
     /// `Star`.
     Split {
@@ -372,6 +380,7 @@ impl Pattern {
             closed: vec![false],
             optional: vec![false],
             depth: 0,
+            ahead: 0,
         };
         let node = parser.alt().map_err(Unsupported::Regex)?;
         if parser.i != parser.chars.len() {
@@ -528,7 +537,7 @@ impl Pattern {
             if partial && start == hay.len() {
                 return None;
             }
-            match self.run(hay, start, partial, &mut run) {
+            match self.run(hay, 0, start, partial, &mut run) {
                 Step::Fail => {}
                 step => return Some((start, step)),
             }
@@ -536,11 +545,12 @@ impl Pattern {
         }
     }
 
-    /// One backtracking run from `start`. In a partial search, reading past
-    /// the end of the haystack is a partial match, except when a lazy repeat
-    /// would extend there; entering a lazy repeat at the end is one too.
-    fn run(&self, hay: &str, start: usize, partial: bool, run: &mut Run) -> Step {
-        run.stack.push(Frame::Try(0, start));
+    /// One backtracking run of the program from `pc` at `start`, up to the
+    /// next `Match`. In a partial search, reading past the end of the
+    /// haystack is a partial match, except when a lazy repeat would extend
+    /// there; entering a lazy repeat at the end is one too.
+    fn run(&self, hay: &str, pc: usize, start: usize, partial: bool, run: &mut Run) -> Step {
+        run.stack.push(Frame::Try(pc, start));
         while let Some(frame) = run.stack.pop() {
             let (mut pc, mut at) = match frame {
                 Frame::Try(pc, at) => (pc, at),
@@ -635,6 +645,25 @@ impl Pattern {
                     }
                     Inst::Look(look) if look.at(hay, at) => pc += 1,
                     Inst::Look(_) => break,
+                    // The body runs with its own stack and memory: whether it
+                    // matches depends only on the position, and once it has
+                    // matched it is not tried again (it sets no groups).
+                    Inst::Ahead { end } => {
+                        let mut body = Run {
+                            slots: Vec::new(),
+                            stack: Vec::new(),
+                            visited: vec![Vec::new(); run.visited.len()],
+                            base: at,
+                        };
+                        match self.run(hay, pc + 1, at, partial, &mut body) {
+                            Step::Match(..) => pc = *end,
+                            Step::Partial => {
+                                run.stack.clear();
+                                return Step::Partial;
+                            }
+                            Step::Fail => break,
+                        }
+                    }
                     Inst::Split { second, memo } => {
                         if !run.visit(*memo, at) {
                             break;
@@ -819,6 +848,13 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, memos: &mut usize) {
     match node {
         Node::One(set) => prog.push(Inst::One(set.clone())),
         Node::Look(look) => prog.push(Inst::Look(*look)),
+        Node::Ahead(body) => {
+            let at = prog.len();
+            prog.push(Inst::Ahead { end: 0 });
+            compile(body, prog, memos);
+            prog.push(Inst::Match);
+            prog[at] = Inst::Ahead { end: prog.len() };
+        }
         Node::Backref(group) => prog.push(Inst::Backref(*group)),
         Node::Group(group, inner) => {
             if let Some(g) = group {
@@ -879,6 +915,8 @@ struct Parser {
     optional: Vec<bool>,
     /// Groups open around the current position.
     depth: usize,
+    /// Lookaheads open around the current position.
+    ahead: usize,
 }
 
 /// The deepest group nesting accepted. The parser, and every walk over the
@@ -1035,6 +1073,9 @@ impl Parser {
                 if self.role == Role::Delimiter {
                     return Err("backreference in an open or close pattern".into());
                 }
+                if self.ahead > 0 {
+                    return Err("backreference in a lookahead".into());
+                }
                 if !self.closed.get(group).copied().unwrap_or(false) {
                     return Err("backreference to a later group".into());
                 }
@@ -1126,6 +1167,9 @@ impl Parser {
                 .ok_or("group name")?;
             let name: String = self.chars[self.i..self.i + end].iter().collect();
             self.i += end + 1;
+            if self.ahead > 0 {
+                return Err("group in a lookahead".into());
+            }
             let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
             if !valid || self.names.iter().any(|(n, _)| *n == name) {
@@ -1136,6 +1180,22 @@ impl Parser {
             self.closed.push(false);
             self.optional.push(false);
             Some(self.groups)
+        } else if self.role == Role::Finditer && self.rest_starts_with("?=") {
+            // Patterns used only with `finditer` are never searched
+            // partially, where a zero-width assertion would change the result.
+            self.i += 2;
+            if self.depth == MAX_GROUP_DEPTH {
+                return Err(format!("groups nested more than {MAX_GROUP_DEPTH} deep"));
+            }
+            self.depth += 1;
+            self.ahead += 1;
+            let body = self.alt()?;
+            self.ahead -= 1;
+            self.depth -= 1;
+            if !self.eat(')') {
+                return Err("unbalanced parenthesis".into());
+            }
+            return Ok(Node::Ahead(Box::new(body)));
         } else if ["?=", "?!", "?<=", "?<!"]
             .iter()
             .any(|s| self.rest_starts_with(s))

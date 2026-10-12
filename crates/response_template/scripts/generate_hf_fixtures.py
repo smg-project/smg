@@ -1504,6 +1504,100 @@ def build_synthetic_corpus():
     )
 
 
+# A tool name read up to whitespace or the next marker, and a tag pattern whose
+# value also ends where the next key starts (`(?=...)`), the shape of templates
+# whose arguments may omit their closing tag.
+SPACE_CLASS_OPEN = r"(?:<\|turn\|>bot)? to=(?P<name>[^\s<]+)<\|args\|>"
+ARG_LOOKAHEAD = r'<arg name="(?P<key>[^"]+)">\n(?P<value>.*?)\n(?:</arg>|(?=<arg name="))'
+# Templates whose patterns take their regex rows from a generator of their own,
+# so that adding them leaves the rows recorded before unchanged.
+LATE_TEMPLATES: list[str] = []
+
+
+def build_class_lookahead_corpus():
+    templates = {
+        "space-class-name": base_template(tool_open=SPACE_CLASS_OPEN),
+        "lookahead-tag": base_template(
+            tool_open=SPACE_CLASS_OPEN,
+            tag=ARG_LOOKAHEAD,
+            value_parser={"name": "text", "args": {"strip": False}},
+            tool_close=("<|ask|>", "<|eos|>"),
+        ),
+    }
+    for name, t in templates.items():
+        LATE_TEMPLATES.append(add_template(f"synthetic/{name}", t, "synthetic"))
+
+    def la_arg(key: str, value: str, closed: bool = True) -> str:
+        return f'<arg name="{key}">\n{value}\n' + ("</arg>" if closed else "")
+
+    prefix = "<|turn|>user\nWhat is the weather?<|done|><|turn|>bot"
+    space = {
+        "one-call": " to=get_weather<|args|>" + arg("city", "Paris") + "<|done|>",
+        "think-then-call": "<|think|>look it up<|done|> to=get_weather<|args|>"
+        + arg("days", "2")
+        + "<|done|>",
+        "name-unicode": " to=wéather_Ω.v2<|args|>" + arg("city", "Zürich") + "<|done|>",
+        "name-cut-by-space": " to=get weather<|args|><|done|>",
+        "name-cut-by-marker": " to=get<|args|><|done|>",
+        "two-calls": " to=get_weather<|args|>"
+        + arg("city", "Paris")
+        + "<|done|> to=get_time<|args|><|done|>",
+        "cut-in-name": " to=get_wea",
+        "say-only": "<|say|>no tools to=use here<|done|>",
+    }
+    for k, text in space.items():
+        add_case(f"synthetic/space-class-name#{k}", "synthetic/space-class-name", text)
+        add_case(
+            f"synthetic/space-class-name#{k}-prefix",
+            "synthetic/space-class-name",
+            text,
+            prefix=prefix,
+            tools=TOOLS,
+        )
+    look = {
+        "closed": " to=get_weather<|args|>" + la_arg("city", "Paris") + "<|ask|>",
+        "next-key-closes": " to=get_weather<|args|>"
+        + la_arg("city", "Paris", closed=False)
+        + la_arg("days", "3")
+        + "<|ask|>",
+        "all-open": " to=get_weather<|args|>"
+        + la_arg("city", "New\nYork", closed=False)
+        + la_arg("days", "3", closed=False)
+        + la_arg("metric", "true", closed=False)
+        + "<|ask|>",
+        "last-open": " to=get_weather<|args|>"
+        + la_arg("city", "Paris")
+        + la_arg("days", "3", closed=False)
+        + "<|ask|>",
+        "typed": " to=get_weather<|args|>"
+        + la_arg("days", "3", closed=False)
+        + la_arg("ratio", "0.5")
+        + la_arg("either", "7", closed=False)
+        + la_arg("filters", '{"a": 1}')
+        + "<|ask|>",
+        "key-in-value": " to=get_weather<|args|>"
+        + la_arg("city", 'a\n<arg name="x', closed=False)
+        + "<|ask|>",
+        "repeated-key": " to=get_weather<|args|>"
+        + la_arg("city", "A", closed=False)
+        + la_arg("city", "B")
+        + "<|ask|>",
+        "think-say-call": "<|think|>t<|done|><|say|>s<|done|> to=get_time<|args|><|ask|>",
+        "cut-before-next": " to=get_weather<|args|>"
+        + la_arg("city", "Paris", closed=False)
+        + "<arg na",
+        "eos-close": " to=get_weather<|args|>" + la_arg("city", "Paris") + "<|eos|>",
+    }
+    for k, text in look.items():
+        add_case(f"synthetic/lookahead-tag#{k}", "synthetic/lookahead-tag", text, tools=TOOLS)
+        add_case(
+            f"synthetic/lookahead-tag#{k}-prefix",
+            "synthetic/lookahead-tag",
+            text,
+            prefix=prefix,
+        )
+
+
 def build_unicode_template():
     t = {
         "start_anchor_pattern": "【助手】",
@@ -2886,6 +2980,32 @@ CLASS_ESCAPE_HAYSTACKS = [
 ]
 
 
+# Lookahead (compared in finditer rows; open and close patterns refuse it),
+# recorded with a generator of their own.
+LOOKAHEAD_ROWS = (
+    r"""
+a(?=b) (?=a)a a(?=b|c) x(?:y|(?=z)) a(?=b*) a(?=\b) a(?=.*?c) a(?=b(?=c)) a(?=[^\s<]+)
+a(?=\s)\s (?=a)|b a(?=(?P<x>b)) (?P<k>a)(?=\1) a(?!b) (?<=a)b a(?=b)? a(?=) (?=a)
+(?:a(?=b)|ab)c x(?=$) x(?=\Z) <k>(?P<v>.*?)(?:</k>|(?=<k>))
+""".split()
+    + [r'<arg name="(?P<key>[^"]+)">\n(?P<value>.*?)\n(?:</arg>|(?=<arg name="))']
+)
+LOOKAHEAD_HAYSTACKS = [
+    "",
+    "a",
+    "ab",
+    "abc",
+    "ac",
+    "a b",
+    "xz",
+    "xyz",
+    " \t\n<",
+    "<k>1</k><k>2<k>3",
+    'q<arg name="a">\n1\n<arg name="b">\n2\n</arg>',
+    '<arg name="a">\n1\n</arg><arg name="',
+]
+
+
 def lazy_family_patterns() -> list[str]:
     """Lazy repeats of one character in open/close patterns, in the positions
     the port supports and others: the `regex` module's partial matches follow
@@ -2984,7 +3104,11 @@ def fragment_haystacks(pattern: str, rng: random.Random, n: int) -> list[str]:
     return ["".join(rng.choice(frags) for _ in range(rng.randint(1, 6))) for _ in range(n)]
 
 
-def build_regex_rows(target: list[tuple[str, str]], others: list[tuple[str, str]]) -> list[dict]:
+def build_regex_rows(
+    target: list[tuple[str, str]],
+    others: list[tuple[str, str]],
+    late: list[tuple[str, str]],
+) -> list[dict]:
     rows = []
     rng = random.Random(0xFACE)
     for role, pattern in target + others:
@@ -3023,6 +3147,13 @@ def build_regex_rows(target: list[tuple[str, str]], others: list[tuple[str, str]
             "".join(rng.choice(REGEX_ALPHABET) for _ in range(rng.randint(0, 12))) for _ in range(2)
         ]
         rows.append(regex_row(pattern, hays, rng.choice(["delimiter", "finditer"])))
+    rng = random.Random(0xC1A5)
+    for role, pattern in late:
+        rows.append(regex_row(pattern, fragment_haystacks(pattern, rng, 12), role))
+    for pattern in LOOKAHEAD_ROWS:
+        hays = LOOKAHEAD_HAYSTACKS + fragment_haystacks(pattern, rng, 4)
+        for role in ("delimiter", "finditer"):
+            rows.append(regex_row(pattern, hays, role))
     return rows
 
 
@@ -3556,6 +3687,7 @@ def generate(src: Path) -> dict[str, str]:
 
     build_tail_corpus()
     build_random_corpus(100, 10)
+    build_class_lookahead_corpus()
 
     templates_out = []
     for tid, entry in TEMPLATES.items():
@@ -3591,10 +3723,13 @@ def generate(src: Path) -> dict[str, str]:
     others = {
         rp
         for tid, entry in TEMPLATES.items()
-        if not tid.startswith("random/")
+        if not tid.startswith("random/") and tid not in LATE_TEMPLATES
         for rp in template_patterns(entry["template"])
     }
-    regex_rows = build_regex_rows(sorted(target), sorted(others - target))
+    late = {rp for tid in LATE_TEMPLATES for rp in template_patterns(TEMPLATES[tid]["template"])}
+    regex_rows = build_regex_rows(
+        sorted(target), sorted(others - target), sorted(late - others - target)
+    )
     with Hooks():
         units = build_units(recorder.units) + build_table_rows()
 

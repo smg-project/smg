@@ -234,6 +234,86 @@ fn class_escapes_match_the_regex_module() {
     }
 }
 
+/// Lookahead in a pattern used only with `finditer`, such as a tag pattern
+/// whose value also ends where the next key starts, with what the `regex`
+/// module returns (`regex` 2026.9.10, spans in characters). Lookahead in an
+/// open or close pattern, and a group, backreference or repeat in or of one,
+/// stay refused.
+#[test]
+fn lookahead_in_finditer_patterns() {
+    type Spans<'a> = (String, Vec<(&'a str, Option<&'a str>)>);
+    let rows = read_jsonl(&fixtures_dir(), "regex");
+    let tag = r#"<arg name="(?P<key>[^"]+)">\n(?P<value>.*?)\n(?:</arg>|(?=<arg name="))"#;
+    for source in [tag, r"a(?=b(?=c))"] {
+        assert!(
+            rows.iter()
+                .any(|r| r["pattern"] == source && r["role"] == "finditer" && r["python"] == "ok"),
+            "{source:?} is not recorded"
+        );
+    }
+    let pattern = Pattern::new(tag, Role::Finditer).unwrap();
+    for (hay, expected) in [
+        (
+            "<arg name=\"a\">\n1\n<arg name=\"b\">\n2\n</arg>",
+            &[("0:17", "a", "1"), ("17:40", "b", "2")][..],
+        ),
+        (
+            "<arg name=\"a\">\nx\n<arg name=\"b\n</arg>",
+            &[("0:17", "a", "x")][..],
+        ),
+        (
+            "<arg name=\"a\">\n1\n</arg><arg name=\"b\">\n2\n",
+            &[("0:23", "a", "1")][..],
+        ),
+    ] {
+        let got: Vec<Spans<'_>> = pattern
+            .finditer(hay)
+            .map(|m| (span(hay, m.start, m.end), pattern.groupdict(hay, &m)))
+            .collect();
+        let expected: Vec<Spans<'_>> = expected
+            .iter()
+            .map(|&(at, key, value)| {
+                (
+                    at.to_owned(),
+                    vec![("key", Some(key)), ("value", Some(value))],
+                )
+            })
+            .collect();
+        assert_eq!(got, expected, "{hay:?}");
+    }
+    let nested = Pattern::new(r"a(?=b(?=c))", Role::Finditer).unwrap();
+    let hay = "abcab abc";
+    let got: Vec<String> = nested
+        .finditer(hay)
+        .map(|m| span(hay, m.start, m.end))
+        .collect();
+    assert_eq!(got, ["0:1", "6:7"]);
+    for (source, role, reason) in [
+        ("a(?=b)", Role::Delimiter, "regex: look-around"),
+        ("a(?!b)", Role::Finditer, "regex: look-around"),
+        ("(?<=a)b", Role::Finditer, "regex: look-around"),
+        (
+            "a(?=(?P<x>b))",
+            Role::Finditer,
+            "regex: group in a lookahead",
+        ),
+        (
+            r"(?P<k>a)(?=\1)",
+            Role::Finditer,
+            "regex: backreference in a lookahead",
+        ),
+        (
+            "a(?=b)?",
+            Role::Finditer,
+            "regex: repeat of a group or an assertion",
+        ),
+        ("(?=a)", Role::Finditer, "empty match"),
+    ] {
+        let refused = Pattern::new(source, role).unwrap_err().to_string();
+        assert_eq!(refused, reason, "{source:?}");
+    }
+}
+
 /// Class escapes the port refuses, with the reason. `\d`, `\S`, `\W` and `\b`
 /// are not ported. The `regex` module reads a `-` next to `\w` or `\s` as a
 /// literal (`[\s-a]` finds "a", "-" and " "), where Python's `re` rejects the

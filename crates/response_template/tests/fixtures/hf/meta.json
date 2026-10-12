@@ -11,7 +11,7 @@
   "src/transformers/utils/chat_parsing/content_parsers.py": "txykwyvwvyssgxvy",
   "tests/utils/test_chat_parsing.py": "hmqypkhjnjkrkkjy"
  },
- "generator": "gsjttyvkppzksxzt",
+ "generator": "jswwjtrrrxskqzsz",
  "hf_test_run": {
   "tests_run": 69,
   "tests_excluded": [
@@ -33,10 +33,10 @@
   "load_error": 1
  },
  "counts": {
-  "templates": 399,
-  "sessions": 689,
+  "templates": 401,
+  "sessions": 725,
   "random_sessions": 1000,
-  "regex_rows": 1636,
+  "regex_rows": 1684,
   "units": 254
  },
  "digest": "sha256 of the canonical JSON, first 8 bytes, nibbles as ghjkmnpqrstvwxyz",

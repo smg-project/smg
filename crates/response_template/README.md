@@ -47,8 +47,9 @@ rather than from the pattern's language. `pyre.rs` parses the constructs used
 by the templates of transformers' tests and of `transformers serve` and by the
 public checkpoint shapes the parity fixtures record, plus positive classes,
 ranges in classes and `\w` and `\s` in classes (as in tool-name patterns like
-`[A-Za-z_][A-Za-z0-9_]*`, `[\w.-]+` or `[^\s<]+`), and runs them on a
-backtracking matcher that reproduces those results.
+`[A-Za-z_][A-Za-z0-9_]*`, `[\w.-]+` or `[^\s<]+`) and lookahead in tag
+patterns (as in a value that also ends where the next key starts), and runs
+them on a backtracking matcher that reproduces those results.
 Supported:
 
 - literal characters other than `{`, `}` and `]`, `\` before ASCII
@@ -63,9 +64,12 @@ Supported:
   character, in open and close patterns only as `.*?` before a literal, or
   after another item and before `\b` and a literal (other positions change
   what a partial search reports);
-- `\1` to `\9` in start anchors and tag patterns.
+- `\1` to `\9` in start anchors and tag patterns;
+- `(?=...)` without groups or backreferences in it, in start anchors and tag
+  patterns (they are only used with `finditer`, never searched partially).
 
-Anything else is refused, for example look-around, inline flags, `{m,n}` and
+Anything else is refused, for example lookahead in open and close patterns,
+negative lookahead and lookbehind, inline flags, `{m,n}` and
 `{`, `}` or `]` that Python reads as literal characters, possessive and other
 lazy quantifiers, escapes such as `\d` or `\t`, a `-` next to `\w` or `\s` in a
 class other than as its last item (the `regex` module reads it as a literal,
