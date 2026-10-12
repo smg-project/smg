@@ -7,6 +7,7 @@ pub mod hasher;
 pub mod hub;
 pub mod jpeg_turbo;
 pub mod media;
+mod mp4_metadata;
 #[cfg(feature = "opencv-video")]
 mod opencv_buffer;
 mod pixel_convert;

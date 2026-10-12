@@ -2312,7 +2312,7 @@ struct VideoMetadata {
     container_frames: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ProbedVideoInfo {
     width: Option<u32>,
     height: Option<u32>,
@@ -2323,7 +2323,16 @@ struct ProbedVideoInfo {
 }
 
 async fn probe_video_metadata(input_path: &Path) -> Result<VideoMetadata, MediaConnectorError> {
-    let info = probe_video_info(input_path).await?;
+    // The container's own tables first (an MP4 / MOV of the common shape, no
+    // process); the probe tool for every other file.
+    let path = input_path.to_path_buf();
+    let from_container = task::spawn_blocking(move || crate::mp4_metadata::read(&path))
+        .await
+        .map_err(MediaConnectorError::Blocking)?;
+    let info = match from_container {
+        Ok(Some(container)) => probed_from_container(&container),
+        _ => probe_video_info(input_path).await?,
+    };
     let width = info.width.ok_or_else(|| {
         MediaConnectorError::VideoDecode("ffprobe did not return video width".to_string())
     })?;
@@ -2338,6 +2347,23 @@ async fn probe_video_metadata(input_path: &Path) -> Result<VideoMetadata, MediaC
         total_frames: info.total_frames,
         container_frames: info.container_frames,
     })
+}
+
+/// The probe's fields from the container's tables: the stream duration (the
+/// probe's first choice), the average frame rate, the sample count as the
+/// frame count the stream and the container both state.
+fn probed_from_container(container: &crate::mp4_metadata::ContainerVideoInfo) -> ProbedVideoInfo {
+    let frames = Some(container.frame_count as usize).filter(|frames| *frames > 0);
+    ProbedVideoInfo {
+        width: Some(container.width),
+        height: Some(container.height),
+        duration_seconds: container
+            .stream_duration_seconds()
+            .or_else(|| container.movie_duration_seconds()),
+        source_fps: container.frames_per_second(),
+        total_frames: frames,
+        container_frames: frames,
+    }
 }
 
 async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaConnectorError> {
@@ -3099,6 +3125,88 @@ fn skip_ppm_whitespace_and_comments(bytes: &[u8], pos: &mut usize) {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    /// Where the tools are installed: clips written by the encoder at several
+    /// frame rates and lengths, read through the container tables, equal the
+    /// probe tool's own report field by field (the numbers the frame
+    /// selection and the clip's sample rate are built from).
+    #[test]
+    fn container_tables_agree_with_the_probe_tool() {
+        use std::process::Command;
+        let have = |tool: &str| {
+            Command::new(tool)
+                .arg("-version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        if !have("ffmpeg") || !have("ffprobe") {
+            // Without the tools there is nothing to agree with; the unit tests
+            // on synthetic containers still run.
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cases = [
+            ("24", "1", "mp4"),
+            ("30000/1001", "2", "mp4"),
+            ("25", "3", "mov"),
+            ("60", "1", "mp4"),
+            ("24000/1001", "2", "mp4"),
+        ];
+        for (rate, seconds, container) in cases {
+            let path = dir.path().join(format!(
+                "clip_{}_{seconds}.{container}",
+                rate.replace('/', "_")
+            ));
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                ])
+                .arg(format!("testsrc=size=64x48:rate={rate}:duration={seconds}"))
+                .args([
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                ])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg runs");
+            assert!(status.success(), "ffmpeg wrote {path:?}");
+            let container_info = crate::mp4_metadata::read(&path)
+                .expect("readable")
+                .unwrap_or_else(|| panic!("{path:?} not accepted by the container reader"));
+            let output = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height,duration,duration_ts,time_base,r_frame_rate,avg_frame_rate,nb_frames:format=duration",
+                    "-of",
+                    "json",
+                ])
+                .arg(&path)
+                .output()
+                .expect("ffprobe runs");
+            assert!(output.status.success());
+            let probed = parse_ffprobe_video_info(&output.stdout).expect("probe parses");
+            assert_eq!(
+                super::probed_from_container(&container_info),
+                probed,
+                "{rate} fps, {seconds} s, {container}"
+            );
+        }
+    }
 
     /// The engine's frame budget replaces only the loader-style budget: the
     /// rate-based samplers keep their rule, `0` means every frame, `None`
