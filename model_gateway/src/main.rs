@@ -584,7 +584,7 @@ struct CliArgs {
     decode_policy: Option<String>,
 
     /// Maximum in-flight Prefill requests per worker in PD or EPD mode (non-positive to disable)
-    #[arg(long, default_value_t = -1, help_heading = "PD Disaggregation")]
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true, help_heading = "PD Disaggregation")]
     prefill_max_inflight_requests_per_worker: i32,
 
     /// Maximum number of requests waiting for Prefill admission (default: 100 when enabled)
@@ -1046,7 +1046,7 @@ struct CliArgs {
     /// derives the bound from the host (1024 per available core, at least
     /// 4096) so an overloaded router sheds with 429/503 instead of queueing
     /// without bound; 0 disables the bound.
-    #[arg(long, default_value_t = -1, help_heading = "Rate Limiting")]
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true, help_heading = "Rate Limiting")]
     max_concurrent_requests: i32,
 
     /// Queue size for pending requests when limit reached
@@ -1098,7 +1098,7 @@ struct CliArgs {
     /// --max-concurrent-requests, which keeps bounding standing concurrency
     /// (a completed request frees its slot, not rate budget). Unset or 0 =
     /// no rate limit: --max-concurrent-requests bounds concurrency alone.
-    #[arg(long, help_heading = "Rate Limiting")]
+    #[arg(long, allow_negative_numbers = true, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
     /// Most Responses API requests with background: true in flight at once;
@@ -1311,11 +1311,21 @@ struct CliArgs {
     oracle_external_auth: bool,
 
     /// Minimum Oracle connection pool size
-    #[arg(long, env = "ATP_POOL_MIN", help_heading = "Oracle Database")]
+    #[arg(
+        long,
+        env = "ATP_POOL_MIN",
+        allow_negative_numbers = true,
+        help_heading = "Oracle Database"
+    )]
     oracle_pool_min: Option<usize>,
 
     /// Maximum Oracle connection pool size
-    #[arg(long, env = "ATP_POOL_MAX", help_heading = "Oracle Database")]
+    #[arg(
+        long,
+        env = "ATP_POOL_MAX",
+        allow_negative_numbers = true,
+        help_heading = "Oracle Database"
+    )]
     oracle_pool_max: Option<usize>,
 
     /// Oracle connection pool timeout in seconds
@@ -1341,7 +1351,7 @@ struct CliArgs {
     redis_pool_max_size: Option<usize>,
 
     /// Redis data retention in days (-1 for persistent, default 30)
-    #[arg(long, help_heading = "Redis Database")]
+    #[arg(long, allow_negative_numbers = true, help_heading = "Redis Database")]
     redis_retention_days: Option<i64>,
 
     // ==================== TLS/mTLS Security ====================
@@ -3003,6 +3013,65 @@ mod tests {
         ])
         .ignored_companions(&prefill, &[]);
         assert!(paired.is_empty(), "{paired:?}");
+
+    /// The arguments of `smg launch ...`, the form a deployment uses.
+    fn launch_args_from(args: &[&str]) -> CliArgs {
+        let argv: Vec<String> = ["smg", "launch"]
+            .into_iter()
+            .map(str::to_string)
+            .chain(args.iter().map(|s| (*s).to_string()))
+            .collect();
+        match Cli::parse_from(argv).command {
+            Some(Commands::Launch { args }) => args,
+            None => panic!("the launch subcommand"),
+        }
+    }
+
+    /// A flag whose documented domain has a negative sentinel takes it in the
+    /// space-separated spelling as in the `=` one, with and without the
+    /// `launch` subcommand, and a flag without such a domain refuses the
+    /// value by name instead of reporting an unexpected argument.
+    #[test]
+    fn negative_sentinels_parse_in_both_spellings() {
+        let spaced = [
+            "--max-concurrent-requests",
+            "-1",
+            "--prefill-max-inflight-requests-per-worker",
+            "-1",
+            "--redis-retention-days",
+            "-1",
+            "--rate-limit-tokens-per-second",
+            "-1",
+        ];
+        // `parse_from` exits the process on a refusal: the sentinels are
+        // tried first, so a refusal reads as the parser's message.
+        for argv in [vec!["smg"], vec!["smg", "launch"]] {
+            let argv: Vec<&str> = argv.into_iter().chain(spaced).collect();
+            if let Err(e) = Cli::try_parse_from(argv.iter().copied()) {
+                panic!("the sentinels are refused: {e}");
+            }
+        }
+        for args in [cli_args_from(&spaced), launch_args_from(&spaced)] {
+            assert_eq!(args.max_concurrent_requests, -1);
+            assert_eq!(args.prefill_max_inflight_requests_per_worker, -1);
+            assert_eq!(args.redis_retention_days, Some(-1));
+            // Refused later by the validator, by name, as a negative rate.
+            assert_eq!(args.rate_limit_tokens_per_second, Some(-1));
+        }
+        assert_eq!(
+            launch_args_from(&["--max-concurrent-requests=-1"]).max_concurrent_requests,
+            -1
+        );
+        for flag in ["--oracle-pool-min", "--oracle-pool-max"] {
+            for argv in [vec!["smg", flag, "-1"], vec!["smg", "launch", flag, "-1"]] {
+                let err = Cli::try_parse_from(argv).expect_err("an unsigned pool size refuses -1");
+                let text = err.to_string();
+                assert!(
+                    text.contains(flag) && !text.contains("unexpected argument"),
+                    "the refusal names the flag: {text}"
+                );
+            }
+        }
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so
