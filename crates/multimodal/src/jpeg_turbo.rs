@@ -157,14 +157,17 @@ pub fn pil_cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> [u8; 3] {
 }
 
 /// Convert a packed CMYK8 buffer (as decoded by libjpeg) to packed RGB8, PIL's
-/// way, pixel by pixel.
-fn cmyk_to_rgb_like_pil(cmyk: &[u8]) -> Vec<u8> {
-    let (pixels, _) = cmyk.as_chunks::<4>();
-    let mut rgb = vec![0_u8; pixels.len() * 3];
-    for (out, &[c, m, y, k]) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
-        *out = pil_cmyk_to_rgb(c, m, y, k);
+/// way, pixel by pixel, in place: pixel `i` is read from `4i..4i+4` before
+/// `3i..3i+3` is written, so no unread byte is overwritten, and the decoded
+/// buffer stays the one allocation `MAX_DECODED_BYTES` bounds.
+fn cmyk_to_rgb_like_pil(mut buf: Vec<u8>) -> Vec<u8> {
+    let pixels = buf.len() / 4;
+    for i in 0..pixels {
+        let [c, m, y, k] = [buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]];
+        buf[3 * i..3 * i + 3].copy_from_slice(&pil_cmyk_to_rgb(c, m, y, k));
     }
-    rgb
+    buf.truncate(pixels * 3);
+    buf
 }
 
 /// Whether libjpeg-turbo was found, so JPEGs decode to PIL's pixels.
@@ -248,11 +251,7 @@ pub fn decode_jpeg_rgb(bytes: &[u8]) -> Option<DynamicImage> {
         if rc != 0 {
             return None;
         }
-        let rgb = if cmyk {
-            cmyk_to_rgb_like_pil(&buf)
-        } else {
-            buf
-        };
+        let rgb = if cmyk { cmyk_to_rgb_like_pil(buf) } else { buf };
         RgbImage::from_raw(w as u32, h as u32, rgb).map(DynamicImage::ImageRgb8)
     }
 }
