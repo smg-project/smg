@@ -813,10 +813,10 @@ mod tests {
                 assert_eq!(delta.content.as_deref(), Some(tool_text), "{first:?}");
                 assert!(delta.tool_calls.is_none(), "{first:?}");
             } else {
-                assert!(
-                    delta.content.is_some() || delta.tool_calls.is_some(),
-                    "{first:?}"
-                );
+                // A complete call in one chunk: the parser releases it as tool
+                // calls and nothing as content.
+                assert!(delta.content.is_none(), "{first:?}");
+                assert!(delta.tool_calls.is_some(), "{first:?}");
             }
         }
     }
