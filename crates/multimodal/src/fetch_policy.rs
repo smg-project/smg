@@ -40,16 +40,21 @@ pub(crate) struct MediaHostPolicy {
 impl MediaHostPolicy {
     /// `allowed_domains` by name, each trimmed and lowercased, empty entries
     /// dropped (a list spelled with a space after each comma names the same
-    /// hosts); `None` is any host.
+    /// hosts). A list with no names left is no allow-list, the meaning the
+    /// gateway's settings and its Python parser already give an empty list:
+    /// any host the address policy passes. Decided here, once, for every
+    /// way a list arrives (the CLI, a configuration file, a worker's flag).
     pub(crate) fn new(allowed_domains: Option<Vec<String>>, allow_private_hosts: bool) -> Self {
         Self {
-            allowed_domains: allowed_domains.map(|domains| {
-                domains
-                    .iter()
-                    .map(|domain| domain.trim().to_ascii_lowercase())
-                    .filter(|domain| !domain.is_empty())
-                    .collect()
-            }),
+            allowed_domains: allowed_domains
+                .map(|domains| {
+                    domains
+                        .iter()
+                        .map(|domain| domain.trim().to_ascii_lowercase())
+                        .filter(|domain| !domain.is_empty())
+                        .collect::<HashSet<String>>()
+                })
+                .filter(|domains| !domains.is_empty()),
             allow_private_hosts,
         }
     }
@@ -150,6 +155,9 @@ fn ipv6_class(address: Ipv6Addr) -> Option<&'static str> {
 #[derive(Debug, Default)]
 pub(crate) struct MediaHostResolver {
     pins: Mutex<HashMap<String, Pin>>,
+    /// The answers a test gives for names nothing resolves where it runs
+    /// ([`Self::answer`]); empty otherwise, and the system resolver answers.
+    answers: Mutex<HashMap<String, Vec<IpAddr>>>,
 }
 
 #[derive(Debug)]
@@ -178,7 +186,7 @@ impl MediaHostResolver {
         }
         match url.host() {
             Some(Host::Domain(domain)) => {
-                let addresses = resolve(domain).await?;
+                let addresses = self.lookup(domain).await?;
                 for &address in &addresses {
                     check_address(domain, address)?;
                 }
@@ -194,6 +202,32 @@ impl MediaHostResolver {
             }
             None => Err(MediaConnectorError::InvalidUrl(url.to_string())),
         }
+    }
+
+    /// The addresses `host` resolves to: a test's answer for it when there
+    /// is one, else the system resolver's, each once.
+    async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, MediaConnectorError> {
+        let answered = self
+            .answers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host)
+            .cloned();
+        match answered {
+            Some(addresses) => Ok(addresses),
+            None => resolve(host).await,
+        }
+    }
+
+    /// What `host` resolves to from now on, for a test: no public name
+    /// resolves where the tests run, and the pin of an admitted hop is
+    /// observed through one.
+    #[cfg(test)]
+    fn answer(&self, host: &str, addresses: Vec<IpAddr>) {
+        self.answers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(host.to_string(), addresses);
     }
 
     fn pin(self: &Arc<Self>, host: &str, addresses: Vec<IpAddr>) -> HostPin {
@@ -490,9 +524,61 @@ mod tests {
         ));
     }
 
+    /// Under the strict policy a public name is admitted on the addresses it
+    /// resolves to, every one of them judged, and the client is handed those
+    /// same addresses until the hop is over: check, then connect to what was
+    /// checked. The answers are the test's: no public name resolves here.
+    #[tokio::test]
+    async fn a_public_name_is_admitted_and_its_checked_addresses_pinned() {
+        let resolver = Arc::new(MediaHostResolver::default());
+        let strict = MediaHostPolicy::new(None, false);
+        let checked = vec![
+            ip("93.184.216.34"),
+            ip("2606:2800:21f:cb07:6820:80da:af6b:8b2c"),
+        ];
+        resolver.answer("media.example", checked.clone());
+        let url = Url::parse("http://media.example/a.png").expect("url");
+        let pin = resolver
+            .admit(&strict, &url)
+            .await
+            .expect("a public name is admitted");
+        assert_eq!(resolver.pinned("media.example"), Some(checked.clone()));
+        let name = Name::from_str("media.example").expect("a name");
+        let pinned: Vec<SocketAddr> = resolver.resolve(name).await.expect("pinned").collect();
+        assert_eq!(
+            pinned.iter().map(SocketAddr::ip).collect::<Vec<_>>(),
+            checked
+        );
+        drop(pin);
+        assert!(
+            resolver.pinned("media.example").is_none(),
+            "released with the hop"
+        );
+
+        // One non-public address among the answers refuses the name, and
+        // nothing is pinned for a refused hop.
+        resolver.answer("mixed.example", vec![ip("93.184.216.34"), ip("10.0.0.5")]);
+        let url = Url::parse("http://mixed.example/a.png").expect("url");
+        let error = resolver
+            .admit(&strict, &url)
+            .await
+            .expect_err("judged on every address");
+        assert!(
+            matches!(
+                &error,
+                MediaConnectorError::DisallowedAddress { host, class: "private", .. }
+                    if host == "mixed.example"
+            ),
+            "{error}"
+        );
+        assert!(resolver.pinned("mixed.example").is_none());
+    }
+
     /// An allow-list entry is matched by its name alone: surrounding blanks
     /// (a space after the comma of a list) do not make a host unmatchable,
-    /// and an empty entry lists nothing.
+    /// an empty entry lists nothing, and a list with no names left is no
+    /// allow-list at all (any host the address policy passes), whichever
+    /// way it arrived.
     #[tokio::test]
     async fn allow_list_entries_are_trimmed_and_empty_ones_dropped() {
         let resolver = Arc::new(MediaHostResolver::default());
@@ -517,6 +603,22 @@ mod tests {
             resolver.admit(&listed, &url).await,
             Err(MediaConnectorError::DisallowedDomain(named)) if named == "other.example"
         ));
+
+        for blank in [
+            vec![],
+            vec![String::new()],
+            vec![" ".to_string(), String::new()],
+        ] {
+            let unlisted = MediaHostPolicy::new(Some(blank.clone()), true);
+            assert!(
+                unlisted.allowed_domains.is_none(),
+                "{blank:?} names no host: no allow-list"
+            );
+            resolver
+                .admit(&unlisted, &url)
+                .await
+                .unwrap_or_else(|error| panic!("{blank:?}: {error}"));
+        }
     }
 
     /// A name nothing resolves is the request's error, named. A label over
