@@ -26,18 +26,30 @@ use super::{
 
 /// One resample axis in the layout the passes read: per output index the
 /// source start and tap count, the taps as `i16` at a fixed stride (a
-/// multiple of four, zero-padded), the same taps repeated four-wide for the
-/// horizontal pass, and the shift that undoes their scale.
+/// multiple of four, zero-padded), on AArch64 the same taps repeated
+/// four-wide for the vector width pass, and the shift that undoes their
+/// scale.
 struct Axis {
     bounds: Vec<(usize, usize)>,
     stride: usize,
     taps: Vec<i16>,
+    /// The taps of the width axis four-wide, read by the vector width pass
+    /// only; empty for the height axis.
+    #[cfg(target_arch = "aarch64")]
     taps_wide: Vec<i16>,
     precision: u32,
 }
 
+/// Which pass an [`Axis`] serves: the width pass reads the taps four-wide on
+/// the vector unit, the height pass does not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Width,
+    Height,
+}
+
 impl Axis {
-    fn new(in_size: usize, out_size: usize, filter: PilResizeFilter) -> Self {
+    fn new(in_size: usize, out_size: usize, filter: PilResizeFilter, pass: Pass) -> Self {
         let kernel = FixedKernel::new(in_size, out_size, filter, KernelQuantization::TorchUint8);
         let stride = kernel
             .taps
@@ -48,19 +60,31 @@ impl Axis {
             .div_ceil(4)
             * 4;
         let mut taps = vec![0i16; out_size * stride];
-        let mut taps_wide = vec![0i16; out_size * stride * 4];
         for (index, output_taps) in kernel.taps.iter().enumerate() {
             for (k, &tap) in output_taps.iter().enumerate() {
-                // Below 2^15 in magnitude by the quantization's rule.
-                let tap = i16::try_from(tap).unwrap_or(i16::MAX);
-                taps[index * stride + k] = tap;
-                taps_wide[(index * stride + k) * 4..(index * stride + k + 1) * 4].fill(tap);
+                // Below 2^15 in magnitude by the quantization's rule (the
+                // finest scale that keeps the largest tap under it); a tap
+                // outside `i16` would be a broken invariant, not a value to
+                // clamp.
+                debug_assert!(
+                    i16::try_from(tap).is_ok(),
+                    "torch uint8 tap {tap} exceeds i16"
+                );
+                taps[index * stride + k] = tap as i16;
             }
         }
+        #[cfg(target_arch = "aarch64")]
+        let taps_wide = match pass {
+            Pass::Width => taps.iter().flat_map(|&tap| [tap; 4]).collect(),
+            Pass::Height => Vec::new(),
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = pass;
         Self {
             bounds: kernel.bounds,
             stride,
             taps,
+            #[cfg(target_arch = "aarch64")]
             taps_wide,
             precision: kernel.precision,
         }
@@ -89,13 +113,19 @@ pub(super) fn resize_rgb(
     filter: PilResizeFilter,
 ) -> Vec<u8> {
     debug_assert_eq!(data.len(), in_w * in_h * 3);
+    let width_axis = || Axis::new(in_w, out_w, filter, Pass::Width);
+    let height_axis = || Axis::new(in_h, out_h, filter, Pass::Height);
     match (in_w != out_w, in_h != out_h) {
+        // A zero-sized target has no pixels (the passes would band a zero
+        // chunk); the fallible entry point refuses it, the infallible one
+        // keeps its empty answer.
+        _ if out_w == 0 || out_h == 0 => Vec::new(),
         (false, false) => data.to_vec(),
-        (true, false) => horizontal_pass(data, in_w, in_h, out_w, &Axis::new(in_w, out_w, filter)),
-        (false, true) => vertical_pass(data, out_w, out_h, &Axis::new(in_h, out_h, filter)),
+        (true, false) => horizontal_pass(data, in_w, in_h, out_w, &width_axis()),
+        (false, true) => vertical_pass(data, out_w, out_h, &height_axis()),
         (true, true) => {
-            let mid = horizontal_pass(data, in_w, in_h, out_w, &Axis::new(in_w, out_w, filter));
-            vertical_pass(&mid, out_w, out_h, &Axis::new(in_h, out_h, filter))
+            let mid = horizontal_pass(data, in_w, in_h, out_w, &width_axis());
+            vertical_pass(&mid, out_w, out_h, &height_axis())
         }
     }
 }
@@ -231,9 +261,9 @@ fn vertical_rows(src: &[u8], row_len: usize, axis: &Axis, y0: usize, band: &mut 
 mod neon {
     use core::arch::aarch64::{
         int16x8_t, int32x4_t, uint16x4_t, uint8x16x4_t, vcombine_u16, vcombine_u8, vdupq_n_s16,
-        vdupq_n_s32, vdupq_n_u8, vget_high_s16, vget_low_s16, vget_low_u8, vld1q_s16, vld1q_u8,
-        vld3q_u8, vmlal_high_s16, vmlal_s16, vmovl_high_u8, vmovl_u8, vqmovn_u16, vqmovun_s32,
-        vreinterpret_u32_u8, vreinterpretq_s16_u16, vshlq_s32, vst1_lane_u32, vst1_u8, vst1q_u8,
+        vdupq_n_s32, vdupq_n_u8, vget_high_s16, vget_lane_u32, vget_low_s16, vget_low_u8,
+        vld1q_s16, vld1q_u8, vld3q_u8, vmlal_high_s16, vmlal_s16, vmovl_high_u8, vmovl_u8,
+        vqmovn_u16, vqmovun_s32, vreinterpret_u32_u8, vreinterpretq_s16_u16, vshlq_s32, vst1q_u8,
         vst4q_u8,
     };
 
@@ -311,21 +341,17 @@ mod neon {
             }
             let narrow = clip8x4(sums, shift);
             let bytes = vqmovn_u16(vcombine_u16(narrow, narrow));
+            // The pixel's three bytes (and a fourth, the clipped value of the
+            // first lane again) as a word, written through the slice: a
+            // 3-byte stride is 4-byte aligned for one pixel in four only, so
+            // no typed `u32` store.
+            let word = vget_lane_u32::<0>(vreinterpret_u32_u8(bytes)).to_ne_bytes();
             if index + 1 < out_w {
-                // SAFETY: bytes `3 * index .. 3 * index + 4` lie inside the
-                // row for every pixel but the last; the fourth byte is the
-                // next pixel's first, written again by the next iteration.
-                unsafe {
-                    vst1_lane_u32::<0>(
-                        out_row.as_mut_ptr().add(index * 3).cast::<u32>(),
-                        vreinterpret_u32_u8(bytes),
-                    );
-                }
+                // The fourth byte is the next pixel's first, written again by
+                // the next iteration.
+                out_row[index * 3..index * 3 + 4].copy_from_slice(&word);
             } else {
-                let mut last = [0u8; 8];
-                // SAFETY: `last` is eight bytes.
-                unsafe { vst1_u8(last.as_mut_ptr(), bytes) };
-                out_row[index * 3..index * 3 + 3].copy_from_slice(&last[..3]);
+                out_row[index * 3..index * 3 + 3].copy_from_slice(&word[..3]);
             }
         }
     }
@@ -487,6 +513,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A zero-sized target is an empty buffer, as the previous resampler
+    /// answered (the infallible entry point keeps that contract).
+    #[test]
+    fn a_zero_sized_target_is_empty() {
+        let data = gradient(9, 4, 2);
+        assert!(resize_rgb(&data, 9, 4, 0, 4, PilResizeFilter::Bicubic).is_empty());
+        assert!(resize_rgb(&data, 9, 4, 9, 0, PilResizeFilter::Bicubic).is_empty());
+        assert!(resize_rgb(&data, 9, 4, 0, 0, PilResizeFilter::Bicubic).is_empty());
     }
 
     /// The identity (no change on either axis) is a plain copy.
