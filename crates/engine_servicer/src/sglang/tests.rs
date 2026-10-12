@@ -863,6 +863,61 @@ async fn a_scheduler_refusal_is_the_callers_error() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A model that takes multimodal input is advertised without vision until
+/// this servicer carries media to the scheduler (the wire refuses
+/// `mm_inputs`): `GetModelInfo.supports_vision` is false whatever the
+/// launcher reported, and `GetServerInfo.server_args` carries the same
+/// `false` on purpose, where the Router reads a non-vLLM servicer's verdict
+/// (a proto3 `false` in `GetModelInfo` is no verdict there). The Router then
+/// refuses image and video input at its gate instead of after fetching it.
+#[tokio::test]
+async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried() {
+    let mut vision = model_info();
+    vision.model_type = "qwen3_vl".to_string();
+    vision.architectures = vec!["Qwen3VLForConditionalGeneration".to_string()];
+    vision.supports_vision = true;
+    let mut h = harness(vision).await;
+    let info = h
+        .client
+        .get_model_info(sg::GetModelInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !info.supports_vision,
+        "no media reaches the scheduler over this wire yet"
+    );
+    let server = h
+        .client
+        .get_server_info(sg::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let args = server.server_args.expect("server_args");
+    assert_eq!(
+        args.fields["supports_vision"].kind,
+        Some(Kind::BoolValue(false)),
+        "the servicer's own verdict, where the Router reads it"
+    );
+    assert_eq!(
+        args.fields["tp_size"].kind,
+        Some(Kind::NumberValue(2.0)),
+        "the launcher's server_args stay as written"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // A text model reads the same: no vision served, whatever the field says.
+    let mut h = harness(model_info()).await;
+    let info = h
+        .client
+        .get_model_info(sg::GetModelInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!info.supports_vision);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Model and server info come from the launcher's facts plus the handshake's
 /// capacity figures; loads are zero-filled until a batch carries a snapshot.
 #[tokio::test]

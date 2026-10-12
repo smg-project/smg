@@ -8,7 +8,7 @@ use smg_grpc_client::sglang_proto as sg;
 use tonic::Status;
 
 use super::State;
-use crate::proto_json::{number, struct_from_json};
+use crate::proto_json::{boolean, number, struct_from_json};
 
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
 pub(super) fn health_check(state: &State) -> sg::HealthCheckResponse {
@@ -47,7 +47,11 @@ pub(super) fn model_info(state: &State) -> sg::GetModelInfoResponse {
         served_model_name: model.served_model_name.clone(),
         max_context_length,
         vocab_size: model.vocab_size,
-        supports_vision: model.supports_vision,
+        // Not the model's capability: this servicer carries no media to the
+        // scheduler yet (the wire refuses `mm_inputs`), so it serves none,
+        // whatever the launcher reported; see `server_info`, which says so
+        // where the Router reads a verdict.
+        supports_vision: false,
         model_type: model.model_type.clone(),
         eos_token_ids: model
             .eos_token_ids
@@ -75,6 +79,18 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
         .get()
         .and_then(ZmqEngineClient::ready_response);
     let max_total_num_tokens = max_total_num_tokens(state);
+    let mut server_args = struct_from_json(&model.server_args_json);
+    // This servicer does not carry media to the scheduler yet (the wire
+    // refuses `mm_inputs`), so it advertises no vision, on purpose and where
+    // the Router reads it: `GetModelInfo.supports_vision` is a proto3 bool
+    // whose `false` the Router drops as no verdict for this runtime, while a
+    // `false` written here is the servicer's own, and the Router refuses
+    // image and video input for the worker at its gate instead of after
+    // fetching it. The label follows the model's capability again once the
+    // wire carries media.
+    server_args
+        .fields
+        .insert("supports_vision".to_string(), boolean(false));
     let mut scheduler_info = struct_from_json(&model.scheduler_info_json);
     if let Some(ready) = ready {
         scheduler_info.fields.insert(
@@ -91,7 +107,7 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
         );
     }
     sg::GetServerInfoResponse {
-        server_args: Some(struct_from_json(&model.server_args_json)),
+        server_args: Some(server_args),
         scheduler_info: Some(scheduler_info),
         active_requests: i32::try_from(state.registry.len()).unwrap_or(i32::MAX),
         is_paused: false,

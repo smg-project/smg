@@ -2250,6 +2250,108 @@ mod request_release_tests {
         );
     }
 
+    /// An SGLang servicer that carries no media to its engine says so with a
+    /// deliberate `supports_vision=false` in its `server_args` (its
+    /// `GetModelInfo` bool is no verdict for this runtime): with the labels
+    /// discovery merges from both, the worker reads as language model only,
+    /// and an image is refused at the gate before anything is decoded or
+    /// dispatched, instead of after the media was fetched.
+    #[tokio::test]
+    async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispatch() {
+        use std::collections::BTreeMap;
+
+        use smg_grpc_client::sglang_proto;
+
+        use crate::routers::grpc::client::ServerInfo;
+
+        let mut merged = ModelInfo::Sglang(Box::default()).to_labels();
+        merged.extend(
+            ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+                server_args: Some(prost_types::Struct {
+                    fields: BTreeMap::from([(
+                        "supports_vision".to_string(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::BoolValue(false)),
+                        },
+                    )]),
+                }),
+                ..Default::default()
+            }))
+            .to_labels(),
+        );
+        let mut labels: Vec<(String, String)> = merged.into_iter().collect();
+        labels.sort();
+        assert!(
+            labels
+                .iter()
+                .any(|(key, value)| key == SUPPORTS_VISION_LABEL && value == "false"),
+            "{labels:?}"
+        );
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_with_labels(
+            &worker_registry,
+            port,
+            WorkerType::Regular,
+            &label_pairs(&labels),
+        );
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        let request: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }))
+            .expect("chat request"),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the refusal must not wait on anything");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        assert!(
+            seen_ids.lock().expect("seen ids").is_empty(),
+            "nothing must reach the worker"
+        );
+    }
+
     /// An image to a model whose only worker runs without a vision encoder
     /// is refused with a prompt 400 that names the modality and the model,
     /// before any media is decoded and before anything reaches the worker

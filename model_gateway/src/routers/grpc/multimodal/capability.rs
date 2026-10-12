@@ -31,7 +31,9 @@ use crate::{
 /// only vLLM's `false` becomes a label; for the other runtimes a `false`
 /// cannot be told from a servicer's default and is dropped
 /// (`ModelInfo::to_labels`), and an absent label reads as unknown, never as
-/// a refusal.
+/// a refusal. An SGLang servicer that carries no media to its engine writes
+/// a deliberate `false` into its `server_args`, which is kept
+/// (`ServerInfo::to_labels`).
 pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
 
 /// Whether the worker's engine runs without a vision encoder (a vLLM
