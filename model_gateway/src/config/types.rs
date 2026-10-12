@@ -88,6 +88,8 @@ pub struct RouterConfig {
     pub header_read_timeout_secs: u64,
     /// Close a keep-alive connection that has had no request in flight for
     /// this many seconds; an open streaming response counts as in flight.
+    /// The bound starts with the connection's first request: a connection
+    /// that never sends one is bounded by `header_read_timeout_secs` alone.
     /// `0` keeps idle connections until the client closes them.
     #[serde(default = "default_idle_connection_timeout_secs")]
     pub idle_connection_timeout_secs: u64,

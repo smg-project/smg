@@ -1523,8 +1523,10 @@ class RouterArgs:
             help=(
                 "Close a keep-alive connection that has had no request in flight"
                 " for this many seconds; an open streaming response counts as in"
-                " flight. 0 keeps idle connections open until the client closes"
-                " them"
+                " flight. The bound starts with the connection's first request (a"
+                " connection that never sends one is bounded by"
+                " --header-read-timeout-secs alone). 0 keeps idle connections open"
+                " until the client closes them"
             ),
         )
         request_group.add_argument(

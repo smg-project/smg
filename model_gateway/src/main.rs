@@ -994,7 +994,9 @@ struct CliArgs {
     header_read_timeout_secs: u64,
 
     /// Close a keep-alive connection that has had no request in flight for
-    /// this many seconds; an open streaming response counts as in flight. 0
+    /// this many seconds; an open streaming response counts as in flight. The
+    /// bound starts with the connection's first request (a connection that
+    /// never sends one is bounded by --header-read-timeout-secs alone). 0
     /// keeps idle connections open until the client closes them
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
