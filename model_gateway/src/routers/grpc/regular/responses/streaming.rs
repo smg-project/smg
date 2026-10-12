@@ -90,6 +90,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
     let response_id = params.response_id;
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
 
     // Get chat streaming response
     let chat_response = ctx
@@ -145,6 +146,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            tenant,
             request_context,
             tx.clone(),
         )
@@ -202,6 +204,7 @@ async fn process_and_transform_sse_stream(
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    tenant: Option<String>,
     request_context: Option<StorageRequestContext>,
     tx: SseSender,
 ) -> Result<(), String> {
@@ -317,6 +320,7 @@ async fn process_and_transform_sse_stream(
         response_storage,
         &final_response,
         &original_request,
+        tenant.as_deref(),
         request_context,
     );
     if stored_foreground(&original_request) {
@@ -1045,12 +1049,14 @@ async fn execute_tool_loop_streaming_internal(
         final_response.incomplete_details = None;
         final_response.error = Some(error);
     }
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
     let persist = persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
         &final_response,
         original_request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
     );
     if stored_foreground(original_request) {
@@ -1342,6 +1348,7 @@ mod tests {
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
                 Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
                 None,
+                None,
                 tx,
             )
             .await
@@ -1521,6 +1528,7 @@ mod tests {
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
             None,
             tx,
         )
@@ -1825,6 +1833,7 @@ mod tests {
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
             None,
             tx,
         )

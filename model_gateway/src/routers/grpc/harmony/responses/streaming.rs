@@ -50,11 +50,14 @@ pub(crate) async fn serve_harmony_responses_stream(
     tenant_request_meta: TenantRequestMeta,
     background: Option<BackgroundStream>,
 ) -> Response {
-    // Load previous conversation history if previous_response_id is set
-    let current_request = match load_previous_messages(ctx, request.clone()).await {
-        Ok(req) => req,
-        Err(err_response) => return err_response,
-    };
+    // Load previous conversation history if previous_response_id is set, as
+    // the caller's tenant may see it
+    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
+    let current_request =
+        match load_previous_messages(ctx, request.clone(), tenant.as_deref()).await {
+            Ok(req) => req,
+            Err(err_response) => return err_response,
+        };
 
     // Check MCP connection BEFORE starting stream and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
@@ -382,6 +385,7 @@ async fn execute_mcp_tool_loop_streaming(
                         ctx.response_storage.clone(),
                         &final_response,
                         original_request,
+                        crate::tenant::storage_tenant(&tenant_request_meta).as_deref(),
                         ctx.request_context.clone(),
                     )
                     .await
@@ -462,6 +466,7 @@ async fn execute_mcp_tool_loop_streaming(
                         ctx.response_storage.clone(),
                         &final_response,
                         original_request,
+                        crate::tenant::storage_tenant(&tenant_request_meta).as_deref(),
                         ctx.request_context.clone(),
                     )
                     .await
@@ -511,12 +516,14 @@ async fn execute_mcp_tool_loop_streaming(
                 // Persist response to storage if store=true; a foreground
                 // response the client expects stored ends with
                 // response.failed when its record could not be written.
+                let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
                 let not_stored = persist_response_if_needed(
                     ctx.conversation_storage.clone(),
                     ctx.conversation_item_storage.clone(),
                     ctx.response_storage.clone(),
                     &final_response,
                     original_request,
+                    tenant.as_deref(),
                     ctx.request_context.clone(),
                 )
                 .await
@@ -559,6 +566,7 @@ async fn execute_without_mcp_streaming(
     mut startup: Option<StreamStartupSender>,
 ) {
     debug!("No MCP tools - executing single iteration");
+    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
 
     // Execute pipeline and get stream + load guards
     let startup_pending = startup.is_some();
@@ -626,6 +634,7 @@ async fn execute_without_mcp_streaming(
         ctx.response_storage.clone(),
         &final_response,
         original_request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
     )
     .await

@@ -195,19 +195,23 @@ pub(super) fn inject_mcp_metadata(
 /// Load previous conversation messages from storage
 ///
 /// If the request has `previous_response_id`, loads the response chain from storage
-/// and prepends the conversation history to the request input items.
+/// and prepends the conversation history to the request input items. `tenant` is
+/// the caller's tenant: a previous response of another tenant answers as a
+/// missing one does.
 pub(super) async fn load_previous_messages(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
+    tenant: Option<&str>,
 ) -> Result<ResponsesRequest, Response> {
     let Some(ref prev_id_str) = request.previous_response_id else {
         // No previous_response_id, return request as-is
         return Ok(request);
     };
 
-    // The chain behind the id, or the refusal shared with the other loaders
-    // (an unknown id, an empty chain, a record its client asked not to store).
-    let responses = previous_response_chain(&ctx.response_storage, prev_id_str).await?;
+    // The chain behind the id, scoped to the caller's tenant, or the refusal
+    // shared with the other loaders (an unknown id, an empty or invisible
+    // chain, a record its client asked not to store).
+    let responses = previous_response_chain(&ctx.response_storage, prev_id_str, tenant).await?;
 
     // Build conversation history from stored responses
     let mut history_items = Vec::new();

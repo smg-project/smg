@@ -38,6 +38,7 @@ pub(super) const RESPONSE_COLUMNS: &[&str] = &[
     "safety_identifier",
     "model",
     "raw_response",
+    "tenant",
 ];
 
 /// Build the `SELECT col1, col2, ... FROM table` base query for responses.

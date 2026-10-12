@@ -142,22 +142,28 @@ impl ResponseStorage for BoundedResponseStorage {
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
         self.bound
             .run(
                 "list_identifier_responses",
-                self.inner.list_identifier_responses(identifier, limit),
+                self.inner
+                    .list_identifier_responses(identifier, tenant, limit),
                 ResponseStorageError::Timeout,
             )
             .await
     }
 
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
         self.bound
             .run(
                 "delete_identifier_responses",
-                self.inner.delete_identifier_responses(identifier),
+                self.inner.delete_identifier_responses(identifier, tenant),
                 ResponseStorageError::Timeout,
             )
             .await
@@ -385,12 +391,17 @@ mod tests {
         async fn list_identifier_responses(
             &self,
             _identifier: &str,
+            _tenant: Option<&str>,
             _limit: Option<usize>,
         ) -> ResponseResult<Vec<StoredResponse>> {
             Ok(Vec::new())
         }
 
-        async fn delete_identifier_responses(&self, _identifier: &str) -> ResponseResult<usize> {
+        async fn delete_identifier_responses(
+            &self,
+            _identifier: &str,
+            _tenant: Option<&str>,
+        ) -> ResponseResult<usize> {
             Ok(0)
         }
     }
@@ -521,6 +532,7 @@ mod tests {
                     role: Some("user".to_string()),
                     content: json!([]),
                     status: Some("completed".to_string()),
+                    tenant: None,
                 })
                 .await
                 .unwrap();

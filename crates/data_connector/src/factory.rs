@@ -280,6 +280,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: None,
                 metadata: None,
+                tenant: None,
             })
             .await
             .unwrap();
@@ -476,6 +477,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: None,
                 metadata: None,
+                tenant: None,
             })
             .await
             .unwrap();

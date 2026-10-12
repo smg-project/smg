@@ -62,8 +62,10 @@ pub(crate) async fn serve_harmony_responses(
     // Clone request for persistence
     let original_request = request.clone();
 
-    // Load previous conversation history if previous_response_id is set
-    let current_request = load_previous_messages(ctx, request).await?;
+    // Load previous conversation history if previous_response_id is set, as
+    // the caller's tenant may see it
+    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
+    let current_request = load_previous_messages(ctx, request, tenant.as_deref()).await?;
 
     // Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -97,6 +99,7 @@ pub(crate) async fn serve_harmony_responses(
         ctx.response_storage.clone(),
         &response,
         &original_request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
     )
     .await

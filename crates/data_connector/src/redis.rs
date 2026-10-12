@@ -99,6 +99,22 @@ impl RedisConversationStorage {
         crate::common::parse_conversation_metadata(metadata)
             .map_err(ConversationStorageError::StorageError)
     }
+
+    /// The tenant stored on a conversation's hash: `None` when the schema
+    /// skips the column or the record carries none.
+    async fn read_tenant(
+        &self,
+        conn: &mut Connection,
+        key: &str,
+    ) -> Result<Option<String>, ConversationStorageError> {
+        let s = &self.store.schema.conversations;
+        if s.is_skipped("tenant") {
+            return Ok(None);
+        }
+        conn.hget(key, s.col("tenant"))
+            .await
+            .map_err(|e| ConversationStorageError::StorageError(e.to_string()))
+    }
 }
 
 #[async_trait]
@@ -134,6 +150,11 @@ impl ConversationStorage for RedisConversationStorage {
         if !s.is_skipped("metadata") {
             if let Some(meta) = metadata_json {
                 pipe.hset(&key, s.col("metadata"), meta);
+            }
+        }
+        if !s.is_skipped("tenant") {
+            if let Some(tenant) = &conversation.tenant {
+                pipe.hset(&key, s.col("tenant"), tenant);
             }
         }
 
@@ -201,10 +222,12 @@ impl ConversationStorage for RedisConversationStorage {
             Self::parse_metadata(metadata_json)?
         };
 
+        let tenant = self.read_tenant(&mut conn, &key).await?;
         Ok(Some(Conversation::with_parts(
             id.clone(),
             created_at,
             metadata,
+            tenant,
         )))
     }
 
@@ -260,10 +283,12 @@ impl ConversationStorage for RedisConversationStorage {
                 .with_timezone(&Utc)
         };
 
+        let tenant = self.read_tenant(&mut conn, &key).await?;
         Ok(Some(Conversation::with_parts(
             id.clone(),
             created_at,
             metadata,
+            tenant,
         )))
     }
 
@@ -847,6 +872,11 @@ impl RedisResponseStorage {
             parse_raw_response(map.get(s.col("raw_response")).cloned())
                 .map_err(ResponseStorageError::StorageError)?
         };
+        let tenant = if s.is_skipped("tenant") {
+            None
+        } else {
+            map.get(s.col("tenant")).cloned()
+        };
 
         Ok(StoredResponse {
             id,
@@ -857,7 +887,41 @@ impl RedisResponseStorage {
             model,
             conversation_id,
             raw_response,
+            tenant,
         })
+    }
+
+    /// The responses stored under `response_ids`, in that order, those the
+    /// caller's `tenant` may see.
+    async fn visible_responses(
+        &self,
+        conn: &mut Connection,
+        response_ids: &[String],
+        tenant: Option<&str>,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        if response_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for id in response_ids {
+            pipe.hgetall(self.response_key(id));
+        }
+        let results: Vec<HashMap<String, String>> = pipe
+            .query_async(conn)
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+
+        let mut out: Vec<StoredResponse> = Vec::with_capacity(results.len());
+        for (i, map) in results.into_iter().enumerate() {
+            if map.is_empty() {
+                continue;
+            }
+            let response = self.build_response_from_map(map, &response_ids[i])?;
+            if response.is_visible_to(tenant) {
+                out.push(response);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -913,6 +977,11 @@ impl ResponseStorage for RedisResponseStorage {
         }
         if !sr.is_skipped("raw_response") {
             pipe.hset(&key, sr.col("raw_response"), &json_raw_response);
+        }
+        if !sr.is_skipped("tenant") {
+            if let Some(tenant) = &response.tenant {
+                pipe.hset(&key, sr.col("tenant"), tenant);
+            }
         }
 
         // Append extra columns from hooks or defaults
@@ -1091,6 +1160,7 @@ impl ResponseStorage for RedisResponseStorage {
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
         let sr = &self.store.schema.responses;
@@ -1106,43 +1176,28 @@ impl ResponseStorage for RedisResponseStorage {
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
 
-        let stop = match limit {
-            Some(l) => (l as isize) - 1,
-            None => -1,
-        };
-
+        // The whole index, newest first: the tenant is a field of each
+        // record, so the limit applies after the records the caller may not
+        // see are dropped.
         let response_ids: Vec<String> = conn
-            .zrevrange(&key, 0, stop)
+            .zrevrange(&key, 0, -1)
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
 
-        if response_ids.is_empty() {
-            return Ok(Vec::<StoredResponse>::new());
+        let mut out = self
+            .visible_responses(&mut conn, &response_ids, tenant)
+            .await?;
+        if let Some(limit) = limit {
+            out.truncate(limit);
         }
-
-        let mut pipe = redis::pipe();
-        for id in &response_ids {
-            pipe.hgetall(self.response_key(id));
-        }
-
-        let results: Vec<HashMap<String, String>> = pipe
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-
-        let mut out: Vec<StoredResponse> = Vec::with_capacity(results.len());
-        for (i, map) in results.into_iter().enumerate() {
-            if map.is_empty() {
-                continue;
-            }
-
-            out.push(self.build_response_from_map(map, &response_ids[i])?);
-        }
-
         Ok(out)
     }
 
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
         let sr = &self.store.schema.responses;
         if sr.is_skipped("safety_identifier") {
             return Ok(0);
@@ -1160,16 +1215,25 @@ impl ResponseStorage for RedisResponseStorage {
             .zrange(&key, 0, -1)
             .await
             .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
-        let count = response_ids.len();
+        if response_ids.is_empty() {
+            return Ok(0);
+        }
 
+        // Only the records the caller may see go; the others keep their
+        // place in the index.
+        let visible_ids: Vec<String> = self
+            .visible_responses(&mut conn, &response_ids, tenant)
+            .await?
+            .into_iter()
+            .map(|response| response.id.0)
+            .collect();
+        let count = visible_ids.len();
         if count == 0 {
             return Ok(0);
         }
 
-        let response_keys: Vec<String> = response_ids
-            .iter()
-            .map(|id| self.response_key(id))
-            .collect();
+        let response_keys: Vec<String> =
+            visible_ids.iter().map(|id| self.response_key(id)).collect();
         let output_item_keys = self
             .output_item_keys_of_many(&mut conn, &response_keys)
             .await?;
@@ -1181,7 +1245,8 @@ impl ResponseStorage for RedisResponseStorage {
         for item_key in &output_item_keys {
             pipe.del(item_key);
         }
-        pipe.del(&key);
+        // An index left empty goes with its last member.
+        pipe.zrem(&key, &visible_ids);
 
         pipe.query_async::<()>(&mut conn)
             .await

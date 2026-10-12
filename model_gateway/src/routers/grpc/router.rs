@@ -533,6 +533,7 @@ impl GrpcRouter {
             &ctx.response_storage,
             &queued,
             &request,
+            crate::tenant::storage_tenant(tenant_meta).as_deref(),
             ctx.request_context.clone(),
         )
         .await
@@ -1075,11 +1076,17 @@ impl RouterTrait for GrpcRouter {
             .await
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        response_id: &str,
+    ) -> Response {
         let Some(responses_context) = self.responses_context.as_ref() else {
             return not_implemented("Cancel response not implemented");
         };
-        cancel_response_impl(responses_context, response_id).await
+        let tenant = crate::tenant::storage_tenant(tenant_meta);
+        cancel_response_impl(responses_context, tenant.as_deref(), response_id).await
     }
 
     async fn route_embeddings(
@@ -1683,7 +1690,9 @@ mod pd_tests {
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let cancel = router.cancel_response(None, "resp_missing").await;
+        let cancel = router
+            .cancel_response(None, &tenant_meta, "resp_missing")
+            .await;
         assert_eq!(cancel.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1700,7 +1709,9 @@ mod pd_tests {
             .await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
-        let cancel = router.cancel_response(None, "resp_missing").await;
+        let cancel = router
+            .cancel_response(None, &tenant_meta, "resp_missing")
+            .await;
         assert_eq!(cancel.status(), StatusCode::NOT_IMPLEMENTED);
     }
 

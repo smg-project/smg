@@ -10,7 +10,7 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 use smg_data_connector::{
-    is_unstored, ConversationItemStorage, ConversationStorage,
+    is_unstored, visible_chain, ConversationItemStorage, ConversationStorage,
     RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
     StoredResponse,
 };
@@ -362,19 +362,29 @@ impl NotStored {
 /// store does not know, an empty chain, or a chain ending in a record its
 /// client asked not to store (a background run's record, kept for its
 /// polling window only: a chain built on it would break when it goes, so it
-/// is no previous response, as the public API answers for an unstored id);
+/// is no previous response, as the public API answers for an unstored id),
+/// or a chain with no record the caller's `tenant` may see (the chain ends at
+/// the first record of another tenant, as it would at a missing one);
 /// `load_previous_response_chain_failed` for a store that failed (a 503
 /// `storage_unavailable` when it timed out, see `error::storage_failure`).
 pub(crate) async fn previous_response_chain(
     storage: &Arc<dyn ResponseStorage>,
     prev_id_str: &str,
+    tenant: Option<&str>,
 ) -> Result<Vec<StoredResponse>, Response> {
     let prev_id = ResponseId::from(prev_id_str);
     match storage.get_response_chain(&prev_id, None).await {
         Ok(chain)
             if !chain.responses.is_empty() && !chain.responses.last().is_some_and(is_unstored) =>
         {
-            Ok(chain.responses)
+            let responses = visible_chain(chain.responses, tenant);
+            if responses.is_empty() {
+                return Err(error::bad_request(
+                    "previous_response_not_found",
+                    format!("Previous response with id '{prev_id_str}' not found."),
+                ));
+            }
+            Ok(responses)
         }
         Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::bad_request(
             "previous_response_not_found",
@@ -415,13 +425,15 @@ pub(crate) fn stored_foreground(request: &ResponsesRequest) -> bool {
 /// response has nothing to fail: those answer `Ok`.
 ///
 /// Common helper function to avoid duplication across sync and streaming paths
-/// in both harmony and regular responses implementations.
+/// in both harmony and regular responses implementations. The record is
+/// scoped to the caller's `tenant`.
 pub(crate) async fn persist_response_if_needed(
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,
     response: &ResponsesResponse,
     original_request: &ResponsesRequest,
+    tenant: Option<&str>,
     request_context: Option<StorageRequestContext>,
 ) -> Result<(), NotStored> {
     if !original_request.store.unwrap_or(true) {
@@ -486,6 +498,7 @@ pub(crate) async fn persist_response_if_needed(
             response_storage.clone(),
             &response_json,
             original_request,
+            tenant,
             request_context.clone(),
         )
         .await
@@ -605,15 +618,15 @@ mod tests {
             storage.store_response(response).await.unwrap();
         }
 
-        let refused = previous_response_chain(&storage, "resp_unstored")
+        let refused = previous_response_chain(&storage, "resp_unstored", None)
             .await
             .expect_err("an unstored record is no previous response");
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        let chain = previous_response_chain(&storage, "resp_stored")
+        let chain = previous_response_chain(&storage, "resp_stored", None)
             .await
             .expect("a stored record is a previous response");
         assert_eq!(chain.len(), 1);
-        let unknown = previous_response_chain(&storage, "resp_unknown")
+        let unknown = previous_response_chain(&storage, "resp_unknown", None)
             .await
             .expect_err("an unknown id is refused");
         assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);

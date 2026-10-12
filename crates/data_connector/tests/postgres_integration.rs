@@ -217,6 +217,7 @@ async fn conversation_metadata_round_trips_json_column() {
         .create_conversation(NewConversation {
             id: None,
             metadata: Some(metadata.clone()),
+            tenant: None,
         })
         .await
         .expect("create_conversation");
@@ -350,7 +351,8 @@ async fn find_response_by_output_item_queries_the_stored_output() {
 /// the store's `CREATE TABLE IF NOT EXISTS` leaves it as it is, so it has
 /// only what its owner gave it. `unique_id` decides whether the mapped id
 /// column carries a unique index. Returns the connection and the task that
-/// drives it (the connection ends with the set).
+/// drives it (the connection ends with the set). The table carries every core
+/// column, as one an operator created for this gateway would.
 async fn create_configured_responses_table(
     db_url: &str,
     table: &str,
@@ -373,7 +375,8 @@ async fn create_configured_responses_table(
             "DROP TABLE IF EXISTS {table}; \
              CREATE TABLE {table} ({id_def}, conversation_id VARCHAR(64), \
              previous_response_id VARCHAR(64), input JSON, created_at TIMESTAMPTZ, \
-             safety_identifier VARCHAR(128), model VARCHAR(128), payload JSON)"
+             safety_identifier VARCHAR(128), model VARCHAR(128), payload JSON, \
+             tenant VARCHAR(255))"
         ))
         .await
         .map_err(|e| format!("create the configured responses table: {e}"))?;
@@ -715,6 +718,7 @@ async fn conversation_items_linked_a_microsecond_apart_list_in_link_order() {
         .create_conversation(NewConversation {
             id: None,
             metadata: None,
+            tenant: None,
         })
         .await
         .expect("create conversation");
@@ -797,6 +801,7 @@ async fn a_second_link_of_an_item_is_refused_by_the_key_and_the_item_lists_once(
         .create_conversation(NewConversation {
             id: None,
             metadata: None,
+            tenant: None,
         })
         .await
         .expect("create conversation");
@@ -1090,6 +1095,7 @@ async fn a_fresh_database_bootstraps_at_the_latest_version_without_auto_migrate(
                 .create_conversation(NewConversation {
                     id: None,
                     metadata: None,
+                    tenant: None,
                 })
                 .await,
         ),
@@ -1490,4 +1496,113 @@ async fn a_store_that_stops_answering_fails_the_call_at_its_bound() {
         .expect("the read after the release must return")
         .expect("the read after the release must succeed");
     assert_eq!(read_back.map(|r| r.id), Some(id));
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn responses_and_conversations_keep_their_tenant_and_the_identifier_queries_are_scoped() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url)
+        .await
+        .expect("failed to initialize Postgres storage");
+    let resp = bundle.response_storage;
+
+    // Three responses under one safety identifier (unique to this run): tenant
+    // a's, tenant b's and one stored under no tenant.
+    let mut of_a = StoredResponse::new(None);
+    let identifier = format!("sid_{}", of_a.id.0);
+    of_a.safety_identifier = Some(identifier.clone());
+    of_a.tenant = Some("header:a".to_string());
+    of_a.input = json!(["a"]);
+    of_a.raw_response = json!({"output": []});
+    let mut of_b = StoredResponse::new(None);
+    of_b.safety_identifier = Some(identifier.clone());
+    of_b.tenant = Some("header:b".to_string());
+    of_b.input = json!(["b"]);
+    of_b.raw_response = json!({"output": []});
+    let mut of_nobody = StoredResponse::new(None);
+    of_nobody.safety_identifier = Some(identifier.clone());
+    of_nobody.input = json!(["nobody"]);
+    of_nobody.raw_response = json!({"output": []});
+    let id_a = resp.store_response(of_a).await.expect("store a's");
+    let id_b = resp.store_response(of_b).await.expect("store b's");
+    let id_nobody = resp
+        .store_response(of_nobody)
+        .await
+        .expect("store the untenanted one");
+
+    // The tenant column round-trips.
+    let fetched = resp.get_response(&id_a).await.unwrap().expect("a's record");
+    assert_eq!(fetched.tenant.as_deref(), Some("header:a"));
+    let fetched = resp
+        .get_response(&id_nobody)
+        .await
+        .unwrap()
+        .expect("the untenanted record");
+    assert_eq!(fetched.tenant, None);
+
+    // The listing by safety identifier is scoped in the query itself.
+    let ids = |responses: Vec<StoredResponse>| {
+        let mut ids: Vec<String> = responses.into_iter().map(|r| r.id.0).collect();
+        ids.sort();
+        ids
+    };
+    let mut expected = vec![id_a.0.clone(), id_nobody.0.clone()];
+    expected.sort();
+    let listed = resp
+        .list_identifier_responses(&identifier, Some("header:a"), None)
+        .await
+        .expect("list as a");
+    assert_eq!(ids(listed), expected, "a's record and the untenanted one");
+    let listed = resp
+        .list_identifier_responses(&identifier, None, Some(10))
+        .await
+        .expect("list without a tenant");
+    assert_eq!(ids(listed), vec![id_nobody.0.clone()]);
+
+    // So is the deletion: a's call takes a's record and the untenanted one, b's stays.
+    let deleted = resp
+        .delete_identifier_responses(&identifier, Some("header:a"))
+        .await
+        .expect("delete as a");
+    assert_eq!(deleted, 2);
+    assert!(resp.get_response(&id_a).await.unwrap().is_none());
+    assert!(resp.get_response(&id_b).await.unwrap().is_some());
+    let left = resp
+        .list_identifier_responses(&identifier, Some("header:b"), None)
+        .await
+        .expect("list as b");
+    assert_eq!(ids(left), vec![id_b.0.clone()]);
+
+    // A conversation keeps its tenant through a read and a metadata update.
+    let conversations = bundle.conversation_storage;
+    let created = conversations
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+            tenant: Some("header:a".to_string()),
+        })
+        .await
+        .expect("create conversation");
+    let fetched = conversations
+        .get_conversation(&created.id)
+        .await
+        .expect("get conversation")
+        .expect("created");
+    assert_eq!(fetched.tenant.as_deref(), Some("header:a"));
+    let metadata = json!({"topic": "tenants"}).as_object().cloned();
+    let updated = conversations
+        .update_conversation(&created.id, metadata.clone())
+        .await
+        .expect("update conversation")
+        .expect("exists");
+    assert_eq!(updated.tenant.as_deref(), Some("header:a"));
+    assert_eq!(updated.metadata, metadata);
+    assert_eq!(updated.created_at, fetched.created_at);
+    assert!(conversations
+        .delete_conversation(&created.id)
+        .await
+        .expect("delete conversation"));
 }

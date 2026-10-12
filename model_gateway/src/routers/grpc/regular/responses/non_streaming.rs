@@ -51,8 +51,10 @@ pub(super) async fn route_responses_internal(
     request: Arc<ResponsesRequest>,
     params: ResponsesCallContext,
 ) -> Result<ResponsesResponse, Response> {
-    // 1. Load conversation history and build modified request
-    let modified_request = load_conversation_history(ctx, &request).await?;
+    // 1. Load conversation history (as the caller's tenant may see it) and
+    //    build modified request
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let modified_request = load_conversation_history(ctx, &request, tenant.as_deref()).await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -80,6 +82,7 @@ pub(super) async fn route_responses_internal(
         ctx.response_storage.clone(),
         &responses_response,
         &request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
     )
     .await

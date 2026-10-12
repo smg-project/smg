@@ -47,7 +47,7 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_data_connector::{
     with_request_context, RequestContext as StorageRequestContext, ResponseId, ResponseStorage,
-    ResponseStorageError,
+    ResponseStorageError, StoredResponse,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -221,11 +221,13 @@ pub(crate) fn queued_response(id: &str, request: &ResponsesRequest) -> Responses
 
 /// Stores `response` under its id with the request's input items, as the
 /// terminal record will carry them, so `GET /v1/responses/{id}` and its
-/// `input_items` answer from the first poll.
+/// `input_items` answer from the first poll; the record is scoped to the
+/// caller's `tenant`.
 pub(crate) async fn store_record(
     storage: &Arc<dyn ResponseStorage>,
     response: &ResponsesResponse,
     request: &ResponsesRequest,
+    tenant: Option<&str>,
     request_context: Option<StorageRequestContext>,
 ) -> Result<(), ResponseStorageError> {
     let raw = serde_json::to_value(response)?;
@@ -233,6 +235,7 @@ pub(crate) async fn store_record(
     stored.input = Value::Array(
         extract_input_items(&request.input).map_err(ResponseStorageError::StorageError)?,
     );
+    stored.tenant = tenant.map(str::to_string);
     let store = async { storage.store_response(stored).await.map(|_| ()) };
     match request_context {
         Some(ctx) => with_request_context(ctx, store).await,
@@ -965,15 +968,47 @@ impl BackgroundStream {
     }
 }
 
-/// `POST /v1/responses/{id}/cancel`: a response this gateway runs is stopped
-/// and answered as `cancelled` once its task has written the record; a
-/// `queued` or `in_progress` background record no task runs here (a response
-/// of another gateway sharing the store, or one lost with a restart) is
-/// closed as `cancelled`, which the gateway running it reads within
-/// [`STATUS_WATCH`] and drops its work on; a response that already ended, or
-/// one that never ran in the background, is refused.
-pub(crate) async fn cancel(ctx: &ResponsesContext, response_id: &str) -> Response {
-    if let Some(mut finished) = ctx.background.cancel(response_id) {
+/// `POST /v1/responses/{id}/cancel` for a caller of `tenant`: a response
+/// this gateway runs is stopped and answered as `cancelled` once its task has
+/// written the record; a `queued` or `in_progress` background record no task
+/// runs here (a response of another gateway sharing the store, or one lost
+/// with a restart) is closed as `cancelled`, which the gateway running it
+/// reads within [`STATUS_WATCH`] and drops its work on; a response that
+/// already ended, or one that never ran in the background, is refused. A
+/// response of another tenant answers as an unknown id does, and nothing
+/// running under its id is touched.
+pub(crate) async fn cancel(
+    ctx: &ResponsesContext,
+    tenant: Option<&str>,
+    response_id: &str,
+) -> Response {
+    cancel_with(
+        &ctx.background,
+        &ctx.response_storage,
+        ctx.request_context.clone(),
+        tenant,
+        response_id,
+    )
+    .await
+}
+
+/// [`cancel`] over the registry and the store it works on.
+pub(crate) async fn cancel_with(
+    registry: &BackgroundResponses,
+    storage: &Arc<dyn ResponseStorage>,
+    request_context: Option<StorageRequestContext>,
+    tenant: Option<&str>,
+    response_id: &str,
+) -> Response {
+    // The record first: the registry is touched only for a response the
+    // caller may see.
+    match visible_record(storage, request_context.clone(), tenant, response_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return response_not_found(response_id),
+        Err(response) => return response,
+    }
+
+    if let Some(mut finished) = registry.cancel(response_id) {
         let settled = tokio::time::timeout(CANCEL_SETTLE, async {
             while !*finished.borrow_and_update() {
                 if finished.changed().await.is_err() {
@@ -990,38 +1025,16 @@ pub(crate) async fn cancel(ctx: &ResponsesContext, response_id: &str) -> Respons
         }
     }
 
-    let stored = match ctx
-        .response_storage
-        .get_response(&ResponseId::from(response_id))
-        .await
-    {
+    let stored = match visible_record(storage, request_context.clone(), tenant, response_id).await {
         Ok(Some(stored)) => stored,
-        Ok(None) => {
-            return error::not_found(
-                "response_not_found",
-                format!("Response with id '{response_id}' not found"),
-            )
-        }
-        Err(e) => {
-            return error::storage_failure(
-                "retrieve_response_failed",
-                "Failed to retrieve response",
-                &e,
-            )
-        }
+        Ok(None) => return response_not_found(response_id),
+        Err(response) => return response,
     };
     let raw = stored.raw_response;
     let background = raw["background"].as_bool().unwrap_or(false);
     match raw["status"].as_str().unwrap_or("unknown") {
         "queued" | "in_progress" if background => {
-            match set_stored_status(
-                &ctx.response_storage,
-                response_id,
-                "cancelled",
-                None,
-                ctx.request_context.clone(),
-            )
-            .await
+            match set_stored_status(storage, response_id, "cancelled", None, request_context).await
             {
                 Ok(Transition::Moved(raw)) => {
                     info!(
@@ -1046,6 +1059,36 @@ pub(crate) async fn cancel(ctx: &ResponsesContext, response_id: &str) -> Respons
     }
 }
 
+/// The record under `id` as a caller of `tenant` may see it: `None` for an
+/// id that is not stored and for one stored under another tenant alike.
+async fn visible_record(
+    storage: &Arc<dyn ResponseStorage>,
+    request_context: Option<StorageRequestContext>,
+    tenant: Option<&str>,
+    id: &str,
+) -> Result<Option<StoredResponse>, Response> {
+    let read = async { storage.get_response(&ResponseId::from(id)).await };
+    let stored = match request_context {
+        Some(ctx) => with_request_context(ctx, read).await,
+        None => read.await,
+    };
+    match stored {
+        Ok(stored) => Ok(stored.filter(|stored| stored.is_visible_to(tenant))),
+        Err(e) => Err(error::storage_failure(
+            "retrieve_response_failed",
+            "Failed to retrieve response",
+            &e,
+        )),
+    }
+}
+
+fn response_not_found(id: &str) -> Response {
+    error::not_found(
+        "response_not_found",
+        format!("Response with id '{id}' not found"),
+    )
+}
+
 /// The cancel answer for a record that is not running in the background:
 /// the `cancelled` object, or the refusal its status earns.
 fn answer_for_closed(raw: Value) -> Response {
@@ -1068,7 +1111,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use smg_data_connector::{MemoryResponseStorage, ResponseStorageError, StoredResponse};
+    use smg_data_connector::{MemoryResponseStorage, ResponseStorageError};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -1102,10 +1145,24 @@ mod tests {
     }
 
     async fn store_queued(storage: &Arc<dyn ResponseStorage>, id: &str) -> ResponsesRequest {
+        store_queued_for(storage, id, None).await
+    }
+
+    async fn store_queued_for(
+        storage: &Arc<dyn ResponseStorage>,
+        id: &str,
+        tenant: Option<&str>,
+    ) -> ResponsesRequest {
         let request = request();
-        store_record(storage, &queued_response(id, &request), &request, None)
-            .await
-            .unwrap();
+        store_record(
+            storage,
+            &queued_response(id, &request),
+            &request,
+            tenant,
+            None,
+        )
+        .await
+        .unwrap();
         request
     }
 
@@ -1175,18 +1232,22 @@ mod tests {
         async fn list_identifier_responses(
             &self,
             identifier: &str,
+            tenant: Option<&str>,
             limit: Option<usize>,
         ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
             self.inner
-                .list_identifier_responses(identifier, limit)
+                .list_identifier_responses(identifier, tenant, limit)
                 .await
         }
 
         async fn delete_identifier_responses(
             &self,
             identifier: &str,
+            tenant: Option<&str>,
         ) -> Result<usize, ResponseStorageError> {
-            self.inner.delete_identifier_responses(identifier).await
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
         }
     }
 
@@ -1273,18 +1334,22 @@ mod tests {
         async fn list_identifier_responses(
             &self,
             identifier: &str,
+            tenant: Option<&str>,
             limit: Option<usize>,
         ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
             self.inner
-                .list_identifier_responses(identifier, limit)
+                .list_identifier_responses(identifier, tenant, limit)
                 .await
         }
 
         async fn delete_identifier_responses(
             &self,
             identifier: &str,
+            tenant: Option<&str>,
         ) -> Result<usize, ResponseStorageError> {
-            self.inner.delete_identifier_responses(identifier).await
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
         }
     }
 
@@ -1439,6 +1504,77 @@ mod tests {
             landed_before,
             "no late result was written"
         );
+    }
+
+    /// The queued record is scoped to the tenant that asked for the response.
+    #[tokio::test]
+    async fn the_queued_record_carries_the_callers_tenant() {
+        let storage = storage();
+        store_queued_for(&storage, "resp_t", Some("header:tenant-a")).await;
+        let stored = storage
+            .get_response(&ResponseId::from("resp_t"))
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored.tenant.as_deref(), Some("header:tenant-a"));
+        store_queued(&storage, "resp_n").await;
+        assert_eq!(
+            storage
+                .get_response(&ResponseId::from("resp_n"))
+                .await
+                .unwrap()
+                .unwrap()
+                .tenant,
+            None
+        );
+    }
+
+    /// A cancel from another tenant answers as for an unknown id and stops
+    /// nothing: the task keeps running and the record stays open; the owner's
+    /// cancel then closes it.
+    #[tokio::test]
+    async fn a_cancel_from_another_tenant_answers_not_found_and_stops_nothing() {
+        let storage = storage();
+        store_queued_for(&storage, "resp_1", Some("header:tenant-a")).await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let token = slot.cancel_token();
+
+        for caller in [Some("header:tenant-b"), None] {
+            let answer = cancel_with(&registry, &storage, None, caller, "resp_1").await;
+            assert_eq!(answer.status(), StatusCode::NOT_FOUND, "{caller:?}");
+            assert!(!token.is_cancelled(), "{caller:?}: the run is untouched");
+            assert_eq!(stored_status(&storage, "resp_1").await, "queued");
+        }
+        let missing = cancel_with(
+            &registry,
+            &storage,
+            None,
+            Some("header:tenant-b"),
+            "resp_404",
+        )
+        .await;
+        assert_eq!(
+            missing.status(),
+            StatusCode::NOT_FOUND,
+            "the same answer as an unknown id"
+        );
+
+        // The owner's cancel fires the token; the record closes once the slot drops.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let owner = tokio::spawn(async move {
+            // The slot (the running task) ends when its token fires.
+            token.cancelled().await;
+            drop(slot);
+        });
+        let answer =
+            cancel_with(&registry, &storage, None, Some("header:tenant-a"), "resp_1").await;
+        owner.await.unwrap();
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(stored_status(&storage, "resp_1").await, "cancelled");
     }
 
     #[test]

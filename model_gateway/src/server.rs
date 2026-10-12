@@ -71,6 +71,7 @@ use crate::{
     },
     server::connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
+    tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
@@ -513,67 +514,116 @@ async fn v1_audio_transcriptions(
         .await
 }
 
+// The stored-state routes act for the caller's tenant (`storage_tenant` of
+// the request's route meta): a stored response or conversation of another
+// tenant answers as an unknown id does.
+
 async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::get_response(&state.context.response_storage, &response_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::get_response(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     state
         .router
-        .cancel_response(Some(&headers), &response_id)
+        .cancel_response(Some(&headers), &tenant_meta, &response_id)
         .await
 }
 
 async fn v1_responses_delete(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::delete_response(&state.context.response_storage, &response_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::delete_response(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(response_id): Path<String>,
 ) -> Response {
-    response_handlers::list_response_input_items(&state.context.response_storage, &response_id)
-        .await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    response_handlers::list_response_input_items(
+        &state.context.response_storage,
+        tenant.as_deref(),
+        &response_id,
+    )
+    .await
 }
 
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Json(body): Json<Value>,
 ) -> Response {
-    conversations::create_conversation(&state.context.conversation_storage, body).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::create_conversation(&state.context.conversation_storage, tenant.as_deref(), body)
+        .await
 }
 
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
 ) -> Response {
-    conversations::get_conversation(&state.context.conversation_storage, &conversation_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::get_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+    )
+    .await
 }
 
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    conversations::update_conversation(&state.context.conversation_storage, &conversation_id, body)
-        .await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::update_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+        body,
+    )
+    .await
 }
 
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
 ) -> Response {
-    conversations::delete_conversation(&state.context.conversation_storage, &conversation_id).await
+    let tenant = tenant::storage_tenant(&tenant_meta);
+    conversations::delete_conversation(
+        &state.context.conversation_storage,
+        tenant.as_deref(),
+        &conversation_id,
+    )
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -585,6 +635,7 @@ struct ListItemsQuery {
 
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Query(ListItemsQuery {
         limit,
@@ -592,9 +643,11 @@ async fn v1_conversations_list_items(
         after,
     }): Query<ListItemsQuery>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::list_conversation_items(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         limit,
         order.as_deref(),
@@ -605,12 +658,15 @@ async fn v1_conversations_list_items(
 
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path(conversation_id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::create_conversation_items(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         body,
     )
@@ -619,6 +675,7 @@ async fn v1_conversations_create_items(
 
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path((conversation_id, item_id)): Path<(String, String)>,
     RawQuery(query): RawQuery,
 ) -> Response {
@@ -628,9 +685,11 @@ async fn v1_conversations_get_item(
         Ok(include) => include,
         Err(response) => return response,
     };
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::get_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         &item_id,
         include,
@@ -640,11 +699,14 @@ async fn v1_conversations_get_item(
 
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
+    Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     Path((conversation_id, item_id)): Path<(String, String)>,
 ) -> Response {
+    let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation_item(
         &state.context.conversation_storage,
         &state.context.conversation_item_storage,
+        tenant.as_deref(),
         &conversation_id,
         &item_id,
     )

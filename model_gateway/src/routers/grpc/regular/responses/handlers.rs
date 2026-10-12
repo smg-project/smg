@@ -141,8 +141,9 @@ async fn route_responses_streaming(
     params: ResponsesCallContext,
     background: Option<BackgroundStream>,
 ) -> Response {
-    // 1. Load conversation history
-    let modified_request = match load_conversation_history(ctx, &request).await {
+    // 1. Load conversation history, as the caller's tenant may see it
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let modified_request = match load_conversation_history(ctx, &request, tenant.as_deref()).await {
         Ok(req) => req,
         Err(response) => return response, // Already a Response with proper status code
     };

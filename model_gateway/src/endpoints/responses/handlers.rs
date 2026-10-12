@@ -7,17 +7,33 @@ use axum::{
 };
 use openai_protocol::responses::generate_id;
 use serde_json::{json, Value};
-use smg_data_connector::{ResponseId, ResponseStorage};
+use smg_data_connector::{ResponseId, ResponseStorage, ResponseStorageError, StoredResponse};
 use tracing::{info, warn};
 
 use crate::routers::error;
 
+/// The response stored under `id` as a caller of `tenant` may see it: `None`
+/// for an id that is not stored and for one stored under another tenant, the
+/// same answer, so an id tells a caller nothing about another tenant's records.
+async fn visible_response(
+    response_storage: &Arc<dyn ResponseStorage>,
+    id: &ResponseId,
+    tenant: Option<&str>,
+) -> Result<Option<StoredResponse>, ResponseStorageError> {
+    Ok(response_storage
+        .get_response(id)
+        .await?
+        .filter(|stored| stored.is_visible_to(tenant)))
+}
+
+/// `GET /v1/responses/{id}` for a caller of `tenant`.
 pub async fn get_response(
     response_storage: &Arc<dyn ResponseStorage>,
+    tenant: Option<&str>,
     response_id: &str,
 ) -> Response {
     let id = ResponseId::from(response_id);
-    match response_storage.get_response(&id).await {
+    match visible_response(response_storage, &id, tenant).await {
         Ok(Some(stored)) => (StatusCode::OK, Json(stored.raw_response)).into_response(),
         Ok(None) => error::not_found(
             "not_found",
@@ -27,13 +43,15 @@ pub async fn get_response(
     }
 }
 
+/// `DELETE /v1/responses/{id}` for a caller of `tenant`.
 pub async fn delete_response(
     response_storage: &Arc<dyn ResponseStorage>,
+    tenant: Option<&str>,
     response_id: &str,
 ) -> Response {
     let id = ResponseId::from(response_id);
 
-    match response_storage.get_response(&id).await {
+    match visible_response(response_storage, &id, tenant).await {
         Ok(Some(_)) => match response_storage.delete_response(&id).await {
             Ok(()) => {
                 info!(response_id = %id.0, "Deleted response");
@@ -57,13 +75,15 @@ pub async fn delete_response(
     }
 }
 
+/// `GET /v1/responses/{id}/input_items` for a caller of `tenant`.
 pub async fn list_response_input_items(
     response_storage: &Arc<dyn ResponseStorage>,
+    tenant: Option<&str>,
     response_id: &str,
 ) -> Response {
     let resp_id = ResponseId::from(response_id);
 
-    match response_storage.get_response(&resp_id).await {
+    match visible_response(response_storage, &resp_id, tenant).await {
         Ok(Some(stored)) => {
             let items = stored.input.as_array().cloned().unwrap_or_default();
 
@@ -103,7 +123,7 @@ pub async fn list_response_input_items(
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use smg_data_connector::{ResponseStorageError, StoredResponse};
+    use smg_data_connector::{MemoryResponseStorage, ResponseStorageError, StoredResponse};
 
     use super::*;
     use crate::routers::error::HEADER_X_SMG_ERROR_CODE;
@@ -137,6 +157,7 @@ mod tests {
         async fn list_identifier_responses(
             &self,
             _identifier: &str,
+            _tenant: Option<&str>,
             _limit: Option<usize>,
         ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
             Ok(Vec::new())
@@ -145,6 +166,7 @@ mod tests {
         async fn delete_identifier_responses(
             &self,
             _identifier: &str,
+            _tenant: Option<&str>,
         ) -> Result<usize, ResponseStorageError> {
             Ok(0)
         }
@@ -173,9 +195,9 @@ mod tests {
         ] {
             let storage: Arc<dyn ResponseStorage> = Arc::new(FailingReads(failure));
             for response in [
-                get_response(&storage, "resp_1").await,
-                delete_response(&storage, "resp_1").await,
-                list_response_input_items(&storage, "resp_1").await,
+                get_response(&storage, None, "resp_1").await,
+                delete_response(&storage, None, "resp_1").await,
+                list_response_input_items(&storage, None, "resp_1").await,
             ] {
                 assert_eq!(response.status(), status);
                 assert_eq!(
@@ -184,5 +206,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    const A: Option<&str> = Some("header:tenant-a");
+    const B: Option<&str> = Some("header:tenant-b");
+
+    async fn storage_with(id: &str, tenant: Option<&str>) -> Arc<dyn ResponseStorage> {
+        let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let mut stored = StoredResponse::new(None);
+        stored.id = ResponseId::from(id);
+        stored.input = json!([{"type": "message", "role": "user", "content": "secret prompt"}]);
+        stored.raw_response = json!({"id": id, "status": "completed", "output": []});
+        stored.tenant = tenant.map(str::to_string);
+        storage.store_response(stored).await.unwrap();
+        storage
+    }
+
+    /// A response stored under a tenant is read, listed and deleted by that
+    /// tenant only; another tenant, and a caller without one, get the answer
+    /// of an unknown id and change nothing.
+    #[tokio::test]
+    async fn another_tenants_response_answers_not_found_on_every_by_id_route() {
+        let storage = storage_with("resp_a", A).await;
+        for caller in [B, None] {
+            assert_eq!(
+                get_response(&storage, caller, "resp_a").await.status(),
+                StatusCode::NOT_FOUND,
+                "{caller:?}"
+            );
+            assert_eq!(
+                list_response_input_items(&storage, caller, "resp_a")
+                    .await
+                    .status(),
+                StatusCode::NOT_FOUND,
+                "{caller:?}"
+            );
+            assert_eq!(
+                delete_response(&storage, caller, "resp_a").await.status(),
+                StatusCode::NOT_FOUND,
+                "{caller:?}"
+            );
+        }
+        assert!(
+            storage
+                .get_response(&ResponseId::from("resp_a"))
+                .await
+                .unwrap()
+                .is_some(),
+            "a refused delete leaves the record"
+        );
+        assert_eq!(
+            get_response(&storage, A, "resp_a").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            list_response_input_items(&storage, A, "resp_a")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete_response(&storage, A, "resp_a").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_response(&storage, A, "resp_a").await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A response stored under no tenant (no tenant identity configured, or
+    /// stored before records carried one) is served as before.
+    #[tokio::test]
+    async fn a_response_without_a_tenant_is_served_to_every_caller() {
+        let storage = storage_with("resp_shared", None).await;
+        for caller in [None, A] {
+            assert_eq!(
+                get_response(&storage, caller, "resp_shared").await.status(),
+                StatusCode::OK,
+                "{caller:?}"
+            );
+            assert_eq!(
+                list_response_input_items(&storage, caller, "resp_shared")
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "{caller:?}"
+            );
+        }
+        assert_eq!(
+            delete_response(&storage, B, "resp_shared").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    /// The answer for another tenant's id is the answer for an unknown id.
+    #[tokio::test]
+    async fn the_refusal_is_the_unknown_id_answer() {
+        let storage = storage_with("resp_a", A).await;
+        let other = get_response(&storage, B, "resp_a").await;
+        let missing = get_response(&storage, B, "resp_missing").await;
+        assert_eq!(other.status(), missing.status());
+        let body = |response: Response| async {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            json["error"]["code"].clone()
+        };
+        assert_eq!(body(other).await, body(missing).await);
     }
 }

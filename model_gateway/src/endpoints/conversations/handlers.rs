@@ -117,13 +117,17 @@ fn item_id_above_max_length(id: &str) -> Response {
 // Storage Helpers
 // ============================================================================
 
+/// The conversation under `conv_id` as a caller of `tenant` may see it. A
+/// conversation stored under another tenant answers as an unknown id does, so
+/// an id tells a caller nothing about another tenant's conversations.
 async fn ensure_conversation_exists(
     storage: &Arc<dyn ConversationStorage>,
     conv_id: &ConversationId,
+    tenant: Option<&str>,
 ) -> Result<Conversation, Response> {
     match storage.get_conversation(conv_id).await {
-        Ok(Some(conv)) => Ok(conv),
-        Ok(None) => Err(not_found("Conversation not found")),
+        Ok(Some(conv)) if conv.is_visible_to(tenant) => Ok(conv),
+        Ok(_) => Err(not_found("Conversation not found")),
         Err(e) => Err(store_error("Failed to get conversation", &e)),
     }
 }
@@ -184,13 +188,23 @@ fn apply_metadata_patches(
 // Conversation CRUD Handlers
 // ============================================================================
 
-pub async fn create_conversation(storage: &Arc<dyn ConversationStorage>, body: Value) -> Response {
+/// `POST /v1/conversations`: the conversation is scoped to the caller's
+/// `tenant`.
+pub async fn create_conversation(
+    storage: &Arc<dyn ConversationStorage>,
+    tenant: Option<&str>,
+    body: Value,
+) -> Response {
     let metadata = match validate_metadata(&body) {
         Ok(m) => m,
         Err(msg) => return bad_request(msg),
     };
 
-    let new_conv = NewConversation { id: None, metadata };
+    let new_conv = NewConversation {
+        id: None,
+        metadata,
+        tenant: tenant.map(str::to_string),
+    };
 
     match storage.create_conversation(new_conv).await {
         Ok(conversation) => {
@@ -201,26 +215,30 @@ pub async fn create_conversation(storage: &Arc<dyn ConversationStorage>, body: V
     }
 }
 
-pub async fn get_conversation(storage: &Arc<dyn ConversationStorage>, conv_id: &str) -> Response {
+pub async fn get_conversation(
+    storage: &Arc<dyn ConversationStorage>,
+    tenant: Option<&str>,
+    conv_id: &str,
+) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    match storage.get_conversation(&conversation_id).await {
-        Ok(Some(conversation)) => {
+    match ensure_conversation_exists(storage, &conversation_id, tenant).await {
+        Ok(conversation) => {
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Ok(None) => not_found("Conversation not found"),
-        Err(e) => store_error("Failed to get conversation", &e),
+        Err(response) => response,
     }
 }
 
 pub async fn update_conversation(
     storage: &Arc<dyn ConversationStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     body: Value,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    let current = match ensure_conversation_exists(storage, &conversation_id).await {
+    let current = match ensure_conversation_exists(storage, &conversation_id, tenant).await {
         Ok(c) => c,
         Err(response) => return response,
     };
@@ -245,9 +263,14 @@ pub async fn update_conversation(
 
 pub async fn delete_conversation(
     storage: &Arc<dyn ConversationStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
+
+    if let Err(response) = ensure_conversation_exists(storage, &conversation_id, tenant).await {
+        return response;
+    }
 
     match storage.delete_conversation(&conversation_id).await {
         Ok(true) => {
@@ -274,6 +297,7 @@ pub async fn delete_conversation(
 pub async fn list_conversation_items(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     limit: Option<usize>,
     order: Option<&str>,
@@ -281,7 +305,8 @@ pub async fn list_conversation_items(
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
+    if let Err(response) =
+        ensure_conversation_exists(conversation_storage, &conversation_id, tenant).await
     {
         return response;
     }
@@ -323,12 +348,14 @@ pub async fn list_conversation_items(
 pub async fn create_conversation_items(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     body: Value,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
+    if let Err(response) =
+        ensure_conversation_exists(conversation_storage, &conversation_id, tenant).await
     {
         return response;
     }
@@ -578,6 +605,7 @@ pub fn parse_item_include_query(query: Option<&str>) -> Result<Option<Vec<String
 pub async fn get_conversation_item(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     item_id: &str,
     _include: Option<Vec<String>>,
@@ -585,7 +613,8 @@ pub async fn get_conversation_item(
     let conversation_id = ConversationId::from(conv_id);
     let item_id = ConversationItemId::from(item_id);
 
-    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
+    if let Err(response) =
+        ensure_conversation_exists(conversation_storage, &conversation_id, tenant).await
     {
         return response;
     }
@@ -612,6 +641,7 @@ pub async fn get_conversation_item(
 pub async fn delete_conversation_item(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
+    tenant: Option<&str>,
     conv_id: &str,
     item_id: &str,
 ) -> Response {
@@ -619,7 +649,7 @@ pub async fn delete_conversation_item(
     let item_id = ConversationItemId::from(item_id);
 
     let conversation =
-        match ensure_conversation_exists(conversation_storage, &conversation_id).await {
+        match ensure_conversation_exists(conversation_storage, &conversation_id, tenant).await {
             Ok(conv) => conv,
             Err(response) => return response,
         };
@@ -758,6 +788,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: None,
                 metadata: None,
+                tenant: None,
             })
             .await
             .unwrap();
@@ -767,9 +798,14 @@ mod tests {
         // 65 and 64 characters: one over the stores' 64-character id columns, one at the bound.
         let over = format!("msg_{}", "a".repeat(61));
         assert_eq!(over.len(), 65);
-        let response =
-            create_conversation_items(&conversation_storage, &item_storage, &conv_id, items(&over))
-                .await;
+        let response = create_conversation_items(
+            &conversation_storage,
+            &item_storage,
+            None,
+            &conv_id,
+            items(&over),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -791,7 +827,8 @@ mod tests {
             {"type": "message", "role": "user", "content": "second", "id": over}
         ]});
         let response =
-            create_conversation_items(&conversation_storage, &item_storage, &conv_id, batch).await;
+            create_conversation_items(&conversation_storage, &item_storage, None, &conv_id, batch)
+                .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let listed = item_storage
             .list_items(
@@ -833,6 +870,7 @@ mod tests {
         let response = create_conversation_items(
             &conversation_storage,
             &item_storage,
+            None,
             &conv_id,
             items(&at_bound),
         )
@@ -845,6 +883,156 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+
+    const A: Option<&str> = Some("header:tenant-a");
+    const B: Option<&str> = Some("header:tenant-b");
+
+    async fn json_of(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A conversation created by tenant a with one item; the stores and the ids.
+    async fn conversation_of_a() -> (
+        Arc<dyn ConversationStorage>,
+        Arc<dyn ConversationItemStorage>,
+        String,
+        String,
+    ) {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let created = json_of(create_conversation(&conversations, A, json!({})).await).await;
+        let conv_id = created["id"].as_str().unwrap().to_string();
+        let added = json_of(
+            create_conversation_items(
+                &conversations,
+                &items,
+                A,
+                &conv_id,
+                json!({"items": [{"type": "message", "role": "user", "content": "secret"}]}),
+            )
+            .await,
+        )
+        .await;
+        let item_id = added["data"][0]["id"].as_str().unwrap().to_string();
+        (conversations, items, conv_id, item_id)
+    }
+
+    /// A conversation created under a tenant is read, listed, written into and
+    /// deleted by that tenant only; another tenant, and a caller without one,
+    /// get the answer of an unknown id on every route and change nothing.
+    #[tokio::test]
+    async fn another_tenants_conversation_answers_not_found_on_every_route() {
+        let (conversations, items, conv_id, item_id) = conversation_of_a().await;
+        let stored = conversations
+            .get_conversation(&ConversationId::from(conv_id.as_str()))
+            .await
+            .unwrap()
+            .expect("created");
+        assert_eq!(
+            stored.tenant.as_deref(),
+            A,
+            "the conversation carries its tenant"
+        );
+
+        for caller in [B, None] {
+            let answers = [
+                get_conversation(&conversations, caller, &conv_id).await,
+                update_conversation(
+                    &conversations,
+                    caller,
+                    &conv_id,
+                    json!({"metadata": {"k": "v"}}),
+                )
+                .await,
+                list_conversation_items(&conversations, &items, caller, &conv_id, None, None, None)
+                    .await,
+                create_conversation_items(
+                    &conversations,
+                    &items,
+                    caller,
+                    &conv_id,
+                    json!({"items": [{"type": "message", "role": "user", "content": "intruder"}]}),
+                )
+                .await,
+                get_conversation_item(&conversations, &items, caller, &conv_id, &item_id, None)
+                    .await,
+                delete_conversation_item(&conversations, &items, caller, &conv_id, &item_id).await,
+                delete_conversation(&conversations, caller, &conv_id).await,
+            ];
+            for answer in answers {
+                assert_eq!(answer.status(), StatusCode::NOT_FOUND, "{caller:?}");
+            }
+        }
+
+        // Nothing changed for its owner: the one item is still there, the
+        // conversation too, and the owner's own calls work.
+        let listed = json_of(
+            list_conversation_items(&conversations, &items, A, &conv_id, None, None, None).await,
+        )
+        .await;
+        assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            get_conversation_item(&conversations, &items, A, &conv_id, &item_id, None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete_conversation_item(&conversations, &items, A, &conv_id, &item_id)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete_conversation(&conversations, A, &conv_id)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_conversation(&conversations, A, &conv_id).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Without tenant identity nothing changes: a conversation created by a
+    /// caller without a tenant is served to every caller, as before.
+    #[tokio::test]
+    async fn a_conversation_without_a_tenant_is_served_to_every_caller() {
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let created = json_of(create_conversation(&conversations, None, json!({})).await).await;
+        let conv_id = created["id"].as_str().unwrap().to_string();
+        for caller in [None, A] {
+            assert_eq!(
+                get_conversation(&conversations, caller, &conv_id)
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "{caller:?}"
+            );
+            assert_eq!(
+                list_conversation_items(&conversations, &items, caller, &conv_id, None, None, None)
+                    .await
+                    .status(),
+                StatusCode::OK,
+                "{caller:?}"
+            );
+        }
+        assert_eq!(
+            delete_conversation(&conversations, B, &conv_id)
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     /// The CRUD helpers answer with the gateway's envelope, an object an SDK

@@ -453,15 +453,18 @@ impl ResponseStorage for MemoryResponseStorage {
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
         let store = self.store.read();
 
         if let Some(user_response_ids) = store.identifier_index.get(identifier) {
-            // Collect responses with their timestamps for sorting
+            // Collect the responses the caller may see with their timestamps for sorting
             let mut responses_with_time: Vec<_> = user_response_ids
                 .iter()
-                .filter_map(|id| store.responses.get(id).map(|r| (r.created_at, r)))
+                .filter_map(|id| store.responses.get(id))
+                .filter(|r| r.is_visible_to(tenant))
+                .map(|r| (r.created_at, r))
                 .collect();
 
             // Sort by creation time (newest first)
@@ -501,18 +504,32 @@ impl ResponseStorage for MemoryResponseStorage {
         Ok(expired.len())
     }
 
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
         let mut store = self.store.write();
 
-        if let Some(user_response_ids) = store.identifier_index.remove(identifier) {
-            let count = user_response_ids.len();
-            for id in user_response_ids {
-                store.responses.remove(&id);
-            }
-            Ok(count)
-        } else {
-            Ok(0)
+        let Some(user_response_ids) = store.identifier_index.remove(identifier) else {
+            return Ok(0);
+        };
+        // The records the caller may see go; the others keep their index entry.
+        let (gone, kept): (Vec<ResponseId>, Vec<ResponseId>) =
+            user_response_ids.into_iter().partition(|id| {
+                store
+                    .responses
+                    .get(id)
+                    .is_none_or(|r| r.is_visible_to(tenant))
+            });
+        let count = gone
+            .iter()
+            .filter(|id| store.responses.remove(id).is_some())
+            .count();
+        if !kept.is_empty() {
+            store.identifier_index.insert(identifier.to_string(), kept);
         }
+        Ok(count)
     }
 }
 
@@ -799,7 +816,7 @@ mod tests {
             .expect("the record stays under its id");
         assert_eq!(stored.raw_response["status"], "completed");
         let listed = store
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert_eq!(listed.len(), 1, "one record, one index entry");
@@ -909,34 +926,97 @@ mod tests {
 
         // List user1's responses
         let user1_responses = store
-            .list_identifier_responses("user1", None)
+            .list_identifier_responses("user1", None, None)
             .await
             .unwrap();
         assert_eq!(user1_responses.len(), 2);
 
         // List user2's responses
         let user2_responses = store
-            .list_identifier_responses("user2", None)
+            .list_identifier_responses("user2", None, None)
             .await
             .unwrap();
         assert_eq!(user2_responses.len(), 1);
 
         // Delete user1's responses
-        let deleted_count = store.delete_identifier_responses("user1").await.unwrap();
+        let deleted_count = store
+            .delete_identifier_responses("user1", None)
+            .await
+            .unwrap();
         assert_eq!(deleted_count, 2);
 
         let user1_responses_after = store
-            .list_identifier_responses("user1", None)
+            .list_identifier_responses("user1", None, None)
             .await
             .unwrap();
         assert_eq!(user1_responses_after.len(), 0);
 
         // User2's responses should still be there
         let user2_responses_after = store
-            .list_identifier_responses("user2", None)
+            .list_identifier_responses("user2", None, None)
             .await
             .unwrap();
         assert_eq!(user2_responses_after.len(), 1);
+    }
+
+    /// A record keeps the tenant it was stored under, and the listing and the
+    /// deletion by safety identifier see only the records of the caller's
+    /// tenant (plus those stored under none, as before).
+    #[tokio::test]
+    async fn the_identifier_listing_and_deletion_are_scoped_to_the_callers_tenant() {
+        let store = MemoryResponseStorage::new();
+        let mut of_a = StoredResponse::new(None);
+        of_a.safety_identifier = Some("user-1".to_string());
+        of_a.tenant = Some("header:a".to_string());
+        let id_a = store.store_response(of_a).await.unwrap();
+        let mut of_b = StoredResponse::new(None);
+        of_b.safety_identifier = Some("user-1".to_string());
+        of_b.tenant = Some("header:b".to_string());
+        store.store_response(of_b).await.unwrap();
+        let mut of_nobody = StoredResponse::new(None);
+        of_nobody.safety_identifier = Some("user-1".to_string());
+        let id_nobody = store.store_response(of_nobody).await.unwrap();
+
+        let stored = store.get_response(&id_a).await.unwrap().unwrap();
+        assert_eq!(stored.tenant.as_deref(), Some("header:a"));
+
+        let ids = |responses: Vec<StoredResponse>| {
+            responses.into_iter().map(|r| r.id).collect::<Vec<_>>()
+        };
+        let listed = store
+            .list_identifier_responses("user-1", Some("header:a"), None)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2, "a's record and the untenanted one");
+        assert!(ids(listed).iter().all(|id| *id == id_a || *id == id_nobody));
+        let listed = store
+            .list_identifier_responses("user-1", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(listed),
+            vec![id_nobody.clone()],
+            "no tenant: the untenanted record only"
+        );
+
+        // a's deletion takes a's record and the untenanted one; b's stays listed for b.
+        let deleted = store
+            .delete_identifier_responses("user-1", Some("header:a"))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+        assert!(store.get_response(&id_a).await.unwrap().is_none());
+        let left = store
+            .list_identifier_responses("user-1", Some("header:b"), None)
+            .await
+            .unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].tenant.as_deref(), Some("header:b"));
+        assert_eq!(
+            store.stats().identifier_count,
+            1,
+            "the index entry stays for b"
+        );
     }
 
     #[tokio::test]
@@ -998,6 +1078,7 @@ mod tests {
         let input = NewConversation {
             id: Some(ConversationId::from("conv_my_custom")),
             metadata: None,
+            tenant: None,
         };
         let conv = store
             .create_conversation(input)
@@ -1016,6 +1097,7 @@ mod tests {
         let input = NewConversation {
             id: None,
             metadata: Some(metadata.clone()),
+            tenant: None,
         };
         let conv = store
             .create_conversation(input)
@@ -1043,6 +1125,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: Some(ConversationId::from("conv_stored")),
                 metadata: None,
+                tenant: None,
             })
             .await
             .expect("create_conversation should succeed");
@@ -1063,6 +1146,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: Some(ConversationId::from("conv_update")),
                 metadata: None,
+                tenant: None,
             })
             .await
             .expect("create_conversation should succeed");
@@ -1108,6 +1192,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: Some(ConversationId::from("conv_to_delete")),
                 metadata: None,
+                tenant: None,
             })
             .await
             .expect("create_conversation should succeed");
@@ -1149,6 +1234,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: Some(ConversationId::from("conv_alpha")),
                 metadata: None,
+                tenant: None,
             })
             .await
             .expect("create conv1 should succeed");
@@ -1157,6 +1243,7 @@ mod tests {
             .create_conversation(NewConversation {
                 id: Some(ConversationId::from("conv_beta")),
                 metadata: None,
+                tenant: None,
             })
             .await
             .expect("create conv2 should succeed");

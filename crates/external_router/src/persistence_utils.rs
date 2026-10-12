@@ -435,6 +435,7 @@ pub async fn persist_conversation_items(
     response_storage: Arc<dyn ResponseStorage>,
     response_json: &Value,
     original_body: &ResponsesRequest,
+    tenant: Option<&str>,
     request_context: Option<StorageRequestContext>,
 ) -> Result<(), PersistError> {
     let inner = persist_conversation_items_inner(
@@ -443,6 +444,7 @@ pub async fn persist_conversation_items(
         response_storage,
         response_json,
         original_body,
+        tenant,
     );
     match request_context {
         Some(ctx) => with_request_context(ctx, inner).await,
@@ -496,12 +498,16 @@ impl std::fmt::Display for PersistError {
 
 impl std::error::Error for PersistError {}
 
+/// `tenant` is the caller's tenant: the stored response is scoped to it, and
+/// the response's items are linked into the request's conversation only when
+/// that conversation is visible to it.
 async fn persist_conversation_items_inner(
     conversation_storage: Arc<dyn ConversationStorage>,
     item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,
     response_json: &Value,
     original_body: &ResponsesRequest,
+    tenant: Option<&str>,
 ) -> Result<(), PersistError> {
     // Respect store=false: skip persistence entirely (matches official API behavior)
     if !original_body.store.unwrap_or(true) {
@@ -548,6 +554,7 @@ async fn persist_conversation_items_inner(
     let mut stored_response = build_stored_response(response_json, original_body);
     stored_response.id = response_id.clone();
     stored_response.input = Value::Array(input_items.clone());
+    stored_response.tenant = tenant.map(str::to_string);
 
     response_storage
         .store_response(stored_response)
@@ -564,7 +571,11 @@ async fn persist_conversation_items_inner(
     let conv_id_opt = if let Some(conv_ref) = &original_body.conversation {
         let conv_id = ConversationId::from(conv_ref.as_id());
         match conversation_storage.get_conversation(&conv_id).await {
-            Ok(Some(_)) => Some(conv_id),
+            Ok(Some(conversation)) if conversation.is_visible_to(tenant) => Some(conv_id),
+            Ok(Some(_)) => {
+                warn!(conversation_id = %conv_id.0, "Conversation belongs to another tenant, skipping item linking");
+                None
+            }
             Ok(None) => {
                 warn!(conversation_id = %conv_id.0, "Conversation not found, skipping item linking");
                 None

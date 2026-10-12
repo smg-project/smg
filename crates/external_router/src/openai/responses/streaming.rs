@@ -651,6 +651,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
                     storage.response.clone(),
                     &response_json,
                     &original_request,
+                    storage.tenant.as_deref(),
                     storage.request_context.clone(),
                 )
                 .await
@@ -1001,6 +1002,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                         storage.response.clone(),
                         &response_json,
                         &original_request,
+                        storage.tenant.as_deref(),
                         storage.request_context.clone(),
                     )
                     .await

@@ -359,6 +359,24 @@ Responses support chaining via `previous_response_id` and can be queried by
 `safety_identifier` for content moderation workflows. The `ResponseChain`
 struct reconstructs the chronological sequence of related responses.
 
+### Tenant scope
+
+`StoredResponse` and `Conversation` carry an optional `tenant`: the identity
+the gateway resolved for the request that stored them (a tenant API key or a
+trusted tenant header, as its canonical key). Every backend persists it (a
+nullable `tenant` column on `responses` and `conversations`, a hash field in
+Redis). The rule, `tenant_scope_allows`, is the same for both record types:
+
+- a record stored under a tenant is served only to a caller of that tenant
+  (`is_visible_to`); the gateway answers another tenant's id as it answers an
+  unknown one;
+- a record stored under no tenant (no tenant identity configured, a caller the
+  gateway resolved no tenant for, or a row from before the column existed) is
+  served to every caller, as before.
+
+The listing and the deletion by `safety_identifier` take the caller's tenant
+and apply the same rule in the store's own query.
+
 ## ID Generation
 
 | ID Type | Format | Example |
@@ -436,6 +454,7 @@ Current core history migrations:
 | 1 | Add `safety_identifier` column to responses |
 | 2 | Remove legacy `user_id` column from responses |
 | 3 | Drop redundant `output`, `metadata`, `instructions`, `tool_calls` columns from responses |
+| 4 | Add the nullable `tenant` column to responses and conversations |
 
 #### A database ahead of the build
 

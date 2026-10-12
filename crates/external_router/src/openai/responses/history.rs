@@ -12,7 +12,8 @@ use openai_protocol::{
 };
 use serde_json::Value;
 use smg_data_connector::{
-    is_unstored, ConversationId, ListParams, ResponseId, ResponseStorageError, SortOrder,
+    is_unstored, visible_chain, ConversationId, ListParams, ResponseId, ResponseStorageError,
+    SortOrder,
 };
 use tracing::warn;
 
@@ -32,13 +33,16 @@ pub(crate) struct LoadedInputHistory {
 
 /// Load conversation history and/or previous response chain into request input.
 ///
-/// Mutates `request_body.input` with the loaded items.
+/// Mutates `request_body.input` with the loaded items. `tenant` is the
+/// caller's tenant: a previous response or a conversation of another tenant
+/// answers as a missing one does.
 /// Returns `Ok(LoadedInputHistory)` on success, or `Err(response)` on validation failure.
 pub(crate) async fn load_input_history(
     components: &ResponsesComponents,
     conversation: Option<&str>,
     request_body: &mut ResponsesRequest,
     model: &str,
+    tenant: Option<&str>,
 ) -> Result<LoadedInputHistory, Response> {
     let previous_response_id = request_body
         .previous_response_id
@@ -54,23 +58,24 @@ pub(crate) async fn load_input_history(
             .response_storage
             .get_response_chain(&prev_id, None)
             .await
+            .map(|chain| visible_chain(chain.responses, tenant))
         {
-            // A chain ending in a record its client asked not to store (a
-            // background run's record on the shared store, kept for its
-            // polling window only) would break when it goes: no previous
-            // response, as for an unstored id.
-            Ok(chain)
-                if !chain.responses.is_empty()
-                    && !chain.responses.last().is_some_and(is_unstored) =>
+            // The records the caller may see (the chain ends at the first
+            // record of another tenant, as it would at a missing one); a chain
+            // ending in a record its client asked not to store (a background
+            // run's record on the shared store, kept for its polling window
+            // only) would break when it goes: no previous response, as for an
+            // unstored id.
+            Ok(responses)
+                if !responses.is_empty() && !responses.last().is_some_and(is_unstored) =>
             {
-                existing_mcp_list_tools_labels.extend(chain.responses.iter().flat_map(|stored| {
+                existing_mcp_list_tools_labels.extend(responses.iter().flat_map(|stored| {
                     extract_mcp_list_tools_labels(
                         stored.raw_response.get("output").unwrap_or(&Value::Null),
                     )
                 }));
 
-                let items: Vec<ResponseInputOutputItem> = chain
-                    .responses
+                let items: Vec<ResponseInputOutputItem> = responses
                     .iter()
                     .flat_map(|stored| {
                         deserialize_items_from_array(&stored.input)
@@ -125,13 +130,14 @@ pub(crate) async fn load_input_history(
     if let Some(conv_id_str) = conversation {
         let conv_id = ConversationId::from(conv_id_str);
 
+        // A conversation of another tenant answers as a missing one.
         match components
             .conversation_storage
             .get_conversation(&conv_id)
             .await
         {
-            Ok(Some(_)) => {}
-            Ok(None) => {
+            Ok(Some(conversation)) if conversation.is_visible_to(tenant) => {}
+            Ok(_) => {
                 Metrics::record_router_error(
                     metrics_labels::ROUTER_OPENAI,
                     metrics_labels::BACKEND_EXTERNAL,

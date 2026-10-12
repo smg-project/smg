@@ -22,6 +22,7 @@ use crate::{
     },
     openai_bridge,
     persistence_utils::{persist_conversation_items, PersistStep},
+    tenant::storage_tenant,
 };
 
 /// Handle a non-streaming responses request
@@ -181,12 +182,14 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         ctx.components.conversation_item_storage(),
         ctx.components.response_storage(),
     ) {
+        let tenant = ctx.tenant_request_meta.as_ref().and_then(storage_tenant);
         if let Err(err) = persist_conversation_items(
             conv_storage.clone(),
             item_storage.clone(),
             resp_storage.clone(),
             &response_json,
             original_body,
+            tenant.as_deref(),
             ctx.storage_request_context.clone(),
         )
         .await

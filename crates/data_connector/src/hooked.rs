@@ -582,9 +582,11 @@ impl ResponseStorage for HookedResponseStorage {
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
-        let payload = serde_json::json!({ "identifier": identifier, "limit": limit });
+        let payload =
+            serde_json::json!({ "identifier": identifier, "tenant": tenant, "limit": limit });
         let extra = run_before(
             &*self.hook,
             StorageOperation::ListIdentifierResponses,
@@ -595,7 +597,7 @@ impl ResponseStorage for HookedResponseStorage {
 
         let result = self
             .inner
-            .list_identifier_responses(identifier, limit)
+            .list_identifier_responses(identifier, tenant, limit)
             .await?;
 
         let result_json = serde_json::to_value(&result).unwrap_or_default();
@@ -626,8 +628,12 @@ impl ResponseStorage for HookedResponseStorage {
         self.inner.delete_unstored_older_than(cutoff).await
     }
 
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
-        let payload = serde_json::json!({ "identifier": identifier });
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
+        let payload = serde_json::json!({ "identifier": identifier, "tenant": tenant });
         let extra = run_before(
             &*self.hook,
             StorageOperation::DeleteIdentifierResponses,
@@ -636,7 +642,10 @@ impl ResponseStorage for HookedResponseStorage {
         )
         .await?;
 
-        let result = self.inner.delete_identifier_responses(identifier).await?;
+        let result = self
+            .inner
+            .delete_identifier_responses(identifier, tenant)
+            .await?;
 
         let result_json = serde_json::to_value(result).unwrap_or_default();
         run_after(
@@ -1153,18 +1162,22 @@ mod tests {
             async fn list_identifier_responses(
                 &self,
                 identifier: &str,
+                tenant: Option<&str>,
                 limit: Option<usize>,
             ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
                 self.inner
-                    .list_identifier_responses(identifier, limit)
+                    .list_identifier_responses(identifier, tenant, limit)
                     .await
             }
 
             async fn delete_identifier_responses(
                 &self,
                 identifier: &str,
+                tenant: Option<&str>,
             ) -> Result<usize, ResponseStorageError> {
-                self.inner.delete_identifier_responses(identifier).await
+                self.inner
+                    .delete_identifier_responses(identifier, tenant)
+                    .await
             }
         }
 
@@ -1400,7 +1413,7 @@ mod tests {
         assert_eq!(hook.after_calls(), 2);
 
         let listed = hooked
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert_eq!(listed.len(), 2, "should list both responses for user-1");
@@ -1429,14 +1442,17 @@ mod tests {
         assert_eq!(hook.after_calls(), 2);
 
         // Delete all responses for user-1
-        let deleted = hooked.delete_identifier_responses("user-1").await.unwrap();
+        let deleted = hooked
+            .delete_identifier_responses("user-1", None)
+            .await
+            .unwrap();
         assert_eq!(deleted, 2, "should delete both responses");
         assert_eq!(hook.before_calls(), 3);
         assert_eq!(hook.after_calls(), 3);
 
         // Verify list is now empty
         let listed = hooked
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert!(listed.is_empty(), "no responses should remain after delete");

@@ -1589,7 +1589,12 @@ class RouterArgs:
             f"--{prefix}trust-tenant-header",
             action="store_true",
             default=False,
-            help="Trust an upstream-provided tenant header for canonical tenant resolution.",
+            help=(
+                "Trust an upstream-provided tenant header for canonical tenant resolution."
+                " Stored responses and conversations are scoped to the tenant that created"
+                " them: another tenant's id answers 404; records stored without a tenant"
+                " identity stay readable by every caller."
+            ),
         )
         request_group.add_argument(
             f"--{prefix}tenant-header-name",
@@ -2152,7 +2157,9 @@ class RouterArgs:
             help=(
                 "Per-tenant API keys for serving-path auth (format: tenant_id:key,"
                 " repeatable). Layers on top of --api-key, each resolving to its own"
-                " tenant identity."
+                " tenant identity. Stored responses and conversations are scoped to the"
+                " tenant that created them: another tenant's id answers 404; records"
+                " stored without a tenant identity stay readable by every caller."
             ),
         )
         auth_group.add_argument(

@@ -333,6 +333,9 @@ impl PostgresConversationStorage {
         if !s.is_skipped("metadata") {
             col_defs.push(format!("{} JSON", s.col("metadata")));
         }
+        if !s.is_skipped("tenant") {
+            col_defs.push(format!("{} VARCHAR(255)", s.col("tenant")));
+        }
         col_defs.extend(extra_column_defs(s));
 
         format!(
@@ -389,6 +392,10 @@ impl ConversationStorage for PostgresConversationStorage {
             col_names.push(s.col("metadata"));
             params.push(&metadata_value);
         }
+        if !s.is_skipped("tenant") {
+            col_names.push(s.col("tenant"));
+            params.push(&conversation.tenant);
+        }
 
         // Append extra columns from hooks or defaults
         let hook_extra = current_extra_columns().unwrap_or_default();
@@ -434,6 +441,9 @@ impl ConversationStorage for PostgresConversationStorage {
         if !s.is_skipped("metadata") {
             select_cols.push(s.col("metadata").to_string());
         }
+        if !s.is_skipped("tenant") {
+            select_cols.push(s.col("tenant").to_string());
+        }
 
         let sql = format!(
             "SELECT {} FROM {table} WHERE {col_id} = $1",
@@ -471,10 +481,16 @@ impl ConversationStorage for PostgresConversationStorage {
             })?
         };
         let metadata = Self::parse_metadata(metadata_json)?;
+        let tenant: Option<String> = if s.is_skipped("tenant") {
+            None
+        } else {
+            row.get(s.col("tenant"))
+        };
         Ok(Some(Conversation::with_parts(
             ConversationId(id_str),
             created_at,
             metadata,
+            tenant,
         )))
     }
 
@@ -483,68 +499,42 @@ impl ConversationStorage for PostgresConversationStorage {
         id: &ConversationId,
         metadata: Option<ConversationMetadata>,
     ) -> Result<Option<Conversation>, ConversationStorageError> {
+        // The row as stored (its creation time and its tenant come back as
+        // they are), then the one column the update moves.
+        let Some(current) = self.get_conversation(id).await? else {
+            return Ok(None);
+        };
         let s = &self.store.schema.conversations;
+        if s.is_skipped("metadata") {
+            return Ok(Some(Conversation {
+                metadata,
+                ..current
+            }));
+        }
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_id = s.col("id");
+        let col_meta = s.col("metadata");
 
+        // Bind the JSON column as `Value`, not a serialized `String` (see
+        // `create_conversation` for why `tokio-postgres` requires this).
+        let metadata_value: Option<Value> = metadata.clone().map(Value::Object);
         let client = self
             .store
             .pool
             .get()
             .await
             .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
-
-        if s.is_skipped("metadata") {
-            // Nothing to update — just verify the row exists
-            let sql = format!("SELECT 1 FROM {table} WHERE {col_id} = $1");
-            let rows = query_cached(&client, &sql, &[&id.0.as_str()])
-                .await
-                .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
-            if rows.is_empty() {
-                return Ok(None);
-            }
-            let created_at = Utc::now();
-            return Ok(Some(Conversation::with_parts(
-                ConversationId(id.0.clone()),
-                created_at,
-                metadata,
-            )));
+        let sql = format!("UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2");
+        let rows_affected = execute_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
+            .await
+            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+        if rows_affected == 0 {
+            return Ok(None);
         }
-
-        // Bind the JSON column as `Value`, not a serialized `String` (see
-        // `create_conversation` for why `tokio-postgres` requires this).
-        let metadata_value: Option<Value> = metadata.clone().map(Value::Object);
-        let col_meta = s.col("metadata");
-
-        let (_, created_at) = if s.is_skipped("created_at") {
-            let sql = format!("UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2");
-            let rows_affected = execute_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
-                .await
-                .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
-            if rows_affected == 0 {
-                return Ok(None);
-            }
-            (sql, Utc::now())
-        } else {
-            let col_created = s.col("created_at");
-            let sql = format!(
-                "UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2 RETURNING {col_created}"
-            );
-            let rows = query_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
-                .await
-                .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
-            if rows.is_empty() {
-                return Ok(None);
-            }
-            let created_at: DateTime<Utc> = rows[0].get(col_created);
-            (sql, created_at)
-        };
-
-        Ok(Some(Conversation::with_parts(
-            ConversationId(id.0.clone()),
-            created_at,
+        Ok(Some(Conversation {
             metadata,
-        )))
+            ..current
+        }))
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
@@ -1080,7 +1070,7 @@ impl PostgresResponseStorage {
 
         // Build DDL column definitions, filtering out skip_columns and appending extras
         let mut col_defs = vec![format!("{} VARCHAR(64) PRIMARY KEY", s.col("id"))];
-        let core_cols: [(&str, &str); 7] = [
+        let core_cols: [(&str, &str); 8] = [
             ("conversation_id", "VARCHAR(64)"),
             ("previous_response_id", "VARCHAR(64)"),
             ("input", "JSON"),
@@ -1088,6 +1078,7 @@ impl PostgresResponseStorage {
             ("safety_identifier", "VARCHAR(128)"),
             ("model", "VARCHAR(128)"),
             ("raw_response", "JSON"),
+            ("tenant", "VARCHAR(255)"),
         ];
         for (logical, sql_type) in &core_cols {
             if !s.is_skipped(logical) {
@@ -1187,6 +1178,12 @@ impl PostgresResponseStorage {
             })?
         };
 
+        let tenant: Option<String> = if s.is_skipped("tenant") {
+            None
+        } else {
+            row.get(s.col("tenant"))
+        };
+
         let previous_response_id = previous.map(ResponseId);
         let raw_response = raw_response_json.unwrap_or(Value::Null);
         let input = input_json.unwrap_or_else(|| Value::Array(Vec::new()));
@@ -1200,8 +1197,22 @@ impl PostgresResponseStorage {
             model,
             conversation_id,
             raw_response,
+            tenant,
         })
     }
+}
+
+/// The condition of the tenant scope on the rows of a query, with the
+/// caller's tenant bound as `$param`: the rows stored under no tenant and
+/// those stored under the caller's (see
+/// [`tenant_scope_allows`](crate::core::tenant_scope_allows)). `None` when
+/// the schema skips the column: every row is served then, as before.
+fn tenant_scope_sql(s: &crate::schema::TableConfig, param: usize) -> Option<String> {
+    if s.is_skipped("tenant") {
+        return None;
+    }
+    let col = s.col("tenant");
+    Some(format!(" AND ({col} IS NULL OR {col} = ${param})"))
 }
 
 /// The query behind [`ResponseStorage::find_response_by_output_item`]:
@@ -1386,6 +1397,7 @@ impl ResponseStorage for PostgresResponseStorage {
             model,
             conversation_id,
             raw_response,
+            tenant,
         } = response;
         let previous_id = previous_response_id.map(|r| r.0);
 
@@ -1423,6 +1435,10 @@ impl ResponseStorage for PostgresResponseStorage {
         if !s.is_skipped("raw_response") {
             col_names.push(s.col("raw_response"));
             params.push(&raw_response);
+        }
+        if !s.is_skipped("tenant") {
+            col_names.push(s.col("tenant"));
+            params.push(&tenant);
         }
 
         // Append extra columns from hooks or defaults
@@ -1551,6 +1567,7 @@ impl ResponseStorage for PostgresResponseStorage {
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
         let s = &self.store.schema.responses;
@@ -1561,12 +1578,21 @@ impl ResponseStorage for PostgresResponseStorage {
         }
 
         let col_safety = s.col("safety_identifier");
+        let limit_i64: Option<i64> = limit.map(|l| l as i64);
 
-        let order_clause = if s.is_skipped("created_at") {
-            String::new()
-        } else {
-            format!(" ORDER BY {} DESC", s.col("created_at"))
-        };
+        let mut sql = format!("{} WHERE {col_safety} = $1", self.select_base);
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&identifier];
+        if let Some(scope) = tenant_scope_sql(s, params.len() + 1) {
+            sql.push_str(&scope);
+            params.push(&tenant);
+        }
+        if !s.is_skipped("created_at") {
+            sql.push_str(&format!(" ORDER BY {} DESC", s.col("created_at")));
+        }
+        if let Some(limit) = &limit_i64 {
+            sql.push_str(&format!(" LIMIT ${}", params.len() + 1));
+            params.push(limit);
+        }
 
         let client = self
             .store
@@ -1574,21 +1600,9 @@ impl ResponseStorage for PostgresResponseStorage {
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
-        let rows = if let Some(l) = limit {
-            let l_i64: i64 = l as i64;
-            let sql = format!(
-                "{} WHERE {col_safety} = $1{order_clause} LIMIT $2",
-                self.select_base,
-            );
-            query_cached(&client, &sql, &[&identifier, &l_i64])
-                .await
-                .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?
-        } else {
-            let sql = format!("{} WHERE {col_safety} = $1{order_clause}", self.select_base,);
-            query_cached(&client, &sql, &[&identifier])
-                .await
-                .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?
-        };
+        let rows = query_cached(&client, &sql, &params)
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
 
         let schema = &self.store.schema;
         let mut out = Vec::with_capacity(rows.len());
@@ -1638,7 +1652,11 @@ impl ResponseStorage for PostgresResponseStorage {
         Ok(rows_deleted as usize)
     }
 
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
         let s = &self.store.schema.responses;
 
         // safety_identifier must exist to filter by it
@@ -1649,7 +1667,12 @@ impl ResponseStorage for PostgresResponseStorage {
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_safety = s.col("safety_identifier");
 
-        let sql = format!("DELETE FROM {table} WHERE {col_safety} = $1");
+        let mut sql = format!("DELETE FROM {table} WHERE {col_safety} = $1");
+        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&identifier];
+        if let Some(scope) = tenant_scope_sql(s, params.len() + 1) {
+            sql.push_str(&scope);
+            params.push(&tenant);
+        }
 
         let client = self
             .store
@@ -1657,7 +1680,7 @@ impl ResponseStorage for PostgresResponseStorage {
             .get()
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
-        let rows_deleted = execute_cached(&client, &sql, &[&identifier])
+        let rows_deleted = execute_cached(&client, &sql, &params)
             .await
             .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
         Ok(rows_deleted as usize)
@@ -1773,6 +1796,18 @@ mod tests {
              INSERT INTO r (response_key) SELECT $1 WHERE NOT EXISTS (SELECT 1 FROM upd)"
         );
         assert_eq!(lock_sql(-42), "SELECT pg_advisory_xact_lock(-42)");
+    }
+
+    #[test]
+    fn the_tenant_scope_condition_serves_untenanted_rows_and_the_callers_own() {
+        let s = crate::schema::TableConfig::with_table("responses");
+        assert_eq!(
+            tenant_scope_sql(&s, 2).as_deref(),
+            Some(" AND (tenant IS NULL OR tenant = $2)")
+        );
+        let mut skipped = crate::schema::TableConfig::with_table("responses");
+        skipped.skip_columns.insert("tenant".to_string());
+        assert_eq!(tenant_scope_sql(&skipped, 2), None);
     }
 
     #[test]

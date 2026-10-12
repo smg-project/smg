@@ -590,13 +590,20 @@ impl RouterTrait for Gateway {
         .await
     }
 
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        response_id: &str,
+    ) -> Response {
         let miss = (
             StatusCode::NOT_FOUND,
             format!("No router available to cancel response '{response_id}'"),
         );
         self.dispatch(None, miss, |router| async move {
-            router.cancel_response(headers, response_id).await
+            router
+                .cancel_response(headers, tenant_meta, response_id)
+                .await
         })
         .await
     }

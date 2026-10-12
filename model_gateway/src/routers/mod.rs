@@ -163,8 +163,14 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Cancel a background response by id
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    /// Cancel a background response by id, for the caller `tenant_meta`
+    /// describes (a response of another tenant answers as an unknown id does).
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _response_id: &str,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Cancel response not implemented",
