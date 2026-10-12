@@ -138,11 +138,12 @@ pub struct PixelNorm {
     /// rescaled but not normalized, else 1.
     pub scale: f32,
     /// Subtracted next, per channel: the mean, in byte units when the bytes
-    /// are rescaled as well (`mean / rescale_factor`); 0 without
-    /// normalization.
+    /// are rescaled as well (`f32(mean) * f32(1 / rescale_factor)`, the
+    /// reference's own rounding, as `pixel_norm` in the Qwen base builds it);
+    /// 0 without normalization.
     pub offset: [f32; 3],
-    /// Divides last, per channel: the std in the same units as `offset`; 1
-    /// without normalization.
+    /// Divides last, per channel: the std in the same units and the same
+    /// rounding as `offset`; 1 without normalization.
     pub divisor: [f32; 3],
     /// Consecutive elements of one channel within a row of the encoder
     /// input: for a patch layout `[C, temporal, patch_h, patch_w]` the
