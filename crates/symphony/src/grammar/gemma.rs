@@ -14,11 +14,14 @@
 //! to a string or a bare literal: a definition that names itself is written once (the `$ref`
 //! pointers on the way down are kept), a value nests at most [`DEPTH`] levels, unions included,
 //! a tag spells at most [`VALUES`] values in all, which bounds the work, and an object's members
-//! take at most [`NODES`] nodes of the tree once [`joined`] has copied each pair into the starts
-//! before it, or the object takes any pairs instead, which bounds the size (estimated from the
-//! pairs before the copies are made). The last two bound a schema whose definitions are distinct
-//! at every level or reused across one (a chain of unions, a wide DAG), where the first two do
-//! not, so a request's schema gives a finite tag of bounded size in bounded time.
+//! take at most [`NODES`] nodes of the tree, which bounds the size: the full spelling where it
+//! fits once [`joined`] has copied each pair into the starts before it, else the pairs in any
+//! order and number, each twice, else that with the largest values untyped one by one, the keys
+//! kept, else any pairs (estimated before the copies are made, a JSON schema leaf counting by its
+//! size). An object's members hold every object below it, so the bound is the whole tag's. The
+//! last two bound a schema whose definitions are distinct at every level or reused across one (a
+//! chain of unions, a wide DAG), where the first two do not, so a request's schema gives a finite
+//! tag of bounded size in bounded time.
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -38,11 +41,16 @@ const KEY: &str = r"[^:,{}\[\]<]+";
 /// recorded tool nests further. The cap is small because [`joined`] clones each pair into every
 /// start before it, so each level of optional pairs multiplies the tree.
 const DEPTH: usize = 8;
-/// How many nodes an object's members may take once [`joined`] has copied each pair into the
-/// starts before it; past that the object takes any pairs. With ten optional properties a pair is
-/// copied up to ten times, so an object of objects multiplies by that at every level, and this
-/// bounds the whole tree whatever the schema's shape.
-const NODES: usize = 2_048;
+/// How many nodes an object's members may take, the objects below it included, so the whole tag
+/// stays within it: the full spelling copies each pair into the starts before it ([`joined`]), the
+/// pairs in any order copy each twice ([`Ends::in_any_order`]), and an object of objects would
+/// multiply by that at every level without the bound. Twenty-nine optional strings still take the
+/// full spelling; thirty to about two hundred and fifty stand in any order.
+const NODES: usize = 4_096;
+/// The JSON schema types, once each: the branches a `type` list can have.
+const TYPES: [&str; 7] = [
+    "string", "integer", "number", "boolean", "null", "object", "array",
+];
 /// How many values a tag spells before the rest give way to a string or a bare literal: the walk
 /// down a schema is depth first and eager, so this bounds its work whatever the schema's shape.
 const VALUES: usize = 256;
@@ -100,8 +108,8 @@ struct Ends<'a> {
 
 impl Ends<'_> {
     /// The members of the object `schema` describes: one `key:value` pair per property, the keys
-    /// in sorted order ignoring case, joined by `,`; any pairs for a schema without properties, or
-    /// whose pairs would take more than [`NODES`] nodes once joined. The properties are read
+    /// in sorted order ignoring case, joined by `,`, within [`NODES`] ([`Self::within_the_cap`]);
+    /// any pairs for a schema without properties. The properties are read
     /// through the schema's `$ref`, as every keyword is. `depth` is what
     /// is left of [`DEPTH`]; `walk` carries the `$ref` pointers on the way down and the values
     /// left to spell.
@@ -125,20 +133,58 @@ impl Ends<'_> {
             .unwrap_or_default();
         let mut sorted: Vec<(&String, &Value)> = properties.iter().collect();
         sorted.sort_by_cached_key(|(key, _)| key.to_lowercase());
-        let pairs: Vec<(Grammar, bool)> = sorted
+        let values: Vec<(&String, Grammar, bool)> = sorted
             .into_iter()
             .map(|(key, property)| {
-                let pair = Grammar::Sequence(vec![
-                    Grammar::ConstString(format!("{key}:")),
-                    self.value(property, definitions, depth, walk),
-                ]);
-                (pair, required.contains(&key.as_str()))
+                let value = self.value(property, definitions, depth, walk);
+                (key, value, required.contains(&key.as_str()))
             })
             .collect();
-        if joined_nodes(&pairs) > NODES {
-            return self.any_members();
+        self.within_the_cap(values)
+    }
+
+    /// The members within [`NODES`]: the full spelling where it fits, else the pairs in any order,
+    /// else that with the largest values untyped one by one, the keys kept, else any pairs (more
+    /// properties than two untyped pairs each fit). Each round is arithmetic on the pairs' weights
+    /// (a pair is its sequence, its key and its value); the pairs are built once, on the way out.
+    fn within_the_cap(&self, mut values: Vec<(&String, Grammar, bool)>) -> Grammar {
+        let untyped = 2 + self.any_value().nodes();
+        let mut weights: Vec<(usize, bool)> = values
+            .iter()
+            .map(|(_, value, required)| (2 + value.nodes(), *required))
+            .collect();
+        loop {
+            if joined_nodes(&weights) <= NODES {
+                return joined(&pairs_of(values), ",");
+            }
+            // Any order: the pairs twice, each copy in its `or`, under the option, the sequence,
+            // the star, its sequence and the separator.
+            let total: usize = weights.iter().map(|(weight, _)| *weight).sum();
+            if 2 * (1 + total) + 5 <= NODES {
+                return self.in_any_order(pairs_of(values));
+            }
+            let largest = weights
+                .iter()
+                .enumerate()
+                .filter(|(_, (weight, _))| *weight > untyped)
+                .max_by_key(|(_, (weight, _))| *weight);
+            let Some((at, _)) = largest else {
+                return self.any_members();
+            };
+            values[at].1 = self.any_value();
+            weights[at].0 = untyped;
         }
-        joined(&pairs, ",")
+    }
+
+    /// The pairs in any order and number, joined by `,`, or none: what an object's members take
+    /// when the full spelling would pass [`NODES`]. Each pair stands twice in the tree instead of
+    /// once per start before it; every key keeps its spelling and its type, and the order, the
+    /// required pairs and the uniqueness, which the assembler does not read, are given up.
+    fn in_any_order(&self, pairs: Vec<(Grammar, bool)>) -> Grammar {
+        let any = one_of(pairs.into_iter().map(|(pair, _)| pair).collect(), || {
+            self.any_value()
+        });
+        Grammar::Optional(Box::new(separated(any, ",")))
     }
 
     /// A value as the template spells one, or a string or a bare literal where the value nests
@@ -172,9 +218,10 @@ impl Ends<'_> {
         grammar
     }
 
-    /// A value by what its schema says: one of its branches where the `type` is a list (each the
-    /// schema with that one type and the `enum` members of that type) or an `anyOf` or `oneOf`
-    /// stands, a union level counting as one of nesting; a string `enum` as one of its values
+    /// A value by what its schema says: one of its branches where the `type` is a list (each known
+    /// type once, the schema with that one type and the `enum` members of that type, none where
+    /// the `enum` has no member of the type) or an `anyOf` or `oneOf` stands, a union level
+    /// counting as one of nesting; a string `enum` as one of its values
     /// between the tokens; a
     /// string between the tokens; `true`, `false` and `null` as the words; a number as the JSON
     /// the property's schema accepts; an object and a list in this same spelling; a string or a
@@ -191,12 +238,19 @@ impl Ends<'_> {
         if let Some(types) = keyword(schema, target, "type").and_then(Value::as_array) {
             // Each branch is the schema with that one type, the property's own keyword winning,
             // and the `enum` narrowed to the members of that type (OpenAI's strict mode writes a
-            // nullable enum as `"type": ["string", "null"], "enum": ["F", "C", null]`).
+            // nullable enum as `"type": ["string", "null"], "enum": ["F", "C", null]`); a type
+            // no member has admits nothing, since `enum` constrains every value, and has no
+            // branch. The known types once each, so a list cannot cost more than seven clones.
             let options = keyword(schema, target, "enum").and_then(Value::as_array);
-            let branches: Vec<Grammar> = types
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|one| {
+            let mut names: Vec<&str> = Vec::new();
+            for one in types.iter().filter_map(Value::as_str) {
+                if TYPES.contains(&one) && !names.contains(&one) {
+                    names.push(one);
+                }
+            }
+            let branches: Vec<Grammar> = names
+                .into_iter()
+                .filter_map(|one| {
                     let mut single = schema.clone();
                     if let Value::Object(map) = &mut single {
                         map.insert("type".to_string(), Value::String(one.to_string()));
@@ -207,13 +261,12 @@ impl Ends<'_> {
                                 .cloned()
                                 .collect();
                             if narrowed.is_empty() {
-                                map.remove("enum");
-                            } else {
-                                map.insert("enum".to_string(), Value::Array(narrowed));
+                                return None;
                             }
+                            map.insert("enum".to_string(), Value::Array(narrowed));
                         }
                     }
-                    self.typed(&single, definitions, depth, walk)
+                    Some(self.typed(&single, definitions, depth, walk))
                 })
                 .collect();
             return one_of(branches, || self.any_value());
@@ -325,6 +378,17 @@ fn is_of_type(option: &Value, one: &str) -> bool {
         "array" => option.is_array(),
         _ => false,
     }
+}
+
+/// The pairs of `values`: each its key, `:` and its value, with whether the schema requires it.
+fn pairs_of(values: Vec<(&String, Grammar, bool)>) -> Vec<(Grammar, bool)> {
+    values
+        .into_iter()
+        .map(|(key, value, required)| {
+            let pair = Grammar::Sequence(vec![Grammar::ConstString(format!("{key}:")), value]);
+            (pair, required)
+        })
+        .collect()
 }
 
 /// One of `branches`: the one alone when there is one, any text when there is none.
@@ -697,8 +761,8 @@ mod tests {
 
         // Eight definitions, each ten optional properties referring to the next: distinct along
         // the path, within the depth, so the value budget bounds the walk (ten to the eighth
-        // values otherwise) and the node cap the tree (the pairs are copied into the starts before
-        // them, so an object of objects takes any pairs instead of its spelling).
+        // values otherwise) and the node cap the tree, the whole of it, since an object's members
+        // hold every object below.
         let mut defs = serde_json::Map::new();
         for i in 0..8 {
             let mut properties = serde_json::Map::new();
@@ -723,9 +787,8 @@ mod tests {
         });
         let mut walk = Walk::new();
         let grammar = ends.members(&wide, Definitions::of(&wide), DEPTH, &mut walk);
-        let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
         assert_eq!(walk.values, 0, "the budget is spent");
-        assert!(written.len() < 300_000, "{} bytes", written.len());
+        assert!(grammar.nodes() <= NODES, "{} nodes", grammar.nodes());
 
         // Ten optional properties, each an object of ten optional strings: 110 values, within the
         // budget, but the outer pairs would be copied into the starts before them (each with the
@@ -747,40 +810,110 @@ mod tests {
         let grammar = ends.members(&two_levels, Definitions::of(&two_levels), DEPTH, &mut walk);
         let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
         assert_eq!(walk.values, VALUES - 110);
-        let key = serde_json::to_string(KEY).expect("JSON");
-        assert!(
-            written.contains(&key),
-            "the outer object takes any pairs: {written}"
+        assert!(grammar.nodes() <= NODES, "{} nodes", grammar.nodes());
+        assert_eq!(
+            written.matches("\"o3:\"").count(),
+            2,
+            "the outer pairs stand twice, in any order: {written}"
         );
-        assert!(written.len() < 10_000, "{} bytes", written.len());
+        // An inner object that keeps its spelling writes `s3:` four times (the fourth pair's
+        // copies), twice over with its outer pair; the largest give way until the members fit.
+        let inner = written.matches("\"s3:\"").count();
+        assert!(
+            inner >= 8 && inner.is_multiple_of(8),
+            "{inner} inner copies: {written}"
+        );
     }
 
     #[test]
     fn a_nullable_enum_keeps_its_members_in_the_string_branch() {
         // OpenAI's strict mode: `{"type": ["string", "null"], "enum": ["F", "C", null]}` is one
         // of the two strings between the tokens, or `null`; a list type whose enum lists no
-        // `null` takes its enum in the string branch alone.
+        // `null` admits none, so its null branch is dropped and the enum stands alone; a type
+        // listed twice is one branch.
         let ends = Ends {
             call_exits: &["<tool_call|>"],
         };
         let root = value!({});
         let definitions = Definitions::of(&root);
-        for unit in [
-            value!({"type": ["string", "null"], "enum": ["F", "C", null]}),
-            value!({"type": ["string", "null"], "enum": ["F", "C"]}),
-        ] {
-            assert_eq!(
-                ends.value(&unit, definitions, DEPTH, &mut Walk::new())
-                    .to_json(),
-                value!({"type": "or", "elements": [
-                    {"type": "or", "elements": [
-                        {"type": "const_string", "value": "<|\"|>F<|\"|>"},
-                        {"type": "const_string", "value": "<|\"|>C<|\"|>"},
-                    ]},
-                    {"type": "const_string", "value": "null"},
-                ]}),
-                "{unit}"
+        let strings = value!({"type": "or", "elements": [
+            {"type": "const_string", "value": "<|\"|>F<|\"|>"},
+            {"type": "const_string", "value": "<|\"|>C<|\"|>"},
+        ]});
+        let nullable = value!({"type": ["string", "null"], "enum": ["F", "C", null]});
+        assert_eq!(
+            ends.value(&nullable, definitions, DEPTH, &mut Walk::new())
+                .to_json(),
+            value!({"type": "or", "elements": [
+                strings,
+                {"type": "const_string", "value": "null"},
+            ]})
+        );
+        let not_null = value!({"type": ["string", "null"], "enum": ["F", "C"]});
+        assert_eq!(
+            ends.value(&not_null, definitions, DEPTH, &mut Walk::new())
+                .to_json(),
+            strings
+        );
+        let repeated = value!({"type": ["null", "null", "null", "string", "unknown"]});
+        assert_eq!(
+            ends.value(&repeated, definitions, DEPTH, &mut Walk::new())
+                .to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "null"},
+                text(),
+            ]})
+        );
+    }
+
+    #[test]
+    fn past_the_node_cap_the_pairs_keep_their_keys_and_types_in_any_order() {
+        // Forty optional strings would take 7,302 nodes once joined (each pair copied into the
+        // starts before it, with its separator and option), past the cap: the
+        // object writes its pairs in any order and number instead, each twice in the tree, every
+        // key still spelled and typed, so a forced call keeps its arguments' names.
+        let mut properties = serde_json::Map::new();
+        for i in 0..40 {
+            properties.insert(format!("k{i:02}"), value!({"type": "string"}));
+        }
+        let flat = value!({"type": "object", "properties": properties});
+        let ends = Ends {
+            call_exits: &["<tool_call|>"],
+        };
+        let grammar = ends.members(&flat, Definitions::of(&flat), DEPTH, &mut Walk::new());
+        let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
+        assert_eq!(written.matches("\"k07:\"").count(), 2, "{written}");
+        assert!(!written.contains(&serde_json::to_string(KEY).expect("JSON")));
+        assert_eq!(grammar.to_json()["type"], "optional");
+        assert_eq!(
+            grammar.to_json()["content"]["elements"][0]["type"],
+            "or",
+            "one of the pairs"
+        );
+
+        // A number behind a reference carries the root's definitions in its JSON schema, which
+        // every copy repeats: the leaf counts by its size, so ten such pairs pass the cap and the
+        // largest values give way until the members fit, every key kept.
+        let mut defs = serde_json::Map::new();
+        for i in 0..400 {
+            defs.insert(
+                format!("Unused{i}"),
+                value!({"type": "string", "minLength": i}),
             );
+        }
+        defs.insert("Count".to_string(), value!({"type": "integer"}));
+        let mut properties = serde_json::Map::new();
+        for i in 0..10 {
+            properties.insert(format!("n{i}"), value!({"$ref": "#/$defs/Count"}));
+        }
+        let heavy = value!({"type": "object", "properties": properties, "$defs": defs});
+        let grammar = ends.members(&heavy, Definitions::of(&heavy), DEPTH, &mut Walk::new());
+        let written = serde_json::to_string(&grammar.to_json()).expect("JSON");
+        assert!(grammar.nodes() <= NODES, "{} nodes", grammar.nodes());
+        let copies = written.matches("\"Unused399\"").count();
+        assert!((2..55).contains(&copies), "{copies} copies");
+        for i in 0..10 {
+            assert!(written.contains(&format!("\"n{i}:\"")), "every key stays");
         }
     }
 

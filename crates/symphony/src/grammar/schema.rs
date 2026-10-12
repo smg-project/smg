@@ -53,7 +53,7 @@ pub(super) fn arguments(
 /// separator inside the option; the whole is optional when no pair is required, and no pairs are
 /// the empty text.
 pub(super) fn joined(pairs: &[(Grammar, bool)], separator: &str) -> Grammar {
-    let (first_required, may_start) = starts_of(pairs);
+    let (first_required, may_start) = starts_of(pairs.iter().map(|(_, required)| *required));
     let mut starts: Vec<Grammar> = (0..may_start)
         .map(|first| {
             let mut elements = vec![pairs[first].0.clone()];
@@ -85,24 +85,38 @@ pub(super) fn joined(pairs: &[(Grammar, bool)], separator: &str) -> Grammar {
 
 /// The position of the first required pair, and how many pairs may stand first: every pair up to
 /// and including it, or all of them when none is required.
-fn starts_of(pairs: &[(Grammar, bool)]) -> (Option<usize>, usize) {
-    let first_required = pairs.iter().position(|(_, required)| *required);
-    (
-        first_required,
-        first_required.map_or(pairs.len(), |at| at + 1),
-    )
+fn starts_of(required: impl Iterator<Item = bool>) -> (Option<usize>, usize) {
+    let mut count = 0;
+    let mut first_required = None;
+    for (at, required) in required.enumerate() {
+        count += 1;
+        if required && first_required.is_none() {
+            first_required = Some(at);
+        }
+    }
+    (first_required, first_required.map_or(count, |at| at + 1))
 }
 
-/// The nodes [`joined`] would make of `pairs`, the separators left out: each pair is copied into
-/// every start before it, so the pair at `i` goes into `i + 1` starts, or into every start when
-/// the required pairs leave fewer. A derivation that bounds its tree asks before joining.
-pub(super) fn joined_nodes(pairs: &[(Grammar, bool)]) -> usize {
-    let (_, may_start) = starts_of(pairs);
-    pairs
-        .iter()
-        .enumerate()
-        .map(|(at, (pair, _))| pair.nodes() * (at + 1).min(may_start))
-        .sum()
+/// The nodes [`joined`] makes of pairs of the given weights (each a pair's nodes), as
+/// [`Grammar::nodes`] counts them: each pair is copied into every start before it, so the pair at
+/// `i` goes into `i + 1` starts, or into every start when the required pairs leave fewer, each
+/// copy after a start's first with its separator (and its option, when the pair is optional).
+/// Each weight is read once, from the last pair back. A derivation that bounds its tree asks
+/// before joining.
+pub(super) fn joined_nodes(pairs: &[(usize, bool)]) -> usize {
+    let (first_required, may_start) = starts_of(pairs.iter().map(|(_, required)| *required));
+    // `after` is what the pairs after `at` add to a start that opens with it.
+    let mut after = 0;
+    let mut starts = 0;
+    for (at, (weight, required)) in pairs.iter().enumerate().rev() {
+        if at < may_start {
+            starts += 1 + weight + after;
+        }
+        after += weight + if *required { 2 } else { 3 };
+    }
+    let or = usize::from(may_start > 1);
+    let optional = usize::from(first_required.is_none());
+    starts + or + optional
 }
 
 /// The schema's own keyword, or its `$ref` target's: a `$ref` lends its target's keywords, and

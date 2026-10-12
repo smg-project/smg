@@ -193,13 +193,13 @@ impl Grammar {
         json!({"format": self.to_json()})
     }
 
-    /// The nodes in the tree, this one included: its size, for a derivation that bounds it.
+    /// The nodes in the tree, this one included: its size, for a derivation that bounds it. A
+    /// JSON schema leaf counts by the size of its schema (a node per four of the schema's own, a
+    /// long string weighing its length), since the definitions attached to it are copied with it.
     pub(crate) fn nodes(&self) -> usize {
         1 + match self {
-            Self::ConstString(_)
-            | Self::AnyText { .. }
-            | Self::Regex(_)
-            | Self::JsonSchema { .. } => 0,
+            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) => 0,
+            Self::JsonSchema { schema, .. } => json_nodes(schema) / 4,
             Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
             Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
             Self::Tag(tag) => tag.content.nodes(),
@@ -207,6 +207,22 @@ impl Grammar {
                 tags.iter().map(|tag| tag.content.nodes()).sum()
             }
         }
+    }
+}
+
+/// The nodes of a JSON value: one per scalar, one per object or array and one per member, and
+/// one more per sixty-four bytes of a string, so a long `description` weighs what it costs.
+fn json_nodes(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            1 + map
+                .values()
+                .map(|member| 1 + json_nodes(member))
+                .sum::<usize>()
+        }
+        Value::Array(items) => 1 + items.iter().map(json_nodes).sum::<usize>(),
+        Value::String(text) => 1 + text.len() / 64,
+        _ => 1,
     }
 }
 
