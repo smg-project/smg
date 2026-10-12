@@ -289,7 +289,7 @@ pub(crate) fn init_metrics() {
     // Layer 2: Router metrics
     describe_counter!(
         "smg_router_requests_total",
-        "Total routed requests by router_type, backend_type, connection_mode, model, endpoint, streaming"
+        "Total routed requests by router_type, backend_type, connection_mode, model, endpoint, streaming; model is the served model's id, or other for a model the gateway does not serve"
     );
     describe_histogram!(
         "smg_router_request_duration_seconds",
@@ -297,7 +297,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_router_request_errors_total",
-        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type"
+        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type; model is the served model's id, or other for a model the gateway does not serve"
     );
     describe_histogram!(
         "smg_router_stage_duration_seconds",

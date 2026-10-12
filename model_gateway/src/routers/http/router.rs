@@ -387,7 +387,7 @@ impl Router {
         // and an alias would silently fall back to router defaults.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let model = model_id;
+        let model = self.worker_registry.metric_model_label(model_id);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -883,13 +883,14 @@ impl Router {
         // never goes through `route_typed_request`.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
+        let model_label = self.worker_registry.metric_model_label(model_id);
         let endpoint = route_to_endpoint(route);
 
         Metrics::record_router_request(
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_REGULAR,
             metrics_labels::CONNECTION_HTTP,
-            model_id,
+            model_label,
             endpoint,
             bool_to_static_str(is_stream),
         );
@@ -912,7 +913,7 @@ impl Router {
                     metrics_labels::ROUTER_HTTP,
                     metrics_labels::BACKEND_REGULAR,
                     metrics_labels::CONNECTION_HTTP,
-                    model_id,
+                    model_label,
                     endpoint,
                     error_type_from_status(rstatus),
                 );
@@ -1068,7 +1069,7 @@ impl Router {
                     metrics_labels::ROUTER_HTTP,
                     metrics_labels::BACKEND_REGULAR,
                     metrics_labels::CONNECTION_HTTP,
-                    model_id,
+                    model_label,
                     endpoint,
                     error_type_from_status(err_status),
                 );
@@ -1106,7 +1107,7 @@ impl Router {
             // classify those.
             let worker_for_stream = worker.clone();
             let stream_header_status = status;
-            let stream_model_id = model_id.to_string();
+            let stream_model_id = model_label.to_string();
             let stream_endpoint = endpoint;
             let stream_start = start;
             #[expect(
@@ -1238,7 +1239,7 @@ impl Router {
                     metrics_labels::ROUTER_HTTP,
                     metrics_labels::BACKEND_REGULAR,
                     metrics_labels::CONNECTION_HTTP,
-                    model_id,
+                    model_label,
                     endpoint,
                     start.elapsed(),
                 );
@@ -1247,7 +1248,7 @@ impl Router {
                     metrics_labels::ROUTER_HTTP,
                     metrics_labels::BACKEND_REGULAR,
                     metrics_labels::CONNECTION_HTTP,
-                    model_id,
+                    model_label,
                     endpoint,
                     error_type_from_status(final_status),
                 );
@@ -2368,7 +2369,7 @@ impl RouterTrait for Router {
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_REGULAR,
             metrics_labels::CONNECTION_WEBSOCKET,
-            model,
+            self.worker_registry.metric_model_label(model),
             metrics_labels::ENDPOINT_REALTIME,
             "false",
         );
@@ -2413,7 +2414,7 @@ impl RouterTrait for Router {
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_REGULAR,
             metrics_labels::CONNECTION_WEBRTC,
-            &parsed.model,
+            self.worker_registry.metric_model_label(&parsed.model),
             metrics_labels::ENDPOINT_REALTIME,
             "false",
         );
@@ -2583,6 +2584,101 @@ mod tests {
         let workers = router.worker_registry.get_all();
         workers[0].set_status(openai_protocol::worker::WorkerStatus::NotReady);
         router
+    }
+
+    /// smg-lab #288: the `model` label of the request families is bounded by
+    /// the served models. A request for a model no worker serves is counted
+    /// under `other` (the value the bounded interner and the `path` label
+    /// already use), never under the client's string, so a client cannot
+    /// mint series; a served model keeps its own id.
+    #[test]
+    fn an_unserved_model_is_counted_under_other_and_a_served_one_under_its_id() {
+        use openai_protocol::validated::Normalizable;
+
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let app = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(|| async {
+                        ([(CONTENT_TYPE, "application/json")], "{}").into_response()
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let served = BasicWorkerBuilder::new(format!("http://{addr}"))
+                    .worker_type(WorkerType::Regular)
+                    .model(crate::worker::ModelCard::new("m1"))
+                    .health_config(no_health_check())
+                    .build();
+                let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![served]);
+                let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+                for model in ["ghost-1", "ghost-2", "m1"] {
+                    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 4,
+                    }))
+                    .unwrap();
+                    request.normalize();
+                    let response = router.route_chat(None, &tenant, request, model).await;
+                    let expected = if model == "m1" {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    };
+                    assert_eq!(response.status(), expected, "{model}");
+                }
+            });
+        });
+        assert!(
+            !rendered.contains("ghost-"),
+            "a client-named model reached a label:\n{rendered}"
+        );
+        let requests: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_requests_total{"))
+            .collect();
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.contains(r#"model="other""#) && line.ends_with(" 2")),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.contains(r#"model="m1""#) && line.ends_with(" 1")),
+            "{requests:?}"
+        );
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert!(
+            errors.iter().any(|line| {
+                line.contains(r#"model="other""#)
+                    && line.contains(r#"error_type="no_workers""#)
+                    && line.ends_with(" 2")
+            }),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|line| line.contains(r#"model="m1""#)),
+            "{errors:?}"
+        );
     }
 
     #[test]

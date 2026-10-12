@@ -222,7 +222,11 @@ pub(crate) fn resolve_mm_processing(
     // Where a model's media is processed is worker configuration, reported in
     // the worker's labels and countable on this metric. It is not a per-request
     // event, so it is not logged as one.
-    Metrics::record_mm_processing(model_id, resolved.as_str(), reason);
+    Metrics::record_mm_processing(
+        registry.metric_model_label(model_id),
+        resolved.as_str(),
+        reason,
+    );
     Ok(resolved)
 }
 

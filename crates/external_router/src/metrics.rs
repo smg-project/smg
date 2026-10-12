@@ -14,7 +14,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use metrics::{counter, histogram};
 use once_cell::sync::Lazy;
 
-const BOUNDED_LABEL_SENTINEL: &str = "other";
+const BOUNDED_LABEL_SENTINEL: &str = metrics_labels::MODEL_OTHER;
 
 /// Max distinct client-supplied model labels retained before collapsing to the
 /// sentinel. A gateway fronts far fewer real models than this; the cap only bites
@@ -106,6 +106,12 @@ pub const fn bool_to_static_str(b: bool) -> &'static str {
 }
 
 pub mod metrics_labels {
+    /// The `model` label of a request that names no served model: an unknown
+    /// name refused with 404, or a value past the model-label cap. One fixed
+    /// value, as the `path` label is `other` for an unmatched route, so a
+    /// client cannot mint label values.
+    pub const MODEL_OTHER: &str = "other";
+
     // Router types
     pub const ROUTER_OPENAI: &str = "openai";
     pub const ROUTER_HTTP: &str = "http";

@@ -692,14 +692,7 @@ impl RequestPipeline {
             {
                 Ok(Some(response)) => {
                     if let Some(endpoint) = metrics_endpoint {
-                        Metrics::record_router_duration(
-                            metrics_labels::ROUTER_GRPC,
-                            self.backend_type,
-                            metrics_labels::CONNECTION_GRPC,
-                            &dctx.model_id,
-                            endpoint,
-                            attempt_start.elapsed(),
-                        );
+                        self.record_duration(endpoint, &dctx.model_id, attempt_start);
                     }
                     return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
                 }
@@ -814,12 +807,15 @@ impl RequestPipeline {
     /// One router request under this pipeline's labels, the count the
     /// dashboards read: recorded per attempt here, and by the router for an
     /// answer it gives without the pipeline, so that traffic stays visible.
+    /// The `model` label is the served model's id, or `other` for a model no
+    /// worker serves ([`WorkerRegistry::metric_model_label`]), here and in
+    /// the error and duration records below.
     pub(crate) fn record_request(&self, endpoint: &'static str, model: &str, streaming: bool) {
         Metrics::record_router_request(
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             bool_to_static_str(streaming),
         );
@@ -838,7 +834,7 @@ impl RequestPipeline {
                 metrics_labels::ROUTER_GRPC,
                 self.backend_type,
                 metrics_labels::CONNECTION_GRPC,
-                model,
+                self.worker_registry.metric_model_label(model),
                 endpoint,
                 error_type_from_status(response.status()),
             );
@@ -878,7 +874,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             start.elapsed(),
         );
@@ -901,7 +897,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
         );
@@ -919,7 +915,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
         );
@@ -3970,5 +3966,72 @@ mod rate_limit_reserve_tests {
             manager.reserve(check).await,
             Reservation::Admitted(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod model_label_tests {
+    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+    use super::*;
+    use crate::{
+        config::types::PolicyConfig,
+        observability::metrics::test_support::render_with_recorder,
+        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    };
+
+    /// smg-lab #288: the pipeline's request and error records carry the
+    /// served model's id, or `other` for a model no worker serves, so a
+    /// client cannot mint series with unknown names.
+    #[test]
+    fn the_pipeline_counts_an_unserved_model_under_other() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Sglang)
+            .model(ModelCard::new("m1"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        worker_registry.register(Arc::new(worker)).unwrap();
+        let deps = PipelineDeps::pair(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let rendered = render_with_recorder(|| {
+            pipeline.record_request(metrics_labels::ENDPOINT_CHAT, "ghost-1", false);
+            pipeline.record_request(metrics_labels::ENDPOINT_CHAT, "m1", false);
+            pipeline.record_error(
+                Some(metrics_labels::ENDPOINT_CHAT),
+                "ghost-1",
+                &error::model_not_found("ghost-1"),
+            );
+        });
+        assert!(!rendered.contains("ghost-"), "{rendered}");
+        let has = |family: &str, label: &str| {
+            rendered
+                .lines()
+                .any(|line| line.starts_with(&format!("{family}{{")) && line.contains(label))
+        };
+        assert!(
+            has("smg_router_requests_total", r#"model="other""#),
+            "{rendered}"
+        );
+        assert!(
+            has("smg_router_requests_total", r#"model="m1""#),
+            "{rendered}"
+        );
+        assert!(
+            has("smg_router_request_errors_total", r#"model="other""#),
+            "{rendered}"
+        );
     }
 }

@@ -422,6 +422,7 @@ impl PDRouter {
         let canonical_model = self.worker_registry.resolve_model_alias(context.model_id);
         let model = canonical_model.as_deref().unwrap_or(context.model_id);
         context.model_id = model;
+        let model_label = self.worker_registry.metric_model_label(model);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -429,7 +430,7 @@ impl PDRouter {
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_PD,
             metrics_labels::CONNECTION_HTTP,
-            model,
+            model_label,
             endpoint,
             bool_to_static_str(context.is_stream),
         );
@@ -504,7 +505,7 @@ impl PDRouter {
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
                 metrics_labels::CONNECTION_HTTP,
-                model,
+                model_label,
                 endpoint,
                 duration,
             );
@@ -513,7 +514,7 @@ impl PDRouter {
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
                 metrics_labels::CONNECTION_HTTP,
-                model,
+                model_label,
                 endpoint,
                 error_type_from_status(response.status()),
             );

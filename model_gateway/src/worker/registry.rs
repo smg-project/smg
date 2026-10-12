@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::{
     config::types::RetryConfig,
-    observability::metrics::Metrics,
+    observability::metrics::{metrics_labels, Metrics},
     worker::{
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
@@ -1065,6 +1065,19 @@ impl WorkerRegistry {
         self.model_index
             .get(canonical_id)
             .is_some_and(|workers| !workers.is_empty())
+    }
+
+    /// The value of the `model` label on the request metric families for a
+    /// request that names `model_id`: the id itself while a worker serves it
+    /// (an alias included), else [`metrics_labels::MODEL_OTHER`], so a client
+    /// cannot mint label values with names the gateway does not serve.
+    /// Routing keeps the request's own id; only the label is bounded.
+    pub fn metric_model_label<'a>(&self, model_id: &'a str) -> &'a str {
+        if self.contains_model(model_id) {
+            model_id
+        } else {
+            metrics_labels::MODEL_OTHER
+        }
     }
 
     /// Return the number of registered workers.
@@ -4171,6 +4184,35 @@ mod tests {
         assert!(registry.remove(&worker_id).is_some());
         assert!(!registry.contains_model("GLM-5.2"));
         assert!(!registry.contains_model("GLM-5.2-Coding"));
+    }
+
+    /// smg-lab #288: the request metric families take the served model's id,
+    /// or `other` for a name no worker serves, as their `model` label.
+    #[test]
+    fn metric_model_label_is_the_served_id_or_other() {
+        let registry = WorkerRegistry::new();
+        assert_eq!(registry.metric_model_label("ghost-1"), "other");
+
+        let worker = worker_with_model_aliases(
+            "http://worker:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Regular,
+        );
+        let worker_id = registry.register(worker).unwrap();
+        assert_eq!(registry.metric_model_label("GLM-5.2"), "GLM-5.2");
+        assert_eq!(
+            registry.metric_model_label("GLM-5.2-Coding"),
+            "GLM-5.2-Coding"
+        );
+        assert_eq!(
+            registry.metric_model_label("ghost-1"),
+            metrics_labels::MODEL_OTHER
+        );
+        assert_eq!(registry.metric_model_label(UNKNOWN_MODEL_ID), "other");
+
+        assert!(registry.remove(&worker_id).is_some());
+        assert_eq!(registry.metric_model_label("GLM-5.2"), "other");
     }
 
     #[test]
