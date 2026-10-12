@@ -1846,10 +1846,10 @@ async fn execute_sequential_pd(
                 if let Some(status) = e.breaker_status() {
                     workers.record_outcome_prefill(ledger, status);
                 }
-                Metrics::record_worker_error(
+                UpstreamClass::account_stream_failure(
                     metrics_labels::WORKER_PREFILL,
                     prefill_label,
-                    metrics_labels::ERROR_BACKEND,
+                    &e,
                 );
                 account_pd_leg_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");

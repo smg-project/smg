@@ -98,9 +98,6 @@ pub(crate) async fn collect_responses(
             })
             .await
             .map_err(|e| {
-                if let Some(worker) = prefill.worker() {
-                    UpstreamClass::account_collected_failure(worker.as_ref(), &e);
-                }
                 e.to_http_error(
                     "worker_stream_failed",
                     format!("Prefill stream failed: {}", e.message()),

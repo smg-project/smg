@@ -139,9 +139,28 @@ impl UpstreamClass {
         connection_mode: &'static str,
         status: &tonic::Status,
     ) {
-        let class = Self::of_dispatch(status);
-        if class.is_worker_failure() {
-            Metrics::record_worker_error(worker_type, connection_mode, class.error_type);
+        Self::of_dispatch(status).account_worker_failure(worker_type, connection_mode);
+    }
+
+    /// Count a stream `status` ended with against the worker that served it,
+    /// under `worker_type` and `connection_mode`, when it is the worker's
+    /// failure: the post-first-chunk class, next to the breaker sample as
+    /// everywhere else.
+    pub(crate) fn account_stream_failure(
+        worker_type: &'static str,
+        connection_mode: &'static str,
+        status: &tonic::Status,
+    ) {
+        Self::of(status).account_worker_failure(worker_type, connection_mode);
+    }
+
+    /// One sample of the worker-error family for this class, when the status
+    /// is the worker's failure AND says something about the worker: a failure
+    /// the breaker does not sample (the request's own media) is not the
+    /// worker's either, whatever its HTTP class.
+    fn account_worker_failure(&self, worker_type: &'static str, connection_mode: &'static str) {
+        if self.breaker_sample.is_some() && self.is_worker_failure() {
+            Metrics::record_worker_error(worker_type, connection_mode, self.error_type);
         }
     }
 
@@ -151,14 +170,11 @@ impl UpstreamClass {
     /// without the streamed answer's event. The client's status and the
     /// router-error family are the pipeline's.
     pub(crate) fn account_collected_failure(worker: &dyn Worker, status: &tonic::Status) {
-        let class = Self::of(status);
-        if class.is_worker_failure() {
-            Metrics::record_worker_error(
-                worker.worker_type().as_metric_label(),
-                worker.connection_mode().as_metric_label(),
-                class.error_type,
-            );
-        }
+        Self::account_stream_failure(
+            worker.worker_type().as_metric_label(),
+            worker.connection_mode().as_metric_label(),
+            status,
+        );
     }
 
     /// Whether the status is the worker's failure: a server error, a timeout
@@ -382,13 +398,14 @@ impl StreamSource {
         if matches!(leg, UpstreamLeg::Answer) && worker_type == metrics_labels::WORKER_DECODE {
             account_pd_leg_failure(worker_type, status);
         }
-        if class.is_worker_failure() {
-            Metrics::record_worker_error(
-                worker_type,
-                metrics_labels::CONNECTION_GRPC,
-                class.error_type,
-            );
-        }
+        // Under the worker's own transport label, as the dispatch sites count;
+        // the router family below keeps its gRPC-router label.
+        class.account_worker_failure(
+            worker_type,
+            worker.map_or(metrics_labels::CONNECTION_GRPC, |worker| {
+                worker.connection_mode().as_metric_label()
+            }),
+        );
         Metrics::record_router_error(
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
@@ -430,7 +447,7 @@ mod tests {
     use super::*;
     use crate::worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder,
+        BasicWorkerBuilder, ConnectionMode,
     };
 
     fn dispatch() -> DispatchMetadata {
@@ -445,7 +462,8 @@ mod tests {
     /// A worker whose breaker opens on the first failure.
     fn worker() -> Arc<dyn Worker> {
         Arc::new(
-            BasicWorkerBuilder::new("http://engine-under-test:8000")
+            BasicWorkerBuilder::new("grpc://engine-under-test:8000")
+                .connection_mode(ConnectionMode::Grpc)
                 .circuit_breaker_config(CircuitBreakerConfig {
                     failure_threshold: 1,
                     ..Default::default()
@@ -994,6 +1012,9 @@ mod tests {
                 tonic::Status::invalid_argument("bad"),
                 tonic::Status::not_found("no such model"),
                 tonic::Status::cancelled("gone away"),
+                // The request's own media failed at the worker (a 502 to the
+                // client, nothing for the breaker): not the worker's failure.
+                tonic::Status::unavailable("HTTP error while fetching media: 503 from the origin"),
             ] {
                 UpstreamClass::account_dispatch_failure(
                     metrics_labels::WORKER_DECODE,
@@ -1046,12 +1067,12 @@ mod tests {
             );
         });
         let rendered = handle.render();
-        // Under the worker's own labels (this one speaks HTTP): the engine's
-        // report only, capacity pushback is not its failure.
+        // Under the worker's own labels (a gRPC worker): the engine's report
+        // only, capacity pushback is not its failure.
         let line = sample(
             &rendered,
             "smg_worker_errors_total",
-            &["worker_type=\"regular\"", "connection_mode=\"http\""],
+            &["worker_type=\"regular\"", "connection_mode=\"grpc\""],
         )
         .unwrap_or_else(|| panic!("counted under the worker's labels:\n{rendered}"));
         assert_eq!(label(line, "error_type"), "engine_error");
