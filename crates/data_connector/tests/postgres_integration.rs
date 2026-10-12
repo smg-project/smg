@@ -70,6 +70,7 @@ async fn postgres_bundle(db_url: &str) -> Result<StorageBundle, String> {
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await
@@ -412,6 +413,7 @@ async fn configured_table_bundle(db_url: &str, table: &str) -> Result<StorageBun
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await

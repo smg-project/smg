@@ -5,10 +5,10 @@ use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MetricsConfig,
-    OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
-    RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig,
-    TraceConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MemoryConfig,
+    MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
+    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
+    TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -942,6 +942,12 @@ impl RouterConfigBuilder {
             self.config.history_backend = HistoryBackend::Redis;
             self.config.redis = Some(cfg);
         }
+        self
+    }
+
+    /// Bounds of the memory history backend.
+    pub fn memory_config(mut self, memory: MemoryConfig) -> Self {
+        self.config.memory = Some(memory);
         self
     }
 

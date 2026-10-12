@@ -1,33 +1,148 @@
 //! In-memory storage implementations
 //!
-//! Used for development and testing - no persistence.
+//! Used for development and testing - no persistence. The stores are bounded
+//! ([`MemoryConfig`]): the oldest records go when a count bound is crossed or
+//! a record is older than the retention, checked on every write.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::RwLock;
 
 use super::core::*;
+use crate::config::MemoryConfig;
+
+// ============================================================================
+// Bounds
+// ============================================================================
+
+/// The bounds of one store: the count it keeps at most and the age past which
+/// a record goes.
+#[derive(Debug, Clone, Copy)]
+struct Bounds {
+    max: Option<usize>,
+    retention: Option<TimeDelta>,
+}
+
+impl Bounds {
+    fn new(max: Option<usize>, retention: Option<std::time::Duration>) -> Self {
+        Self {
+            max,
+            retention: retention.and_then(|retention| TimeDelta::from_std(retention).ok()),
+        }
+    }
+
+    /// Whether a record stamped `stamp` is older than the retention at `now`.
+    fn expired(&self, stamp: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+        self.retention
+            .is_some_and(|retention| now.signed_duration_since(stamp) >= retention)
+    }
+
+    /// Whether `count` records are more than the store keeps.
+    fn over(&self, count: usize) -> bool {
+        self.max.is_some_and(|max| count > max)
+    }
+}
+
+/// The ids of a store in insertion order with their stamps, oldest first. An
+/// id a client deleted stays in the queue until it reaches the front, where
+/// it is skipped; the store's real count is what the bound is held against.
+type Order<K> = VecDeque<(DateTime<Utc>, K)>;
+
+/// Evicts from the front of `order` while it is expired at `now` or the store
+/// holds more than the bound: `remove` drops the record under an id and
+/// answers whether there was one; `len` is the store's count before. Answers
+/// how many records went.
+fn evict<K>(
+    order: &mut Order<K>,
+    bounds: &Bounds,
+    now: DateTime<Utc>,
+    mut len: usize,
+    mut remove: impl FnMut(&K) -> bool,
+) -> usize {
+    let mut evicted = 0;
+    while let Some((stamp, _)) = order.front() {
+        if !(bounds.expired(*stamp, now) || bounds.over(len)) {
+            break;
+        }
+        if let Some((_, id)) = order.pop_front() {
+            if remove(&id) {
+                evicted += 1;
+                len -= 1;
+            }
+        }
+    }
+    evicted
+}
 
 // ============================================================================
 // PART 1: MemoryConversationStorage
 // ============================================================================
 
-/// In-memory conversation storage used for development and tests
-#[derive(Default, Clone)]
+#[derive(Default)]
+struct ConversationInner {
+    conversations: HashMap<ConversationId, Conversation>,
+    order: Order<ConversationId>,
+}
+
+impl ConversationInner {
+    fn evict(&mut self, bounds: &Bounds, now: DateTime<Utc>) -> usize {
+        let Self {
+            conversations,
+            order,
+        } = self;
+        let len = conversations.len();
+        let evicted = evict(order, bounds, now, len, |id| {
+            conversations.remove(id).is_some()
+        });
+        if evicted > 0 {
+            tracing::debug!(
+                evicted,
+                left = conversations.len(),
+                "Memory history: conversations evicted"
+            );
+        }
+        evicted
+    }
+}
+
+/// In-memory conversation storage used for development and tests; the
+/// conversations follow the retention of its [`MemoryConfig`] (a conversation
+/// record is small; its items have a bound of their own).
+#[derive(Clone)]
 pub struct MemoryConversationStorage {
-    inner: Arc<RwLock<HashMap<ConversationId, Conversation>>>,
+    inner: Arc<RwLock<ConversationInner>>,
+    bounds: Bounds,
+}
+
+impl Default for MemoryConversationStorage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryConversationStorage {
+    /// A store with the default bounds ([`MemoryConfig::default`]).
     pub fn new() -> Self {
+        Self::with_config(&MemoryConfig::default())
+    }
+
+    /// A store bounded as `config` says.
+    pub fn with_config(config: &MemoryConfig) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(ConversationInner::default())),
+            bounds: Bounds::new(None, config.retention()),
         }
+    }
+
+    /// Drops the conversations older than the retention at `now`; answers how
+    /// many went. Every write does this at the current time.
+    pub fn evict_at(&self, now: DateTime<Utc>) -> usize {
+        self.inner.write().evict(&self.bounds, now)
     }
 }
 
@@ -38,9 +153,16 @@ impl ConversationStorage for MemoryConversationStorage {
         input: NewConversation,
     ) -> ConversationResult<Conversation> {
         let conversation = Conversation::new(input);
-        self.inner
-            .write()
-            .insert(conversation.id.clone(), conversation.clone());
+        let mut store = self.inner.write();
+        let now = Utc::now();
+        if store
+            .conversations
+            .insert(conversation.id.clone(), conversation.clone())
+            .is_none()
+        {
+            store.order.push_back((now, conversation.id.clone()));
+        }
+        store.evict(&self.bounds, now);
         Ok(conversation)
     }
 
@@ -48,7 +170,7 @@ impl ConversationStorage for MemoryConversationStorage {
         &self,
         id: &ConversationId,
     ) -> ConversationResult<Option<Conversation>> {
-        Ok(self.inner.read().get(id).cloned())
+        Ok(self.inner.read().conversations.get(id).cloned())
     }
 
     async fn update_conversation(
@@ -57,7 +179,7 @@ impl ConversationStorage for MemoryConversationStorage {
         metadata: Option<ConversationMetadata>,
     ) -> ConversationResult<Option<Conversation>> {
         let mut store = self.inner.write();
-        if let Some(entry) = store.get_mut(id) {
+        if let Some(entry) = store.conversations.get_mut(id) {
             entry.metadata = metadata;
             return Ok(Some(entry.clone()));
         }
@@ -66,8 +188,12 @@ impl ConversationStorage for MemoryConversationStorage {
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
-        let removed = self.inner.write().remove(id).is_some();
+        let removed = self.inner.write().conversations.remove(id).is_some();
         Ok(removed)
+    }
+
+    fn stored_record_count(&self) -> Option<usize> {
+        Some(self.inner.read().conversations.len())
     }
 }
 
@@ -80,7 +206,7 @@ impl ConversationStorage for MemoryConversationStorage {
 type LinkKey = (DateTime<Utc>, String);
 
 /// Internal store for conversation items, protected by a single lock to prevent
-/// lock ordering inversions between the three maps.
+/// lock ordering inversions between the maps.
 #[derive(Default)]
 struct ConversationItemInner {
     /// All items indexed by ID
@@ -89,6 +215,10 @@ struct ConversationItemInner {
     links: HashMap<ConversationId, BTreeMap<LinkKey, ConversationItemId>>,
     /// Per-conversation reverse index: item_id_str -> (added_at, item_id_str)
     rev_index: HashMap<ConversationId, HashMap<String, LinkKey>>,
+    /// The conversations each item is linked into: an evicted item leaves all of them.
+    item_conversations: HashMap<ConversationItemId, HashSet<ConversationId>>,
+    /// The items in insertion order, for the bound.
+    order: Order<ConversationItemId>,
 }
 
 impl ConversationItemInner {
@@ -108,17 +238,108 @@ impl ConversationItemInner {
             links.remove(&previous);
         }
         links.insert(key, item_id.clone());
+        self.item_conversations
+            .entry(item_id.clone())
+            .or_default()
+            .insert(conversation_id.clone());
+    }
+
+    /// Removes the link of `item_id` in `conversation_id`; a conversation left
+    /// without links drops its maps, an item linked nowhere its entry.
+    fn unlink(&mut self, conversation_id: &ConversationId, item_id: &ConversationItemId) {
+        let key = self
+            .rev_index
+            .get_mut(conversation_id)
+            .and_then(|idx| idx.remove(&item_id.0));
+        if let Some(key) = key {
+            if let Some(links) = self.links.get_mut(conversation_id) {
+                links.remove(&key);
+                if links.is_empty() {
+                    self.links.remove(conversation_id);
+                    self.rev_index.remove(conversation_id);
+                }
+            }
+        }
+        if let Some(conversations) = self.item_conversations.get_mut(item_id) {
+            conversations.remove(conversation_id);
+            if conversations.is_empty() {
+                self.item_conversations.remove(item_id);
+            }
+        }
+    }
+
+    /// Drops the item and its links in every conversation; whether an item went.
+    fn evict_item(&mut self, item_id: &ConversationItemId) -> bool {
+        let existed = self.items.remove(item_id).is_some();
+        if let Some(conversations) = self.item_conversations.remove(item_id) {
+            for conversation_id in conversations {
+                let key = self
+                    .rev_index
+                    .get_mut(&conversation_id)
+                    .and_then(|idx| idx.remove(&item_id.0));
+                if let Some(key) = key {
+                    if let Some(links) = self.links.get_mut(&conversation_id) {
+                        links.remove(&key);
+                        if links.is_empty() {
+                            self.links.remove(&conversation_id);
+                            self.rev_index.remove(&conversation_id);
+                        }
+                    }
+                }
+            }
+        }
+        existed
+    }
+
+    fn evict(&mut self, bounds: &Bounds, now: DateTime<Utc>) -> usize {
+        let len = self.items.len();
+        let mut order = std::mem::take(&mut self.order);
+        let evicted = evict(&mut order, bounds, now, len, |id| self.evict_item(id));
+        self.order = order;
+        if evicted > 0 {
+            tracing::debug!(
+                evicted,
+                left = self.items.len(),
+                "Memory history: conversation items evicted"
+            );
+        }
+        evicted
     }
 }
 
-#[derive(Default, Clone)]
+/// In-memory conversation item storage; bounded by the item count and the
+/// retention of its [`MemoryConfig`].
+#[derive(Clone)]
 pub struct MemoryConversationItemStorage {
     inner: Arc<RwLock<ConversationItemInner>>,
+    bounds: Bounds,
+}
+
+impl Default for MemoryConversationItemStorage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryConversationItemStorage {
+    /// A store with the default bounds ([`MemoryConfig::default`]).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_config(&MemoryConfig::default())
+    }
+
+    /// A store bounded as `config` says.
+    pub fn with_config(config: &MemoryConfig) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(ConversationItemInner::default())),
+            bounds: Bounds::new(Some(config.max_items), config.retention()),
+        }
+    }
+
+    /// Drops the items over the bound or older than the retention at `now`,
+    /// unlinking them from every conversation; answers how many went. Every
+    /// write does this at the current time.
+    pub fn evict_at(&self, now: DateTime<Utc>) -> usize {
+        self.inner.write().evict(&self.bounds, now)
     }
 }
 
@@ -143,7 +364,11 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
             created_at,
             tenant: new_item.tenant,
         };
-        self.inner.write().items.insert(id, item.clone());
+        let mut store = self.inner.write();
+        if store.items.insert(id.clone(), item.clone()).is_none() {
+            store.order.push_back((created_at, id));
+        }
+        store.evict(&self.bounds, created_at);
         Ok(item)
     }
 
@@ -262,19 +487,12 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> ConversationItemResult<()> {
-        let mut store = self.inner.write();
-        let key_to_remove = store
-            .rev_index
-            .get_mut(conversation_id)
-            .and_then(|idx| idx.remove(&item_id.0));
-
-        if let Some(key) = key_to_remove {
-            if let Some(conv_links) = store.links.get_mut(conversation_id) {
-                conv_links.remove(&key);
-            }
-        }
-
+        self.inner.write().unlink(conversation_id, item_id);
         Ok(())
+    }
+
+    fn stored_record_count(&self) -> Option<usize> {
+        Some(self.inner.read().items.len())
     }
 }
 
@@ -282,26 +500,76 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 // PART 3: MemoryResponseStorage
 // ============================================================================
 
-/// Internal store structure holding both maps together
+/// Internal store structure holding the maps together
 #[derive(Default)]
 struct InnerStore {
     /// All stored responses indexed by ID
     responses: HashMap<ResponseId, StoredResponse>,
     /// Index of response IDs by safety identifier
     identifier_index: HashMap<String, Vec<ResponseId>>,
+    /// The responses in insertion order (a record replaced under its id keeps
+    /// its place), for the bound.
+    order: Order<ResponseId>,
 }
 
-/// In-memory implementation of response storage
+impl InnerStore {
+    fn remove(&mut self, response_id: &ResponseId) -> bool {
+        let Some(response) = self.responses.remove(response_id) else {
+            return false;
+        };
+        if let Some(ref safety_identifier) = response.safety_identifier {
+            if let Some(user_responses) = self.identifier_index.get_mut(safety_identifier) {
+                user_responses.retain(|id| id != response_id);
+                if user_responses.is_empty() {
+                    self.identifier_index.remove(safety_identifier);
+                }
+            }
+        }
+        true
+    }
+
+    fn evict(&mut self, bounds: &Bounds, now: DateTime<Utc>) -> usize {
+        let len = self.responses.len();
+        let mut order = std::mem::take(&mut self.order);
+        let evicted = evict(&mut order, bounds, now, len, |id| self.remove(id));
+        self.order = order;
+        if evicted > 0 {
+            tracing::debug!(
+                evicted,
+                left = self.responses.len(),
+                "Memory history: responses evicted"
+            );
+        }
+        evicted
+    }
+}
+
+/// In-memory implementation of response storage; bounded by the response
+/// count and the retention of its [`MemoryConfig`].
 pub struct MemoryResponseStorage {
-    /// Single lock wrapping both maps to prevent deadlocks and ensure atomic updates
+    /// Single lock wrapping the maps to prevent deadlocks and ensure atomic updates
     store: Arc<RwLock<InnerStore>>,
+    bounds: Bounds,
 }
 
 impl MemoryResponseStorage {
+    /// A store with the default bounds ([`MemoryConfig::default`]).
     pub fn new() -> Self {
+        Self::with_config(&MemoryConfig::default())
+    }
+
+    /// A store bounded as `config` says.
+    pub fn with_config(config: &MemoryConfig) -> Self {
         Self {
             store: Arc::new(RwLock::new(InnerStore::default())),
+            bounds: Bounds::new(Some(config.max_responses), config.retention()),
         }
+    }
+
+    /// Drops the responses over the bound or older than the retention at
+    /// `now`; answers how many went. Every write does this at the current time.
+    pub fn evict_at(&self, now: DateTime<Utc>) -> usize {
+        self.store.write().evict(&self.bounds, now)
     }
 
     /// Get statistics about the store
@@ -319,6 +587,7 @@ impl MemoryResponseStorage {
         let mut store = self.store.write();
         store.responses.clear();
         store.identifier_index.clear();
+        store.order.clear();
     }
 }
 
@@ -353,7 +622,15 @@ impl ResponseStorage for MemoryResponseStorage {
             }
         }
 
-        store.responses.insert(response_id.clone(), response);
+        let now = Utc::now();
+        if store
+            .responses
+            .insert(response_id.clone(), response)
+            .is_none()
+        {
+            store.order.push_back((now, response_id.clone()));
+        }
+        store.evict(&self.bounds, now);
         tracing::debug!(
             memory_store_size = store.responses.len(),
             "Response stored in memory"
@@ -373,17 +650,7 @@ impl ResponseStorage for MemoryResponseStorage {
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> ResponseResult<()> {
-        let mut store = self.store.write();
-
-        // Remove the response and update user index if needed
-        if let Some(response) = store.responses.remove(response_id) {
-            if let Some(ref safety_identifier) = response.safety_identifier {
-                if let Some(user_responses) = store.identifier_index.get_mut(safety_identifier) {
-                    user_responses.retain(|id| id != response_id);
-                }
-            }
-        }
-
+        self.store.write().remove(response_id);
         Ok(())
     }
 
@@ -532,6 +799,10 @@ impl ResponseStorage for MemoryResponseStorage {
         }
         Ok(count)
     }
+
+    fn stored_record_count(&self) -> Option<usize> {
+        Some(self.store.read().responses.len())
+    }
 }
 
 /// Statistics for the memory store
@@ -584,7 +855,7 @@ mod tests {
         }
         let base = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         for (i, id) in ids.iter().enumerate() {
-            let added_at = base + chrono::TimeDelta::microseconds(i as i64);
+            let added_at = base + TimeDelta::microseconds(i as i64);
             store.link_item(&conv, id, added_at).await.unwrap();
         }
 
@@ -1040,6 +1311,214 @@ mod tests {
         assert_eq!(stats.identifier_count, 2);
     }
 
+    /// The default store keeps at most 10,000 responses: the oldest go.
+    #[tokio::test]
+    async fn the_default_store_keeps_at_most_ten_thousand_responses() {
+        let store = MemoryResponseStorage::new();
+        let mut first = None;
+        for i in 0..10_001 {
+            let mut response = StoredResponse::new(None);
+            response.input = json!(format!("request {i}"));
+            let id = store.store_response(response).await.unwrap();
+            first.get_or_insert(id);
+        }
+        assert_eq!(store.stats().response_count, 10_000);
+        assert!(
+            store.get_response(&first.unwrap()).await.unwrap().is_none(),
+            "the oldest record went"
+        );
+    }
+
+    /// The default store keeps at most 100,000 conversation items.
+    #[tokio::test]
+    async fn the_default_store_keeps_at_most_one_hundred_thousand_items() {
+        let store = MemoryConversationItemStorage::new();
+        let conv: ConversationId = "conv_bound".into();
+        let mut first = None;
+        for _ in 0..100_001 {
+            let item = store
+                .create_item(make_item("message", Some("user"), json!([])))
+                .await
+                .unwrap();
+            store.link_item(&conv, &item.id, Utc::now()).await.unwrap();
+            first.get_or_insert(item.id);
+        }
+        let first = first.unwrap();
+        assert!(
+            store.get_item(&first).await.unwrap().is_none(),
+            "the oldest item went"
+        );
+        assert!(
+            !store.is_item_linked(&conv, &first).await.unwrap(),
+            "and left the conversation"
+        );
+        let listed = store
+            .list_items(
+                &conv,
+                ListParams {
+                    limit: 1_000_000,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 100_000);
+    }
+
+    /// A configured count bound evicts the oldest records on every write; a
+    /// record deleted by a client is no longer counted.
+    #[tokio::test]
+    async fn the_response_bound_evicts_the_oldest_records_on_write() {
+        let config = MemoryConfig {
+            max_responses: 2,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let store = MemoryResponseStorage::with_config(&config);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut response = StoredResponse::new(None);
+            response.safety_identifier = Some("user-1".to_string());
+            response.input = json!(i);
+            ids.push(store.store_response(response).await.unwrap());
+        }
+        assert!(store.get_response(&ids[0]).await.unwrap().is_none());
+        assert!(store.get_response(&ids[1]).await.unwrap().is_some());
+        assert!(store.get_response(&ids[2]).await.unwrap().is_some());
+        assert_eq!(store.stored_record_count(), Some(2));
+        // The index follows: the evicted record is not listed.
+        let listed = store
+            .list_identifier_responses("user-1", None)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        // A record re-stored under its id keeps its place: it is not younger.
+        let mut again = StoredResponse::new(None);
+        again.id = ids[1].clone();
+        again.input = json!("again");
+        store.store_response(again).await.unwrap();
+        assert_eq!(store.stored_record_count(), Some(2));
+        let mut fourth = StoredResponse::new(None);
+        fourth.input = json!(4);
+        let fourth = store.store_response(fourth).await.unwrap();
+        assert!(
+            store.get_response(&ids[1]).await.unwrap().is_none(),
+            "the re-stored record was still the oldest"
+        );
+        assert!(store.get_response(&fourth).await.unwrap().is_some());
+        // A deleted record leaves room: its id in the order is skipped.
+        store.delete_response(&ids[2]).await.unwrap();
+        let mut fifth = StoredResponse::new(None);
+        fifth.input = json!(5);
+        let fifth = store.store_response(fifth).await.unwrap();
+        assert!(store.get_response(&fourth).await.unwrap().is_some());
+        assert!(store.get_response(&fifth).await.unwrap().is_some());
+        assert_eq!(store.stored_record_count(), Some(2));
+    }
+
+    /// The retention drops the records older than it, at the time it is
+    /// checked against; the newer ones stay.
+    #[tokio::test]
+    async fn the_retention_evicts_the_records_older_than_it() {
+        let config = MemoryConfig {
+            max_responses: 1_000,
+            max_items: 1_000,
+            retention_secs: Some(60),
+        };
+        let responses = MemoryResponseStorage::with_config(&config);
+        let old = responses
+            .store_response(StoredResponse::new(None))
+            .await
+            .unwrap();
+        let items = MemoryConversationItemStorage::with_config(&config);
+        let conv: ConversationId = "conv_retention".into();
+        let old_item = items
+            .create_item(make_item("message", Some("user"), json!([])))
+            .await
+            .unwrap();
+        items
+            .link_item(&conv, &old_item.id, Utc::now())
+            .await
+            .unwrap();
+        let conversations = MemoryConversationStorage::with_config(&config);
+        let old_conversation = conversations
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+
+        // Fifty-nine seconds later nothing goes; sixty-one seconds later everything does.
+        let later = Utc::now() + TimeDelta::seconds(59);
+        assert_eq!(responses.evict_at(later), 0);
+        assert_eq!(items.evict_at(later), 0);
+        assert_eq!(conversations.evict_at(later), 0);
+        let later = Utc::now() + TimeDelta::seconds(61);
+        assert_eq!(responses.evict_at(later), 1);
+        assert_eq!(items.evict_at(later), 1);
+        assert_eq!(conversations.evict_at(later), 1);
+        assert!(responses.get_response(&old).await.unwrap().is_none());
+        assert!(items.get_item(&old_item.id).await.unwrap().is_none());
+        assert!(!items.is_item_linked(&conv, &old_item.id).await.unwrap());
+        assert!(conversations
+            .get_conversation(&old_conversation.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(responses.stored_record_count(), Some(0));
+        assert_eq!(items.stored_record_count(), Some(0));
+        assert_eq!(conversations.stored_record_count(), Some(0));
+    }
+
+    /// An evicted item leaves every conversation that listed it; the counts
+    /// the gauges read follow the stores.
+    #[tokio::test]
+    async fn an_evicted_item_leaves_every_conversation_and_the_counts_follow() {
+        let config = MemoryConfig {
+            max_responses: 10,
+            max_items: 2,
+            retention_secs: None,
+        };
+        let store = MemoryConversationItemStorage::with_config(&config);
+        let a: ConversationId = "conv_a".into();
+        let b: ConversationId = "conv_b".into();
+        let shared = store
+            .create_item(make_item("message", Some("user"), json!([])))
+            .await
+            .unwrap();
+        store.link_item(&a, &shared.id, Utc::now()).await.unwrap();
+        store.link_item(&b, &shared.id, Utc::now()).await.unwrap();
+        assert_eq!(store.stored_record_count(), Some(1));
+        for _ in 0..2 {
+            let item = store
+                .create_item(make_item("message", Some("user"), json!([])))
+                .await
+                .unwrap();
+            store.link_item(&a, &item.id, Utc::now()).await.unwrap();
+        }
+        assert_eq!(store.stored_record_count(), Some(2));
+        assert!(store.get_item(&shared.id).await.unwrap().is_none());
+        assert!(!store.is_item_linked(&a, &shared.id).await.unwrap());
+        assert!(!store.is_item_linked(&b, &shared.id).await.unwrap());
+        let params = |order| ListParams {
+            limit: 10,
+            order,
+            after: None,
+        };
+        assert_eq!(
+            store
+                .list_items(&a, params(SortOrder::Asc))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(store
+            .list_items(&b, params(SortOrder::Asc))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn test_conversation_item_storage_clone_shares_state() {
         let store = MemoryConversationItemStorage::new();
@@ -1319,7 +1798,7 @@ mod tests {
             ids.push(store.create_item(item).await.unwrap().id);
         }
         let base = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
-        let at = |seconds: i64| base + chrono::TimeDelta::seconds(seconds);
+        let at = |seconds: i64| base + TimeDelta::seconds(seconds);
         store.link_item(&conv, &ids[0], at(0)).await.unwrap();
         store.link_item(&conv, &ids[1], at(1)).await.unwrap();
 

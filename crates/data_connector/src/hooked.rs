@@ -76,6 +76,10 @@ impl HookedConversationStorage {
 
 #[async_trait]
 impl ConversationStorage for HookedConversationStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn create_conversation(
         &self,
         input: NewConversation,
@@ -206,6 +210,10 @@ impl HookedConversationItemStorage {
 
 #[async_trait]
 impl ConversationItemStorage for HookedConversationItemStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn create_item(
         &self,
         item: NewConversationItem,
@@ -430,6 +438,10 @@ impl HookedResponseStorage {
 
 #[async_trait]
 impl ResponseStorage for HookedResponseStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId> {
         let payload = serde_json::to_value(&response).unwrap_or_default();
         let extra = run_before(

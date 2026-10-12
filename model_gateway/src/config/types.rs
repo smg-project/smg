@@ -9,7 +9,7 @@ pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use serde::{de, Deserialize, Deserializer, Serialize};
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
-    HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
+    HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
 
 use super::{validation::ConfigValidator, ConfigResult};
@@ -434,6 +434,12 @@ pub struct RouterConfig {
     /// Required when history_backend = "redis"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis: Option<RedisConfig>,
+    /// Bounds of the memory history backend (`history_backend = "memory"`):
+    /// the most stored responses and conversation items it keeps and how long
+    /// it keeps a record; unset = the defaults (10,000 responses, 100,000
+    /// items, one day).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
     pub reasoning_parser: Option<String>,
     /// For tool-call interactions
@@ -1692,6 +1698,7 @@ impl Default for RouterConfig {
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             reasoning_parser: None,
             tool_call_parser: None,
             tokenizer_cache: TokenizerCacheConfig::default(),

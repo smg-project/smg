@@ -37,6 +37,7 @@ async fn redis_bundle(url: &str) -> Result<StorageBundle, String> {
         oracle: None,
         postgres: None,
         redis: Some(&redis_cfg),
+        memory: None,
         hook: None,
     })
     .await

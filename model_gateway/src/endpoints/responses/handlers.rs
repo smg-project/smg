@@ -317,3 +317,40 @@ mod tests {
         assert_eq!(body(other).await, body(missing).await);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use smg_data_connector::{MemoryConfig, MemoryResponseStorage, StoredResponse};
+
+    use super::*;
+
+    /// A response the bounded memory store evicted answers as an unknown id.
+    #[tokio::test]
+    async fn an_evicted_response_answers_not_found() {
+        let config = MemoryConfig {
+            max_responses: 2,
+            max_items: 1,
+            retention_secs: None,
+        };
+        let storage: Arc<dyn ResponseStorage> =
+            Arc::new(MemoryResponseStorage::with_config(&config));
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut stored = StoredResponse::new(None);
+            stored.raw_response = json!({"id": stored.id.0, "status": "completed", "n": i});
+            ids.push(storage.store_response(stored).await.unwrap().0);
+        }
+        assert_eq!(
+            get_response(&storage, &ids[0]).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            list_response_input_items(&storage, &ids[0]).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_response(&storage, &ids[2]).await.status(),
+            StatusCode::OK
+        );
+    }
+}

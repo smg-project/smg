@@ -366,6 +366,12 @@ class RouterArgs:
     # operation included); appended last for positional callers
     postgres_op_timeout_secs: int = 5
     redis_op_timeout_secs: int = 5
+    # Bounds of the memory history backend: the most stored responses and
+    # conversation items kept (the oldest go first) and how long a record is
+    # kept (0 = until a count bound drops it); appended last for the same reason
+    history_memory_max_responses: int = 10000
+    history_memory_max_items: int = 100000
+    history_memory_retention_secs: int = 86400
 
     @staticmethod
     def add_cli_args(
@@ -1968,6 +1974,35 @@ class RouterArgs:
             default=RouterArgs.history_backend,
             choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-max-responses",
+            type=int,
+            default=RouterArgs.history_memory_max_responses,
+            help=(
+                "Most stored responses the memory history backend keeps; the oldest go"
+                " first, on every write (memory backend only; a stored response takes"
+                " about 12 KB)."
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-max-items",
+            type=int,
+            default=RouterArgs.history_memory_max_items,
+            help=(
+                "Most conversation items the memory history backend keeps; the oldest go"
+                " first and leave every conversation that listed them (memory backend"
+                " only; an item takes about 1.5 KB)."
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-retention-secs",
+            type=int,
+            default=RouterArgs.history_memory_retention_secs,
+            help=(
+                "How long the memory history backend keeps a record, in seconds, checked"
+                " on every write; 0 keeps a record until a count bound drops it."
+            ),
         )
 
         # Oracle configuration

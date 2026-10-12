@@ -170,6 +170,7 @@ impl ConfigValidator {
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
+        Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
         Self::validate_prefill_admission(config)?;
@@ -328,6 +329,16 @@ impl ConfigValidator {
                     "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
                 ),
             })?;
+        }
+        Ok(())
+    }
+
+    /// The memory history backend's bounds: at least one record of each kind.
+    fn validate_memory_history(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(memory) = &config.memory {
+            memory
+                .validate()
+                .map_err(|reason| ConfigError::ValidationFailed { reason })?;
         }
         Ok(())
     }

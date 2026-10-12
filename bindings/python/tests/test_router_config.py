@@ -527,6 +527,9 @@ class TestRouterPositionalSignature:
             "mm_allowed_media_domains",
             "mm_allow_private_media_hosts",
             "sse_keepalive_secs",
+            "history_memory_max_responses",
+            "history_memory_max_items",
+            "history_memory_retention_secs",
         ]
 
 

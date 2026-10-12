@@ -39,7 +39,7 @@ pub use core::{
     SortOrder, StorageFailure, StoredResponse,
 };
 
-pub use config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig};
+pub use config::{HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig};
 // Re-export hook infrastructure
 pub use context::{
     current_extra_columns, current_request_context, with_extra_columns, with_request_context,

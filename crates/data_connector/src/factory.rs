@@ -10,7 +10,7 @@ use crate::{
         BoundedConversationItemStorage, BoundedConversationStorage, BoundedResponseStorage,
         CallBound,
     },
-    config::{HistoryBackend, OracleConfig, PostgresConfig, RedisConfig},
+    config::{HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig},
     core::{ConversationItemStorage, ConversationStorage, ResponseStorage},
     hooked::{HookedConversationItemStorage, HookedConversationStorage, HookedResponseStorage},
     hooks::StorageHook,
@@ -39,6 +39,8 @@ pub struct StorageFactoryConfig<'a> {
     pub oracle: Option<&'a OracleConfig>,
     pub postgres: Option<&'a PostgresConfig>,
     pub redis: Option<&'a RedisConfig>,
+    /// Bounds of the memory backend; `None` = [`MemoryConfig::default`].
+    pub memory: Option<&'a MemoryConfig>,
     /// Optional storage hook. When provided, all three storage backends are
     /// wrapped in `Hooked*Storage` that runs before/after hooks around every
     /// storage operation.
@@ -52,11 +54,22 @@ pub struct StorageFactoryConfig<'a> {
 pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageBundle, String> {
     let bundle = match config.backend {
         HistoryBackend::Memory => {
-            info!("Initializing data connector: Memory");
+            let memory = config.memory.copied().unwrap_or_default();
+            memory.validate()?;
+            info!(
+                "Initializing data connector: Memory (at most {} responses and {} items, retention {})",
+                memory.max_responses,
+                memory.max_items,
+                memory
+                    .retention()
+                    .map_or_else(|| "none".to_string(), |r| format!("{} s", r.as_secs()))
+            );
             StorageBundle {
-                response_storage: Arc::new(MemoryResponseStorage::new()),
-                conversation_storage: Arc::new(MemoryConversationStorage::new()),
-                conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
+                response_storage: Arc::new(MemoryResponseStorage::with_config(&memory)),
+                conversation_storage: Arc::new(MemoryConversationStorage::with_config(&memory)),
+                conversation_item_storage: Arc::new(MemoryConversationItemStorage::with_config(
+                    &memory,
+                )),
             }
         }
         HistoryBackend::None => {
@@ -261,6 +274,7 @@ mod tests {
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             hook: None,
         };
         let bundle = create_storage(config).await.unwrap();
@@ -312,6 +326,7 @@ mod tests {
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             hook: None,
         };
         let bundle = create_storage(config).await.unwrap();
@@ -336,6 +351,7 @@ mod tests {
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             hook: None,
         })
         .await
@@ -395,6 +411,7 @@ mod tests {
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             hook: None,
         })
         .await
@@ -410,6 +427,7 @@ mod tests {
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             hook: None,
         })
         .await
@@ -459,6 +477,7 @@ mod tests {
             oracle: None,
             postgres: None,
             redis: None,
+            memory: None,
             hook: Some(Arc::new(NoOpHook)),
         };
         let bundle = create_storage(config).await.unwrap();

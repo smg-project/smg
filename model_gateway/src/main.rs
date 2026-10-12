@@ -30,8 +30,8 @@ use smg::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
         HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
-        ManualAssignmentMode, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
-        PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, PdPairingMode,
+        PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
         RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
         TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
@@ -1285,6 +1285,23 @@ struct CliArgs {
     /// History storage backend
     #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle", "postgres", "redis"], help_heading = "Backend")]
     history_backend: String,
+
+    /// Most stored responses the memory history backend keeps; the oldest go
+    /// first, on every write (memory backend only; a stored response takes
+    /// about 12 KB).
+    #[arg(long, default_value_t = 10_000, help_heading = "Backend")]
+    history_memory_max_responses: usize,
+
+    /// Most conversation items the memory history backend keeps; the oldest
+    /// go first and leave every conversation that listed them (memory backend
+    /// only; an item takes about 1.5 KB).
+    #[arg(long, default_value_t = 100_000, help_heading = "Backend")]
+    history_memory_max_items: usize,
+
+    /// How long the memory history backend keeps a record, in seconds, checked
+    /// on every write; 0 keeps a record until a count bound drops it.
+    #[arg(long, default_value_t = 86_400, help_heading = "Backend")]
+    history_memory_retention_secs: u64,
 
     /// Enable WebAssembly support
     #[arg(long, default_value_t = false, help_heading = "Backend")]
@@ -2610,6 +2627,12 @@ impl CliArgs {
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .history_backend(history_backend)
+            .memory_config(MemoryConfig {
+                max_responses: self.history_memory_max_responses,
+                max_items: self.history_memory_max_items,
+                retention_secs: (self.history_memory_retention_secs > 0)
+                    .then_some(self.history_memory_retention_secs),
+            })
             .log_level(&self.log_level)
             .maybe_api_key(self.api_key.as_ref())
             .tenant_api_keys(tenant_api_keys)

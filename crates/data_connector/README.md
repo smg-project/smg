@@ -42,7 +42,7 @@ pub type StorageTuple = (
 
 | Backend | Variant | Description |
 |---------|---------|-------------|
-| **Memory** | `HistoryBackend::Memory` | In-process `HashMap`/`BTreeMap` storage. Default. No persistence across restarts. Suitable for development and testing. |
+| **Memory** | `HistoryBackend::Memory` | In-process `HashMap`/`BTreeMap` storage. Default. No persistence across restarts. Bounded by [`MemoryConfig`](#memoryconfig): the oldest records go when a count bound is crossed or a record is older than the retention. Suitable for development, testing and small deployments. |
 | **None / NoOp** | `HistoryBackend::None` | Accepts all writes silently, returns empty on reads. Use when persistence is intentionally disabled. |
 | **PostgreSQL** | `HistoryBackend::Postgres` | Production backend using `tokio-postgres` with `deadpool` connection pooling. Fully async. Tables are auto-created on first connection. |
 | **Redis** | `HistoryBackend::Redis` | Production backend using `deadpool-redis`. Supports optional TTL-based data retention (`retention_days`). |
@@ -101,6 +101,21 @@ items.link_item(&conv.id, &item.id, chrono::Utc::now()).await.unwrap();
 Backend selection is controlled by the `HistoryBackend` enum
 (`"memory"`, `"none"`, `"oracle"`, `"postgres"`, `"redis"` when deserialized
 from JSON/YAML). Each database backend has a dedicated config struct.
+
+### `MemoryConfig`
+
+The memory backend keeps its records in the gateway's own memory, so it is
+bounded; the bounds are checked on every write and the oldest records go first.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_responses` | `usize` | `10_000` | Most stored responses kept (a stored response of a short exchange takes about 12 KB). |
+| `max_items` | `usize` | `100_000` | Most conversation items kept; an evicted item leaves every conversation that listed it (an item takes about 1.5 KB). |
+| `retention_secs` | `Option<u64>` | `Some(86_400)` | How long a record is kept; `None` or `0` keeps a record until a count bound drops it. Conversations follow the retention only. |
+
+The stores report their record counts through `stored_record_count()` (the
+gateway samples them into `smg_history_memory_records{kind}`); the other
+backends answer `None`.
 
 ### `PostgresConfig`
 

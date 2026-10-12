@@ -758,6 +758,7 @@ impl AppContextBuilder {
             oracle: config.oracle.as_ref(),
             postgres: config.postgres.as_ref(),
             redis: config.redis.as_ref(),
+            memory: config.memory.as_ref(),
             hook,
         };
         let bundle = create_storage(storage_config).await?;
