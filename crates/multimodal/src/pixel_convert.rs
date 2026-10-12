@@ -399,4 +399,54 @@ mod tests {
             .collect();
         assert_eq!(dst, expected);
     }
+
+    /// On the target that has the vector path, the normalizations the
+    /// pipelines run (mean and std 0.5 with rescale; the CLIP constants with
+    /// rescale, both in byte units as the processors build them) take it: a
+    /// rounding regression in the formula would not change the bytes (the
+    /// table lookup is the fallback) but would lose the speed without a
+    /// failing test, so this one fails instead.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_vector_formula_reproduces_the_tables_of_the_pipelines_normalizations() {
+        use crate::encoder_inputs::f32_to_bf16_bits;
+
+        let into_bytes = (1.0_f64 / (1.0 / 255.0)) as f32;
+        let norms = [
+            PixelNorm {
+                scale: 1.0,
+                offset: [0.5_f64 as f32 * into_bytes; 3],
+                divisor: [0.5_f64 as f32 * into_bytes; 3],
+                channel_block: 512,
+            },
+            PixelNorm {
+                scale: 1.0,
+                offset: [
+                    0.481_454_66_f64 as f32 * into_bytes,
+                    0.457_827_5_f64 as f32 * into_bytes,
+                    0.408_210_73_f64 as f32 * into_bytes,
+                ],
+                divisor: [
+                    0.268_629_54_f64 as f32 * into_bytes,
+                    0.261_302_58_f64 as f32 * into_bytes,
+                    0.275_777_11_f64 as f32 * into_bytes,
+                ],
+                channel_block: 392,
+            },
+        ];
+        for norm in norms {
+            let bf16 = norm
+                .table_f32()
+                .map(|channel| channel.map(f32_to_bf16_bits));
+            assert!(
+                neon::Bf16Formula::reproducing(&norm, &bf16).is_some(),
+                "bf16 formula declined {norm:?}"
+            );
+            let f32s = norm.table_f32().map(|channel| channel.map(f32::to_bits));
+            assert!(
+                neon::F32Formula::reproducing(&norm, &f32s).is_some(),
+                "f32 formula declined {norm:?}"
+            );
+        }
+    }
 }
