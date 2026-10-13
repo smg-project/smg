@@ -50,47 +50,86 @@ use smg::{
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
 
-/// Parse repeated `<flag> <url> [bootstrap_port|none]` occurrences into
-/// (url, optional bootstrap port) pairs. The trailing port is optional, so
-/// these flags are hand-parsed (clap cannot express the optional positional)
-/// and stripped from argv before `Cli::parse_from`.
-fn parse_url_port_args(flag: &str) -> Vec<(String, Option<u16>)> {
-    let args: Vec<String> = std::env::args().collect();
+/// The command line as the gateway reads it, before clap sees it: the
+/// `--prefill <url> [bootstrap_port|none]` and `--encode <url>
+/// [bootstrap_port|none]` occurrences are hand-parsed (clap cannot express
+/// the optional trailing port) and stripped from the arguments clap parses.
+struct CommandLine {
+    /// argv without the `--prefill` / `--encode` occurrences and their values.
+    clap_args: Vec<String>,
+    prefill_urls: Vec<(String, Option<u16>)>,
+    encode_urls: Vec<(String, Option<u16>)>,
+}
+
+impl CommandLine {
+    /// Split `args` (argv, the program name first). Each url list is what
+    /// [`parse_url_port_args`] reads for its flag over the whole of `args`,
+    /// independently of the other flag; `clap_args` is `args` with every
+    /// `<flag> <url> [port|none]` run removed by the same token rule, so a
+    /// flag given without a url (last on the line) reaches clap, which
+    /// refuses it as unexpected.
+    fn split(args: &[String]) -> Self {
+        Self {
+            clap_args: strip_url_port_args(args),
+            prefill_urls: parse_url_port_args(args, "--prefill"),
+            encode_urls: parse_url_port_args(args, "--encode"),
+        }
+    }
+}
+
+/// Whether the token after a `--prefill` / `--encode` url is its optional
+/// bootstrap port: a port number or `none` (any case). Another flag, or a
+/// url, is not consumed.
+fn is_bootstrap_port_token(token: &str) -> bool {
+    !token.starts_with("--") && (token.parse::<u16>().is_ok() || token.to_lowercase() == "none")
+}
+
+/// Parse the repeated `<flag> <url> [bootstrap_port|none]` occurrences of
+/// `args` into (url, optional bootstrap port) pairs; `none` and an absent
+/// port both read as `None`.
+fn parse_url_port_args(args: &[String], flag: &str) -> Vec<(String, Option<u16>)> {
     let mut entries = Vec::new();
     let mut i = 0;
-
     while i < args.len() {
         if args[i] == flag && i + 1 < args.len() {
             let url = args[i + 1].clone();
-            let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
-                if let Ok(port) = args[i + 2].parse::<u16>() {
-                    i += 1;
-                    Some(port)
-                } else if args[i + 2].to_lowercase() == "none" {
-                    i += 1;
-                    None
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let mut bootstrap_port = None;
+            if args
+                .get(i + 2)
+                .is_some_and(|token| is_bootstrap_port_token(token))
+            {
+                bootstrap_port = args[i + 2].parse::<u16>().ok();
+                i += 1;
+            }
             entries.push((url, bootstrap_port));
             i += 2;
         } else {
             i += 1;
         }
     }
-
     entries
 }
 
-fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
-    parse_url_port_args("--prefill")
-}
-
-fn parse_encode_args() -> Vec<(String, Option<u16>)> {
-    parse_url_port_args("--encode")
+/// `args` without the `--prefill` / `--encode` occurrences and their url and
+/// optional port, by the token rule of [`parse_url_port_args`].
+fn strip_url_port_args(args: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if (args[i] == "--prefill" || args[i] == "--encode") && i + 1 < args.len() {
+            i += 2;
+            if args
+                .get(i)
+                .is_some_and(|token| is_bootstrap_port_token(token))
+            {
+                i += 1;
+            }
+        } else {
+            kept.push(args[i].clone());
+            i += 1;
+        }
+    }
+    kept
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -257,6 +296,15 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
     parse_usize_in_range(value, 100_000)
 }
 
+// The flags in the order `--help` lists them, one `help_heading` section
+// each; a field's doc comment is its help text. The second spellings, each a
+// `visible_alias` of its field and mirrored by the Python launcher's
+// `RouterArgs`: --cache-match-threshold (--cache-threshold),
+// --spill-abs-threshold (--balance-abs-threshold), --spill-rel-threshold
+// (--balance-rel-threshold), --sticky-key-idle-secs (--max-idle-secs),
+// --sticky-sessions (--routing-key-override) and --worker-auto-recovery
+// (--remove-unhealthy-workers); the hidden ones: --model (--model-path),
+// --runtime (--backend), and `start` for the `launch` subcommand.
 #[derive(Parser, Debug)]
 struct CliArgs {
     // ==================== Worker Configuration ====================
@@ -2740,105 +2788,104 @@ impl CliArgs {
             webrtc_stun_server: self.webrtc_stun_server.clone(),
         })
     }
-}
 
-#[expect(
-    clippy::print_stdout,
-    reason = "pre-logger startup output and version display"
-)]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    register_jemalloc_as_global_allocator();
-
-    // Check for version flags before parsing other args to avoid errors
-    let args: Vec<String> = std::env::args().collect();
-    for arg in &args {
-        if arg == "--version" || arg == "-V" {
-            println!("{}", version::get_version_string());
-            return Ok(());
-        }
-        if arg == "--version-verbose" {
-            println!("{}", version::get_verbose_version_string());
-            return Ok(());
-        }
-    }
-
-    let prefill_urls = parse_prefill_args();
-    let encode_urls = parse_encode_args();
-
-    let mut filtered_args: Vec<String> = Vec::new();
-    let raw_args: Vec<String> = std::env::args().collect();
-    let mut i = 0;
-
-    while i < raw_args.len() {
-        if (raw_args[i] == "--prefill" || raw_args[i] == "--encode") && i + 1 < raw_args.len() {
-            i += 2;
-            if i < raw_args.len()
-                && !raw_args[i].starts_with("--")
-                && (raw_args[i].parse::<u16>().is_ok() || raw_args[i].to_lowercase() == "none")
-            {
-                i += 1;
-            }
+    /// The mode label of the start-up banner. It follows the flags, not the
+    /// built [`RoutingMode`]: IGW first, then the OpenAI and Anthropic
+    /// backends, then the disaggregated modes, then the backend's name
+    /// (`--backend gemini` is labelled `Regular (gemini)`, as it always was).
+    fn banner_mode(&self) -> String {
+        if self.enable_igw {
+            "IGW (Inference Gateway)".to_string()
+        } else if matches!(self.backend, Some(Backend::Openai)) {
+            "OpenAI Backend".to_string()
+        } else if matches!(self.backend, Some(Backend::Anthropic)) {
+            "Anthropic Backend".to_string()
+        } else if self.epd_disaggregation {
+            "EPD Disaggregated".to_string()
+        } else if self.pd_disaggregation {
+            "PD Disaggregated".to_string()
+        } else if let Some(backend) = &self.backend {
+            format!("Regular ({backend})")
         } else {
-            filtered_args.push(raw_args[i].clone());
-            i += 1;
+            "Regular".to_string()
         }
     }
 
-    let cli = Cli::parse_from(filtered_args);
-
-    // Handle subcommands or use direct args
-    let mut cli_args = match cli.command {
-        Some(Commands::Launch { args }) => args,
-        None => cli.router_args,
-    };
-
-    if cli_args.enable_igw_for_discovery() {
-        println!("INFO: IGW mode automatically enabled because service discovery is turned on");
-    }
-
-    let mode_str = if cli_args.enable_igw {
-        "IGW (Inference Gateway)".to_string()
-    } else if matches!(cli_args.backend, Some(Backend::Openai)) {
-        "OpenAI Backend".to_string()
-    } else if matches!(cli_args.backend, Some(Backend::Anthropic)) {
-        "Anthropic Backend".to_string()
-    } else if cli_args.epd_disaggregation {
-        "EPD Disaggregated".to_string()
-    } else if cli_args.pd_disaggregation {
-        "PD Disaggregated".to_string()
-    } else if let Some(backend) = &cli_args.backend {
-        format!("Regular ({backend})")
-    } else {
-        "Regular".to_string()
-    };
-
-    version::print_banner(&cli_args.host, cli_args.port, &mode_str);
-
-    if !cli_args.enable_igw {
-        println!("Policy: {}", cli_args.policy);
-
-        if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
+    /// Phase 2, announce: the banner and the lines under it, printed before
+    /// the configuration is built so an operator sees what was asked for
+    /// even when it is refused. Selecting a discovery provider turns IGW
+    /// mode on here, before anything reads `enable_igw`; nothing else is
+    /// changed. The logger is not up yet: this is plain stdout.
+    #[expect(
+        clippy::print_stdout,
+        reason = "pre-logger startup output: the banner and the flags' summary"
+    )]
+    fn announce(
+        &mut self,
+        prefill_urls: &[(String, Option<u16>)],
+        encode_urls: &[(String, Option<u16>)],
+    ) {
+        if self.enable_igw_for_discovery() {
+            println!("INFO: IGW mode automatically enabled because service discovery is turned on");
+        }
+        version::print_banner(&self.host, self.port, &self.banner_mode());
+        if self.enable_igw {
+            return;
+        }
+        println!("Policy: {}", self.policy);
+        if self.pd_disaggregation && !prefill_urls.is_empty() {
             println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", cli_args.decode);
+            println!("Decode nodes: {:?}", self.decode);
         }
-
-        if cli_args.epd_disaggregation {
+        if self.epd_disaggregation {
             println!("Encode nodes: {encode_urls:?}");
             println!("Prefill nodes: {prefill_urls:?}");
-            println!("Decode nodes: {:?}", cli_args.decode);
+            println!("Decode nodes: {:?}", self.decode);
         }
     }
 
-    let router_config = cli_args.to_router_config(prefill_urls, encode_urls)?;
-    router_config.validate()?;
+    /// Phase 3, configure: the router configuration, validated, wrapped in
+    /// the server configuration. Every refusal is a [`ConfigError`] naming
+    /// the flag; nothing has been bound or spawned when one is raised.
+    fn configure(
+        &self,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<ServerConfig> {
+        let router_config = self.to_router_config(prefill_urls, encode_urls)?;
+        router_config.validate()?;
+        self.to_server_config(router_config)
+    }
+}
 
-    let server_config = cli_args.to_server_config(router_config)?;
-    // tokio's default worker-thread count is `available_parallelism()`, which on
-    // Rust 1.95+ already honors the cgroup CPU quota, so the default is
-    // container-aware. Only build the runtime explicitly when an operator pins a
-    // worker-thread count.
-    // The runtime's size is logged by `startup`, once the log subscriber is
-    // up: a line emitted here would reach no subscriber.
+/// The text a version flag prints, read before anything else is parsed so a
+/// command line with an error elsewhere still answers `--version`.
+fn version_flag(args: &[String]) -> Option<String> {
+    args.iter().find_map(|arg| match arg.as_str() {
+        "--version" | "-V" => Some(version::get_version_string()),
+        "--version-verbose" => Some(version::get_verbose_version_string()),
+        _ => None,
+    })
+}
+
+/// Phase 1, parse: clap over the command line with the `--prefill` /
+/// `--encode` occurrences already taken out, `smg launch ...` and the bare
+/// form alike. A usage error or `--help` ends the process here, before the
+/// banner.
+fn parse_cli_args(clap_args: Vec<String>) -> CliArgs {
+    let cli = Cli::parse_from(clap_args);
+    match cli.command {
+        Some(Commands::Launch { args }) => args,
+        None => cli.router_args,
+    }
+}
+
+/// Phase 4, serve: the async runtime (tokio's container-aware default size
+/// unless `--runtime-worker-threads` pins one; the size is logged by
+/// `startup` once the log subscriber is up), the server until it stops,
+/// then the log writers flushed and the tracer shut down. The runtime is
+/// built only now: a refusal before this point costs no threads.
+fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = match server_config.runtime_worker_threads {
         Some(n) => tokio::runtime::Builder::new_multi_thread()
             .worker_threads(n)
@@ -2857,6 +2904,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The start-up sequence: parse, announce, configure, serve. The version
+/// flags are answered first, before clap sees the line.
+#[expect(clippy::print_stdout, reason = "the version flags' answer")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    register_jemalloc_as_global_allocator();
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(version) = version_flag(&args) {
+        println!("{version}");
+        return Ok(());
+    }
+    let command_line = CommandLine::split(&args);
+    let mut cli_args = parse_cli_args(command_line.clap_args);
+    cli_args.announce(&command_line.prefill_urls, &command_line.encode_urls);
+    let server_config = cli_args.configure(command_line.prefill_urls, command_line.encode_urls)?;
+    serve(server_config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2867,6 +2931,62 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// `--prefill` / `--encode` take an optional trailing bootstrap port (a
+    /// number or `none`, any case); one token rule parses the pairs and
+    /// strips them from the line clap parses, so a following flag or url is
+    /// kept, and a flag without a url is left for clap to refuse.
+    #[test]
+    fn url_port_flags_are_split_from_argv_by_one_token_rule() {
+        let args: Vec<String> = [
+            "smg",
+            "--pd-disaggregation",
+            "--prefill",
+            "http://p1:1",
+            "9001",
+            "--prefill",
+            "http://p2:2",
+            "NONE",
+            "--encode",
+            "http://e1:3",
+            "--prefill",
+            "http://p3:4",
+            "--decode",
+            "http://d1:5",
+            "--encode",
+            "http://e2:6",
+            "--prefill",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let line = CommandLine::split(&args);
+        assert_eq!(
+            line.prefill_urls,
+            vec![
+                ("http://p1:1".to_string(), Some(9001)),
+                ("http://p2:2".to_string(), None),
+                ("http://p3:4".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            line.encode_urls,
+            vec![
+                ("http://e1:3".to_string(), None),
+                ("http://e2:6".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            line.clap_args,
+            [
+                "smg",
+                "--pd-disaggregation",
+                "--decode",
+                "http://d1:5",
+                "--prefill"
+            ]
+        );
     }
 
     /// A flag whose value has a required shape is refused by name when the
