@@ -9,37 +9,7 @@
 //! equivalent; it parsed the partial object on every chunk, re-serialized the arguments and emitted
 //! the difference, which is how `{"city": "Paris"}` reached clients as `{"city":"Paris"}`.
 //!
-//! Every byte of the object lands in exactly one event: the head up to the arguments value is the
-//! `source` of `ToolCallStart`, the argument bytes are the `source` of their fragments, the tail
-//! after the value is the `source` of `ToolCallEnd`. When the arguments come before the name they
-//! are held until the name is whole, since a call starts before its arguments.
-//!
-//! The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form
-//! a valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is
-//! judged by [`Prefix`], which accepts what [`PartialJson`](super::PartialJson) accepts in prefix
-//! mode, before it is emitted, and from the first byte it cannot take, the argument bytes come
-//! back as `Malformed` with `InvalidArguments` instead, nothing already emitted being revised. The
-//! prefix parser tolerates what the old crate tolerated (a literal's prefix, a bracket closed by
-//! the wrong kind where the parent can take it), so the promise is exactly as strong as that
-//! parser.
-//!
-//! Every byte is read once. The outline is taken by a [`Scanner`] that keeps its place between
-//! pieces, and the prefix is judged on the bytes that arrived, so a call's cost is linear in its
-//! length however the text is cut: the first version read the whole text again on every piece,
-//! and a 259 KB argument string fed by the character took 800 s against 0.03 s whole.
-//!
-//! A started call whose object never closes is closed at `finish` with what arrived, and the bytes
-//! after its arguments value (a comma cut short, a complete member, or bytes that are no member)
-//! come back as `Malformed` with `UnterminatedRegion`.
-//!
-//! `feed` takes one piece and returns how many of its bytes the object took: all of them before the
-//! close, and up to the closing brace in the piece that carries it, so the format routes whatever
-//! follows the object (a closing marker, more text) itself. Bytes fed after the close are not
-//! taken.
-//!
-//! What the assembler does not decide: the call's index and id (the format mints them and passes
-//! them to [`Assembler::new`]), whether the name is a declared tool, and whether a string-valued
-//! arguments member should be decoded. The format decides those with the events in hand.
+//! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},

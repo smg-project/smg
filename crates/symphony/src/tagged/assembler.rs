@@ -22,27 +22,7 @@
 //! MiMo) every byte between them is the value's, a newline it ends with included, and nothing is
 //! taken away: a patch keeps its final newline, and a value that is one newline is one newline.
 //!
-//! Every byte of the call lands in exactly one event. Whitespace between tags is the template's
-//! and goes into the source of the next event: the function tag's into `ToolCallStart`, a
-//! parameter tag's and the value's text into the fragments they produce, the rest into the
-//! closing `}`. Anything else between tags, a tag out of its place, a tag that cuts a name short
-//! and a name that is empty come back as `Malformed` with a reason, so the model's bytes are never
-//! read as something they are not and never vanish into a source. Inside a value only
-//! `</parameter>` is a tag; `<function=`, `<parameter=` and `</function>` there are the value's
-//! text (the engine's parser ends a value at the next `<parameter=` or `</function>` as well, a tolerance to judge
-//! with adversarial fixtures rather than port).
-//!
-//! Two endings. [`Assembler::close`] is for a block the model ended before `</function>` (its own
-//! closing marker came, or the next call began): the call is over as far as the model is
-//! concerned, so an open string is closed, the object is closed, and what was held comes back as
-//! `Malformed`. [`Assembler::finish`] is for a stream that was cut: nothing is closed, as in
-//! [`crate::json::Assembler`], because arguments cut short must not look complete to a client.
-//! A value that is written whole and never closed comes back as `Malformed` in both, since its key
-//! was never written.
-//!
-//! `feed` takes one piece and returns how many of its bytes the call took: all of them before
-//! `</function>`, and up to that tag in the piece that carries it, so the format routes whatever
-//! follows (the block's closing marker, more text) itself.
+//! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},

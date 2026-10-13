@@ -10,50 +10,7 @@
 //! tag and one before the closing tag, and the caller has removed exactly those two, as the engine's
 //! parsers do. Every other byte is the value's.
 //!
-//! The rules, in the order [`json`] applies them:
-//!
-//! - A parameter declared `string` is its text, every byte of it. Nothing is trimmed and nothing is
-//!   decoded: `"exact phrase"` keeps its quotes, indentation and a trailing newline stay, and
-//!   `&amp;` is five characters. A parameter is declared `string` when its schema admits that
-//!   type at all: `"type": "string"`, a list of types or an `anyOf` that includes it, or, when the
-//!   schema has no `type`, an `enum` of strings, with or without `null` among them. A `type`
-//!   decides alone when it is there, as it does for the engine's parser: BFCL declares
-//!   `{"type": "array", "enum": [...]}` for a list whose members come from the enum, and that is
-//!   an array. When the schema admits `null` as well as `string`, the text `null`, and the `None`
-//!   a template writes for a null argument, are null; any other text is the string. A string
-//!   declared alone keeps `null` as its text, as the engine's readers do; bellwether #56 refuses a case
-//!   whose reference holds a null there, since no output carries it.
-//! - A parameter declared `integer` is that integer when its text is a sign and digits, with the
-//!   whitespace around it ignored. It may be spelled `+5` or `007`; it is written in JSON's
-//!   spelling, with the digits the model wrote.
-//! - Everything else is inferred: text that is JSON is that JSON; text that is a Python literal
-//!   (`True`, `None`, `{'size': 'large'}`, `['n1', 'n2']`, a tuple) is the JSON it stands for,
-//!   written with `json.dumps`'s separators; and the rest is a string holding the text exactly.
-//!   That covers a parameter the tool does not declare, a declared integer whose text is not one,
-//!   and every other declared type. Most templates write an array or object with `tojson` and a
-//!   boolean or null as Python's `True`, `False` and `None`; Seed-OSS's writes every value with
-//!   `{{ value }}`, so an object comes as Python's repr. Inference reads both, so declaring a
-//!   `number`, `boolean`, `array` or `object` changes nothing.
-//!
-//! A value read as JSON keeps the model's own bytes: `[1, 2.5]` stays spaced as written, and
-//! `9007199254740993` keeps every digit. JSON here means what `serde_json` reads into a value from
-//! inside the arguments object, because that is how the adapters read a call's arguments back.
-//! Text it refuses there, such as a lone surrogate escape or nesting that reaches its depth limit
-//! once the object is around it, is a string like any other text, so one odd value never costs a
-//! call its other arguments.
-//!
-//! Ported from `safe_val` and `coerce_value` in `crates/tool_parser/src/parsers/qwen_xml.rs` and
-//! from `coerce_by_schema_type` and `param_types_for_function` in that crate's `helpers.rs`. Three
-//! things differ. The first two are how the templates write values and what bellwether's
-//! references record:
-//!
-//! - A string keeps its text exactly. The old functions trimmed it, and unquoted a value declared
-//!   `string` that happened to be a JSON string literal, so a search for `"exact phrase"` lost its
-//!   quotes and a file's contents lost their final newline.
-//! - JSON keeps the model's bytes. The old functions parsed the value and wrote it again compactly,
-//!   so `{"a": 1}` reached the client as `{"a":1}`.
-//! - The old functions had a rule each for `number`, `boolean`, `array` and `object`. Each gave
-//!   exactly what inference gives, so they are not carried over.
+//! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use std::collections::{HashMap, HashSet};
 

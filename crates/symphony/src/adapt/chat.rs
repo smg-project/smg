@@ -6,31 +6,7 @@
 //! driver wraps the choices in the response envelope (request id, model, timestamp, usage) and sets
 //! `matched_stop`, and `logprobs` where it has them, since the events carry neither.
 //!
-//! The shapes are the ones SMG's gateway sends today, the same fields in the same places:
-//!
-//! - content and reasoning deltas carry `role: "assistant"`; reasoning goes to `reasoning_content`;
-//! - a call begins with its `id`, `type: "function"` and `name` and no arguments; every later
-//!   fragment carries the call's `index` and `arguments` only;
-//! - the finishing choice has an empty delta without a role;
-//! - the whole message has `content` null when it is only whitespace, `reasoning_content` only when
-//!   there was reasoning, and `tool_calls` only when a call was made, each call with its id, name
-//!   and its argument fragments joined.
-//!
-//! One rule for `finish_reason`, in both shapes: the engine's reason, except that `stop` after at
-//! least one tool call becomes `tool_calls`. `length`, `abort` and engine-specific reasons stay what
-//! the engine said even when calls were made. The old streaming path rewrote `stop` only, as here;
-//! the old non-streaming path turned every reason but `length`, `failed` and `error` into
-//! `tool_calls`, so the two differ on `abort` and engine-specific reasons, where the rule keeps the
-//! information.
-//!
-//! Policy this adapter sets, where the events say more than Chat Completions can:
-//!
-//! - `ReasoningStart`, `ReasoningEnd`, `ToolCallEnd` and `Dropped` have no representation and
-//!   produce nothing; the markers a format consumes never reach the client.
-//! - `Malformed` text is content: the model wrote it, and the client sees it rather than losing
-//!   it. This is the opposite of the old driver, which logged a parser error and sent nothing for
-//!   that chunk.
-//! - An empty text or an empty argument fragment produces nothing; the gateway sends no empty deltas.
+//! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatMessageDelta, ChatStreamChoice},

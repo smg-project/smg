@@ -20,32 +20,7 @@
 //! closing one, which it hands over as the call's end. Between the two the assembler reads the
 //! name and the tags itself.
 //!
-//! What the syntax says, and what the assembler does with it:
-//!
-//! - **The name is the text before the first `<arg_key>`**, or before the call's end when the call
-//!   has no arguments, less the whitespace around it, which is the template's and goes into the
-//!   next event's source. The name is known only when that tag arrives, so `ToolCallStart` waits
-//!   for it; names are short. A name holds no whitespace, quote, brace or angle bracket: any
-//!   other text there (the JSON of a `<tool_call>` block quoted inside a code fence, prose) is
-//!   reported, and no call starts, so a block that names no call writes no arguments either.
-//! - **A value's type comes from the request's tools**, as in the Qwen assembler: a declared string
-//!   is its text, streamed as it arrives; every other value is written whole at `</arg_value>`
-//!   through [`json`], which reads the JSON the templates write for a number, a boolean, a list,
-//!   an object or null, and infers the rest. Nothing is taken from a value: the templates write it
-//!   directly between its tags.
-//! - **Inside a value only `</arg_value>` is a tag**; the other three there are the value's text.
-//! - **Two endings.** [`Assembler::close`] is the call's closing marker, or the block's end before
-//!   it: after the last value it names the call if it has not, closes the object and pushes
-//!   `ToolCallEnd` with the marker's bytes; inside a value it closes an open string and the object
-//!   and reports what was held. [`Assembler::finish`] is a stream that was cut: nothing is closed.
-//! - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
-//!   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
-//!   produce, text where the syntax has tags as `Malformed` run by run with the whitespace before
-//!   it as `Dropped { Wrapper }`.
-//!
-//! This is the third tagged assembler, beside the Qwen one and DSML's; the three share the value
-//! module and the escaping, and the seams for one core are now visible: the tag spellings, how a
-//! name ends, where the template's newlines are, and what types a value.
+//! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},

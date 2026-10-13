@@ -27,55 +27,7 @@
 //! fragment to its call, and once its text has substance keeps every run of whitespace in it, the
 //! separators after a call included.
 //!
-//! The blocks are the ones SMG's gateway builds today from a finished turn, in the order the
-//! Messages API uses:
-//!
-//! - one `thinking` block when there was reasoning, with an empty `signature`: the engines sign
-//!   nothing, and a signature a client could verify needs a decision of its own;
-//! - one `text` block when the content is not whitespace, every content and malformed text in
-//!   order;
-//! - one `tool_use` block per call in the order the calls started, its `input` the joined argument
-//!   fragments parsed as JSON.
-//!
-//! This is the same folding as `chat::message` and `responses::output`, so the three adapters agree
-//! on what a turn contains.
-//!
-//! Ids: a call id of the form `call_<suffix>` becomes `toolu_<suffix>`, the prefix Anthropic SDKs
-//! and tooling pattern-match; any other shape passes through unchanged, since a model family whose
-//! id format is load-bearing in the prompt must keep it. The rule is deterministic, so a client
-//! echoing the id back names the same call.
-//!
-//! Stop reason, from the `Finish` event: `length` is `max_tokens`, and parsed calls do not override
-//! a truncation; `tool_calls`, and any other reason after at least one tool call, are `tool_use`,
-//! since a message with `tool_use` blocks says so whatever stopped the model, as the API itself
-//! does; `stop` is `end_turn`; `abort` and engine-specific reasons are `end_turn` too when no call
-//! was made, since the Messages API has no word for them and the driver decides whether a failed
-//! generation is a message at all. A sequence without `Finish` has no stop reason.
-//!
-//! Policy this adapter sets, where the events say more than the Messages API can:
-//!
-//! - `ReasoningStart` and `Dropped` shape nothing, and `ReasoningEnd` and `ToolCallEnd` only close
-//!   their blocks in the stream: the markers a format consumes never reach the client.
-//! - `Malformed` text is content, as in `chat`: the model wrote it, and the client sees it rather
-//!   than losing it.
-//! - A call whose argument fragments are not a whole JSON value, because the output was cut or the
-//!   model wrote something else, has `{}` as its `input`: `input` must be a JSON value, and the
-//!   fragments are not one. Chat carries the fragments as a string and Responses marks the call
-//!   `incomplete`; here `max_tokens` is all a client learns. A call the model closed without
-//!   arguments has `{}` too.
-//! - Argument fragments for a call that never started cannot occur under the `Event` contract;
-//!   should one arrive, its text joins the content so that no byte is lost. In the stream the same
-//!   goes for a fragment whose call has no open `tool_use` block because other text, or another
-//!   call, came between the call's start and the fragment: the Messages API streams one block at a
-//!   time and cannot reopen a closed one, so the fragment is text, where the fold still gives it to
-//!   its call. The formats parse a call from one contiguous region, so this does not happen for
-//!   them, and nothing is dropped if it does; the old driver dropped such fragments.
-//! - In the stream, the thinking block stops when the reasoning region ends rather than when the
-//!   next text arrives, as the old driver did, so a client sees the block close as soon as the
-//!   model stops thinking.
-//! - In the stream, whitespace-only text opens no block until text with substance joins it; the old
-//!   driver opened a text block for any non-empty text, so a separator between a thinking block
-//!   and a call became a block holding one newline.
+//! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
 use std::mem;
 

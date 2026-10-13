@@ -17,59 +17,7 @@
 //! separator through [`Assembler::ignored`], and leaves at `</invoke>`, which it hands over as the
 //! call's end. Between those the assembler reads the name and the elements itself.
 //!
-//! What the syntax says, and what the assembler does with it:
-//!
-//! - **An element is a key, and its children say what it holds.** Text makes it a leaf; a child
-//!   tag makes it a container: a list when the tool declares an array there or, failing a
-//!   declaration, when the child is an `<item>`, else an object (a list's elements are `<item>`
-//!   elements, but so is a member named `item`, which is why the declaration decides first); no
-//!   child at all makes it empty. A tag under an element the tool declares a string or an
-//!   integer is the leaf's text (a file's `<template>`, an e-mail's `<p>`), and with no
-//!   declaration a tag opens a child only after the template's separator, since the template
-//!   writes the separator before every tag it writes and never inside a value. A list's items
-//!   and an object's members are elements in turn, so the tree nests as deep as the arguments
-//!   do. Whitespace right after an opening tag is held until the element's next byte says what
-//!   it is: a leaf's text when text or the closing tag follows (a value that is one space is one
-//!   space), the template's when a child tag follows.
-//! - **A value's type comes from the request's tools at every depth** ([`Declared::kind_at`]:
-//!   below an object a key selects a property, below an array any element selects its items). A
-//!   declared string is its text, streamed as it arrives; every other leaf is written whole at
-//!   its closing tag through [`json`], which reads the booleans and numbers the template writes
-//!   as text and infers the rest. An empty element is `[]` or `{}` when the tool declares an
-//!   array or an object there, `null` when nothing is declared and it is a list's item, and `""`
-//!   everywhere else: the template writes `None` inside a list as an empty element, skips a
-//!   mapping's `None` member, and leaves a top-level argument that is `None` out altogether.
-//!   Nothing is taken from a value: the template writes it directly between the tags, with no
-//!   escaping.
-//! - **A top-level null is never written.** The template leaves an argument whose value is `None`
-//!   out (`for k, v in arguments.items() if v is not none`), so no output carries one; the
-//!   parity test counts that as a corpus class.
-//! - **A tag is `<`, a name and `>`**, the name any run of characters without whitespace or angle
-//!   brackets, with a leading `/` for a closing tag. A `<` followed by anything else is
-//!   text, so a comparison in a value stays text; a `<` that does spell a tag is one, inside a
-//!   value too, as every marker parser reads it. Inside a leaf, a tag other than the leaf's own
-//!   closing tag is the leaf's text; a closing tag that matches nothing open is reported.
-//! - **The name ends at its quote**, and the invoke tag at `>`; text between the two is reported,
-//!   as for DSML. An invoke with no name starts no call, and everything in it is reported.
-//! - **The separator keeps its place.** When nothing is held before it, it is `Dropped { Wrapper }`
-//!   at once; when a value's text or an opening tag is held, its bytes go into the next
-//!   fragment's source, so every event's bytes stay in the output's order.
-//! - **Two endings.** [`Assembler::close`] is the invoke's closing tag ([`INVOKE_CLOSE`], the one
-//!   terminal a started call's end carries), or the next invoke's opening or the block's close,
-//!   which end the call with no bytes of their own: every open container is closed, a tag the
-//!   end cut short is reported and an open streamed string gets its quote, a leaf never written
-//!   and an element without a child come back as `Malformed`, and the arguments object is
-//!   closed. An invoke that named no call takes whichever terminal ended it, so that it is
-//!   reported the same way however it ended. [`Assembler::finish`] is a stream that was
-//!   cut: nothing is closed, what was held comes back as `Malformed { UnterminatedRegion }`, and a
-//!   call that started still ends, with no bytes of its own, as every assembler ends one.
-//! - **Every byte of the invoke lands in exactly one event**, with the tagged assemblers'
-//!   accounting: the name's bytes in `ToolCallStart`, each tag's and value's bytes in the
-//!   fragments they produce, text where the syntax has tags as `Malformed` run by run with the
-//!   whitespace before it as `Dropped { Wrapper }`.
-//!
-//! This is the fourth tagged assembler. It shares the value module and the escaping with the
-//! other three; the tree is its own.
+//! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 //!
 //! [`formats::minimax_m3`]: crate::formats::minimax_m3()
 
