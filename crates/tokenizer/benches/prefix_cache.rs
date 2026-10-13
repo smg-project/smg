@@ -497,7 +497,7 @@ fn main() {
                 black_box(boundaries_one_pass(&text0, &automaton));
             });
             rows.push(("scan_one_pass".into(), stat, [0; 4]));
-            let boundaries = boundaries_per_string(&text0, &specials);
+            let boundaries = boundaries_one_pass(&text0, &automaton);
             let stat = timed(usize::MAX, budget, |_| {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(&[0u8]);
