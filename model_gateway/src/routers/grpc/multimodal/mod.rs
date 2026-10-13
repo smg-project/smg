@@ -89,7 +89,9 @@ pub(crate) use refs::{
     worker_accepts_media_refs, MmProcessing, MmRefsError,
 };
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
-pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
+pub(crate) use transport::{
+    init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype,
+};
 
 /// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
 /// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal

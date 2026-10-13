@@ -3,9 +3,7 @@
 
 use std::{collections::HashMap, time::Instant};
 
-use llm_multimodal::{
-    EncoderDtype, EncoderInputView, ModelSpecificValue, PreprocessedEncoderInputs,
-};
+use llm_multimodal::{EncoderDtype, EncoderInput, EncoderInputView, ModelSpecificValue};
 use tracing::{info, warn};
 
 use super::log_mm_timing_enabled;
@@ -15,14 +13,15 @@ use crate::routers::grpc::proto_wrapper::{
 
 /// Serialize the primary encoder input to raw little-endian bytes in `dtype`,
 /// returning the shape and the dtype the bytes were actually written in,
-/// which is what the receiver must be told to read them at.
-pub(super) fn serialize_encoder_input(
-    preprocessed: &PreprocessedEncoderInputs,
+/// which is what the receiver must be told to read them at. Bytes the
+/// preprocessor already laid out in `dtype` move into the result.
+pub(super) fn serialize_encoder_input_owned(
+    encoder_input: EncoderInput,
     dtype: &str,
 ) -> (Vec<u8>, Vec<u32>, String) {
-    let input = preprocessed.encoder_input.view();
     let dtype = wire_dtype(dtype, true);
-    (input.write_as(dtype), shape_u32(&input), dtype.to_string())
+    let shape = shape_u32(&encoder_input.view());
+    (encoder_input.into_bytes_as(dtype), shape, dtype.to_string())
 }
 
 /// One item's encoder input for TokenSpeed: written straight into shared
@@ -73,7 +72,7 @@ pub(super) fn serialize_tokenspeed_encoder_input(
 
 /// The dtype `asked` names, or `float32` for one the receiver may not share:
 /// a name it does not know, and `uint8` where only float widths are read.
-fn wire_dtype(asked: &str, uint8_allowed: bool) -> EncoderDtype {
+pub(super) fn wire_dtype(asked: &str, uint8_allowed: bool) -> EncoderDtype {
     match asked.parse::<EncoderDtype>() {
         Ok(EncoderDtype::Uint8) if !uint8_allowed => {
             warn!(
@@ -152,7 +151,9 @@ pub(super) fn model_specific_to_tensor_bytes(value: &ModelSpecificValue) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use llm_multimodal::{f32_to_bf16_bits, f32_to_f16_bits, EncoderInput, PixelNorm};
+    use llm_multimodal::{
+        f32_to_bf16_bits, f32_to_f16_bits, EncoderInput, PixelNorm, PreprocessedEncoderInputs,
+    };
     use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 
     use super::*;
@@ -198,7 +199,8 @@ mod tests {
             ("bfloat16", f32_to_bf16_bits as fn(f32) -> u16),
             ("float16", f32_to_f16_bits as fn(f32) -> u16),
         ] {
-            let (actual, _, written) = serialize_encoder_input(&preprocessed, dtype);
+            let (actual, _, written) =
+                serialize_encoder_input_owned(preprocessed.encoder_input.clone(), dtype);
             assert_eq!(written, dtype);
             assert_eq!(actual, le_bytes(values.iter().map(|&value| convert(value))));
         }
@@ -220,7 +222,8 @@ mod tests {
             // share, so the widest dtype is used and reported as such.
             ("float64", "float32", 4),
         ] {
-            let (data, shape, dtype) = serialize_encoder_input(&preprocessed, asked);
+            let (data, shape, dtype) =
+                serialize_encoder_input_owned(preprocessed.encoder_input.clone(), asked);
 
             assert_eq!(dtype, expected_dtype, "asked for {asked}");
             assert_eq!(shape, vec![2, 2]);
@@ -239,13 +242,15 @@ mod tests {
             .map(|&v| v as f32 * 0.5 - 1.0)
             .collect();
 
-        let (data, shape, dtype) = serialize_encoder_input(&preprocessed, "uint8");
+        let (data, shape, dtype) =
+            serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "uint8");
         assert_eq!(
             (data, shape, dtype.as_str()),
             (vec![0, 255, 51, 102, 153, 204], vec![1, 6], "uint8")
         );
 
-        let (data, _, dtype) = serialize_encoder_input(&preprocessed, "float32");
+        let (data, _, dtype) =
+            serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "float32");
         assert_eq!(dtype, "float32");
         let floats: Vec<f32> = data
             .as_chunks::<4>()

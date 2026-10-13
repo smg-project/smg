@@ -258,6 +258,11 @@ pub(crate) async fn prepare_chat_like(
                 );
                 multimodal_refs = Some(media_plan);
             } else {
+                // The dtype every worker of the model reads image pixels in,
+                // when they agree: the preprocessor then writes it directly.
+                let image_wire_dtype = multimodal::mm_shared_image_wire_dtype(
+                    &ctx.components.worker_registry.get_by_model(model_id),
+                );
                 match multimodal::process_multimodal_plan(
                     media_plan,
                     model_id,
@@ -266,6 +271,7 @@ pub(crate) async fn prepare_chat_like(
                     mm_components,
                     &tokenizer_id,
                     &tokenizer_source,
+                    image_wire_dtype,
                 )
                 .await
                 {

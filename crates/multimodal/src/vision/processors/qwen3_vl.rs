@@ -22,6 +22,7 @@ use image::DynamicImage;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::{
+    encoder_inputs::EncoderDtype,
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
@@ -306,6 +307,16 @@ impl VisionPreProcessor for Qwen3VLProcessor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let processor = self.with_preprocessor_config(config);
         processor.inner.preprocess(images, config)
+    }
+
+    fn preprocess_wire(
+        &self,
+        images: &[DynamicImage],
+        config: &PreProcessorConfig,
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        let processor = self.with_preprocessor_config(config);
+        processor.inner.preprocess_wire(images, config, dtype)
     }
 
     fn preprocess_video(
