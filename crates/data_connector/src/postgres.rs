@@ -230,37 +230,49 @@ impl PostgresStore {
         // own locks: the links index on columns the table always has, then
         // the safety-identifier index, whose column exists once the
         // migrations ran. A table the operator declared up to date without
-        // the column keeps starting without that index, as before.
-        tx.batch_execute(&PostgresConversationItemStorage::index_ddl(schema))
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to create the conversation item links index: {}",
-                    describe_error(&e)
-                )
-            })?;
-        if let Some(index_ddl) = PostgresResponseStorage::index_ddl(schema) {
-            let index = tx.savepoint("response_index").await.map_err(|e| {
-                format!("failed to open the index savepoint: {}", describe_error(&e))
-            })?;
-            match index.batch_execute(&index_ddl).await {
-                Ok(()) => index.commit().await.map_err(|e| {
+        // the column keeps starting without that index, as before. An index
+        // the catalog already has is not asked for again: the statement
+        // takes its share lock before it finds the index in place, and a
+        // share lock waiting behind an open write queues every later write
+        // on the table behind it (a start next to another's concurrent drop
+        // would wait that way too), so a start on a database that has its
+        // indexes takes no lock on the live tables.
+        let links_index = PostgresConversationItemStorage::links_index_name(schema);
+        if !postgres_index_exists(&tx, &links_index).await? {
+            tx.batch_execute(&PostgresConversationItemStorage::index_ddl(schema))
+                .await
+                .map_err(|e| {
                     format!(
-                        "failed to release the index savepoint: {}",
+                        "failed to create the conversation item links index: {}",
                         describe_error(&e)
                     )
-                })?,
-                Err(e) => {
-                    tracing::warn!(
+                })?;
+        }
+        let safety_index = PostgresResponseStorage::safety_index_name(schema);
+        if let Some(index_ddl) = PostgresResponseStorage::index_ddl(schema) {
+            if !postgres_index_exists(&tx, &safety_index).await? {
+                let index = tx.savepoint("response_index").await.map_err(|e| {
+                    format!("failed to open the index savepoint: {}", describe_error(&e))
+                })?;
+                match index.batch_execute(&index_ddl).await {
+                    Ok(()) => index.commit().await.map_err(|e| {
+                        format!(
+                            "failed to release the index savepoint: {}",
+                            describe_error(&e)
+                        )
+                    })?,
+                    Err(e) => {
+                        tracing::warn!(
                         "response index not created (the safety_identifier column may be missing): {}",
                         describe_error(&e)
                     );
-                    index.rollback().await.map_err(|e| {
-                        format!(
-                            "failed to roll back the index savepoint: {}",
-                            describe_error(&e)
-                        )
-                    })?;
+                        index.rollback().await.map_err(|e| {
+                            format!(
+                                "failed to roll back the index savepoint: {}",
+                                describe_error(&e)
+                            )
+                        })?;
+                    }
                 }
             }
         }
@@ -323,6 +335,25 @@ impl PostgresStore {
                 )
             })
     }
+}
+
+/// Whether the catalog `tx` sees has the index `index` (owner-qualified when
+/// the schema has an owner): `to_regclass` resolves an index as it does a
+/// table.
+async fn postgres_index_exists(
+    tx: &tokio_postgres::Transaction<'_>,
+    index: &str,
+) -> Result<bool, String> {
+    let row = tx
+        .query_one(postgres_table_exists_sql(), &[&index])
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to check for the {index} index: {}",
+                describe_error(&e)
+            )
+        })?;
+    Ok(row.get(0))
 }
 
 impl Clone for PostgresStore {
@@ -766,10 +797,15 @@ impl PostgresConversationItemStorage {
         let sl = &schema.conversation_item_links;
         let links_table = sl.qualified_table(schema.owner.as_deref());
         format!(
-            "CREATE INDEX IF NOT EXISTS conv_item_links_conv_idx ON {links_table} ({}, {});",
+            "CREATE INDEX IF NOT EXISTS {LINKS_INDEX} ON {links_table} ({}, {});",
             sl.col("conversation_id"),
             sl.col("added_at")
         )
+    }
+
+    /// The name of the links index, under the schema's owner when it has one.
+    pub(crate) fn links_index_name(schema: &SchemaConfig) -> String {
+        qualified_index(schema, LINKS_INDEX)
     }
 }
 
@@ -1253,9 +1289,15 @@ impl PostgresResponseStorage {
         }
         let table = s.qualified_table(schema.owner.as_deref());
         Some(format!(
-            "CREATE INDEX IF NOT EXISTS responses_safety_idx ON {table} ({});",
+            "CREATE INDEX IF NOT EXISTS {SAFETY_INDEX} ON {table} ({});",
             s.col("safety_identifier")
         ))
+    }
+
+    /// The name of the safety-identifier index, under the schema's owner
+    /// when it has one.
+    pub(crate) fn safety_index_name(schema: &SchemaConfig) -> String {
+        qualified_index(schema, SAFETY_INDEX)
     }
 
     /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
@@ -1313,10 +1355,7 @@ impl PostgresResponseStorage {
     /// The name of the index an earlier release built over `::jsonb`,
     /// [`LEGACY_UNSTORED_INDEX`], under the schema's owner when it has one.
     pub(crate) fn legacy_unstored_index_name(schema: &SchemaConfig) -> String {
-        match schema.owner.as_deref() {
-            Some(owner) => format!("{owner}.{LEGACY_UNSTORED_INDEX}"),
-            None => LEGACY_UNSTORED_INDEX.to_string(),
-        }
+        qualified_index(schema, LEGACY_UNSTORED_INDEX)
     }
 
     /// The statement that drops the index an earlier release built over
@@ -1558,10 +1597,23 @@ fn link_sql(table: &str, col_names: &[&str]) -> String {
     )
 }
 
+/// The name of the conversation item links index.
+const LINKS_INDEX: &str = "conv_item_links_conv_idx";
+/// The name of the safety-identifier index on the responses table.
+const SAFETY_INDEX: &str = "responses_safety_idx";
 /// The name of the index the unstored-record sweep reads.
 const UNSTORED_INDEX: &str = "responses_unstored_text_idx";
 /// The name an earlier release gave that index, built over `::jsonb`.
 const LEGACY_UNSTORED_INDEX: &str = "responses_unstored_idx";
+
+/// `index` under the schema's owner when it has one: the name the catalog
+/// resolves, as `to_regclass` and `DROP INDEX` take it.
+fn qualified_index(schema: &SchemaConfig, index: &str) -> String {
+    match schema.owner.as_deref() {
+        Some(owner) => format!("{owner}.{index}"),
+        None => index.to_string(),
+    }
+}
 
 /// The JSON document in `col_raw` as text every stored object survives: the
 /// column's text with the escape `\u0000` replaced by `\u0020` (a space), to
@@ -1976,7 +2028,8 @@ mod tests {
 
     /// The earlier index is dropped concurrently (a plain drop holds an
     /// ACCESS EXCLUSIVE lock on the live table to the end of its
-    /// transaction), under the schema's owner when it has one.
+    /// transaction), under the schema's owner when it has one, as are the
+    /// indexes a start looks up before asking for them.
     #[test]
     fn the_earlier_index_is_dropped_concurrently() {
         let schema = SchemaConfig::default();
@@ -1991,6 +2044,14 @@ mod tests {
         assert_eq!(
             PostgresResponseStorage::legacy_unstored_index_drop_ddl(&owned),
             "DROP INDEX CONCURRENTLY IF EXISTS history.responses_unstored_idx;"
+        );
+        assert_eq!(
+            PostgresConversationItemStorage::links_index_name(&owned),
+            "history.conv_item_links_conv_idx"
+        );
+        assert_eq!(
+            PostgresResponseStorage::safety_index_name(&schema),
+            "responses_safety_idx"
         );
     }
 

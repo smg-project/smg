@@ -1934,10 +1934,13 @@ async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earli
 
 /// A start on a database that still has the index an earlier release built
 /// drops it without blocking the table: while a transaction another session
-/// holds open on `responses` makes the drop wait, a plain read from a third
-/// session answers (a plain `DROP INDEX` wants an ACCESS EXCLUSIVE lock on the
-/// table, and the read would queue behind it until the first session ends).
-/// On a database of its own.
+/// holds open on `responses` makes the drop wait, and a second start comes up
+/// next to it, a plain read and a plain write from a third session answer (a
+/// plain `DROP INDEX` wants an ACCESS EXCLUSIVE lock on the table, and the
+/// read would queue behind it until the first session ends; a second start
+/// asking for an index the table has would wait for a share lock behind the
+/// first's concurrent drop, and the write would queue behind that). On a
+/// database of its own.
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 #[tokio::test]
 #[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
@@ -2007,7 +2010,32 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() 
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Session 3: a plain read, bounded by the server at 2 s.
+        // A second start while the first's drop waits (replicas come up
+        // together): it must take no lock on the table either, or every write
+        // queues behind it. Both starts are seen waiting before the third
+        // session's statements go out.
+        let url = scratch.url.clone();
+        start.spawn(async move { postgres_bundle(&url).await.map(drop) });
+        let mut both_waiting = false;
+        for _ in 0..200 {
+            let waiting: i64 = watch
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("session 4's count: {e}"))?
+                .get(0);
+            if waiting >= 2 {
+                both_waiting = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Session 3: a plain read and a plain write, bounded by the server at
+        // 2 s each.
         let (reader, reader_connection) =
             tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
                 .await
@@ -2029,45 +2057,79 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() 
                 None => e.to_string(),
             });
         let read_took = started.elapsed();
+        let writing = Instant::now();
+        let write = reader
+            .execute("DELETE FROM responses WHERE id = 'none'", &[])
+            .await
+            .map_err(|e| match e.as_db_error() {
+                Some(db) => format!("{} ({})", db.message(), db.code().code()),
+                None => e.to_string(),
+            });
+        let write_took = writing.elapsed();
 
-        // Session 1 ends: the drop goes through and the start completes.
+        // Session 1 ends: the drop goes through and both starts complete.
         holder
             .batch_execute("COMMIT")
             .await
             .map_err(|e| format!("session 1's commit: {e}"))?;
-        let second_start = match tokio::time::timeout(Duration::from_secs(60), start.join_next()).await
-        {
-            Err(_) => Err("still waiting 60 s after session 1 ended".to_string()),
-            Ok(None) => Err("did not run".to_string()),
-            Ok(Some(Err(e))) => Err(format!("its task: {e}")),
-            Ok(Some(Ok(result))) => result,
-        };
+        let mut starts = Vec::new();
+        loop {
+            let joined = tokio::time::timeout(Duration::from_secs(60), start.join_next()).await;
+            match joined {
+                Err(_) => starts.push(Err("still waiting 60 s after session 1 ended".to_string())),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => starts.push(Err(format!("its task: {e}"))),
+                Ok(Some(Ok(result))) => starts.push(result),
+            }
+            if starts.len() == 2 {
+                break;
+            }
+        }
         let indexes = scratch.indexes().await?;
         drop(holder);
         drop(watch);
         drop(reader);
         drivers.join_all().await;
-        Ok::<_, String>((waiting_drop, read, read_took, second_start, indexes))
+        Ok::<_, String>((
+            waiting_drop,
+            both_waiting,
+            read,
+            read_took,
+            write,
+            write_took,
+            starts,
+            indexes,
+        ))
     }
     .await;
     scratch.drop().await;
 
-    let (waiting_drop, read, read_took, second_start, indexes) = outcome.unwrap();
+    let (waiting_drop, both_waiting, read, read_took, write, write_took, starts, indexes) =
+        outcome.unwrap();
     println!(
-        "the start's drop waited on {waiting_drop:?}; the read during it: {read:?} after {read_took:?}; \
-         the second start: {second_start:?}; indexes after it: {indexes:?}"
+        "the first start's drop waited on {waiting_drop:?}; a second start waited with it: {both_waiting}; \
+         the read meanwhile: {read:?} after {read_took:?}; the write: {write:?} after {write_took:?}; \
+         the starts: {starts:?}; indexes after: {indexes:?}"
     );
     assert!(
         waiting_drop.is_some(),
         "the start's drop of the earlier index did not wait for the open transaction"
     );
     assert!(
-        read.is_ok(),
-        "a plain read on the table waited behind the start's drop (cancelled at its 2 s bound): {read:?}"
+        both_waiting,
+        "the second start was not seen waiting next to the first's drop"
     );
     assert!(
-        second_start.is_ok(),
-        "the second start once session 1 ended: {second_start:?}"
+        read.is_ok(),
+        "a plain read on the table waited behind the starts (cancelled at its 2 s bound): {read:?}"
+    );
+    assert!(
+        write.is_ok(),
+        "a plain write on the table waited behind the starts (cancelled at its 2 s bound): {write:?}"
+    );
+    assert!(
+        starts.len() == 2 && starts.iter().all(|s| s.is_ok()),
+        "the starts once session 1 ended: {starts:?}"
     );
     assert!(
         !indexes
