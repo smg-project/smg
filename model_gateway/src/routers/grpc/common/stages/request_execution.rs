@@ -1300,8 +1300,9 @@ fn pd_leg_error(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Retirement {
     /// Its partner failed to start, and the request with it. The leg's own
-    /// late result is still this request's one word on its worker: sampled
-    /// on the breaker and counted as a dispatch's is.
+    /// late failure is still this request's one word on its worker: sampled
+    /// on the breaker and counted as a dispatch's is. A late stream is
+    /// aborted and earns no success: the leg never produced anything.
     PartnerFailed,
     /// Its partner, the prefill, fell silent: the request charged that
     /// prefill where its bound passed, and this leg's late result is not its
@@ -1348,9 +1349,11 @@ impl Retirement {
 /// and it is the only thing that releases that room early. The abort is
 /// deferred only when a KV handoff may still be written into the leg: the
 /// decode partner of a prefill that fell silent rather than failed; a peer
-/// that failed to start writes nothing. The late result is sampled and
+/// that failed to start writes nothing. A late failure is sampled and
 /// counted only when it is the request's one word on the worker; a leg
 /// given up on for its silence charged its worker when the bound passed.
+/// A late stream earns no success either way: the leg is aborted before it
+/// produced anything.
 #[expect(
     clippy::disallowed_methods,
     reason = "the abandoned PD leg is retired off the request path; its dispatch is bounded by the engine's own deadline"
@@ -1364,7 +1367,10 @@ fn retire_pd_leg(
 ) {
     tokio::spawn(async move {
         let result = dispatch.await;
-        if let Some(status) = result.breaker_status().filter(|_| retirement.charges()) {
+        if let Some(status) = result
+            .breaker_status()
+            .filter(|_| retirement.charges() && result.is_err())
+        {
             worker.record_outcome(status);
         }
         let cause = retirement.cause();
@@ -2328,6 +2334,43 @@ mod tests {
         assert!(Retirement::PartnerFailed.charges());
         assert!(!Retirement::PartnerFailed.defer_abort());
         assert!(!Retirement::Silent.charges());
+    }
+
+    /// A leg retired because its partner failed to start samples only a late
+    /// failure on its worker: its late stream is aborted and earns no success
+    /// (the leg never produced anything), so a failure before it stands and
+    /// the next one opens a breaker set to two.
+    #[tokio::test]
+    async fn the_late_stream_of_a_leg_retired_for_its_partners_failure_earns_no_breaker_success() {
+        use crate::worker::circuit_breaker::CircuitState;
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30002")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        decode.record_outcome(504);
+        let late: PdLegDispatch =
+            Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
+        retire_pd_leg(
+            PdLeg::Decode,
+            "grpc",
+            Arc::clone(&decode),
+            late,
+            Retirement::PartnerFailed,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+        decode.record_outcome(504);
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::Open,
+            "the late stream earned no success between the two failures"
+        );
     }
 
     fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
