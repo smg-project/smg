@@ -1844,6 +1844,17 @@ impl WorkerRuntime {
 
     pub fn note_token_progress(&self) {
         let now = super::liveness::now_ms();
+        // The stamps are millisecond stamps and the wake keeps one permit, so
+        // a token within the millisecond of the previous one has nothing to
+        // record: it leaves with one plain load. Every stream of the worker
+        // reports here for every token, from whichever core runs it; the
+        // three stores and the notifier's compare-exchange would otherwise
+        // bounce the worker's cache lines between cores once per token.
+        if self.last_token_ms.load(Ordering::Relaxed) == now
+            && !self.transport_failed.load(Ordering::Relaxed)
+        {
+            return;
+        }
         self.last_token_ms.store(now, Ordering::Relaxed);
         self.last_contact_ms.store(now, Ordering::Relaxed);
         self.transport_failed.store(false, Ordering::Relaxed);
@@ -4824,6 +4835,40 @@ mod tests {
         worker.set_completion_sink(None);
         drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None));
         assert_eq!(spy.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_token_within_the_stamped_millisecond_records_nothing_new_and_keeps_the_semantics() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_token_progress();
+        let stamped = runtime.progress_reference_ms();
+        let contact = runtime.contact_age();
+
+        // A transport failure flagged between two tokens of one millisecond is
+        // cleared by the second token all the same.
+        runtime.note_transport_failure();
+        assert!(runtime.transport_failure_pending());
+        runtime.note_token_progress();
+        assert!(
+            !runtime.transport_failure_pending(),
+            "progress clears a transport failure, same millisecond or not"
+        );
+        assert!(runtime.progress_reference_ms() >= stamped);
+        assert!(runtime.contact_age() <= contact + Duration::from_millis(5));
+
+        // The wake's permit is there for a waiter that comes after the tokens.
+        let wake = runtime.contact_wake();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async { time::timeout(Duration::from_millis(50), wake.notified()).await })
+            .expect("the tokens left the notifier's permit for a later waiter");
+
+        // Once the millisecond turns, the next token stamps again.
+        thread::sleep(Duration::from_millis(3));
+        runtime.note_token_progress();
+        assert!(runtime.progress_reference_ms() > stamped);
     }
 
     #[test]
