@@ -126,6 +126,10 @@ mod handles {
 
     /// The inner map under `key`, created on first sight; the key is only
     /// allocated for a new entry.
+    #[expect(
+        clippy::expect_used,
+        reason = "the key is inserted just above when missing"
+    )]
     pub(super) fn nested<'m, V: Default>(map: &'m mut HashMap<String, V>, key: &str) -> &'m mut V {
         if !map.contains_key(key) {
             map.insert(key.to_owned(), V::default());
