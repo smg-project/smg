@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -27,6 +28,7 @@ use openai_protocol::{
     },
     generate::GenerateFinishReason,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
@@ -55,25 +57,56 @@ use crate::{
 /// backpressure to a slow client.
 pub(crate) type SseSender = sse::SseSender;
 
-/// Send an SSE error event with a typed error body.
-///
-/// Produces `data: {"error":{"message":"...","type":"..."}}\n\n` using
-/// `serde_json` so that quotes, newlines, and other special characters in the
-/// error message are properly escaped.
+/// The body of an SSE error event, `{"error":{"message":...,"type":...}}`,
+/// serialized straight into its frame: the message is written through
+/// `Display` into the JSON escaper, so the frame is the one allocation.
+#[derive(Serialize)]
+#[serde(bound = "M: fmt::Display")]
+struct SseErrorFrame<'a, M: fmt::Display> {
+    error: SseErrorBody<'a, M>,
+}
+
+#[derive(Serialize)]
+#[serde(bound = "M: fmt::Display")]
+struct SseErrorBody<'a, M: fmt::Display> {
+    #[serde(serialize_with = "serialize_display")]
+    message: M,
+    #[serde(rename = "type")]
+    error_type: &'a str,
+}
+
+fn serialize_display<M: fmt::Display, S: serde::Serializer>(
+    message: &M,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(message)
+}
+
+/// Send an SSE error event with a typed error body:
+/// `data: {"error":{"message":"...","type":"..."}}\n\n`, the message
+/// JSON-escaped (quotes, newlines, control characters).
 ///
 /// `async` because the sender is bounded: awaits if the buffer is full so the
 /// terminal error frame still applies backpressure rather than being dropped.
-pub(crate) async fn send_error_sse(tx: &SseSender, message: impl ToString, error_type: &str) {
-    let chunk = format!(
-        "data: {}\n\n",
-        json!({
-            "error": {
-                "message": message.to_string(),
-                "type": error_type,
-            }
-        })
-    );
-    let _ = tx.send(Ok(Bytes::from(chunk))).await;
+pub(crate) async fn send_error_sse(tx: &SseSender, message: impl fmt::Display, error_type: &str) {
+    const PREFIX: &[u8] = b"data: ";
+    let mut frame = Vec::with_capacity(256);
+    frame.extend_from_slice(PREFIX);
+    let body = SseErrorFrame {
+        error: SseErrorBody {
+            message,
+            error_type,
+        },
+    };
+    // Serializing into memory fails only when the message's `Display` does.
+    if serde_json::to_writer(&mut frame, &body).is_err() {
+        frame.truncate(PREFIX.len());
+        frame.extend_from_slice(
+            br#"{"error":{"message":"the error message could not be serialized","type":"internal_error"}}"#,
+        );
+    }
+    frame.extend_from_slice(b"\n\n");
+    let _ = tx.send(Ok(Bytes::from(frame))).await;
 }
 
 /// Resolve tokenizer from registry and cache it in request context.
@@ -1055,6 +1088,28 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The error frame is `data: {"error":{"message":..,"type":..}}` with
+    /// the message escaped as JSON, whatever it carries.
+    #[tokio::test]
+    async fn an_sse_error_frame_carries_the_escaped_message_and_its_type() {
+        let (tx, mut rx) = sse::sse_channel();
+        send_error_sse(&tx, "a \"quoted\"\nline \u{1F600}", "stream_error").await;
+        send_error_sse(&tx, format!("built {}", 42), "internal_error").await;
+        drop(tx);
+        let mut frames = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            frames.push(String::from_utf8(bytes.to_vec()).unwrap());
+        }
+        assert_eq!(
+            frames,
+            [
+                "data: {\"error\":{\"message\":\"a \\\"quoted\\\"\\nline \u{1F600}\",\
+                 \"type\":\"stream_error\"}}\n\n",
+                "data: {\"error\":{\"message\":\"built 42\",\"type\":\"internal_error\"}}\n\n",
+            ]
+        );
+    }
 
     fn placeholders(entries: &[(Modality, &str)]) -> PlaceholderTokens {
         let mut tokens = PlaceholderTokens::default();

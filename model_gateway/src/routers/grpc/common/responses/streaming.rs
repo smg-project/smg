@@ -31,7 +31,7 @@ use crate::{
     routers::{
         common::{
             openai_bridge::{self, descriptor, ResponseFormat},
-            sse::{SseReceiver, SseSender},
+            sse::{SseEncodeError, SseEncoder, SseReceiver, SseSender},
         },
         error,
         grpc::harmony::responses::ToolResult,
@@ -156,6 +156,8 @@ pub(crate) struct ResponseStreamEventEmitter {
     /// The error of the last `error` event sent, for the runner of a
     /// background stream that ends without a terminal object.
     last_error: Option<serde_json::Value>,
+    /// Frames every event of the stream through one reusable buffer.
+    encoder: SseEncoder,
 }
 
 /// Streaming state for the reasoning output item of the current turn.
@@ -188,6 +190,7 @@ impl ResponseStreamEventEmitter {
             finish_reason: None,
             background: false,
             last_error: None,
+            encoder: SseEncoder::new(),
         }
     }
 
@@ -1330,24 +1333,29 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
+    /// Send `event` as one frame: its `type` on the `event:` line (`message`
+    /// when it has none), its JSON on the `data:` line, serialized straight
+    /// into the encoder's buffer.
     pub async fn send_event(
-        &self,
+        &mut self,
         event: &serde_json::Value,
         tx: &SseSender,
     ) -> Result<(), String> {
-        let event_json =
-            serde_json::to_string(event).map_err(|e| format!("Failed to serialize event: {e}"))?;
-
-        // Extract event type from the JSON for SSE event field
         let event_type = event
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("message");
+        let frame = self
+            .encoder
+            .encode_event(event_type, event)
+            .map_err(|e| match e {
+                SseEncodeError::Json(e) => format!("Failed to serialize event: {e}"),
+                SseEncodeError::InvalidEventType => {
+                    "Failed to serialize event: its type breaks the frame".to_string()
+                }
+            })?;
 
-        // Format as SSE with event: field
-        let sse_message = format!("event: {event_type}\ndata: {event_json}\n\n");
-
-        if tx.send(Ok(Bytes::from(sse_message))).await.is_err() {
+        if tx.send(Ok(frame)).await.is_err() {
             return Err("Client disconnected".to_string());
         }
 
@@ -1359,7 +1367,11 @@ impl ResponseStreamEventEmitter {
     /// This is a convenience method for streaming scenarios where client
     /// disconnection is expected and should be logged but not fail the operation.
     /// Returns true if sent successfully, false if client disconnected.
-    pub async fn send_event_best_effort(&self, event: &serde_json::Value, tx: &SseSender) -> bool {
+    pub async fn send_event_best_effort(
+        &mut self,
+        event: &serde_json::Value,
+        tx: &SseSender,
+    ) -> bool {
         match self.send_event(event, tx).await {
             Ok(()) => true,
             Err(e) => {
@@ -1384,11 +1396,11 @@ impl ResponseStreamEventEmitter {
             "param": null,
             "sequence_number": self.next_sequence()
         });
-        let sse_data = match serde_json::to_string(&event) {
-            Ok(json) => format!("data: {json}\n\n"),
-            Err(_) => "data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n".to_string(),
-        };
-        let _ = tx.send(Ok(Bytes::from(sse_data))).await;
+        // The error event goes out on a `data:` line alone, as it always has.
+        let frame = self.encoder.encode_data(&event).unwrap_or_else(|_| {
+            Bytes::from_static(b"data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n")
+        });
+        let _ = tx.send(Ok(frame)).await;
     }
 
     /// The error of the last `error` event this emitter sent, if any.
@@ -1540,6 +1552,40 @@ pub(crate) fn attach_mcp_server_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame of an event: its `type` on the `event:` line and the JSON on
+    /// the `data:` line, the text escaped as JSON; an error frame has no
+    /// `event:` line.
+    #[tokio::test]
+    async fn an_event_frame_names_its_type_and_an_error_frame_does_not() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, mut rx) = sse_channel();
+        let event = emitter.emit_text_delta("héllo \"there\"\n", 1, "msg_1", 0);
+        emitter.send_event(&event, &tx).await.unwrap();
+        emitter
+            .emit_error("engine unavailable", Some("server_error"), &tx)
+            .await;
+        drop(tx);
+        let mut frames = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            frames.push(String::from_utf8(bytes.to_vec()).unwrap());
+        }
+        let delta = OutputTextEvent::DELTA;
+        assert_eq!(
+            frames,
+            [
+                format!(
+                    "event: {delta}\ndata: {{\"type\":\"{delta}\",\"sequence_number\":0,\
+                     \"output_index\":1,\"item_id\":\"msg_1\",\"content_index\":0,\
+                     \"delta\":\"héllo \\\"there\\\"\\n\"}}\n\n"
+                ),
+                "data: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"engine \
+                 unavailable\",\"param\":null,\"sequence_number\":1}\n\n"
+                    .to_string(),
+            ]
+        );
+    }
 
     /// A run that ends as failed before its terminal (the tool-call limit)
     /// stores what the stream carries: `failed`, the error, the items still
