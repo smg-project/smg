@@ -1246,3 +1246,71 @@ async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     server.stop(Duration::from_secs(5)).unwrap();
     assert_handshake_released(&handshake).await;
 }
+
+/// `Abort` ends the response stream the way the Python servicer ends it: a
+/// terminal `abort` completion with the output so far, then the stream
+/// closes and the scheduler-side request is aborted. The caller's own abort
+/// stays a completion; only a shutdown under an open request is a status.
+#[tokio::test]
+async fn abort_rpc_ends_an_open_stream_with_the_abort_completion() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r7", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r7", vec![10], 1, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    h.client
+        .abort(ts::AbortRequest {
+            request_id: "r7".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("abort");
+    let aborted = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(aborted.finish_reason, "abort");
+    assert_eq!(aborted.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r7".to_string()]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A shutdown with a stream still open is the engine side going away under
+/// the request, not an abort the caller asked for: the stream ends with
+/// `UNAVAILABLE` (the status the Router counts and logs as the worker's
+/// failure), never with a `Complete` whose finish reason is `abort`.
+#[tokio::test]
+async fn a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r8", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r8", vec![10], 1, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let status = stream
+        .message()
+        .bounded()
+        .await
+        .expect_err("a shutdown ends the stream with a status, not a completion");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(
+        status.message().contains("shutting down"),
+        "{}",
+        status.message()
+    );
+    assert!(!h.server.running());
+}

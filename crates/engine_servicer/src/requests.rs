@@ -1,5 +1,8 @@
-//! In-flight request registry: the `Abort` RPC's cancellation handles, keyed
-//! by request id. Engine-neutral; every servicer registers its streams here.
+//! In-flight request registry: the cancellation handles of the `Abort` RPC
+//! and of shutdown, keyed by request id. Engine-neutral; every servicer
+//! registers its streams here. A cancellation names its cause
+//! ([`CancelReason`]), so a stream can end a caller's abort as a completion
+//! and a shutdown under an open request as the failure it is.
 
 use std::{
     collections::HashMap,
@@ -12,11 +15,32 @@ use std::{
 use tokio::sync::oneshot;
 use tonic::Status;
 
+/// Why a registered request's stream is being cancelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancelReason {
+    /// An `Abort` RPC named the request: the caller's own abort (the Router
+    /// drops the stream and sends it). The stream ends the way the Python
+    /// servicer ends it, with each open choice's `Complete(finish_reason =
+    /// "abort")`.
+    Abort,
+    /// The servicer is shutting down with the request still open: its engine
+    /// side is going away (the lifecycle owner stopping the pair after the
+    /// engine exited, a drain whose grace ran out). Nobody asked for an abort
+    /// and the request did not complete, so the stream ends with a status,
+    /// never with a completion the caller could read as a short answer.
+    Shutdown,
+}
+
+/// The message of the `UNAVAILABLE` status a shutdown ends an open stream
+/// with.
+pub(crate) const SHUTDOWN_MESSAGE: &str =
+    "servicer shutting down: the engine went away before the request completed";
+
 /// Registered in-flight requests. The generation disambiguates an id reused
 /// after an abort from the stream that registered it.
 #[derive(Default)]
 pub(crate) struct RequestRegistry {
-    entries: Mutex<HashMap<String, (u64, oneshot::Sender<()>)>>,
+    entries: Mutex<HashMap<String, (u64, oneshot::Sender<CancelReason>)>>,
     generation: AtomicU64,
 }
 
@@ -49,7 +73,7 @@ impl RequestRegistry {
     pub(crate) fn register(
         self: &Arc<Self>,
         request_id: &str,
-    ) -> Result<(Registration, oneshot::Receiver<()>), Status> {
+    ) -> Result<(Registration, oneshot::Receiver<CancelReason>), Status> {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         let mut entries = self
@@ -73,9 +97,9 @@ impl RequestRegistry {
         ))
     }
 
-    /// Fire the cancellation of every given id that is live; returns how many
-    /// were. An unknown or already-finished id is a no-op: cleanup is
-    /// idempotent.
+    /// Fire the cancellation of every given id that is live, as the caller's
+    /// abort ([`CancelReason::Abort`]); returns how many were. An unknown or
+    /// already-finished id is a no-op: cleanup is idempotent.
     pub(crate) fn abort(&self, request_ids: &[String]) -> Result<usize, Status> {
         let mut entries = self
             .entries
@@ -84,19 +108,20 @@ impl RequestRegistry {
         let mut found = 0;
         for request_id in request_ids {
             if let Some((_, cancel)) = entries.remove(request_id) {
-                let _ = cancel.send(());
+                let _ = cancel.send(CancelReason::Abort);
                 found += 1;
             }
         }
         Ok(found)
     }
 
-    /// Fire every registered cancellation: shutdown ends the streams before
-    /// the listener closes.
+    /// Fire every registered cancellation as the shutdown it is
+    /// ([`CancelReason::Shutdown`]): the streams end before the listener
+    /// closes, each with the status a request the engine left behind gets.
     pub(crate) fn cancel_all(&self) -> Result<(), crate::ServicerError> {
         let mut entries = crate::lock(&self.entries)?;
         for (_, (_, cancel)) in entries.drain() {
-            let _ = cancel.send(());
+            let _ = cancel.send(CancelReason::Shutdown);
         }
         Ok(())
     }

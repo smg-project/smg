@@ -32,6 +32,24 @@ _HTTP_TO_GRPC_CODE = {
 }
 
 
+def scheduler_abort(output: dict) -> dict | None:
+    """The scheduler's own abort of the request, when the output's finish
+    reason carries one with a status code (its refusal of the caller's input,
+    a full queue, an internal failure): the request did not complete and the
+    status says whose fault it is, so the stream ends with a gRPC status (see
+    :func:`abort_code_from_output`), not with a completion. A plain abort with
+    no status code (the caller's own cancel) is not the scheduler's and stays a
+    completion; so does any other finish. Returns the finish-reason dict."""
+    finish_reason = output.get("meta_info", {}).get("finish_reason")
+    if (
+        isinstance(finish_reason, dict)
+        and finish_reason.get("type") == "abort"
+        and finish_reason.get("status_code") is not None
+    ):
+        return finish_reason
+    return None
+
+
 def abort_code_from_output(output: dict) -> grpc.StatusCode:
     """Map a scheduler error output to the appropriate gRPC status code."""
     finish_reason = output.get("meta_info", {}).get("finish_reason")

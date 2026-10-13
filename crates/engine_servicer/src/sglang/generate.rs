@@ -19,7 +19,10 @@ use tokio::sync::oneshot;
 use tonic::Status;
 
 use super::State;
-use crate::{requests::Registration, BoxStream};
+use crate::{
+    requests::{CancelReason, Registration},
+    BoxStream,
+};
 
 /// Handle one `Generate` request against the connected scheduler.
 /// `trace_headers` is the caller's W3C trace context (see
@@ -145,7 +148,7 @@ impl Stream for ChoiceStream {
 /// `Abort` RPC.
 struct GenerateStream {
     choices: SelectAll<ChoiceStream>,
-    cancel: oneshot::Receiver<()>,
+    cancel: oneshot::Receiver<CancelReason>,
     /// Set once aborted: the terminal `Complete` of every choice still open
     /// at that point, yielded before the stream ends.
     aborted: Option<VecDeque<sg::GenerateResponse>>,
@@ -161,11 +164,25 @@ impl Stream for GenerateStream {
             if let Some(aborted) = this.aborted.as_mut() {
                 return Poll::Ready(aborted.pop_front().map(Ok));
             }
-            // Either an `Abort` fired the sender or shutdown dropped the
-            // registry: both end the request as the Python servicer does, with
-            // each open choice's `Complete(finish_reason = "abort")`. Dropping
-            // the choices aborts the engine side.
-            if Pin::new(&mut this.cancel).poll(cx).is_ready() {
+            // The cancellation names its cause. An `Abort` RPC is the caller's
+            // own abort: the request ends as the Python servicer ends it, with
+            // each open choice's `Complete(finish_reason = "abort")`. A
+            // shutdown with the request still open is its engine side going
+            // away under it (the lifecycle owner stopping the pair after the
+            // engine exited, a drain whose grace ran out): no completion the
+            // caller could read as a short answer, so the stream ends with
+            // UNAVAILABLE, which the Router classes as the worker's failure.
+            // Either way dropping the choices aborts the engine side.
+            if let Poll::Ready(reason) = Pin::new(&mut this.cancel).poll(cx) {
+                if reason == Ok(CancelReason::Shutdown) {
+                    this.choices.clear();
+                    this.aborted = Some(VecDeque::new());
+                    return Poll::Ready(Some(Err(Status::unavailable(
+                        crate::requests::SHUTDOWN_MESSAGE,
+                    ))));
+                }
+                // The abort, or a sender dropped without a word (the registry
+                // entry went away): the completion it always was.
                 let aborted = this
                     .choices
                     .iter_mut()
