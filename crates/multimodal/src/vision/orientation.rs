@@ -7,8 +7,9 @@
 //!
 //! The AArch64 path is the module's only use of `core::arch` vector loads and
 //! stores, hence the local override of the workspace-wide
-//! `unsafe_code = "deny"`; every pointer it forms comes from a row offset
-//! checked against the buffer by the tile bounds.
+//! `unsafe_code = "deny"`; every pointer it forms comes from an exact-size
+//! slice (a 48-byte run), so a wrong length or offset is a bounds check,
+//! never an out-of-bounds vector access.
 #![cfg_attr(target_arch = "aarch64", allow(unsafe_code))]
 
 use image::{metadata::Orientation, DynamicImage, RgbImage};
@@ -178,8 +179,8 @@ fn transposed(src: &[u8], w: usize, h: usize, layout: Transpose) -> Vec<u8> {
         for tx in 0..tiles_x {
             if vector {
                 #[cfg(target_arch = "aarch64")]
-                // SAFETY: NEON was detected; the tile lies inside both buffers
-                // (the caller's tile counts are whole tiles of 16).
+                // SAFETY: NEON was detected (the tile's runs are bounds-checked
+                // slices inside).
                 unsafe {
                     neon::transpose_tile(src, w, &mut out, out_w, tx * 16, ty * 16, layout);
                 }
@@ -270,29 +271,28 @@ mod neon {
 
     use super::Transpose;
 
-    /// The pixels of `row` in reverse order into `out_row`: sixteen pixels
-    /// per de-interleaving load, each plane reversed, stored at the mirrored
-    /// position; the remainder pixel by pixel.
+    /// The pixels of `row` in reverse order into `out_row` (cut to `row`'s
+    /// length): sixteen pixels per de-interleaving load, each plane reversed,
+    /// stored into the mirrored 48-byte chunk of the destination; the
+    /// remainder (the source's tail, the destination's head) pixel by pixel.
+    /// Every pointer comes from a 48-byte chunk of a slice, so a short
+    /// `out_row` is a bounds-check panic, not an out-of-bounds store.
     #[target_feature(enable = "neon")]
     pub(super) fn reverse_pixels(row: &[u8], out_row: &mut [u8]) {
-        let pixels = row.len() / 3;
-        let whole = pixels / 16;
-        for chunk in 0..whole {
-            let x = chunk * 16;
-            let target = pixels - 16 - x;
-            // SAFETY: the source pixels `x .. x + 16` and the destination
-            // pixels `target .. target + 16` lie inside rows of `pixels`
-            // pixels (three bytes each).
+        let out_row = &mut out_row[..row.len()];
+        let (chunks, rest) = row.as_chunks::<48>();
+        let (out_rest, out_chunks) = out_row.as_rchunks_mut::<48>();
+        for (chunk, out) in chunks.iter().zip(out_chunks.iter_mut().rev()) {
+            // SAFETY: both pointers come from 48-byte arrays.
             unsafe {
-                let planes = vld3q_u8(row.as_ptr().add(x * 3));
+                let planes = vld3q_u8(chunk.as_ptr());
                 vst3q_u8(
-                    out_row.as_mut_ptr().add(target * 3),
+                    out.as_mut_ptr(),
                     uint8x16x3_t(reversed(planes.0), reversed(planes.1), reversed(planes.2)),
                 );
             }
         }
-        let done = whole * 16;
-        super::reverse_pixels_scalar(&row[done * 3..], &mut out_row[..(pixels - done) * 3]);
+        super::reverse_pixels_scalar(rest, out_rest);
     }
 
     /// The sixteen bytes of a vector in reverse order.
@@ -357,8 +357,12 @@ mod neon {
             } else {
                 y0 + k
             };
-            // SAFETY: row `y < h` and columns `x0 .. x0 + 16 <= w` lie inside `src`.
-            let planes = unsafe { vld3q_u8(src.as_ptr().add((y * w + x0) * 3)) };
+            // The source run: a 48-byte slice (a wrong origin is a bounds
+            // check, not an out-of-bounds load).
+            let start = (y * w + x0) * 3;
+            let run = &src[start..start + 48];
+            // SAFETY: `run` is 48 bytes.
+            let planes = unsafe { vld3q_u8(run.as_ptr()) };
             r[k] = planes.0;
             g[k] = planes.1;
             b[k] = planes.2;
@@ -376,13 +380,12 @@ mod neon {
             } else {
                 x
             };
-            // SAFETY: destination row `row < out_h` and columns
-            // `col0 .. col0 + 16 <= out_w` lie inside `out`.
+            // The destination run, a 48-byte slice as above.
+            let start = (row * out_w + col0) * 3;
+            let run = &mut out[start..start + 48];
+            // SAFETY: `run` is 48 bytes.
             unsafe {
-                vst3q_u8(
-                    out.as_mut_ptr().add((row * out_w + col0) * 3),
-                    uint8x16x3_t(r[j], g[j], b[j]),
-                );
+                vst3q_u8(run.as_mut_ptr(), uint8x16x3_t(r[j], g[j], b[j]));
             }
         }
     }
