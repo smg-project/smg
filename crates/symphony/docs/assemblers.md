@@ -84,6 +84,48 @@ What the syntax says, and what the assembler does with it:
   produce, text where the syntax has tags as `Malformed` run by run with the whitespace before
   it as `Dropped { Wrapper }`.
 
+## The attributed assembler (`tagged::attributed`)
+
+What the syntax says, and what the assembler does with it:
+
+- **The request's tools type the value** (`Typing::Declared`), as in the keyed assembler: a
+  declared string is its text, every byte of it, streamed as it arrives; every other value is
+  written whole at `</parameter>` through `json`, which reads the JSON the template writes
+  for a number, a boolean, a list, an object or null (`tojson`), and infers the rest. A
+  parameter tag with anything between the name's closing quote and `>` is no parameter tag the
+  syntax has: the whole tag comes back as `Malformed`, and no parameter opens.
+- **Or the tag's `string` attribute types the value** (`Typing::StringAttribute`, DSML):
+  `string="true"` is the text, streamed like a declared string; `string="false"` is JSON the
+  model wrote, written whole at the close through `json`'s inference. The request's tools are
+  not consulted: the model says the type. A parameter tag with another attribute, or none, is
+  no parameter tag.
+- **Or the tag's `type` attribute types the value** (`Typing::TypeAttribute`, XTML), with
+  every type: `string` streams, `number`, `boolean`, `null`, `array` and `object` are written
+  whole through `json`'s inference; a type that is none of the six is no parameter tag.
+- **A tag ends at `>`, or at a marker** (`TagEnd`): XTML's `<|sep|>` is a token of its own
+  and may arrive in pieces, so the scanner holds it like the other tags, and inside a value it
+  is the value's text. XTML's call tag carries the model's count of the turn's calls,
+  ` index="N"`, which the family's tags allow (`Tags::indexed_calls`); the assembler keeps
+  its own index, as every assembler does.
+- **Inside a value only `</parameter>` is a tag**; `<parameter name="` there is the value's
+  text.
+- **A value may be a CDATA section** where the family's template writes one (`Tags::cdata`):
+  MiniCPM5 wraps a value that holds `<`, `&` or a newline as `<![CDATA[…]]>`. The section's
+  opener and closer are the template's wrapping and go into the fragments' sources, not the
+  value; the text between them is the value as it is, streamed as it arrives for a declared
+  string, read whole at the closing tag for any other type. Text between `]]>` and the closing
+  tag, which the template never writes, is reported.
+- **A value may stand on its own line** (`Tags::value_on_its_own_line`): dots3's template
+  writes a newline after the parameter tag and one before its closing tag. Those two are the
+  template's framing and go into the fragments' sources, not the value: the first byte of a
+  value is dropped when it is a newline, and a trailing newline is held until the closing tag
+  says it was the framing, or more text says it was the value's.
+- **The newlines between the tags are the template's** and go into the next event's source;
+  text where the syntax has tags is reported.
+- **Two endings**, as DSML's: `Assembler::close` is the invoke's closing tag, or the block's
+  end before it; `Assembler::finish` is a stream that was cut, and closes nothing.
+- **Every byte of the call lands in exactly one event.**
+
 ## The XML assembler (`tagged::xml`)
 
 What the syntax says, and what the assembler does with it:
