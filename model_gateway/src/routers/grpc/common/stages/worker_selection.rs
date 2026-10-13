@@ -867,6 +867,16 @@ impl MediaDemands {
 
 /// Runtime of the leg that builds the generate request: the sole worker in
 /// regular mode, the prefill worker in disaggregated (PD/EPD) mode.
+/// A leg's name in a refusal's text.
+fn leg_name(leg: WorkerType) -> &'static str {
+    match leg {
+        WorkerType::Regular => "regular",
+        WorkerType::Prefill => "prefill",
+        WorkerType::Decode => "decode",
+        WorkerType::Encode => "encode",
+    }
+}
+
 fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
     match workers {
         WorkerSelection::Single { worker } => worker.metadata().spec.runtime_type,
@@ -900,6 +910,7 @@ impl WorkerSelectionStage {
             return self.media_failure(model_id, legs, wire, media);
         }
         let mut unavailable = false;
+        let mut missing: Vec<&'static str> = Vec::new();
         for leg in legs {
             let verdict = match leg {
                 // The regular leg is judged from exactly the pool the shared
@@ -928,13 +939,32 @@ impl WorkerSelectionStage {
                 | PlacementFailure::PrefillAtCapacity => {
                     unavailable = true;
                 }
-                PlacementFailure::NoCandidates => {}
+                PlacementFailure::NoCandidates => missing.push(leg_name(*leg)),
             }
         }
         if unavailable {
+            // A leg with workers beside a leg with none: the pair is
+            // incomplete (a leg restarting, or not yet discovered), which the
+            // refusal says, instead of calling the registered leg unhealthy.
+            if !missing.is_empty() {
+                return Self::leg_missing(model_id, &missing);
+            }
             return Self::workers_unavailable(model_id);
         }
         error::model_not_found(model_id)
+    }
+
+    /// The refusal for a disaggregated request whose model has workers on
+    /// some leg and none on `missing`: the `no_available_workers` 503 with
+    /// its `Retry-After`, naming the missing leg for the client and for the
+    /// refusal's line. A model with no leg at all is not this: it stays the
+    /// 404 of a model nobody serves.
+    fn leg_missing(model_id: &str, missing: &[&'static str]) -> Response {
+        placement::no_available_workers(format!(
+            "No {} worker is registered for model '{model_id}' at the moment (its other leg \
+             is): the pair is incomplete",
+            missing.join(" or ")
+        ))
     }
 
     /// Selection failure for a request with media demands, judged from the
@@ -1163,8 +1193,10 @@ impl WorkerSelectionStage {
 
     /// The response for a failed pair placement. The verdict was judged from
     /// the leg's own candidates inside the placement, so a shed is answered
-    /// as it was built and counted once; a leg nobody serves is a 404, and a
-    /// leg whose workers are all unavailable is the 503 the HTTP router gives.
+    /// as it was built and counted once; a leg nobody serves is a 404 unless
+    /// its partner leg has workers (the pair is incomplete: the 503 naming
+    /// the missing leg), and a leg whose workers are all unavailable is the
+    /// 503 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
         let leg = match failure.leg {
             WorkerLeg::Prefill => "prefill",
@@ -1208,7 +1240,29 @@ impl WorkerSelectionStage {
                     ),
                 )
             }
-            PlacementFailure::NoCandidates => error::model_not_found(model_id),
+            // A leg nobody serves beside a partner leg with workers: the
+            // pair is incomplete (a leg restarting, or not yet discovered),
+            // which the refusal says; with no worker on either leg the model
+            // is one nobody serves.
+            PlacementFailure::NoCandidates => {
+                let partner = match failure.leg {
+                    WorkerLeg::Prefill => Some(RoutingPool::GrpcDecode),
+                    WorkerLeg::Decode => Some(RoutingPool::GrpcPrefill),
+                    WorkerLeg::Single => None,
+                };
+                let partner_registered = partner.is_some_and(|pool| {
+                    self.worker_registry
+                        .get_routing_pool(model_id, pool)
+                        .iter()
+                        .next()
+                        .is_some()
+                });
+                if partner_registered {
+                    Self::leg_missing(model_id, &[leg])
+                } else {
+                    error::model_not_found(model_id)
+                }
+            }
         }
     }
 
@@ -5171,6 +5225,72 @@ mod tests {
             errors.load(Ordering::Relaxed),
             0,
             "a model nobody serves is the client's mistake, not an error of the gateway"
+        );
+    }
+
+    /// A pair whose prefill leg is gone while its decode leg is registered
+    /// (the prefill restarting) is refused, through the stage's own entry
+    /// point, with the retryable 503 naming the missing leg: not the 404 of
+    /// a model nobody serves, and not a line that calls the registered leg
+    /// unhealthy. The other way round the same; a model with no leg at all
+    /// stays the 404.
+    #[tokio::test]
+    async fn a_pair_with_one_leg_missing_is_refused_with_the_missing_leg_not_as_an_unknown_model() {
+        let stage_over = |registry: &Arc<WorkerRegistry>| {
+            pd_stage(
+                Arc::clone(registry),
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                Arc::new(PrefillAdmission::new(1, 0, Duration::from_secs(1))),
+            )
+        };
+        for (registered, missing) in [
+            (WorkerType::Decode, "prefill"),
+            (WorkerType::Prefill, "decode"),
+        ] {
+            let registry = Arc::new(WorkerRegistry::new());
+            registry
+                .register(worker("grpc://127.0.0.1:8000", registered))
+                .unwrap();
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            let refused = stage_over(&registry)
+                .execute(&mut ctx)
+                .await
+                .expect_err("one leg of the pair is missing");
+            assert_eq!(
+                refused.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{missing} missing"
+            );
+            assert_eq!(
+                error::extract_error_code_from_response(&refused),
+                placement::NO_AVAILABLE_WORKERS_CODE
+            );
+            assert!(
+                refused.headers().contains_key(RETRY_AFTER),
+                "a client may retry once the leg is back"
+            );
+            let reason = placement::refusal_reason(&refused).unwrap_or_default();
+            assert!(
+                reason.contains(&format!("No {missing} worker")),
+                "the refusal names the missing leg: {reason}"
+            );
+            assert!(
+                !reason.contains("unhealthy"),
+                "the registered leg is not called unhealthy: {reason}"
+            );
+        }
+
+        // No leg at all: a model nobody serves.
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        let nobody = stage_over(&registry)
+            .execute(&mut ctx)
+            .await
+            .expect_err("nobody serves the model");
+        assert_eq!(nobody.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&nobody),
+            placement::MODEL_NOT_FOUND_CODE
         );
     }
 
