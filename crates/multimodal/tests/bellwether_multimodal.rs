@@ -19,8 +19,10 @@
 //! `BELLWETHER_MULTIMODAL_SOURCE`, when set, is passed to `verify --source`: a source name
 //! from the suite's README (unset, the suite compares with its default, the reference
 //! implementation's own image path). `uv` must be on the path. The example is built in this
-//! test's profile, so `cargo test --release` runs the pipeline at its release speed; the
-//! suite's report, the dumps and its logs stay under `target/tmp/bellwether_multimodal/`.
+//! test's profile and target directory, read from the test binary's own path and from
+//! `CARGO_TARGET_TMPDIR`, so `cargo test --release` runs the pipeline at its release speed and a
+//! custom profile builds the example under its own settings; the suite's report, the dumps and
+//! its logs stay under `<target-dir>/tmp/bellwether_multimodal/`.
 
 use std::{
     env,
@@ -125,20 +127,42 @@ fn without_test_environment(command: &mut Command) {
     }
 }
 
-/// Build the dump example with the cargo that runs this test, in this test's profile, and
-/// take its path from cargo's own artifact message.
+/// The profile this test was built with, from its own path: cargo puts a test binary under
+/// `<target-dir>/<profile directory>/deps/`, where `dev` and `test` share `debug`, `release`
+/// and `bench` share `release`, and a custom profile has a directory of its own name.
+fn own_profile() -> Result<String, String> {
+    let exe = env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let directory = exe
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| format!("{}: not under <target-dir>/<profile>/deps", exe.display()))?;
+    Ok(match directory {
+        "debug" => "dev",
+        "release" => "release",
+        custom => custom,
+    }
+    .to_string())
+}
+
+/// Build the dump example with the cargo that runs this test, in this test's profile and
+/// target directory, and take its path from cargo's own artifact message.
 fn build_example() -> Result<PathBuf, String> {
     let cargo = env!("CARGO");
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let target_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .ok_or_else(|| format!("{}: no parent directory", env!("CARGO_TARGET_TMPDIR")))?;
+    let profile = own_profile()?;
     let mut command = Command::new(cargo);
     without_test_environment(&mut command);
     command
         .args(["build", "--example", EXAMPLE, "--manifest-path"])
         .arg(&manifest)
+        .args(["--profile", &profile, "--target-dir"])
+        .arg(target_dir)
         .arg("--message-format=json-render-diagnostics");
-    if !cfg!(debug_assertions) {
-        command.arg("--release");
-    }
     let output = command.output().map_err(|e| format!("{cargo}: {e}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -198,7 +222,8 @@ fn verify(
     })
 }
 
-/// A family's totals from the suite's report.
+/// A family's totals from the suite's report; a count the report lacks reads as 0, so a family
+/// without images, or a report of another shape, falls short rather than passing as 0 == 0.
 struct Totals {
     images: u64,
     matched: u64,
@@ -291,7 +316,7 @@ fn corpus_50_matches_the_reference() {
     let mut short = Vec::new();
     for (name, family) in families {
         let totals = Totals::of(family);
-        let verdict = if totals.images == totals.matched + totals.known {
+        let verdict = if totals.images > 0 && totals.images == totals.matched + totals.known {
             "ok"
         } else {
             short.push(name.clone());

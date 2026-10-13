@@ -33,10 +33,10 @@
 //! processor's name and the per-image lines without the digests, for the first differing
 //! element.
 //!
-//! The exit status is 0 once every listed image has its line, errors included; a fault in the
-//! setup (an unreadable list or config, an unknown processor, an output that cannot be
-//! written) ends the run with a non-zero status and the fault on standard error. The last
-//! line on standard error is `DUMP_DONE mode=<mode> processor=<name> ok=<n> err=<n>`. The
+//! The exit status is 0 once every listed image has its line, errors included, and the last
+//! line on standard error is then `DUMP_DONE mode=<mode> processor=<name> ok=<n> err=<n>`. A
+//! fault in the setup (an unreadable list or config, an unknown processor, an output that
+//! cannot be written) ends the run with status 1 and the fault, as written, on standard error. The
 //! crate's preprocessing pool is sized by `SMG_MM_THREADS` as everywhere else; the suite's
 //! runner sets it to 1 and shards the list across processes itself.
 //!
@@ -53,6 +53,7 @@ use std::{
     io::{BufWriter, Cursor, Write},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
+    process::ExitCode,
 };
 
 use image::{DynamicImage, ImageReader};
@@ -353,9 +354,23 @@ enum Sink {
 
 #[expect(
     clippy::print_stderr,
+    reason = "a setup fault is the example's diagnostic output"
+)]
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(fault) => {
+            eprintln!("bellwether_dump: {fault}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[expect(
+    clippy::print_stderr,
     reason = "the run's summary line is the example's diagnostic output"
 )]
-fn main() -> Result<(), Fault> {
+fn run() -> Result<(), Fault> {
     let Some(options) = Options::parse(env::args().skip(1))? else {
         return Ok(());
     };
