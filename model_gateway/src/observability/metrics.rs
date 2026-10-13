@@ -52,6 +52,142 @@ pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
 }
 
+/// Per-worker caches of the handles the HTTP layer records through.
+///
+/// The `metrics` macros build a key on every call (the labels in a `Vec`,
+/// the hash) and search the recorder's registry for the series under one of
+/// its shard locks; the path label is interned through a shared map first.
+/// A request records a handful of HTTP metrics that way from whichever
+/// runtime worker is polling it, against the same few label sets, so at a
+/// thousand requests per second the interner's and the registry's locks are
+/// taken thousands of times per second from every worker. A handle the
+/// recorder hands out refers to the series' shared value, so each worker
+/// keeps the handles it has used in a map of its own and a record is a local
+/// lookup plus the atomic update of the value. The label sets are bounded
+/// (the route templates, the status codes, the gateway's error codes), so
+/// the maps are. Nothing is kept before the recorder is installed: a handle
+/// from the no-op recorder would be a dead end for the series.
+mod handles {
+    use std::{
+        cell::RefCell,
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            OnceLock,
+        },
+    };
+
+    use metrics::{Counter, Gauge, Histogram};
+
+    static RECORDER_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// The Prometheus recorder is installed: handles may be kept from here.
+    pub(super) fn recorder_installed() {
+        RECORDER_INSTALLED.store(true, Ordering::Release);
+    }
+
+    pub(super) fn keep_handles() -> bool {
+        RECORDER_INSTALLED.load(Ordering::Acquire)
+    }
+
+    /// Handles by the matched path (the only label a request computes).
+    pub(super) type ByPath<H> = HashMap<String, H>;
+    /// Handles by method, then matched path.
+    pub(super) type ByMethodAndPath<H> = HashMap<&'static str, ByPath<H>>;
+    /// Response counters by matched path, then status code, then error code.
+    pub(super) type ByPathStatusAndError = HashMap<String, HashMap<u16, ByPath<Counter>>>;
+
+    thread_local! {
+        /// `smg_http_requests_total`.
+        pub(super) static HTTP_REQUESTS: RefCell<ByMethodAndPath<Counter>> = RefCell::new(HashMap::new());
+        /// `smg_http_request_duration_seconds`.
+        pub(super) static HTTP_DURATIONS: RefCell<ByMethodAndPath<Histogram>> = RefCell::new(HashMap::new());
+        /// `smg_http_responses_total`.
+        pub(super) static HTTP_RESPONSES: RefCell<ByPathStatusAndError> = RefCell::new(HashMap::new());
+        /// `smg_http_rate_limit_total` by result.
+        pub(super) static HTTP_RATE_LIMITS: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+    }
+
+    /// `smg_http_connections_active` has one series; its handle serves the
+    /// process.
+    pub(super) static HTTP_CONNECTIONS_ACTIVE: OnceLock<Gauge> = OnceLock::new();
+
+    /// Uses the handle under `key`, building and keeping it on first sight.
+    /// The key is only allocated for a new entry.
+    pub(super) fn with_handle<H>(
+        map: &mut HashMap<String, H>,
+        key: &str,
+        build: impl FnOnce() -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        if let Some(handle) = map.get(key) {
+            use_handle(handle);
+            return;
+        }
+        let handle = build();
+        use_handle(&handle);
+        map.insert(key.to_owned(), handle);
+    }
+
+    /// The inner map under `key`, created on first sight; the key is only
+    /// allocated for a new entry.
+    pub(super) fn nested<'m, V: Default>(
+        map: &'m mut HashMap<String, V>,
+        key: &str,
+    ) -> Option<&'m mut V> {
+        if !map.contains_key(key) {
+            map.insert(key.to_owned(), V::default());
+        }
+        map.get_mut(key)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset() {
+        RECORDER_INSTALLED.store(false, Ordering::Release);
+        HTTP_REQUESTS.with_borrow_mut(HashMap::clear);
+        HTTP_DURATIONS.with_borrow_mut(HashMap::clear);
+        HTTP_RESPONSES.with_borrow_mut(HashMap::clear);
+        HTTP_RATE_LIMITS.with_borrow_mut(HashMap::clear);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::cell::Cell;
+
+        use super::*;
+
+        #[test]
+        fn a_handle_is_built_once_per_key_and_used_every_time() {
+            let mut map: HashMap<String, usize> = HashMap::new();
+            let builds = Cell::new(0);
+            let mut used = Vec::new();
+            for key in ["/a", "/a", "/b", "/a"] {
+                with_handle(
+                    &mut map,
+                    key,
+                    || {
+                        builds.set(builds.get() + 1);
+                        key.len() * 10
+                    },
+                    |handle| used.push(*handle),
+                );
+            }
+            assert_eq!(builds.get(), 2);
+            assert_eq!(map.len(), 2);
+            assert_eq!(used, [20, 20, 20, 20]);
+        }
+
+        #[test]
+        fn a_nested_map_is_created_once() {
+            let mut map: HashMap<String, Vec<u8>> = HashMap::new();
+            nested(&mut map, "/a").expect("created").push(1);
+            nested(&mut map, "/a").expect("found").push(2);
+            assert_eq!(map.len(), 1);
+            assert_eq!(map["/a"], [1, 2]);
+        }
+    }
+}
+
 // =============================================================================
 // STATIC STRING CONSTANTS
 // =============================================================================
@@ -994,6 +1130,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     worker_metrics::install(Arc::clone(&workers));
     metrics::set_global_recorder(WorkerSeriesRecorder::new(recorder, workers))
         .expect("failed to install Prometheus recorder");
+    handles::recorder_installed();
     #[cfg(all(
         feature = "jemalloc-stats",
         not(target_env = "msvc"),
@@ -1287,44 +1424,98 @@ impl Metrics {
     /// Here we want a metric to directly reflect user's experience ("I am sending a request")
     /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
     pub fn record_http_request(method: &'static str, path: &str) {
-        let path_interned = intern_string(path);
-        counter!(
-            "smg_http_requests_total",
-            "method" => method,
-            "path" => path_interned,
-        )
-        .increment(1);
+        let build = || {
+            let path_interned = intern_string(path);
+            counter!(
+                "smg_http_requests_total",
+                "method" => method,
+                "path" => path_interned,
+            )
+        };
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        handles::HTTP_REQUESTS.with_borrow_mut(|by_method| {
+            handles::with_handle(
+                by_method.entry(method).or_default(),
+                path,
+                build,
+                |counter| {
+                    counter.increment(1);
+                },
+            );
+        });
     }
 
     /// Record HTTP request duration.
     /// For best performance, pass static strings for method.
     pub fn record_http_duration(method: &'static str, path: &str, duration: Duration) {
-        let path_interned = intern_string(path);
-        histogram!(
-            "smg_http_request_duration_seconds",
-            "method" => method,
-            "path" => path_interned
-        )
-        .record(duration.as_secs_f64());
+        let build = || {
+            let path_interned = intern_string(path);
+            histogram!(
+                "smg_http_request_duration_seconds",
+                "method" => method,
+                "path" => path_interned
+            )
+        };
+        let seconds = duration.as_secs_f64();
+        if !handles::keep_handles() {
+            build().record(seconds);
+            return;
+        }
+        handles::HTTP_DURATIONS.with_borrow_mut(|by_method| {
+            handles::with_handle(
+                by_method.entry(method).or_default(),
+                path,
+                build,
+                |histogram| {
+                    histogram.record(seconds);
+                },
+            );
+        });
     }
 
     /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
-        gauge!("smg_http_connections_active").set(count as f64);
+        if !handles::keep_handles() {
+            gauge!("smg_http_connections_active").set(count as f64);
+            return;
+        }
+        handles::HTTP_CONNECTIONS_ACTIVE
+            .get_or_init(|| gauge!("smg_http_connections_active"))
+            .set(count as f64);
     }
 
     /// Record HTTP response.
     pub fn record_http_response(path: &str, status_code: u16, error_code: &str) {
-        let path_interned = intern_string(path);
-        let status_str: Cow<'static, str> = status_code_to_cow(status_code);
-        let error_interned = intern_string(error_code);
-        counter!(
-            "smg_http_responses_total",
-            "path" => path_interned,
-            "status_code" => status_str,
-            "error_code" => error_interned
-        )
-        .increment(1);
+        let build = || {
+            let path_interned = intern_string(path);
+            let status_str: Cow<'static, str> = status_code_to_cow(status_code);
+            let error_interned = intern_string(error_code);
+            counter!(
+                "smg_http_responses_total",
+                "path" => path_interned,
+                "status_code" => status_str,
+                "error_code" => error_interned
+            )
+        };
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        handles::HTTP_RESPONSES.with_borrow_mut(|by_path| {
+            let Some(by_status) = handles::nested(by_path, path) else {
+                build().increment(1);
+                return;
+            };
+            handles::with_handle(
+                by_status.entry(status_code).or_default(),
+                error_code,
+                build,
+                |counter| counter.increment(1),
+            );
+        });
     }
 
     /// Record a connection closed by one of the HTTP edge's connection
@@ -1339,11 +1530,14 @@ impl Metrics {
 
     /// Record rate limit decision.
     pub fn record_http_rate_limit(result: &'static str) {
-        counter!(
-            "smg_http_rate_limit_total",
-            "result" => result
-        )
-        .increment(1);
+        let build = || counter!("smg_http_rate_limit_total", "result" => result);
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        handles::HTTP_RATE_LIMITS.with_borrow_mut(|by_result| {
+            by_result.entry(result).or_insert_with(build).increment(1);
+        });
     }
 
     /// Track a request entering the admission queue.
@@ -3561,5 +3755,78 @@ mod tests {
                 && line.ends_with(" 2")),
             "{rendered}"
         );
+    }
+
+    /// With the recorder installed, the kept handles update the recorder's
+    /// own series: the rendered counts are those of the records. Runs alone
+    /// (`--ignored`): it flips the process-wide flag and keeps handles on
+    /// this thread, which it clears afterwards.
+    #[test]
+    #[ignore = "flips the process-wide recorder flag; run alone"]
+    fn kept_handles_update_the_recorders_series() {
+        let rendered = render_with_recorder(|| {
+            handles::recorder_installed();
+            for _ in 0..3 {
+                Metrics::record_http_request("POST", "/v1/chat/completions");
+            }
+            Metrics::record_http_request("GET", "/v1/models");
+            for _ in 0..2 {
+                Metrics::record_http_response("/v1/chat/completions", 200, "");
+            }
+            Metrics::record_http_response("/v1/chat/completions", 429, "rate_limited");
+            Metrics::record_http_duration("POST", "/v1/chat/completions", Duration::from_millis(5));
+            Metrics::record_http_rate_limit("allowed");
+            Metrics::record_http_rate_limit("allowed");
+            Metrics::set_http_connections_active(7);
+            handles::reset();
+        });
+        for expected in [
+            "smg_http_requests_total{method=\"POST\",path=\"/v1/chat/completions\"} 3",
+            "smg_http_requests_total{method=\"GET\",path=\"/v1/models\"} 1",
+            "smg_http_responses_total{path=\"/v1/chat/completions\",status_code=\"200\",error_code=\"\"} 2",
+            "smg_http_responses_total{path=\"/v1/chat/completions\",status_code=\"429\",error_code=\"rate_limited\"} 1",
+            "smg_http_rate_limit_total{result=\"allowed\"} 2",
+            "smg_http_connections_active 7",
+        ] {
+            assert!(
+                rendered.lines().any(|line| line == expected),
+                "missing {expected} in:\n{rendered}"
+            );
+        }
+        assert!(rendered.contains("smg_http_request_duration_seconds_count{method=\"POST\",path=\"/v1/chat/completions\"} 1"));
+    }
+
+    /// The cost of one HTTP record with and without the kept handles, for
+    /// the Numbers table; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing, not a check; flips the process-wide recorder flag"]
+    #[expect(clippy::print_stdout, reason = "the timing is the output")]
+    fn time_per_http_record() {
+        use std::time::Instant;
+        const ROUNDS: u32 = 200_000;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let time = |label: &str| {
+            metrics::with_local_recorder(&recorder, || {
+                let start = Instant::now();
+                for _ in 0..ROUNDS {
+                    Metrics::record_http_request("POST", "/v1/chat/completions");
+                    Metrics::set_http_connections_active(3);
+                    Metrics::record_http_duration(
+                        "POST",
+                        "/v1/chat/completions",
+                        Duration::from_millis(2),
+                    );
+                    Metrics::record_http_response("/v1/chat/completions", 200, "");
+                }
+                let per_request = start.elapsed().as_nanos() as f64 / f64::from(ROUNDS);
+                println!(
+                    "ns per request for the HTTP layer's four records, {label}: {per_request:.0}"
+                );
+            });
+        };
+        time("keys built per record");
+        handles::recorder_installed();
+        time("handles kept per worker");
+        handles::reset();
     }
 }
