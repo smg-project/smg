@@ -198,7 +198,7 @@ impl GossipService {
                  certificate, its private key or the CA certificate)",
             )?;
             log::info!(
-                "Mesh listener {} serves TLS with the node certificate",
+                "Mesh listener {} is prepared to serve TLS with the node certificate",
                 self.listen_addr
             );
         }
