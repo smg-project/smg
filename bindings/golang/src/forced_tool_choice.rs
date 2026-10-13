@@ -102,6 +102,7 @@ impl ToolParser for NamedFunctionParser {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         ffi::{CStr, CString},
         os::raw::c_char,
         ptr,
@@ -216,24 +217,26 @@ mod tests {
         text.bytes().map(|byte| u32::from(byte) + 1).collect()
     }
 
-    fn chunk_of(text: &str) -> proto::GenerateResponse {
+    fn chunk_at(index: u32, text: &str) -> proto::GenerateResponse {
         proto::GenerateResponse {
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Chunk(
                 proto::GenerateStreamChunk {
                     token_ids: byte_ids(text),
+                    index,
                     ..Default::default()
                 },
             )),
         }
     }
 
-    fn complete_of(finish_reason: &str) -> proto::GenerateResponse {
+    fn complete_at(index: u32, finish_reason: &str) -> proto::GenerateResponse {
         proto::GenerateResponse {
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Complete(
                 proto::GenerateComplete {
                     finish_reason: finish_reason.into(),
+                    index,
                     ..Default::default()
                 },
             )),
@@ -251,6 +254,20 @@ mod tests {
     }
 
     async fn stream_through_converter(tool_choice_json: Option<&str>, chunks: &[&str]) -> Streamed {
+        let steps: Vec<(u32, &str)> = chunks.iter().map(|text| (0, *text)).collect();
+        stream_choices_through_converter(tool_choice_json, &steps)
+            .await
+            .remove(&0)
+            .expect("choice 0 streamed")
+    }
+
+    /// The choices of one request streamed through one converter handle,
+    /// their chunks interleaved as given (choice index, text); every choice
+    /// ends with a Complete, in index order.
+    async fn stream_choices_through_converter(
+        tool_choice_json: Option<&str>,
+        steps: &[(u32, &str)],
+    ) -> BTreeMap<u32, Streamed> {
         let tokenizer = byte_tokenizer();
         let tokenizer_handle = Box::into_raw(Box::new(TokenizerHandle {
             tokenizer: tokenizer.clone(),
@@ -284,24 +301,31 @@ mod tests {
                 .into_owned();
             panic!("converter creation failed: {error}");
         }
-        let mut streamed = Streamed {
-            content: Vec::new(),
-            names: Vec::new(),
-            arguments: String::new(),
-            finish_reason: None,
-        };
+        let mut streamed: BTreeMap<u32, Streamed> = BTreeMap::new();
         {
             // SAFETY: the handle was just created and is freed once, below.
             let handle: &mut GrpcResponseConverterHandle = unsafe { &mut *handle };
             let mut responses = Vec::new();
-            for text in chunks {
-                responses
-                    .push(convert_proto_chunk_to_openai(chunk_of(text), handle, &tokenizer).await);
+            for (index, text) in steps {
+                responses.push(
+                    convert_proto_chunk_to_openai(chunk_at(*index, text), handle, &tokenizer).await,
+                );
             }
-            responses
-                .push(convert_proto_chunk_to_openai(complete_of("stop"), handle, &tokenizer).await);
+            let indexes: BTreeMap<u32, ()> = steps.iter().map(|(index, _)| (*index, ())).collect();
+            for index in indexes.keys() {
+                responses.push(
+                    convert_proto_chunk_to_openai(complete_at(*index, "stop"), handle, &tokenizer)
+                        .await,
+                );
+            }
             for response in responses.into_iter().flat_map(|result| result.unwrap()) {
                 let choice = &response.choices[0];
+                let streamed = streamed.entry(choice.index).or_insert_with(|| Streamed {
+                    content: Vec::new(),
+                    names: Vec::new(),
+                    arguments: String::new(),
+                    finish_reason: None,
+                });
                 if let Some(content) = &choice.delta.content {
                     streamed.content.push(content.clone());
                 }
@@ -369,5 +393,72 @@ mod tests {
         assert_eq!(streamed.content.concat(), "hello there");
         assert!(streamed.names.is_empty() && streamed.arguments.is_empty());
         assert_eq!(streamed.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Two choices of one request, their chunks interleaved, under a named
+    /// function: each choice has its own parser, so each announces the call's
+    /// name with its first delta and keeps its own arguments.
+    #[tokio::test]
+    async fn each_choice_of_a_named_function_request_announces_its_own_call() {
+        let streamed = stream_choices_through_converter(
+            Some(NAMED),
+            &[
+                (0, r#"{"city":"#),
+                (1, r#"{"city":"#),
+                (0, r#""Paris"}"#),
+                (1, r#""Rome"}"#),
+            ],
+        )
+        .await;
+        for (index, city) in [(0, "Paris"), (1, "Rome")] {
+            let choice = &streamed[&index];
+            assert_eq!(choice.names, ["get_weather"], "choice {index}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&choice.arguments).unwrap(),
+                serde_json::json!({"city": city}),
+                "choice {index}"
+            );
+            assert_eq!(
+                choice.finish_reason.as_deref(),
+                Some("tool_calls"),
+                "choice {index}"
+            );
+        }
+    }
+
+    /// Two choices under `required`, read by the buffering generic JSON
+    /// parser: each choice's call carries its own arguments and no content,
+    /// the other choice's text never enters its buffer.
+    #[tokio::test]
+    async fn each_choice_of_a_required_request_keeps_its_own_arguments() {
+        let streamed = stream_choices_through_converter(
+            Some(r#""required""#),
+            &[
+                (0, r#"[{"name":"get_weather","parameters":{"city":"Pa"#),
+                (1, r#"[{"name":"get_weather","parameters":{"city":"Ro"#),
+                (0, r#"ris"}}]"#),
+                (1, r#"me"}}]"#),
+            ],
+        )
+        .await;
+        for (index, city) in [(0, "Paris"), (1, "Rome")] {
+            let choice = &streamed[&index];
+            assert!(
+                choice.content.is_empty(),
+                "choice {index}: {:?}",
+                choice.content
+            );
+            assert_eq!(choice.names, ["get_weather"], "choice {index}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&choice.arguments).unwrap(),
+                serde_json::json!({"city": city}),
+                "choice {index}"
+            );
+            assert_eq!(
+                choice.finish_reason.as_deref(),
+                Some("tool_calls"),
+                "choice {index}"
+            );
+        }
     }
 }
