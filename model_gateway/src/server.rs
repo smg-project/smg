@@ -1953,6 +1953,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
         None => None,
     };
+    // Everything the mesh server does before it serves happens now, before
+    // the HTTP listener binds: the listener against the configured address,
+    // the TLS configuration from the mesh TLS material, the gossip service
+    // and its controller. A failure here used to be one error line from the
+    // mesh server's task a second after the gateway was serving, as a node
+    // outside the mesh (`Mesh server failed: ...` once, `/readiness` ready);
+    // the mesh TLS flags check only that their files exist.
+    let mesh_server = match (mesh_server, mesh_listener) {
+        (Some(mesh_server), Some(mesh_listener)) => {
+            let with_tls = config
+                .mesh_server_config
+                .as_ref()
+                .is_some_and(|mesh| mesh.mtls_config.is_some());
+            let flags = if with_tls {
+                "--enable-mesh with --mesh-tls-ca-cert, --mesh-tls-cert and --mesh-tls-key"
+            } else {
+                "--enable-mesh"
+            };
+            Some(
+                mesh_server
+                    .prepare_with_listener(mesh_listener)
+                    .await
+                    .map_err(|e| format!("Failed to start the mesh server ({flags}): {e:#}"))?,
+            )
+        }
+        _ => None,
+    };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before the mesh server
     // below has joined the cluster. Bound through tokio, as axum-server
@@ -1965,19 +1992,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
 
-    // The mesh server starts once every listener is bound: a member that
+    // The mesh server serves once every listener is bound: a member that
     // joined the cluster and vanished with a failed bind is the partial start
     // the checks above exist to prevent. The adapters registered their
     // namespaces earlier, so gossip is safe to start. It serves from the
-    // socket bound above.
-    if let (Some(mesh_server), Some(mesh_listener)) = (mesh_server, mesh_listener) {
+    // socket bound and prepared above.
+    if let Some(mesh_server) = mesh_server {
         #[expect(
             clippy::disallowed_methods,
             reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
         )]
         spawn(async move {
-            if let Err(e) = mesh_server.start_with_listener(mesh_listener).await {
-                tracing::error!("Mesh server failed: {}", e);
+            if let Err(e) = mesh_server.serve().await {
+                tracing::error!("Mesh server failed: {e:#}");
             }
         });
     }

@@ -32,6 +32,9 @@ pub use kv::{
 pub use metrics::init_mesh_metrics;
 pub use mtls::{MTLSConfig, MTLSManager};
 pub use partition::PartitionDetector;
-pub use service::{gossip, ClusterState, MeshServerBuilder, MeshServerConfig, MeshServerHandler};
+pub use service::{
+    gossip, ClusterState, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
+    PreparedMeshServer,
+};
 pub use transport::limits::MAX_STREAM_CHUNK_BYTES;
 pub use types::WorkerState;

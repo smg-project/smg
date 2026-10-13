@@ -26,7 +26,7 @@ use gossip::{
 
 use crate::{
     gossip_controller::GossipController,
-    gossip_service::GossipService,
+    gossip_service::{GossipService, PreparedGossipServer},
     mtls::{tls_server_name, MTLSConfig, MTLSManager},
     partition::PartitionDetector,
 };
@@ -273,10 +273,25 @@ impl MeshServer {
     }
 
     pub async fn start(self) -> Result<()> {
-        self.start_inner(None).await
+        self.prepare(None).await?.serve().await
     }
 
     pub async fn start_with_listener(self, listener: tokio::net::TcpListener) -> Result<()> {
+        self.prepare_with_listener(listener).await?.serve().await
+    }
+
+    /// Everything this server does before it serves from `listener`, which
+    /// the caller bound on the configured bind address: the listener against
+    /// that address, the gossip service and its controller, the tonic server
+    /// with the TLS configuration from the node's material. Every failure the
+    /// mesh server can raise before it serves surfaces here, so a caller can
+    /// refuse its own start on it instead of learning of it from the task
+    /// the server runs in, after it serves. [`PreparedMeshServer::serve`]
+    /// runs the result.
+    pub async fn prepare_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<PreparedMeshServer> {
         let bound_addr = listener
             .local_addr()
             .map_err(|e| anyhow::anyhow!("Failed to read listener local addr: {e}"))?;
@@ -287,18 +302,13 @@ impl MeshServer {
                 self.bind_addr
             ));
         }
-        self.start_inner(Some(listener)).await
+        self.prepare(Some(listener)).await
     }
 
-    async fn start_inner(self, listener: Option<tokio::net::TcpListener>) -> Result<()> {
-        log::info!(
-            "Mesh server listening on {} and advertising {}",
-            self.bind_addr,
-            self.advertise_addr
-        );
-        let self_name = self.self_name.clone();
-        let advertise_address = self.advertise_addr;
-
+    async fn prepare(
+        self,
+        listener: Option<tokio::net::TcpListener>,
+    ) -> Result<PreparedMeshServer> {
         #[expect(
             clippy::expect_used,
             reason = "partition_detector is always set to Some by MeshServerBuilder::build() before start() is called"
@@ -326,27 +336,54 @@ impl MeshServer {
             service = service.with_mtls_manager(mtls_manager);
         }
 
+        let server = service.prepare(listener).await?;
+        Ok(PreparedMeshServer {
+            self_name: self.self_name,
+            bind_addr: self.bind_addr,
+            advertise_addr: self.advertise_addr,
+            signal_rx: self.signal_rx,
+            controller,
+            server,
+        })
+    }
+}
+
+/// A mesh server with everything that can fail before it serves already
+/// done ([`MeshServer::prepare_with_listener`]); [`serve`](Self::serve) runs
+/// it for the life of the process.
+pub struct PreparedMeshServer {
+    self_name: String,
+    bind_addr: SocketAddr,
+    advertise_addr: SocketAddr,
+    signal_rx: watch::Receiver<bool>,
+    controller: GossipController,
+    server: PreparedGossipServer,
+}
+
+impl PreparedMeshServer {
+    /// Serves the gossip service and runs the gossip loop until the handler
+    /// signals shutdown or either of them fails.
+    pub async fn serve(self) -> Result<()> {
+        log::info!(
+            "Mesh server listening on {} and advertising {}",
+            self.bind_addr,
+            self.advertise_addr
+        );
         let mut service_shutdown = self.signal_rx.clone();
 
         #[expect(
             clippy::disallowed_methods,
             reason = "handle is awaited immediately below via tokio::select!, bounded by shutdown signal"
         )]
-        let server_handle = if let Some(tcp_listener) = listener {
-            tokio::spawn(service.serve_ping_with_listener(tcp_listener, async move {
-                _ = service_shutdown.changed().await;
-            }))
-        } else {
-            tokio::spawn(service.serve_ping_with_shutdown(async move {
-                _ = service_shutdown.changed().await;
-            }))
-        };
+        let server_handle = tokio::spawn(self.server.serve(async move {
+            _ = service_shutdown.changed().await;
+        }));
         tokio::time::sleep(Duration::from_secs(1)).await;
         #[expect(
             clippy::disallowed_methods,
             reason = "handle is awaited immediately below via tokio::select!, bounded by shutdown signal"
         )]
-        let app_handle = tokio::spawn(controller.event_loop(self.signal_rx.clone()));
+        let app_handle = tokio::spawn(self.controller.event_loop(self.signal_rx.clone()));
 
         tokio::select! {
             res = server_handle => res??,
@@ -355,8 +392,8 @@ impl MeshServer {
 
         log::info!(
             "Mesh server {} at {} is shutting down",
-            self_name,
-            advertise_address
+            self.self_name,
+            self.advertise_addr
         );
         Ok(())
     }
@@ -952,5 +989,58 @@ mod tests {
 
         assert!(result.is_err(), "a foreign CA must be refused: {result:?}");
         handler_a.shutdown();
+    }
+
+    /// Material the node can read but not use fails the preparation, before
+    /// anything serves: the listener goes with the error and its port answers
+    /// nobody. The caller refuses its own start on that error, where it used
+    /// to learn of it from the task the running server failed in.
+    #[tokio::test]
+    async fn unusable_tls_material_fails_the_preparation_before_anything_serves() {
+        init();
+        install_crypto_provider();
+        let certs = MtlsTestCerts::generate();
+        std::fs::write(&certs.node_cert_path, "not a certificate\n").unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, _handler) = MeshServerBuilder::new("node".to_string(), addr, addr, None)
+            .with_mtls(mtls_config(&certs))
+            .build();
+
+        let error = match server.prepare_with_listener(listener).await {
+            Ok(_) => panic!("a mesh server was prepared from unusable TLS material"),
+            Err(e) => format!("{e:#}"),
+        };
+
+        assert!(
+            error.contains("mesh TLS material"),
+            "the error does not say what is wrong: {error}"
+        );
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "the mesh port answers after the failed preparation"
+        );
+    }
+
+    /// The listener handed in must be bound on the configured address: a
+    /// mismatch fails the preparation, not the first poll of a running task.
+    #[tokio::test]
+    async fn a_listener_on_another_address_fails_the_preparation() {
+        init();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let other = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let configured = other.local_addr().unwrap();
+        let (server, _handler) =
+            MeshServerBuilder::new("node".to_string(), configured, configured, None).build();
+
+        let error = match server.prepare_with_listener(listener).await {
+            Ok(_) => panic!("a mesh server was prepared on a listener bound elsewhere"),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            error.contains("mismatch"),
+            "the error does not name the mismatch: {error}"
+        );
     }
 }
