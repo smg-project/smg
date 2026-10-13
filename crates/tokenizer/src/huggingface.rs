@@ -19,6 +19,7 @@ use tokenizers::{
 use tracing::debug;
 
 use crate::{
+    byte_fallback::PieceTable,
     byte_level::{ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
@@ -53,6 +54,10 @@ pub struct HuggingFaceTokenizer {
     renderer: Renderer,
     /// Bytes per id, when the decoder is a plain `ByteLevel` (see `byte_level`).
     byte_level: Option<Arc<ByteLevelTable>>,
+    /// Text per id, when the decoder is the sentencepiece-style chain with
+    /// byte fallback (see `byte_fallback`): the streaming step's window
+    /// decodes read it instead of running the `tokenizers` decode.
+    pieces: Option<Arc<PieceTable>>,
     /// The direct encode path for byte-level BPE tokenizers of the common
     /// shape (see `native`); `None` keeps every encode in `tokenizers`.
     native: Option<NativeEncoder>,
@@ -371,6 +376,7 @@ impl HuggingFaceTokenizer {
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
+            pieces: PieceTable::build(&tokenizer),
             native,
             #[cfg(feature = "tokenizers-v1")]
             v1,
@@ -384,6 +390,15 @@ impl HuggingFaceTokenizer {
             has_byte_fallback,
             byte_fallback_values,
         })
+    }
+
+    /// The text of a window of the stream (a handful of ids): a walk of the
+    /// piece table when the vocabulary has one, else the `tokenizers` decode.
+    fn window_decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
+        match &self.pieces {
+            Some(table) => Ok(table.render(ids, skip_special_tokens)),
+            None => self.decode(ids, skip_special_tokens),
+        }
     }
 
     /// The byte a ByteFallback byte token (`<0xHH>`) stands for.
@@ -541,6 +556,7 @@ impl HuggingFaceTokenizer {
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
+            pieces: PieceTable::build(&tokenizer),
             native,
             #[cfg(feature = "tokenizers-v1")]
             v1,
@@ -753,7 +769,7 @@ impl HuggingFaceTokenizer {
         count: bool,
     ) -> Result<DecodeStep> {
         if prefix.is_empty() && !ids.is_empty() {
-            let new_prefix = self.decode(ids, skip_special_tokens)?;
+            let new_prefix = self.window_decode(ids, skip_special_tokens)?;
             if !new_prefix.ends_with('\u{FFFD}') {
                 *prefix = new_prefix;
                 *prefix_index = ids.len();
@@ -761,7 +777,7 @@ impl HuggingFaceTokenizer {
         }
         let token_id = new_ids.last().copied();
         ids.extend(new_ids);
-        let string = self.decode(ids, skip_special_tokens)?;
+        let string = self.window_decode(ids, skip_special_tokens)?;
         if string.ends_with('\u{FFFD}') {
             return Ok(DecodeStep::default());
         }
@@ -787,7 +803,7 @@ impl HuggingFaceTokenizer {
         };
         let new_prefix_index = ids.len() - *prefix_index;
         ids.drain(..*prefix_index);
-        *prefix = self.decode(ids, skip_special_tokens)?;
+        *prefix = self.window_decode(ids, skip_special_tokens)?;
         *prefix_index = new_prefix_index;
         Ok(DecodeStep {
             text: Some(new_text),
@@ -864,7 +880,7 @@ impl HuggingFaceTokenizer {
         // step that spans the boundary (a `Replace` after the fuse) breaks
         // that, and the alignment then covers the whole emitted text, as it
         // did before the run's start was known.
-        let stable = self.decode(&emitted[..stable_end], skip_special_tokens)?;
+        let stable = self.window_decode(&emitted[..stable_end], skip_special_tokens)?;
         Ok(if prefix.starts_with(stable.as_str()) {
             stable.len()
         } else {
@@ -904,7 +920,7 @@ impl HuggingFaceTokenizer {
             && *prefix_index > 0
             && *prefix_index == ids.len()
         {
-            let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+            let prefill = self.window_decode(&ids[..*prefix_index], skip_special_tokens)?;
             let stable_seed_end = ids[..*prefix_index]
                 .iter()
                 .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
@@ -913,13 +929,13 @@ impl HuggingFaceTokenizer {
                 // Keep an unfinished seed byte run as decode context, but
                 // suppress the stable prompt text before it.
                 *prefix_index = stable_seed_end;
-                *prefix = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+                *prefix = self.window_decode(&ids[..*prefix_index], skip_special_tokens)?;
             } else if stable_seed_end < *prefix_index {
                 // A completed seed run is prompt text. Start new bytes at
                 // its boundary so later invalid bytes cannot rewrite it.
                 ids.truncate(stable_seed_end);
                 *prefix_index = stable_seed_end;
-                *prefix = self.decode(ids, skip_special_tokens)?;
+                *prefix = self.window_decode(ids, skip_special_tokens)?;
             } else {
                 *prefix = prefill;
             }
@@ -946,6 +962,26 @@ impl HuggingFaceTokenizer {
                 text: Some('\u{FFFD}'.to_string()),
                 prefix_mismatch: false,
             });
+        }
+        if let Some(table) = &self.pieces {
+            // Nothing pending and a plain piece: the window's text grows by
+            // exactly this piece's text (the leading-space strip touched the
+            // window's first piece, which this one is not), so it streams at
+            // once and becomes the window on its own, where the strip applies
+            // to it: the prefix the full step would record.
+            if *prefix_index == ids.len() && !prefix.is_empty() && !prefix.ends_with('\u{FFFD}') {
+                if let Some(text) = table.plain_text(token_id, skip_special_tokens) {
+                    let text = text.to_owned();
+                    ids.clear();
+                    ids.push(token_id);
+                    *prefix = table.render(ids, skip_special_tokens);
+                    *prefix_index = 1;
+                    return Ok(DecodeStep {
+                        text: Some(text),
+                        prefix_mismatch: false,
+                    });
+                }
+            }
         }
         let step = self.step_decode_lenient(
             vec![token_id],
@@ -1133,7 +1169,7 @@ impl Decoder for HuggingFaceTokenizer {
             *prefix_index = 0;
             return Ok(DecodeStep::default());
         }
-        let decoded = self.decode(ids, skip_special_tokens)?;
+        let decoded = self.window_decode(ids, skip_special_tokens)?;
         let (pending, prefix_mismatch) = match decoded.strip_prefix(prefix.as_str()) {
             Some(pending) => (pending.to_string(), false),
             None => {
@@ -1751,6 +1787,100 @@ mod tests {
 
     use super::derive_thinking_mode;
     use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
+
+    /// With the piece table the step algorithm streams byte for byte what it
+    /// streams through the `tokenizers` window decode. Random streams of word
+    /// pieces, byte runs (valid, incomplete, lost), specials, a lone marker
+    /// and a piece ending in U+FFFD go through the raw client step, the eager
+    /// step and `finish_decode`, fresh and seeded, with and without the
+    /// trailing strip, under both special-token settings; the raw step keeps
+    /// the process-wide recovery counters still, which other tests of this
+    /// binary read. Streams without a lost run also go through `Sequence`,
+    /// the gateway's path.
+    #[test]
+    fn the_piece_table_streams_what_the_tokenizers_window_decode_streams() {
+        use std::sync::Arc;
+
+        use super::HuggingFaceTokenizer;
+        use crate::{
+            byte_fallback::tests::{random_ids, random_ids_without_lost_runs, synthetic},
+            sequence::Sequence,
+            traits::{Decoder, Tokenizer as TokenizerTrait},
+        };
+        type Window = (Vec<u32>, String, usize);
+        for strip in [false, true] {
+            for skip in [false, true] {
+                let with = HuggingFaceTokenizer::from_tokenizer(synthetic(strip));
+                assert!(with.pieces.is_some(), "the synthetic chain has a table");
+                let mut without = HuggingFaceTokenizer::from_tokenizer(synthetic(strip));
+                without.pieces = None;
+                let mut state =
+                    0x9E37_79B9_7F4A_7C15u64 ^ u64::from(strip) ^ (u64::from(skip) << 1);
+                for round in 0..1_200usize {
+                    let seed = random_ids(&mut state, round % 5);
+                    let ids = random_ids(&mut state, 1 + round % 24);
+                    let eager = round % 3 == 2;
+                    // The window a seeded sequence starts from: the seed as
+                    // context, nothing emitted.
+                    let mut a: Window = (seed.clone(), String::new(), seed.len());
+                    let mut b: Window = (seed.clone(), String::new(), seed.len());
+                    let step = |tok: &HuggingFaceTokenizer, w: &mut Window, id: u32| {
+                        if eager {
+                            tok.decode_step_eager(id, &mut w.0, &mut w.1, &mut w.2, skip)
+                        } else {
+                            tok.decode_step(id, &mut w.0, &mut w.1, &mut w.2, skip)
+                        }
+                    };
+                    for &id in &ids {
+                        assert_eq!(
+                            step(&with, &mut a, id).unwrap(),
+                            step(&without, &mut b, id).unwrap(),
+                            "seed {seed:?} ids {ids:?} at {id} strip {strip} skip {skip} eager {eager}"
+                        );
+                    }
+                    // The end of input, where nothing is pending that a lost
+                    // run would make the counters record.
+                    if ids.last().is_some_and(|&id| (1..=7).contains(&id)) {
+                        let fa = with
+                            .finish_decode(&mut a.0, &mut a.1, &mut a.2, skip)
+                            .unwrap();
+                        let fb = without
+                            .finish_decode(&mut b.0, &mut b.1, &mut b.2, skip)
+                            .unwrap();
+                        assert_eq!(
+                            (fa.text, fa.prefix_mismatch),
+                            (fb.text, fb.prefix_mismatch),
+                            "finish of {seed:?} + {ids:?}"
+                        );
+                    }
+                }
+                let with: Arc<dyn TokenizerTrait> = Arc::new(with);
+                let without: Arc<dyn TokenizerTrait> = Arc::new(without);
+                for round in 0..300usize {
+                    let ids = random_ids_without_lost_runs(&mut state, 1 + round % 30);
+                    let mut a = Sequence::new_with_options(Arc::clone(&with), skip);
+                    let mut b = Sequence::new_with_options(Arc::clone(&without), skip);
+                    for &id in &ids {
+                        assert_eq!(
+                            a.append_token(id).unwrap(),
+                            b.append_token(id).unwrap(),
+                            "{ids:?} at {id} strip {strip} skip {skip}"
+                        );
+                    }
+                    assert_eq!(
+                        a.finish().unwrap(),
+                        b.finish().unwrap(),
+                        "finish of {ids:?}"
+                    );
+                    assert_eq!(
+                        a.prefix_mismatches(),
+                        0,
+                        "{ids:?}: no lost run, no recovery"
+                    );
+                }
+            }
+        }
+    }
 
     fn thinking_kwargs(value: bool) -> HashMap<String, serde_json::Value> {
         HashMap::from([("thinking".to_string(), serde_json::Value::Bool(value))])

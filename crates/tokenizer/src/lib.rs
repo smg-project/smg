@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+mod byte_fallback;
 mod byte_level;
 pub mod cache;
 pub mod decode_activity;
