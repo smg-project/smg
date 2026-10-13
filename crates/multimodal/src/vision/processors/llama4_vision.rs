@@ -470,7 +470,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
 
         // Concatenate all tiles from all images into a single 4D tensor
         // [total_tiles, C, H, W] — no batch dimension, no zero-padding.
-        // This matches what sglang and vLLM vision models expect.
+        // This matches what the serving engines' vision models expect.
         let encoder_input = if all_outputs.len() == 1 {
             all_outputs.remove(0)
         } else {

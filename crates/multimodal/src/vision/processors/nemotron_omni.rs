@@ -1,13 +1,13 @@
 //! Nemotron-H Omni (C-RADIO) image preprocessing.
 //!
-//! Port of vLLM's dynamic-resolution Nemotron-Omni image path
+//! Port of the serving engine's dynamic-resolution Nemotron-Omni image path
 //! (`DynamicResolutionImageTiler`). Each image keeps its aspect ratio and is
 //! resized to an even grid of 16-pixel patches with between `min_num_patches`
 //! and `max_num_patches` patches, using torch's antialiased bicubic on the
 //! image as floats; it is then normalized with the CLIP mean and std. A
-//! transparent image is first composited onto white, as vLLM's image loader
+//! transparent image is first composited onto white, as the engine's image loader
 //! does; the decoder also reports a truecolor PNG's tRNS colour key as alpha,
-//! which vLLM leaves opaque. The engine receives `(patches, 3 * p * p)` rows (each patch flattened channel,
+//! which the engine leaves opaque. The engine receives `(patches, 3 * p * p)` rows (each patch flattened channel,
 //! row, column; patches row-major) and `image_grid_hw`, and its 2x2 pixel
 //! shuffle makes `h * w / 4` tokens of an image.
 //!
@@ -16,10 +16,10 @@
 //! as `(frames * h * w, 3 * p * p)` rows with `video_grid_thw` `(frames, h, w)`;
 //! the engine pairs frames into tubelets of `h * w / 4` tokens each.
 //!
-//! vLLM also scales a request's images down to share `4 * (max_model_len -
+//! The engine also scales a request's images down to share `4 * (max_model_len -
 //! prompt_len - 4)` patches. This port does not: each image gets the
 //! per-image maximum, so a request whose images overflow the engine's context
-//! is refused where vLLM would shrink them.
+//! is refused where the engine would shrink them.
 
 use std::borrow::Cow;
 
@@ -110,7 +110,7 @@ impl NemotronOmniProcessor {
         })
         .map(|(pointer, _)| pointer)
         .or_else(|| {
-            // vLLM sizes video frames by exactly one of these two.
+            // The engine sizes video frames by exactly one of these two.
             let size = "/vision_config/video_target_img_size";
             config
                 .pointer(size)
@@ -119,9 +119,9 @@ impl NemotronOmniProcessor {
         })
     }
 
-    /// The `(rows, cols)` patch grid an image is resized to, as vLLM's
+    /// The `(rows, cols)` patch grid an image is resized to, as the engine's
     /// `process_media` plans it at the per-image maximum; `None` for a strip so
-    /// thin it rounds to no patches, which vLLM fails on too.
+    /// thin it rounds to no patches, which the engine fails on too.
     pub fn plan_grid(width: u32, height: u32) -> Option<(usize, usize)> {
         let budget = MAX_NUM_PATCHES;
         let p = PATCH_SIZE as f64;
@@ -159,7 +159,7 @@ impl NemotronOmniProcessor {
         Some((rows, cols))
     }
 
-    /// The `(rows, cols)` grid of a video's frames, as vLLM's
+    /// The `(rows, cols)` grid of a video's frames, as the engine's
     /// `_compute_aspect_preserving_size` plans it.
     pub fn plan_video_grid(width: u32, height: u32) -> (usize, usize) {
         let target = VIDEO_TARGET_PATCHES as f64;
@@ -178,7 +178,7 @@ impl NemotronOmniProcessor {
     }
 
     /// The image's RGB bytes with any transparency composited onto white the
-    /// way vLLM's loader does it: PIL's `paste` with the alpha as mask.
+    /// way the engine's loader does it: PIL's `paste` with the alpha as mask.
     fn rgb_on_white(image: &DynamicImage) -> (usize, usize, Cow<'_, [u8]>) {
         if !image.color().has_alpha() {
             return rgb_bytes(image);
@@ -401,7 +401,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
 mod tests {
     use super::*;
 
-    /// Token counts vLLM's tiler gives these sizes at the per-image maximum.
+    /// Token counts the engine's tiler gives these sizes at the per-image maximum.
     #[test]
     fn plans_the_reference_grids() {
         let tokens = |w, h| {
@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(tokens(1920, 1080), 2040);
         assert_eq!(tokens(2048, 2048), 3306);
         assert_eq!(tokens(4000, 3000), 3300);
-        // Rounds to a zero-height grid; vLLM divides by its area and fails.
+        // Rounds to a zero-height grid; the engine divides by its area and fails.
         assert_eq!(NemotronOmniProcessor::plan_grid(300_000, 8), None);
         // The count refuses what the grid planner refuses, as the
         // preprocessing does.
@@ -425,7 +425,7 @@ mod tests {
         assert!(error.contains("too thin"), "{error}");
     }
 
-    /// Frame grids vLLM's `_compute_aspect_preserving_size` gives these sizes.
+    /// Frame grids the engine's `_compute_aspect_preserving_size` gives these sizes.
     #[test]
     fn plans_the_reference_video_grids() {
         let grid = NemotronOmniProcessor::plan_video_grid;

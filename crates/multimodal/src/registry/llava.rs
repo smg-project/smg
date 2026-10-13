@@ -116,7 +116,7 @@ impl ModelProcessorSpec for LlavaNextSpec {
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // encoder_input is [num_images, max_patches, C, H, W] (5D, batched).
-        // image_sizes is [num_images, 2] (batched), matching HF/vLLM kwargs.
+        // image_sizes is [num_images, 2] (batched), matching the reference processor's kwargs.
         HashMap::from([
             ("pixel_values".to_string(), FieldLayout::Batched),
             ("image_sizes".to_string(), FieldLayout::Batched),

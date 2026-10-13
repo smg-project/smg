@@ -568,7 +568,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         }
 
         // Build 5D encoder_input [num_images, max_patches, C, H, W] matching the
-        // HF LlavaNextImageProcessor output that vLLM expects with Batched layout.
+        // HF LlavaNextImageProcessor output the engine expects with Batched layout.
         let max_patches = patches_per_image.iter().map(|p| p.len()).max().unwrap_or(0);
         let (c, h, w) = if let Some(first) = patches_per_image.iter().find_map(|p| p.first()) {
             let s = first.shape();
@@ -588,7 +588,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         }
 
         // Build model-specific image_sizes tensor as [num_images, 2] in (height, width) order
-        // to match the HF LlavaNextImageProcessor output format that vLLM expects.
+        // to match the HF LlavaNextImageProcessor output format the engine expects.
         let image_sizes_flat: Vec<i64> = item_sizes
             .iter()
             .flat_map(|&(w, h)| [h as i64, w as i64])
@@ -628,7 +628,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         // Grid shape in crops (e.g. 1x2 for 336x672 best resolution)
         let (grid_w, grid_h) = self.get_anyres_grid_shape(original_size);
 
-        // Unpadded feature dimensions — matches vLLM's
+        // Unpadded feature dimensions — matches the reference implementation's
         // _get_num_unpadded_features which operates in feature space
         // (npatches * grid_dim) per axis.
         let current_w = (npatches * grid_w) as f32;

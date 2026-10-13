@@ -1,7 +1,7 @@
 //! DeepSeek-V4.1 vision preprocessor.
 //!
 //! Port of the reference `load_image` in the checkpoint's
-//! `inference/image_processor.py` (the same math as vLLM's
+//! `inference/image_processor.py` (the same math as the serving engine's
 //! `models/deepseek_v4_1/common/mm_preprocess.py`) so that token counts and
 //! pixel values match the reference. Each `<｜deepseek_image｜>` placeholder
 //! in the prompt expands to `[IMAGE_START] + ([IMAGE] * n_llm_w +
@@ -11,8 +11,8 @@
 //! IMAGE slots receive aligner rows in reading order; the delimiters take the
 //! learned `image_start` / `image_newline` / `image_end` vectors.
 //!
-//! The span is spliced verbatim: vLLM removed its compressor-alignment pad
-//! (vllm-project/vllm#56554), so the budget is the full `max_image_tokens`
+//! The span is spliced verbatim: the engine removed its compressor-alignment pad
+//! (its change 56554), so the budget is the full `max_image_tokens`
 //! and no token is reserved.
 
 use image::{DynamicImage, Rgb, RgbImage};
@@ -363,7 +363,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
                     .expect("patch array is standard-layout by construction"),
             );
         }
-        // The engine consumes patches as `(np, 3, p, p)` (see vLLM's
+        // The engine consumes patches as `(np, 3, p, p)` (see its
         // `DeepseekV4VLImagePixelInputs`).
         let p = processor.patch_size;
         let encoder_input = Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)

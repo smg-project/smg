@@ -1,7 +1,7 @@
 //! Gemma 4 image and video preprocessing.
 //!
 //! Port of transformers' `Gemma4ImageProcessor` (its torchvision backend, the
-//! one vLLM runs) in the form the engine's Gemma 4 model consumes: per image a
+//! one the serving engine runs) in the form the engine's Gemma 4 model consumes: per image a
 //! flat `(max_patches, patch_pixels)` tensor of `patch_size` x `patch_size`
 //! RGB patches in row-major order, zero-padded to `max_patches =
 //! max_soft_tokens * pooling_kernel_size^2`, and per patch its `(x, y)` grid
@@ -14,7 +14,7 @@
 //! one soft token, so an image costs `num_patches / pooling_kernel_size^2`
 //! tokens: 280 at most with the default budget, 256 for a square image.
 //!
-//! Video has no processor of its own in the engine: vLLM runs the image
+//! Video has no processor of its own in the engine: it runs the image
 //! processor over the sampled frames with the video budget (70 soft tokens per
 //! frame by default), so a clip is encoded here as its frames stacked along
 //! the first dimension, with `video_frame_counts` saying how many belong to
@@ -59,7 +59,7 @@ impl Params {
     fn from_config(config: &PreProcessorConfig, video: bool) -> Result<Self, TransformError> {
         let patch = config.get_patch_size(DEFAULT_PATCH_SIZE);
         let pool = extra_usize(config, "pooling_kernel_size", DEFAULT_POOLING_KERNEL_SIZE)?;
-        // vLLM feeds frames to the image processor at the video processor's
+        // The engine feeds frames to the image processor at the video processor's
         // default budget whatever the configs say; the video processor's own
         // config is honoured when it is the one handed in (its budget is that
         // default on the released checkpoints), the image config's budget is
