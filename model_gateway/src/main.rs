@@ -3197,6 +3197,33 @@ mod tests {
         assert!(err.contains("op_timeout_secs"), "{err}");
     }
 
+    /// `-1` is the one spelling of persistent Redis records on the command
+    /// line; 0 and any other negative value are refused by name.
+    #[test]
+    fn a_redis_retention_other_than_minus_one_below_one_is_refused() {
+        let persistent = cli_args_from(&["--redis-retention-days=-1"]);
+        assert_eq!(
+            persistent.build_redis_config(None).unwrap().retention_days,
+            None
+        );
+        for value in ["-2", "0"] {
+            let flag = format!("--redis-retention-days={value}");
+            let args = cli_args_from(&[flag.as_str()]);
+            match args.build_redis_config(None) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value: shown,
+                    reason,
+                }) => {
+                    assert_eq!(field, "redis_retention_days");
+                    assert_eq!(shown, value);
+                    assert!(reason.contains("-1 keeps records persistent"), "{reason}");
+                }
+                other => panic!("expected {value} refused by name, got {other:?}"),
+            }
+        }
+    }
+
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so
     /// IPv6 works with or without brackets, as it does for `--host`.
     #[test]
