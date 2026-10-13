@@ -1,6 +1,6 @@
 //! Factory for creating router instances
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use smg_external_router::{builtin_routers, spec_for_backend};
 
@@ -176,6 +176,12 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
         mode: Mode,
     ) -> Result<Box<dyn RouterTrait>, String> {
+        // Every gRPC router, the single one and the IGW ones alike, passes
+        // through here: from now on every request to a worker carries the
+        // configuration's request timeout as its deadline.
+        smg_grpc_client::set_request_timeout(Some(Duration::from_secs(
+            ctx.router_config.request_timeout_secs,
+        )));
         let router = GrpcRouter::new(ctx, mode)?;
 
         Ok(Box::new(router))

@@ -7,6 +7,7 @@ use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
 use crate::{
+    deadline::deadline_request,
     request_fields::{
         completion_constraint, plain_constraint, response_format_schema, stop_strings,
         ConstraintKind, PlainSampling,
@@ -56,7 +57,7 @@ impl SglangSchedulerClient {
         req: proto::EmbedRequest,
     ) -> Result<proto::EmbedResponse, tonic::Status> {
         let mut client = self.client.clone();
-        let mut request = Request::new(req);
+        let (_, mut request) = deadline_request(req);
 
         // Inject W3C trace context into gRPC metadata
         if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {

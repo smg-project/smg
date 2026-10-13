@@ -16,6 +16,7 @@ pub mod common_proto {
 pub mod abort_on_drop;
 pub mod channel;
 pub mod codec;
+pub mod deadline;
 pub mod engine_load;
 pub mod media_fault;
 pub mod mlx_engine;
@@ -34,6 +35,9 @@ pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
     connect_channel, connect_channel_with_timeout, is_transport_failure, normalize_grpc_endpoint,
     DEFAULT_CONNECT_TIMEOUT,
+};
+pub use deadline::{
+    deadline_request, is_call_deadline, request_timeout, set_request_timeout, CallDeadline,
 };
 /// The HTTP/2 layer under the channels, re-exported for callers that build
 /// or classify the transport faults [`is_transport_failure`] recognises.
@@ -342,17 +346,18 @@ macro_rules! impl_engine_client_basics {
         ) -> Result<AbortOnDropStream, tonic::Status> {
             let request_id = req.request_id.clone();
             let mut client = self.client.clone();
-            let mut request = tonic::Request::new(req);
+            // The call's deadline (--request-timeout-secs) rides on the request; the
+            // stream below answers its lapse as the deadline's status.
+            let (deadline, mut request) = $crate::deadline::deadline_request(req);
             // W3C trace context into the gRPC metadata for distributed tracing.
             if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
                 tracing::warn!("Failed to inject trace context: {}", e);
             }
             let response = client.generate(request).await?;
-            Ok(AbortOnDropStream::new(
-                response.into_inner(),
-                request_id,
-                self.clone(),
-            ))
+            Ok(
+                AbortOnDropStream::new(response.into_inner(), request_id, self.clone())
+                    .with_deadline(deadline),
+            )
         }
 
         /// Perform a health check.

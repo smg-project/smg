@@ -14,10 +14,10 @@ use std::{
     },
 };
 
-use tonic::{transport::Channel, Request};
+use tonic::transport::Channel;
 use tracing::{debug, warn};
 
-use crate::{BoxedTraceInjector, NoopTraceInjector};
+use crate::{deadline::deadline_request, BoxedTraceInjector, NoopTraceInjector};
 
 /// Process-global cache of connected channels, keyed by encode-worker endpoint.
 ///
@@ -117,7 +117,9 @@ impl TokenSpeedEncoderClient {
         req: tokenspeed_encoder_proto::EncodeRequest,
     ) -> Result<tokenspeed_encoder_proto::EncodeResponse, tonic::Status> {
         let mut client = self.client.clone();
-        let mut request = Request::new(req);
+        // The unary encode call under the request deadline: tonic's client
+        // bounds it from the header, and the worker's server cancels it.
+        let (_, mut request) = deadline_request(req);
 
         if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
             warn!("Failed to inject trace context: {}", e);

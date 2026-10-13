@@ -26,6 +26,7 @@
 use std::{fmt, sync::Arc};
 
 use axum::http::StatusCode;
+use smg_grpc_client::is_call_deadline;
 use tracing::{error, warn};
 
 use super::{
@@ -35,6 +36,7 @@ use super::{
     tonic_ext::TonicStatusExt,
 };
 use crate::{
+    middleware::messages_error_type,
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         error::error_type_for_status,
@@ -236,19 +238,32 @@ impl StreamFailure {
         }
     }
 
+    /// Whether the call's deadline ended the stream: the gateway's own cut.
+    pub(crate) fn is_request_timeout(&self) -> bool {
+        matches!(self, Self::Upstream { status, .. } if is_call_deadline(status))
+    }
+
     /// The `type` of the SSE error event that ends the response:
     /// `stream_error` for a stream the worker failed, the HTTP error body's
     /// type for any other status the engine answered, `internal_error` for a
-    /// failure of the gateway's own processing.
+    /// failure of the gateway's own processing, and for a stream the call's
+    /// deadline ended the type of the HTTP path's 504.
     pub(crate) fn error_type(&self) -> &'static str {
+        if self.is_request_timeout() {
+            return error_type_for_status(StatusCode::GATEWAY_TIMEOUT);
+        }
         self.class().map_or(INTERNAL_ERROR_TYPE, |class| {
             class.client_type(STREAM_ERROR_TYPE)
         })
     }
 
     /// The same for the messages API's error event, whose type for a failure
-    /// on the server's side is `api_error`.
+    /// on the server's side is `api_error` and for the call's deadline the
+    /// type its 504 carries (`timeout_error`).
     pub(crate) fn messages_error_type(&self) -> &'static str {
+        if self.is_request_timeout() {
+            return messages_error_type(StatusCode::GATEWAY_TIMEOUT);
+        }
         self.class().map_or(MESSAGES_API_ERROR_TYPE, |class| {
             class.client_type(MESSAGES_API_ERROR_TYPE)
         })
@@ -535,6 +550,15 @@ mod tests {
         let failure = cut();
         assert_eq!(failure.error_type(), "stream_error");
         assert_eq!(failure.messages_error_type(), "api_error");
+        // A stream the call's deadline ended is typed as the HTTP path's 504
+        // on both APIs.
+        let timed_out = StreamFailure::upstream(
+            smg_grpc_client::CallDeadline::after(std::time::Duration::from_secs(15)).status(),
+            5,
+        );
+        assert!(timed_out.is_request_timeout());
+        assert_eq!(timed_out.error_type(), "server_error");
+        assert_eq!(timed_out.messages_error_type(), "timeout_error");
         assert_eq!(
             failure.to_string(),
             "Stream error: h2 protocol error: error reading a body from connection"

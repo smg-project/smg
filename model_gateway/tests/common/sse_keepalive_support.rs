@@ -14,7 +14,7 @@ use http_body_util::BodyExt;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use smg::{
     config::{RouterConfig, RoutingMode},
-    routers::RouterFactory,
+    routers::{factory::router_ids, RouterFactory},
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use tokio::{net::TcpListener, task::JoinHandle};
@@ -24,8 +24,9 @@ use crate::{common, held_worker::HeldWorker};
 
 pub const MODEL: &str = "sse-keepalive-test-model";
 
-/// The gateway's app over one held worker. `keepalive_secs` of `None` leaves
-/// the configuration at its default.
+/// The gateway's app over one held worker. `keepalive_secs` and
+/// `request_timeout_secs` of `None` leave the configuration at its defaults;
+/// `igw` builds the gRPC router the multi-router (IGW) way.
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -35,6 +36,8 @@ pub const MODEL: &str = "sse-keepalive-test-model";
 pub async fn app(
     first_token_after: Duration,
     keepalive_secs: Option<u64>,
+    request_timeout_secs: Option<u64>,
+    igw: bool,
 ) -> (Router, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -69,13 +72,25 @@ pub async fn app(
     if let Some(secs) = keepalive_secs {
         builder = builder.sse_keepalive_secs(secs);
     }
+    if let Some(secs) = request_timeout_secs {
+        builder = builder.request_timeout_secs(secs);
+    }
     let mut config = builder.build_unchecked();
     config.health_check.disable_health_check = true;
     let context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
     context.worker_registry.register(worker).unwrap();
-    let router = RouterFactory::create_router(&context)
-        .await
-        .expect("gRPC router");
+    let router = if igw {
+        RouterFactory::create_igw_routers(&context.router_config.policy, &context)
+            .await
+            .into_iter()
+            .find_map(|(id, _, result)| (id == router_ids::GRPC_REGULAR).then_some(result))
+            .expect("the IGW list names a gRPC regular router")
+            .expect("the IGW gRPC regular router")
+    } else {
+        RouterFactory::create_router(&context)
+            .await
+            .expect("gRPC router")
+    };
     let app = common::test_app::create_test_app_with_context(Arc::from(router), context);
     (app, server)
 }
