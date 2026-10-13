@@ -327,7 +327,8 @@ impl Format {
         };
         // The thought's own markers stay writable: the model closes its thought inside the
         // prefix where the engine applies the grammar from the first token, and an engine that
-        // runs a reasoning parser has consumed them before the grammar starts.
+        // runs a reasoning parser has consumed them before the grammar starts. XTML's tag never
+        // comes this far: it closes the thought on its own way into the block.
         let thought = self.region(reasoning, |state| self.is_call_state(state))?;
         let mut excludes: Vec<String> = self
             .terminal_texts()
@@ -341,9 +342,7 @@ impl Format {
                 tags.value_open,
                 tags.value_close,
             ],
-            Some(CallSyntax::Attributed(tags)) if tags.typing != Typing::TypeAttribute => {
-                &[tags.parameter_open, tags.parameter_close]
-            }
+            Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
             Some(CallSyntax::Gemma) => &[GEMMA_STRING],
             _ => &[],
