@@ -829,6 +829,7 @@ mod tests {
             load: 0.0,
             version: 0,
             spec: serde_json::to_vec(&spec).unwrap(),
+            owner: "peer".to_string(),
         };
         app_context.worker_registry.on_remote_worker_state(&state);
         assert!(app_context

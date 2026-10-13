@@ -1751,6 +1751,7 @@ mod tests {
             load: 0.0,
             version: 1,
             spec: vec![],
+            owner: "peer".to_string(),
         });
         let worker_id = registry.get_id_by_url("http://remote:1").unwrap();
         let worker = registry.get(&worker_id).unwrap();
@@ -2007,6 +2008,7 @@ mod tests {
             load: 0.0,
             version: 1,
             spec: vec![],
+            owner: "peer".to_string(),
         });
         let mesh_id = registry.get_id_by_url("http://remote:1").unwrap();
         assert!(

@@ -107,7 +107,12 @@ impl MeshAdapters {
                 routing: StreamRouting::Targeted,
             },
         );
-        let worker = WorkerSyncAdapter::new(worker_ns, worker_registry);
+        let worker = WorkerSyncAdapter::new(
+            worker_ns,
+            worker_registry,
+            node_name.clone(),
+            cluster_state.clone(),
+        );
         let rate_limit = RateLimitSyncAdapter::new(rl_ns, node_name.clone());
         let peers: Arc<dyn PeerList> =
             Arc::new(ClusterStatePeerList::new(cluster_state, node_name.clone()));
@@ -351,6 +356,7 @@ mod tests {
             load: 0.0,
             version: 1,
             spec: vec![],
+            owner: "node-b".into(),
         };
         adapters.worker().on_worker_changed("w1", &state);
 

@@ -3014,6 +3014,7 @@ mod tests {
             load: 0.0,
             version: 1,
             spec: vec![],
+            owner: "peer".to_string(),
         });
         let mesh_id = registry.get_id_by_url("http://remote:8080").unwrap();
         assert_eq!(registry.origin_of(&mesh_id), Some(WorkerOrigin::Mesh));
@@ -3033,6 +3034,7 @@ mod tests {
             load: 0.0,
             version: 1,
             spec,
+            owner: "peer".to_string(),
         }
     }
 
