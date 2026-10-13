@@ -28,16 +28,16 @@ use tracing_appender::{
 use tracing_log::{AsLog, LogTracer};
 use tracing_subscriber::{
     filter::{LevelFilter, Targets},
-    fmt::time::ChronoUtc,
     layer::SubscriberExt,
     util::SubscriberInitExt,
     EnvFilter, Layer, Registry,
 };
 
-use super::otel_trace::get_otel_layer;
+use super::{
+    log_format::{JsonLine, SpanFields, UtcSeconds},
+    otel_trace::get_otel_layer,
+};
 use crate::{config::TraceConfig, observability::metrics::Metrics};
-
-const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// All workspace crate names (hyphens → underscores to match tracing targets).
 /// When no explicit log targets are configured, these crates get the configured
@@ -370,11 +370,16 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         .with_ansi(config.colorize)
         .with_file(true)
         .with_line_number(true)
-        .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
+        .with_timer(UtcSeconds)
         .with_writer(stdout_writer);
 
+    // The JSON lines are the stock format's, written by `log_format` (the
+    // span's fields appended to, never re-parsed per record or per line).
     let stdout_layer = if config.json_format {
-        stdout_layer.json().flatten_event(true).boxed()
+        stdout_layer
+            .fmt_fields(SpanFields)
+            .event_format(JsonLine::new())
+            .boxed()
     } else {
         stdout_layer.boxed()
     };
@@ -412,11 +417,14 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
                     .with_ansi(false)
                     .with_file(true)
                     .with_line_number(true)
-                    .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
+                    .with_timer(UtcSeconds)
                     .with_writer(file_writer);
 
                 let file_layer = if config.json_format {
-                    file_layer.json().flatten_event(true).boxed()
+                    file_layer
+                        .fmt_fields(SpanFields)
+                        .event_format(JsonLine::new())
+                        .boxed()
                 } else {
                     file_layer.boxed()
                 };

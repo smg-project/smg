@@ -6,6 +6,7 @@ pub mod gauge_histogram;
 pub mod heap_profile;
 pub(crate) mod history_metrics;
 pub mod inflight_tracker;
+pub mod log_format;
 pub mod log_throttle;
 pub mod logging;
 pub mod metrics;
