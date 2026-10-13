@@ -1775,6 +1775,156 @@ async fn a_constraint_the_store_refuses_is_its_answer_not_unavailable() {
     assert!(err.to_string().contains("duplicate key"), "{err}");
 }
 
+/// The sweep index, the sweep and the lookup by output item mean the same
+/// whatever the server's `standard_conforming_strings` says: under `off` an
+/// ordinary literal with a backslash in it is re-read (the replacement's
+/// pattern refused at parse time, its replacement a space), which left such a
+/// database without the index and with a failing sweep and lookup. One
+/// database of its own per setting.
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn the_sweep_index_the_sweep_and_the_lookup_read_the_same_under_either_string_setting() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    for setting in ["off", "on"] {
+        let scratch = ScratchDatabase::create(&db_url, &format!("scs_{setting}"))
+            .await
+            .expect("create a scratch database");
+        let outcome = async {
+            scratch
+                .admin(&format!(
+                    "ALTER DATABASE \"{}\" SET standard_conforming_strings = {setting}",
+                    scratch.name
+                ))
+                .await?;
+            let storage = postgres_bundle(&scratch.url)
+                .await
+                .map_err(|e| format!("the start: {e}"))?
+                .response_storage;
+            let record = |store: bool, status: &str, completed_at: i64| {
+                let mut stored = StoredResponse::new(None);
+                stored.raw_response = json!({
+                    "id": stored.id.0, "store": store, "status": status,
+                    "completed_at": completed_at, "instructions": "a\u{0}b",
+                    "output": [{"type": "message", "id": format!("msg_{}", stored.id.0)}],
+                });
+                stored
+            };
+            let now = Utc::now().timestamp();
+            let kept = record(true, "completed", now - 3_600);
+            let swept = record(false, "completed", now - 3_600);
+            let fresh = record(false, "completed", now - 60);
+            for stored in [&kept, &swept, &fresh] {
+                storage
+                    .store_response(stored.clone())
+                    .await
+                    .map_err(|e| format!("a store: {e}"))?;
+            }
+            let deleted = storage
+                .delete_unstored_older_than(Utc::now() - TimeDelta::seconds(600))
+                .await
+                .map_err(|e| format!("the sweep: {e}"))?;
+            let mut left = Vec::new();
+            for id in [&kept.id, &swept.id, &fresh.id] {
+                left.push(
+                    storage
+                        .get_response(id)
+                        .await
+                        .map_err(|e| format!("a read: {e}"))?
+                        .is_some(),
+                );
+            }
+            let found_by_item = storage
+                .find_response_by_output_item(&format!("msg_{}", kept.id.0))
+                .await
+                .map_err(|e| format!("the lookup by output item: {e}"))?
+                .map(|r| r.id);
+
+            let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut driver = JoinSet::new();
+            driver.spawn(async move {
+                let _ = connection.await;
+            });
+            let in_effect: String = client
+                .query_one("SHOW standard_conforming_strings", &[])
+                .await
+                .map_err(|e| e.to_string())?
+                .get(0);
+            client
+                .batch_execute("SET enable_seqscan = off")
+                .await
+                .map_err(|e| e.to_string())?;
+            // The sweep's own predicate, its literals dollar-quoted as the
+            // store writes them.
+            let plan: Vec<String> = client
+                .query(
+                    "EXPLAIN DELETE FROM responses WHERE \
+                     replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'store' = 'false' AND \
+                     replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status' \
+                     IN ('completed', 'incomplete', 'failed', 'cancelled') AND \
+                     COALESCE((replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'completed_at')::bigint, \
+                     EXTRACT(EPOCH FROM created_at)::bigint) < 0",
+                    &[],
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect();
+            drop(client);
+            driver.join_all().await;
+            let indexes = scratch.indexes().await?;
+            Ok::<_, String>((
+                in_effect,
+                deleted,
+                left,
+                found_by_item == Some(kept.id.clone()),
+                indexes,
+                plan,
+            ))
+        }
+        .await;
+        scratch.drop().await;
+
+        let (in_effect, deleted, left, found_by_item_is_kept, indexes, plan) = outcome
+            .unwrap_or_else(|e| panic!("under standard_conforming_strings = {setting}: {e}"));
+        println!(
+            "standard_conforming_strings = {in_effect}: the sweep deleted {deleted}; stored / swept / \
+             fresh left: {left:?}; the lookup finds the stored record: {found_by_item_is_kept}; \
+             indexes: {indexes:?}; plan: {plan:?}"
+        );
+        assert_eq!(in_effect, setting, "the setting in effect for the sessions");
+        assert_eq!(
+            deleted, 1,
+            "under {setting}: the one unstored terminal record past the window"
+        );
+        assert_eq!(
+            left,
+            [true, false, true],
+            "under {setting}: the stored record and the one inside the window stay"
+        );
+        assert!(
+            found_by_item_is_kept,
+            "under {setting}: the stored record is found by its output item"
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|index| index == "responses_unstored_text_idx"),
+            "under {setting}: the sweep index is on the table: {indexes:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("Index Scan using responses_unstored_text_idx")),
+            "under {setting}: the sweep's predicate is served by its index: {plan:?}"
+        );
+    }
+}
+
 /// A response whose object carries the escape `\u0000` (a model's or a
 /// client's text can) stores with the unstored-record sweep index on the
 /// table, the sweep still takes the unstored terminal records past their

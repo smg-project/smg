@@ -1521,9 +1521,14 @@ const LEGACY_UNSTORED_INDEX: &str = "responses_unstored_idx";
 /// and an index expression is evaluated for every row written and a lookup's
 /// predicate for every row scanned; the replacement keeps the text the same
 /// length and a literal backslash sequence in it valid, which replacing with
-/// nothing would not.
+/// nothing would not. The two literals are dollar-quoted: an ordinary literal
+/// with a backslash in it reads differently under
+/// `standard_conforming_strings = off` (an installation setting the server
+/// still accepts: the pattern is refused at parse time, the replacement
+/// becomes a space), and the index on a database, the sweep and the lookup
+/// must mean the same on every installation.
 fn nul_safe_json_document(col_raw: &str) -> String {
-    format!("replace({col_raw}::text, '\\u0000', '\\u0020')")
+    format!("replace({col_raw}::text, $$\\u0000$$, $$\\u0020$$)")
 }
 
 /// `field` of the JSON object in `col_raw` as text, read through
@@ -1893,6 +1898,21 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The replacement's literals are dollar-quoted, so the index expression,
+    /// the sweep and the lookup read the same under
+    /// `standard_conforming_strings = off` as under `on`: an ordinary literal
+    /// with a backslash in it is re-read under `off` (the pattern refused, the
+    /// replacement a space).
+    #[test]
+    fn the_nul_replacement_s_literals_read_the_same_under_either_string_setting() {
+        let document = nul_safe_json_document("raw_response");
+        assert_eq!(
+            document,
+            "replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)"
+        );
+        assert!(!document.contains("'\\"), "{document}");
+    }
 
     /// The sweep's statement reads `store` and `status` through the very
     /// expressions its index is built on (a drift between the two would leave
