@@ -2175,8 +2175,10 @@ async fn decode_video_with_ffmpeg_raw(
     );
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes.to_string();
-    // Rawvideo has no per-frame header, so we interpret stdout using ffprobe's
-    // coded stream dimensions. Disable FFmpeg autorotation here; otherwise a
+    // Rawvideo has no per-frame header, so stdout is framed by the metadata's
+    // size: the probe's coded size, or the container's sample entry size when
+    // the tables were read directly (a stream decoded at another size fails
+    // the framing check below). Disable FFmpeg autorotation here; otherwise a
     // display-matrix rotation can swap output width/height and corrupt framing.
     let active_decode = ActiveVideoDecode::enter_async().await;
     let mut command = ffmpeg_decode_command(decoder_threads(active_decode.count()), false);
@@ -2558,7 +2560,11 @@ fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) ->
         .unwrap_or(cfg.sample_fps)
 }
 
-/// Terms ffmpeg will accept in one expression before it refuses to parse any of it.
+/// Past this many distinct frames the selection is described by a fixed-size
+/// spread expression when one reproduces it, instead of a list that grows with
+/// the clip. The cutoff is about expression size, not a parser limit: ffmpeg 8
+/// takes a 451-term list (the real-ffmpeg test below runs one), and a
+/// selection no spread formula describes stays a list past it.
 const FFMPEG_MAX_SELECT_TERMS: usize = 100;
 
 /// Exact source frames for an ffmpeg decode, sampled the way the OpenCV path samples.
@@ -2637,8 +2643,9 @@ impl FrameSelection {
 
     /// `select` over the distinct indices; `\,` keeps the filtergraph parser from splitting.
     ///
-    /// Anything over a minute or two has more frames than ffmpeg will take as a
-    /// list, so those are described instead of enumerated.
+    /// Anything over a minute or two would be a list of hundreds of terms, so
+    /// those are described instead of enumerated where a spread formula
+    /// reproduces them exactly.
     fn select_filter(&self) -> String {
         if self.unique_frames.len() > FFMPEG_MAX_SELECT_TERMS {
             if let Some(filter) = self.spread_select_filter() {
@@ -3157,7 +3164,9 @@ mod tests {
                 "clip_{}_{seconds}.{container}",
                 rate.replace('/', "_")
             ));
-            let status = Command::new("ffmpeg")
+            // A codec every ffmpeg build carries; the tables under test are
+            // the container's, whichever codec fills them.
+            let encoded = Command::new("ffmpeg")
                 .args([
                     "-hide_banner",
                     "-loglevel",
@@ -3169,18 +3178,15 @@ mod tests {
                     "-i",
                 ])
                 .arg(format!("testsrc=size=64x48:rate={rate}:duration={seconds}"))
-                .args([
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                ])
+                .args(["-pix_fmt", "yuv420p", "-c:v", "mpeg4"])
                 .arg(&path)
-                .status()
+                .output()
                 .expect("ffmpeg runs");
-            assert!(status.success(), "ffmpeg wrote {path:?}");
+            assert!(
+                encoded.status.success(),
+                "ffmpeg wrote {path:?}: {}",
+                String::from_utf8_lossy(&encoded.stderr)
+            );
             let container_info = crate::mp4_metadata::read(&path)
                 .expect("readable")
                 .unwrap_or_else(|| panic!("{path:?} not accepted by the container reader"));
@@ -4104,18 +4110,18 @@ mod video_sampling_tests {
             assert_eq!(filter, expected, "{sampling:?}");
             assert!(
                 filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
-                "ffmpeg refuses an expression this long as a list"
+                "a selection past the cutoff is described, not listed"
             );
         }
     }
 
-    /// The described selection run through ffmpeg itself, where it is
-    /// installed: a synthetic clip longer than the list limit, the filter as
-    /// the crate builds it (both spreads: the loader's and the rate-based
-    /// one), the frames ffmpeg hands back matched against a plain decode of
-    /// every frame, so the source indices picked are the Rust selection's.
+    /// The selection run through ffmpeg itself, where it is installed: a
+    /// synthetic clip longer than the list cutoff, the filter as the crate
+    /// builds it in both of its shapes (the described spread and the explicit
+    /// list), the frames ffmpeg hands back read as the source indices they
+    /// carry, so the frames picked are the Rust selection's.
     #[tokio::test]
-    async fn the_described_selection_picks_the_same_frames_through_ffmpeg() {
+    async fn the_selection_picks_the_same_frames_through_ffmpeg() {
         use std::process::{Command as Sync, Stdio};
         let have = |tool: &str| {
             Sync::new(tool)
@@ -4130,10 +4136,10 @@ mod video_sampling_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let total = 900usize;
         let fps = 30.0;
-        let path = dir.path().join("clip.mp4");
+        let path = dir.path().join("clip.mkv");
         // Frame i carries i in its pixels: sixteen 4x4 blocks, white where
-        // the bit is set, black elsewhere, kept exact by lossless coding, so
-        // a decoded frame names its own source index.
+        // the bit is set, black elsewhere, kept exact by a lossless codec
+        // every ffmpeg build carries, so a decoded frame names its own index.
         let side = 16usize;
         let mut raw = Vec::with_capacity(total * side * side * 3);
         for index in 0..total {
@@ -4165,16 +4171,11 @@ mod video_sampling_tests {
                 "-pix_fmt",
                 "yuv420p",
                 "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-qp",
-                "0",
-                "-g",
-                "30",
+                "ffv1",
             ])
             .arg(&path)
             .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("ffmpeg runs");
         {
@@ -4182,8 +4183,12 @@ mod video_sampling_tests {
             let mut stdin = encode.stdin.take().expect("ffmpeg stdin");
             stdin.write_all(&raw).expect("frames written");
         }
-        let status = encode.wait().expect("ffmpeg finishes");
-        assert!(status.success());
+        let encoded = encode.wait_with_output().expect("ffmpeg finishes");
+        assert!(
+            encoded.status.success(),
+            "ffmpeg encode: {}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
         // every frame, decoded the way the selected frames are decoded
         let mut all = ffmpeg_decode_command(2, true);
         all.arg(&path);

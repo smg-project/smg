@@ -5,11 +5,18 @@
 //! duration) before it decodes it, to pin the frames the engine's loader
 //! would pick. That took a probe process per clip; for the common file shape
 //! the same numbers sit in the `moov` box and are read here without one. The
-//! shape is checked, not assumed: one video track, a single constant frame
-//! duration, an edit list that is the whole track or none, a stated size and
-//! a positive duration. Any other file returns `None` and keeps the probe
-//! process, so the values this module yields are the probe's for every file
-//! it accepts (the agreement test runs the tool when it is installed):
+//! shape is checked, not assumed: the first video track (the probe's `v:0`;
+//! later video tracks are ignored, as the probe ignores them), a single
+//! constant frame duration, an edit list that is the whole track at rate 1.0
+//! exactly or none, a stated size and a positive duration. Any other file
+//! returns `None` and keeps the probe process, so the values this module
+//! yields are the probe's for every file it accepts (the agreement test runs
+//! the tool when it is installed). One caveat: the size is the sample entry's,
+//! what the muxer wrote, which the probe replaces with the decoder's own size
+//! after it has looked at the stream; the two agree on the files common
+//! muxers write, and a frame decoded at another size fails the frame parsing
+//! (headed frames) or the framing check (raw frames) rather than passing
+//! through:
 //!
 //! - `width` / `height`: the first visual sample entry's;
 //! - `duration_ts` / `time_base`: the media header's duration and time scale
@@ -104,7 +111,9 @@ pub(crate) fn read(path: &Path) -> io::Result<Option<ContainerVideoInfo>> {
         } else if size == 0 {
             size = len - offset;
         }
-        if size < header_len || offset + size > len {
+        // `checked_add`: a crafted 64-bit size that wraps the sum would otherwise
+        // pass the bound and send the walk back to the start, forever.
+        if size < header_len || offset.checked_add(size).is_none_or(|end| end > len) {
             return Ok(None);
         }
         if first {
@@ -142,7 +151,7 @@ fn boxes(data: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
         } else if size == 0 {
             size = data.len() - offset;
         }
-        if size < header || offset + size > data.len() {
+        if size < header || offset.checked_add(size).is_none_or(|end| end > data.len()) {
             return None;
         }
         out.push((kind, &data[offset + header..offset + size]));
@@ -263,21 +272,33 @@ fn edit_list_is_whole_track(
     if entries != 1 {
         return false;
     }
-    let (segment_duration, media_time, rate) = match elst.first() {
-        Some(0) => match (be_u32(elst, 8), be_u32(elst, 12), be_u16(elst, 16)) {
-            (Some(d), Some(t), Some(r)) => (u64::from(d), i64::from(t as i32), r),
+    // The rate is 16.16 fixed point: its integer part and its fraction.
+    let (segment_duration, media_time, rate, fraction) = match elst.first() {
+        Some(0) => match (
+            be_u32(elst, 8),
+            be_u32(elst, 12),
+            be_u16(elst, 16),
+            be_u16(elst, 18),
+        ) {
+            (Some(d), Some(t), Some(r), Some(f)) => (u64::from(d), i64::from(t as i32), r, f),
             _ => return false,
         },
-        Some(1) => match (be_u64(elst, 8), be_u64(elst, 16), be_u16(elst, 24)) {
-            (Some(d), Some(t), Some(r)) => (d, t as i64, r),
+        Some(1) => match (
+            be_u64(elst, 8),
+            be_u64(elst, 16),
+            be_u16(elst, 24),
+            be_u16(elst, 26),
+        ) {
+            (Some(d), Some(t), Some(r), Some(f)) => (d, t as i64, r, f),
             _ => return false,
         },
         _ => return false,
     };
-    // media_time 0 at rate 1, and the edit's duration (in the movie's time
-    // scale) equal to the track's (in the media's).
+    // media_time 0 at rate 1.0 exactly, and the edit's duration (in the
+    // movie's time scale) equal to the track's (in the media's).
     media_time == 0
         && rate == 1
+        && fraction == 0
         && u128::from(segment_duration) * u128::from(timescale)
             == u128::from(duration_ts) * u128::from(movie_timescale)
 }
@@ -405,6 +426,51 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("temp file");
         file.write_all(bytes).expect("write");
         file
+    }
+
+    /// A 64-bit box size chosen so that `offset + size` wraps to zero: the
+    /// walk rejects the file instead of starting over at the top forever.
+    #[test]
+    fn a_box_size_that_wraps_the_offset_is_rejected_not_walked() {
+        let mut bytes = boxed(*b"ftyp", &[0u8; 8]);
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(b"free");
+        bytes.extend_from_slice(&(u64::MAX - 15).to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        let file = written(&bytes);
+        assert!(read(file.path()).expect("readable").is_none());
+
+        // The same wrap inside a payload.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(b"free");
+        payload.extend_from_slice(&(u64::MAX - 7).to_be_bytes());
+        assert!(boxes(&payload).is_none());
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&1u32.to_be_bytes());
+        inner.extend_from_slice(b"free");
+        inner.extend_from_slice(&(usize::MAX as u64 - 7).to_be_bytes());
+        inner.extend_from_slice(&[0u8; 8]);
+        assert!(boxes(&inner).is_none());
+    }
+
+    /// An edit at rate 1.5 (`0x0001_8000`) is not the whole track at normal
+    /// speed, even though its integer part reads 1.
+    #[test]
+    fn an_edit_at_a_fractional_rate_keeps_the_probe() {
+        let mut elst = whole_track_edit(1000);
+        let end = elst.len();
+        elst[end - 2..].copy_from_slice(&0x8000u16.to_be_bytes());
+        let file = written(&movie(
+            12288,
+            512,
+            24,
+            320,
+            240,
+            Some(elst),
+            vec![(24, 512)],
+        ));
+        assert!(read(file.path()).expect("readable").is_none());
     }
 
     /// A 24 fps track of 24 frames with the whole-track edit list: the
