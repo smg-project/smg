@@ -487,6 +487,7 @@ class VllmLauncher(RustLauncher):
 
     engine = "vLLM"
     started = "engine"
+    counted = "engine"
     server_class = "VllmGrpcServer"
     ipc_prefix = "servicer"
     handshake_port_env = HANDSHAKE_PORT_ENV

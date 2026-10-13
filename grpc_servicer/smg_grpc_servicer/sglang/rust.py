@@ -426,6 +426,7 @@ class SglangLauncher(RustLauncher):
 
     engine = "SGLang"
     started = "scheduler"
+    counted = "DP rank"
     server_class = "SglangGrpcServer"
     ipc_prefix = "sglang-servicer"
     handshake_port_env = HANDSHAKE_PORT_ENV

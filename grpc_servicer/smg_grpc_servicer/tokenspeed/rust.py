@@ -428,6 +428,7 @@ class TokenSpeedLauncher(RustLauncher):
 
     engine = "TokenSpeed"
     started = "scheduler"
+    counted = "DP rank"
     server_class = "TokenSpeedGrpcServer"
     ipc_prefix = "tokenspeed-servicer"
     handshake_port_env = HANDSHAKE_PORT_ENV

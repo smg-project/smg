@@ -849,10 +849,13 @@ class RustLauncher:
     (the engine config the facts were read from).
     """
 
-    # The engine's name in the log lines, and the word for what the handshake
-    # waits for: its "engine" or its "scheduler".
+    # The engine's name in the log lines; the word for what the handshake
+    # waits for (its "engine" or its "scheduler"); and the word for what the
+    # engine count counts: the handshake identities (a data-parallel engine of
+    # vLLM, a DP rank of a scheduler whose TP ranks share one identity).
     engine: str
     started: str
+    counted: str
     # The ``smg.servicer`` class that serves this engine's contract, by name:
     # the binding is imported when ``serve`` runs, after the knobs are read.
     server_class: str
@@ -940,7 +943,7 @@ class RustLauncher:
             self.started,
             handshake_port,
             engine_count,
-            self.started,
+            self.counted,
         )
         logger.info(
             "%s startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
