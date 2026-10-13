@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use llm_tokenizer::{
-    Decoder, Encoder, HuggingFaceTokenizer, Sequence, SequenceDecoderOutput, StopSequenceConfig,
+    create_tokenizer, HuggingFaceTokenizer, Sequence, SequenceDecoderOutput, StopSequenceConfig,
     StopSequenceDecoder, TokenizerTrait,
 };
 use tokenizers::{
@@ -66,15 +66,24 @@ fn synthetic_byte_level() -> HfTokenizer {
     tokenizer
 }
 
-fn load_tokenizer() -> (Arc<HuggingFaceTokenizer>, &'static str) {
+/// `SMG_BENCH_TOKENIZER_DIR` loads any vocabulary the crate's factory loads
+/// (a tiktoken model among them); `SMG_BENCH_TOKENIZER_JSON` a `tokenizer.json`.
+fn load_tokenizer() -> (Arc<dyn TokenizerTrait>, String) {
+    if let Ok(dir) = std::env::var("SMG_BENCH_TOKENIZER_DIR") {
+        let name = std::path::Path::new(&dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "dir".into());
+        return (create_tokenizer(&dir).expect("load tokenizer"), name);
+    }
     match std::env::var("SMG_BENCH_TOKENIZER_JSON") {
         Ok(path) => (
             Arc::new(HuggingFaceTokenizer::from_file(&path).expect("load tokenizer")),
-            "real",
+            "real".into(),
         ),
         Err(_) => (
             Arc::new(HuggingFaceTokenizer::from_tokenizer(synthetic_byte_level())),
-            "synthetic",
+            "synthetic".into(),
         ),
     }
 }
