@@ -925,8 +925,9 @@ impl RedisResponseStorage {
     }
 
     /// The writes that go with a stored response besides its hash: one key
-    /// per output item id (with the response's retention) and the hash's
-    /// expiry.
+    /// per output item id (with the response's retention), the set of the
+    /// open background responses (joined while the record is open, left with
+    /// its terminal store), and the hash's expiry.
     fn index_writes(&self, pipe: &mut redis::Pipeline, key: &str, response: &StoredResponse) {
         let sr = &self.store.schema.responses;
         let response_id_str = response.id.0.as_str();
@@ -943,15 +944,50 @@ impl RedisResponseStorage {
                     }
                 }
             }
-            if response.is_open_background() {
-                pipe.sadd(self.open_background_key(), response_id_str);
-            } else if response.raw_response["background"].as_bool() == Some(true) {
-                pipe.srem(self.open_background_key(), response_id_str);
-            }
+            self.open_set_writes(pipe, response);
         }
         if let Some(seconds) = retention {
             pipe.expire(key, seconds as i64);
         }
+    }
+
+    /// Queues the change of the set of the open background responses that
+    /// goes with a write of `response`: joined while the record is open, left
+    /// with its terminal store; nothing for a response that is not a
+    /// background one, or under a schema without the object field (the set is
+    /// read against the stored object). `true` when a command was queued.
+    fn open_set_writes(&self, pipe: &mut redis::Pipeline, response: &StoredResponse) -> bool {
+        if self.store.schema.responses.is_skipped("raw_response") {
+            return false;
+        }
+        let response_id_str = response.id.0.as_str();
+        if response.is_open_background() {
+            pipe.sadd(self.open_background_key(), response_id_str);
+            true
+        } else if response.raw_response["background"].as_bool() == Some(true) {
+            pipe.srem(self.open_background_key(), response_id_str);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The open set's change for a conditional write that was stored: the
+    /// script's run wrote the hash, the output-item keys and the expiry, and
+    /// the set follows here (the unconditional store queues the same change
+    /// in [`Self::index_writes`]).
+    async fn follow_open_set(
+        &self,
+        conn: &mut Connection,
+        response: &StoredResponse,
+    ) -> ResponseResult<()> {
+        let mut pipe = redis::pipe();
+        if !self.open_set_writes(&mut pipe, response) {
+            return Ok(());
+        }
+        pipe.query_async::<()>(conn)
+            .await
+            .map_err(ResponseStorageError::from_redis)
     }
 
     /// One run of [`store_if_open_script`] on the hash under `key`, answered
@@ -1196,6 +1232,9 @@ impl ResponseStorage for RedisResponseStorage {
             .await?;
         match outcome.as_str() {
             "stored" => {
+                // The open set follows the object (the output-item keys and
+                // the expiry were written in the script's run).
+                self.follow_open_set(&mut conn, &response).await?;
                 // A repeat of the entry the record's first store made (the
                 // identifier does not change between the writes of one
                 // response), so a failure here loses nothing.
@@ -1244,7 +1283,15 @@ impl ResponseStorage for RedisResponseStorage {
             )
             .await?;
         match outcome.as_str() {
-            "stored" => Ok(ConditionalStore::Stored),
+            "stored" => {
+                // The open set follows the object (the output-item keys and
+                // the expiry were written in the script's run).
+                let mut moved = StoredResponse::new(None);
+                moved.id = id.clone();
+                moved.raw_response = raw_response;
+                self.follow_open_set(&mut conn, &moved).await?;
+                Ok(ConditionalStore::Stored)
+            }
             "closed" => {
                 drop(conn);
                 Ok(match self.get_response(id).await? {
