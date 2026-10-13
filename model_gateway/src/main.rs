@@ -1270,7 +1270,8 @@ struct ServingArgs {
     /// compare their clocks through the lease: keep them within a third of
     /// this value of each other (a gateway running ahead by more than two
     /// thirds of it closes live responses as lost). 0 writes no lease and
-    /// runs no reaper; 1 to 5 are rejected (too short to be renewed).
+    /// runs no reaper; 1 to 5 are rejected (too short to be renewed). A
+    /// reaper pass reads at most 1,024 open records, the oldest first.
     #[arg(long, default_value_t = 30, help_heading = "Rate Limiting")]
     background_lease_ttl_secs: u64,
 

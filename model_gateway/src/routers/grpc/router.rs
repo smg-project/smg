@@ -200,14 +200,6 @@ impl GrpcRouter {
                 ctx.router_config.max_background_responses,
                 Duration::from_secs(ctx.router_config.background_lease_ttl_secs),
             ));
-            // The reaper of the background responses a gateway that is gone
-            // left open (none when background mode or the lease is off).
-            background::spawn_reaper(
-                ctx.response_storage.clone(),
-                storage_request_context.clone(),
-                &background_responses,
-            );
-
             // Helper closure to create responses context with a given pipeline
             let create_responses_context = |pipeline: &RequestPipeline| {
                 ResponsesContext::new(
@@ -230,6 +222,15 @@ impl GrpcRouter {
                 .ok_or_else(|| {
                     format!("gRPC router: mode {mode:?} must build a harmony pipeline")
                 })?;
+            // The reaper of the background responses a gateway that is gone
+            // left open (none when background mode or the lease is off); after
+            // the fallible part, so a router that fails to build leaves no
+            // reaper running.
+            background::spawn_reaper(
+                ctx.response_storage.clone(),
+                storage_request_context.clone(),
+                &background_responses,
+            );
             (Some(responses_context), Some(harmony_responses_context))
         };
 

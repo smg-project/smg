@@ -988,7 +988,8 @@ pub(crate) const DELETED: &str = "deleted";
 /// `registry`'s lease on it every [`BackgroundResponses::renew_every`] (a
 /// renewal that fails is retried at the next read; a lease left to expire
 /// lets the reaper close the record, which this watch then reads); a record
-/// read in a result is closed already and is not renewed.
+/// read in a result is closed already and is not renewed, and a renewal the
+/// work's own result refused is read as that result.
 async fn watch_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
@@ -1037,12 +1038,18 @@ async fn watch_stored_status(
                 };
                 match written {
                     Ok(ConditionalStore::Stored) => renewed = Instant::now(),
-                    // Closed between the read and the write: the status it closed with.
+                    // Closed between the read and the write. A close from
+                    // elsewhere ends the run with the status it closed with;
+                    // the work's own result (it landed between the read and
+                    // the renewal) is the work finishing, as a result read at
+                    // the top of the loop is: it opens the terminal write
+                    // window, and the next read goes through that path.
                     Ok(ConditionalStore::Closed(current)) => {
-                        return current.raw_response["status"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
+                        let status = current.raw_response["status"].as_str().unwrap_or("");
+                        if !is_result(status) {
+                            return status.to_string();
+                        }
+                        result_read_at.get_or_insert_with(tokio::time::Instant::now);
                     }
                     Ok(ConditionalStore::Missing) => {
                         debug!(response_id = %id, "Background response record gone while its work runs");
@@ -3577,5 +3584,193 @@ mod tests {
             .unwrap()
             .expect("the record is still there");
         assert_eq!(stored.raw_response["status"], "cancelled");
+    }
+
+    /// A store whose first lease renewal meets a record that closed between
+    /// the watch's read and its write: `close_with` is stored under the id
+    /// right before the renewal is forwarded (the work's own result, or a
+    /// close from elsewhere), so the inner store refuses the renewal as
+    /// `Closed` with that object. The renewal is the second `in_progress`
+    /// write of the object; the first is the transition out of `queued`.
+    struct ClosedBeforeRenewalStorage {
+        inner: Arc<dyn ResponseStorage>,
+        close_with: Value,
+        in_progress_writes: AtomicUsize,
+        raced: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ResponseStorage for ClosedBeforeRenewalStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.inner.store_response(response).await
+        }
+
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.inner.store_response_if_open(response).await
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            if raw_response["status"] == "in_progress"
+                && self.in_progress_writes.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                self.inner
+                    .update_response_object_if_open(id, self.close_with.clone())
+                    .await?;
+                self.raced.notify_one();
+            }
+            self.inner
+                .update_response_object_if_open(id, raw_response)
+                .await
+        }
+
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.inner.get_response(response_id).await
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.inner.delete_response(response_id).await
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.inner
+                .list_identifier_responses(identifier, tenant, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+        ) -> Result<usize, ResponseStorageError> {
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
+        }
+    }
+
+    /// The renewal's write can meet the work's own result: the watch read the
+    /// record `in_progress`, the work stored `completed` before the renewal
+    /// landed, and the conditional write answers `Closed` with the result.
+    /// That is the work finishing, as a result read at the top of the loop
+    /// is: the run stays open for the terminal write window and the linking
+    /// after the result's write runs to its end.
+    #[tokio::test]
+    async fn a_work_finishes_its_linking_after_its_result_refuses_the_renewal() {
+        let inner = storage();
+        let request = store_queued(&inner, "resp_1").await;
+        let result = serde_json::to_value(completed_after_queued("resp_1", &request)).unwrap();
+        let racing = Arc::new(ClosedBeforeRenewalStorage {
+            inner: inner.clone(),
+            close_with: result,
+            in_progress_writes: AtomicUsize::new(0),
+            raced: tokio::sync::Notify::new(),
+        });
+        let storage: Arc<dyn ResponseStorage> = racing.clone();
+        // A short lease: the first renewal comes a third of it after the start.
+        let registry = Arc::new(BackgroundResponses::new(4, Duration::from_secs(3)));
+        let slot = registry.admit("resp_1").unwrap();
+        // The result is stored by the race, on the work's behalf; the linking
+        // that follows it waits at this gate.
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (linked_tx, linked_rx) = oneshot::channel::<()>();
+        let work = async move {
+            if gate_rx.await.is_ok() {
+                let _ = linked_tx.send(());
+            }
+            Ok(())
+        };
+        let watch = Duration::from_millis(20);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(storage.clone(), None, slot, work, watch));
+        tokio::time::timeout(Duration::from_secs(5), racing.raced.notified())
+            .await
+            .expect("the first renewal met the result");
+        // Several watch ticks read the result before the linking goes on.
+        tokio::time::sleep(watch * 4).await;
+        let _ = gate_tx.send(());
+        task.await.unwrap();
+        assert!(
+            linked_rx.await.is_ok(),
+            "the linking after the result's write ran to its end"
+        );
+        assert_eq!(stored_status(&storage, "resp_1").await, "completed");
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// A renewal refused because the record closed meanwhile from elsewhere
+    /// (a cancel on another gateway, the reaper's close once the lease had
+    /// run out) ends the run with that status: the work is dropped and the
+    /// close stands.
+    #[tokio::test]
+    async fn a_renewal_refused_by_a_close_from_elsewhere_ends_the_run() {
+        let inner = storage();
+        store_queued(&inner, "resp_1").await;
+        let closed = with_status(
+            stored_raw(&inner, "resp_1").await,
+            "failed",
+            Some(
+                json!({"code": "gateway_lost", "message": "the gateway running this response stopped"}),
+            ),
+        );
+        let racing = Arc::new(ClosedBeforeRenewalStorage {
+            inner: inner.clone(),
+            close_with: closed,
+            in_progress_writes: AtomicUsize::new(0),
+            raced: tokio::sync::Notify::new(),
+        });
+        let storage: Arc<dyn ResponseStorage> = racing.clone();
+        let registry = Arc::new(BackgroundResponses::new(4, Duration::from_secs(3)));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(20),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends once the renewal is refused")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        let raw = stored_raw(&storage, "resp_1").await;
+        assert_eq!(raw["status"], "failed");
+        assert_eq!(raw["error"]["code"], "gateway_lost");
+        assert_eq!(registry.in_flight(), 0);
     }
 }
