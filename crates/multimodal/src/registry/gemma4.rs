@@ -23,14 +23,13 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
     registry::{
-        MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
-        RegistryResult,
+        MediaItemInfo, MediaPartOrder, ModalityHooks, ModelMetadata, ModelProcessorSpec,
+        ModelRegistryError, RegistryResult,
     },
     types::{
         EncoderFieldLayouts, FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId,
         VideoSamplingInfo,
     },
-    vision::PreProcessorConfig,
 };
 
 /// The engine's default loader keeps at most this many frames of a clip.
@@ -70,6 +69,34 @@ impl Gemma4Spec {
             spec: "gemma4",
             modality,
         }
+    }
+
+    /// One replacement per image: `[begin] + n x <|image|> + [end]`.
+    fn image_replacements(
+        metadata: &ModelMetadata,
+        preprocessed: &PreprocessedEncoderInputs,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        let placeholder = Self::token_for(metadata, "image_token_id")?;
+        let image = Self::config_token_id(metadata, "image_token_id")?;
+        let begin = Self::config_token_id(metadata, "boi_token_id")?;
+        let end = Self::config_token_id(metadata, "eoi_token_id")?;
+        Ok(preprocessed
+            .feature_token_counts
+            .iter()
+            .map(|&count| Self::wrapped(&placeholder, Modality::Image, begin, image, end, count))
+            .collect())
+    }
+
+    /// The sampling the decoder reported per clip, where its rate is usable.
+    fn usable_sampling(media: &[MediaItemInfo]) -> Vec<Option<&VideoSamplingInfo>> {
+        media
+            .iter()
+            .map(|item| {
+                item.video_sampling
+                    .as_ref()
+                    .filter(|sampling| sampling.source_fps.is_finite() && sampling.source_fps > 0.0)
+            })
+            .collect()
     }
 
     /// `[begin] + n x token + [end]`, the soft tokens as the feature span.
@@ -203,13 +230,63 @@ impl ModelProcessorSpec for Gemma4Spec {
         MediaPartOrder::Authored
     }
 
-    /// Image, video and native audio anchors are expanded by the serving engine.
-    /// Audio is worker-only; the router has no Gemma 4 audio tensor processor.
-    fn worker_expandable(&self, modality: Modality) -> bool {
-        matches!(
-            modality,
-            Modality::Image | Modality::Video | Modality::Audio
-        )
+    /// The per-modality table: image, video and native audio anchors are
+    /// expanded by the serving engine; audio is worker-only (the router has
+    /// no Gemma 4 audio tensor processor), so its replacements are refused;
+    /// video frames travel as `pixel_values_videos`, flat over the batch and
+    /// sliced per clip by `video_frame_counts`, which stays on the CPU.
+    fn hooks(&self, modality: Modality) -> Option<ModalityHooks> {
+        let image_layouts = || {
+            EncoderFieldLayouts::new(
+                FieldLayout::Batched,
+                HashMap::from([("pixel_position_ids".to_string(), FieldLayout::Batched)]),
+            )
+        };
+        Some(match modality {
+            Modality::Image => ModalityHooks {
+                placeholder: |metadata| Self::token_for(metadata, "image_token_id"),
+                placeholder_id: |metadata| Self::config_token_id(metadata, "image_token_id"),
+                replacements: |metadata, preprocessed, _, _| {
+                    Self::image_replacements(metadata, preprocessed)
+                },
+                layouts: image_layouts,
+                keep_on_cpu: &[],
+                encoder_input_key: None,
+                worker_expandable: true,
+            },
+            Modality::Video => ModalityHooks {
+                placeholder: |metadata| Self::token_for(metadata, "video_token_id"),
+                placeholder_id: |metadata| Self::config_token_id(metadata, "video_token_id"),
+                replacements: |metadata, preprocessed, media, _| {
+                    Self::video_replacements(metadata, preprocessed, &Self::usable_sampling(media))
+                },
+                layouts: || {
+                    EncoderFieldLayouts::new(
+                        FieldLayout::flat("video_frame_counts"),
+                        HashMap::from([
+                            (
+                                "pixel_position_ids_videos".to_string(),
+                                FieldLayout::flat("video_frame_counts"),
+                            ),
+                            ("video_frame_counts".to_string(), FieldLayout::Batched),
+                        ]),
+                    )
+                },
+                keep_on_cpu: &["video_frame_counts"],
+                encoder_input_key: Some("pixel_values_videos"),
+                worker_expandable: true,
+            },
+            Modality::Audio => ModalityHooks {
+                placeholder: |metadata| Self::token_for(metadata, "audio_token_id"),
+                placeholder_id: |metadata| Self::config_token_id(metadata, "audio_token_id"),
+                replacements: |_, _, _, _| Err(Self::unsupported(Modality::Audio)),
+                layouts: image_layouts,
+                keep_on_cpu: &[],
+                encoder_input_key: None,
+                worker_expandable: true,
+            },
+            Modality::ImageEmbeds => return None,
+        })
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -218,32 +295,6 @@ impl ModelProcessorSpec for Gemma4Spec {
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
         Self::config_token_id(metadata, "image_token_id")
-    }
-
-    fn placeholder_token_for(
-        &self,
-        metadata: &ModelMetadata,
-        modality: Modality,
-    ) -> RegistryResult<String> {
-        match modality {
-            Modality::Image => self.placeholder_token(metadata),
-            Modality::Video => Self::token_for(metadata, "video_token_id"),
-            Modality::Audio => Self::token_for(metadata, "audio_token_id"),
-            Modality::ImageEmbeds => Err(Self::unsupported(modality)),
-        }
-    }
-
-    fn placeholder_token_id_for(
-        &self,
-        metadata: &ModelMetadata,
-        modality: Modality,
-    ) -> RegistryResult<TokenId> {
-        match modality {
-            Modality::Image => self.placeholder_token_id(metadata),
-            Modality::Video => Self::config_token_id(metadata, "video_token_id"),
-            Modality::Audio => Self::config_token_id(metadata, "audio_token_id"),
-            Modality::ImageEmbeds => Err(Self::unsupported(modality)),
-        }
     }
 
     fn modality_limits(
@@ -283,52 +334,7 @@ impl ModelProcessorSpec for Gemma4Spec {
         metadata: &ModelMetadata,
         preprocessed: &PreprocessedEncoderInputs,
     ) -> RegistryResult<Vec<PromptReplacement>> {
-        let placeholder = self.placeholder_token(metadata)?;
-        let image = Self::config_token_id(metadata, "image_token_id")?;
-        let begin = Self::config_token_id(metadata, "boi_token_id")?;
-        let end = Self::config_token_id(metadata, "eoi_token_id")?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| Self::wrapped(&placeholder, Modality::Image, begin, image, end, count))
-            .collect())
-    }
-
-    fn prompt_replacements_for(
-        &self,
-        metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
-        modality: Modality,
-    ) -> RegistryResult<Vec<PromptReplacement>> {
-        match modality {
-            Modality::Image => self.prompt_replacements(metadata, preprocessed),
-            Modality::Video => Self::video_replacements(metadata, preprocessed, &[]),
-            _ => Err(Self::unsupported(modality)),
-        }
-    }
-
-    fn prompt_replacements_with_media(
-        &self,
-        metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
-        modality: Modality,
-        media: &[MediaItemInfo],
-        _preprocessor_config: &PreProcessorConfig,
-    ) -> RegistryResult<Vec<PromptReplacement>> {
-        match modality {
-            Modality::Video => {
-                let sampling: Vec<Option<&VideoSamplingInfo>> = media
-                    .iter()
-                    .map(|item| {
-                        item.video_sampling.as_ref().filter(|sampling| {
-                            sampling.source_fps.is_finite() && sampling.source_fps > 0.0
-                        })
-                    })
-                    .collect();
-                Self::video_replacements(metadata, preprocessed, &sampling)
-            }
-            _ => self.prompt_replacements_for(metadata, preprocessed, modality),
-        }
+        Self::image_replacements(metadata, preprocessed)
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -349,42 +355,8 @@ impl ModelProcessorSpec for Gemma4Spec {
         ])
     }
 
-    fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
-        match modality {
-            Modality::Video => EncoderFieldLayouts::new(
-                FieldLayout::flat("video_frame_counts"),
-                HashMap::from([
-                    (
-                        "pixel_position_ids_videos".to_string(),
-                        FieldLayout::flat("video_frame_counts"),
-                    ),
-                    ("video_frame_counts".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            _ => EncoderFieldLayouts::new(
-                FieldLayout::Batched,
-                HashMap::from([("pixel_position_ids".to_string(), FieldLayout::Batched)]),
-            ),
-        }
-    }
-
-    /// The model's forward takes frames as `pixel_values_videos`.
-    fn encoder_input_key_for(&self, modality: Modality) -> Option<String> {
-        match modality {
-            Modality::Video => Some("pixel_values_videos".to_string()),
-            _ => None,
-        }
-    }
-
     fn keep_on_cpu_keys(&self) -> Vec<String> {
         vec!["video_frame_counts".to_string()]
-    }
-
-    fn keep_on_cpu_keys_for(&self, modality: Modality) -> Vec<String> {
-        match modality {
-            Modality::Video => self.keep_on_cpu_keys(),
-            _ => Vec::new(),
-        }
     }
 
     fn video_frame_sampling(&self) -> FrameSampling {
@@ -402,6 +374,7 @@ mod tests {
     use crate::{
         registry::{test_helpers::*, ModelRegistry},
         types::ImageSize,
+        vision::PreProcessorConfig,
     };
 
     const IMAGE: &str = "<|image|>";
@@ -456,6 +429,42 @@ mod tests {
                 "video_frame_counts",
                 ModelSpecificValue::int_1d(vec![frames as i64]),
             )
+    }
+
+    /// The table says what the per-method matches said: three served
+    /// modalities, video's frames flat over the batch under their own key,
+    /// nothing for image embeddings.
+    #[test]
+    fn hooks_table_serves_image_video_and_audio() {
+        let spec = Gemma4Spec;
+        for modality in [Modality::Image, Modality::Video, Modality::Audio] {
+            assert!(spec.hooks(modality).is_some(), "{modality}");
+            assert!(spec.worker_expandable(modality), "{modality}");
+        }
+        assert!(spec.hooks(Modality::ImageEmbeds).is_none());
+        assert!(!spec.worker_expandable(Modality::ImageEmbeds));
+        assert_eq!(
+            spec.encoder_input_key_for(Modality::Video).as_deref(),
+            Some("pixel_values_videos")
+        );
+        assert_eq!(spec.encoder_input_key_for(Modality::Image), None);
+        assert_eq!(
+            spec.keep_on_cpu_keys_for(Modality::Video),
+            ["video_frame_counts"]
+        );
+        assert!(spec.keep_on_cpu_keys_for(Modality::Image).is_empty());
+        assert!(spec.keep_on_cpu_keys_for(Modality::Audio).is_empty());
+        assert_eq!(
+            spec.encoder_field_layouts_for(Modality::Video)
+                .encoder_input,
+            FieldLayout::flat("video_frame_counts")
+        );
+        for modality in [Modality::Image, Modality::Audio] {
+            assert_eq!(
+                spec.encoder_field_layouts_for(modality).encoder_input,
+                FieldLayout::Batched
+            );
+        }
     }
 
     #[test]

@@ -35,8 +35,9 @@ use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
-    modality_limit_override, EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata,
-    ModelProcessorSpec, ModelRegistryError, RegistryResult, Tokenizer,
+    modality_limit_override, EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModalityHooks,
+    ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult, ReplacementsHook,
+    Tokenizer,
 };
 
 pub struct ModelRegistry {
