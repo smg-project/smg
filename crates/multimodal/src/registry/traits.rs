@@ -36,6 +36,8 @@ pub enum ModelRegistryError {
     MissingConfigField { field: String },
     #[error("invalid or missing preprocessed field '{field}'")]
     InvalidPreprocessedField { field: String },
+    #[error("config field '{field}' is present but unusable: {reason}")]
+    InvalidConfigField { field: String, reason: String },
     #[error("model spec {spec} could not encode '{text}' with the model tokenizer")]
     TextEncodingFailed { spec: &'static str, text: String },
     #[error("modality {modality} is not supported by model spec {spec}")]

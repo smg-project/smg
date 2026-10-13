@@ -5,7 +5,7 @@
 //! images the Qwen2-VL way: a Qwen-style `smart_resize` onto a
 //! `patch_size * merge_size` grid, patchified into a flat
 //! `[total_patches, channels * temporal_patch_size * patch_size^2]` tensor
-//! alongside an `image_grid_thw` triple. vLLM's M3 vision tower consumes exactly
+//! alongside an `image_grid_thw` triple. The engine's M3 vision tower consumes exactly
 //! that layout, so this processor wraps the shared [`QwenVLProcessorBase`],
 //! supplies M3's own parameters, and raises images below M3's short-side floor
 //! before delegating.
@@ -198,12 +198,13 @@ impl MiniMaxM3VisionProcessor {
             .or(nested))
     }
 
-    /// Frames per temporal patch this processor pairs under `config`; unset or unusable values fall back to the default.
-    pub fn temporal_patch_size_from(config: &PreProcessorConfig) -> usize {
-        Self::declared_temporal_patch_size(config)
-            .ok()
-            .flatten()
-            .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE)
+    /// Frames per temporal patch this processor pairs under `config`: the flat
+    /// key, else the compression block, else the default. A present but
+    /// unusable block value is the configuration error the construction path
+    /// reports, so a prompt's stamps are never paired by a default that the
+    /// preprocessing of the same config refuses.
+    pub fn temporal_patch_size_from(config: &PreProcessorConfig) -> Result<usize, TransformError> {
+        Ok(Self::declared_temporal_patch_size(config)?.unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE))
     }
 
     /// Build a processor from a preprocessor config, falling back to M3's
@@ -710,37 +711,47 @@ mod tests {
         // The flat key, then the checkpoint block, then the default.
         let mut config = m3_config();
         assert_eq!(
-            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config).unwrap(),
             2
         );
         config.temporal_patch_size = Some(4);
         assert_eq!(
-            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config).unwrap(),
             4
         );
         assert_eq!(
-            MiniMaxM3VisionProcessor::temporal_patch_size_from(&PreProcessorConfig::default()),
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&PreProcessorConfig::default())
+                .unwrap(),
             DEFAULT_TEMPORAL_PATCH_SIZE
         );
     }
 
     #[test]
-    fn temporal_patch_size_from_treats_unusable_values_as_unset() {
-        // A zero flat key defers to the block; a zero or malformed block value is the default.
+    fn temporal_patch_size_from_rejects_unusable_block_values() {
+        // A zero flat key defers to the block; a zero or malformed block value
+        // is the configuration error the construction path reports, not the
+        // default.
         let mut config = m3_config();
         config.temporal_patch_size = Some(0);
         assert_eq!(
-            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config).unwrap(),
             2
         );
         for bad in ["0", "-1", "2.5", "\"two\"", "null"] {
             let raw =
                 format!(r#"{{"img_token_compression_config": {{"temporal_patch_size": {bad}}}}}"#);
             let config: PreProcessorConfig = serde_json::from_str(&raw).unwrap();
+            let error = MiniMaxM3VisionProcessor::temporal_patch_size_from(&config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("temporal_patch_size"), "{error}");
+            let constructed = MiniMaxM3VisionProcessor::from_preprocessor_config(&config)
+                .err()
+                .unwrap()
+                .to_string();
             assert_eq!(
-                MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
-                DEFAULT_TEMPORAL_PATCH_SIZE,
-                "temporal_patch_size {bad}"
+                error, constructed,
+                "temporal_patch_size {bad}: one reader, one error"
             );
         }
     }
@@ -767,7 +778,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 layered.temporal_patch_size(),
-                MiniMaxM3VisionProcessor::temporal_patch_size_from(&config)
+                MiniMaxM3VisionProcessor::temporal_patch_size_from(&config).unwrap()
             );
         }
     }

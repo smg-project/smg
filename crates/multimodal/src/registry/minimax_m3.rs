@@ -448,7 +448,11 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
             Modality::Video => {
                 let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
                 let temporal_patch_size =
-                    MiniMaxM3VisionProcessor::temporal_patch_size_from(preprocessor_config);
+                    MiniMaxM3VisionProcessor::temporal_patch_size_from(preprocessor_config)
+                        .map_err(|error| ModelRegistryError::InvalidConfigField {
+                            field: "img_token_compression_config.temporal_patch_size".to_string(),
+                            reason: error.to_string(),
+                        })?;
                 let stamps: Vec<Option<ClipStamps<'_>>> = media
                     .iter()
                     .map(|item| {
@@ -1088,6 +1092,36 @@ mod tests {
                 text: "]<]0.0 seconds[>[".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn malformed_temporal_patch_size_is_rejected_on_the_stamp_path() {
+        // The construction path refuses a present but unusable block value;
+        // the stamp path reports the same configuration error instead of
+        // pairing the frames by the default.
+        let meta = metadata();
+        let mut config = PreProcessorConfig::default();
+        config.extra.insert(
+            "img_token_compression_config".to_string(),
+            json!({ "temporal_patch_size": "two" }),
+        );
+        assert!(
+            MiniMaxM3VisionProcessor::from_preprocessor_config(&config).is_err(),
+            "the construction path refuses this config"
+        );
+
+        let error = MiniMaxM3VisionSpec
+            .prompt_replacements_with_media(
+                &meta,
+                &preprocessed_video(vec![12], 3),
+                Modality::Video,
+                &[sampled(&[0, 15, 30, 45, 60], 30.0)],
+                &config,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("temporal_patch_size"), "{error}");
     }
 
     #[test]
