@@ -2,11 +2,13 @@
 //! state machine the probes drive, the removal of failed workers, and the
 //! admin fan-outs (cache flush, profiling, engine metrics, fleet loads).
 //!
-//! The schedule is one deadline per probed worker. Every write to it comes
-//! from one decision, [`ProbeSlot::of`]: what the schedule does with a
-//! worker of a given status under the manager's configuration. A worker's
-//! deadline is re-armed when its probe launches (never when it completes),
-//! and `in_flight` keeps a slow probe from being joined by a second one.
+//! The schedule is one deadline per probed worker. Every slot a worker is
+//! given comes from one decision, [`ProbeSlot::of`]: what the schedule does
+//! with a worker of a given status under the manager's configuration (a
+//! removed worker's slot and the lag recovery's rebuild are the only writes
+//! beside it). A worker's deadline is re-armed when its probe launches
+//! (never when it completes), and `in_flight` keeps a slow probe from being
+//! joined by a second one.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -307,25 +309,31 @@ enum ProbeSlot {
     /// a probe would only churn metrics, and `compute_next_status` is a
     /// no-op for Draining anyway.
     Unprobed,
-    /// Failed under `--remove-unhealthy-workers`: the removal takes the
-    /// worker from here, so the schedule never holds it (a reconcile stays
+    /// Failed under `--remove-unhealthy-workers`, and the removal will take
+    /// the worker: the schedule never holds it (a reconcile stays
     /// side-effect-free, and a slot would queue the removal at its due
-    /// time). Without the flag a Failed worker keeps its slot: the probe is
-    /// how an engine that comes back on the same address rejoins.
+    /// time). Without the flag, and for a worker the removal skips (a mesh
+    /// import is owner-managed: [`should_remove_failed`]), a Failed worker
+    /// keeps its slot: the probe is the only way an engine that comes back
+    /// on the same address rejoins.
     Removal,
 }
 
 impl ProbeSlot {
-    /// The slot of a worker at `status`. A Failed worker under removal is
-    /// `Removal` whatever its health settings, so the connect signal can ask
-    /// this to recognise a last poll's contact.
+    /// The slot of a worker at `status`; `removable` is the registry's word
+    /// on whether a removal would take this worker
+    /// ([`should_remove_failed`]). A Failed worker under removal is `Removal`
+    /// whatever its health settings, so the connect signal can ask this to
+    /// recognise a last poll's contact (the order only shows there: a worker
+    /// with its checks disabled never holds a deadline).
     fn of(
         status: WorkerStatus,
         disable_health_check: bool,
         check_interval_secs: u64,
         config: &WorkerManagerConfig,
+        removable: bool,
     ) -> Self {
-        if status == WorkerStatus::Failed && config.remove_unhealthy {
+        if status == WorkerStatus::Failed && config.remove_unhealthy && removable {
             return Self::Removal;
         }
         if disable_health_check || status == WorkerStatus::Draining {
@@ -340,13 +348,20 @@ impl ProbeSlot {
 
     /// The slot of a registered worker at `status`: the status the caller
     /// read at a probe's launch, or the one a transition just installed.
-    fn of_worker(worker: &dyn Worker, status: WorkerStatus, config: &WorkerManagerConfig) -> Self {
+    fn of_worker(
+        registry: &Arc<WorkerRegistry>,
+        worker_id: &WorkerId,
+        worker: &dyn Worker,
+        status: WorkerStatus,
+        config: &WorkerManagerConfig,
+    ) -> Self {
         let health = &worker.metadata().health_config;
         Self::of(
             status,
             health.disable_health_check,
             health.check_interval_secs,
             config,
+            should_remove_failed(registry, worker_id),
         )
     }
 }
@@ -437,7 +452,9 @@ async fn run_health_loop(
                     // just failed under removal leaves the schedule (its
                     // removal is in flight). Every other transition keeps the
                     // deadline armed at the probe's launch.
-                    if ProbeSlot::of_worker(worker.as_ref(), new, &config) == ProbeSlot::Removal {
+                    if ProbeSlot::of_worker(&registry, &worker_id, worker.as_ref(), new, &config)
+                        == ProbeSlot::Removal
+                    {
                         next_check.remove(&worker_id);
                     }
                 }
@@ -484,7 +501,13 @@ fn apply_registry_event(
             new: worker,
             ..
         }) => {
-            let slot = ProbeSlot::of_worker(worker.as_ref(), worker.status(), config);
+            let slot = ProbeSlot::of_worker(
+                registry,
+                &worker_id,
+                worker.as_ref(),
+                worker.status(),
+                config,
+            );
             schedule_at(
                 next_check,
                 worker_id,
@@ -526,6 +549,7 @@ fn reconcile_from_registry(
             descriptor.disable_health_check,
             descriptor.check_interval_secs,
             config,
+            should_remove_failed(registry, &descriptor.worker_id),
         );
         schedule_at(next_check, descriptor.worker_id, slot, now, false);
     }
@@ -559,7 +583,14 @@ fn queue_due_probes(
         };
 
         let launched_status = worker.status();
-        let interval = match ProbeSlot::of_worker(worker.as_ref(), launched_status, config) {
+        let slot = ProbeSlot::of_worker(
+            registry,
+            &worker_id,
+            worker.as_ref(),
+            launched_status,
+            config,
+        );
+        let interval = match slot {
             ProbeSlot::Probe(interval) => interval,
             ProbeSlot::Unprobed => {
                 next_check.remove(&worker_id);
@@ -711,7 +742,13 @@ fn apply_connect_signal(
     // A Failed worker under removal is on its way out: the contact that
     // signalled it was a last poll, not a return.
     if registry.get(&worker_id).is_some_and(|worker| {
-        ProbeSlot::of_worker(worker.as_ref(), worker.status(), config) == ProbeSlot::Removal
+        ProbeSlot::of_worker(
+            registry,
+            &worker_id,
+            worker.as_ref(),
+            worker.status(),
+            config,
+        ) == ProbeSlot::Removal
     }) {
         debug!(worker_url = %url, "Connect signal for a worker being removed; ignoring");
         return;
@@ -724,7 +761,7 @@ fn apply_connect_signal(
             // otherwise a later engine death would leave it Ready with a dead
             // client forever.
             if let Some(worker) = registry.get(&worker_id) {
-                let slot = ProbeSlot::of_worker(worker.as_ref(), new, config);
+                let slot = ProbeSlot::of_worker(registry, &worker_id, worker.as_ref(), new, config);
                 schedule_at(
                     next_check,
                     worker_id,
@@ -1621,10 +1658,11 @@ mod tests {
         Arc::new(BasicWorkerBuilder::from_spec(spec).build())
     }
 
-    /// The one decision behind every schedule write: a Failed worker under
-    /// removal has no slot whatever its health settings, a worker whose
-    /// checks are off or whose drain is the removal workflow's is never
-    /// probed, everyone else is probed at its own interval or the default.
+    /// The one decision behind every slot: a Failed worker that a removal
+    /// will take has no slot whatever its health settings, one the removal
+    /// skips keeps its probe, a worker whose checks are off or whose drain is
+    /// the removal workflow's is never probed, everyone else is probed at its
+    /// own interval or the default.
     #[test]
     fn the_probe_slot_follows_the_status_and_the_health_settings() {
         let config = |remove_unhealthy| WorkerManagerConfig {
@@ -1632,25 +1670,137 @@ mod tests {
             remove_unhealthy,
         };
         let probe = |secs| ProbeSlot::Probe(Duration::from_secs(secs));
+        // (status, checks disabled, own interval, --remove-unhealthy-workers, removable, slot)
         let cases = [
-            (WorkerStatus::Pending, false, 0, false, probe(5)),
-            (WorkerStatus::Pending, false, 7, true, probe(7)),
-            (WorkerStatus::Ready, false, 7, false, probe(7)),
-            (WorkerStatus::NotReady, false, 7, true, probe(7)),
-            (WorkerStatus::Failed, false, 7, false, probe(7)),
-            (WorkerStatus::Failed, false, 7, true, ProbeSlot::Removal),
-            (WorkerStatus::Failed, true, 7, true, ProbeSlot::Removal),
-            (WorkerStatus::Ready, true, 7, false, ProbeSlot::Unprobed),
-            (WorkerStatus::Draining, false, 7, false, ProbeSlot::Unprobed),
-            (WorkerStatus::Draining, false, 7, true, ProbeSlot::Unprobed),
+            (WorkerStatus::Pending, false, 0, false, true, probe(5)),
+            (WorkerStatus::Pending, false, 7, true, true, probe(7)),
+            (WorkerStatus::Ready, false, 7, false, true, probe(7)),
+            (WorkerStatus::NotReady, false, 7, true, true, probe(7)),
+            (WorkerStatus::Failed, false, 7, false, true, probe(7)),
+            (
+                WorkerStatus::Failed,
+                false,
+                7,
+                true,
+                true,
+                ProbeSlot::Removal,
+            ),
+            (
+                WorkerStatus::Failed,
+                true,
+                7,
+                true,
+                true,
+                ProbeSlot::Removal,
+            ),
+            (WorkerStatus::Failed, false, 7, true, false, probe(7)),
+            (
+                WorkerStatus::Ready,
+                true,
+                7,
+                false,
+                true,
+                ProbeSlot::Unprobed,
+            ),
+            (
+                WorkerStatus::Draining,
+                false,
+                7,
+                false,
+                true,
+                ProbeSlot::Unprobed,
+            ),
+            (
+                WorkerStatus::Draining,
+                false,
+                7,
+                true,
+                true,
+                ProbeSlot::Unprobed,
+            ),
         ];
-        for (status, disabled, interval, remove_unhealthy, expected) in cases {
+        for (status, disabled, interval, remove_unhealthy, removable, expected) in cases {
             assert_eq!(
-                ProbeSlot::of(status, disabled, interval, &config(remove_unhealthy)),
+                ProbeSlot::of(
+                    status,
+                    disabled,
+                    interval,
+                    &config(remove_unhealthy),
+                    removable
+                ),
                 expected,
-                "{status:?} disabled={disabled} interval={interval} removal={remove_unhealthy}"
+                "{status:?} disabled={disabled} interval={interval} removal={remove_unhealthy} \
+                 removable={removable}"
             );
         }
+    }
+
+    /// A mesh import that the local probes took to Failed is owner-managed:
+    /// `--remove-unhealthy-workers` never removes it, so it must keep its
+    /// probe slot (the reconcile and the due-probe pass alike), take no
+    /// removal, and answer its connect signal, or it stays Failed and
+    /// unroutable on this node until its owner re-publishes it.
+    #[tokio::test]
+    async fn a_failed_mesh_import_under_removal_keeps_its_probe_slot() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: "http://remote:1".to_string(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+        });
+        let worker_id = registry.get_id_by_url("http://remote:1").unwrap();
+        let worker = registry.get(&worker_id).unwrap();
+        worker.set_status(WorkerStatus::Failed);
+        let config = WorkerManagerConfig {
+            default_check_interval_secs: 5,
+            remove_unhealthy: true,
+        };
+
+        let mut next_check = HashMap::new();
+        reconcile_from_registry(&registry, &mut next_check, &config);
+        assert!(
+            next_check.contains_key(&worker_id),
+            "the reconcile keeps a Failed import on the schedule"
+        );
+
+        next_check.insert(worker_id.clone(), tokio::time::Instant::now());
+        let mut in_flight = HashSet::new();
+        let mut probes: ProbeFutures = FuturesUnordered::new();
+        let removals = queue_due_probes(
+            &registry,
+            &config,
+            &mut next_check,
+            &mut in_flight,
+            &mut probes,
+            tokio::time::Instant::now(),
+        );
+        assert!(
+            removals.is_empty(),
+            "no removal: the import is owner-managed"
+        );
+        assert!(
+            in_flight.contains(&worker_id) && next_check.contains_key(&worker_id),
+            "the due pass probes the import and re-arms its slot"
+        );
+
+        apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: "http://remote:1".to_string(),
+                revision: worker.revision(),
+            },
+            &mut next_check,
+            &config,
+        );
+        assert_eq!(
+            registry.get(&worker_id).unwrap().status(),
+            WorkerStatus::Ready,
+            "a contact from the import promotes it: it is not being removed"
+        );
     }
 
     #[test]
