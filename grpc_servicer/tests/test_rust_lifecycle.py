@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import multiprocessing
 import os
@@ -612,3 +613,25 @@ def test_the_guard_ends_the_process_even_when_its_report_fails(monkeypatch):
     monkeypatch.setattr(rust_lifecycle.os, "_exit", ended.append)
     rust_lifecycle._end_process(1, 15.0)
     assert ended == [1]
+
+
+def test_launch_or_stop_stops_the_server_only_when_the_launch_raises():
+    events: list[str] = []
+
+    class Server:
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+
+    server = Server()
+    assert asyncio.run(rust_lifecycle.launch_or_stop(server, lambda: "engine")) == "engine"
+    assert events == []
+
+    def failing_launch():
+        raise RuntimeError("engine would not start")
+
+    with pytest.raises(RuntimeError, match="engine would not start"):
+        asyncio.run(rust_lifecycle.launch_or_stop(server, failing_launch))
+    assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}"]

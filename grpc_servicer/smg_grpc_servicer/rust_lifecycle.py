@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DRAIN_SECS = 5.0
 ENGINE_TERMINATE_SECS = 30.0
+# How long the Rust server gets to stop: at the end of the supervision loop,
+# and when the engine launch behind an already-bound server failed.
+SERVER_STOP_SECS = 5.0
 # Bound on silence during the engine's ZMQ handshake. An engine's start
 # includes model load, kernel JIT and graph capture, and nothing crosses the
 # wire between its first handshake message and its last; a server that takes
@@ -704,6 +707,19 @@ def _start_time(pid: int) -> str | None:
     return fields[19]
 
 
+async def launch_or_stop(server: Any, launch: Callable[[], Any]) -> Any:
+    """Start the engine behind an already-bound server: ``launch()``'s handle,
+    or, when the launch raises, the error after the server was marked not
+    serving and stopped. The server owns the port and a runtime thread; a
+    launch that fails must not leave them to the process exit."""
+    try:
+        return launch()
+    except BaseException:
+        server.set_serving(False)
+        await asyncio.to_thread(server.stop, SERVER_STOP_SECS)
+        raise
+
+
 def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> None:
     """SIGTERM the headless engine (it tears down its own workers), then kill;
     workers that outlived it either way are killed too."""
@@ -727,7 +743,7 @@ async def supervise(
     engine: Any,
     *,
     drain_secs: float = DEFAULT_DRAIN_SECS,
-    stop_timeout: float = 5.0,
+    stop_timeout: float = SERVER_STOP_SECS,
     stop_event: asyncio.Event | None = None,
     poll_secs: float = _POLL_SECS,
 ) -> int:

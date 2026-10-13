@@ -53,6 +53,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     default_socket_dir,
     ensure_spawn_start_method,
     free_port,
+    launch_or_stop,
     on_fault_signal,
     read_launcher_knobs,
     resolve_tokenizer_dir,
@@ -499,5 +500,7 @@ async def serve_rust(server_args: Any) -> int:
         f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
         STARTUP_CEILING_SECS_ENV,
     )
-    engine = launch_scheduler_ranks(server_args, handshake_port=handshake_port)
+    engine = await launch_or_stop(
+        server, lambda: launch_scheduler_ranks(server_args, handshake_port=handshake_port)
+    )
     return await supervise(server, engine, drain_secs=knobs.drain_secs)

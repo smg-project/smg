@@ -63,6 +63,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     ServicerConfigError,
     default_socket_dir,
     free_port,
+    launch_or_stop,
     read_launcher_knobs,
     resolve_tokenizer_dir,
     servicer_switch,
@@ -588,18 +589,14 @@ async def serve_rust(args: argparse.Namespace) -> int:
         f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
         STARTUP_CEILING_SECS_ENV,
     )
-    try:
-        engine = launch_engine_cores(
+    engine = await launch_or_stop(
+        server,
+        lambda: launch_engine_cores(
             headless_namespace(
                 args, handshake_port=handshake_port, data_parallel_size=data_parallel_size
             )
-        )
-    except BaseException:
-        # The server owns the port and a runtime thread; a launch that fails
-        # must not leave them to the process exit.
-        server.set_serving(False)
-        await asyncio.to_thread(server.stop, 5.0)
-        raise
+        ),
+    )
     logger.info("Launched the headless engine (pid %s)", engine.pid)
     if media is not None:
         media.start_warmup()

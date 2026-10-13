@@ -945,3 +945,41 @@ def test_serve_rust_refuses_a_socket_dir_that_is_a_file_before_the_server_binds(
 def test_a_disaggregated_worker_is_refused_as_a_configuration_error():
     with pytest.raises(rust_lifecycle.ServicerConfigError, match="PD disaggregation"):
         rust.refuse_disaggregation(_server_args(disaggregation_mode="prefill"))
+
+
+def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_path):
+    """The server owns the port and a runtime thread: a scheduler launch that
+    raises must not leave them to the process exit (what the vLLM launcher
+    does), and nothing is supervised."""
+    events: list[str] = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            self.address = kwargs["bind_address"]
+
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
+    monkeypatch.setattr(
+        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+    )
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
+
+    def failing_launch(server_args, *, handshake_port):
+        raise RuntimeError("scheduler would not start")
+
+    async def never_supervise(*_args, **_kwargs):
+        pytest.fail("a failed launch was supervised")
+
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", failing_launch)
+    monkeypatch.setattr(rust, "supervise", never_supervise)
+    with pytest.raises(RuntimeError, match="scheduler would not start"):
+        asyncio.run(rust.serve_rust(_server_args()))
+    assert events == ["serving:False", "stop:5.0"]

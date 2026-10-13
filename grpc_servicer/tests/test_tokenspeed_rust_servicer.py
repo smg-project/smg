@@ -1064,3 +1064,42 @@ def test_the_launcher_answers_a_configuration_error_with_exit_code_2(launcher, m
         module.main(["--servicer-impl", "rust", "--model", "org/m"])
     assert raised.value.code == 2
     assert "SMG_TOKENSPEED_SERVICER_DRAIN_SECS='abc' is not a number" in caplog.text
+
+
+def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_path):
+    """The server owns the port and a runtime thread: a scheduler launch that
+    raises must not leave them to the process exit (what the vLLM launcher
+    does), and nothing is supervised."""
+    events: list[str] = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            self.address = kwargs["bind_address"]
+
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model})
+    monkeypatch.setattr(
+        rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
+    )
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
+    monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
+
+    def failing_launch(headless):
+        raise RuntimeError("scheduler would not start")
+
+    async def never_supervise(*_args, **_kwargs):
+        pytest.fail("a failed launch was supervised")
+
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", failing_launch)
+    monkeypatch.setattr(rust, "supervise", never_supervise)
+    with pytest.raises(RuntimeError, match="scheduler would not start"):
+        asyncio.run(rust.serve_rust(FakeServerArgs(port=50123)))
+    assert events == ["serving:False", "stop:5.0"]
