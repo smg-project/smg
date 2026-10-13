@@ -42,7 +42,8 @@ use crate::{
         metrics_aggregator::{self, MetricPack},
         registry::WorkerId,
         worker::WorkerTypeExt,
-        ConnectionMode, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
+        ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
+        WorkerType,
     },
     workflow::{steps::local::discover_grpc_kv_engine_id, Job, JobQueue},
 };
@@ -246,12 +247,6 @@ impl WorkerManager {
         // the same registry would simply run poll-only.
         let connect_rx = registry.take_connect_signal_receiver();
 
-        let job_queue = if config.remove_unhealthy {
-            job_queue
-        } else {
-            None
-        };
-
         #[expect(
             clippy::disallowed_methods,
             reason = "WorkerManager loop runs for the lifetime of the registry; handle is stored and abort() runs on drop"
@@ -430,6 +425,13 @@ async fn run_health_loop(
     job_queue: Option<Arc<JobQueue>>,
     shutdown: Arc<Notify>,
 ) {
+    // Removals go to the queue only under `remove_unhealthy`; label refreshes
+    // (a worker coming into service) always do.
+    let removal_queue = if config.remove_unhealthy {
+        job_queue.clone()
+    } else {
+        None
+    };
     let mut probes: ProbeFutures = FuturesUnordered::new();
     let mut in_flight: HashSet<WorkerId> = HashSet::new();
 
@@ -444,7 +446,7 @@ async fn run_health_loop(
             now,
         );
         for removal in removals {
-            if let Some(jq) = job_queue.as_ref() {
+            if let Some(jq) = removal_queue.as_ref() {
                 submit_removal_job(
                     &registry,
                     &removal.worker_id,
@@ -467,8 +469,13 @@ async fn run_health_loop(
                 let worker_id = completion.worker_id.clone();
                 let worker = Arc::clone(&completion.worker);
                 in_flight.remove(&worker_id);
-                if let ProbeApplyResult::Applied(Some((_, new))) =
-                    apply_probe_completion(&registry, completion, job_queue.as_ref()).await
+                if let ProbeApplyResult::Applied(Some((_, new))) = apply_probe_completion(
+                    &registry,
+                    completion,
+                    removal_queue.as_ref(),
+                    job_queue.as_ref(),
+                )
+                .await
                 {
                     // The one slot a probe's outcome changes: a worker that
                     // just failed under removal leaves the schedule (its
@@ -656,6 +663,7 @@ async fn apply_probe_completion(
     registry: &Arc<WorkerRegistry>,
     completion: ProbeCompletion,
     job_queue: Option<&Arc<JobQueue>>,
+    refresh_queue: Option<&Arc<JobQueue>>,
 ) -> ProbeApplyResult {
     let ProbeCompletion {
         worker_id,
@@ -728,6 +736,11 @@ async fn apply_probe_completion(
                     jq,
                 )
                 .await;
+            }
+        }
+        if new == WorkerStatus::Ready && labels_follow_the_engine(registry, &worker_id, &worker) {
+            if let Some(jq) = refresh_queue {
+                submit_label_refresh(&worker, jq).await;
             }
         }
     }
@@ -887,6 +900,49 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
             worker_url = %worker.url(),
             timeout_secs = timeout.as_secs(),
             "Re-reading the KV engine id of a recovered PD worker timed out; keeping the previous one and retrying on the next probe"
+        ),
+    }
+}
+
+/// Whether a worker's labels are re-read from its engine when it comes into
+/// service: a worker this node registered itself (a mesh import carries its
+/// owner's labels), over a transport with metadata endpoints (a ZMQ engine
+/// reports its geometry at the handshake), that is a self-hosted engine (an
+/// external provider is never read for engine metadata, at registration or
+/// later). Judged by kind, not by what registration's read returned: a read
+/// that failed leaves empty labels behind, and the first transition into
+/// service is what fills them in; an engine that offers no metadata answers
+/// a refresh with no labels, which the refresh step skips.
+fn labels_follow_the_engine(
+    registry: &WorkerRegistry,
+    worker_id: &WorkerId,
+    worker: &Arc<dyn Worker>,
+) -> bool {
+    registry.origin_of(worker_id) == Some(WorkerOrigin::Local)
+        && *worker.connection_mode() != ConnectionMode::Zmq
+        && worker.metadata().spec.runtime_type != RuntimeType::External
+}
+
+/// A worker that came into service may be a new engine process on the same
+/// address, or an engine that finished loading after the worker was
+/// registered on provisional information. Its labels, and everything derived
+/// from them (the decode admission window, multimodal placement, PD pairing),
+/// are re-read through the update workflow, which rebuilds the worker only if
+/// they changed. A failed submission is logged; the next transition retries.
+async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue>) {
+    let url = worker.url().to_string();
+    match job_queue
+        .submit(Job::RefreshWorkerLabels { url: url.clone() })
+        .await
+    {
+        Ok(()) => debug!(
+            worker_url = %url,
+            "Submitted a label refresh for a worker that came into service"
+        ),
+        Err(error) => warn!(
+            worker_url = %url,
+            %error,
+            "Could not submit a label refresh for a worker that came into service"
         ),
     }
 }
@@ -1498,7 +1554,7 @@ mod tests {
             launched_status: WorkerStatus::NotReady,
             probe_result: Ok(()),
         };
-        let applied = apply_probe_completion(&registry, completion, None).await;
+        let applied = apply_probe_completion(&registry, completion, None, None).await;
         assert!(matches!(
             applied,
             ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
@@ -1512,9 +1568,156 @@ mod tests {
             CircuitState::HalfOpen,
             "the promotion puts the open breaker on trial instead of leaving it to its timeout"
         );
+    }
+
+    /// Labels follow the engine for a worker this node registered itself over
+    /// a transport with metadata endpoints; a mesh import carries its owner's
+    /// labels and a ZMQ engine reports its geometry at the handshake.
+    fn discovered_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    success_threshold: 1,
+                    failure_threshold: 1,
+                    timeout_secs: 1,
+                    check_interval_secs: 1,
+                    disable_health_check: false,
+                    drain_settle_secs: 0,
+                })
+                .labels(HashMap::from([(
+                    "max_num_seqs".to_string(),
+                    "256".to_string(),
+                )]))
+                .discovered_labels(HashMap::from([(
+                    "max_num_seqs".to_string(),
+                    "256".to_string(),
+                )]))
+                .build(),
+        )
+    }
+
+    #[test]
+    fn labels_follow_the_engine_for_local_non_zmq_workers_only() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let local = discovered_worker("http://local:1");
+        let local_id = registry.register(local.clone()).unwrap();
+        assert!(labels_follow_the_engine(&registry, &local_id, &local));
+
+        // Registration discovered nothing (its read failed, or the engine
+        // offers no metadata): the labels follow once the engine answers.
+        let undiscovered = make_worker("http://local:2", 1, 1);
+        let undiscovered_id = registry.register(undiscovered.clone()).unwrap();
+        assert!(labels_follow_the_engine(
+            &registry,
+            &undiscovered_id,
+            &undiscovered
+        ));
+
+        // An external provider is never read for engine metadata.
+        let external: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("https://provider.example")
+                .runtime_type(RuntimeType::External)
+                .build(),
+        );
+        let external_id = registry.register(external.clone()).unwrap();
+        assert!(!labels_follow_the_engine(
+            &registry,
+            &external_id,
+            &external
+        ));
+
+        let zmq: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("ipc:///tmp/engine.sock")
+                .connection_mode(ConnectionMode::Zmq)
+                .build(),
+        );
+        let zmq_id = registry.register(zmq.clone()).unwrap();
+        assert!(!labels_follow_the_engine(&registry, &zmq_id, &zmq));
+
+        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+            worker_id: "peer-w1".to_string(),
+            model_id: "m".to_string(),
+            url: "http://remote:1".to_string(),
+            health: true,
+            load: 0.0,
+            version: 1,
+            spec: vec![],
+            owner: "peer".to_string(),
+        });
+        let mesh_id = registry.get_id_by_url("http://remote:1").unwrap();
+        let mesh = registry.get(&mesh_id).unwrap();
+        assert!(!labels_follow_the_engine(&registry, &mesh_id, &mesh));
+    }
+
+    /// A transition into Ready submits a label refresh for the worker's URL,
+    /// with no removal queue (the shape of `remove_unhealthy = false`).
+    #[tokio::test]
+    async fn a_transition_into_ready_submits_a_label_refresh() {
+        use crate::{
+            service_discovery::testing::create_test_app_context, workflow::JobQueueConfig,
+        };
+        let app_context = create_test_app_context();
+        let registry = Arc::clone(&app_context.worker_registry);
+        let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+
+        let worker = discovered_worker("http://local:7");
+        worker.set_status(WorkerStatus::NotReady);
+        let worker_id = registry.register(worker.clone()).unwrap();
+        let completion = ProbeCompletion {
+            worker_id,
+            worker: worker.clone(),
+            expected_revision: worker.revision(),
+            launched_status: WorkerStatus::NotReady,
+            probe_result: Ok(()),
+        };
+        let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
+        assert!(matches!(
+            applied,
+            ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
+        ));
+        assert!(
+            job_queue.get_status("http://local:7").is_some(),
+            "a refresh job was submitted for the worker that came into service"
+        );
+        assert_eq!(worker.status(), WorkerStatus::Ready);
         assert!(
             worker.is_available(),
             "a worker promoted by its probes is routable at once"
+        );
+    }
+
+    /// Registration's read can fail while an engine is still loading, and the
+    /// step registers the worker with no labels rather than failing; the first
+    /// transition into service is then what fills them in.
+    #[tokio::test]
+    async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_service() {
+        use crate::{
+            service_discovery::testing::create_test_app_context, workflow::JobQueueConfig,
+        };
+        let app_context = create_test_app_context();
+        let registry = Arc::clone(&app_context.worker_registry);
+        let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+
+        let worker = make_worker("http://local:8", 1, 1);
+        assert!(worker.metadata().discovered_labels.is_empty());
+        worker.set_status(WorkerStatus::NotReady);
+        let worker_id = registry.register(worker.clone()).unwrap();
+        let completion = ProbeCompletion {
+            worker_id,
+            worker: worker.clone(),
+            expected_revision: worker.revision(),
+            launched_status: WorkerStatus::NotReady,
+            probe_result: Ok(()),
+        };
+        let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
+        assert!(matches!(
+            applied,
+            ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
+        ));
+        assert!(
+            job_queue.get_status("http://local:8").is_some(),
+            "a worker whose registration discovered nothing is refreshed all the same"
         );
     }
 
@@ -2348,7 +2551,7 @@ mod tests {
         assert_eq!(current.status(), WorkerStatus::Ready);
         assert_eq!(current.revision(), expected_revision + 1);
 
-        let result = apply_probe_completion(&registry, completion, None).await;
+        let result = apply_probe_completion(&registry, completion, None, None).await;
         assert!(matches!(result, ProbeApplyResult::Stale));
         assert_eq!(
             registry.get(&worker_id).unwrap().status(),

@@ -68,6 +68,7 @@ impl GrpcWorker {
         let metadata = WorkerMetadata {
             pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
+            discovered_labels: Arc::default(),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),

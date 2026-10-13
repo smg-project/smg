@@ -11,7 +11,7 @@ use crate::{
 /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
 /// accepted and queued but never processed, so tests observe what discovery
 /// *submits* without spawning workflow background tasks.
-pub(super) fn create_test_app_context() -> Arc<AppContext> {
+pub(crate) fn create_test_app_context() -> Arc<AppContext> {
     use crate::{
         config::RouterConfig, middleware::TokenBucket,
         observability::inflight_tracker::InFlightRequestTracker,
