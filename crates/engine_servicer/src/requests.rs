@@ -288,19 +288,13 @@ mod tests {
         assert!(!cut);
     }
 
-    /// The engine's own `Complete` already went out and the shutdown lands
-    /// before the next poll: the choice holds nothing and is not open (its
-    /// engine stream went with the completion), so the request keeps the
-    /// clean end it had; only a choice still generating is cut.
+    /// A choice whose completion already went out next to one still
+    /// generating: only the latter is cut. (That a choice stream drops its
+    /// engine stream as the engine's own `Complete` goes out, so it is
+    /// `done` here and not `open`, is pinned per servicer by
+    /// `a_shutdown_after_the_engines_completion_ends_the_stream_cleanly`.)
     #[test]
     fn a_choice_whose_completion_already_went_out_is_not_cut() {
-        let mut all = choices(vec![Choice::done()]);
-        let (finished, cut) = settle_shutdown(&mut all);
-        assert!(finished.is_empty());
-        assert!(
-            !cut,
-            "nothing was open: no status after a completion that went out"
-        );
         let mut mixed = choices(vec![Choice::done(), Choice::open()]);
         let (finished, cut) = settle_shutdown(&mut mixed);
         assert!(finished.is_empty());
