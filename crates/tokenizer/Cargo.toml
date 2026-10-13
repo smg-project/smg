@@ -89,3 +89,7 @@ harness = false
 [[bench]]
 name = "decode_compare"
 harness = false
+
+[[bench]]
+name = "prefix_cache"
+harness = false
