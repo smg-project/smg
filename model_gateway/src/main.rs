@@ -2167,45 +2167,8 @@ impl CliArgs {
             value: value.to_string(),
             reason: reason.to_string(),
         };
-        for origin in &self.cors_allowed_origins {
-            // A lone `*` is the open policy; next to an origin it would be
-            // either a typo or a list the layer cannot express.
-            if origin == "*" {
-                if self.cors_allowed_origins.len() == 1 {
-                    continue;
-                }
-                return Err(invalid(
-                    "cors_allowed_origins",
-                    origin,
-                    "'*' stands alone: either any origin or a list of exact origins",
-                ));
-            }
-            // Exactly what a browser sends as `Origin`: the scheme and the host
-            // in lower case, no userinfo, no default port, nothing after the
-            // authority (not even `/`); anything else never matches the exact
-            // comparison of the CORS layer.
-            let default_port = |scheme: &str| match scheme {
-                "http" | "ws" => Some(80),
-                "https" | "wss" => Some(443),
-                _ => None,
-            };
-            let parsed = http::Uri::try_from(origin.as_str()).ok().filter(|uri| {
-                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
-                    if origin.as_str() == format!("{scheme}://{authority}")
-                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
-                        && !authority.as_str().contains('@')
-                        && authority
-                            .port_u16()
-                            .is_none_or(|port| Some(port) != default_port(scheme)))
-            });
-            if parsed.is_none() || http::HeaderValue::from_str(origin).is_err() {
-                return Err(invalid(
-                    "cors_allowed_origins",
-                    origin,
-                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
-                ));
-            }
-        }
+        // `cors_allowed_origins` is checked by the shared `ConfigValidator`, which
+        // every construction path runs (this CLI through `builder.build()`).
         if !self.health_check_endpoint.starts_with('/') {
             return Err(invalid(
                 "health_check_endpoint",

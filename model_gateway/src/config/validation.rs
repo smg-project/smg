@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use axum::http::HeaderName;
+use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -286,6 +286,7 @@ impl ConfigValidator {
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
+        Self::validate_cors_allowed_origins(config)?;
         Self::validate_log_dir(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
@@ -1193,6 +1194,56 @@ impl ConfigValidator {
             });
         }
 
+        Ok(())
+    }
+
+    /// `cors_allowed_origins`: exact origins, or a lone `*` for the open
+    /// policy. This is the one place the rule is checked, so the Python
+    /// launcher and library callers (`RouterConfig::builder().build()`)
+    /// refuse the same values by name as `smg launch` does.
+    fn validate_cors_allowed_origins(config: &RouterConfig) -> ConfigResult<()> {
+        let invalid = |origin: &str, reason: &str| ConfigError::InvalidValue {
+            field: "cors_allowed_origins".to_string(),
+            value: origin.to_string(),
+            reason: reason.to_string(),
+        };
+        for origin in &config.cors_allowed_origins {
+            // A lone `*` is the open policy; next to an origin it would be
+            // either a typo or a list the layer cannot express.
+            if origin == "*" {
+                if config.cors_allowed_origins.len() == 1 {
+                    continue;
+                }
+                return Err(invalid(
+                    origin,
+                    "'*' stands alone: either any origin or a list of exact origins",
+                ));
+            }
+            // Exactly what a browser sends as `Origin`: the scheme and the host
+            // in lower case, no userinfo, no default port, nothing after the
+            // authority (not even `/`); anything else never matches the exact
+            // comparison of the CORS layer.
+            let default_port = |scheme: &str| match scheme {
+                "http" | "ws" => Some(80),
+                "https" | "wss" => Some(443),
+                _ => None,
+            };
+            let parsed = Uri::try_from(origin.as_str()).ok().filter(|uri| {
+                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
+                    if origin.as_str() == format!("{scheme}://{authority}")
+                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
+                        && !authority.as_str().contains('@')
+                        && authority
+                            .port_u16()
+                            .is_none_or(|port| Some(port) != default_port(scheme)))
+            });
+            if parsed.is_none() || HeaderValue::from_str(origin).is_err() {
+                return Err(invalid(
+                    origin,
+                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -4151,5 +4202,57 @@ mod tests {
             })
             .build_unchecked();
         assert!(ConfigValidator::validate(&ok).is_ok());
+    }
+
+    /// The CORS origin rule holds on every construction path, not only in
+    /// the CLI: a lone `*` is the open policy, `*` next to an origin and a
+    /// value that is not exactly an origin are refused by name.
+    #[test]
+    fn cors_allowed_origins_are_exact_origins_or_a_lone_wildcard_on_every_path() {
+        let config = |origins: &[&str]| {
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .round_robin_policy()
+                .cors_allowed_origins(origins.iter().map(|origin| (*origin).to_string()).collect())
+                .build_unchecked()
+        };
+        for accepted in [
+            &[][..],
+            &["*"][..],
+            &["https://app.example"][..],
+            &["https://app.example", "http://localhost:3000"][..],
+        ] {
+            assert!(
+                ConfigValidator::validate(&config(accepted)).is_ok(),
+                "{accepted:?} is accepted"
+            );
+        }
+        for (refused, named) in [
+            (&["*", "https://app.example"][..], "*"),
+            (&["https://app.example", "*"][..], "*"),
+            (&["https://Example.com"][..], "https://Example.com"),
+            (&["example.com"][..], "example.com"),
+            (&["https://example.com/"][..], "https://example.com/"),
+        ] {
+            match ConfigValidator::validate(&config(refused)) {
+                Err(ConfigError::InvalidValue { field, value, .. }) => {
+                    assert_eq!(
+                        (field.as_str(), value.as_str()),
+                        ("cors_allowed_origins", named)
+                    );
+                }
+                other => panic!("{refused:?}: {other:?}"),
+            }
+        }
+        // The launcher's path: the builder's validating `build()`.
+        let built = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .cors_allowed_origins(vec!["*".to_string(), "https://app.example".to_string()])
+            .build();
+        assert!(
+            matches!(built, Err(ConfigError::InvalidValue { ref field, .. }) if field == "cors_allowed_origins"),
+            "{built:?}"
+        );
     }
 }

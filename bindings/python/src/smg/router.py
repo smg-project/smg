@@ -310,8 +310,9 @@ class Router:
         rate_limit_tokens_per_second: Sustained admission rate (requests per
             second), bursting up to max_concurrent_requests, which keeps bounding
             standing concurrency. Unset or 0 = no rate limit. Default: None
-        cors_allowed_origins: List of allowed origins for CORS. Empty list allows all
-            origins. Default: []
+        cors_allowed_origins: Exact origins a browser may call the gateway from, or
+            ['*'] alone for any origin. An empty list sends no CORS headers (no
+            cross-origin allowance). Default: []
         health_failure_threshold: Number of consecutive health check failures before
             marking worker unhealthy. Default: 3
         health_success_threshold: Number of consecutive health check successes before
