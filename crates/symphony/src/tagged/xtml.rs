@@ -543,6 +543,28 @@ fn is_index(tail: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+        self.feed(text, out);
+        text.len()
+    }
+
+    /// Only the call's closing tag is a started call's end, as for XML.
+    fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool {
+        if terminal == CALL_CLOSE || !self.started() {
+            (*self).close(terminal, out);
+            true
+        } else {
+            (*self).close("", out);
+            false
+        }
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

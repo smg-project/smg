@@ -683,6 +683,23 @@ pub(crate) fn push_escaped(out: &mut String, text: &str) {
     }
 }
 
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+        self.feed(text, declared, out)
+    }
+
+    /// The region's marker closes the call for the client; it belongs to the region, not to the
+    /// call.
+    fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
+        (*self).close(out);
+        false
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use openai_protocol::common::{Function, Tool};

@@ -761,3 +761,31 @@ impl Assembler {
         });
     }
 }
+
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+        self.feed(text, declared, out);
+        text.len()
+    }
+
+    fn ignored(&mut self, text: &str, declared: &Declared, out: &mut Events) {
+        self.ignored(text, declared, out);
+    }
+
+    /// Only the invoke's closing tag is a started call's end; the next invoke's opening and the
+    /// block's close end the call too, as the region's. An invoke that named no call takes
+    /// whichever terminal ended it, so that it is reported the same way however it ended.
+    fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool {
+        if terminal == INVOKE_CLOSE || !self.started() {
+            (*self).close(terminal, out);
+            true
+        } else {
+            (*self).close("", out);
+            false
+        }
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
+    }
+}

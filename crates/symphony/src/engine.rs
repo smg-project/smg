@@ -92,167 +92,65 @@ pub struct Engine {
     scanner: Scanner,
     state: usize,
     /// The call being assembled while the engine is in an arguments state.
-    call: Option<Call>,
+    call: Option<Box<dyn CallAssembler>>,
     calls: u32,
     tokens: Ledger,
     reasoning_tokens: u32,
     stage: Stage,
 }
 
-/// The assembler of the call region, one per call syntax.
-#[derive(Debug)]
-enum Call {
-    Json(json::Assembler),
-    Tagged(tagged::Assembler),
-    Keyed(tagged::keyed::Assembler),
-    Pythonic(pythonic::Assembler),
-    JsonList(json::list::Assembler),
-    Xml(tagged::xml::Assembler),
-    Xtml(tagged::xtml::Assembler),
-    Attributed(tagged::attributed::Assembler),
-    NamedJson(json::named::Assembler),
-    Gemma(gemma::Assembler),
+/// What the engine asks of a call syntax's assembler, whichever the syntax: the region's bytes as
+/// they arrive, the table's ignored terminal inside the region, and the two endings. Each syntax
+/// implements it over its own assembler, so the policy of what ends a call lives with the syntax.
+/// An engine moves between threads with its request, so the assembler does too.
+pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
+    /// Takes the next bytes of the region and pushes the events they complete; the number of bytes
+    /// taken. A JSON syntax stops at its object's end and leaves the rest to the engine, which
+    /// reports it as text after the object; every other syntax takes every byte.
+    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize;
+
+    /// The table's ignored terminal arrived inside the call: dropped where it stands, unless the
+    /// syntax keeps its bytes in place among the bytes it holds (MiniMax M3's XML).
+    fn ignored(&mut self, text: &str, _declared: &Declared, out: &mut Events) {
+        out.push(Event::Dropped {
+            text: Text::uncounted(text),
+            why: DropReason::Wrapper,
+        });
+    }
+
+    /// The region closed: `terminal` is the table's terminal that closed it, the call's own closing
+    /// marker, the next call's opener or the block's close. The call ends as the syntax has it, and
+    /// the answer says whether the terminal's bytes were taken as the call's end (`ToolCallEnd`'s
+    /// source); otherwise the engine drops them as the region's.
+    fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool;
+
+    /// The stream ended inside the region: nothing is closed for the client, so arguments cut
+    /// short never look complete.
+    fn finish(self: Box<Self>, out: &mut Events);
 }
 
-impl Call {
-    fn new(syntax: Option<CallSyntax>, index: u32) -> Self {
-        let id = format!("call_{index}");
-        match syntax {
-            // `None` is unreachable: `Format::validate`, run by `Engine::new`, refuses a table
-            // with an arguments state and no call syntax. The arm keeps the match total.
-            Some(CallSyntax::Json) | None => Self::Json(json::Assembler::new(index, id)),
-            Some(CallSyntax::Tagged(_, placement)) => {
-                Self::Tagged(tagged::Assembler::new(index, id, placement))
-            }
-            Some(CallSyntax::Keyed(tags)) => {
-                Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))
-            }
-            Some(CallSyntax::Pythonic(_)) => Self::Pythonic(pythonic::Assembler::new(index)),
-            Some(CallSyntax::JsonList) => Self::JsonList(json::list::Assembler::new(index)),
-            Some(CallSyntax::Xml) => Self::Xml(tagged::xml::Assembler::new(index, id)),
-            Some(CallSyntax::Xtml) => Self::Xtml(tagged::xtml::Assembler::new(index, id)),
-            Some(CallSyntax::Attributed(tags)) => {
-                Self::Attributed(tagged::attributed::Assembler::new(index, id, tags))
-            }
-            Some(CallSyntax::NamedJson(marker)) => {
-                Self::NamedJson(json::named::Assembler::new(index, id, marker))
-            }
-            Some(CallSyntax::Gemma) => Self::Gemma(gemma::Assembler::new(index, id)),
+/// The assembler for `syntax`'s next call, at `index`.
+fn assembler(syntax: Option<CallSyntax>, index: u32) -> Box<dyn CallAssembler> {
+    let id = format!("call_{index}");
+    match syntax {
+        // `None` is unreachable: `Format::validate`, run by `Engine::new`, refuses a table with
+        // an arguments state and no call syntax. The arm keeps the match total.
+        Some(CallSyntax::Json) | None => Box::new(json::Assembler::new(index, id)),
+        Some(CallSyntax::Tagged(_, placement)) => {
+            Box::new(tagged::Assembler::new(index, id, placement))
         }
-    }
-
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
-        match self {
-            Self::Json(assembler) => assembler.feed(text, out),
-            Self::Tagged(assembler) => assembler.feed(text, declared, out),
-            Self::Keyed(assembler) => {
-                assembler.feed(text, declared, out);
-                text.len()
-            }
-            Self::Pythonic(assembler) => {
-                assembler.feed(text, out);
-                text.len()
-            }
-            Self::JsonList(assembler) => {
-                assembler.feed(text, out);
-                text.len()
-            }
-            Self::Xml(assembler) => {
-                assembler.feed(text, declared, out);
-                text.len()
-            }
-            Self::Xtml(assembler) => {
-                assembler.feed(text, out);
-                text.len()
-            }
-            Self::Attributed(assembler) => {
-                assembler.feed(text, declared, out);
-                text.len()
-            }
-            Self::NamedJson(assembler) => assembler.feed(text, out),
-            Self::Gemma(assembler) => {
-                assembler.feed(text, out);
-                text.len()
-            }
+        Some(CallSyntax::Keyed(tags)) => Box::new(tagged::keyed::Assembler::new(index, id, tags)),
+        Some(CallSyntax::Pythonic(_)) => Box::new(pythonic::Assembler::new(index)),
+        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index)),
+        Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id)),
+        Some(CallSyntax::Xtml) => Box::new(tagged::xtml::Assembler::new(index, id)),
+        Some(CallSyntax::Attributed(tags)) => {
+            Box::new(tagged::attributed::Assembler::new(index, id, tags))
         }
-    }
-
-    /// The table's ignored terminal arrived inside the call. The XML assembler keeps its bytes in
-    /// place among the bytes it holds; no other syntax's table ignores a terminal, so for them the
-    /// bytes are dropped where they stand.
-    fn ignored(&mut self, text: &str, declared: &Declared, out: &mut Events) {
-        match self {
-            Self::Xml(assembler) => assembler.ignored(text, declared, out),
-            _ => out.push(Event::Dropped {
-                text: Text::uncounted(text),
-                why: DropReason::Wrapper,
-            }),
+        Some(CallSyntax::NamedJson(marker)) => {
+            Box::new(json::named::Assembler::new(index, id, marker))
         }
-    }
-
-    /// Ends the call the way the region closed, and says whether the terminal that closed it was
-    /// taken as the call's end. The JSON assembler has one ending, and the engine names a block its
-    /// terminal closed (`close_call`); the Qwen tagged one closes the call for the client when the
-    /// block ended, and leaves it open when the stream was cut; the DSML one takes the invoke's
-    /// closing tag, and only that terminal, as `ToolCallEnd`'s bytes; the keyed one takes the
-    /// call's closing marker.
-    fn end(self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
-        match (self, closed) {
-            (Self::Json(assembler), _) => assembler.finish(out),
-            (Self::Tagged(assembler), Closed::ByMarker) => assembler.close(out),
-            (Self::Tagged(assembler), Closed::ByEnd) => assembler.finish(out),
-            (Self::Keyed(assembler), Closed::ByMarker) => {
-                assembler.close(terminal, out);
-                return true;
-            }
-            (Self::Keyed(assembler), Closed::ByEnd) => assembler.finish(out),
-            // The region's marker belongs to the region, not to its last call.
-            (Self::Pythonic(assembler), Closed::ByMarker) => assembler.close(out),
-            (Self::Pythonic(assembler), Closed::ByEnd) => assembler.finish(out),
-            (Self::JsonList(assembler), Closed::ByMarker) => assembler.close(out),
-            (Self::JsonList(assembler), Closed::ByEnd) => assembler.finish(out),
-            // Only the invoke's closing tag is a started call's end; the next invoke's opening and
-            // the block's close end the call too, and the engine drops them as the region's. An
-            // invoke that named no call takes whichever terminal ended it, so that it is reported
-            // the same way however it ended.
-            (Self::Xml(assembler), Closed::ByMarker)
-                if terminal == tagged::xml::INVOKE_CLOSE || !assembler.started() =>
-            {
-                assembler.close(terminal, out);
-                return true;
-            }
-            (Self::Xml(assembler), Closed::ByMarker) => assembler.close("", out),
-            (Self::Xml(assembler), Closed::ByEnd) => assembler.finish(out),
-            // As for XML: only the call's closing tag is a started call's end.
-            (Self::Xtml(assembler), Closed::ByMarker)
-                if terminal == tagged::xtml::CALL_CLOSE || !assembler.started() =>
-            {
-                assembler.close(terminal, out);
-                return true;
-            }
-            (Self::Xtml(assembler), Closed::ByMarker) => assembler.close("", out),
-            (Self::Xtml(assembler), Closed::ByEnd) => assembler.finish(out),
-            // As for XML: only the invoke's closing tag is a started call's end.
-            (Self::Attributed(assembler), Closed::ByMarker)
-                if terminal == assembler.invoke_close() || !assembler.started() =>
-            {
-                assembler.close(terminal, out);
-                return true;
-            }
-            (Self::Attributed(assembler), Closed::ByMarker) => assembler.close("", out),
-            (Self::Attributed(assembler), Closed::ByEnd) => assembler.finish(out),
-            // The message's closing terminal is the region's, as Qwen3's `</tool_call>` is: the
-            // object closed the call at its brace.
-            (Self::NamedJson(assembler), Closed::ByMarker) => assembler.close(out),
-            (Self::NamedJson(assembler), Closed::ByEnd) => assembler.finish(out),
-            // Gemma 4's closing marker is the call's own, carried by its end.
-            (Self::Gemma(assembler), Closed::ByMarker) => {
-                assembler.close(terminal, out);
-                return true;
-            }
-            (Self::Gemma(assembler), Closed::ByEnd) => assembler.finish(out),
-        }
-        false
+        Some(CallSyntax::Gemma) => Box::new(gemma::Assembler::new(index, id)),
     }
 }
 
@@ -419,7 +317,7 @@ impl Engine {
     /// The next call takes the next free index; the index is spent only when a call starts, so a
     /// `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
-        self.call = Some(Call::new(self.format.call_syntax().copied(), self.calls));
+        self.call = Some(assembler(self.format.call_syntax().copied(), self.calls));
     }
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took
@@ -431,7 +329,13 @@ impl Engine {
             return false;
         };
         let mut finished = Events::new();
-        let taken = call.end(closed, terminal, &mut finished);
+        let taken = match closed {
+            Closed::ByMarker => call.close(terminal, &mut finished),
+            Closed::ByEnd => {
+                call.finish(&mut finished);
+                false
+            }
+        };
         if closed == Closed::ByMarker {
             let mut renamed = Events::new();
             for event in finished.drain() {

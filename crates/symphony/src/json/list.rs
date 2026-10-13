@@ -235,6 +235,22 @@ impl Assembler {
     }
 }
 
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+        self.feed(text, out);
+        text.len()
+    }
+
+    fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
+        (*self).close(out);
+        false
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

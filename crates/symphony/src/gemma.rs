@@ -486,6 +486,23 @@ fn push_bare(json: &mut String, literal: &str) {
     }
 }
 
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+        self.feed(text, out);
+        text.len()
+    }
+
+    /// Gemma 4's closing marker is the call's own, carried by its end.
+    fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool {
+        (*self).close(terminal, out);
+        true
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
