@@ -5478,6 +5478,7 @@ pub(crate) fn decode_image_bytes(
         },
     };
     image = narrow_sixteen_bit_colour(image);
+    image = flatten_transparency(image, bytes);
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
 }
@@ -5566,6 +5567,109 @@ mod sixteen_bit_colour_tests {
         assert!(matches!(
             narrow_sixteen_bit_colour(rgb),
             image::DynamicImage::ImageRgb8(_)
+        ));
+    }
+}
+
+/// Flatten an image that carries transparency onto opaque white, as the
+/// serving engine's own loader does before its processor sees the pixels: per
+/// channel `out = (src * a + 255 * (255 - a) + 127) / 255`, the integer
+/// paste-through-mask blend (exact rounding of the real blend, checked
+/// against the reference for every value and alpha). Dropping the alpha
+/// channel instead reads a fully transparent pixel, usually stored as
+/// `(0, 0, 0)`, as solid black, and every downstream tensor differs.
+///
+/// Images without an alpha channel pass through untouched; the processors
+/// convert grey and palette pixels as before. So does a truecolour PNG whose
+/// `tRNS` chunk names a colour key: the reference loader returns such an
+/// image as stored (its mode is already RGB, the key never becomes alpha),
+/// while the decoder here expands the key into an alpha channel, so that
+/// alpha is dropped rather than blended.
+fn flatten_transparency(image: image::DynamicImage, bytes: &[u8]) -> image::DynamicImage {
+    if !image.color().has_alpha() {
+        return image;
+    }
+    if png_colour_type(bytes) == Some(PNG_COLOUR_TYPE_TRUECOLOUR) {
+        return image::DynamicImage::ImageRgb8(image.to_rgb8());
+    }
+    image::DynamicImage::ImageRgb8(composite_over_white(&image.into_rgba8()))
+}
+
+/// The eight-byte PNG signature.
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+/// PNG colour type 2: truecolour without an alpha channel.
+const PNG_COLOUR_TYPE_TRUECOLOUR: u8 = 2;
+
+/// The colour type from a PNG's IHDR chunk; `None` for any other container.
+fn png_colour_type(bytes: &[u8]) -> Option<u8> {
+    let is_png = bytes.starts_with(&PNG_SIGNATURE) && bytes.get(12..16) == Some(&b"IHDR"[..]);
+    if is_png {
+        bytes.get(25).copied()
+    } else {
+        None
+    }
+}
+
+/// Composite straight-alpha RGBA over opaque white with the reference's
+/// integer blend, `(src * a + 255 * (255 - a) + 127) / 255` per channel.
+fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
+    let (width, height) = rgba.dimensions();
+    let mut out = Vec::with_capacity(width as usize * height as usize * 3);
+    for px in rgba.as_raw().as_chunks::<4>().0 {
+        let alpha = u32::from(px[3]);
+        let white = 255 * (255 - alpha) + 127;
+        out.extend_from_slice(&[
+            ((u32::from(px[0]) * alpha + white) / 255) as u8,
+            ((u32::from(px[1]) * alpha + white) / 255) as u8,
+            ((u32::from(px[2]) * alpha + white) / 255) as u8,
+        ]);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "out holds exactly width * height * 3 bytes by construction"
+    )]
+    image::RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
+}
+
+#[cfg(test)]
+mod transparency_tests {
+    use super::*;
+
+    #[test]
+    fn png_colour_type_comes_from_the_header_alone() {
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+        assert_eq!(png_colour_type(&png), Some(PNG_COLOUR_TYPE_TRUECOLOUR));
+        assert_eq!(png_colour_type(&png[..20]), None);
+        assert_eq!(png_colour_type(b"RIFF\0\0\0\0WEBPVP8 "), None);
+    }
+
+    #[test]
+    fn the_blend_is_the_reference_loader_s() {
+        // Pillow's paste through the alpha mask over (255, 255, 255).
+        let rgba = image::RgbaImage::from_raw(
+            4,
+            1,
+            vec![
+                10, 20, 30, 255, 10, 20, 30, 0, 10, 20, 30, 128, 200, 100, 0, 1,
+            ],
+        )
+        .expect("4x1 RGBA");
+        let rgb = composite_over_white(&rgba);
+        assert_eq!(
+            rgb.as_raw(),
+            &[10, 20, 30, 255, 255, 255, 132, 137, 142, 255, 254, 254]
+        );
+    }
+
+    #[test]
+    fn opaque_images_pass_through_untouched() {
+        let grey = image::DynamicImage::new_luma8(2, 2);
+        assert!(matches!(
+            flatten_transparency(grey, &[]),
+            image::DynamicImage::ImageLuma8(_)
         ));
     }
 }

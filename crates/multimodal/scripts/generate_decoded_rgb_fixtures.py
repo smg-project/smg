@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the decoded-RGB fixtures: small synthetic images in the sample
-formats the pipeline has to convert, with the RGB bytes the serving engine's
-own image loader hands its processor for each of them.
+formats the pipeline has to convert (transparency, 16-bit depth), with the RGB
+bytes the serving engine's own image loader hands its processor for each of them.
 
 The loader (reproduced below) opens the file with Pillow, applies the EXIF
 orientation and converts to RGB: an image with an alpha channel, an ``LA`` or
@@ -59,6 +59,86 @@ def reference_load(data: bytes) -> Image.Image:
     return rgba_to_rgb(image)
 
 
+def alpha_grid() -> tuple[Image.Image, dict]:
+    """Every alpha value (rows) against 52 channel values (columns), three
+    different values per pixel, so each blend rounding case is pinned."""
+    values = np.array([*range(0, 255, 5), 255], dtype=np.uint16)
+    y, x = np.indices((256, len(values)))
+    v = values[x]
+    rgba = np.stack([v, 255 - v, (v * 3) % 256, y], axis=-1).astype(np.uint8)
+    return Image.fromarray(rgba, "RGBA"), {}
+
+
+def rgba_opaque() -> tuple[Image.Image, dict]:
+    y, x = np.indices((16, 16))
+    rgba = np.stack([x * 17, y * 17, (x + y) * 8, np.full_like(x, 255)], axis=-1)
+    return Image.fromarray(rgba.astype(np.uint8), "RGBA"), {}
+
+
+def la_blend() -> tuple[Image.Image, dict]:
+    y, x = np.indices((64, 64))
+    la = np.stack([x * 255 // 63, y * 255 // 63], axis=-1).astype(np.uint8)
+    return Image.fromarray(la, "LA"), {}
+
+
+def palette_trns() -> tuple[Image.Image, dict]:
+    """Eight palette entries, a tRNS chunk for the first six (alpha 0, 1, 127,
+    128, 254, 255); the last two are opaque by omission."""
+    palette = [
+        (0, 0, 0),
+        (255, 0, 0),
+        (0, 255, 0),
+        (0, 0, 255),
+        (40, 90, 160),
+        (200, 150, 100),
+        (255, 255, 0),
+        (17, 34, 51),
+    ]
+    image = Image.new("P", (16, 16))
+    image.putpalette([c for rgb in palette for c in rgb])
+    y, x = np.indices((16, 16))
+    image.putdata(((x + y) % 8).flatten().tolist())
+    return image, {"transparency": bytes([0, 1, 127, 128, 254, 255])}
+
+
+def gray_trns() -> tuple[Image.Image, dict]:
+    """8-bit greyscale with a colour key: value 85 is transparent."""
+    y, x = np.indices((16, 16))
+    gray = ((x * 17 + y) % 256).astype(np.uint8)
+    return Image.fromarray(gray, "L"), {"transparency": 85}
+
+
+def rgb_trns() -> tuple[Image.Image, dict]:
+    """Truecolour with a colour key: the loader keeps the stored RGB."""
+    y, x = np.indices((16, 16))
+    rgb = np.stack([x * 17, 255 - x * 17, (y // 8) * 255], axis=-1).astype(np.uint8)
+    return Image.fromarray(rgb, "RGB"), {"transparency": (85, 170, 0)}
+
+
+def rgba_exif6() -> tuple[Image.Image, dict]:
+    """RGBA with EXIF orientation 6 in an eXIf chunk: transposed, then
+    composited."""
+    y, x = np.indices((24, 16))
+    rgba = np.stack([x * 16, y * 10, (x * y) % 256, (x * 16 + y) % 256], axis=-1)
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    return Image.fromarray(rgba.astype(np.uint8), "RGBA"), {"exif": exif.tobytes()}
+
+
+def webp_rgba() -> tuple[Image.Image, dict]:
+    y, x = np.indices((32, 32))
+    rgba = np.stack([x * 8, y * 8, (x + y) * 4, x * 8], axis=-1).astype(np.uint8)
+    return Image.fromarray(rgba, "RGBA"), {"lossless": True, "exact": True}
+
+
+def gif_trns() -> tuple[Image.Image, dict]:
+    image = Image.new("P", (16, 16))
+    image.putpalette([0, 0, 0, 200, 30, 30, 30, 200, 30, 30, 30, 200])
+    y, x = np.indices((16, 16))
+    image.putdata(((x + y) % 4).flatten().tolist())
+    return image, {"transparency": 0}
+
+
 def png_chunk(kind: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
@@ -98,6 +178,15 @@ def rgb16_trns() -> bytes:
 
 
 CASES = (
+    ("alpha_grid", "png", alpha_grid, "RGBA PNG: every alpha against 52 values per channel"),
+    ("rgba_opaque", "png", rgba_opaque, "RGBA PNG whose alpha is 255 everywhere"),
+    ("la_blend", "png", la_blend, "LA PNG: grey replicated, then composited"),
+    ("palette_trns", "png", palette_trns, "palette PNG with per-index alpha in tRNS"),
+    ("gray_trns", "png", gray_trns, "greyscale PNG with a tRNS colour key"),
+    ("rgb_trns", "png", rgb_trns, "truecolour PNG with a tRNS colour key: kept as stored"),
+    ("rgba_exif6", "png", rgba_exif6, "RGBA PNG with EXIF orientation 6"),
+    ("webp_rgba", "webp", webp_rgba, "lossless WebP with alpha"),
+    ("gif_trns", "gif", gif_trns, "GIF with a transparent index"),
     ("rgb16", "png", rgb16, "16-bit truecolour PNG: each sample's high byte"),
     (
         "rgb16_trns",
