@@ -11,8 +11,8 @@
 //! IMAGE slots receive aligner rows in reading order; the delimiters take the
 //! learned `image_start` / `image_newline` / `image_end` vectors.
 //!
-//! The span is spliced verbatim: the engine removed its compressor-alignment pad
-//! (its change 56554), so the budget is the full `max_image_tokens`
+//! The span is spliced verbatim: the engine no longer pads the span for
+//! compressor alignment, so the budget is the full `max_image_tokens`
 //! and no token is reserved.
 
 use image::{DynamicImage, Rgb, RgbImage};
