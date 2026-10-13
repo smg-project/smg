@@ -87,6 +87,7 @@ mod runtime;
 mod stream;
 mod stream_state;
 mod tokenizer;
+mod tool_constraint;
 mod tool_parser;
 mod utils;
 

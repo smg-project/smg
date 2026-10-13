@@ -21,6 +21,7 @@ use super::{
     error::{set_error_message, SglErrorCode},
     memory::{sgl_free_string, sgl_free_token_ids},
     tokenizer::TokenizerHandle,
+    tool_constraint::tool_constraint_for,
     utils::chat_requires_reasoning,
 };
 
@@ -59,38 +60,28 @@ fn preprocess_impl(
     let prompt_tokens = token_ids.len() as i32;
 
     // Generate tool constraints if tools are present
-    let registry = super::runtime::PARSER_FACTORY.registry();
-    let tool_constraints = if let (Some(tools), Some(tool_choice)) = (
-        chat_request.tools.as_ref(),
-        chat_request.tool_choice.as_ref(),
-    ) {
-        // No parser is configured here, so the registry falls back to a JSON
-        // schema, which carries no reasoning prefix.
-        match registry.generate_tool_constraint(None, tools, tool_choice, false) {
-            Ok(Some(c)) => {
-                let json_str = serde_json::to_string(&c.to_tuple()).map_err(|e| {
-                    (
-                        SglErrorCode::ParsingError,
-                        format!("Failed to serialize tool constraints: {e}"),
-                    )
-                })?;
-                Some(CString::new(json_str).map_err(|e| {
-                    (
-                        SglErrorCode::MemoryError,
-                        format!("Failed to create C string: {e}"),
-                    )
-                })?)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                return Err((
+    let tool_constraints = match tool_constraint_for(chat_request) {
+        Ok(Some(c)) => {
+            let json_str = serde_json::to_string(&c.to_tuple()).map_err(|e| {
+                (
                     SglErrorCode::ParsingError,
-                    format!("Failed to generate tool constraints: {e}"),
-                ))
-            }
+                    format!("Failed to serialize tool constraints: {e}"),
+                )
+            })?;
+            Some(CString::new(json_str).map_err(|e| {
+                (
+                    SglErrorCode::MemoryError,
+                    format!("Failed to create C string: {e}"),
+                )
+            })?)
         }
-    } else {
-        None
+        Ok(None) => None,
+        Err(e) => {
+            return Err((
+                SglErrorCode::ParsingError,
+                format!("Failed to generate tool constraints: {e}"),
+            ))
+        }
     };
 
     // Create prompt text CString
