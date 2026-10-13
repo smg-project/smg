@@ -4264,8 +4264,11 @@ mod request_release_tests {
         let line = rendered
             .lines()
             .find(|line| {
+                // The model label is bounded to the served models (an
+                // unregistered one reads "other"), so the line is found by
+                // its router, as the HTTP and PD tests find theirs.
                 line.starts_with("smg_router_request_errors_total{")
-                    && line.contains(&format!("model=\"{MODEL}\""))
+                    && line.contains(&format!("router_type=\"{}\"", metrics_labels::ROUTER_GRPC))
             })
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
