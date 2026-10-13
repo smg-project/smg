@@ -1,29 +1,56 @@
 //! The decoding constraint of a request's tool choice.
 
-use openai_protocol::chat::ChatCompletionRequest;
+use openai_protocol::{
+    chat::ChatCompletionRequest,
+    common::{Tool, ToolChoice},
+};
 use tool_parser::ToolConstraint;
 
 use super::runtime::PARSER_FACTORY;
 
 /// The constraint the engine is held to for the request's tool choice, built
-/// from the request's callable tools: the tools narrowed to the named function
-/// when the choice names one, the set the gateway's preparation stage builds
-/// its constraint from. Built from `tools` as a whole, a named choice is
+/// from the request's tools narrowed by the choice (the named function, an
+/// allowed-tools list), the way the gateway's preparation stage narrows the
+/// tools it constrains with; the bindings' response parser reads the same
+/// request-level tools. Built from `tools` as a whole, a named choice is
 /// constrained with the first tool's schema. `None` when the request has no
-/// tools or its choice forces no call.
+/// tools or its choice forces no call; an error when the choice narrows the
+/// tools to none (a function the request does not declare, an allowed-tools
+/// list naming none of them), which the gateway's validation rejects.
 pub(crate) fn tool_constraint_for(
     request: &ChatCompletionRequest,
 ) -> Result<Option<ToolConstraint>, String> {
-    let (Some(_), Some(tool_choice)) = (request.tools.as_ref(), request.tool_choice.as_ref())
+    let (Some(tools), Some(tool_choice)) = (request.tools.as_ref(), request.tool_choice.as_ref())
     else {
         return Ok(None);
     };
-    let tools = request.callable_tools();
+    let narrowed = tool_choice.narrow_tools(tools);
+    let tools: &[Tool] = match &narrowed {
+        Some(narrowed) if narrowed.is_empty() => return Err(narrowed_to_none(tool_choice)),
+        Some(narrowed) => narrowed,
+        None => tools,
+    };
     // No parser is configured here, so the registry falls back to a JSON
     // schema, which carries no reasoning prefix.
     PARSER_FACTORY
         .registry()
-        .generate_tool_constraint(None, &tools, tool_choice, false)
+        .generate_tool_constraint(None, tools, tool_choice, false)
+}
+
+/// The error of a choice that leaves no tool to call, worded as the
+/// gateway's validation words it.
+fn narrowed_to_none(tool_choice: &ToolChoice) -> String {
+    match tool_choice {
+        ToolChoice::Function { function, .. } => format!(
+            "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+            function.name
+        ),
+        ToolChoice::AllowedTools { .. } => {
+            "Invalid value for 'tool_choice.tools': the listed tools are not found in 'tools'."
+                .to_string()
+        }
+        ToolChoice::Value(_) => "Invalid value for 'tool_choice': no tool to call.".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -78,14 +105,27 @@ mod tests {
         );
     }
 
-    /// `auto` forces nothing, and neither does a choice naming a function the
-    /// request does not declare (nothing is callable, so nothing is forced).
+    /// `auto` forces nothing.
     #[test]
-    fn auto_and_an_undeclared_function_force_nothing() {
+    fn an_auto_choice_forces_nothing() {
         assert!(tool_constraint_for(&request(json!("auto")))
             .unwrap()
             .is_none());
+    }
+
+    /// A choice that leaves no tool to call (a function the request does not
+    /// declare, an allowed-tools list naming none of its tools) is an error,
+    /// not a request served without a constraint.
+    #[test]
+    fn a_choice_that_names_no_declared_tool_is_an_error() {
         let undeclared = request(json!({"type": "function", "function": {"name": "get_news"}}));
-        assert!(tool_constraint_for(&undeclared).unwrap().is_none());
+        let error = tool_constraint_for(&undeclared).unwrap_err();
+        assert!(error.contains("'get_news' not found in 'tools'"), "{error}");
+        let allowed = request(json!({
+            "type": "allowed_tools", "mode": "required",
+            "tools": [{"type": "function", "name": "get_news"}]
+        }));
+        let error = tool_constraint_for(&allowed).unwrap_err();
+        assert!(error.contains("not found in 'tools'"), "{error}");
     }
 }
