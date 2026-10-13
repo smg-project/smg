@@ -99,3 +99,7 @@ harness = false
 [[bench]]
 name = "encode_volume"
 harness = false
+
+[[bench]]
+name = "parallel_encode"
+harness = false

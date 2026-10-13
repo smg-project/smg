@@ -248,6 +248,14 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
             })
             .collect();
         check(&long);
+        // A long document without special tokens: the direct encoder cuts it
+        // at stable piece boundaries for the thread pool; the ids must be the
+        // ids of the one piece.
+        let document: String = (0..60)
+            .map(|_| random_text(&mut state, 2000, &[]))
+            .collect::<Vec<_>>()
+            .join(" ");
+        check(&document);
         println!("{dir}: {compared} texts compared, {native} through the native path");
         assert!(
             native > compared / 2,
