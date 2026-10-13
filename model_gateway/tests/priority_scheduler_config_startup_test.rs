@@ -123,12 +123,12 @@ fn a_known_default_max_class_name_in_any_case_starts() {
             "--priority-scheduler-default-max-class",
             "Interactive",
         ],
-        Until::Bound,
+        Until::Served,
         &dir.path().join("known-class.log"),
     );
     assert!(
-        launch.bound.is_some(),
-        "the gateway did not listen with a known class name\n{}",
-        launch.log
+        launch.served,
+        "the gateway did not serve its health route with a known class name (status {:?})\n{}",
+        launch.status, launch.log
     );
 }
