@@ -826,7 +826,8 @@ pub struct ChatTemplateParams<'a> {
     /// rendered with that message and cut right after its text. Not
     /// compatible with `add_generation_prompt`. Where the template cannot
     /// continue the message, its text follows the generation prompt instead
-    /// (`ChatTemplateOutput::continued_final_message` says which happened).
+    /// (`ChatTemplateOutput::continued_final_message` says which happened),
+    /// and a message that also has `reasoning_content` is refused.
     pub continue_final_message: bool,
 }
 
@@ -1610,8 +1611,10 @@ fn cut_at_final_message(rendered: &str, text: &str, marker: &str) -> Result<Stri
 /// its text appended after the generation prompt, which is how every
 /// continued message rendered before. Speech-recognition prompts rely on
 /// this: their forced-language prefill follows a generation prompt the
-/// template opens but whose turn it never renders. The flag says which
-/// happened: true when the message was continued.
+/// template opens but whose turn it never renders. Only the text survives
+/// that, so a message that also has `reasoning_content` is refused there
+/// instead. The flag says which happened: true when the message was
+/// continued.
 fn render_continuing_final_message(
     env: &Environment<'_>,
     messages: &[JsonValue],
@@ -1639,6 +1642,16 @@ fn render_continuing_final_message(
     let Some((last, head)) = messages.split_last() else {
         return Err(reason);
     };
+    if last
+        .get("reasoning_content")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|reasoning| !reasoning.is_empty())
+    {
+        return Err(anyhow!(
+            "{reason}: only its text could follow the generation prompt, and its \
+             reasoning_content would be lost"
+        ));
+    }
     tracing::debug!(%reason, "appending the continued message after the generation prompt");
     let (mut prompt, _) = render_chat_template(
         env,

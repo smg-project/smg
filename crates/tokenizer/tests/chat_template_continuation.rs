@@ -231,6 +231,42 @@ mod tests {
         assert!(both.is_err());
     }
 
+    /// Only the text can follow the generation prompt, so where the template
+    /// cannot continue a message that also has reasoning, the message is
+    /// refused (transformers raises for each of these) rather than continued
+    /// without its reasoning.
+    #[test]
+    fn refuses_to_drop_the_reasoning_where_only_the_text_could_follow() {
+        for (template, assistant) in [
+            (
+                NO_ASSISTANT_TURNS,
+                json!({"content": "language English", "reasoning_content": "Asked."}),
+            ),
+            (
+                REASONING,
+                json!({"content": null, "reasoning_content": "Asked."}),
+            ),
+            (
+                ANSWER_ONLY,
+                json!({"content": "<think>Asked.</think>The weather", "reasoning_content": "Asked."}),
+            ),
+        ] {
+            let rendered = render(template, &chat(assistant), false, true, None);
+            assert!(
+                rendered
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("reasoning_content")),
+                "{rendered:?}"
+            );
+        }
+        // An empty reasoning has nothing to lose: the text follows as before.
+        let messages = chat(json!({"content": "language English", "reasoning_content": ""}));
+        assert_eq!(
+            continue_final(NO_ASSISTANT_TURNS, &messages),
+            prompt_then_text(NO_ASSISTANT_TURNS, &messages, "language English")
+        );
+    }
+
     /// The prompt is cut only at the final message's own marker, right after
     /// its text. An earlier message with the marker's words and that text
     /// does not change that: where the template leaves the final message out
