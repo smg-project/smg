@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use llm_multimodal::{media, MediaContentPart, Modality};
+use llm_multimodal::{data_url::data_url_payload_bytes, media, MediaContentPart, Modality};
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
 
@@ -322,20 +322,6 @@ fn url_scheme(url: &str) -> String {
         })
         .map(str::to_ascii_lowercase)
         .unwrap_or_default()
-}
-
-/// Approximate decoded byte size of a `data:` URL payload; `None` otherwise.
-fn data_url_payload_bytes(url: &str) -> Option<usize> {
-    let rest = url
-        .get(..5)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("data:"))
-        .map(|_| &url[5..])?;
-    let (header, payload) = rest.split_once(',').unwrap_or((rest, ""));
-    Some(if header.to_ascii_lowercase().contains(";base64") {
-        payload.len() * 3 / 4
-    } else {
-        payload.len()
-    })
 }
 
 /// Classify one part as a forwardable reference: its modality, URL and the

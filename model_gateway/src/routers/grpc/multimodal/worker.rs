@@ -12,10 +12,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_multimodal::{
-    configure_parallelism, registry::modality_limit_override, vision::PreProcessorConfig,
-    FrameSampling, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
-    MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
-    TransparencyPolicy, VisionProcessorRegistry, POOL_THREADS_ENV,
+    configure_parallelism, data_url::data_url_payload_bytes, registry::modality_limit_override,
+    vision::PreProcessorConfig, FrameSampling, MediaConnector, MediaConnectorConfig,
+    MediaConnectorError, MediaContentPart, MediaFault, Modality, ModelMetadata, ModelRegistry,
+    MultiModalError, Parallelism, TransparencyPolicy, VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -648,19 +648,6 @@ impl WorkerMediaPipeline {
     }
 }
 
-/// The decoded size of a `data:` URL's payload, as the Python servicer
-/// estimates it (`data_url_payload_bytes`); `None` for any other URL.
-fn data_url_payload_bytes(url: &str) -> Option<usize> {
-    let rest = url.strip_prefix("data:")?;
-    let (header, payload) = rest.split_once(',')?;
-    if header.to_ascii_lowercase().contains(";base64") {
-        let trimmed = payload.trim_end_matches('=');
-        Some(trimmed.len() * 3 / 4)
-    } else {
-        Some(payload.len())
-    }
-}
-
 /// The model's configs with `kwargs` laid over each preprocessor config, or
 /// `None` when there are none. A key the config has no field for is refused:
 /// the engine's own processor would have honoured it, this pipeline cannot.
@@ -886,17 +873,81 @@ mod tests {
         std::fs::remove_dir(dir).unwrap();
     }
 
+    /// The inline payload cap sizes a `data:` URL by the shared rule: the
+    /// scheme's case does not matter, so an uppercase scheme cannot slip a
+    /// payload past `--mm-max-item-bytes` that the router and the servicer
+    /// refuse.
+    #[tokio::test]
+    async fn pipeline_caps_an_inline_payload_whatever_the_scheme_case() {
+        let dir = std::env::temp_dir().join(format!(
+            "smg-worker-media-item-bytes-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"model_type": "llava", "image_token_index": 32000}"#,
+        )
+        .unwrap();
+        let settings = WorkerMediaSettings {
+            model_dir: dir.display().to_string(),
+            served_model_name: None,
+            model_id: dir.display().to_string(),
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "float32".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: Some(4),
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
+        };
+        let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+
+        for url in [
+            "data:image/png;base64,AAAAAAAA",
+            "DATA:image/png;base64,AAAAAAAA",
+        ] {
+            let items = vec![WorkerMediaItem {
+                modality: Modality::Image,
+                url: url.to_string(),
+            }];
+            let error = pipeline
+                .process(vec![1, 2, 3], &items, false)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    WorkerMediaError::Invalid(message)
+                        if message.contains("inline payload is 6 bytes")
+                            && message.contains("--mm-max-item-bytes")
+                ),
+                "{url}: {error}"
+            );
+        }
+        std::fs::remove_file(config).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     #[test]
     fn data_url_payload_size_is_estimated_like_the_python_servicer() {
+        // The shared estimator counts base64 padding, as the servicer does.
         assert_eq!(
             data_url_payload_bytes("data:image/png;base64,AAAA"),
             Some(3)
         );
         assert_eq!(
             data_url_payload_bytes("data:image/png;base64,AAA="),
-            Some(2)
+            Some(3)
         );
-        assert_eq!(data_url_payload_bytes("data:text/plain,hello"), Some(5));
+        assert_eq!(data_url_payload_bytes("DATA:text/plain,hello"), Some(5));
         assert_eq!(data_url_payload_bytes("https://example.com/x.png"), None);
     }
 
