@@ -11,7 +11,10 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use bytes::{Bytes, BytesMut};
-use image::{codecs::jpeg::JpegDecoder, ImageDecoder as _};
+use image::{
+    codecs::{jpeg::JpegDecoder, webp::WebPDecoder},
+    ImageDecoder as _,
+};
 #[cfg(feature = "opencv-video")]
 use opencv::{
     core::{Mat, Vector},
@@ -26,7 +29,7 @@ use url::Url;
 use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
-    vision::transforms::resize_catmull_rom_rgb,
+    vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
 };
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -4714,6 +4717,10 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// also treats the ink values as Adobe-inverted and multiplies them the same
 /// way for plain CMYK, but its DCT and upsampling are its own and YCCK goes
 /// through its own YCbCr step, so those pixels are close to PIL's, not equal.
+/// A still WebP decodes through libwebp when it is present
+/// (`webp_native::decode_webp`, the library the reference loaders use, in
+/// the JPEG class of cost); without it, or for an animation, the `image`
+/// crate's decoder takes it, with the same pixels on the files checked.
 pub(crate) fn decode_image_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
@@ -4721,35 +4728,129 @@ pub(crate) fn decode_image_bytes(
     // The orientation tag is applied the way the engine's own loader applies
     // it, so a photo stored sideways reaches the model upright on both paths.
     let mut image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
-        Some(mut image) => {
+        Some(image) => {
             // libjpeg-turbo yields pixels only; the tag comes from the header.
-            image.apply_orientation(jpeg_orientation(bytes));
-            image
+            oriented(image, jpeg_orientation(bytes))
         }
-        None => {
-            let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
-                .with_guessed_format()
-                .map_err(MediaConnectorError::Io)?
-                .into_decoder()?;
-            // `ImageReader::decode` reserves the decoded buffer against the
-            // crate's allocation limit (512 MiB by default) before it decodes;
-            // `into_decoder` does not, so the reservation is made here. A file
-            // whose header declares more than the limit (a decompression bomb,
-            // or a JPEG the turbojpeg path handed over for its size) is refused
-            // without the allocation.
-            let mut limits = image::Limits::default();
-            limits.reserve(decoder.total_bytes())?;
-            decoder.set_limits(limits)?;
-            let orientation = decoder
-                .orientation()
-                .unwrap_or(image::metadata::Orientation::NoTransforms);
-            let mut image = image::DynamicImage::from_decoder(decoder)?;
-            image.apply_orientation(orientation);
-            image
-        }
+        None => match crate::webp_native::decode_webp(bytes) {
+            Some(image) => {
+                // libwebp yields pixels only; the tag comes from the file's
+                // metadata chunk, read as the fallback decoder reads it.
+                oriented(image, webp_orientation(bytes))
+            }
+            None => {
+                let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+                    .with_guessed_format()
+                    .map_err(MediaConnectorError::Io)?
+                    .into_decoder()?;
+                // `ImageReader::decode` reserves the decoded buffer against the
+                // crate's allocation limit (512 MiB by default) before it
+                // decodes; `into_decoder` does not, so the reservation is made
+                // here. A file whose header declares more than the limit (a
+                // decompression bomb, or a JPEG the turbojpeg path handed over
+                // for its size) is refused without the allocation.
+                let mut limits = image::Limits::default();
+                limits.reserve(decoder.total_bytes())?;
+                decoder.set_limits(limits)?;
+                let orientation = decoder
+                    .orientation()
+                    .unwrap_or(image::metadata::Orientation::NoTransforms);
+                let image = image::DynamicImage::from_decoder(decoder)?;
+                oriented(image, orientation)
+            }
+        },
     };
+    image = narrow_sixteen_bit_colour(image);
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
+}
+
+/// Bring 16-bit truecolour samples down to 8 bits by their high byte, as the
+/// serving engine's own loader unpacks them (its 16-bit RGB, RGBA and LA
+/// readers keep the most significant byte of each sample). Rounding the
+/// sample instead (`v * 255 / 65535`, what the `image` crate's conversion
+/// does) lands one level higher wherever the low byte is 128 or more, and
+/// every downstream tensor differs there. 16-bit greyscale keeps its own
+/// conversion.
+fn narrow_sixteen_bit_colour(image: image::DynamicImage) -> image::DynamicImage {
+    use image::DynamicImage::{
+        ImageLumaA16, ImageLumaA8, ImageRgb16, ImageRgb8, ImageRgba16, ImageRgba8,
+    };
+    match image {
+        ImageRgb16(wide) => ImageRgb8(high_bytes(wide)),
+        ImageRgba16(wide) => ImageRgba8(high_bytes(wide)),
+        ImageLumaA16(wide) => ImageLumaA8(high_bytes(wide)),
+        other => other,
+    }
+}
+
+/// The high byte of every sample; the pixel layout is unchanged, so the
+/// narrow pixel type must have the wide one's channel count.
+fn high_bytes<Wide, Narrow>(
+    image: image::ImageBuffer<Wide, Vec<u16>>,
+) -> image::ImageBuffer<Narrow, Vec<u8>>
+where
+    Wide: image::Pixel<Subpixel = u16>,
+    Narrow: image::Pixel<Subpixel = u8>,
+{
+    let (width, height) = image.dimensions();
+    let bytes: Vec<u8> = image
+        .into_raw()
+        .into_iter()
+        .map(|sample| (sample >> 8) as u8)
+        .collect();
+    #[expect(
+        clippy::expect_used,
+        reason = "the same pixel and channel count as the 16-bit buffer"
+    )]
+    image::ImageBuffer::from_raw(width, height, bytes).expect("buffer matches image dimensions")
+}
+
+#[cfg(test)]
+mod sixteen_bit_colour_tests {
+    use super::*;
+
+    #[test]
+    fn truecolour_samples_keep_their_high_byte() {
+        // Low bytes of 128 and more are where rounding would land one higher.
+        let wide = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_raw(
+            2,
+            1,
+            vec![0x0080, 0x00FF, 0x8080, 0xFF7F, 0x0100, 0xFFFF],
+        )
+        .expect("2x1 RGB16");
+        match narrow_sixteen_bit_colour(image::DynamicImage::ImageRgb16(wide)) {
+            image::DynamicImage::ImageRgb8(narrow) => {
+                assert_eq!(narrow.as_raw(), &[0, 0, 0x80, 0xFF, 1, 0xFF]);
+            }
+            other => panic!("expected RGB8, got {:?}", other.color()),
+        }
+    }
+
+    #[test]
+    fn alpha_samples_are_narrowed_the_same_way() {
+        let wide =
+            image::ImageBuffer::<image::LumaA<u16>, Vec<u16>>::from_raw(1, 1, vec![0x1234, 0xFF80])
+                .expect("1x1 LA16");
+        match narrow_sixteen_bit_colour(image::DynamicImage::ImageLumaA16(wide)) {
+            image::DynamicImage::ImageLumaA8(narrow) => assert_eq!(narrow.as_raw(), &[0x12, 0xFF]),
+            other => panic!("expected LA8, got {:?}", other.color()),
+        }
+    }
+
+    #[test]
+    fn other_depths_pass_through_untouched() {
+        let grey = image::DynamicImage::new_luma16(2, 2);
+        assert!(matches!(
+            narrow_sixteen_bit_colour(grey),
+            image::DynamicImage::ImageLuma16(_)
+        ));
+        let rgb = image::DynamicImage::new_rgb8(2, 2);
+        assert!(matches!(
+            narrow_sixteen_bit_colour(rgb),
+            image::DynamicImage::ImageRgb8(_)
+        ));
+    }
 }
 
 /// The dimensions the decode will produce, from the header alone (after the
@@ -4781,6 +4882,15 @@ pub(crate) fn encoded_image_size(
 /// unreadable metadata means no transform.
 fn jpeg_orientation(bytes: &[u8]) -> image::metadata::Orientation {
     JpegDecoder::new(std::io::Cursor::new(bytes))
+        .and_then(|mut decoder| decoder.orientation())
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+/// The orientation tag of a WebP file, from its metadata chunk, as the
+/// `image` crate's decoder reads it (`NoTransforms` when there is none or
+/// the header does not parse).
+fn webp_orientation(bytes: &[u8]) -> image::metadata::Orientation {
+    WebPDecoder::new(std::io::Cursor::new(bytes))
         .and_then(|mut decoder| decoder.orientation())
         .unwrap_or(image::metadata::Orientation::NoTransforms)
 }

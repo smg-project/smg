@@ -53,7 +53,11 @@ from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
 )
-from smg_grpc_servicer.sglang.utils import abort_code_from_output, to_token_id_array
+from smg_grpc_servicer.sglang.utils import (
+    abort_code_from_output,
+    scheduler_abort,
+    to_token_id_array,
+)
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
@@ -214,6 +218,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 abort_code_from_output(batch_output),
                                 batch_output["error"],
                             )
+                        elif (aborted := scheduler_abort(batch_output)) is not None:
+                            # The scheduler's own abort, with its status: the
+                            # caller's error or the worker's, never a completion.
+                            await context.abort(
+                                abort_code_from_output(batch_output),
+                                aborted.get("message") or "aborted by the scheduler",
+                            )
                         else:
                             # All non-error batch outputs are final responses
                             yield self._create_completion_response(request.request_id, batch_output)
@@ -223,6 +234,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         await context.abort(
                             abort_code_from_output(output),
                             output["error"],
+                        )
+                    elif (aborted := scheduler_abort(output)) is not None:
+                        # The scheduler's own abort, with its status (a 400 for
+                        # the caller's input, a 503 for a full queue): the stream
+                        # ends with that status and the scheduler's message, as
+                        # the TokenSpeed servicer ends it, not with a
+                        # `Complete(finish_reason = "abort")` that drops both.
+                        await context.abort(
+                            abort_code_from_output(output),
+                            aborted.get("message") or "aborted by the scheduler",
                         )
                     elif request.stream:
                         yield self._create_chunk_response(request.request_id, output)

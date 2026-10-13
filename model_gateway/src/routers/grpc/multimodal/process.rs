@@ -9,10 +9,10 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use anyhow::{Context, Result};
 use futures::{future::try_join_all, StreamExt, TryStreamExt};
 use llm_multimodal::{
-    AsyncMultiModalTracker, AudioClip, EncoderFieldLayouts, ImageFrame, MediaItemInfo, Modality,
-    ModelMetadata, ModelProcessorSpec, PlaceholderRange, PreProcessorConfig,
-    PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput, VideoClip,
-    VisionProcessorRegistry,
+    AsyncMultiModalTracker, AudioClip, EncoderDtype, EncoderFieldLayouts, ImageFrame,
+    MediaItemInfo, Modality, ModelMetadata, ModelProcessorSpec, PlaceholderRange,
+    PreProcessorConfig, PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput,
+    VideoClip, VisionPreProcessor, VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
 use rayon::prelude::*;
@@ -40,6 +40,7 @@ struct PreparedMultimodalPart {
 }
 
 /// Process a protocol-independent, ordered media plan.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_multimodal_plan(
     plan: MediaPlan,
     model_id: &str,
@@ -48,6 +49,7 @@ pub(crate) async fn process_multimodal_plan(
     components: &MultimodalComponents,
     tokenizer_id: &str,
     tokenizer_source: &str,
+    image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -209,6 +211,7 @@ pub(crate) async fn process_multimodal_plan(
             spec,
             tokenizer_id,
             &model_config,
+            image_wire_dtype,
         )
     }))
     .await?;
@@ -350,6 +353,7 @@ pub(crate) async fn process_multimodal_plan(
     })
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn preprocess_modality(
     media: &MediaBatch,
     components: &MultimodalComponents,
@@ -358,6 +362,7 @@ async fn preprocess_modality(
     spec: &dyn ModelProcessorSpec,
     tokenizer_id: &str,
     model_config: &MultimodalModelConfig,
+    image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     // Run CPU-intensive preprocessing on a blocking thread pool so it doesn't
     // block the tokio async runtime under concurrent load.
@@ -381,6 +386,8 @@ async fn preprocess_modality(
                     "model_type": model_type,
                     "model_config": model_config.config,
                     "preprocessor_config": pp_config,
+                    // A one-pass result is only right for its own wire.
+                    "image_wire_dtype": image_wire_dtype.map(|dtype| dtype.to_string()),
                 });
                 config.sort_all_objects();
                 let fingerprint = config_fingerprint(tokenizer_id, &config);
@@ -416,6 +423,7 @@ async fn preprocess_modality(
                             model_type.map(String::from),
                             pp_config.clone(),
                             fingerprint,
+                            image_wire_dtype,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -495,9 +503,7 @@ async fn preprocess_modality(
                         .map_err(llm_multimodal::MultiModalError::Media)
                 })
                 .collect::<Result<_, _>>()?;
-            processor
-                .preprocess(&raw_images, &pp_config)
-                .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
+            preprocess_images(processor, &raw_images, &pp_config, image_wire_dtype)
         }
         MediaBatch::Videos(videos) => {
             let processor = registry
@@ -614,6 +620,7 @@ fn media_item_infos(media: &MediaBatch) -> Vec<MediaItemInfo> {
 }
 
 /// Pixel-cache lookup and preprocessing for one image.
+#[expect(clippy::too_many_arguments)]
 async fn preprocess_image_cached(
     cache: Arc<PixelCache>,
     image: Arc<ImageFrame>,
@@ -622,6 +629,7 @@ async fn preprocess_image_cached(
     model_type: Option<String>,
     pp_config: PreProcessorConfig,
     fingerprint: u64,
+    image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     let key = PixelCacheKey {
         image_hash: image.hash.clone(),
@@ -639,8 +647,13 @@ async fn preprocess_image_cached(
         model_type,
         pp_config,
         std::slice::from_ref(&image),
+        image_wire_dtype,
     )
     .await?;
+    // The entry is the form the request is sent in: the wire bytes when a
+    // dtype was resolved (twice the neutral bytes at the half widths, four
+    // times at float32, against the same budget), so a hit skips the write
+    // pass; the neutral patches otherwise.
     cache.insert(
         key,
         Arc::new(CachedPreprocessedItem {
@@ -656,6 +669,7 @@ async fn preprocess_image_batch(
     model_type: Option<String>,
     pp_config: PreProcessorConfig,
     images: &[Arc<ImageFrame>],
+    image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -671,12 +685,25 @@ async fn preprocess_image_batch(
         let processor = registry
             .find(&model_id, model_type.as_deref())
             .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;
-        processor
-            .preprocess(&raw_images, &pp_config)
-            .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
+        preprocess_images(processor, &raw_images, &pp_config, image_wire_dtype)
     })
     .await
     .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
+}
+
+/// The images preprocessed: laid out in `wire_dtype` in one pass when the
+/// dtype is known and the processor writes it, through the per-destination
+/// write otherwise. Both arms produce the same bytes on the wire.
+fn preprocess_images(
+    processor: &dyn VisionPreProcessor,
+    images: &[image::DynamicImage],
+    pp_config: &PreProcessorConfig,
+    wire_dtype: Option<EncoderDtype>,
+) -> Result<PreprocessedEncoderInputs> {
+    wire_dtype
+        .and_then(|dtype| processor.preprocess_wire(images, pp_config, dtype))
+        .unwrap_or_else(|| processor.preprocess(images, pp_config))
+        .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
 }
 
 struct ModalityExpansion<'a> {

@@ -154,7 +154,8 @@ impl MiniMaxM3VisionProcessor {
                 std: CLIP_STD,
                 model_name: "minimax_m3",
             })
-            .allow_video_dimensions_below_factor(),
+            .allow_video_dimensions_below_factor()
+            .raise_rounded_sides_to_factor(),
         }
     }
 
@@ -1247,5 +1248,16 @@ mod tests {
             tokens <= 576,
             "expected at most image_seq_length (576) tokens, got {tokens}"
         );
+    }
+
+    #[test]
+    fn smart_resize_floors_a_side_that_rounds_to_zero_like_the_reference() {
+        // MiniMax-M3's reference takes `max(factor, round(side / factor) * factor)`
+        // before the pixel-budget test, so a 1x100 image keeps its rounded long
+        // side (28x112 = exactly min_pixels, no scale-up); the Qwen rule would
+        // scale it up to 28x560.
+        let processor = MiniMaxM3VisionProcessor::new();
+        assert_eq!(processor.inner.smart_resize(1, 100).unwrap(), (28, 112));
+        assert_eq!(processor.inner.smart_resize(100, 1).unwrap(), (112, 28));
     }
 }

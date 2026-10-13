@@ -562,6 +562,7 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
+            self.assembly.image_wire_dtype(),
         )
         .await
         .map_err(classify)?;

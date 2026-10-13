@@ -15,7 +15,7 @@ use crate::routers::{
         },
         multimodal::{
             assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
-            reserve_multimodal_inflight,
+            assembly_error_response, reserve_multimodal_inflight,
         },
         spec::{ChatResponseSpec, ResponseSpec},
         utils,
@@ -99,7 +99,7 @@ pub(crate) async fn build_chat_backed_plan(
         };
         Some(assembled.map_err(|e| {
             error!(function = "build_chat_backed_plan", error = %e, "Failed to assemble multimodal request");
-            error::bad_request("multimodal_not_supported", format!("{e}"))
+            assembly_error_response(&e)
         })?)
     } else {
         None

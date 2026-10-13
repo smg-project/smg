@@ -131,6 +131,13 @@ impl SglangGenerateStream {
         }
     }
 
+    /// Whether the engine already finished this choice and its terminal
+    /// `Complete` is parked behind the chunk just yielded (the finish tick
+    /// carried new tokens).
+    pub fn has_parked_complete(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// End this choice as aborted: the engine's own parked `Complete` when it
     /// already finished, else the terminal `Complete` the Python servicer
     /// yields after an `Abort` RPC (`finish_reason = "abort"`). The

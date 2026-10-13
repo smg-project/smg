@@ -21,7 +21,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{gateway_launch::free_ports, test_certs::TestCertificates};
+use common::{
+    gateway_launch::{base_args, free_ports, launch_with, serial, Until, EXIT_TIMEOUT},
+    test_certs::TestCertificates,
+};
 use openssl::ssl::{HandshakeError, SslConnector, SslFiletype, SslMethod};
 
 const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -384,6 +387,101 @@ fn mesh_with_mtls_forms_between_two_gateway_processes() {
             "{}'s mesh server failed\n{}",
             gateway.name,
             gateway.log()
+        );
+    }
+}
+
+/// Mesh TLS material the gateway can read but not use is refused before the
+/// HTTP listener binds, like a held mesh port: the mesh server used to fail
+/// on its first poll, a second after the gateway was serving outside the
+/// mesh (`Mesh server failed: ...` once, `/readiness` ready), because the
+/// flags check only that the files exist and the material is parsed when
+/// the server starts. Three shapes: a certificate file that holds no
+/// certificate, a key file that holds the certificate instead of the key,
+/// and a CA file with nothing in it (the client verifier cannot be built
+/// from it; the files are all readable).
+#[test]
+fn unusable_mesh_tls_material_refuses_the_start() {
+    let _serial = serial();
+    let certs = TestCertificates::generate().expect("test certificates");
+    let (cert, key) = certs.node_identity("nodec").expect("node identity");
+    let dir = certs.temp_dir.path();
+    let garbage = dir.join("garbage.pem");
+    fs::write(&garbage, "not a certificate\n").expect("write the file");
+    let empty_ca = dir.join("empty-ca.pem");
+    fs::write(&empty_ca, "").expect("write the file");
+    let path = |p: &std::path::Path| p.to_str().expect("a UTF-8 path").to_string();
+    let ca = path(&certs.ca_cert_path);
+    let cases: [(&str, [String; 3]); 3] = [
+        (
+            "cert-not-a-certificate",
+            [ca.clone(), path(&garbage), path(&key)],
+        ),
+        ("key-is-the-certificate", [ca, path(&cert), path(&cert)]),
+        (
+            "ca-without-a-certificate",
+            [path(&empty_ca), path(&cert), path(&key)],
+        ),
+    ];
+    let ip = IP.to_string();
+    for (name, [ca, cert, key]) in cases {
+        let [http_port, mesh_port, metrics_port] = free_ports();
+        let mut args = base_args(http_port, metrics_port);
+        args.extend(
+            [
+                "--enable-mesh",
+                "--mesh-host",
+                &ip,
+                "--mesh-port",
+                &mesh_port.to_string(),
+                "--mesh-tls-ca-cert",
+                &ca,
+                "--mesh-tls-cert",
+                &cert,
+                "--mesh-tls-key",
+                &key,
+            ]
+            .map(str::to_string),
+        );
+        // The metrics and probe listeners are up when the mesh server's
+        // preparation fails (they bind earlier, by design): the HTTP port is
+        // watched, the one a gateway outside the mesh used to serve on.
+        let launch = launch_with(
+            &args,
+            &[http_port],
+            Until::Bound,
+            &dir.join(format!("{name}.log")),
+        );
+        let log = &launch.log;
+        assert!(
+            launch.bound.is_none(),
+            "{name}: the HTTP port answered although the mesh TLS material is unusable\n{log}"
+        );
+        assert!(
+            launch.status.is_some(),
+            "{name}: the gateway neither exited nor served within {EXIT_TIMEOUT:?}\n{log}"
+        );
+        assert!(
+            launch.status.is_some_and(|status| !status.success()),
+            "{name}: the gateway exited successfully\n{log}"
+        );
+        assert!(
+            !log.contains("panicked"),
+            "{name}: a panic is not a configuration error\n{log}"
+        );
+        for text in [
+            "Failed to start the mesh server",
+            "--mesh-tls-",
+            "mesh TLS material",
+        ] {
+            assert!(
+                log.contains(text),
+                "{name}: the error does not name {text:?}\n{log}"
+            );
+        }
+        assert!(
+            !log.contains("Mesh server listening on"),
+            "{name}: the mesh server served\n{log}"
         );
     }
 }

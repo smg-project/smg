@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use axum::http::HeaderName;
+use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -286,6 +286,8 @@ impl ConfigValidator {
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
+        Self::validate_cors_allowed_origins(config)?;
+        Self::validate_value_shapes(config)?;
         Self::validate_log_dir(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
@@ -326,22 +328,25 @@ impl ConfigValidator {
                 Self::validate_oracle(oracle)?;
             }
         }
-        // The Redis and Postgres configurations carry their own rules (the
-        // URL, the pool size, a retention of 0 days that would expire every
-        // record as it is written); the command line ran them while building
-        // its config, the bindings and a directly built RouterConfig did not,
-        // so they run here for every start-up.
+        // The Redis and Postgres configurations carry their own numeric rules
+        // (the pool size, the call bound, a retention of 0 days that would
+        // expire every record as it is written); the command line ran them
+        // while building its config, the bindings and a directly built
+        // RouterConfig did not, so they run here for every start-up. The
+        // connection string's shape is the driver's: a socket path or a
+        // key=value string the driver understands is not refused here (the
+        // command line's own URL check stays with the command line).
         if config.history_backend == HistoryBackend::Redis {
             if let Some(redis) = &config.redis {
                 redis
-                    .validate()
+                    .validate_bounds()
                     .map_err(|reason| ConfigError::ValidationFailed { reason })?;
             }
         }
         if config.history_backend == HistoryBackend::Postgres {
             if let Some(postgres) = &config.postgres {
                 postgres
-                    .validate()
+                    .validate_bounds()
                     .map_err(|reason| ConfigError::ValidationFailed { reason })?;
             }
         }
@@ -392,20 +397,22 @@ impl ConfigValidator {
     }
 
     /// With the priority scheduler enabled, the optional YAML file must be
-    /// readable, parsable and valid: an operator who asked for tenant
-    /// priorities gets a start-up error naming the file instead of a gateway
-    /// that serves with the legacy admission (the contract of
-    /// `tenant_rate_limit_config`). Without the flag the path is not read.
+    /// readable, parsable (no key the scheduler does not know) and valid, and
+    /// the default max class must name one of the four classes: an operator
+    /// who asked for tenant priorities gets a start-up error naming the field
+    /// instead of a gateway that serves with the legacy admission or with a
+    /// policy they did not write (the contract of `tenant_rate_limit_config`).
+    /// Without the flag neither is read.
     fn validate_priority_scheduler(config: &RouterConfig) -> ConfigResult<()> {
         if !config.priority_scheduler_enabled {
             return Ok(());
         }
         scheduler::settings_from_config(config)
             .map(drop)
-            .map_err(|reason| ConfigError::InvalidValue {
-                field: "priority_scheduler_config".to_string(),
-                value: config.priority_scheduler_config.clone().unwrap_or_default(),
-                reason,
+            .map_err(|e| ConfigError::InvalidValue {
+                field: e.field.to_string(),
+                value: e.value,
+                reason: e.reason,
             })
     }
 
@@ -430,6 +437,42 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// The fields whose value has a required shape, refused by name when the
+    /// shape is wrong, on every path that builds a `RouterConfig` (the
+    /// command line, a configuration file, the language binding): checked on
+    /// the command line alone, a wrong shape from a binding still matched no
+    /// request's id header or switched authentication on with an empty
+    /// credential, in silence. The CORS origins and the health-check endpoint
+    /// have rules of their own (`validate_cors_allowed_origins`,
+    /// `validate_health_check`); the command line keeps the shapes of what
+    /// never reaches `RouterConfig`.
+    fn validate_value_shapes(config: &RouterConfig) -> ConfigResult<()> {
+        let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value: value.to_string(),
+            reason: reason.to_string(),
+        };
+        for name in config.request_id_headers.iter().flatten() {
+            if HeaderName::try_from(name.as_str()).is_err() {
+                return Err(invalid(
+                    "request_id_headers",
+                    name,
+                    "not a valid HTTP header name: it could never match a request",
+                ));
+            }
+        }
+        if let Some(key) = &config.api_key {
+            if key.trim().is_empty() {
+                return Err(invalid(
+                    "api_key",
+                    "",
+                    "an empty credential would switch authentication on with a key nothing can present",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_storage_context_headers(config: &RouterConfig) -> ConfigResult<()> {
         let mut seen_context_keys = std::collections::HashSet::new();
 
@@ -440,6 +483,15 @@ impl ConfigValidator {
             if header_name.is_empty() {
                 return Err(ConfigError::ValidationFailed {
                     reason: "storage_context_headers must not contain empty header names"
+                        .to_string(),
+                });
+            }
+
+            if HeaderName::try_from(header_name).is_err() {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage_context_headers".to_string(),
+                    value: header_name.to_string(),
+                    reason: "not a valid HTTP header name: it could never match a request"
                         .to_string(),
                 });
             }
@@ -1191,6 +1243,56 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// `cors_allowed_origins`: exact origins, or a lone `*` for the open
+    /// policy. This is the one place the rule is checked, so the Python
+    /// launcher and library callers (`RouterConfig::builder().build()`)
+    /// refuse the same values by name as `smg launch` does.
+    fn validate_cors_allowed_origins(config: &RouterConfig) -> ConfigResult<()> {
+        let invalid = |origin: &str, reason: &str| ConfigError::InvalidValue {
+            field: "cors_allowed_origins".to_string(),
+            value: origin.to_string(),
+            reason: reason.to_string(),
+        };
+        for origin in &config.cors_allowed_origins {
+            // A lone `*` is the open policy; next to an origin it would be
+            // either a typo or a list the layer cannot express.
+            if origin == "*" {
+                if config.cors_allowed_origins.len() == 1 {
+                    continue;
+                }
+                return Err(invalid(
+                    origin,
+                    "'*' stands alone: either any origin or a list of exact origins",
+                ));
+            }
+            // Exactly what a browser sends as `Origin`: the scheme and the host
+            // in lower case, no userinfo, no default port, nothing after the
+            // authority (not even `/`); anything else never matches the exact
+            // comparison of the CORS layer.
+            let default_port = |scheme: &str| match scheme {
+                "http" | "ws" => Some(80),
+                "https" | "wss" => Some(443),
+                _ => None,
+            };
+            let parsed = Uri::try_from(origin.as_str()).ok().filter(|uri| {
+                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
+                    if origin.as_str() == format!("{scheme}://{authority}")
+                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
+                        && !authority.as_str().contains('@')
+                        && authority
+                            .port_u16()
+                            .is_none_or(|port| Some(port) != default_port(scheme)))
+            });
+            if parsed.is_none() || HeaderValue::from_str(origin).is_err() {
+                return Err(invalid(
+                    origin,
+                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// `log_dir` names the directory the file log appender writes to, so it
     /// is checked before anything binds: a path that exists must be a
     /// directory the gateway can write; one that does not exist must sit
@@ -1590,6 +1692,14 @@ impl ConfigValidator {
     /// interval is refused with probing disabled too: the checker's loop
     /// still sleeps on it between connect signals.
     fn validate_health_check(health_check: &HealthCheckConfig) -> ConfigResult<()> {
+        if !health_check.endpoint.starts_with('/') {
+            return Err(ConfigError::InvalidValue {
+                field: "health_check.endpoint".to_string(),
+                value: health_check.endpoint.clone(),
+                reason: "must start with '/': it is appended to every HTTP worker's URL"
+                    .to_string(),
+            });
+        }
         let knobs = [
             (
                 "health_check.check_interval_secs",
@@ -2018,6 +2128,70 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
+    /// A `RouterConfig` built directly, as a language binding or a library
+    /// caller builds one: the validator refuses each malformed shape by its
+    /// field, and accepts the well-formed values.
+    #[test]
+    fn malformed_value_shapes_are_refused_by_name_on_a_directly_built_router_config() {
+        let defaults = RouterConfig::default;
+        let cases: Vec<(&str, RouterConfig)> = vec![
+            (
+                "health_check.endpoint",
+                RouterConfig {
+                    health_check: HealthCheckConfig {
+                        endpoint: "health".to_owned(),
+                        ..HealthCheckConfig::default()
+                    },
+                    ..defaults()
+                },
+            ),
+            (
+                "request_id_headers",
+                RouterConfig {
+                    request_id_headers: Some(vec!["bad header".to_owned()]),
+                    ..defaults()
+                },
+            ),
+            (
+                "storage_context_headers",
+                RouterConfig {
+                    storage_context_headers: [("bad header".to_owned(), "tenant".to_owned())]
+                        .into_iter()
+                        .collect(),
+                    ..defaults()
+                },
+            ),
+            (
+                "api_key",
+                RouterConfig {
+                    api_key: Some(" ".to_owned()),
+                    ..defaults()
+                },
+            ),
+        ];
+        for (field, config) in cases {
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue { field: named, .. }) => {
+                    assert_eq!(named, field);
+                }
+                other => panic!("{field}: expected a refusal by name, got {other:?}"),
+            }
+        }
+        let accepted = RouterConfig {
+            health_check: HealthCheckConfig {
+                endpoint: "/health".to_owned(),
+                ..HealthCheckConfig::default()
+            },
+            request_id_headers: Some(vec!["x-request-id".to_owned()]),
+            storage_context_headers: [("x-tenant".to_owned(), "tenant".to_owned())]
+                .into_iter()
+                .collect(),
+            api_key: Some("secret".to_owned()),
+            ..defaults()
+        };
+        assert!(ConfigValidator::validate(&accepted).is_ok());
+    }
+
     fn scheduler_config(path: Option<&str>) -> RouterConfig {
         RouterConfig {
             priority_scheduler_enabled: true,
@@ -2095,6 +2269,77 @@ mod tests {
         assert!(
             reason.contains("queue_timeout_secs must be > 0"),
             "the reason is the scheduler's own: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_priority_scheduler_default_max_class_is_a_configuration_error() {
+        for unknown in ["gold", "urgent"] {
+            let config = RouterConfig {
+                priority_scheduler_default_max_class: unknown.to_owned(),
+                ..scheduler_config(None)
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) if field == "priority_scheduler_default_max_class" => {
+                    assert_eq!(value, unknown);
+                    assert!(
+                        ["system", "interactive", "default", "bulk"]
+                            .iter()
+                            .all(|class| reason.contains(class)),
+                        "the reason names the four classes: {reason}"
+                    );
+                }
+                other => panic!(
+                    "`{unknown}` was not refused as a priority_scheduler_default_max_class error: {other:?}"
+                ),
+            }
+        }
+        // The four names in any case are accepted.
+        for known in ["system", "Interactive", " default ", "BULK"] {
+            let config = RouterConfig {
+                priority_scheduler_default_max_class: known.to_owned(),
+                ..scheduler_config(None)
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{known}");
+        }
+        // Not enabled: the flag is not read, like the path.
+        let config = RouterConfig {
+            priority_scheduler_default_max_class: "gold".to_owned(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_priority_scheduler_config_with_an_unknown_key_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let unknown_key = dir.path().join("unknown-key.yaml");
+        std::fs::write(
+            &unknown_key,
+            "classes: {}\ntenant_policies: {}\nextra_field: 1\n",
+        )
+        .unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(unknown_key.to_str()));
+        assert_eq!(value, unknown_key.to_str().unwrap());
+        assert!(
+            reason.starts_with("parsing ") && reason.contains("extra_field"),
+            "the reason names the file and the unknown key: {reason}"
+        );
+        // A misspelt section is an unknown key, not an empty section.
+        let misspelt = dir.path().join("misspelt.yaml");
+        std::fs::write(
+            &misspelt,
+            "tenant_polices:\n  \"header:a\":\n    max_class: bulk\n",
+        )
+        .unwrap();
+        let (_, reason) = refused_scheduler_config(&scheduler_config(misspelt.to_str()));
+        assert!(
+            reason.contains("tenant_polices"),
+            "the reason names the misspelt section: {reason}"
         );
     }
 
@@ -2322,6 +2567,63 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The shared validation holds the stores' numeric rules and leaves the
+    /// connection string to the driver: a Redis socket path and a Postgres
+    /// key=value string, which the drivers accept and the command line's URL
+    /// check does not, pass it; a zero bound in the same configuration does
+    /// not.
+    #[test]
+    fn the_shared_validation_leaves_the_store_connection_string_to_the_driver() {
+        let redis = |pool_max| RedisConfig {
+            url: "unix:///run/redis.sock".to_string(),
+            pool_max,
+            op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+            schema: None,
+            retention_days: Some(7),
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(4)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(0)),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(reason.contains("pool_max"), "{reason}");
+            }
+            other => panic!("expected the Redis bound, got {other:?}"),
+        }
+
+        let postgres = |op_timeout_secs| PostgresConfig {
+            db_url: "host=/var/run/postgresql dbname=smg user=smg".to_string(),
+            pool_max: 4,
+            op_timeout_secs,
+            schema: None,
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Postgres,
+            postgres: Some(postgres(5)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Postgres,
+            postgres: Some(postgres(0)),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(reason.contains("op_timeout_secs"), "{reason}");
+            }
+            other => panic!("expected the Postgres bound, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4018,5 +4320,57 @@ mod tests {
             })
             .build_unchecked();
         assert!(ConfigValidator::validate(&ok).is_ok());
+    }
+
+    /// The CORS origin rule holds on every construction path, not only in
+    /// the CLI: a lone `*` is the open policy, `*` next to an origin and a
+    /// value that is not exactly an origin are refused by name.
+    #[test]
+    fn cors_allowed_origins_are_exact_origins_or_a_lone_wildcard_on_every_path() {
+        let config = |origins: &[&str]| {
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .round_robin_policy()
+                .cors_allowed_origins(origins.iter().map(|origin| (*origin).to_string()).collect())
+                .build_unchecked()
+        };
+        for accepted in [
+            &[][..],
+            &["*"][..],
+            &["https://app.example"][..],
+            &["https://app.example", "http://localhost:3000"][..],
+        ] {
+            assert!(
+                ConfigValidator::validate(&config(accepted)).is_ok(),
+                "{accepted:?} is accepted"
+            );
+        }
+        for (refused, named) in [
+            (&["*", "https://app.example"][..], "*"),
+            (&["https://app.example", "*"][..], "*"),
+            (&["https://Example.com"][..], "https://Example.com"),
+            (&["example.com"][..], "example.com"),
+            (&["https://example.com/"][..], "https://example.com/"),
+        ] {
+            match ConfigValidator::validate(&config(refused)) {
+                Err(ConfigError::InvalidValue { field, value, .. }) => {
+                    assert_eq!(
+                        (field.as_str(), value.as_str()),
+                        ("cors_allowed_origins", named)
+                    );
+                }
+                other => panic!("{refused:?}: {other:?}"),
+            }
+        }
+        // The launcher's path: the builder's validating `build()`.
+        let built = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .cors_allowed_origins(vec!["*".to_string(), "https://app.example".to_string()])
+            .build();
+        assert!(
+            matches!(built, Err(ConfigError::InvalidValue { ref field, .. }) if field == "cors_allowed_origins"),
+            "{built:?}"
+        );
     }
 }

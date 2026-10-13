@@ -86,36 +86,14 @@ pub(crate) struct UpstreamClass {
 }
 
 impl UpstreamClass {
-    /// The class of `status`, through the dispatch path's own mapping, with
-    /// one difference: a cancelled RPC. A failed dispatch answers `Cancelled`
-    /// as the request's fault (400); after the response began, it is what
-    /// the engine's server produces when it resets its streams (a stop whose
-    /// grace period ran out, a dead peer: the transport's codes the liveness
-    /// monitor reads the same way), so it is a bad gateway here.
+    /// The class of `status`, through the dispatch path's own mapping
+    /// ([`TonicStatusExt::http_status`]): the same status is the same failure
+    /// on either side of the first chunk. A cancelled RPC is what the
+    /// engine's server produces when it resets its streams or its connection
+    /// closes under a call (a stop whose grace period ran out, a dead peer:
+    /// the transport's codes the liveness monitor reads the same way), a bad
+    /// gateway before the first token as after it.
     pub(crate) fn of(status: &tonic::Status) -> Self {
-        let (http, breaker_sample) = match status.code() {
-            tonic::Code::Cancelled => (
-                StatusCode::BAD_GATEWAY,
-                Some(StatusCode::BAD_GATEWAY.as_u16()),
-            ),
-            _ => (status.http_status(), status.breaker_status()),
-        };
-        let error_type = if is_the_engines_own_report(status) {
-            metrics_labels::ERROR_ENGINE
-        } else {
-            error_type_from_status(http)
-        };
-        Self {
-            http,
-            error_type,
-            breaker_sample,
-        }
-    }
-
-    /// The class of a status the engine answered a dispatch with: the
-    /// dispatch path's own mapping, `Cancelled` included (the request's
-    /// fault there, as [`TonicStatusExt::http_status`] has it).
-    pub(crate) fn of_dispatch(status: &tonic::Status) -> Self {
         let http = status.http_status();
         let error_type = if is_the_engines_own_report(status) {
             metrics_labels::ERROR_ENGINE
@@ -142,7 +120,7 @@ impl UpstreamClass {
         connection_mode: &'static str,
         status: &tonic::Status,
     ) {
-        Self::of_dispatch(status).account_worker_failure(worker_type, connection_mode);
+        Self::of(status).account_worker_failure(worker_type, connection_mode);
     }
 
     /// Count a stream `status` ended with against the worker that served it,
@@ -970,35 +948,23 @@ mod tests {
         );
     }
 
+    /// One classifier serves both sides of the first chunk: a cancelled
+    /// dispatch (the worker's side ending the call, its connection closed
+    /// under the leg's start) is the same cut by the engine's server as a
+    /// cancelled stream, a bad gateway the worker is charged for, never the
+    /// request's fault.
     #[test]
-    fn a_dispatch_status_is_classed_as_the_same_status_after_the_first_chunk_but_cancelled() {
-        for status in [
-            tonic::Status::unavailable("gone"),
-            tonic::Status::internal("broke"),
-            tonic::Status::internal(ENGINE_ERROR_MESSAGE),
-            tonic::Status::deadline_exceeded("too slow"),
-            tonic::Status::resource_exhausted("full"),
-            tonic::Status::invalid_argument("bad"),
-            tonic::Status::not_found("no such model"),
-        ] {
-            assert_eq!(
-                UpstreamClass::of_dispatch(&status),
-                UpstreamClass::of(&status),
-                "{status:?}"
-            );
-        }
-        // A cancelled dispatch is the request's fault (400), where the same
-        // code after the first chunk is a cut by the engine's server (502).
-        let cancelled = UpstreamClass::of_dispatch(&tonic::Status::cancelled("gone away"));
+    fn a_dispatch_status_is_classed_as_the_same_status_after_the_first_chunk() {
+        let cancelled = UpstreamClass::of(&tonic::Status::cancelled("operation was canceled"));
         assert_eq!(
             (
                 cancelled.http,
                 cancelled.error_type,
                 cancelled.breaker_sample
             ),
-            (StatusCode::BAD_REQUEST, "validation_error", Some(400))
+            (StatusCode::BAD_GATEWAY, "backend_error", Some(502))
         );
-        assert!(!cancelled.is_worker_failure());
+        assert!(cancelled.is_worker_failure());
     }
 
     #[test]
@@ -1039,8 +1005,9 @@ mod tests {
             )
             .map(|line| line.rsplit(' ').next().expect("a value").to_owned())
         };
-        // The worker's failures, each under its class...
-        assert_eq!(count("backend_error").as_deref(), Some("2"), "{rendered}");
+        // The worker's failures, each under its class (the cancelled call
+        // among the backend errors)...
+        assert_eq!(count("backend_error").as_deref(), Some("3"), "{rendered}");
         assert_eq!(count("timeout").as_deref(), Some("1"), "{rendered}");
         assert_eq!(count("engine_error").as_deref(), Some("1"), "{rendered}");
         // ...and nothing for the request's fault or capacity pushback.

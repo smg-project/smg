@@ -898,8 +898,9 @@ mod tests {
         listener.local_addr().expect("address").port()
     }
 
-    /// A registration context for a prefill leg at a loopback URL.
-    fn prefill_leg_context(
+    /// A registration context for a disaggregated leg at a loopback URL.
+    fn leg_context(
+        worker_type: WorkerType,
         bootstrap_port: Option<u16>,
         registration_mode: WorkerRegistrationMode,
     ) -> WorkflowContext<WorkerWorkflowData> {
@@ -910,7 +911,7 @@ mod tests {
 
         let mut spec = WorkerSpec::new("http://127.0.0.1:18000");
         spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
-        spec.worker_type = WorkerType::Prefill;
+        spec.worker_type = worker_type;
         spec.bootstrap_port = bootstrap_port;
         let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
@@ -954,7 +955,11 @@ mod tests {
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let mut ctx = prefill_leg_context(Some(closed_port), WorkerRegistrationMode::Upsert);
+        let mut ctx = leg_context(
+            WorkerType::Prefill,
+            Some(closed_port),
+            WorkerRegistrationMode::Upsert,
+        );
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
@@ -985,9 +990,10 @@ mod tests {
 
     /// A leg whose registration the register step refuses never joined the
     /// registry, so its port is not probed and no probe failure is counted
-    /// for it; a leg without a bootstrap port is not probed either.
+    /// for it; a decode leg without a bootstrap port is not probed either,
+    /// since no partner is handed a port for it.
     #[tokio::test]
-    async fn a_leg_the_registry_refuses_or_one_without_a_bootstrap_port_is_not_probed() {
+    async fn a_leg_the_registry_refuses_or_a_decode_leg_without_a_bootstrap_port_is_not_probed() {
         use crate::workflow::steps::RegisterWorkersStep;
 
         let closed_port = closed_loopback_port();
@@ -1000,14 +1006,14 @@ mod tests {
             worker_id: "worker-gone".to_string(),
             expected_revision: 0,
         };
-        let mut ctx = prefill_leg_context(Some(closed_port), refused);
+        let mut ctx = leg_context(WorkerType::Prefill, Some(closed_port), refused);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
         assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
 
-        let mut ctx = prefill_leg_context(None, WorkerRegistrationMode::Upsert);
+        let mut ctx = leg_context(WorkerType::Decode, None, WorkerRegistrationMode::Upsert);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
@@ -1022,6 +1028,56 @@ mod tests {
             !handle.render().contains("smg_pd_rendezvous_failures_total"),
             "{}",
             handle.render()
+        );
+    }
+
+    /// Whether something on this host answers on the default bootstrap port:
+    /// the tests of a leg registered without a port cannot tell a probe that
+    /// found a listener there from one that never ran, so they stand down.
+    fn something_listens_on_the_default_bootstrap_port() -> bool {
+        use std::net::{SocketAddr, TcpStream};
+
+        let address = SocketAddr::from(([127, 0, 0, 1], crate::worker::DEFAULT_BOOTSTRAP_PORT));
+        TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok()
+    }
+
+    /// A prefill leg registered without a bootstrap port (a `POST /workers`
+    /// without the field, a discovered pod without the annotation) is handed
+    /// the default port on the request path, so the default port is what is
+    /// probed for it: with nothing listening there, the failed probe is
+    /// counted once the leg is registered, like a registered port's.
+    #[tokio::test]
+    async fn a_prefill_leg_registered_without_a_bootstrap_port_is_probed_on_the_default_port() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        if something_listens_on_the_default_bootstrap_port() {
+            return;
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut ctx = leg_context(WorkerType::Prefill, None, WorkerRegistrationMode::Upsert);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let worker = Arc::clone(&ctx.data.actual_workers.as_ref().unwrap()[0]);
+        assert_eq!(
+            worker.bootstrap_port(),
+            None,
+            "the spec keeps what was registered"
+        );
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let counted = wait_for_probe_count(&handle).await;
+        assert!(
+            counted.contains(r#"leg="prefill""#)
+                && counted.contains(r#"phase="probe""#)
+                && counted.ends_with(" 1"),
+            "{counted}"
         );
     }
 

@@ -1,0 +1,26 @@
+{
+  "generator": "crates/multimodal/scripts/generate_decoded_rgb_fixtures.py",
+  "pillow": "12.3.0",
+  "cases": [
+    {
+      "name": "rgb16",
+      "image": "rgb16.png",
+      "width": 64,
+      "height": 4,
+      "mode": "RGB",
+      "transparent": false,
+      "note": "16-bit truecolour PNG: each sample's high byte",
+      "expected_rgb_base64": "AP8CBPseCPc7DPNXEO90FOuQGOesHOPJIN/lJNsCKNceLNM7Mc5XNcpzOcaQPcKsQb7JRbrlSbYCTbIeUa47VapXWaZzXaKQYZ6sZZrJaZblbZICco0edok6eoVXfoFzgn2QhnmsinXJjnHlkm0ClmkemmU6nmFXol1zplmQqlWsrlHJs0zlt0gBu0Qev0A6wzxXxzhzyzSQzzCs0yzJ1yjl2yQB3yAe4xw65xhX6xRz7xCQ9Aus+AfI/APlAP8BAP8CBPseCPc7DPNXEO90FOuQGOesHOPJIN/lJNsCKNceLNM7Mc5XNcp0OcaQPcKsQb7JRbrlSbYCTbIeUa47VapXWaZzXaKQYZ6sZZrJaZblbZICco0edok7eoVXfoFzgn2QhnmsinXJjnHlkm0ClmkemmU6nmFXol1zplmQqlWsrlHJs0zlt0gCu0Qev0A6wzxXxzhzyzSQzzCs0yzJ1yjl2yQB3yAe4xw65xhX6xRz7xCQ9Aus+AfJ/APlAP8BAP8CBPseCPc7DPNXEO90FOuQGOetHOPJIN/lJNsCKNceLNM7Mc5XNcp0OcaQPcKtQb7JRbrlSbYCTbIeUa47VapXWaZ0XaKQYZ6sZZrJaZblbZICco0edok7eoVXfoF0gn2QhnmsinXJjnHlkm0ClmkemmU7nmFXol1zplmQqlWsrlHJs0zlt0gCu0Qev0A7wzxXxzhzyzSQzzCs0yzJ1yjl2yQC3yAe4xw65xhX6xRz7xCQ9Aus+AfJ/APlAP8CAP8CBPseCPc7DPNXEO90FOuQGOetHOPJIN/mJNsCKNceLNM7Mc5XNcp0OcaQPcKtQb7JRbrlSbYCTbIeUa47VapXWaZ0XaKQYZ6tZZrJaZblbZICco0edok7eoVXfoF0gn2QhnmsinXJjnHlkm0ClmkemmU7nmFXol10plmQqlWsrlHJs0zlt0gCu0Qev0A7wzxXxzhzyzSQzzCs0yzJ1yjl2yQC3yAe4xw75xhX6xRz7xCQ9Aus+AfJ/APlAP8C"
+    },
+    {
+      "name": "rgb16_trns",
+      "image": "rgb16_trns.png",
+      "width": 64,
+      "height": 4,
+      "mode": "RGB",
+      "transparent": true,
+      "note": "16-bit truecolour PNG with a tRNS colour key: kept as stored",
+      "expected_rgb_base64": "AP8CBPseCPc7DPNXEO90FOuQGOesHOPJIN/lJNsCKNceLNM7Mc5XNcpzOcaQPcKsQb7JRbrlSbYCTbIeUa47VapXWaZzXaKQYZ6sZZrJaZblbZICco0edok6eoVXfoFzgn2QhnmsinXJjnHlkm0ClmkemmU6nmFXol1zplmQqlWsrlHJs0zlt0gBu0Qev0A6wzxXxzhzyzSQzzCs0yzJ1yjl2yQB3yAe4xw65xhX6xRz7xCQ9Aus+AfI/APlAP8BAP8CBPseCPc7DPNXEO90FOuQGOesHOPJIN/lJNsCKNceLNM7Mc5XNcp0OcaQPcKsQb7JRbrlSbYCTbIeUa47VapXWaZzXaKQYZ6sZZrJaZblbZICco0edok7eoVXfoFzgn2QhnmsinXJjnHlkm0ClmkemmU6nmFXol1zplmQqlWsrlHJs0zlt0gCu0Qev0A6wzxXxzhzyzSQzzCs0yzJ1yjl2yQB3yAe4xw65xhX6xRz7xCQ9Aus+AfJ/APlAP8BAP8CBPseCPc7DPNXEO90FOuQGOetHOPJIN/lJNsCKNceLNM7Mc5XNcp0OcaQPcKtQb7JRbrlSbYCTbIeUa47VapXWaZ0XaKQYZ6sZZrJaZblbZICco0edok7eoVXfoF0gn2QhnmsinXJjnHlkm0ClmkemmU7nmFXol1zplmQqlWsrlHJs0zlt0gCu0Qev0A7wzxXxzhzyzSQzzCs0yzJ1yjl2yQC3yAe4xw65xhX6xRz7xCQ9Aus+AfJ/APlAP8CAP8CBPseCPc7DPNXEO90FOuQGOetHOPJIN/mJNsCKNceLNM7Mc5XNcp0OcaQPcKtQb7JRbrlSbYCTbIeUa47VapXWaZ0XaKQYZ6tZZrJaZblbZICco0edok7eoVXfoF0gn2QhnmsinXJjnHlkm0ClmkemmU7nmFXol10plmQqlWsrlHJs0zlt0gCu0Qev0A7wzxXxzhzyzSQzzCs0yzJ1yjl2yQC3yAe4xw75xhX6xRz7xCQ9Aus+AfJ/APlAP8C"
+    }
+  ]
+}

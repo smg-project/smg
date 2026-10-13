@@ -946,4 +946,102 @@ mod tests {
         )
         .await;
     }
+
+    /// A prefill leg discovered without a bootstrap annotation carries no
+    /// bootstrap port into its spec and is handed the default port on the
+    /// request path (here a vLLM leg on the Mooncake connector, as the
+    /// provider reports it). Registered, it is probed on that default port:
+    /// with nothing listening there, the failed probe is counted like a
+    /// registered port's.
+    #[tokio::test]
+    async fn a_discovered_prefill_leg_without_a_bootstrap_annotation_is_probed_on_the_default_port()
+    {
+        use std::{
+            net::{SocketAddr, TcpStream},
+            sync::Arc,
+            time::Duration,
+        };
+
+        use openai_protocol::worker::RuntimeType;
+        use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
+
+        use crate::{
+            worker::{ConnectionMode, DEFAULT_BOOTSTRAP_PORT},
+            workflow::{
+                data::WorkerKind,
+                steps::{create_worker_workflow_data, CreateLocalWorkerStep, RegisterWorkersStep},
+            },
+        };
+
+        // A listener on the default port would make a passed probe and an
+        // absent one look alike, so the test stands down then.
+        let default_port = SocketAddr::from(([127, 0, 0, 1], DEFAULT_BOOTSTRAP_PORT));
+        if TcpStream::connect_timeout(&default_port, Duration::from_millis(500)).is_ok() {
+            return;
+        }
+
+        let app_context = create_test_app_context();
+        let worker = DiscoveredWorker {
+            worker_type: WorkerType::Prefill,
+            kv_connector: Some("MooncakeConnector".to_string()),
+            kv_role: Some("kv_producer".to_string()),
+            kv_engine_id: Some("engine-1".to_string()),
+            ..published("127.0.0.1:18081", "uid-1:18081")
+        };
+        let mut spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &app_context);
+        assert_eq!(spec.bootstrap_port, None, "no annotation, no port");
+        // The runtime the leg's engine reports when the registration detects it.
+        spec.runtime_type = RuntimeType::Vllm;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut data = create_worker_workflow_data(
+            spec,
+            WorkerRegistrationMode::Upsert,
+            Arc::clone(&app_context),
+        );
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let registered = &ctx.data.actual_workers.as_ref().unwrap()[0];
+        assert_eq!(
+            registered.bootstrap_port(),
+            None,
+            "the spec keeps what was discovered"
+        );
+
+        // The probe runs off the path, within its own timeout.
+        let deadline = time::Instant::now() + Duration::from_secs(5);
+        let counted = loop {
+            let rendered = handle.render();
+            if let Some(line) = rendered
+                .lines()
+                .find(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            {
+                break line.to_string();
+            }
+            assert!(
+                time::Instant::now() < deadline,
+                "the failed probe of the default port is counted within its timeout:\n{rendered}"
+            );
+            time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            counted.contains(r#"leg="prefill""#)
+                && counted.contains(r#"phase="probe""#)
+                && counted.ends_with(" 1"),
+            "{counted}"
+        );
+    }
 }

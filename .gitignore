@@ -107,6 +107,7 @@ tl_out/
 *.pdf
 # Lossless image fixtures for preprocessing parity tests
 !crates/multimodal/tests/fixtures/images/*.png
+!crates/multimodal/tests/fixtures/images/decoded_rgb/*.png
 
 # personnal
 work_dirs/

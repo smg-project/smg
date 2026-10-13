@@ -1551,7 +1551,9 @@ class RouterArgs:
             action="extend",
             help=(
                 "Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id)."
-                " If not specified, uses common defaults."
+                " If not specified, uses common defaults. The first header present is honoured"
+                " when its value is 1 to 128 visible-ASCII characters; otherwise a fresh id is"
+                " generated."
             ),
         )
         request_group.add_argument(
@@ -1631,7 +1633,11 @@ class RouterArgs:
             nargs="*",
             action="extend",
             default=[],
-            help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+            help=(
+                "Origins a browser may call the gateway from (e.g., http://localhost:3000"
+                " https://example.com), or '*' alone for any origin. Without this flag the"
+                " gateway makes no cross-origin allowance."
+            ),
         )
 
         # Rate limiting configuration

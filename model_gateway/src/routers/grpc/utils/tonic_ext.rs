@@ -12,7 +12,9 @@ pub(crate) trait TonicStatusExt {
     /// Map gRPC status code to the corresponding HTTP status code. A failure
     /// of the request's media (see [`TonicStatusExt::media_fault`]) is
     /// answered for the media: the request's own fault 400, the media host's
-    /// 502.
+    /// 502. A `CANCELLED` the worker answered is the worker's side ending the
+    /// call (its connection closed under it, its server reset the stream):
+    /// a bad gateway, never the request's fault.
     fn http_status(&self) -> StatusCode;
 
     /// Convert this gRPC error into an HTTP error response with the appropriate status code.
@@ -48,10 +50,13 @@ impl TonicStatusExt for tonic::Status {
         }
         match self.code() {
             Code::Ok => StatusCode::OK,
-            Code::InvalidArgument
-            | Code::FailedPrecondition
-            | Code::OutOfRange
-            | Code::Cancelled => StatusCode::BAD_REQUEST,
+            Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => {
+                StatusCode::BAD_REQUEST
+            }
+            // The worker's side ended the call: what a connection that closed
+            // under it or a server that reset the stream produce, nothing the
+            // request did (the liveness monitor reads the code the same way).
+            Code::Cancelled => StatusCode::BAD_GATEWAY,
             Code::Unauthenticated => StatusCode::UNAUTHORIZED,
             Code::PermissionDenied => StatusCode::FORBIDDEN,
             Code::NotFound => StatusCode::NOT_FOUND,
@@ -119,6 +124,18 @@ mod tests {
             let result: Result<(), tonic::Status> = Err(status);
             assert_eq!(result.breaker_status(), Some(400));
         }
+        assert!(!DEFAULT_RETRYABLE_STATUS_CODES.contains(&400));
+    }
+
+    /// A call the worker's side cancelled is the worker's failure: a 502 the
+    /// retry layer replays elsewhere and the breaker samples, never a 400.
+    #[test]
+    fn a_cancelled_call_maps_to_502_and_is_a_retryable_circuit_breaker_failure() {
+        let status = tonic::Status::cancelled("operation was canceled");
+        assert_eq!(status.http_status(), StatusCode::BAD_GATEWAY);
+        let result: Result<(), tonic::Status> = Err(status);
+        assert_eq!(result.breaker_status(), Some(502));
+        assert!(DEFAULT_RETRYABLE_STATUS_CODES.contains(&502));
         assert!(!DEFAULT_RETRYABLE_STATUS_CODES.contains(&400));
     }
 

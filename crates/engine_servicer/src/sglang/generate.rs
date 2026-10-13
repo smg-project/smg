@@ -19,7 +19,10 @@ use tokio::sync::oneshot;
 use tonic::Status;
 
 use super::State;
-use crate::{requests::Registration, BoxStream};
+use crate::{
+    requests::{settle_shutdown, CancelReason, HeldTerminal, Registration},
+    BoxStream,
+};
 
 /// Handle one `Generate` request against the connected scheduler.
 /// `trace_headers` is the caller's W3C trace context (see
@@ -63,6 +66,7 @@ pub(super) async fn generate(
         choices,
         cancel,
         aborted: None,
+        cut: None,
         _registration: registration,
     }))
 }
@@ -103,6 +107,31 @@ impl ChoiceStream {
     }
 }
 
+impl HeldTerminal for ChoiceStream {
+    type Response = sg::GenerateResponse;
+
+    /// The terminal this choice already holds, when the engine finished it on
+    /// the tick before the poll that would have yielded it (the parked
+    /// `Complete`). `None` for a choice still open, which is left as it is.
+    fn finished(&mut self) -> Option<sg::GenerateResponse> {
+        let inner = self.inner.as_mut()?;
+        if !inner.has_parked_complete() {
+            return None;
+        }
+        // `complete_aborted` yields the parked `Complete` when there is one.
+        let complete = inner.complete_aborted();
+        let response = self.convert(complete);
+        self.inner = None;
+        Some(response)
+    }
+
+    /// Whether this choice is still open: neither ended nor holding its
+    /// terminal.
+    fn is_open(&self) -> bool {
+        self.inner.is_some()
+    }
+}
+
 type ChoiceItem = Result<sg::GenerateResponse, Status>;
 
 impl Stream for ChoiceStream {
@@ -134,8 +163,20 @@ impl Stream for ChoiceStream {
                 continue;
             }
             // The engine's own terminal `Complete` passes through as-is; the
-            // engine stream ends after it.
-            return Poll::Ready(Some(Ok(this.convert(item))));
+            // engine stream ends after it, and the choice is no longer open
+            // once the `Complete` is out (a shutdown landing before the next
+            // poll must not cut it; the engine stream has already seen the
+            // finish, so dropping it sends no abort). `convert` reads the
+            // engine stream, so it goes first.
+            let ended = matches!(
+                item.response,
+                Some(vllm::generate_response::Response::Complete(_))
+            );
+            let response = this.convert(item);
+            if ended {
+                this.inner = None;
+            }
+            return Poll::Ready(Some(Ok(response)));
         }
     }
 }
@@ -145,10 +186,13 @@ impl Stream for ChoiceStream {
 /// `Abort` RPC.
 struct GenerateStream {
     choices: SelectAll<ChoiceStream>,
-    cancel: oneshot::Receiver<()>,
+    cancel: oneshot::Receiver<CancelReason>,
     /// Set once aborted: the terminal `Complete` of every choice still open
     /// at that point, yielded before the stream ends.
     aborted: Option<VecDeque<sg::GenerateResponse>>,
+    /// The status a shutdown ends the stream with once `aborted` is drained,
+    /// when it cut a choice still open; `None` ends it plainly.
+    cut: Option<Status>,
     _registration: Registration,
 }
 
@@ -159,13 +203,36 @@ impl Stream for GenerateStream {
         let this = self.get_mut();
         loop {
             if let Some(aborted) = this.aborted.as_mut() {
-                return Poll::Ready(aborted.pop_front().map(Ok));
+                if let Some(response) = aborted.pop_front() {
+                    return Poll::Ready(Some(Ok(response)));
+                }
+                // The completions the choices already held went out; a
+                // shutdown that cut a choice still open ends the stream with
+                // its status, a plain abort just ends it.
+                return Poll::Ready(this.cut.take().map(Err));
             }
-            // Either an `Abort` fired the sender or shutdown dropped the
-            // registry: both end the request as the Python servicer does, with
-            // each open choice's `Complete(finish_reason = "abort")`. Dropping
-            // the choices aborts the engine side.
-            if Pin::new(&mut this.cancel).poll(cx).is_ready() {
+            // The cancellation names its cause. An `Abort` RPC is the caller's
+            // own abort: the request ends as the Python servicer ends it, with
+            // each open choice's `Complete(finish_reason = "abort")`. A
+            // shutdown with the request still open is its engine side going
+            // away under it (the lifecycle owner stopping the pair after the
+            // engine exited, a drain whose grace ran out): no completion the
+            // caller could read as a short answer, so the stream ends with
+            // UNAVAILABLE, which the Router classes as the worker's failure.
+            // Either way dropping the choices aborts the engine side.
+            if let Poll::Ready(reason) = Pin::new(&mut this.cancel).poll(cx) {
+                if reason == Ok(CancelReason::Shutdown) {
+                    // A choice the engine (or a stop string) finished before
+                    // this poll keeps its completion; only a choice still
+                    // open is cut, and only then does the stream end with the
+                    // status (see `settle_shutdown`).
+                    let (finished, cut) = settle_shutdown(&mut this.choices);
+                    this.aborted = Some(finished);
+                    this.cut = cut.then(|| Status::unavailable(crate::requests::SHUTDOWN_MESSAGE));
+                    continue;
+                }
+                // The abort, or a sender dropped without a word (the registry
+                // entry went away): the completion it always was.
                 let aborted = this
                     .choices
                     .iter_mut()

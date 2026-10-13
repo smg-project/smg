@@ -40,8 +40,9 @@ use crate::{
             },
             multimodal::worker_language_model_only,
             proto_wrapper::{
-                FanoutStream, FirstItem, PrefillCachedTokens, PrefillTicket, ProtoEmbedRequest,
-                ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant, ProtoStream,
+                DispatchBooking, FanoutStream, FirstItem, PrefillCachedTokens, PrefillTicket,
+                ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant,
+                ProtoStream,
             },
             utils::{
                 account_pd_leg_failure,
@@ -812,10 +813,20 @@ async fn execute_single(
 
     let prompt_tokens = u64::try_from(proto_request.prompt_len()).unwrap_or(u64::MAX);
     let streaming = proto_request.stream();
-    if let Some(worker) = workers.single() {
+    let worker = workers.single();
+    if let Some(worker) = worker {
         Metrics::record_worker_request(worker.url(), worker.model_id());
     }
-    let result = client.generate(proto_request).await;
+    // The call's future is boxed, as the disaggregated legs' are: it is the
+    // large part of the dispatch, and inlined in the pipeline's future it
+    // put that future over the size bound.
+    let result = dispatch_single_booked(
+        Box::pin(client.generate(proto_request)),
+        worker,
+        prompt_tokens,
+        streaming,
+    )
+    .await;
     if let Some(status) = result.breaker_status() {
         workers.record_outcome(ledger, status);
     }
@@ -835,19 +846,35 @@ async fn execute_single(
             "start_generation_failed",
         )
     })?;
-    // Every generation to one worker is tracked: each response on it is
-    // progress for the worker (liveness), the one answer of a non-streaming
-    // generation included, and its prompt is pending prefill there until the
-    // first response. Only a streaming generation joins the worker's pile: a
-    // non-streaming one shows nothing between dispatch and completion, and
-    // the pile rule never judges a worker by requests it cannot see progress
-    // on.
-    let stream = match workers.single() {
-        Some(worker) => stream.tracked(Arc::clone(worker), prompt_tokens, streaming),
-        None => stream,
-    };
-
     Ok(ExecutionResult::Single { stream })
+}
+
+/// Dispatch one generation to `worker` (the `call`), booked on the worker
+/// before the call is polled; the call's stream takes the booking over.
+/// Every generation to one worker is tracked: each response on it is
+/// progress for the worker (liveness), the one answer of a non-streaming
+/// generation included, and its prompt is pending prefill there from the
+/// dispatch until the first response. Only a streaming generation joins the
+/// worker's pile: a non-streaming one shows nothing between dispatch and
+/// completion, and the pile rule never judges a worker by requests it cannot
+/// see progress on. The booking comes first because the gRPC servicers
+/// answer the call together with the first message: booked at the call's
+/// return, the prompt was never pending while its prefill ran, every busy
+/// span was about zero, the worker learned a prefill rate many times its
+/// real one and the wedge bound never covered a prefill in progress (see
+/// `PrefillTicket::book`). A call that fails gives the booking back.
+async fn dispatch_single_booked(
+    call: impl Future<Output = StreamResult>,
+    worker: Option<&Arc<dyn Worker>>,
+    prompt_tokens: u64,
+    streaming: bool,
+) -> StreamResult {
+    let Some(worker) = worker else {
+        return call.await;
+    };
+    let booking = DispatchBooking::book(worker, prompt_tokens, streaming);
+    let stream = call.await?;
+    Ok(stream.tracked_booked(Arc::clone(worker), booking))
 }
 
 /// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
@@ -2227,6 +2254,31 @@ mod tests {
         );
     }
 
+    /// A leg start the worker's side cancelled (its connection closed under
+    /// the call) is the worker's failure, not a rejection of the request: a
+    /// 502 under the leg's code, which the retry layer replays on another
+    /// worker, never a 400 the client would read as its own mistake.
+    #[test]
+    fn a_leg_start_the_worker_cancelled_is_a_retryable_502_not_a_rejection() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let cancelled = start_failure_response(
+            &tonic::Status::cancelled("operation was canceled"),
+            "execute_sequential_pd",
+            PdLeg::Decode.error_message(),
+            PdLeg::Decode.error_code(),
+        );
+        assert_eq!(cancelled.status(), http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            cancelled
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "decode_worker_failed_to_start"
+        );
+        assert!(is_retryable_response(&cancelled));
+    }
+
     #[test]
     fn a_spent_sidecar_budget_is_not_retried_but_a_fast_sidecar_failure_is() {
         use crate::routers::common::retry::is_retryable_response;
@@ -3395,5 +3447,62 @@ mod tests {
 
         let unset = ProtoGenerateComplete::Vllm(Box::default());
         assert_eq!(unset.kv_transfer_params_json(), None);
+    }
+
+    /// The regular dispatch books the request on its worker before its call
+    /// is polled: the gRPC servicers answer the call together with the first
+    /// message, so a prefill in progress on the worker sees the prompt
+    /// pending and a streaming request in the pile the whole time; the
+    /// stream takes the booking over, a failed call gives it back.
+    #[tokio::test]
+    async fn a_single_dispatch_is_booked_on_its_worker_before_its_call_answers() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
+        fn books(worker: &Arc<dyn Worker>) -> (Duration, usize) {
+            (worker.prefill_backlog(), worker.tracked_load())
+        }
+        // 4,096 prompt tokens at the cold prior read as 409 ms of backlog.
+        let pending = Duration::from_millis(409);
+        let none = (Duration::ZERO, 0);
+        for (streaming, pile) in [(true, 1), (false, 0)] {
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            let call = {
+                let worker = Arc::clone(&worker);
+                let seen = Arc::clone(&seen);
+                async move {
+                    *seen.lock().unwrap() = Some(books(&worker));
+                    Ok(ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(
+                        Vec::new(),
+                    )))
+                }
+            };
+            let stream = dispatch_single_booked(call, Some(&worker), 4_096, streaming)
+                .await
+                .expect("the call answered");
+            assert_eq!(
+                seen.lock().unwrap().take(),
+                Some((pending, pile)),
+                "pending prefill and in the pile while the call runs (streaming {streaming})"
+            );
+            assert_eq!(
+                books(&worker),
+                (pending, pile),
+                "handed to the stream: booked once, not again"
+            );
+            drop(stream);
+            assert_eq!(books(&worker), none, "released with the stream");
+        }
+        let failed = dispatch_single_booked(
+            async { Err(tonic::Status::unavailable("refused")) },
+            Some(&worker),
+            4_096,
+            true,
+        )
+        .await;
+        assert!(failed.is_err(), "the call's failure is the dispatch's");
+        assert_eq!(
+            books(&worker),
+            none,
+            "a call that fails gives the booking back"
+        );
     }
 }

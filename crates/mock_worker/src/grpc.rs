@@ -461,8 +461,9 @@ impl TokenSpeedScheduler for MockScheduler {
 /// The gRPC status code closest to the HTTP status a request fault answers,
 /// chosen so the gateway's mapping of codes to HTTP statuses gives that status
 /// back where it can: 408 reads back as 504 and 502 as 503 (both still
-/// retryable), any other 4xx as 400 (not retryable, as on the HTTP worker),
-/// any other 5xx as 500.
+/// retryable), 499 as 502 (`cancelled`: the worker's side ending the call,
+/// retryable and charged to the worker), any other 4xx as 400 (not
+/// retryable, as on the HTTP worker), any other 5xx as 500.
 fn injected_status(status: u16) -> Status {
     const MESSAGE: &str = "injected";
     match status {
@@ -473,6 +474,9 @@ fn injected_status(status: u16) -> Status {
         408 | 504 => Status::deadline_exceeded(MESSAGE),
         409 => Status::aborted(MESSAGE),
         429 => Status::resource_exhausted(MESSAGE),
+        // The call the worker's side ended: what a connection that closed
+        // under it produces at the gateway.
+        499 => Status::cancelled(MESSAGE),
         501 => Status::unimplemented(MESSAGE),
         502 | 503 => Status::unavailable(MESSAGE),
         other if (400..=499).contains(&other) => Status::invalid_argument(MESSAGE),
@@ -1072,8 +1076,9 @@ mod tests {
         assert_eq!(injected_status(429).code(), tonic::Code::ResourceExhausted);
         assert_eq!(injected_status(504).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(400).code(), tonic::Code::InvalidArgument);
-        // The two non-inverse cases (read back as 504 and 503) and a 4xx
-        // without its own code (read back as 400).
+        assert_eq!(injected_status(499).code(), tonic::Code::Cancelled);
+        // The three non-inverse cases (408 and 502 read back as 504 and 503,
+        // 499 as 502) and a 4xx without its own code (read back as 400).
         assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
         assert_eq!(injected_status(422).code(), tonic::Code::InvalidArgument);

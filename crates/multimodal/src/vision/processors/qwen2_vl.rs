@@ -22,10 +22,13 @@ use std::ops::Deref;
 use image::DynamicImage;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::TransformError,
+use crate::{
+    encoder_inputs::EncoderDtype,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{PreprocessedEncoderInputs, VisionPreProcessor},
+        transforms::TransformError,
+    },
 };
 
 /// CLIP normalization mean values used by Qwen2-VL models.
@@ -241,6 +244,16 @@ impl VisionPreProcessor for Qwen2VLProcessor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let processor = self.with_preprocessor_config(config);
         processor.inner.preprocess(images, config)
+    }
+
+    fn preprocess_wire(
+        &self,
+        images: &[DynamicImage],
+        config: &PreProcessorConfig,
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        let processor = self.with_preprocessor_config(config);
+        processor.inner.preprocess_wire(images, config, dtype)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {

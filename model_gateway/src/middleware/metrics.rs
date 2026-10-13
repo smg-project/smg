@@ -13,6 +13,11 @@
 //! cut was a 200 and a request the client abandoned before its answer was
 //! nothing at all.
 //!
+//! A body that failed after its head went out (the relay's upstream stream
+//! broke mid-body) keeps the head's status, told apart by the `error_code`
+//! [`BODY_FAILED_CODE`]: counted as its head alone, a truncated answer was a
+//! complete one.
+//!
 //! A body has gone out in full at its last frame, or once its data frames
 //! add up to the length the response declared (`Content-Length`): an
 //! HTTP/1.1 server writes that many bytes and asks for no more, so a relayed
@@ -43,7 +48,9 @@ use crate::{
         inflight_tracker::{InFlightGuard, InFlightRequestTracker},
         metrics::{method_to_static_str, Metrics},
     },
-    routers::error::extract_error_code_from_response,
+    routers::{
+        error::extract_error_code_from_response, grpc::utils::stream_failure::STREAM_ERROR_TYPE,
+    },
 };
 
 /// The `error_code` label of a response: the code the gateway's error builder
@@ -67,6 +74,14 @@ pub(crate) fn error_code_label(response: &Response) -> &str {
 /// names the outcome on the same sample.
 pub const CLIENT_CLOSED_REQUEST_STATUS: u16 = 499;
 pub const CLIENT_CLOSED_REQUEST_CODE: &str = "client_closed_request";
+
+/// The `error_code` of a response whose body failed after its head was out
+/// (the relay's upstream stream broke mid-body): the sample keeps the head's
+/// status; a gateway error code the head carried stays, else this code names
+/// the failure where an empty code would say the response went out in full.
+/// The type the SSE error event gives a stream the worker failed, shared with
+/// it so the two names cannot drift apart.
+pub const BODY_FAILED_CODE: &str = STREAM_ERROR_TYPE;
 
 /// The length a response declares for its body: its `Content-Length`, or
 /// else what the body itself knows exactly. An HTTP/1.1 server writes that
@@ -206,7 +221,8 @@ where
 
 /// What `smg_http_responses_total` counts for one request, recorded exactly
 /// once: the response head's status once the response has gone out in full,
-/// a client-closed request when the client left first.
+/// the head's status with [`BODY_FAILED_CODE`] when its body failed after
+/// the head, a client-closed request when the client left first.
 struct ResponseOutcome {
     path: String,
     /// The response head's status and gateway error code, once there is one.
@@ -237,6 +253,22 @@ impl ResponseOutcome {
             return;
         }
         if let Some((status_code, error_code)) = &self.head {
+            Metrics::record_http_response(&self.path, *status_code, error_code);
+        }
+    }
+
+    /// The body failed after the head went out: count the head's status,
+    /// with the failure named unless the head carried a gateway error code.
+    fn body_failed(&mut self) {
+        if std::mem::replace(&mut self.recorded, true) {
+            return;
+        }
+        if let Some((status_code, error_code)) = &self.head {
+            let error_code = if error_code.is_empty() {
+                BODY_FAILED_CODE
+            } else {
+                error_code.as_str()
+            };
             Metrics::record_http_response(&self.path, *status_code, error_code);
         }
     }
@@ -324,11 +356,18 @@ impl TrackedBody {
         }
     }
 
-    /// The body reached its end (a failure of the body ends it too): the
-    /// response is out and counts as its head's status.
+    /// The body reached its end: the response is out and counts as its
+    /// head's status.
     fn ended(&mut self) {
         self.release();
         self.outcome.completed();
+    }
+
+    /// The body failed after its head: the response ends here, truncated,
+    /// and counts as its head's status with the failure named.
+    fn failed(&mut self) {
+        self.release();
+        self.outcome.body_failed();
     }
 }
 
@@ -351,7 +390,8 @@ impl http_body::Body for TrackedBody {
         // for the None (an HTTP/1.1 server stops at the declared length).
         // Drop still covers client disconnect.
         match &poll {
-            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => this.ended(),
+            Poll::Ready(None) => this.ended(),
+            Poll::Ready(Some(Err(_))) => this.failed(),
             Poll::Ready(Some(Ok(frame))) => {
                 if this.progress.frame_out(frame, this.inner.is_end_stream()) {
                     this.ended();
@@ -754,8 +794,9 @@ mod tests {
 }
 
 /// `smg_http_responses_total` counts a request once, at its outcome: the
-/// head's status once the response is out in full, 499 when the client closed
-/// the connection first.
+/// head's status once the response is out in full, the head's status with
+/// `stream_error` when its body failed after the head, 499 when the client
+/// closed the connection first.
 #[cfg(test)]
 mod client_closed_tests {
     use std::{
@@ -912,6 +953,110 @@ mod client_closed_tests {
                 }),
             )
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
+    }
+
+    /// A router whose `/refused` handler answers the gateway's own 503 error
+    /// (its gateway error code on the head) with `body` in place of the
+    /// error's JSON.
+    fn refused_stream_app(body: Body) -> Router {
+        let slot = Arc::new(Mutex::new(Some(body)));
+        Router::new()
+            .route(
+                "/refused",
+                get(move || {
+                    let body = slot
+                        .lock()
+                        .expect("slot")
+                        .take()
+                        .expect("handler called once");
+                    async move {
+                        let (parts, _) = create_error(
+                            http::StatusCode::SERVICE_UNAVAILABLE,
+                            "no_available_workers",
+                            "no worker".to_owned(),
+                        )
+                        .into_parts();
+                        Response::from_parts(parts, body)
+                    }
+                }),
+            )
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
+    }
+
+    /// The error a relayed body ends with when its upstream stream breaks.
+    fn broken() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::ConnectionReset, "upstream reset")
+    }
+
+    #[test]
+    fn a_stream_whose_body_fails_after_its_head_counts_the_head_status_with_the_failure_named() {
+        // The HTTP relay's body ends with an error when the upstream stream
+        // breaks after the head: the client received a truncated answer.
+        let rendered = render(|handle| async move {
+            let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let app = stream_app(Body::from_stream(ReceiverStream::new(rx)));
+            let response = app.oneshot(request("/stream")).await.expect("response");
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let mut body = response.into_body();
+            tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
+                .await
+                .expect("send");
+            let frame = body.frame().await.expect("one frame").expect("frame ok");
+            assert!(frame.is_data());
+            assert!(responses(&handle.render(), "/stream").is_empty());
+            tx.send(Err(broken())).await.expect("send");
+            assert!(
+                body.frame().await.expect("a frame").is_err(),
+                "the body ends with the error"
+            );
+            // Counted at the failure, once: the head's status, the failure
+            // named; the drop that follows adds nothing.
+            assert_eq!(
+                responses(&handle.render(), "/stream"),
+                sample("200", "stream_error")
+            );
+            drop(body);
+            drop(tx);
+        });
+        assert_eq!(
+            responses(&rendered, "/stream"),
+            sample("200", "stream_error"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_body_that_fails_under_an_error_head_keeps_a_gateway_error_code_the_head_carried() {
+        // A relayed error head carries no gateway code: the failure names it.
+        let rendered = render(|_| async {
+            let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let app = relay_app(503, 12, Body::from_stream(ReceiverStream::new(rx)));
+            let response = app.oneshot(request("/relay")).await.expect("response");
+            let mut body = response.into_body();
+            tx.send(Err(broken())).await.expect("send");
+            assert!(body.frame().await.expect("a frame").is_err());
+            drop(body);
+        });
+        assert_eq!(
+            responses(&rendered, "/relay"),
+            sample("503", "stream_error"),
+            "{rendered}"
+        );
+        // The gateway's own refusal already names its outcome on the head.
+        let rendered = render(|_| async {
+            let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+            let app = refused_stream_app(Body::from_stream(ReceiverStream::new(rx)));
+            let response = app.oneshot(request("/refused")).await.expect("response");
+            let mut body = response.into_body();
+            tx.send(Err(broken())).await.expect("send");
+            assert!(body.frame().await.expect("a frame").is_err());
+            drop(body);
+        });
+        assert_eq!(
+            responses(&rendered, "/refused"),
+            sample("503", "no_available_workers"),
+            "{rendered}"
+        );
     }
 
     #[test]

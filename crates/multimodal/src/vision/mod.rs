@@ -33,9 +33,11 @@
 //! ```
 
 pub mod execution;
+pub(crate) mod orientation;
 pub mod preprocessor_config;
 pub mod processor;
 pub mod processors;
+pub(crate) mod rgb_runs;
 pub(crate) mod scratch;
 mod torch_resample;
 pub mod transforms;

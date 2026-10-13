@@ -9,7 +9,7 @@ use image::DynamicImage;
 
 use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::types::RgbFrameRef;
+use crate::{encoder_inputs::EncoderDtype, types::RgbFrameRef};
 
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
@@ -105,6 +105,22 @@ pub trait VisionPreProcessor: Send + Sync {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
+
+    /// Preprocess a batch of images straight into `dtype`, the wire's dtype,
+    /// when the processor can lay the patches out and normalize them in one
+    /// pass (an [`EncoderInput::Wire`](crate::encoder_inputs::EncoderInput::Wire)
+    /// result); `None` when it cannot, which leaves the caller
+    /// [`preprocess`](Self::preprocess) and the per-destination write. The
+    /// bytes a `Wire` carries are the bytes `preprocess` followed by a write
+    /// in `dtype` would produce.
+    fn preprocess_wire(
+        &self,
+        _images: &[DynamicImage],
+        _config: &PreProcessorConfig,
+        _dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        None
+    }
 
     /// Preprocess one decoded video clip represented as sampled frames.
     ///

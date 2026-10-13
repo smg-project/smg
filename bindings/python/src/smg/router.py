@@ -310,8 +310,9 @@ class Router:
         rate_limit_tokens_per_second: Sustained admission rate (requests per
             second), bursting up to max_concurrent_requests, which keeps bounding
             standing concurrency. Unset or 0 = no rate limit. Default: None
-        cors_allowed_origins: List of allowed origins for CORS. Empty list allows all
-            origins. Default: []
+        cors_allowed_origins: Exact origins a browser may call the gateway from, or
+            ['*'] alone for any origin. An empty list sends no CORS headers (no
+            cross-origin allowance). Default: []
         health_failure_threshold: Number of consecutive health check failures before
             marking worker unhealthy. Default: 3
         health_success_threshold: Number of consecutive health check successes before
@@ -436,8 +437,15 @@ class Router:
         redis_config = None
         if history_backend == HistoryBackendType.Redis:
             retention_days = args_dict.get("redis_retention_days", 30)
-            # If retention_days is negative, it means persistent storage (None in Rust)
-            retention_arg = None if retention_days < 0 else retention_days
+            # -1 is the one spelling of persistent records (None in Rust); 0
+            # and the other negatives are refused by name, as the command
+            # line refuses them.
+            if retention_days < -1 or retention_days == 0:
+                raise ValueError(
+                    "redis_retention_days must be at least 1 "
+                    f"(-1 keeps records persistent), got {retention_days}"
+                )
+            retention_arg = None if retention_days == -1 else retention_days
 
             redis_config = PyRedisConfig(
                 url=args_dict.get("redis_url"),

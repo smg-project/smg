@@ -976,7 +976,9 @@ struct CliArgs {
     jemalloc_prof_dir: Option<String>,
 
     // ==================== Request Handling ====================
-    /// Custom HTTP headers to check for request IDs
+    /// Custom HTTP headers to check for request IDs. The first one present
+    /// is honoured when its value is 1 to 128 visible-ASCII characters;
+    /// otherwise a fresh id is generated
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     request_id_headers: Vec<String>,
 
@@ -1067,7 +1069,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
 
-    /// CORS allowed origins
+    /// Origins a browser may call the gateway from (exact origins,
+    /// space-separated), or `*` alone for any origin. Without this flag the
+    /// gateway makes no cross-origin allowance
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
 
@@ -2124,12 +2128,13 @@ impl CliArgs {
         let pool_max = self.redis_pool_max_size.unwrap_or(16);
 
         let retention_days = match self.redis_retention_days {
-            Some(d) if d < 0 => None, // Persistent
-            // A retention of 0 days would expire every record as it is written.
-            Some(0) => {
+            Some(-1) => None, // Persistent
+            // A retention of 0 days would expire every record as it is
+            // written; -1 is the one spelling of persistent records.
+            Some(d) if d <= 0 => {
                 return Err(ConfigError::InvalidValue {
                     field: "redis_retention_days".to_string(),
-                    value: "0".to_string(),
+                    value: d.to_string(),
                     reason: "Must be at least 1 (-1 keeps records persistent)".to_string(),
                 });
             }
@@ -2152,50 +2157,23 @@ impl CliArgs {
         Ok(rcf)
     }
 
-    /// The flags whose value has a required shape, refused by name when the
-    /// shape is wrong: a wrong shape used to be dropped or passed on in
-    /// silence, which narrowed a security policy or broke a health policy
-    /// without a word.
+    /// The flags whose value has a required shape and whose raw form never
+    /// reaches `RouterConfig`, refused by name when the shape is wrong: a
+    /// wrong shape used to be dropped or passed on in silence. The shapes of
+    /// the fields `RouterConfig` carries (the CORS origins, the health-check
+    /// endpoint, the request-id header names, the storage-context header
+    /// names, an empty API key) are checked by `ConfigValidator`, on every
+    /// construction path.
     fn validate_flag_formats(&self) -> ConfigResult<()> {
         let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
             field: field.to_string(),
             value: value.to_string(),
             reason: reason.to_string(),
         };
-        for origin in &self.cors_allowed_origins {
-            // Exactly what a browser sends as `Origin`: the scheme and the host
-            // in lower case, no userinfo, no default port, nothing after the
-            // authority (not even `/`); anything else never matches the exact
-            // comparison of the CORS layer.
-            let default_port = |scheme: &str| match scheme {
-                "http" | "ws" => Some(80),
-                "https" | "wss" => Some(443),
-                _ => None,
-            };
-            let parsed = http::Uri::try_from(origin.as_str()).ok().filter(|uri| {
-                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
-                    if origin.as_str() == format!("{scheme}://{authority}")
-                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
-                        && !authority.as_str().contains('@')
-                        && authority
-                            .port_u16()
-                            .is_none_or(|port| Some(port) != default_port(scheme)))
-            });
-            if parsed.is_none() || http::HeaderValue::from_str(origin).is_err() {
-                return Err(invalid(
-                    "cors_allowed_origins",
-                    origin,
-                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
-                ));
-            }
-        }
-        if !self.health_check_endpoint.starts_with('/') {
-            return Err(invalid(
-                "health_check_endpoint",
-                &self.health_check_endpoint,
-                "must start with '/': it is appended to every HTTP worker's URL",
-            ));
-        }
+        // `cors_allowed_origins`, the health-check endpoint, the request-id
+        // header names and an empty API key are checked by the shared
+        // `ConfigValidator`, which every construction path runs (this CLI
+        // through `builder.build()`).
         let buckets = &self.prometheus_duration_buckets;
         if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
             return Err(invalid(
@@ -2217,24 +2195,6 @@ impl CliArgs {
                     "storage_context_headers",
                     entry,
                     "expected 'header-name=context-key'",
-                ));
-            }
-        }
-        for name in &self.request_id_headers {
-            if http::header::HeaderName::try_from(name.as_str()).is_err() {
-                return Err(invalid(
-                    "request_id_headers",
-                    name,
-                    "not a valid HTTP header name: it could never match a request",
-                ));
-            }
-        }
-        if let Some(key) = &self.api_key {
-            if key.trim().is_empty() {
-                return Err(invalid(
-                    "api_key",
-                    "",
-                    "an empty credential would switch authentication on with a key nothing can present",
                 ));
             }
         }
@@ -2941,7 +2901,7 @@ mod tests {
             ),
             (
                 vec!["--health-check-endpoint", "health"],
-                "health_check_endpoint",
+                "health_check.endpoint",
             ),
             (
                 vec!["--prometheus-duration-buckets", "2", "1"],
@@ -2962,6 +2922,10 @@ mod tests {
             (
                 vec!["--request-id-headers", "bad header"],
                 "request_id_headers",
+            ),
+            (
+                vec!["--cors-allowed-origins", "*", "https://example.com"],
+                "cors_allowed_origins",
             ),
             (vec!["--api-key", ""], "api_key"),
             (vec!["--jwt-role-mapping", "noeq"], "jwt_role_mapping"),
@@ -2996,6 +2960,9 @@ mod tests {
         ])
         .to_router_config(vec![], vec![])
         .expect("well-formed values pass");
+        cli_args_from(&["--cors-allowed-origins", "*"])
+            .to_router_config(vec![], vec![])
+            .expect("a lone '*' is the open policy");
     }
 
     /// A flag that only acts with a companion is named when the companion is
@@ -3195,6 +3162,34 @@ mod tests {
         assert!(err.contains("op_timeout_secs"), "{err}");
         let err = args.build_redis_config(None).unwrap_err().to_string();
         assert!(err.contains("op_timeout_secs"), "{err}");
+    }
+
+    /// `-1` is the one spelling of persistent Redis records on the command
+    /// line; 0 and any other negative value are refused by name.
+    #[test]
+    fn a_redis_retention_other_than_minus_one_below_one_is_refused() {
+        let persistent =
+            cli_args_from(&["--redis-url", "redis://h:6379", "--redis-retention-days=-1"]);
+        assert_eq!(
+            persistent.build_redis_config(None).unwrap().retention_days,
+            None
+        );
+        for value in ["-2", "0"] {
+            let flag = format!("--redis-retention-days={value}");
+            let args = cli_args_from(&["--redis-url", "redis://h:6379", flag.as_str()]);
+            match args.build_redis_config(None) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value: shown,
+                    reason,
+                }) => {
+                    assert_eq!(field, "redis_retention_days");
+                    assert_eq!(shown, value);
+                    assert!(reason.contains("-1 keeps records persistent"), "{reason}");
+                }
+                other => panic!("expected {value} refused by name, got {other:?}"),
+            }
+        }
     }
 
     /// Mesh bind and advertise hosts go through the shared bind-host rule, so

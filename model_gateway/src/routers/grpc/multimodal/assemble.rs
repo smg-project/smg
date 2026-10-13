@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use llm_multimodal::{
-    EncoderFieldLayouts, EncoderInputView, FieldLayout, Modality, ModelSpecificValue,
+    EncoderDtype, EncoderFieldLayouts, EncoderInputView, FieldLayout, Modality, ModelSpecificValue,
     PlaceholderRange, PreprocessedEncoderInputs,
 };
 use smg_grpc_client::common_proto as common;
@@ -21,8 +21,8 @@ use super::{
     capability::ensure_backend_supports_modalities,
     log_mm_timing_enabled,
     serialize::{
-        model_specific_to_tensor_bytes, serialize_encoder_input, serialize_model_specific,
-        serialize_tokenspeed_encoder_input,
+        model_specific_to_tensor_bytes, serialize_encoder_input_owned, serialize_model_specific,
+        serialize_tokenspeed_encoder_input, wire_dtype,
     },
     transport::{
         mm_encoder_input_dtype, mm_vllm_device_normalizes, mm_vllm_encoder_input_dtype,
@@ -233,6 +233,17 @@ impl VllmAssembly {
             shm_min_bytes: resolve_mm_shm_min_bytes(workers),
         }
     }
+
+    /// The dtype this assembly writes an image encoder input in, known
+    /// before the images are preprocessed; `None` when the engine takes the
+    /// pixels' own bytes.
+    pub(super) fn image_wire_dtype(&self) -> Option<EncoderDtype> {
+        if self.device_normalizes {
+            return None;
+        }
+        let dtype = wire_dtype(&self.encoder_dtype, true);
+        (dtype != EncoderDtype::Uint8).then_some(dtype)
+    }
 }
 
 /// [`assemble_vllm_batches`] with the wire choices given.
@@ -286,7 +297,7 @@ fn assemble_sglang(
     // Pinned to float32: nothing on this wire reports which widths the worker
     // accepts, and the three names it does document are all four bytes or wider.
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
-        serialize_encoder_input(&intermediate.preprocessed, "float32");
+        serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, "float32")?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let MediaBatch::Images(images) = &intermediate.media else {
         anyhow::bail!("SGLang assembly requires an image batch");
@@ -338,7 +349,7 @@ fn assemble_vllm(
 ) -> Result<VllmMultimodalData> {
     let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly);
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
-        serialize_encoder_input(&intermediate.preprocessed, dtype);
+        serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let (modality, mm_hashes) = match &intermediate.media {
         MediaBatch::Images(images) => (
@@ -523,12 +534,18 @@ fn assemble_tokenspeed_with_options(
                     return Err(error);
                 }
             };
-            serialize_tokenspeed_encoder_input(
+            match serialize_tokenspeed_encoder_input(
                 &item_encoder_input,
                 &encoder_input_dtype,
                 shm_enabled,
                 shm_min_bytes,
-            )
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    cleanup_tokenspeed_items_encoder_shm(&items, None);
+                    return Err(error);
+                }
+            }
         };
         let encoder_input_serialize_ms = encoder_input_started.elapsed().as_secs_f64() * 1000.0;
         let model_specific_started = Instant::now();

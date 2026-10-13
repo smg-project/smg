@@ -326,7 +326,9 @@ impl RequestPipeline {
             Endpoint::Chat => {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 PipelineStages {
-                    preparation: Box::new(ChatGeneratePreparationStage::new()),
+                    preparation: Box::new(ChatGeneratePreparationStage::new(
+                        mode.multimodal_wire_pools(),
+                    )),
                     rate_limit: Some(rate_limit()),
                     worker_selection,
                     encode,
@@ -343,7 +345,9 @@ impl RequestPipeline {
             Endpoint::Messages => {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 PipelineStages {
-                    preparation: Box::new(MessagePreparationStage),
+                    preparation: Box::new(MessagePreparationStage::new(
+                        mode.multimodal_wire_pools(),
+                    )),
                     rate_limit: Some(rate_limit()),
                     worker_selection,
                     encode,

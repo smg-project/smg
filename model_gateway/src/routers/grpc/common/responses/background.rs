@@ -97,6 +97,14 @@ pub(crate) fn is_terminal(status: &str) -> bool {
     TERMINAL_STATUSES.contains(&status)
 }
 
+/// Whether `status` is a result only the work itself stores (a run that
+/// reached its end, whole or truncated): a record read in one of these while
+/// the work runs is the work's own terminal write, not a close from
+/// elsewhere.
+fn is_result(status: &str) -> bool {
+    matches!(status, "completed" | "incomplete")
+}
+
 /// The in-flight background responses of this gateway.
 pub(crate) struct BackgroundResponses {
     running: Mutex<HashMap<String, Entry>>,
@@ -743,7 +751,10 @@ pub(crate) fn spawn(
 /// closed on another gateway sharing the store (read every
 /// [`STATUS_WATCH`]) stops the work and is not written again; so does a
 /// record deleted while the work ran, which is not written back either: the
-/// delete holds.
+/// delete holds. A record read in the work's own result (`completed` or
+/// `incomplete`, which only the work writes) is the work finishing: it links
+/// the response's items to its conversation after that write, so the run
+/// goes on until the work ends, for the terminal write window at most.
 pub(crate) async fn drive<F>(
     storage: Arc<dyn ResponseStorage>,
     request_context: Option<StorageRequestContext>,
@@ -812,7 +823,11 @@ pub(crate) async fn drive_watching<F>(
             close_retrying(&storage, &id, "cancelled", None, request_context, watch).await;
         }
         status = closed_elsewhere => {
-            info!(response_id = %id, status = %status, "Background response was closed elsewhere; its work is dropped");
+            if is_result(&status) {
+                warn!(response_id = %id, status = %status, "Background response stored its result but its work did not end within the terminal write window; the work is dropped");
+            } else {
+                info!(response_id = %id, status = %status, "Background response was closed elsewhere; its work is dropped");
+            }
         }
         outcome = work => match outcome {
             Ok(Ok(())) => {
@@ -867,7 +882,15 @@ pub(crate) const DELETED: &str = "deleted";
 /// once the record was seen (`record_seen` at the start, or by a read of
 /// this watch), with [`DELETED`] once it is gone. A store that never showed
 /// the record is not read as a deletion; a store that cannot be read is
-/// retried at the next tick.
+/// retried at the next tick. A record read in the work's own result (see
+/// [`is_result`]) is the work finishing, not a close from elsewhere: the
+/// work stores the terminal object first and links the response's items to
+/// its conversation after it (two or more store round trips later), and a
+/// run dropped between the two left a `completed` record whose conversation
+/// missed the items. The watch keeps reading for the terminal write window
+/// from that first read (a delete meanwhile still ends the run) and resolves
+/// with the result only once the window has passed, so the run ends with the
+/// work in the meantime.
 async fn watch_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
@@ -875,6 +898,7 @@ async fn watch_stored_status(
     every: Duration,
     mut record_seen: bool,
 ) -> String {
+    let mut result_read_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::time::sleep(every).await;
         let read = async { storage.get_response(&ResponseId::from(id)).await };
@@ -887,7 +911,13 @@ async fn watch_stored_status(
                 record_seen = true;
                 let status = stored.raw_response["status"].as_str().unwrap_or("");
                 if is_terminal(status) {
-                    return status.to_string();
+                    if !is_result(status) {
+                        return status.to_string();
+                    }
+                    let read_at = *result_read_at.get_or_insert_with(tokio::time::Instant::now);
+                    if read_at.elapsed() >= terminal_write_window(every) {
+                        return status.to_string();
+                    }
                 }
             }
             Ok(None) if record_seen => {
@@ -2320,5 +2350,105 @@ mod tests {
             "cancelled",
             "a stored record is kept"
         );
+    }
+
+    /// The work's persistence stores the terminal object first and links the
+    /// response's items to its conversation after it (two or more store
+    /// round trips later). A watch tick between the two reads `completed`:
+    /// the object is the work's own, the work is not dropped there and
+    /// finishes its linking.
+    #[tokio::test]
+    async fn a_work_finishes_its_linking_after_the_watch_reads_its_own_result() {
+        let storage = storage();
+        let request = store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        // The linking waits at this gate until the watch has read the result.
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (linked_tx, linked_rx) = oneshot::channel::<()>();
+        let work = {
+            let storage = storage.clone();
+            async move {
+                store_record(
+                    &storage,
+                    &completed_after_queued("resp_1", &request),
+                    &request,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                if gate_rx.await.is_ok() {
+                    let _ = linked_tx.send(());
+                }
+                Ok(())
+            }
+        };
+        let watch = Duration::from_millis(20);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(storage.clone(), None, slot, work, watch));
+        wait_for_status(&storage, "resp_1", "completed").await;
+        // Several watch ticks read the result before the linking goes on.
+        tokio::time::sleep(watch * 4).await;
+        let _ = gate_tx.send(());
+        task.await.unwrap();
+        assert!(
+            linked_rx.await.is_ok(),
+            "the linking after the result's write ran to its end"
+        );
+        assert_eq!(stored_status(&storage, "resp_1").await, "completed");
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// The run stays open on the work's own result for the terminal write
+    /// window at most: a work that never ends after its write is dropped at
+    /// the window's end, and the record keeps the result.
+    #[tokio::test]
+    async fn a_work_that_never_ends_after_its_result_is_dropped_at_the_windows_end() {
+        let storage = storage();
+        let request = store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = {
+            let storage = storage.clone();
+            async move {
+                let _flag = flag;
+                store_record(
+                    &storage,
+                    &completed_after_queued("resp_1", &request),
+                    &request,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        };
+        let watch = Duration::from_millis(10);
+        let started = tokio::time::Instant::now();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(storage.clone(), None, slot, work, watch));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends at the window's end")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert!(
+            started.elapsed() >= terminal_write_window(watch),
+            "dropped no sooner than the window: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(stored_status(&storage, "resp_1").await, "completed");
+        assert_eq!(registry.in_flight(), 0);
     }
 }

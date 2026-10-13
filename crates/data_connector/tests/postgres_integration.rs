@@ -39,8 +39,8 @@ use std::{
 use chrono::{TimeDelta, Utc};
 use data_connector::{
     create_storage, ConversationItemId, ConversationItemStorageError, HistoryBackend, ListParams,
-    NewConversation, NewConversationItem, PostgresConfig, SchemaConfig, SortOrder, StorageBundle,
-    StorageFactoryConfig, StorageFailure, StoredResponse, TableConfig,
+    NewConversation, NewConversationItem, PostgresConfig, ResponseId, SchemaConfig, SortOrder,
+    StorageBundle, StorageFactoryConfig, StorageFailure, StoredResponse, TableConfig,
 };
 use serde_json::json;
 use tokio::task::JoinSet;
@@ -1773,4 +1773,523 @@ async fn a_constraint_the_store_refuses_is_its_answer_not_unavailable() {
     );
     assert!(!err.is_unavailable(), "{err}");
     assert!(err.to_string().contains("duplicate key"), "{err}");
+}
+
+/// The sweep index, the sweep and the lookup by output item mean the same
+/// whatever the server's `standard_conforming_strings` says: under `off` an
+/// ordinary literal with a backslash in it is re-read (the replacement's
+/// pattern refused at parse time, its replacement a space), which left such a
+/// database without the index and with a failing sweep and lookup. One
+/// database of its own per setting.
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn the_sweep_index_the_sweep_and_the_lookup_read_the_same_under_either_string_setting() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    for setting in ["off", "on"] {
+        let scratch = ScratchDatabase::create(&db_url, &format!("scs_{setting}"))
+            .await
+            .expect("create a scratch database");
+        let outcome = async {
+            scratch
+                .admin(&format!(
+                    "ALTER DATABASE \"{}\" SET standard_conforming_strings = {setting}",
+                    scratch.name
+                ))
+                .await?;
+            let storage = postgres_bundle(&scratch.url)
+                .await
+                .map_err(|e| format!("the start: {e}"))?
+                .response_storage;
+            let record = |store: bool, status: &str, completed_at: i64| {
+                let mut stored = StoredResponse::new(None);
+                stored.raw_response = json!({
+                    "id": stored.id.0, "store": store, "status": status,
+                    "completed_at": completed_at, "instructions": "a\u{0}b",
+                    "output": [{"type": "message", "id": format!("msg_{}", stored.id.0)}],
+                });
+                stored
+            };
+            let now = Utc::now().timestamp();
+            let kept = record(true, "completed", now - 3_600);
+            let swept = record(false, "completed", now - 3_600);
+            let fresh = record(false, "completed", now - 60);
+            for stored in [&kept, &swept, &fresh] {
+                storage
+                    .store_response(stored.clone())
+                    .await
+                    .map_err(|e| format!("a store: {e}"))?;
+            }
+            let deleted = storage
+                .delete_unstored_older_than(Utc::now() - TimeDelta::seconds(600))
+                .await
+                .map_err(|e| format!("the sweep: {e}"))?;
+            let mut left = Vec::new();
+            for id in [&kept.id, &swept.id, &fresh.id] {
+                left.push(
+                    storage
+                        .get_response(id)
+                        .await
+                        .map_err(|e| format!("a read: {e}"))?
+                        .is_some(),
+                );
+            }
+            let found_by_item = storage
+                .find_response_by_output_item(&format!("msg_{}", kept.id.0))
+                .await
+                .map_err(|e| format!("the lookup by output item: {e}"))?
+                .map(|r| r.id);
+
+            let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut driver = JoinSet::new();
+            driver.spawn(async move {
+                let _ = connection.await;
+            });
+            let in_effect: String = client
+                .query_one("SHOW standard_conforming_strings", &[])
+                .await
+                .map_err(|e| e.to_string())?
+                .get(0);
+            client
+                .batch_execute("SET enable_seqscan = off")
+                .await
+                .map_err(|e| e.to_string())?;
+            // The sweep's own predicate, its literals dollar-quoted as the
+            // store writes them.
+            let plan: Vec<String> = client
+                .query(
+                    "EXPLAIN DELETE FROM responses WHERE \
+                     replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'store' = 'false' AND \
+                     replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status' \
+                     IN ('completed', 'incomplete', 'failed', 'cancelled') AND \
+                     COALESCE((replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'completed_at')::bigint, \
+                     EXTRACT(EPOCH FROM created_at)::bigint) < 0",
+                    &[],
+                )
+                .await
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect();
+            drop(client);
+            driver.join_all().await;
+            let indexes = scratch.indexes().await?;
+            Ok::<_, String>((
+                in_effect,
+                deleted,
+                left,
+                found_by_item == Some(kept.id.clone()),
+                indexes,
+                plan,
+            ))
+        }
+        .await;
+        scratch.drop().await;
+
+        let (in_effect, deleted, left, found_by_item_is_kept, indexes, plan) = outcome
+            .unwrap_or_else(|e| panic!("under standard_conforming_strings = {setting}: {e}"));
+        println!(
+            "standard_conforming_strings = {in_effect}: the sweep deleted {deleted}; stored / swept / \
+             fresh left: {left:?}; the lookup finds the stored record: {found_by_item_is_kept}; \
+             indexes: {indexes:?}; plan: {plan:?}"
+        );
+        assert_eq!(in_effect, setting, "the setting in effect for the sessions");
+        assert_eq!(
+            deleted, 1,
+            "under {setting}: the one unstored terminal record past the window"
+        );
+        assert_eq!(
+            left,
+            [true, false, true],
+            "under {setting}: the stored record and the one inside the window stay"
+        );
+        assert!(
+            found_by_item_is_kept,
+            "under {setting}: the stored record is found by its output item"
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|index| index == "responses_unstored_text_idx"),
+            "under {setting}: the sweep index is on the table: {indexes:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("responses_unstored_text_idx")),
+            "under {setting}: the sweep's predicate is served by its index: {plan:?}"
+        );
+    }
+}
+
+/// A response whose object carries the escape `\u0000` (a model's or a
+/// client's text can) stores with the unstored-record sweep index on the
+/// table, the sweep still takes the unstored terminal records past their
+/// window through that index, and the index an earlier release built over
+/// `::jsonb` (which refused every such row) is dropped by the next start. On
+/// a database of its own, so the shared one keeps no NUL row behind.
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earlier_index_goes() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "nul_index")
+        .await
+        .expect("create a scratch database");
+    // First start: the tables and the sweep index. Then the index an earlier
+    // release built, by hand on the still empty table, as its release note
+    // asked an operator to; a second start must drop it.
+    let first = postgres_bundle(&scratch.url).await.map(drop);
+    let legacy = scratch
+        .run(
+            "CREATE INDEX responses_unstored_idx ON responses ((raw_response::jsonb->>'status')) \
+             WHERE (raw_response::jsonb->>'store') = 'false'",
+        )
+        .await;
+    let bundle = postgres_bundle(&scratch.url).await;
+
+    let outcome = async {
+        first.map_err(|e| format!("the first start: {e}"))?;
+        legacy.map_err(|e| format!("the earlier release's index: {e}"))?;
+        let storage = bundle
+            .map_err(|e| format!("the second start: {e}"))?
+            .response_storage;
+
+        let record = |store: bool, status: &str, completed_at: i64| {
+            let mut stored = StoredResponse::new(None);
+            stored.raw_response = json!({
+                "id": stored.id.0, "store": store, "status": status,
+                "completed_at": completed_at, "instructions": "a\u{0}b",
+                "output": [{"type": "message", "id": format!("msg_{}", stored.id.0)}],
+            });
+            stored
+        };
+        let now = Utc::now().timestamp();
+        let kept = record(true, "completed", now - 3_600);
+        let swept = record(false, "completed", now - 3_600);
+        let fresh = record(false, "completed", now - 60);
+        for stored in [&kept, &swept, &fresh] {
+            storage
+                .store_response(stored.clone())
+                .await
+                .map_err(|e| format!("a record whose object carries a NUL escape stores: {e}"))?;
+        }
+
+        let deleted = storage
+            .delete_unstored_older_than(Utc::now() - TimeDelta::seconds(600))
+            .await
+            .map_err(|e| format!("the sweep: {e}"))?;
+        let left = |id: &ResponseId| {
+            let storage = storage.clone();
+            let id = id.clone();
+            async move { storage.get_response(&id).await.map(|r| r.is_some()) }
+        };
+        let kept_left = left(&kept.id).await.map_err(|e| e.to_string())?;
+        let swept_left = left(&swept.id).await.map_err(|e| e.to_string())?;
+        let fresh_left = left(&fresh.id).await.map_err(|e| e.to_string())?;
+        // The lookup by an output item's id scans past the rows that carry a
+        // NUL escape; its predicate reads the document the same way.
+        let found_by_item = storage
+            .find_response_by_output_item(&format!("msg_{}", kept.id.0))
+            .await
+            .map_err(|e| format!("the lookup by output item over NUL rows: {e}"))?
+            .map(|r| r.id);
+        let found_by_item_is_kept = found_by_item == Some(kept.id.clone());
+
+        let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| e.to_string())?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test drives its own connection for the queries it makes"
+        )]
+        let driver = tokio::spawn(connection);
+        let indexes: Vec<String> = client
+            .query(
+                "SELECT indexname FROM pg_indexes WHERE tablename = 'responses' ORDER BY indexname",
+                &[],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        client
+            .batch_execute("SET enable_seqscan = off")
+            .await
+            .map_err(|e| e.to_string())?;
+        let plan: Vec<String> = client
+            .query(
+                "EXPLAIN DELETE FROM responses WHERE \
+                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'store' = 'false' AND \
+                 replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
+                 IN ('completed', 'incomplete', 'failed', 'cancelled') AND \
+                 COALESCE((replace(raw_response::text, '\\u0000', '\\u0020')::json->>'completed_at')::bigint, \
+                 EXTRACT(EPOCH FROM created_at)::bigint) < 0",
+                &[],
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        drop(client);
+        let _ = driver.await;
+        Ok::<_, String>((
+            deleted,
+            kept_left,
+            swept_left,
+            fresh_left,
+            found_by_item_is_kept,
+            indexes,
+            plan,
+        ))
+    }
+    .await;
+    scratch.drop().await;
+
+    let (deleted, kept_left, swept_left, fresh_left, found_by_item_is_kept, indexes, plan) =
+        outcome.unwrap();
+    assert!(
+        found_by_item_is_kept,
+        "the stored record is found by its output item's id past the NUL rows"
+    );
+    assert_eq!(
+        deleted, 1,
+        "the one unstored terminal record past the window"
+    );
+    assert!(kept_left, "the stored record stays");
+    assert!(!swept_left, "the swept record is gone");
+    assert!(fresh_left, "the unstored record inside its window stays");
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "responses_unstored_text_idx"),
+        "the sweep index exists: {indexes:?}"
+    );
+    assert!(
+        indexes.iter().all(|name| name != "responses_unstored_idx"),
+        "the earlier release's index is gone after the second start: {indexes:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("responses_unstored_text_idx")),
+        "the sweep plans on its index: {plan:?}"
+    );
+}
+
+/// A start on a database that still has the index an earlier release built
+/// drops it without blocking the table: while a transaction another session
+/// holds open on `responses` makes that start's drop wait, and a third start
+/// comes up next to it, a plain read and a plain write from another session
+/// answer (a plain `DROP INDEX` wants an ACCESS EXCLUSIVE lock on the table,
+/// and the read would queue behind it until the first session ends; a third
+/// start asking for an index the table has would wait for a share lock
+/// behind the waiting drop, and the write would queue behind that). The
+/// starts: the first prepares the database, the second's drop waits, the
+/// third comes up next to it. On a database of its own.
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_start_drops_the_earlier_index_without_blocking_a_read_or_a_write_on_the_table() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "drop_lock")
+        .await
+        .expect("create a scratch database");
+    let outcome = async {
+        postgres_bundle(&scratch.url)
+            .await
+            .map(drop)
+            .map_err(|e| format!("the first start: {e}"))?;
+        scratch
+            .run(
+                "CREATE INDEX responses_unstored_idx ON responses ((raw_response::jsonb->>'status')) \
+                 WHERE (raw_response::jsonb->>'store') = 'false'",
+            )
+            .await
+            .map_err(|e| format!("the earlier release's index: {e}"))?;
+
+        // Session 1: a transaction that read the table and stays open.
+        let (holder, holder_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 1: {e}"))?;
+        let mut drivers = JoinSet::new();
+        drivers.spawn(async move {
+            let _ = holder_connection.await;
+        });
+        holder
+            .batch_execute("BEGIN; SELECT count(*) FROM responses")
+            .await
+            .map_err(|e| format!("session 1's read: {e}"))?;
+
+        // Session 2: the second start, whose drop of the earlier index has
+        // to wait for session 1.
+        let url = scratch.url.clone();
+        let mut start = JoinSet::new();
+        start.spawn(async move { postgres_bundle(&url).await.map(drop) });
+
+        // Seen from a fourth session: the second start waits on a lock in
+        // its drop.
+        let (watch, watch_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 4: {e}"))?;
+        drivers.spawn(async move {
+            let _ = watch_connection.await;
+        });
+        let mut waiting_drop = None;
+        for _ in 0..200 {
+            let rows = watch
+                .query(
+                    "SELECT wait_event_type || '/' || coalesce(wait_event, '') FROM pg_stat_activity \
+                     WHERE datname = current_database() AND query ILIKE 'DROP INDEX%' \
+                     AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("session 4's read: {e}"))?;
+            if let Some(row) = rows.first() {
+                waiting_drop = Some(row.get::<_, String>(0));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A third start while the second's drop waits (replicas come up
+        // together): it must take no lock on the table either, or every write
+        // queues behind it. Both are seen waiting in a drop (the third in its
+        // own concurrent drop, not in a share-lock request for an index the
+        // table has) before the third session's statements go out.
+        let url = scratch.url.clone();
+        start.spawn(async move { postgres_bundle(&url).await.map(drop) });
+        let mut both_waiting = false;
+        for _ in 0..200 {
+            let waiting: i64 = watch
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE datname = current_database() AND query ILIKE 'DROP INDEX%' \
+                     AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("session 4's count: {e}"))?
+                .get(0);
+            if waiting >= 2 {
+                both_waiting = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Session 3: a plain read and a plain write, bounded by the server at
+        // 2 s each.
+        let (reader, reader_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 3: {e}"))?;
+        drivers.spawn(async move {
+            let _ = reader_connection.await;
+        });
+        reader
+            .batch_execute("SET statement_timeout = '2s'")
+            .await
+            .map_err(|e| format!("session 3's bound: {e}"))?;
+        let started = Instant::now();
+        let read = reader
+            .query_one("SELECT count(*) FROM responses", &[])
+            .await
+            .map(|row| row.get::<_, i64>(0))
+            .map_err(|e| match e.as_db_error() {
+                Some(db) => format!("{} ({})", db.message(), db.code().code()),
+                None => e.to_string(),
+            });
+        let read_took = started.elapsed();
+        let writing = Instant::now();
+        let write = reader
+            .execute("DELETE FROM responses WHERE id = 'none'", &[])
+            .await
+            .map_err(|e| match e.as_db_error() {
+                Some(db) => format!("{} ({})", db.message(), db.code().code()),
+                None => e.to_string(),
+            });
+        let write_took = writing.elapsed();
+
+        // Session 1 ends: the drops go through and the second and third
+        // starts complete.
+        holder
+            .batch_execute("COMMIT")
+            .await
+            .map_err(|e| format!("session 1's commit: {e}"))?;
+        let mut starts = Vec::new();
+        loop {
+            let joined = tokio::time::timeout(Duration::from_secs(60), start.join_next()).await;
+            match joined {
+                Err(_) => starts.push(Err("still waiting 60 s after session 1 ended".to_string())),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => starts.push(Err(format!("its task: {e}"))),
+                Ok(Some(Ok(result))) => starts.push(result),
+            }
+            if starts.len() == 2 {
+                break;
+            }
+        }
+        let indexes = scratch.indexes().await?;
+        drop(holder);
+        drop(watch);
+        drop(reader);
+        drivers.join_all().await;
+        Ok::<_, String>((
+            waiting_drop,
+            both_waiting,
+            read,
+            read_took,
+            write,
+            write_took,
+            starts,
+            indexes,
+        ))
+    }
+    .await;
+    scratch.drop().await;
+
+    let (waiting_drop, both_waiting, read, read_took, write, write_took, starts, indexes) =
+        outcome.unwrap();
+    println!(
+        "the second start's drop waited on {waiting_drop:?}; a third start waited in its own drop: {both_waiting}; \
+         the read meanwhile: {read:?} after {read_took:?}; the write: {write:?} after {write_took:?}; \
+         the starts: {starts:?}; indexes after: {indexes:?}"
+    );
+    assert!(
+        waiting_drop.is_some(),
+        "the second start's drop of the earlier index did not wait for the open transaction"
+    );
+    assert!(
+        both_waiting,
+        "the third start was not seen waiting in its own drop next to the second's"
+    );
+    assert!(
+        read.is_ok(),
+        "a plain read on the table waited behind the starts (cancelled at its 2 s bound): {read:?}"
+    );
+    assert!(
+        write.is_ok(),
+        "a plain write on the table waited behind the starts (cancelled at its 2 s bound): {write:?}"
+    );
+    assert!(
+        starts.len() == 2 && starts.iter().all(|s| s.is_ok()),
+        "the second and third starts once session 1 ended: {starts:?}"
+    );
+    assert!(
+        !indexes
+            .iter()
+            .any(|index| index == "responses_unstored_idx"),
+        "the earlier index is gone after the start: {indexes:?}"
+    );
 }

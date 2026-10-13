@@ -56,12 +56,19 @@ criterion = { version = "0.8", features = ["html_reports"] }
 futures.workspace = true
 http.workspace = true
 npyz = { version = "0.9", features = ["npz"] }
+# The dump example for bellwether's multimodal fixtures digests its artifacts with SHA-256, as the fixtures do.
+sha2 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
+
+# The dump example for bellwether's multimodal fixtures carries unit tests of its own (`cargo test --example bellwether_dump`).
+[[example]]
+name = "bellwether_dump"
+test = true
 
 [[bench]]
 name = "image_preprocess"

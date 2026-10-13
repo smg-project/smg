@@ -129,6 +129,16 @@ async fn run(
     ids: &[u32],
     tokenizer_id: &str,
 ) -> PreprocessedEncoderInputs {
+    run_for(components, config, ids, tokenizer_id, None).await
+}
+
+async fn run_for(
+    components: &MultimodalComponents,
+    config: &MultimodalModelConfig,
+    ids: &[u32],
+    tokenizer_id: &str,
+    image_wire_dtype: Option<EncoderDtype>,
+) -> PreprocessedEncoderInputs {
     let media = MediaBatch::Images(
         ids.iter()
             .map(|&id| {
@@ -156,9 +166,49 @@ async fn run(
         spec,
         tokenizer_id,
         config,
+        image_wire_dtype,
     )
     .await
     .unwrap()
+}
+
+/// A result preprocessed for one wire dtype is served again for that wire
+/// only: the neutral form and every other dtype miss, as their bytes differ.
+#[tokio::test]
+async fn a_wire_dtype_keys_the_cache_apart_from_the_other_forms() {
+    let (components, calls, config) = setup(true, false);
+    let misses = || calls.batches.lock().unwrap().len();
+    run_for(
+        &components,
+        &config,
+        &[1, 2],
+        "tok",
+        Some(EncoderDtype::BFloat16),
+    )
+    .await;
+    assert_eq!(misses(), 2);
+    run_for(
+        &components,
+        &config,
+        &[1, 2],
+        "tok",
+        Some(EncoderDtype::BFloat16),
+    )
+    .await;
+    assert_eq!(misses(), 2, "the same wire is a hit");
+    run_for(&components, &config, &[1, 2], "tok", None).await;
+    assert_eq!(misses(), 4, "the neutral form is not the bfloat16 entry");
+    run_for(
+        &components,
+        &config,
+        &[1, 2],
+        "tok",
+        Some(EncoderDtype::Float32),
+    )
+    .await;
+    assert_eq!(misses(), 6, "another wire is not the bfloat16 entry either");
+    run(&components, &config, &[1, 2], "tok").await;
+    assert_eq!(misses(), 6, "the neutral entries are hits again");
 }
 
 #[tokio::test]

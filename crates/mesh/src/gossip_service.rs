@@ -31,12 +31,15 @@
 
 use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::{
-    transport::{server::TcpIncoming, Server},
+    transport::{
+        server::{Router, TcpIncoming},
+        Server,
+    },
     Response, Status,
 };
 use tracing as log;
@@ -67,6 +70,38 @@ use super::{
         },
     },
 };
+
+/// Where a prepared gossip server accepts: a listener its caller bound, or
+/// the configured address, bound when it serves.
+enum Incoming {
+    Listener(TcpIncoming),
+    Address(SocketAddr),
+}
+
+/// A gossip server built by [`GossipService::prepare`] and not yet serving:
+/// its TLS configuration, when the node has TLS material, is already built.
+/// [`serve`](Self::serve) runs it until the shutdown signal completes.
+pub struct PreparedGossipServer {
+    router: Router,
+    incoming: Incoming,
+}
+
+impl PreparedGossipServer {
+    /// Serves until `signal` completes.
+    pub async fn serve<F: std::future::Future<Output = ()>>(self, signal: F) -> Result<()> {
+        match self.incoming {
+            Incoming::Listener(incoming) => {
+                self.router
+                    .serve_with_incoming_shutdown(incoming, signal)
+                    .await?;
+            }
+            Incoming::Address(addr) => {
+                self.router.serve_with_shutdown(addr, signal).await?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Server-side handler for the proto-defined `Gossip` service.
 ///
@@ -147,59 +182,57 @@ impl GossipService {
         self
     }
 
-    pub async fn serve_ping_with_shutdown<F: std::future::Future<Output = ()>>(
-        self,
-        signal: F,
-    ) -> Result<()> {
-        let listen_addr = self.listen_addr;
-        let mut server = self.server_builder().await?;
-        let service = GossipServer::new(self)
-            .max_decoding_message_size(MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(MAX_MESSAGE_SIZE)
-            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-            .send_compressed(tonic::codec::CompressionEncoding::Gzip);
-
-        server
-            .add_service(service)
-            .serve_with_shutdown(listen_addr, signal)
-            .await?;
-        Ok(())
-    }
-
-    /// The listener's server: plain gRPC, or TLS with this node's
-    /// certificate (client certificates checked against the CA) when mTLS is
-    /// configured.
+    /// The tonic server for this service: with the node's TLS material, the
+    /// server's TLS configuration is built here, from the files the mTLS
+    /// manager reads, so material that exists but cannot be used fails here,
+    /// not where the server is polled.
     async fn server_builder(&self) -> Result<Server> {
         let mut server = Server::builder();
         if let Some(mtls_manager) = &self.mtls_manager {
-            server = server.tls_config(mtls_manager.server_tls_config().await?)?;
+            let tls = mtls_manager
+                .server_tls_config()
+                .await
+                .context("the mesh TLS material cannot be read")?;
+            server = server.tls_config(tls).context(
+                "the mesh TLS material cannot be used for the mesh listener (the node \
+                 certificate, its private key or the CA certificate)",
+            )?;
             log::info!(
-                "Mesh listener {} serves TLS with the node certificate",
+                "Mesh listener {} is prepared to serve TLS with the node certificate",
                 self.listen_addr
             );
         }
         Ok(server)
     }
 
-    pub async fn serve_ping_with_listener<F: std::future::Future<Output = ()>>(
+    /// This service's server, built but not serving: on `listener` when one
+    /// is given (the caller bound it), else on the configured listen address,
+    /// bound when it serves. Everything that can fail before the server
+    /// serves happens here, the TLS configuration first of all, so a caller
+    /// learns of it before it serves anything itself.
+    pub async fn prepare(
         self,
-        listener: tokio::net::TcpListener,
-        signal: F,
-    ) -> Result<()> {
-        // The socket option the address path sets (tonic's server default):
-        // TCP_NODELAY on every accepted connection; no keepalive either way.
-        let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
+        listener: Option<tokio::net::TcpListener>,
+    ) -> Result<PreparedGossipServer> {
+        let incoming = match listener {
+            // The socket option the address path sets (tonic's server
+            // default): TCP_NODELAY on every accepted connection; no
+            // keepalive either way.
+            Some(listener) => {
+                Incoming::Listener(TcpIncoming::from(listener).with_nodelay(Some(true)))
+            }
+            None => Incoming::Address(self.listen_addr),
+        };
         let mut server = self.server_builder().await?;
         let service = GossipServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
             .send_compressed(tonic::codec::CompressionEncoding::Gzip);
-        server
-            .add_service(service)
-            .serve_with_incoming_shutdown(incoming, signal)
-            .await?;
-        Ok(())
+        Ok(PreparedGossipServer {
+            router: server.add_service(service),
+            incoming,
+        })
     }
 
     fn merge_state(&self, incoming_nodes: Vec<NodeState>) -> bool {

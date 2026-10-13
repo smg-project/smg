@@ -1365,7 +1365,9 @@ where
         .layer(middleware::create_logging_layer())
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
-        .layer(create_cors_layer(cors_allowed_origins))
+        .layer(tower::util::option_layer(create_cors_layer(
+            cors_allowed_origins,
+        )))
 }
 
 /// Discovery tasks owned by `startup`, aborted when this guard drops.
@@ -1953,6 +1955,33 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
         None => None,
     };
+    // Everything the mesh server does before it serves happens now, before
+    // the HTTP listener binds: the listener against the configured address,
+    // the TLS configuration from the mesh TLS material, the gossip service
+    // and its controller. A failure here used to be one error line from the
+    // mesh server's task a second after the gateway was serving, as a node
+    // outside the mesh (`Mesh server failed: ...` once, `/readiness` ready);
+    // the mesh TLS flags check only that their files exist.
+    let mesh_server = match (mesh_server, mesh_listener) {
+        (Some(mesh_server), Some(mesh_listener)) => {
+            let with_tls = config
+                .mesh_server_config
+                .as_ref()
+                .is_some_and(|mesh| mesh.mtls_config.is_some());
+            let flags = if with_tls {
+                "--enable-mesh with --mesh-tls-ca-cert, --mesh-tls-cert and --mesh-tls-key"
+            } else {
+                "--enable-mesh"
+            };
+            Some(
+                mesh_server
+                    .prepare_with_listener(mesh_listener)
+                    .await
+                    .map_err(|e| format!("Failed to start the mesh server ({flags}): {e:#}"))?,
+            )
+        }
+        _ => None,
+    };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before the mesh server
     // below has joined the cluster. Bound through tokio, as axum-server
@@ -1965,19 +1994,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
 
-    // The mesh server starts once every listener is bound: a member that
+    // The mesh server serves once every listener is bound: a member that
     // joined the cluster and vanished with a failed bind is the partial start
     // the checks above exist to prevent. The adapters registered their
     // namespaces earlier, so gossip is safe to start. It serves from the
-    // socket bound above.
-    if let (Some(mesh_server), Some(mesh_listener)) = (mesh_server, mesh_listener) {
+    // socket bound and prepared above.
+    if let Some(mesh_server) = mesh_server {
         #[expect(
             clippy::disallowed_methods,
             reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
         )]
         spawn(async move {
-            if let Err(e) = mesh_server.start_with_listener(mesh_listener).await {
-                tracing::error!("Mesh server failed: {}", e);
+            if let Err(e) = mesh_server.serve().await {
+                tracing::error!("Mesh server failed: {e:#}");
             }
         });
     }
@@ -2142,10 +2171,18 @@ async fn shutdown_signal() {
     }
 }
 
-fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
+/// The CORS policy for `--cors-allowed-origins`. Without the flag there is
+/// no layer: the gateway makes no cross-origin allowance, so a browser's
+/// preflight gets no `access-control-allow-*` headers and the browser
+/// refuses the cross-origin call (every other client is unaffected). A lone
+/// `*` is the open policy: any origin, method and header. A list allows
+/// exactly those origins with a fixed method and header set.
+fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::CorsLayer> {
     use tower_http::cors::Any;
 
     let cors = if allowed_origins.is_empty() {
+        return None;
+    } else if allowed_origins.iter().any(|origin| origin == "*") {
         tower_http::cors::CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
@@ -2183,7 +2220,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
             ])
     };
 
-    cors.max_age(Duration::from_secs(3600))
+    Some(cors.max_age(Duration::from_secs(3600)))
 }
 
 #[cfg(test)]
@@ -2587,6 +2624,109 @@ mod tests {
         );
     }
 
+    /// The CORS policy per `--cors-allowed-origins`, through the edge stack
+    /// a request meets: nothing cross-origin without the flag, any origin
+    /// for a lone `*`, the listed origins otherwise; on a preflight and on a
+    /// plain request alike.
+    #[tokio::test]
+    async fn cors_is_off_without_the_flag_open_for_a_wildcard_and_listed_otherwise() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let allow_origin = |origins: Vec<String>, origin: &'static str, preflight: bool| async move {
+            let app = attach_edge_layers(
+                Router::new().route("/v1/models", get(|| async { StatusCode::OK })),
+                1 << 20,
+                InFlightRequestTracker::new(),
+                vec![],
+                origins,
+            );
+            let mut request = http::Request::builder()
+                .method(if preflight { "OPTIONS" } else { "GET" })
+                .uri("/v1/models")
+                .header("origin", origin);
+            if preflight {
+                request = request
+                    .header("access-control-request-method", "GET")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization,content-type",
+                    );
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|value| value.to_str().unwrap().to_owned())
+            };
+            (
+                response.status(),
+                header("access-control-allow-origin"),
+                header("access-control-allow-methods"),
+                header("access-control-allow-headers"),
+            )
+        };
+        let listed = || vec!["https://app.example".to_string()];
+        let star = || vec!["*".to_string()];
+
+        // Absent: no allowance for any origin, and a plain request still works.
+        let (_, origin, methods, headers) =
+            allow_origin(vec![], "https://evil.example", true).await;
+        assert_eq!(
+            (origin, methods, headers),
+            (None, None, None),
+            "preflight without the flag"
+        );
+        let (status, origin, _, _) = allow_origin(vec![], "https://evil.example", false).await;
+        assert_eq!(
+            (status, origin),
+            (StatusCode::OK, None),
+            "plain request without the flag"
+        );
+
+        // A lone `*`: the open policy.
+        let (status, origin, methods, headers) =
+            allow_origin(star(), "https://evil.example", true).await;
+        assert!(status.is_success());
+        assert_eq!(
+            (origin.as_deref(), methods.as_deref(), headers.as_deref()),
+            (Some("*"), Some("*"), Some("*")),
+            "preflight with '*'"
+        );
+        let (status, origin, _, _) = allow_origin(star(), "https://evil.example", false).await;
+        assert_eq!(
+            (status, origin.as_deref()),
+            (StatusCode::OK, Some("*")),
+            "plain request with '*'"
+        );
+
+        // A list: the listed origin is echoed, every other origin gets nothing.
+        let (status, origin, methods, _) =
+            allow_origin(listed(), "https://app.example", true).await;
+        assert!(status.is_success());
+        assert_eq!(
+            origin.as_deref(),
+            Some("https://app.example"),
+            "preflight from a listed origin"
+        );
+        assert!(
+            methods.is_some_and(|m| m.contains("POST")),
+            "the fixed method list"
+        );
+        let (_, origin, _, _) = allow_origin(listed(), "https://evil.example", true).await;
+        assert_eq!(origin, None, "preflight from an unlisted origin");
+        let (status, origin, _, _) = allow_origin(listed(), "https://app.example", false).await;
+        assert_eq!(
+            (status, origin.as_deref()),
+            (StatusCode::OK, Some("https://app.example")),
+            "plain request from a listed origin"
+        );
+    }
+
     #[tokio::test]
     async fn configured_cors_allows_anthropic_headers() {
         use axum::body::Body;
@@ -2597,7 +2737,10 @@ mod tests {
                 "/v1/messages/count_tokens",
                 post(|| async { StatusCode::OK }),
             )
-            .layer(create_cors_layer(vec!["https://client.example".into()]));
+            .layer(
+                create_cors_layer(vec!["https://client.example".into()])
+                    .expect("a configured origin list attaches the layer"),
+            );
         let response = app
             .oneshot(
                 http::Request::builder()

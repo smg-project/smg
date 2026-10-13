@@ -18,7 +18,7 @@
 //! chunk of a slice.
 #![cfg_attr(target_arch = "aarch64", allow(unsafe_code))]
 
-use crate::encoder_inputs::PixelNorm;
+use crate::encoder_inputs::{EncoderDtype, PixelNorm};
 
 /// Writes `tables[channel][byte]` as a little-endian `u16` for every byte of
 /// `src` (`dst` holds two bytes per source byte). Consecutive runs of `block`
@@ -86,6 +86,106 @@ pub(crate) fn write_f32(
     write_u32(dst, src, block, tables);
 }
 
+/// The converter of one normalization to one wire dtype, decided once per
+/// image for the one-pass writers (the patch layout and the normalization
+/// together): the vector formula where it reproduces the tables, the tables
+/// otherwise. `None` for the `uint8` wire, which has nothing to convert.
+pub(crate) enum WireWriter {
+    Half {
+        tables: Box<[[u16; 256]; 3]>,
+        #[cfg(target_arch = "aarch64")]
+        formula: Option<neon::Bf16Formula>,
+    },
+    Single {
+        tables: Box<[[u32; 256]; 3]>,
+        #[cfg(target_arch = "aarch64")]
+        formula: Option<neon::F32Formula>,
+    },
+}
+
+impl WireWriter {
+    pub(crate) fn new(norm: &PixelNorm, dtype: EncoderDtype) -> Option<Self> {
+        match dtype {
+            EncoderDtype::Uint8 => None,
+            EncoderDtype::Float32 => {
+                let tables = Box::new(norm.table_f32().map(|channel| channel.map(f32::to_bits)));
+                Some(Self::Single {
+                    #[cfg(target_arch = "aarch64")]
+                    formula: neon::F32Formula::reproducing(norm, &tables),
+                    tables,
+                })
+            }
+            EncoderDtype::BFloat16 => {
+                let tables = Box::new(
+                    norm.table_f32()
+                        .map(|channel| channel.map(crate::encoder_inputs::f32_to_bf16_bits)),
+                );
+                Some(Self::Half {
+                    #[cfg(target_arch = "aarch64")]
+                    formula: neon::Bf16Formula::reproducing(norm, &tables),
+                    tables,
+                })
+            }
+            EncoderDtype::Float16 => Some(Self::Half {
+                tables: Box::new(
+                    norm.table_f32()
+                        .map(|channel| channel.map(crate::encoder_inputs::f32_to_f16_bits)),
+                ),
+                // The half-up rounding of the vector formula is the
+                // bfloat16's; float16 takes the tables.
+                #[cfg(target_arch = "aarch64")]
+                formula: None,
+            }),
+        }
+    }
+
+    /// Bytes per written element.
+    pub(crate) fn element_size(&self) -> usize {
+        match self {
+            Self::Half { .. } => 2,
+            Self::Single { .. } => 4,
+        }
+    }
+
+    /// Writes one channel's run: `src.len()` pixel bytes of `channel` as
+    /// `dst` (`element_size()` bytes each).
+    pub(crate) fn write_run(&self, dst: &mut [u8], src: &[u8], channel: usize) {
+        debug_assert_eq!(dst.len(), src.len() * self.element_size());
+        match self {
+            Self::Half { tables, .. } => {
+                #[cfg(target_arch = "aarch64")]
+                if let Self::Half {
+                    formula: Some(formula),
+                    ..
+                } = self
+                {
+                    formula.write(dst, src, channel);
+                    return;
+                }
+                let table = &tables[channel];
+                for (d, &v) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                    *d = table[v as usize].to_le_bytes();
+                }
+            }
+            Self::Single { tables, .. } => {
+                #[cfg(target_arch = "aarch64")]
+                if let Self::Single {
+                    formula: Some(formula),
+                    ..
+                } = self
+                {
+                    formula.write(dst, src, channel);
+                    return;
+                }
+                let table = &tables[channel];
+                for (d, &v) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                    *d = table[v as usize].to_le_bytes();
+                }
+            }
+        }
+    }
+}
+
 /// `(dst, src)` per channel block: `block` source bytes and their `width`
 /// bytes each of output.
 fn channel_blocks<'a>(
@@ -117,7 +217,7 @@ mod neon {
     /// `bfloat16` half-up on the bit pattern: cheaper than a division and
     /// than round-to-nearest-even, and exactly the table's value whenever
     /// [`Self::reproducing`] says so, which is the only time it runs.
-    pub(super) struct Bf16Formula {
+    pub(crate) struct Bf16Formula {
         scale: f32,
         offset: [f32; 3],
         reciprocal: [f32; 3],
@@ -126,7 +226,7 @@ mod neon {
     impl Bf16Formula {
         /// The formula for `norm`, if it reproduces `tables` for every byte of
         /// every channel (768 values, checked with the same code that writes).
-        pub(super) fn reproducing(norm: &PixelNorm, tables: &[[u16; 256]; 3]) -> Option<Self> {
+        pub(crate) fn reproducing(norm: &PixelNorm, tables: &[[u16; 256]; 3]) -> Option<Self> {
             if !std::arch::is_aarch64_feature_detected!("neon") {
                 return None;
             }
@@ -151,7 +251,7 @@ mod neon {
         }
 
         /// Writes `channel`'s words for `src` into `dst` (two bytes each).
-        pub(super) fn write(&self, dst: &mut [u8], src: &[u8], channel: usize) {
+        pub(crate) fn write(&self, dst: &mut [u8], src: &[u8], channel: usize) {
             // SAFETY: NEON was detected in `reproducing`, the only constructor.
             unsafe {
                 write_bf16(
@@ -166,7 +266,7 @@ mod neon {
     }
 
     /// `(byte * scale - offset) / divisor` in `f32` on the vector unit.
-    pub(super) struct F32Formula {
+    pub(crate) struct F32Formula {
         scale: f32,
         offset: [f32; 3],
         divisor: [f32; 3],
@@ -175,7 +275,7 @@ mod neon {
     impl F32Formula {
         /// The formula for `norm`, if it reproduces `tables` for every byte of
         /// every channel.
-        pub(super) fn reproducing(norm: &PixelNorm, tables: &[[u32; 256]; 3]) -> Option<Self> {
+        pub(crate) fn reproducing(norm: &PixelNorm, tables: &[[u32; 256]; 3]) -> Option<Self> {
             if !std::arch::is_aarch64_feature_detected!("neon") {
                 return None;
             }
@@ -200,7 +300,7 @@ mod neon {
         }
 
         /// Writes `channel`'s words for `src` into `dst` (four bytes each).
-        pub(super) fn write(&self, dst: &mut [u8], src: &[u8], channel: usize) {
+        pub(crate) fn write(&self, dst: &mut [u8], src: &[u8], channel: usize) {
             // SAFETY: NEON was detected in `reproducing`, the only constructor.
             unsafe {
                 write_f32(
