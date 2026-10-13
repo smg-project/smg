@@ -1735,6 +1735,47 @@ async fn responses_and_conversations_keep_their_tenant_and_the_identifier_querie
         .expect("delete conversation"));
 }
 
+/// A sweep the store refuses answers with the server's message, classified
+/// as every other call's failure is (a failure of the operation, not the
+/// store being unavailable), so an operator reads why; it answered `db error`
+/// alone. On a database of its own, whose responses table is dropped under
+/// the store.
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_sweep_the_store_refuses_answers_with_the_server_s_message() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "sweep_error")
+        .await
+        .expect("create a scratch database");
+    let outcome = async {
+        let storage = postgres_bundle(&scratch.url)
+            .await
+            .map_err(|e| format!("the start: {e}"))?
+            .response_storage;
+        scratch.run("DROP TABLE responses").await?;
+        Ok::<_, String>(storage.delete_unstored_older_than(Utc::now()).await)
+    }
+    .await;
+    scratch.drop().await;
+
+    let err = outcome
+        .unwrap()
+        .expect_err("a sweep over a dropped table must fail");
+    let message = err.to_string();
+    println!(
+        "the sweep's error: {message}; unavailable: {}",
+        err.is_unavailable()
+    );
+    assert!(
+        message.contains("does not exist"),
+        "the server's message is in the error: {message}"
+    );
+    assert!(!err.is_unavailable(), "{message}");
+}
+
 /// A failure the store answers (here a unique key refusing a second item under
 /// a client-supplied id) is the store's own error, not the store being
 /// unavailable: the gateway keeps the endpoint's answer for it rather than a

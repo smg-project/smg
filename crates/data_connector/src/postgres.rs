@@ -1839,17 +1839,21 @@ impl ResponseStorage for PostgresResponseStorage {
             return Ok(0);
         };
 
+        // The failures as every other call maps them: no connection from
+        // the pool is the store being unavailable; a statement the server
+        // refuses keeps the server's message (`e.to_string()` alone is the
+        // kind, `db error`, without it).
         let client = self
             .store
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
         let cutoff_secs: i64 = cutoff.timestamp();
         let rows_deleted = client
             .execute(&sql, &[&cutoff_secs])
             .await
-            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+            .map_err(ResponseStorageError::from_pg)?;
         Ok(rows_deleted as usize)
     }
 
