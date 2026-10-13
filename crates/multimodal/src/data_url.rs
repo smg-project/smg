@@ -8,8 +8,12 @@
 /// The rule is the servicer's: the scheme is matched without regard to case,
 /// a URL with no comma has an empty payload, and a base64 payload is sized as
 /// `len * 3 / 4` with its padding counted (at most two bytes over the decoded
-/// size). An over-estimate at the cap is the safe side; an estimate that
-/// differs between the places that enforce the cap is not.
+/// size). The payload's length is its UTF-8 byte length, the unit of the cap
+/// (the servicer counts code points, which is the same figure for the base64
+/// and percent-encoded payloads media arrives in and a smaller one for a
+/// plain payload with non-ASCII text). An over-estimate at the cap is the
+/// safe side; an estimate that differs between the places that enforce the
+/// cap is not.
 pub fn data_url_payload_bytes(url: &str) -> Option<usize> {
     let rest = url
         .get(..5)
@@ -39,6 +43,12 @@ mod tests {
         );
         assert_eq!(data_url_payload_bytes("data:text/plain,hello"), Some(5));
         assert_eq!(data_url_payload_bytes("data:,"), Some(0));
+        // Bytes, not code points: the unit of the cap.
+        assert_eq!(data_url_payload_bytes("data:text/plain,\u{e9}"), Some(2));
+        assert_eq!(
+            data_url_payload_bytes("data:text/plain;charset=utf-8,%C3%A9"),
+            Some(6)
+        );
     }
 
     #[test]
