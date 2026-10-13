@@ -714,7 +714,7 @@ def mark_not_serving(server: Any) -> None:
     try:
         server.set_serving(False)
     except Exception:
-        logger.exception("Failed to mark the servicer as draining")
+        logger.exception("Failed to mark the servicer as not serving")
 
 
 async def stop_server(server: Any, timeout: float) -> None:

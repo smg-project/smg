@@ -672,5 +672,5 @@ def test_launch_or_stop_reports_the_launch_error_when_the_stop_itself_fails(capl
         with pytest.raises(ValueError, match="engine would not start"):
             asyncio.run(rust_lifecycle.launch_or_stop(server, failing_launch))
         assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}"]
-    assert "Failed to mark the servicer as draining" in caplog.text
+    assert "Failed to mark the servicer as not serving" in caplog.text
     assert "Failed to stop the Rust servicer cleanly" in caplog.text
