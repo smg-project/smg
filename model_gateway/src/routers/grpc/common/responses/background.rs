@@ -198,14 +198,6 @@ impl BackgroundResponses {
         (self.lease_ttl / 3).max(Duration::from_secs(1))
     }
 
-    /// How often the reaper reads the open records: half the TTL, so a
-    /// record of a lost gateway is closed within one and a half TTLs of its
-    /// last renewal; `None` when background mode or the lease is off.
-    pub fn reap_every(&self) -> Option<Duration> {
-        (self.enabled() && !self.lease_ttl.is_zero())
-            .then(|| (self.lease_ttl / 2).max(Duration::from_secs(1)))
-    }
-
     /// Whether `background: true` runs in the background here at all; off,
     /// such requests run in the foreground like every other request.
     pub fn enabled(&self) -> bool {
@@ -1263,10 +1255,20 @@ pub(crate) async fn reap_expired(
     Ok(reaped)
 }
 
-/// Runs [`reap_expired`] every [`BackgroundResponses::reap_every`] for as
-/// long as the gateway runs; nothing when background mode or the lease is
-/// off. The start is logged with the registry's owner id, the one the
-/// `gateway_lost` errors of this gateway's responses would name.
+/// How often a reaper reads the open records on a gateway whose cap on
+/// background responses is `max_in_flight` and whose lease is `lease_ttl`:
+/// half the TTL, so a record of a lost gateway is closed within one and a
+/// half TTLs of its last renewal; `None` when background mode or the lease
+/// is off.
+pub(crate) fn reap_every(max_in_flight: usize, lease_ttl: Duration) -> Option<Duration> {
+    (max_in_flight > 0 && !lease_ttl.is_zero()).then(|| (lease_ttl / 2).max(Duration::from_secs(1)))
+}
+
+/// Runs [`reap_expired`] every [`reap_every`] for as long as the gateway
+/// runs: one reaper per gateway process, spawned at the server's start-up
+/// whatever the number of routers the gateway builds (each router's registry
+/// writes its own leases; the reaper closes any gateway's expired records);
+/// nothing when background mode or the lease is off.
 #[expect(
     clippy::disallowed_methods,
     reason = "the reaper is a maintenance loop of the gateway; it writes nothing a shutdown has to wait for"
@@ -1274,14 +1276,14 @@ pub(crate) async fn reap_expired(
 pub(crate) fn spawn_reaper(
     storage: Arc<dyn ResponseStorage>,
     request_context: Option<StorageRequestContext>,
-    registry: &BackgroundResponses,
+    max_in_flight: usize,
+    lease_ttl: Duration,
 ) {
-    let Some(every) = registry.reap_every() else {
+    let Some(every) = reap_every(max_in_flight, lease_ttl) else {
         return;
     };
     info!(
-        owner = registry.owner(),
-        lease_ttl_secs = registry.lease_ttl.as_secs(),
+        lease_ttl_secs = lease_ttl.as_secs(),
         every_secs = every.as_secs_f64(),
         "Background response reaper started"
     );
@@ -2404,7 +2406,6 @@ mod tests {
             "{lease:?}"
         );
         assert_eq!(registry.renew_every(), Duration::from_secs(10));
-        assert_eq!(registry.reap_every(), Some(Duration::from_secs(15)));
         assert_ne!(
             BackgroundResponses::new(4, LEASE).owner(),
             registry.owner(),
@@ -2413,13 +2414,27 @@ mod tests {
 
         let short = BackgroundResponses::new(4, Duration::from_millis(1500));
         assert_eq!(short.renew_every(), Duration::from_secs(1));
-        assert_eq!(short.reap_every(), Some(Duration::from_secs(1)));
 
         let off = BackgroundResponses::new(4, Duration::ZERO);
         assert!(off.lease().is_none());
-        assert!(off.reap_every().is_none(), "no lease, no reaper");
+
+        // The reaper's period comes from the cap and the TTL alone (the
+        // server spawns it without a registry): half the TTL, at least a
+        // second; none without background mode or without a lease.
+        assert_eq!(
+            reap_every(4, Duration::from_secs(30)),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            reap_every(4, Duration::from_millis(1500)),
+            Some(Duration::from_secs(1))
+        );
         assert!(
-            BackgroundResponses::new(0, LEASE).reap_every().is_none(),
+            reap_every(4, Duration::ZERO).is_none(),
+            "no lease, no reaper"
+        );
+        assert!(
+            reap_every(0, LEASE).is_none(),
             "background mode off, no reaper"
         );
     }
