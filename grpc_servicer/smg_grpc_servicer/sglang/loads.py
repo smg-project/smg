@@ -69,6 +69,21 @@ def effective_running_window(snapshots: Iterable[Any], attention_dp_size: int = 
     return min(window, MAX_REPORTED_RUNNING_WINDOW)
 
 
+def ranks_with_a_window(snapshots: Iterable[Any]) -> int:
+    """How many of the published snapshots carry a positive running window:
+    the snapshot reader skips the slots of ranks that have not published yet,
+    so a read with fewer than the engine's ranks is a partial one, whose
+    smallest figure may still be corrected by a rank with a smaller bound.
+    """
+    count = 0
+    for snapshot in snapshots:
+        window = getattr(snapshot, "max_running_requests", 0)
+        if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+            continue
+        count += 1
+    return count
+
+
 def convert_loads_to_protobuf(result: LoadSnapshot) -> sglang_scheduler_pb2.SchedulerLoad:
     """Convert a LoadSnapshot to a protobuf SchedulerLoad message."""
     scheduler_load = sglang_scheduler_pb2.SchedulerLoad(

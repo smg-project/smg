@@ -52,6 +52,7 @@ from smg_grpc_servicer.sglang.loads import (
     convert_loads_to_protobuf,
     effective_running_window,
     load_record,
+    ranks_with_a_window,
 )
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
@@ -127,9 +128,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     Fully separated from HTTP server with its own process and no shared globals.
     """
 
-    # The running window the schedulers computed, once a load snapshot has
-    # shown it (the bound does not change for the engine's lifetime); 0 until
-    # then. See `_running_window`.
+    # The running window the schedulers computed, once every rank's load
+    # snapshot has shown its bound (the bound does not change for the
+    # engine's lifetime); 0 until then. See `_running_window`.
     _computed_running_window: int = 0
 
     def __init__(
@@ -574,15 +575,26 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         whole flag on every scheduler)."""
         if not getattr(self.server_args, "enable_dp_attention", False):
             return 1
+        return self._rank_count()
+
+    def _rank_count(self) -> int:
+        """How many schedulers publish a load snapshot: ``dp_size``, 1 when
+        the server arguments do not carry it."""
         dp_size = getattr(self.server_args, "dp_size", 1)
-        return dp_size if isinstance(dp_size, int) and not isinstance(dp_size, bool) else 1
+        if isinstance(dp_size, bool) or not isinstance(dp_size, int) or dp_size < 1:
+            return 1
+        return dp_size
 
     def _running_window(self) -> int:
         """The running window the schedulers enforce, in the flag's units: the
         operator's `--max-running-requests` when set, else the figure the
         schedulers publish in their load snapshots (one attention-DP worker's
-        share each, scaled back to the flag's units; cached once seen), else 0
-        (no snapshot published yet, or a request manager without the reader)."""
+        share each, scaled back to the flag's units), else 0 (no snapshot
+        published yet, or a request manager without the reader). The figure is
+        cached once every rank has published its bound; a partial read (the
+        reader skips the ranks that have not published yet) is reported as it
+        stands and read again on the next call, so a rank with a smaller bound
+        still corrects it."""
         configured = getattr(self.server_args, "max_running_requests", None)
         if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
             return configured
@@ -597,7 +609,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             logger.debug("load snapshots unreadable while resolving the running window: %s", e)
             return 0
         window = effective_running_window(snapshots, self._attention_dp_size())
-        if window > 0:
+        if window > 0 and ranks_with_a_window(snapshots) >= self._rank_count():
             self._computed_running_window = window
             logger.info(
                 "max_running_requests is unset: reporting the scheduler's computed window %d",

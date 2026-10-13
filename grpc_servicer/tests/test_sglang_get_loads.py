@@ -119,6 +119,13 @@ class TestEffectiveRunningWindow:
         assert loads_mod.effective_running_window([wide]) == 65535
         assert loads_mod.MAX_REPORTED_RUNNING_WINDOW == 65535
 
+    def test_the_ranks_that_published_a_window_are_counted(self, loads_mod):
+        published, unset = _snapshot(None), _snapshot(None)
+        unset.max_running_requests = 0
+        assert loads_mod.ranks_with_a_window([]) == 0
+        assert loads_mod.ranks_with_a_window([published, unset]) == 1
+        assert loads_mod.ranks_with_a_window([published, published]) == 2
+
     def test_no_snapshot_or_no_figure_means_no_window(self, loads_mod):
         unset = _snapshot(None)
         unset.max_running_requests = 0

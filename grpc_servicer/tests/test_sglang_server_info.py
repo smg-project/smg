@@ -170,6 +170,25 @@ def test_server_info_reports_the_window_in_the_flags_units_under_attention_dp(
     assert _info(explicit).server_args["max_running_requests"] == 16384
 
 
+def test_a_partial_read_is_reported_but_not_cached_until_every_rank_published(
+    servicer_mod, monkeypatch
+):
+    """The reader skips the ranks that have not published yet; a read with one
+    of two ranks is reported as it stands, and the rank that publishes a
+    smaller bound later still corrects it. Once both have published, the
+    figure is cached."""
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    published = _snapshots(2048)
+    reader = SimpleNamespace(read_all=lambda: list(published))
+    servicer = _servicer(servicer_mod, _WindowServerArgs(dp_size=2), load_snapshot_reader=reader)
+    assert _info(servicer).server_args["max_running_requests"] == 2048
+    published.append(SimpleNamespace(dp_rank=1, max_running_requests=1024))
+    assert _info(servicer).server_args["max_running_requests"] == 1024
+    # Both ranks published: cached from here on.
+    published.clear()
+    assert _info(servicer).server_args["max_running_requests"] == 1024
+
+
 def test_server_info_reports_the_window_once_a_snapshot_is_published(servicer_mod, monkeypatch):
     monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
     published = []
