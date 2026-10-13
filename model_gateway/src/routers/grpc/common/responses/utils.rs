@@ -496,8 +496,8 @@ pub(crate) async fn persist_response_if_needed(
         }
     };
     // A background response's record may have been closed while the work
-    // ran (a cancel, here or on another gateway sharing the store): its
-    // terminal object is stored with one conditional write, so
+    // ran (a cancel, here or on another gateway sharing the store, or the
+    // reaper): its terminal object is stored with one conditional write, so
     // a closed record is never rewritten by a late result. The write is
     // retried at the status-watch cadence within the terminal write window
     // while the store answers with an error: the result of a run that
@@ -694,6 +694,7 @@ mod tests {
             &response_storage,
             &background::queued_response("resp_u", &request),
             &request,
+            None,
             None,
             None,
         )
@@ -907,6 +908,7 @@ mod tests {
             &response_storage,
             &background::queued_response("resp_d", &request),
             &request,
+            None,
             None,
             None,
         )

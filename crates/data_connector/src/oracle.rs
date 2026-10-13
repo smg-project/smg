@@ -13,7 +13,8 @@ use super::core::{
     ConversationItem, ConversationItemId, ConversationItemStorage, ConversationItemStorageError,
     ConversationMetadata, ConversationStorage, ConversationStorageError, Failure, ListParams,
     NewConversation, NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError,
-    SortOrder, StoredResponse, TERMINAL_RESPONSE_STATUSES,
+    SortOrder, StoredResponse, BACKGROUND_LEASE_KEY, OPEN_RESPONSE_STATUSES,
+    TERMINAL_RESPONSE_STATUSES,
 };
 use crate::{
     common::{
@@ -1179,6 +1180,31 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     ))
 }
 
+/// The query behind `list_open_background_responses`: the rows whose
+/// `raw_response` carries `background: true`, a status the response still
+/// leaves and a lease (`JSON_VALUE` and `JSON_EXISTS` over the JSON text),
+/// oldest first, at most `limit` of them. `None` when the schema skips the
+/// column.
+fn open_background_sql(schema: &SchemaConfig, select_base: &str, limit: usize) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let order = if s.is_skipped("created_at") {
+        String::new()
+    } else {
+        format!(" ORDER BY {} ASC", s.col("created_at"))
+    };
+    Some(format!(
+        "SELECT * FROM ({select_base} WHERE JSON_VALUE({col_raw}, '$.background') = 'true' \
+         AND JSON_VALUE({col_raw}, '$.status') IN ({}) \
+         AND JSON_EXISTS({col_raw}, '$.{BACKGROUND_LEASE_KEY}'){order}) \
+         WHERE ROWNUM <= {limit}",
+        sql_string_list(&OPEN_RESPONSE_STATUSES)
+    ))
+}
+
 impl OracleResponseStorage {
     pub fn new(store: OracleStore) -> Self {
         let select_base = build_response_select_base(&store.schema);
@@ -1832,6 +1858,30 @@ impl ResponseStorage for OracleResponseStorage {
             .map_err(ResponseStorageError::from_failure)
     }
 
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+        let schema = self.store.schema.clone();
+        let Some(sql) = open_background_sql(&schema, &self.select_base, limit) else {
+            return Ok(Vec::new());
+        };
+
+        self.store
+            .execute(move |conn| {
+                let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
+                let mut rows = stmt.query(&[]).map_err(map_oracle_error)?;
+                let mut results = Vec::new();
+                for row in &mut rows {
+                    let row = row.map_err(map_oracle_error)?;
+                    results.push(Self::build_response_from_row(&row, &schema)?);
+                }
+                Ok(results)
+            })
+            .await
+            .map_err(ResponseStorageError::from_failure)
+    }
+
     async fn delete_response(&self, response_id: &ResponseId) -> Result<(), ResponseStorageError> {
         let id = response_id.0.clone();
         let schema = self.store.schema.clone();
@@ -2217,6 +2267,26 @@ mod tests {
                 ("c".to_string(), t(4)),
             ]
         );
+    }
+
+    #[test]
+    fn open_background_lookup_reads_the_status_and_flag_from_the_json_text() {
+        let schema = SchemaConfig::default();
+        let sql = open_background_sql(&schema, "SELECT id FROM responses", 64).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT id FROM responses WHERE JSON_VALUE(raw_response, '$.background') \
+             = 'true' AND JSON_VALUE(raw_response, '$.status') IN ('queued', 'in_progress') \
+             AND JSON_EXISTS(raw_response, '$._lease') \
+             ORDER BY created_at ASC) WHERE ROWNUM <= 64"
+        );
+
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_sql(&skipped, "SELECT id FROM responses", 64).is_none());
     }
 
     #[test]

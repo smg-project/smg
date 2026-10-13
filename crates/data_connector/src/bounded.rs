@@ -221,6 +221,19 @@ impl ResponseStorage for BoundedResponseStorage {
             )
             .await
     }
+
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        self.bound
+            .run(
+                "list_open_background_responses",
+                self.inner.list_open_background_responses(limit),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

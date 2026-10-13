@@ -198,7 +198,15 @@ impl GrpcRouter {
             // one place a cancel looks a running id up.
             let background_responses = Arc::new(BackgroundResponses::new(
                 ctx.router_config.max_background_responses,
+                Duration::from_secs(ctx.router_config.background_lease_ttl_secs),
             ));
+            // The reaper of the background responses a gateway that is gone
+            // left open (none when background mode or the lease is off).
+            background::spawn_reaper(
+                ctx.response_storage.clone(),
+                storage_request_context.clone(),
+                &background_responses,
+            );
 
             // Helper closure to create responses context with a given pipeline
             let create_responses_context = |pipeline: &RequestPipeline| {
@@ -564,6 +572,7 @@ impl GrpcRouter {
             &queued,
             &request,
             crate::tenant::storage_tenant(tenant_meta).as_deref(),
+            ctx.background.lease().as_ref(),
             ctx.request_context.clone(),
         )
         .await

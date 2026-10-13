@@ -2124,6 +2124,523 @@ async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earli
     );
 }
 
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn open_background_responses_are_listed_until_they_close() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    // Three records of this run: a background response in flight (with the
+    // lease its gateway wrote), one that closed, and a foreground one.
+    let record = |status: &str, background: bool| {
+        let mut stored = StoredResponse::new(None);
+        let mut raw = json!({"id": stored.id.0, "status": status, "output": []});
+        if background {
+            raw["background"] = json!(true);
+            raw["_lease"] = json!({"owner": "gw_test", "expires_at": 1_700_000_000});
+        }
+        stored.raw_response = raw;
+        stored
+    };
+    let open = record("in_progress", true);
+    let closed = record("completed", true);
+    let foreground = record("in_progress", false);
+    for stored in [&open, &closed, &foreground] {
+        storage.store_response(stored.clone()).await.expect("store");
+    }
+
+    let listed_ids =
+        |responses: Vec<StoredResponse>| responses.into_iter().map(|r| r.id.0).collect::<Vec<_>>();
+    let ids = listed_ids(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list"),
+    );
+    assert!(
+        ids.contains(&open.id.0),
+        "the open background record is listed: {ids:?}"
+    );
+    assert!(!ids.contains(&closed.id.0), "a closed record is not");
+    assert!(
+        !ids.contains(&foreground.id.0),
+        "a foreground record is not"
+    );
+    let listed = storage
+        .list_open_background_responses(10_000)
+        .await
+        .expect("list");
+    let found = listed
+        .iter()
+        .find(|r| r.id == open.id)
+        .expect("the open record");
+    assert_eq!(found.raw_response["_lease"]["owner"], "gw_test");
+
+    // Its terminal store takes it out of the list.
+    let mut done = open.clone();
+    done.raw_response["status"] = json!("failed");
+    storage.store_response(done).await.expect("store");
+    let ids = listed_ids(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list"),
+    );
+    assert!(!ids.contains(&open.id.0), "{ids:?}");
+
+    for stored in [&open, &closed, &foreground] {
+        storage.delete_response(&stored.id).await.expect("delete");
+    }
+
+    // The listing is served by the partial index, built off the start-up path
+    // and waited for here.
+    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the one query it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    // The index is built off the start-up path: waited for.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let indexes = loop {
+        let indexes = client
+            .query(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = 'responses_open_background_idx'",
+                &[],
+            )
+            .await
+            .expect("pg_indexes");
+        if !indexes.is_empty() {
+            break indexes;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the open-background index is built within its time"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(indexes.len(), 1, "the open-background index exists");
+    let indexdef: String = indexes[0].get(0);
+    assert!(
+        indexdef.contains("WHERE") && indexdef.contains("'status'"),
+        "{indexdef}"
+    );
+    drop(client);
+    let _ = driver.await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_stored_object_with_a_nul_escape_is_stored_listed_and_moved_under_the_index() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&db_url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    // The partial index is built off the start-up path: the records below are
+    // stored once it is valid, so Postgres evaluates its expression on their
+    // INSERT, which is what this case is about.
+    let (client, connection) = tokio_postgres::connect(&db_url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the queries it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let valid = client
+            .query(
+                "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = 'responses_open_background_idx'",
+                &[],
+            )
+            .await
+            .expect("pg_index");
+        if valid.iter().any(|row| row.get::<_, bool>(0)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the open-background index is built within its time"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // An open background record whose object carries a NUL in a string (as a
+    // model's or a client's text can), stored under the index; and an open
+    // one without a lease.
+    let record = |status: &str, text: &str, lease: bool| {
+        let mut stored = StoredResponse::new(None);
+        let mut raw = json!({
+            "id": stored.id.0, "status": status, "background": true,
+            "instructions": text, "output": [],
+        });
+        if lease {
+            raw["_lease"] = json!({"owner": "gw_test", "expires_at": 1_700_000_000});
+        }
+        stored.raw_response = raw;
+        stored
+    };
+    let nul = record("in_progress", "a\u{0}b", true);
+    // The six characters of the escape written literally in a string (code,
+    // prose about escapes): stored as an escaped backslash followed by the
+    // text, which the index's expression must leave valid.
+    let literal = record("in_progress", "char c = '\\u0000';", true);
+    let no_lease = record("queued", "plain", false);
+    storage
+        .store_response(nul.clone())
+        .await
+        .expect("an object with a NUL escape stores under the index");
+    storage
+        .store_response(literal.clone())
+        .await
+        .expect("an object with the escape's text written literally stores under the index");
+    storage
+        .store_response(no_lease.clone())
+        .await
+        .expect("store");
+
+    let listed = storage
+        .list_open_background_responses(10_000)
+        .await
+        .expect("list");
+    let found = listed
+        .iter()
+        .find(|r| r.id == nul.id)
+        .expect("the record with the NUL escape is listed");
+    assert_eq!(
+        found.raw_response["instructions"], "a\u{0}b",
+        "the text round-trips"
+    );
+    let found = listed
+        .iter()
+        .find(|r| r.id == literal.id)
+        .expect("the record with the literal text is listed");
+    assert_eq!(
+        found.raw_response["instructions"], "char c = '\\u0000';",
+        "the text round-trips"
+    );
+    assert!(
+        listed.iter().all(|r| r.id != no_lease.id),
+        "a record without a lease is not listed"
+    );
+
+    // Its transitions are conditional writes over the same expression.
+    let mut moved = nul.clone();
+    moved.raw_response["status"] = json!("completed");
+    assert!(matches!(
+        storage
+            .store_response_if_open(moved.clone())
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    assert!(matches!(
+        storage
+            .store_response_if_open(moved)
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Closed(_)
+    ));
+    assert!(storage
+        .list_open_background_responses(10_000)
+        .await
+        .expect("list")
+        .iter()
+        .all(|r| r.id != nul.id));
+
+    drop(client);
+    let _ = driver.await;
+
+    for stored in [&nul, &literal, &no_lease] {
+        storage.delete_response(&stored.id).await.expect("delete");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn the_listing_s_plan_uses_the_open_background_index() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    // A database of its own: a table with no updated rows, so the index
+    // built concurrently is usable by every snapshot as soon as it is valid
+    // (a concurrent build over rows updated before it can be left for the
+    // older snapshots to drain first).
+    let scratch = ScratchDatabase::create(&db_url, "plan")
+        .await
+        .expect("scratch database");
+    let postgres_cfg: PostgresConfig = serde_json::from_value(json!({
+        "db_url": scratch.url,
+        "pool_max": 4,
+        "schema": {"auto_migrate": true},
+    }))
+    .expect("a Postgres config");
+    let bundle = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&postgres_cfg),
+        redis: None,
+        memory: None,
+        hook: None,
+    })
+    .await
+    .expect("create storage");
+    let storage = bundle.response_storage.clone();
+
+    let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the queries it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let valid = client
+            .query(
+                "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = 'responses_open_background_idx'",
+                &[],
+            )
+            .await
+            .expect("pg_index");
+        if valid.iter().any(|row| row.get::<_, bool>(0)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the open-background index is built within its time"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({
+        "id": stored.id.0, "status": "in_progress", "background": true, "output": [],
+        "_lease": {"owner": "gw_test", "expires_at": 1_700_000_000},
+    });
+    storage.store_response(stored).await.expect("store");
+
+    // With sequential scans off the planner must still find a plan, through
+    // the index.
+    client
+        .batch_execute("SET enable_seqscan = off")
+        .await
+        .expect("set");
+    let plan = client
+        .query(
+            "EXPLAIN SELECT id FROM responses WHERE \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'status' \
+             IN ('queued', 'in_progress') AND \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'background' = 'true' AND \
+             replace(raw_response::text, '\\u0000', '\\u0020')::json->>'_lease' IS NOT NULL \
+             ORDER BY created_at ASC LIMIT 1024",
+            &[],
+        )
+        .await
+        .expect("explain");
+    let plan: Vec<String> = plan.iter().map(|row| row.get::<_, String>(0)).collect();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("responses_open_background_idx")),
+        "{plan:?}"
+    );
+    drop(client);
+    let _ = driver.await;
+    drop(storage);
+    drop(bundle);
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_transition_keeps_the_columns_written_when_the_record_was_created() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    // A database of its own: its responses table carries an extra column a
+    // storage hook fills from the request's context.
+    let scratch = ScratchDatabase::create(&db_url, "extra")
+        .await
+        .expect("scratch database");
+    let mut schema = SchemaConfig {
+        auto_migrate: true,
+        ..Default::default()
+    };
+    schema.responses.extra_columns.insert(
+        "team".to_string(),
+        ColumnDef {
+            sql_type: "VARCHAR(64)".to_string(),
+            default_value: None,
+        },
+    );
+    let postgres_cfg = PostgresConfig {
+        db_url: scratch.url.clone(),
+        pool_max: 4,
+        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
+        schema: Some(schema),
+    };
+    let bundle = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Postgres,
+        oracle: None,
+        postgres: Some(&postgres_cfg),
+        redis: None,
+        memory: None,
+        hook: None,
+    })
+    .await
+    .expect("create storage");
+    let storage = bundle.response_storage.clone();
+
+    // The record is created under the request's context: the hook's column
+    // is written with it.
+    let mut stored = StoredResponse::new(None);
+    let id = stored.id.clone();
+    stored.raw_response = json!({
+        "id": id.0, "status": "queued", "background": true,
+        "_lease": {"owner": "gw_a", "expires_at": 1},
+    });
+    with_extra_columns(
+        std::collections::HashMap::from([("team".to_string(), json!("acme"))]),
+        storage.store_response(stored),
+    )
+    .await
+    .expect("store");
+
+    // The reaper's close: no request context, the stored object alone moves.
+    let mut raw = storage
+        .get_response(&id)
+        .await
+        .expect("get")
+        .expect("stored")
+        .raw_response;
+    raw["status"] = json!("failed");
+    assert!(matches!(
+        storage
+            .update_response_object_if_open(&id, raw)
+            .await
+            .expect("transition"),
+        ConditionalStore::Stored
+    ));
+
+    let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test drives its own connection for the one query it makes"
+    )]
+    let driver = tokio::spawn(connection);
+    let row = client
+        .query_one(
+            "SELECT team, raw_response->>'status' FROM responses WHERE id = $1",
+            &[&id.0],
+        )
+        .await
+        .expect("the row");
+    assert_eq!(
+        row.get::<_, Option<String>>(0).as_deref(),
+        Some("acme"),
+        "the column written at creation survives the transition"
+    );
+    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("failed"));
+    drop(client);
+    let _ = driver.await;
+    drop(storage);
+    drop(bundle);
+    scratch.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_missing_one() {
+    let Some(url) = test_db_url() else {
+        return;
+    };
+    let bundle = postgres_bundle(&url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    let base = StoredResponse::new(None);
+    let record = |status: &str| {
+        let mut stored = base.clone();
+        stored.raw_response =
+            json!({"id": stored.id.0, "background": true, "status": status, "output": []});
+        stored
+    };
+    // Missing: nothing is written.
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("in_progress"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Missing
+    ));
+    assert!(storage.get_response(&base.id).await.expect("get").is_none());
+
+    // Open: replaced.
+    storage
+        .store_response(record("queued"))
+        .await
+        .expect("store");
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("in_progress"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    let stored = storage
+        .get_response(&base.id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.raw_response["status"], "in_progress");
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("cancelled"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+
+    // Closed: refused, the record handed back as it is.
+    let ConditionalStore::Closed(current) = storage
+        .store_response_if_open(record("completed"))
+        .await
+        .expect("conditional store")
+    else {
+        panic!("a cancelled record is closed");
+    };
+    assert_eq!(current.raw_response["status"], "cancelled");
+    let stored = storage
+        .get_response(&base.id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.raw_response["status"], "cancelled");
+    assert!(
+        storage
+            .list_open_background_responses(10_000)
+            .await
+            .expect("list")
+            .iter()
+            .all(|r| r.id != base.id),
+        "a closed record is not among the open ones"
+    );
+
+    storage.delete_response(&base.id).await.expect("delete");
+}
+
 /// A start on a database that still has the index an earlier release built
 /// drops it without blocking the table: while a transaction another session
 /// holds open on `responses` makes that start's drop wait, and a third start
@@ -2334,172 +2851,4 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_or_a_write_on_t
             .any(|index| index == "responses_unstored_idx"),
         "the earlier index is gone after the start: {indexes:?}"
     );
-}
-
-#[tokio::test]
-#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
-async fn a_transition_keeps_the_columns_written_when_the_record_was_created() {
-    let Some(db_url) = test_db_url() else {
-        return;
-    };
-    // A database of its own: its responses table carries an extra column a
-    // storage hook fills from the request's context.
-    let scratch = ScratchDatabase::create(&db_url, "extra")
-        .await
-        .expect("scratch database");
-    let mut schema = SchemaConfig {
-        auto_migrate: true,
-        ..Default::default()
-    };
-    schema.responses.extra_columns.insert(
-        "team".to_string(),
-        ColumnDef {
-            sql_type: "VARCHAR(64)".to_string(),
-            default_value: None,
-        },
-    );
-    let postgres_cfg = PostgresConfig {
-        db_url: scratch.url.clone(),
-        pool_max: 4,
-        op_timeout_secs: PostgresConfig::default_op_timeout_secs(),
-        schema: Some(schema),
-    };
-    let bundle = create_storage(StorageFactoryConfig {
-        backend: &HistoryBackend::Postgres,
-        oracle: None,
-        postgres: Some(&postgres_cfg),
-        redis: None,
-        memory: None,
-        hook: None,
-    })
-    .await
-    .expect("create storage");
-    let storage = bundle.response_storage.clone();
-
-    // The record is created under the request's context: the hook's column
-    // is written with it.
-    let mut stored = StoredResponse::new(None);
-    let id = stored.id.clone();
-    stored.raw_response = json!({
-        "id": id.0, "status": "queued", "background": true,
-    });
-    with_extra_columns(
-        std::collections::HashMap::from([("team".to_string(), json!("acme"))]),
-        storage.store_response(stored),
-    )
-    .await
-    .expect("store");
-
-    // A transition under no request context: the stored object alone moves.
-    let mut raw = storage
-        .get_response(&id)
-        .await
-        .expect("get")
-        .expect("stored")
-        .raw_response;
-    raw["status"] = json!("failed");
-    assert!(matches!(
-        storage
-            .update_response_object_if_open(&id, raw)
-            .await
-            .expect("transition"),
-        ConditionalStore::Stored
-    ));
-
-    let (client, connection) = tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
-        .await
-        .expect("connect");
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the test drives its own connection for the one query it makes"
-    )]
-    let driver = tokio::spawn(connection);
-    let row = client
-        .query_one(
-            "SELECT team, raw_response->>'status' FROM responses WHERE id = $1",
-            &[&id.0],
-        )
-        .await
-        .expect("the row");
-    assert_eq!(
-        row.get::<_, Option<String>>(0).as_deref(),
-        Some("acme"),
-        "the column written at creation survives the transition"
-    );
-    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("failed"));
-    drop(client);
-    let _ = driver.await;
-    drop(storage);
-    drop(bundle);
-    scratch.drop().await;
-}
-
-#[tokio::test]
-#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
-async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_missing_one() {
-    let Some(url) = test_db_url() else {
-        return;
-    };
-    let bundle = postgres_bundle(&url).await.expect("create storage");
-    let storage = bundle.response_storage;
-
-    let base = StoredResponse::new(None);
-    let record = |status: &str| {
-        let mut stored = base.clone();
-        stored.raw_response =
-            json!({"id": stored.id.0, "background": true, "status": status, "output": []});
-        stored
-    };
-    // Missing: nothing is written.
-    assert!(matches!(
-        storage
-            .store_response_if_open(record("in_progress"))
-            .await
-            .expect("conditional store"),
-        ConditionalStore::Missing
-    ));
-    assert!(storage.get_response(&base.id).await.expect("get").is_none());
-
-    // Open: replaced.
-    storage
-        .store_response(record("queued"))
-        .await
-        .expect("store");
-    assert!(matches!(
-        storage
-            .store_response_if_open(record("in_progress"))
-            .await
-            .expect("conditional store"),
-        ConditionalStore::Stored
-    ));
-    let stored = storage
-        .get_response(&base.id)
-        .await
-        .expect("get")
-        .expect("stored");
-    assert_eq!(stored.raw_response["status"], "in_progress");
-    assert!(matches!(
-        storage
-            .store_response_if_open(record("cancelled"))
-            .await
-            .expect("conditional store"),
-        ConditionalStore::Stored
-    ));
-
-    // Closed: refused, the record handed back as it is.
-    let ConditionalStore::Closed(current) = storage
-        .store_response_if_open(record("completed"))
-        .await
-        .expect("conditional store")
-    else {
-        panic!("a cancelled record is closed");
-    };
-    assert_eq!(current.raw_response["status"], "cancelled");
-    let stored = storage
-        .get_response(&base.id)
-        .await
-        .expect("get")
-        .expect("stored");
-    assert_eq!(stored.raw_response["status"], "cancelled");
-    storage.delete_response(&base.id).await.expect("delete");
 }

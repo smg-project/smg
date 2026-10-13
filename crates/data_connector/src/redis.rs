@@ -825,6 +825,19 @@ impl RedisResponseStorage {
         }
     }
 
+    /// The set of the ids of the background responses still in flight: a
+    /// record stored `queued` or `in_progress` with `background: true` joins
+    /// it, its terminal store or its deletion removes it (a hash cannot be
+    /// searched by a field of its JSON payload short of scanning every
+    /// response). The listing behind the gateway's reaper of abandoned
+    /// background responses reads it.
+    fn open_background_key(&self) -> String {
+        match &self.store.schema.owner {
+            Some(owner) => format!("{owner}:background:open"),
+            None => "background:open".to_string(),
+        }
+    }
+
     /// The output-item keys pointing at the responses stored under `keys`,
     /// read from each hash's `raw_response` (before the hashes go).
     async fn output_item_keys_of_many(
@@ -929,6 +942,11 @@ impl RedisResponseStorage {
                         pipe.set(item_key, response_id_str);
                     }
                 }
+            }
+            if response.is_open_background() {
+                pipe.sadd(self.open_background_key(), response_id_str);
+            } else if response.raw_response["background"].as_bool() == Some(true) {
+                pipe.srem(self.open_background_key(), response_id_str);
             }
         }
         if let Some(seconds) = retention {
@@ -1330,6 +1348,9 @@ impl ResponseStorage for RedisResponseStorage {
                 .await
                 .map_err(ResponseStorageError::from_redis)?;
         }
+        conn.srem::<_, _, ()>(self.open_background_key(), id)
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
 
         Ok(())
     }
@@ -1363,6 +1384,76 @@ impl ResponseStorage for RedisResponseStorage {
             .await
             .map_err(ResponseStorageError::from_redis)?;
         Ok(())
+    }
+
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        let sr = &self.store.schema.responses;
+        if sr.is_skipped("raw_response") || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let open_key = self.open_background_key();
+        let mut conn = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let ids: Vec<String> = conn
+            .smembers(&open_key)
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Two fields per member, not the whole hash (whose input can run to
+        // megabytes): the object and when it was created; the record builder
+        // reads a missing input as empty, and the reaper re-reads the whole
+        // record of the few it closes.
+        let fields = [sr.col("raw_response"), sr.col("created_at")];
+        let mut pipe = redis::pipe();
+        for id in &ids {
+            pipe.cmd("HMGET")
+                .arg(self.response_key(id))
+                .arg(&fields[..]);
+        }
+        let values: Vec<Vec<Option<String>>> = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
+
+        // A member whose record is gone (expired, or deleted by an older
+        // build) or closed by one that did not maintain the set leaves it.
+        let mut open = Vec::new();
+        let mut stale = Vec::new();
+        for (id, got) in ids.iter().zip(values) {
+            let map: HashMap<String, String> = fields
+                .iter()
+                .zip(got)
+                .filter_map(|(field, value)| value.map(|value| (field.to_string(), value)))
+                .collect();
+            if !map.contains_key(sr.col("raw_response")) {
+                stale.push(id.clone());
+                continue;
+            }
+            let response = self.build_response_from_map(map, id)?;
+            if response.is_open_background() {
+                open.push(response);
+            } else {
+                stale.push(id.clone());
+            }
+        }
+        if !stale.is_empty() {
+            conn.srem::<_, _, ()>(&open_key, stale)
+                .await
+                .map_err(ResponseStorageError::from_redis)?;
+        }
+        open.sort_by_key(|response| response.created_at);
+        open.truncate(limit);
+        Ok(open)
     }
 
     async fn list_identifier_responses(
@@ -1465,6 +1556,7 @@ impl ResponseStorage for RedisResponseStorage {
         // An index left empty goes with its last member.
         let mut leaving = visible_ids;
         leaving.extend(gone);
+        pipe.srem(self.open_background_key(), &leaving);
         pipe.zrem(&key, &leaving);
 
         pipe.query_async::<()>(&mut conn)

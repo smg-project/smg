@@ -20,7 +20,8 @@ use crate::{
         ConversationItemStorageError, ConversationMetadata, ConversationResult,
         ConversationStorage, ConversationStorageError, ListParams, NewConversation,
         NewConversationItem, ResponseId, ResponseResult, ResponseStorage, ResponseStorageError,
-        SortOrder, StoredResponse, TERMINAL_RESPONSE_STATUSES,
+        SortOrder, StoredResponse, BACKGROUND_LEASE_KEY, OPEN_RESPONSE_STATUSES,
+        TERMINAL_RESPONSE_STATUSES,
     },
     factory::StoreContactError,
     postgres_migrations::POSTGRES_HISTORY_MIGRATIONS,
@@ -296,7 +297,59 @@ impl PostgresStore {
         // the table and every later statement behind it, held to the commit.
         // An existing table gets the replacement from its operator,
         // concurrently too (see the release note).
-        self.drop_legacy_unstored_index(&client).await
+        self.drop_legacy_unstored_index(&client).await?;
+        drop(client);
+
+        // The partial index behind the reaper's listing of the open background
+        // records is built off the start-up path, by one gateway at a time:
+        // see `build_open_background_index`.
+        if open_background_index_sql(schema).is_some()
+            && !index_exists_on(&self.pool, schema, OPEN_BACKGROUND_INDEX).await?
+        {
+            self.spawn_open_background_index_build();
+        }
+        Ok(())
+    }
+
+    /// Builds the partial index behind the reaper's listing of the open
+    /// background records on a task of its own, so the gateway starts as soon
+    /// as the bootstrap's transaction has committed: the build is
+    /// `CONCURRENTLY` (a plain build takes a share lock on the table that holds
+    /// every write of every gateway for as long as it parses each stored
+    /// object, which on an existing table of some size is the upgrade's
+    /// rollout), which cannot run inside a transaction, scans the table twice
+    /// and waits for every older snapshot, so it can take a while; the listing
+    /// works without it (as a scan) until it is there. One gateway builds at a
+    /// time: a session-level advisory lock is tried, not waited for, and a
+    /// gateway that does not get it skips the build (two concurrent builds of
+    /// the same index would deadlock on each other's snapshots, leaving an
+    /// INVALID index). The builder drops an INVALID leftover of an interrupted
+    /// build first (Postgres keeps it, and `IF NOT EXISTS` would honour it),
+    /// lifts the statement timeout for the build on its connection and
+    /// restores it, and logs a failure instead of failing the start.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the index build outlives the start-up it was spawned from; the task holds only the pool and the schema"
+    )]
+    fn spawn_open_background_index_build(&self) {
+        let pool = self.pool.clone();
+        let schema = Arc::clone(&self.schema);
+        tokio::spawn(async move {
+            match build_open_background_index(&pool, &schema).await {
+                Ok(IndexBuild::Built) => {
+                    tracing::info!(index = OPEN_BACKGROUND_INDEX, "open-background index built");
+                }
+                Ok(IndexBuild::AnotherGatewayBuilds) => tracing::info!(
+                    index = OPEN_BACKGROUND_INDEX,
+                    "open-background index is being built by another gateway; the listing scans the table until it is there"
+                ),
+                Ok(IndexBuild::Present) => {}
+                Err(e) => tracing::warn!(
+                    index = OPEN_BACKGROUND_INDEX,
+                    "open-background index not built (the reaper's listing scans the table): {e}"
+                ),
+            }
+        });
     }
 
     /// Drops the index an earlier release built under
@@ -339,6 +392,172 @@ impl PostgresStore {
                 )
             })
     }
+}
+
+/// What [`build_open_background_index`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexBuild {
+    /// The index was built (or an INVALID leftover replaced).
+    Built,
+    /// The index was there already.
+    Present,
+    /// Another gateway holds the build lock: left to it.
+    AnotherGatewayBuilds,
+}
+
+/// The class of the advisory lock the builder of the open-background index
+/// holds for the build (session-level, tried, never waited for); the lock's
+/// second key is the hash of the index name qualified by the schema the
+/// store writes to (`owner` folded as the server folds the unquoted DDL,
+/// else `current_schema()` on the server), so two stores sharing one
+/// database under different schemas build their own index at the same
+/// time, two spellings of one schema share the key, and one gateway per
+/// schema builds.
+const POSTGRES_INDEX_BUILD_LOCK_CLASS: i32 = 0x736D_6778;
+
+/// The schema owner as the server stores the schema the unquoted DDL
+/// created: folded to lower case the way identifiers are folded (`A`-`Z`
+/// only; the owner is ASCII by validation, and `lower()` on the server would
+/// follow the database's collation instead). `None` leaves the lookup to
+/// `current_schema()`.
+fn folded_owner(schema: &SchemaConfig) -> Option<String> {
+    schema.owner.as_deref().map(str::to_ascii_lowercase)
+}
+
+/// Builds the open-background index on one connection of `pool`, under the
+/// build lock, with the statement timeout lifted for the build; see
+/// `PostgresStore::spawn_open_background_index_build`.
+async fn build_open_background_index(
+    pool: &Pool,
+    schema: &SchemaConfig,
+) -> Result<IndexBuild, String> {
+    let Some(index_ddl) = open_background_index_sql(schema) else {
+        return Ok(IndexBuild::Present);
+    };
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| format!("no connection for the index build: {}", describe_error(&e)))?;
+    let owner = folded_owner(schema);
+    let locked: bool = client
+        .query_one(
+            "SELECT pg_try_advisory_lock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
+            &[&POSTGRES_INDEX_BUILD_LOCK_CLASS, &owner, &OPEN_BACKGROUND_INDEX],
+        )
+        .await
+        .map_err(|e| format!("failed to try the index build lock: {}", describe_error(&e)))?
+        .get(0);
+    if !locked {
+        return Ok(IndexBuild::AnotherGatewayBuilds);
+    }
+    let built = async {
+        if index_exists_on_client(&client, schema, OPEN_BACKGROUND_INDEX, true).await? {
+            return Ok(IndexBuild::Present);
+        }
+        if drop_invalid_index(&client, schema, OPEN_BACKGROUND_INDEX).await? {
+            tracing::warn!(
+                index = OPEN_BACKGROUND_INDEX,
+                "dropped an invalid leftover of an interrupted index build"
+            );
+        }
+        client
+            .batch_execute("SET statement_timeout = 0")
+            .await
+            .map_err(|e| describe_error(&e))?;
+        let build = client.batch_execute(&index_ddl).await;
+        let reset = client.batch_execute("RESET statement_timeout").await;
+        build.map_err(|e| describe_error(&e))?;
+        reset.map_err(|e| format!("the index was built, but the statement timeout was not restored on the connection: {}", describe_error(&e)))?;
+        Ok(IndexBuild::Built)
+    }
+    .await;
+    if let Err(e) = client
+        .execute(
+            "SELECT pg_advisory_unlock($1, hashtext(COALESCE($2, current_schema()) || '.' || $3))",
+            &[
+                &POSTGRES_INDEX_BUILD_LOCK_CLASS,
+                &owner,
+                &OPEN_BACKGROUND_INDEX,
+            ],
+        )
+        .await
+    {
+        tracing::warn!(
+            "could not release the index build lock: {}",
+            describe_error(&e)
+        );
+    }
+    built
+}
+
+/// [`index_exists_on_client`] on a connection of `pool`.
+async fn index_exists_on(pool: &Pool, schema: &SchemaConfig, name: &str) -> Result<bool, String> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| format!("no connection for the index lookup: {}", describe_error(&e)))?;
+    index_exists_on_client(&client, schema, name, true).await
+}
+
+/// The name of the partial index behind the reaper's listing.
+const OPEN_BACKGROUND_INDEX: &str = "responses_open_background_idx";
+
+/// Whether an index named `name` exists in the schema the store writes to
+/// ([`folded_owner`], else `current_schema()` on the server); with
+/// `valid_only`, an INVALID one (an interrupted concurrent build) does not
+/// count.
+async fn index_exists_on_client(
+    client: &impl deadpool_postgres::GenericClient,
+    schema: &SchemaConfig,
+    name: &str,
+    valid_only: bool,
+) -> Result<bool, String> {
+    let rows = client
+        .query(
+            "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_index i ON i.indexrelid = c.oid \
+             WHERE c.relkind = 'i' AND c.relname = $1 \
+             AND n.nspname = COALESCE($2, current_schema()) \
+             AND (i.indisvalid OR NOT $3)",
+            &[&name, &folded_owner(schema), &valid_only],
+        )
+        .await
+        .map_err(|e| format!("failed to look the index {name} up: {}", describe_error(&e)))?;
+    Ok(!rows.is_empty())
+}
+
+/// Drops the index `name` of the schema the store writes to when it exists
+/// but is not valid (a `CREATE INDEX CONCURRENTLY` that was interrupted leaves
+/// such an index behind, and `IF NOT EXISTS` would then keep it). Run under
+/// the build lock only, so the index is nobody's build in progress.
+/// `Ok(true)` when one was dropped.
+async fn drop_invalid_index(
+    client: &impl deadpool_postgres::GenericClient,
+    schema: &SchemaConfig,
+    name: &str,
+) -> Result<bool, String> {
+    let rows = client
+        .query(
+            "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = $1 AND n.nspname = COALESCE($2, current_schema()) \
+             AND NOT i.indisvalid",
+            &[&name, &folded_owner(schema)],
+        )
+        .await
+        .map_err(|e| describe_error(&e))?;
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    let qualified = match schema.owner.as_deref() {
+        Some(owner) => format!("{owner}.\"{name}\""),
+        None => name.to_string(),
+    };
+    client
+        .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS {qualified};"))
+        .await
+        .map_err(|e| describe_error(&e))?;
+    Ok(true)
 }
 
 /// Whether the catalog `tx` sees has the index `index` (owner-qualified when
@@ -1265,7 +1484,9 @@ impl PostgresResponseStorage {
 
     /// The index on the safety identifier, created by the bootstrap after
     /// the migrations (a legacy table gains the column in v1), unless the
-    /// column is skipped.
+    /// column is skipped. The partial index behind the reaper's listing
+    /// ([`open_background_index_sql`]) is built after the bootstrap's
+    /// transaction, concurrently.
     pub(crate) fn index_ddl(schema: &SchemaConfig) -> Option<String> {
         let s = &schema.responses;
         if s.is_skipped("safety_identifier") {
@@ -1466,6 +1687,68 @@ fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<S
     Some(format!(
         "{select_base} WHERE {document}::jsonb @> jsonb_build_object('output', \
          jsonb_build_array(jsonb_build_object('id', $1::text))){order} LIMIT 1"
+    ))
+}
+
+/// The condition of a row whose stored object's status is one a response
+/// still leaves: the predicate of [`open_background_index_sql`] and of the
+/// listing it serves.
+fn open_status_condition(col_raw: &str) -> String {
+    format!(
+        "{} IN ({})",
+        nul_safe_json_text(col_raw, "status"),
+        sql_string_list(&OPEN_RESPONSE_STATUSES)
+    )
+}
+
+/// The index behind [`ResponseStorage::list_open_background_responses`]: a
+/// partial index over the rows whose stored object's status is one a
+/// response still leaves, keyed by that status, so the listing every
+/// gateway's reaper runs reads the few open rows instead of scanning the
+/// table. Postgres evaluates the key and the predicate on every INSERT and
+/// UPDATE of the table once the index exists, hence [`nul_safe_json_text`]: an
+/// object with a `\u0000` escape stores as it did without the index. Built
+/// CONCURRENTLY, off the start-up path and by one gateway at a time, once
+/// the bootstrap's transaction has committed, so the writes of an existing
+/// table are not held behind the build (see
+/// `PostgresStore::spawn_open_background_index_build`). `None` when the
+/// schema skips the column.
+fn open_background_index_sql(schema: &SchemaConfig) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let table = s.qualified_table(schema.owner.as_deref());
+    let col_raw = s.col("raw_response");
+    Some(format!(
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {OPEN_BACKGROUND_INDEX} ON {table} \
+         (({})) WHERE {};",
+        nul_safe_json_text(col_raw, "status"),
+        open_status_condition(col_raw)
+    ))
+}
+
+/// The query behind [`ResponseStorage::list_open_background_responses`]:
+/// the rows whose stored object carries a status the response still leaves
+/// (the condition of [`open_background_index_sql`], so the partial index
+/// serves the query), `background: true` and a lease, oldest first, `$1` the
+/// most rows. `None` when the schema skips the column (nothing to list).
+fn open_background_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let order = if s.is_skipped("created_at") {
+        String::new()
+    } else {
+        format!(" ORDER BY {} ASC", s.col("created_at"))
+    };
+    Some(format!(
+        "{select_base} WHERE {} AND {} = 'true' AND {} IS NOT NULL{order} LIMIT $1",
+        open_status_condition(col_raw),
+        nul_safe_json_text(col_raw, "background"),
+        nul_safe_json_text(col_raw, BACKGROUND_LEASE_KEY)
     ))
 }
 
@@ -1981,6 +2264,31 @@ impl ResponseStorage for PostgresResponseStorage {
         }
     }
 
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        let Some(sql) = open_background_sql(&self.store.schema, &self.select_base) else {
+            return Ok(Vec::new());
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let rows = query_cached(&client, &sql, &[&limit])
+            .await
+            .map_err(ResponseStorageError::from_pg)?;
+        let schema = &self.store.schema;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(Self::build_response_from_row(&row, schema)?);
+        }
+        Ok(out)
+    }
+
     async fn delete_response(&self, response_id: &ResponseId) -> ResponseResult<()> {
         let s = &self.store.schema.responses;
         let table = s.qualified_table(self.store.schema.owner.as_deref());
@@ -2340,6 +2648,46 @@ mod tests {
             "INSERT INTO l (conversation_id, item_id) VALUES ($1, $2) \
              ON CONFLICT (conversation_id, item_id) DO NOTHING"
         );
+    }
+
+    #[test]
+    fn the_open_background_index_covers_the_listing_s_status_condition() {
+        let schema = SchemaConfig::default();
+        assert_eq!(
+            open_background_index_sql(&schema).unwrap(),
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS responses_open_background_idx ON responses \
+             ((replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status')) \
+             WHERE replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status' \
+             IN ('queued', 'in_progress');"
+        );
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_index_sql(&skipped).is_none());
+    }
+
+    #[test]
+    fn open_background_sql_filters_on_the_stored_status_and_flag_oldest_first() {
+        let schema = SchemaConfig::default();
+        let sql = open_background_sql(&schema, "SELECT id, raw_response FROM responses").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT id, raw_response FROM responses WHERE \
+             replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status' \
+             IN ('queued', 'in_progress') AND \
+             replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'background' = 'true' AND \
+             replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'_lease' IS NOT NULL \
+             ORDER BY created_at ASC LIMIT $1"
+        );
+
+        let mut skipped = SchemaConfig::default();
+        skipped
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(open_background_sql(&skipped, "SELECT id FROM responses").is_none());
     }
 
     #[test]

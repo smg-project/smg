@@ -545,6 +545,9 @@ impl StoredResponse {
     }
 }
 
+/// The statuses a background response still leaves.
+pub(crate) const OPEN_RESPONSE_STATUSES: [&str; 2] = ["queued", "in_progress"];
+
 /// The statuses a response does not leave any more: a record in one of them
 /// is closed, and [`ResponseStorage::store_response_if_open`] refuses to
 /// rewrite it. The one list behind the gateway's notion of a closed record
@@ -562,7 +565,26 @@ pub(crate) fn sql_string_list(values: &[&str]) -> String {
         .join(", ")
 }
 
+/// The key under which the gateway running a background response stamps its
+/// lease (owner and expiry) on the stored object; a terminal record carries
+/// none, and the object is served without it.
+pub const BACKGROUND_LEASE_KEY: &str = "_lease";
+
 impl StoredResponse {
+    /// Whether this is a background record still in flight that a gateway
+    /// holds a lease on (`background: true`, a status it still leaves and a
+    /// lease under [`BACKGROUND_LEASE_KEY`]): any gateway sharing the store
+    /// closes it once that lease has expired. A record without a lease
+    /// (written by a gateway running without leases) is left to a client's
+    /// cancel and is not one of these.
+    pub fn is_open_background(&self) -> bool {
+        self.raw_response["background"].as_bool() == Some(true)
+            && self.raw_response["status"]
+                .as_str()
+                .is_some_and(|status| OPEN_RESPONSE_STATUSES.contains(&status))
+            && self.raw_response.get(BACKGROUND_LEASE_KEY).is_some()
+    }
+
     /// Whether the stored object's status is one a response does not leave
     /// any more.
     pub fn is_closed(&self) -> bool {
@@ -864,7 +886,7 @@ pub trait ResponseStorage: Send + Sync {
     /// Store `response` under its id unless the record stored there has
     /// reached a terminal status ([`TERMINAL_RESPONSE_STATUSES`]) or is
     /// missing: the write of a background response's status transition
-    /// (`in_progress`, `cancelled`, `failed`, the terminal
+    /// (`in_progress`, a lease renewal, `cancelled`, `failed`, the terminal
     /// object) is one conditional write, so a record closed on one gateway
     /// is never rewritten by another whatever the timing.
     ///
@@ -887,11 +909,12 @@ pub trait ResponseStorage: Send + Sync {
 
     /// Moves the stored object of the record under `id` to `raw_response`
     /// unless the record has reached a terminal status or is missing: the
-    /// write of a status transition (`in_progress`, `cancelled`, `failed`),
-    /// which changes the object alone. The columns written when the record
-    /// was created (the request's context, a hook's extra columns) are left
-    /// as they are: a transition written under no request context must not
-    /// reset them.
+    /// write of a status transition (`in_progress`, a lease renewal,
+    /// `cancelled`, `failed`, the reaper's close), which changes the object
+    /// alone. The columns written when the record was created (the request's
+    /// context, a hook's extra columns) are left as they are: the reaper runs
+    /// under no request, and must not reset them. A storage hook that refuses
+    /// writes without a request context refuses the reaper's close too.
     ///
     /// The default reads the record and writes it whole through
     /// [`Self::store_response_if_open`]; every backend of this crate
@@ -979,6 +1002,24 @@ pub trait ResponseStorage: Send + Sync {
     ) -> ResponseResult<Option<StoredResponse>> {
         let _ = item_id;
         Ok(None)
+    }
+
+    /// The background responses still in flight under a lease (`background:
+    /// true`, a status they still leave and a lease under
+    /// [`BACKGROUND_LEASE_KEY`]: [`StoredResponse::is_open_background`]),
+    /// oldest first, at most `limit` of them: the records a gateway reads to
+    /// close those whose running gateway is gone. A record without a lease is
+    /// not listed: it is left to a client's cancel, and the oldest such
+    /// records would otherwise fill every batch.
+    ///
+    /// The default answers an empty list: a backend without a way to find
+    /// them leaves such records to a client's cancel.
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        let _ = limit;
+        Ok(Vec::new())
     }
 
     /// List recent responses for a safety identifier: those a caller of
