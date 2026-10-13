@@ -512,7 +512,24 @@ pub(crate) fn mm_shared_image_wire_dtype_over(
     model_id: &str,
     pools: &[RoutingPool],
 ) -> Option<EncoderDtype> {
+    if !one_pass_wire_enabled() {
+        return None;
+    }
     shared_image_wire_dtype_over(registry, model_id, pools, &DtypeOverrides::from_env())
+}
+
+/// Opts the one-pass wire write in (`1`): the images of a request whose
+/// workers all read one wire dtype are then preprocessed straight into it.
+/// Off, the request takes the two-pass path (the patch layout, then the
+/// write in the worker's dtype at assembly), whose layout pass is the faster
+/// one on every image size but one since the vectorised patch layout landed;
+/// the one-pass writer is turned back on by default once it is at least as
+/// fast at every size.
+pub const ONE_PASS_WIRE_ENV: &str = "SMG_MM_ONE_PASS_WIRE";
+
+fn one_pass_wire_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var(ONE_PASS_WIRE_ENV).is_ok_and(|value| value == "1"))
 }
 
 fn shared_image_wire_dtype_over(
@@ -839,6 +856,50 @@ mod tests {
         assert_eq!(
             shared_image_wire_dtype(&[worker("http://f", RuntimeType::Sglang, &[])], &plain),
             Some(EncoderDtype::Float32)
+        );
+    }
+
+    /// Without the opt-in the stages get no wire dtype, whatever the fleet
+    /// agrees on: every request takes the two-pass path. The resolution
+    /// itself still answers, for the opt-in and the tests of its rules.
+    #[test]
+    fn the_one_pass_wire_write_is_opt_in() {
+        use crate::{
+            routers::grpc::mode::Mode,
+            worker::{ConnectionMode, WorkerRegistry},
+        };
+
+        let registry = WorkerRegistry::new();
+        for url in ["grpc://regular-1:8000", "grpc://regular-2:8000"] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("qwen3-vl"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("register");
+        }
+        let pools = Mode::Regular.multimodal_wire_pools();
+        assert_eq!(
+            shared_image_wire_dtype_over(&registry, "qwen3-vl", pools, &DtypeOverrides::default()),
+            Some(EncoderDtype::BFloat16),
+            "the fleet agrees on one dtype"
+        );
+        assert!(
+            std::env::var_os(ONE_PASS_WIRE_ENV).is_none(),
+            "the test process must not opt in"
+        );
+        assert_eq!(
+            mm_shared_image_wire_dtype_over(&registry, "qwen3-vl", pools),
+            None,
+            "the stages see no wire dtype without the opt-in"
         );
     }
 
