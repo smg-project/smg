@@ -73,7 +73,15 @@ pub(crate) fn effective_bootstrap_port(worker: &dyn Worker) -> Option<(u16, Boot
         WorkerType::Encode => true,
         WorkerType::Prefill => match spec.runtime_type {
             RuntimeType::Vllm => spec.kv_connector.as_deref() == Some(MOONCAKE_CONNECTOR),
-            _ => true,
+            // Listed, as the PD protocol table lists them, so that a runtime
+            // added later decides its probe here instead of inheriting one.
+            RuntimeType::Sglang
+            | RuntimeType::TokenSpeed
+            | RuntimeType::Trtllm
+            | RuntimeType::Mlx
+            | RuntimeType::Generic
+            | RuntimeType::External
+            | RuntimeType::Unspecified => true,
         },
         WorkerType::Regular | WorkerType::Decode => false,
     };
