@@ -14,9 +14,9 @@
 //! the tool when it is installed). One caveat: the size is the sample entry's,
 //! what the muxer wrote, which the probe replaces with the decoder's own size
 //! after it has looked at the stream; the two agree on the files common
-//! muxers write, and a frame decoded at another size fails the frame parsing
-//! (headed frames) or the framing check (raw frames) rather than passing
-//! through:
+//! muxers write, and the connector checks the decoded frames' own size
+//! against this one and re-reads a disagreeing file from the probe before any
+//! raw framing:
 //!
 //! - `width` / `height`: the first visual sample entry's;
 //! - `duration_ts` / `time_base`: the media header's duration and time scale
@@ -440,18 +440,13 @@ mod tests {
         let file = written(&bytes);
         assert!(read(file.path()).expect("readable").is_none());
 
-        // The same wrap inside a payload.
-        let mut payload = Vec::new();
+        // The same wrap inside a payload: an empty box first, so the 64-bit
+        // size starts at offset 8 and `8 + (2^64 - 8)` wraps to zero.
+        let mut payload = boxed(*b"free", &[]);
         payload.extend_from_slice(&1u32.to_be_bytes());
         payload.extend_from_slice(b"free");
         payload.extend_from_slice(&(u64::MAX - 7).to_be_bytes());
         assert!(boxes(&payload).is_none());
-        let mut inner = Vec::new();
-        inner.extend_from_slice(&1u32.to_be_bytes());
-        inner.extend_from_slice(b"free");
-        inner.extend_from_slice(&(usize::MAX as u64 - 7).to_be_bytes());
-        inner.extend_from_slice(&[0u8; 8]);
-        assert!(boxes(&inner).is_none());
     }
 
     /// An edit at rate 1.5 (`0x0001_8000`) is not the whole track at normal

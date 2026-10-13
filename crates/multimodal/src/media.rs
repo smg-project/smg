@@ -1912,10 +1912,28 @@ async fn decode_video_with_ffmpeg_runners(
     selection: Option<&FrameSelection>,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
     let sampling = selection.map(FrameSelection::sampling_info);
-    if let Some(metadata) = metadata {
+    if let Some(mut metadata) = metadata {
         let sample_fps = effective_sample_fps(metadata.duration_seconds, cfg);
         let started = Instant::now();
-        match decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await {
+        let mut headed = decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
+        if let (Err(error), true) = (&headed, metadata.from_container) {
+            // The container's size is the muxer's; the probe's is the
+            // decoder's. A headed decode that failed on the container's
+            // metadata is retried on the probe's before anything frames raw
+            // output by a size the decoder may not produce.
+            log_video_decode_backend_timing(
+                "ffmpeg_ppm_file",
+                started,
+                input_bytes,
+                cfg,
+                Some(error),
+            );
+            metadata = probe_video_info(input_path)
+                .await
+                .and_then(|info| video_metadata_from(info, false))?;
+            headed = decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
+        }
+        match headed {
             Ok(video) => {
                 log_video_decode_backend_timing("ffmpeg_ppm_file", started, input_bytes, cfg, None);
                 return Ok(DecodedVideoFrames::Rgb {
@@ -1923,6 +1941,26 @@ async fn decode_video_with_ffmpeg_runners(
                     sample_fps,
                     sampling,
                 });
+            }
+            Err(error) if is_frame_size_mismatch(&error) => {
+                // The frames are not the metadata's size: the raw runner would
+                // frame them wrongly; the headed PNG runner carries its own.
+                log_video_decode_backend_timing(
+                    "ffmpeg_ppm_file",
+                    started,
+                    input_bytes,
+                    cfg,
+                    Some(&error),
+                );
+                return decode_video_png_frames(
+                    input_path,
+                    input_bytes,
+                    cfg,
+                    Some(metadata),
+                    selection,
+                    sampling,
+                )
+                .await;
             }
             Err(error) => {
                 log_video_decode_backend_timing(
@@ -1957,6 +1995,18 @@ async fn decode_video_with_ffmpeg_runners(
         }
     }
 
+    decode_video_png_frames(input_path, input_bytes, cfg, metadata, selection, sampling).await
+}
+
+/// The headed PNG runner, the last of the chain: every frame carries its own size.
+async fn decode_video_png_frames(
+    input_path: &Path,
+    input_bytes: usize,
+    cfg: VideoFetchConfig,
+    metadata: Option<VideoMetadata>,
+    selection: Option<&FrameSelection>,
+    sampling: Option<VideoSamplingInfo>,
+) -> Result<DecodedVideoFrames, MediaConnectorError> {
     let started = Instant::now();
     match decode_video_with_ffmpeg_png(input_path, cfg, metadata, selection).await {
         Ok((frames, sample_fps)) => {
@@ -2155,6 +2205,14 @@ async fn decode_video_with_ffmpeg_ppm(
     }
 
     let mut video = parse_ppm_rgb_video(Bytes::from(output.stdout))?;
+    if let Some(frame) = video.frames.first() {
+        if (frame.width, frame.height) != (metadata.width, metadata.height) {
+            return Err(MediaConnectorError::VideoDecode(format!(
+                "{FRAME_SIZE_MISMATCH} {}x{} differs from the stated {}x{}",
+                frame.width, frame.height, metadata.width, metadata.height
+            )));
+        }
+    }
     if let Some(selection) = selection {
         video.frames = selection.expand(video.frames)?;
     }
@@ -2176,9 +2234,12 @@ async fn decode_video_with_ffmpeg_raw(
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes.to_string();
     // Rawvideo has no per-frame header, so stdout is framed by the metadata's
-    // size: the probe's coded size, or the container's sample entry size when
-    // the tables were read directly (a stream decoded at another size fails
-    // the framing check below). Disable FFmpeg autorotation here; otherwise a
+    // size. That size is the probe's, or the container's sample entry size
+    // when the tables were read directly; the headed runner before this one
+    // has checked the decoded frames against it (and container metadata the
+    // decoder disagreed with was re-read from the probe), so the check below
+    // only guards a stream that is not a whole number of frames. Disable
+    // FFmpeg autorotation here; otherwise a
     // display-matrix rotation can swap output width/height and corrupt framing.
     let active_decode = ActiveVideoDecode::enter_async().await;
     let mut command = ffmpeg_decode_command(decoder_threads(active_decode.count()), false);
@@ -2312,6 +2373,11 @@ struct VideoMetadata {
     /// else the container's duration (the format's before the stream's) at the
     /// frame rate; `None` when the container states neither.
     container_frames: Option<usize>,
+    /// The values were read from the container's own tables, not from the
+    /// probe tool: the size is then the muxer's stated size, which the probe
+    /// replaces with the decoder's; a headed decode that disagrees with it
+    /// sends the file back to the probe before any raw framing.
+    from_container: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2331,10 +2397,17 @@ async fn probe_video_metadata(input_path: &Path) -> Result<VideoMetadata, MediaC
     let from_container = task::spawn_blocking(move || crate::mp4_metadata::read(&path))
         .await
         .map_err(MediaConnectorError::Blocking)?;
-    let info = match from_container {
-        Ok(Some(container)) => probed_from_container(&container),
-        _ => probe_video_info(input_path).await?,
+    let (info, from_container) = match from_container {
+        Ok(Some(container)) => (probed_from_container(&container), true),
+        _ => (probe_video_info(input_path).await?, false),
     };
+    video_metadata_from(info, from_container)
+}
+
+fn video_metadata_from(
+    info: ProbedVideoInfo,
+    from_container: bool,
+) -> Result<VideoMetadata, MediaConnectorError> {
     let width = info.width.ok_or_else(|| {
         MediaConnectorError::VideoDecode("ffprobe did not return video width".to_string())
     })?;
@@ -2348,7 +2421,17 @@ async fn probe_video_metadata(input_path: &Path) -> Result<VideoMetadata, MediaC
         source_fps: info.source_fps,
         total_frames: info.total_frames,
         container_frames: info.container_frames,
+        from_container,
     })
+}
+
+/// The start of the error a headed decode returns when its frames are not
+/// the metadata's size: the raw runner, which frames its output by that size,
+/// must not run on such metadata.
+const FRAME_SIZE_MISMATCH: &str = "decoded frame size";
+
+fn is_frame_size_mismatch(error: &MediaConnectorError) -> bool {
+    matches!(error, MediaConnectorError::VideoDecode(message) if message.starts_with(FRAME_SIZE_MISMATCH))
 }
 
 /// The probe's fields from the container's tables: the stream duration (the
@@ -2561,11 +2644,15 @@ fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) ->
 }
 
 /// Past this many distinct frames the selection is described by a fixed-size
-/// spread expression when one reproduces it, instead of a list that grows with
-/// the clip. The cutoff is about expression size, not a parser limit: ffmpeg 8
-/// takes a 451-term list (the real-ffmpeg test below runs one), and a
-/// selection no spread formula describes stays a list past it.
+/// spread expression (plus at most [`FFMPEG_SPREAD_EXTRA_TERMS`] explicit
+/// frames) when one reproduces it, instead of a list that grows with the clip:
+/// ffmpeg 5.1 refuses a list of hundreds of terms (a 451-term list fails to
+/// parse on 5.1.9; 8.0 takes it). A selection no spread describes stays a
+/// list past the cutoff and depends on the ffmpeg build.
 const FFMPEG_MAX_SELECT_TERMS: usize = 100;
+/// Explicit frames a described selection may add to its spread formula (a
+/// rate-based selection ends on the clip's last frame, one past its spread).
+const FFMPEG_SPREAD_EXTRA_TERMS: usize = 8;
 
 /// Exact source frames for an ffmpeg decode, sampled the way the OpenCV path samples.
 #[derive(Debug, Clone, PartialEq)]
@@ -2676,6 +2763,9 @@ impl FrameSelection {
     /// computes it): `(step * last) / denom` lands on the other side of a tie
     /// for some steps, and ffmpeg evaluates in the same doubles.
     fn spread_select_filter(&self) -> Option<String> {
+        let unique: Vec<usize> = self.unique_frames.iter().map(|(index, _)| *index).collect();
+        // The picker's own spread (its steps over the whole stream), exact or
+        // with a few explicit frames beyond it.
         let last = self.total_frames.checked_sub(1).filter(|last| *last > 0)?;
         let denom = self
             .frame_indices
@@ -2685,38 +2775,49 @@ impl FrameSelection {
         let floored = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
         let stride = last as f64 / denom as f64;
         let nearest_to_even = |step: f64| (step * stride).round_ties_even() as usize;
-        if self.is_described_by(last, denom, floored) {
-            return Some(format!(
-                "select='eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))'"
-            ));
+        let floored_expr = format!("eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))");
+        let x = format!("round(n*{denom}/{last})*({last}/{denom})");
+        let nearest_expr = format!(
+            "eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2))"
+        );
+        let floored_extra = spread_misses(&unique, last, denom, floored);
+        let nearest_extra = spread_misses(&unique, last, denom, nearest_to_even);
+        let described = match (floored_extra, nearest_extra) {
+            (Some(extra), _) if extra.is_empty() => Some((floored_expr, extra)),
+            (_, Some(extra)) if extra.is_empty() => Some((nearest_expr, extra)),
+            (Some(extra), _) => Some((floored_expr, extra)),
+            (_, Some(extra)) => Some((nearest_expr, extra)),
+            (None, None) => None,
+        };
+        // Else a selection that is an even spread of its own distinct frames
+        // plus a few trailing frames: a rate-based selection ends on the
+        // clip's last frame, one stride short of its spread. The spread is
+        // bounded to its own last frame, so no frame between it and the
+        // trailing ones is picked up.
+        let described = described.or_else(|| {
+            (1..=FFMPEG_SPREAD_EXTRA_TERMS).find_map(|drop| {
+                let kept = unique.len().checked_sub(drop).filter(|kept| *kept > 2)?;
+                let (own_last, own_denom) = (unique[kept - 1], kept - 1);
+                let own_floored =
+                    |step: f64| (step * own_last as f64 / own_denom as f64).floor() as usize;
+                let extra = spread_misses(&unique[..kept], own_last, own_denom, own_floored)?;
+                extra.is_empty().then(|| {
+                    (
+                        format!(
+                            "eq(n\\,floor(round(n*{own_denom}/{own_last})*{own_last}/{own_denom}))*lte(n\\,{own_last})"
+                        ),
+                        unique[kept..].to_vec(),
+                    )
+                })
+            })
+        });
+        let (expr, extra) = described?;
+        let mut filter = format!("select='{expr}");
+        for index in extra {
+            filter.push_str(&format!("+eq(n\\,{index})"));
         }
-        if self.is_described_by(last, denom, nearest_to_even) {
-            let x = format!("round(n*{denom}/{last})*({last}/{denom})");
-            return Some(format!(
-                "select='eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2))'"
-            ));
-        }
-        None
-    }
-
-    /// Whether `eq(n, frame_at(round(n * denom / last)))` over the stream picks
-    /// out exactly this selection's distinct frames.
-    fn is_described_by(&self, last: usize, denom: usize, frame_at: impl Fn(f64) -> usize) -> bool {
-        let step_of = |index: usize| (index as f64 * denom as f64 / last as f64).round();
-        // A fixed point is by definition something the formula produces, and the
-        // formula produces one frame per step, so the candidates are counted by
-        // the frames asked for rather than by the frames the file claims to hold.
-        // Ascending, so the last one kept is enough to skip a repeat.
-        let mut described: Vec<usize> = Vec::with_capacity(self.unique_frames.len());
-        for step in 0..=denom {
-            let index = frame_at(step as f64);
-            if described.last() != Some(&index) && frame_at(step_of(index)) == index {
-                described.push(index);
-            }
-        }
-        described
-            .iter()
-            .eq(self.unique_frames.iter().map(|(index, _)| index))
+        filter.push('\'');
+        Some(filter)
     }
 
     /// Repeat each distinct decoded frame so the result lines up with `frame_indices`.
@@ -2741,6 +2842,47 @@ impl FrameSelection {
             frame_indices: self.frame_indices.clone(),
         }
     }
+}
+
+/// The frames of `selected` (ascending) that the spread
+/// `eq(n, frame_at(round(n * denom / last)))` over the stream misses, when it
+/// misses at most [`FFMPEG_SPREAD_EXTRA_TERMS`] of them and picks no frame
+/// outside `selected`; `None` otherwise. Empty when the spread is the selection.
+fn spread_misses(
+    selected: &[usize],
+    last: usize,
+    denom: usize,
+    frame_at: impl Fn(f64) -> usize,
+) -> Option<Vec<usize>> {
+    let step_of = |index: usize| (index as f64 * denom as f64 / last as f64).round();
+    // A fixed point is by definition something the formula produces, and the
+    // formula produces one frame per step, so the candidates are counted by
+    // the frames asked for rather than by the frames the file claims to hold.
+    // Ascending, so the last one kept is enough to skip a repeat.
+    let mut described: Vec<usize> = Vec::with_capacity(selected.len());
+    for step in 0..=denom {
+        let index = frame_at(step as f64);
+        if described.last() != Some(&index) && frame_at(step_of(index)) == index {
+            described.push(index);
+        }
+    }
+    // Every described frame must be selected; the selected frames the spread
+    // misses (both lists ascending) become the explicit terms.
+    let mut extra = Vec::new();
+    let mut described = described.iter().peekable();
+    for index in selected {
+        match described.peek() {
+            Some(next) if *next == index => {
+                described.next();
+            }
+            Some(next) if *next < index => return None,
+            _ => extra.push(*index),
+        }
+    }
+    if described.next().is_some() || extra.len() > FFMPEG_SPREAD_EXTRA_TERMS {
+        return None;
+    }
+    Some(extra)
 }
 
 /// How the decoded frames become RGB, appended to every frame filter.
@@ -3322,6 +3464,7 @@ mod tests {
             source_fps: info.source_fps,
             total_frames: info.total_frames,
             container_frames: info.container_frames,
+            from_container: false,
         };
         assert_eq!(expected_sampled_frame_count(metadata, cfg), 4);
         assert_eq!(fps_filter_for_metadata(metadata, cfg), "fps=4.000000");
@@ -3883,6 +4026,7 @@ mod video_sampling_tests {
             source_fps,
             total_frames,
             container_frames: total_frames,
+            from_container: false,
         }
     }
 
@@ -4223,21 +4367,24 @@ mod video_sampling_tests {
             (0..total).collect::<Vec<_>>(),
             "the clip's frames decode to their own indices, in order"
         );
-        // The loader's spread and an exact rate spread are the described
-        // form; a rate whose picks end on the clip's last frame has no spread
-        // formula and stays a list past the limit: both shapes go through
-        // ffmpeg.
-        for (label, config, described) in [
-            ("loader spread", up_to_cfg(300), true),
-            ("rate spread, listed", interval_cfg(15.0, 768), false),
+        // The loader's spread, an exact rate spread, and a rate whose picks
+        // end on the clip's last frame (the spread plus one explicit term):
+        // all three are the described form, and all three go through ffmpeg.
+        for (label, config, extra_terms) in [
+            ("loader spread", up_to_cfg(300), 0),
             (
-                "rate spread, described",
+                "rate spread ending on the last frame",
+                interval_cfg(15.0, 768),
+                1,
+            ),
+            (
+                "exact rate spread",
                 VideoFetchConfig {
                     sample_fps: 12.0,
                     max_frames: 768,
                     ..cfg()
                 },
-                true,
+                0,
             ),
         ] {
             let selection = FrameSelection::from_metadata(metadata(Some(fps), Some(total)), config)
@@ -4248,10 +4395,14 @@ mod video_sampling_tests {
                 selection.unique_count()
             );
             let filter = selection.select_filter();
-            assert_eq!(
+            assert!(
                 filter.starts_with("select='eq(n\\,floor("),
-                described,
-                "{label}: {filter}"
+                "{label}: described, not listed: {filter}"
+            );
+            assert_eq!(
+                filter.matches('+').count(),
+                extra_terms,
+                "{label}: explicit terms beyond the spread: {filter}"
             );
             let mut command = ffmpeg_decode_command(2, true);
             command.arg(&path);
@@ -4411,16 +4562,29 @@ mod video_sampling_tests {
         assert!(checked > 8_000, "{checked} selections checked");
     }
 
+    /// A selection with no even spread in it (gaps alternating 4 and 2) keeps
+    /// the explicit list; one that is its own even spread plus a trailing
+    /// frame, which the picker's whole-stream spread misses, is described by
+    /// that spread, bounded to its last frame, plus the frame.
     #[test]
     fn a_selection_the_formula_misses_keeps_the_explicit_list() {
         let mut selection =
             FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), cfg())
                 .expect("frame rate and count are known");
         selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
-            .map(|index| (index * 3, 1))
+            .map(|index| (index * 3 + index % 2, 1))
             .collect();
         assert!(selection.spread_select_filter().is_none());
         assert!(selection.select_filter().starts_with(r"select='eq(n\,0)+"));
+
+        selection.unique_frames = (0..FFMPEG_MAX_SELECT_TERMS + 1)
+            .map(|index| (index * 3, 1))
+            .collect();
+        let filter = selection.select_filter();
+        assert_eq!(
+            filter,
+            r"select='eq(n\,floor(round(n*99/297)*297/99))*lte(n\,297)+eq(n\,300)'"
+        );
     }
 
     #[test]
