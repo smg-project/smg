@@ -208,7 +208,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang
         sglang_version = ""
-    dp_size = EngineConfigView(server_args).server_args.dp_size
+    args = EngineConfigView(server_args).server_args
     kv_events_endpoint, kv_events_replay_endpoint, kv_events_topic = kv_events_publisher(
         server_args
     )
@@ -218,8 +218,8 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         "server_args_json": json.dumps(args_dict, sort_keys=True, allow_nan=False),
         "scheduler_info_json": "{}",
         "sglang_version": str(sglang_version),
-        "max_running_requests": EngineConfigView(server_args).server_args.max_running_requests or 0,
-        "data_parallel_size": dp_size or 1,
+        "max_running_requests": args.max_running_requests or 0,
+        "data_parallel_size": args.dp_size or 1,
         "kv_events_endpoint": kv_events_endpoint,
         "kv_events_replay_endpoint": kv_events_replay_endpoint,
         "kv_events_topic": kv_events_topic,
