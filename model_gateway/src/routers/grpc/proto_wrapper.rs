@@ -2831,6 +2831,10 @@ pub struct TrackedStream {
     /// Held from the stream's first response to its end: one of the streams
     /// the worker is producing for (see [`Worker::output_silence`]).
     output: Option<OutputTicket>,
+    /// Whether the worker's circuit-breaker success for this dispatch is
+    /// still to be sampled, at the stream's first response (a disaggregated
+    /// decode leg: see [`ProtoStream::tracked_decode_leg`]).
+    samples_success: bool,
     /// A response (or the stream's end) pulled ahead of the stream's reader
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
     /// as it was: its bookkeeping ran when it was pulled.
@@ -3097,6 +3101,43 @@ mod tracked_tests {
         assert_eq!(worker.tracked_load(), 0);
     }
 
+    /// A disaggregated decode leg earns its worker's breaker success at its
+    /// first response, never at its dispatch: a leg whose stream ends with
+    /// nothing on it leaves a failure before it standing, so the next one
+    /// opens a breaker set to two.
+    #[tokio::test]
+    async fn a_decode_leg_that_ends_with_nothing_on_it_earns_no_breaker_success() {
+        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.record_outcome(504);
+        let mut leg = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_decode_leg(Arc::clone(&worker));
+        match &leg {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.samples_success, "the success waits for a response");
+                assert!(tracked.progress.is_none(), "no pile slot");
+                assert!(tracked.prefill.is_none(), "no prompt booked");
+            }
+            _ => panic!("a tracked stream"),
+        }
+        assert!(leg.next().await.is_none(), "an empty fanout ends at once");
+        drop(leg);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        worker.record_outcome(504);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "two failures with no success earned between them"
+        );
+    }
+
     #[test]
     fn a_prefill_leg_booked_at_dispatch_is_pending_before_its_stream_exists() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
@@ -3283,6 +3324,7 @@ impl ProtoStream {
             prefill,
             progress,
             output: None,
+            samples_success: false,
             replay: None,
         }))
     }
@@ -3316,8 +3358,29 @@ impl ProtoStream {
             prefill,
             progress: None,
             output: None,
+            samples_success: false,
             replay: None,
         }))
+    }
+
+    /// Track this stream as the decode leg of a disaggregated dispatch to
+    /// `worker`: every response is the worker's token progress, the leg
+    /// joins no pile and books no prefill (as [`Self::tracked`] with no
+    /// prompt and no pile does), and the worker's circuit-breaker success
+    /// for the dispatch is sampled at the leg's first response rather than
+    /// when the call returned its stream. A decode leg's first response
+    /// waits for the handoff, so a leg accepted into silence, or one whose
+    /// stream fails at once, is one failure of its worker and not a success
+    /// and then a failure, which reset the breaker's streak on every
+    /// request; a stream that ends with nothing on it earns no success
+    /// either, as a prefill leg's does not.
+    #[must_use]
+    pub(crate) fn tracked_decode_leg(self, worker: Arc<dyn Worker>) -> Self {
+        let mut stream = self.tracked(worker, 0, false);
+        if let Self::Tracked(tracked) = &mut stream {
+            tracked.samples_success = true;
+        }
+        stream
     }
 
     /// Wait for the stream's first item, a response or its end, until
@@ -3404,6 +3467,9 @@ impl ProtoStream {
         match &item {
             Some(Ok(response)) => {
                 liveness::on_token_progress(&tracked.worker);
+                if std::mem::take(&mut tracked.samples_success) {
+                    tracked.worker.record_outcome(200);
+                }
                 if tracked.output.is_none() {
                     tracked.output = Some(OutputTicket::open(&tracked.worker));
                 }
@@ -3504,6 +3570,7 @@ impl ProtoStream {
                     prefill,
                     progress,
                     output,
+                    samples_success,
                     replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
@@ -3512,6 +3579,7 @@ impl ProtoStream {
                     prefill,
                     progress,
                     output,
+                    samples_success,
                     replay,
                 }))
             }

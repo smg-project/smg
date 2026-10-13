@@ -611,6 +611,136 @@ async fn start_mock_grpc_worker(delay: Duration) -> u16 {
     port
 }
 
+/// A parallel-dispatch mock engine (the TokenSpeed proto) that accepts every
+/// generate call, returns its stream at once and fails it with the first item
+/// (`UNAVAILABLE`): a decode engine that admits a request and then drops it
+/// before any token.
+#[derive(Clone, Default)]
+struct CutEngine;
+
+#[tonic::async_trait]
+impl TokenSpeedScheduler for CutEngine {
+    type GenerateStream = ReceiverStream<Result<ts::GenerateResponse, Status>>;
+    type GetTokenizerStream = ReceiverStream<Result<grpc_common::GetTokenizerChunk, Status>>;
+    type SubscribeKvEventsStream = ReceiverStream<Result<grpc_common::KvEventBatch, Status>>;
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test mock; the producer task ends with its one item"
+    )]
+    async fn generate(
+        &self,
+        _request: Request<ts::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        let (tx, rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Err(Status::unavailable("the engine dropped the request")))
+                .await;
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn health_check(
+        &self,
+        _request: Request<ts::HealthCheckRequest>,
+    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
+        Ok(Response::new(ts::HealthCheckResponse {
+            healthy: true,
+            message: "ok".to_string(),
+        }))
+    }
+
+    async fn abort(
+        &self,
+        _request: Request<ts::AbortRequest>,
+    ) -> Result<Response<ts::AbortResponse>, Status> {
+        Ok(Response::new(ts::AbortResponse {
+            success: true,
+            message: String::new(),
+        }))
+    }
+
+    async fn get_model_info(
+        &self,
+        _request: Request<ts::GetModelInfoRequest>,
+    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
+        Ok(Response::new(ts::GetModelInfoResponse::default()))
+    }
+
+    async fn get_server_info(
+        &self,
+        _request: Request<ts::GetServerInfoRequest>,
+    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        Ok(Response::new(ts::GetServerInfoResponse::default()))
+    }
+
+    async fn get_loads(
+        &self,
+        _request: Request<ts::GetLoadsRequest>,
+    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
+        Ok(Response::new(ts::GetLoadsResponse::default()))
+    }
+
+    async fn flush_cache(
+        &self,
+        _request: Request<grpc_common::FlushCacheRequest>,
+    ) -> Result<Response<grpc_common::FlushCacheResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn start_profile(
+        &self,
+        _request: Request<grpc_common::StartProfileRequest>,
+    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn stop_profile(
+        &self,
+        _request: Request<grpc_common::StopProfileRequest>,
+    ) -> Result<Response<grpc_common::ProfileResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn get_tokenizer(
+        &self,
+        _request: Request<grpc_common::GetTokenizerRequest>,
+    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _request: Request<grpc_common::SubscribeKvEventsRequest>,
+    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+}
+
+/// Serve a [`CutEngine`] in-process; returns its port.
+#[expect(
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "test helper - panicking on failure is intentional; the spawned \
+              mock server task is fire-and-forget for the test process's lifetime"
+)]
+async fn start_cut_grpc_worker() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind cut mock engine");
+    let port = listener
+        .local_addr()
+        .expect("cut mock engine address")
+        .port();
+    tokio::spawn(
+        Server::builder()
+            .add_service(TokenSpeedSchedulerServer::new(CutEngine))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    port
+}
+
 /// A PD gRPC router over the given legs, registered as `runtime` (which picks
 /// the dispatch shape), with round-robin leg policies so the first request
 /// goes to the first registered worker of each leg.
@@ -1302,4 +1432,86 @@ fn the_request_is_retried_on_another_prefill_worker_and_never_on_the_silent_one_
         1.0,
         "one timeout on the silent prefill worker:\n{rendered}"
     );
+}
+
+/// Parallel dispatch, a decode worker that accepts every leg and fails its
+/// stream before any token: each request is one failure of that worker, so
+/// two failed requests open its breaker (set to two), as they do on any
+/// other worker. The leg's dispatch used to be sampled as a success the
+/// moment its stream was returned, a success the leg had not earned, and the
+/// failure that followed never built a streak: a decode worker that failed
+/// every request kept its breaker closed. The prefill worker, which answered
+/// every leg, keeps its breaker closed.
+#[test]
+fn a_decode_worker_that_fails_every_stream_it_accepted_opens_its_breaker() {
+    let rendered = render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let decode_port = start_cut_grpc_worker().await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        for _ in 0..2 {
+            let (status, body, _) = one_streaming_chat(router.as_ref()).await;
+            assert!(
+                status.is_server_error() || body.contains("error"),
+                "the request fails on its decode leg: {status} {body}"
+            );
+        }
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "two failed requests are two consecutive failures of the decode worker"
+        );
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker answered every leg"
+        );
+    });
+    assert!(
+        worker_errors(&rendered, "decode", "backend_error") >= 2.0,
+        "each failed request counts on the decode worker:\n{rendered}"
+    );
+}
+
+/// The success a decode leg does earn is still sampled, at its first
+/// response: a failure before it is forgiven by a request the decode served,
+/// so the next failure leaves a breaker set to two closed.
+#[test]
+fn a_decode_leg_that_answers_earns_its_workers_breaker_success_at_its_first_response() {
+    render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let decode_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        workers[1].record_outcome(504);
+        let (status, body, _) = one_streaming_chat(router.as_ref()).await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert!(body.contains("data: [DONE]"), "{body}");
+        workers[1].record_outcome(504);
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the served request's first response reset the streak"
+        );
+    });
 }

@@ -561,6 +561,8 @@ async fn execute_pd_dispatch(
 /// liveness monitor, as a regular dispatch's does. The legs join no tracked
 /// pile and add no prefill backlog: those are the regular dispatch's rules,
 /// and a disaggregated request is admitted through its prefill guard. The
+/// decode leg's dispatch success is sampled on its worker's breaker at the
+/// leg's first response (see [`ProtoStream::tracked_decode_leg`]). The
 /// sequential dispatch's prefill stream is drained already; the wrapper is a
 /// no-op on it.
 fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> ExecutionResult {
@@ -578,9 +580,13 @@ fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> Exec
         Some(worker) => stream.tracked(Arc::clone(worker), 0, false),
         None => stream,
     };
+    let decode = match workers.decode_worker() {
+        Some(worker) => (*decode).tracked_decode_leg(Arc::clone(worker)),
+        None => *decode,
+    };
     ExecutionResult::PrefillDecode {
         prefill: attribute(prefill, workers.prefill_worker()),
-        decode: Box::new(attribute(*decode, workers.decode_worker())),
+        decode: Box::new(decode),
         prefill_guards,
         pd_timing,
         prefill_input_logprobs,
@@ -1559,15 +1565,16 @@ fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> 
 }
 
 /// The breaker samples of a parallel dispatch whose two legs both answered
-/// (client errors don't count as failures). A prefill dispatch that
-/// succeeded is sampled once its first response is in, as the sequential
-/// path samples it after the drain: a leg that was accepted into silence is
-/// one failure of its worker, not a success and then a failure, which would
-/// reset the breaker's streak every time. A prefill dispatch that ended
-/// with the decode verdict (its partner had stalled while the decode's own
-/// call had already returned its stream) is charged where the verdict put
-/// it, the decode, and that decode's dispatch is no success beside the
-/// verdict that gave up on it.
+/// (client errors don't count as failures). A dispatch that succeeded is
+/// sampled once the leg's first response is in: the prefill's where its
+/// first response is awaited, as the sequential path samples it after the
+/// drain; the decode's by the tracked leg (`attribute_pd_legs`), since its
+/// first response waits for the handoff. A leg that was accepted into
+/// silence, or whose stream fails at once, is one failure of its worker,
+/// not a success and then a failure, which would reset the breaker's streak
+/// every time. A prefill dispatch that ended with the decode verdict (its
+/// partner had stalled while the decode's own call had already returned its
+/// stream) is charged where the verdict put it, the decode.
 fn record_pd_dispatch_outcomes(
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
@@ -1581,7 +1588,9 @@ fn record_pd_dispatch_outcomes(
             prefill_result
                 .breaker_status()
                 .filter(|_| prefill_result.is_err()),
-            decode_result.breaker_status(),
+            decode_result
+                .breaker_status()
+                .filter(|_| decode_result.is_err()),
         ),
     }
 }
@@ -2219,7 +2228,9 @@ async fn execute_sequential_pd(
         )
     })?;
 
-    workers.record_outcome_decode(ledger, 200);
+    // The decode worker's breaker success is sampled at the leg's first
+    // response, by the tracked leg (`attribute_pd_legs`): the call returning
+    // its stream says nothing about the handoff the first token waits for.
     // Decode established: record the success-only PD metrics here.
     Metrics::record_pd_kv_connector_mode(kv_connector_label);
     Metrics::record_pd_prefill_duration(
