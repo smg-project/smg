@@ -17,7 +17,7 @@ its defaults, a view over ``None`` reads every section so) except what the
 servicers never invent: :attr:`model`, the facts of ``GetModelInfo``, fails
 on a config without the model's name, context length or vocabulary;
 :attr:`data_parallel_size` on a config without one; and :attr:`launch`, the
-process manager's inputs, on a config without any of them.
+process manager's inputs, on a config missing any one of them.
 """
 
 from __future__ import annotations
