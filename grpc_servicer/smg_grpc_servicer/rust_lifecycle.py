@@ -731,12 +731,19 @@ async def launch_or_stop(server: Any, launch: Callable[[], Any]) -> Any:
     or, when the launch raises, that error after the server was marked not
     serving and stopped, each step best effort. The server owns the port and
     a runtime thread; a launch that fails must not leave them to the process
-    exit, and the launch error is what the entry point reports."""
+    exit, and the launch error is what the entry point reports. A
+    cancellation of this task while the stop runs waits for the stop too:
+    the port is released either way."""
     try:
         return launch()
     except BaseException:
         mark_not_serving(server)
-        await stop_server(server, SERVER_STOP_SECS)
+        stopping = asyncio.create_task(stop_server(server, SERVER_STOP_SECS))
+        try:
+            await asyncio.shield(stopping)
+        except asyncio.CancelledError:
+            await asyncio.shield(stopping)
+            raise
         raise
 
 

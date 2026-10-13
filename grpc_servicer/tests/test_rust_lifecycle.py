@@ -674,3 +674,36 @@ def test_launch_or_stop_reports_the_launch_error_when_the_stop_itself_fails(capl
         assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}"]
     assert "Failed to mark the servicer as not serving" in caplog.text
     assert "Failed to stop the Rust servicer cleanly" in caplog.text
+
+
+def test_a_cancelled_launch_task_still_stops_the_server():
+    """The stop after a failed launch finishes even when the launch's own task
+    is cancelled meanwhile (the entry point's loop shutting down): the port
+    is released before the cancellation propagates."""
+    stop_entered = threading.Event()
+    stop_may_finish = threading.Event()
+    events: list[str] = []
+
+    class Server:
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            stop_entered.set()
+            stop_may_finish.wait(5)
+            events.append(f"stop:{timeout}")
+
+    def failing_launch():
+        raise RuntimeError("engine would not start")
+
+    async def run():
+        task = asyncio.create_task(rust_lifecycle.launch_or_stop(Server(), failing_launch))
+        await asyncio.to_thread(stop_entered.wait, 5)
+        task.cancel()
+        stop_may_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        events.append("cancelled")
+
+    asyncio.run(run())
+    assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}", "cancelled"]
