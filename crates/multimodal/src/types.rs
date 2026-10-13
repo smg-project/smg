@@ -138,6 +138,30 @@ pub enum VideoSource {
     File { path: PathBuf },
 }
 
+/// How an image that carries an alpha channel becomes RGB when a frame is
+/// decoded. The serving engines' own image loaders differ: one composites
+/// such an image over opaque white before its processor runs, another drops
+/// the channel and keeps the stored colour, and a processor whose reference
+/// is handed the image as stored handles alpha itself. The gateway resolves
+/// the policy from the destination engine; a frame without one keeps the
+/// image as decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparencyPolicy {
+    /// The image as decoded, alpha channel included; the processor composites
+    /// or drops it itself.
+    #[default]
+    KeepAlpha,
+    /// Composite over opaque white with the integer paste-through-mask blend
+    /// `(src * a + 255 * (255 - a) + 127) / 255`; a truecolour PNG with a
+    /// `tRNS` colour key keeps its stored colour, as that loader keeps it.
+    CompositeOverWhite,
+    /// Drop the alpha channel and keep every pixel's stored colour (Pillow's
+    /// `convert("RGB")`): a fully transparent pixel reads as its stored
+    /// colour, usually black.
+    DropAlpha,
+}
+
 /// Concrete image payload captured by the media connector: the encoded bytes
 /// with their identity and size, decoded on first use, so a request whose
 /// pixels are already cached never pays for the decode.
@@ -153,6 +177,9 @@ pub struct ImageFrame {
     pub source: ImageSource,
     /// Blake3 hex-digest of `raw_bytes` and the resolution cap.
     pub hash: String,
+    /// The policy the decode applies to an alpha channel; `KeepAlpha` until
+    /// [`set_transparency`](Self::set_transparency) is called, before the decode.
+    transparency: OnceLock<TransparencyPolicy>,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -419,6 +446,7 @@ impl ImageFrame {
             detail,
             source,
             hash,
+            transparency: OnceLock::new(),
         }
     }
 
@@ -440,16 +468,43 @@ impl ImageFrame {
             detail,
             source,
             hash,
+            transparency: OnceLock::new(),
         }
     }
 
     /// The decoded pixels, decoding on the first call. A body its header did
     /// not vouch for fails here, as the caller's input.
     pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
-        self.decoded
-            .get_or_try_init(|| decode_image_bytes(&self.raw_bytes, self.max_long_side_pixel))
+        self.decoded.get_or_try_init(|| {
+            decode_image_bytes(
+                &self.raw_bytes,
+                self.max_long_side_pixel,
+                self.transparency(),
+            )
+        })
     }
 
+    /// The transparency policy the decode applies (see [`TransparencyPolicy`]);
+    /// `KeepAlpha` until one is set.
+    pub fn transparency(&self) -> TransparencyPolicy {
+        self.transparency.get().copied().unwrap_or_default()
+    }
+
+    /// Set the policy before the first decode. Returns `false` when the pixels
+    /// are already decoded or another policy was set: the decode is final, so
+    /// the caller's policy did not take effect.
+    pub fn set_transparency(&self, policy: TransparencyPolicy) -> bool {
+        if self.decoded.get().is_some() {
+            return false;
+        }
+        self.transparency.set(policy).is_ok() || self.transparency.get() == Some(&policy)
+    }
+
+    /// [`set_transparency`](Self::set_transparency) for a frame being built.
+    pub fn with_transparency(self, policy: TransparencyPolicy) -> Self {
+        self.set_transparency(policy);
+        self
+    }
     /// Decode the pixels of every frame that is still encoded, in parallel on
     /// the preprocessing pool (inline under `Parallelism::Inline`), instead of
     /// one photo after another on the calling thread. [`image`](Self::image)
@@ -838,7 +893,11 @@ mod tests {
                         for _ in 0..2 {
                             waiting_rx.recv().expect("pool waiter ready");
                         }
-                        decode_image_bytes(&frame.raw_bytes, frame.max_long_side_pixel)
+                        decode_image_bytes(
+                            &frame.raw_bytes,
+                            frame.max_long_side_pixel,
+                            frame.transparency(),
+                        )
                     })
                     .expect("decode and cap")
             });

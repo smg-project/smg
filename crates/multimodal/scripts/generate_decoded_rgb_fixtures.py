@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Generate the decoded-RGB fixtures: small synthetic images in the sample
 formats the pipeline has to convert (transparency, 16-bit depth), with the RGB
-bytes the serving engine's own image loader hands its processor for each of them.
+bytes each of the serving engines' image loaders hands its processor for them.
 
-The loader (reproduced below) opens the file with Pillow, applies the EXIF
-orientation and converts to RGB: an image with an alpha channel, an ``LA`` or
-``PA`` mode or a ``transparency`` key is converted to RGBA and composited over
-opaque white with a paste through the alpha mask; anything else goes through
-``convert("RGB")``. A truecolour image is returned as stored even when it
-names a transparency colour key, because its mode is already RGB.
+Two loader rules are recorded per case, both with Pillow. The compositing
+loader (reproduced below) opens the file, applies the EXIF orientation and
+converts to RGB: an image with an alpha channel, an ``LA`` or ``PA`` mode or
+a ``transparency`` key is converted to RGBA and composited over opaque white
+with a paste through the alpha mask; anything else goes through
+``convert("RGB")``; a truecolour image is returned as stored even when it
+names a transparency colour key, because its mode is already RGB. The
+dropping loader opens the file and calls ``convert("RGB")``, which keeps
+every pixel's stored colour and ignores the alpha channel (the orientation
+step is applied first here too: it is the gateway's own, before any policy).
 
 The images land under ``tests/fixtures/images/decoded_rgb/``; the expected
-bytes (raw interleaved RGB, row-major, base64 in the JSON) and the case list
+bytes (raw interleaved RGB, row-major, base64 in the JSON: ``expected_rgb``
+for the composite, ``expected_dropped_rgb`` for the drop) and the case list
 in ``tests/fixtures/golden/decoded_rgb/manifest.json``.
 ``tests/decoded_rgb_reference.rs`` reads them. Regenerate with the Pillow
 version the manifest records.
@@ -57,6 +62,15 @@ def reference_load(data: bytes) -> Image.Image:
     if image.mode != "RGBA":
         image = image.convert("RGBA")
     return rgba_to_rgb(image)
+
+
+def dropped_load(data: bytes) -> Image.Image:
+    """The dropping loader's RGB: the stored colour, the alpha channel ignored."""
+    image = Image.open(io.BytesIO(data))
+    with contextlib.suppress(Exception):
+        image = ImageOps.exif_transpose(image)
+    image.load()
+    return image if image.mode == "RGB" else image.convert("RGB")
 
 
 def alpha_grid() -> tuple[Image.Image, dict]:
@@ -214,6 +228,8 @@ def main() -> None:
         opened = Image.open(io.BytesIO(data))
         mode, transparent = opened.mode, has_transparency(opened)
         rgb = np.asarray(reference_load(data), dtype=np.uint8)
+        dropped = np.asarray(dropped_load(data), dtype=np.uint8)
+        assert dropped.shape == rgb.shape
         cases.append(
             {
                 "name": name,
@@ -224,6 +240,7 @@ def main() -> None:
                 "transparent": transparent,
                 "note": note,
                 "expected_rgb_base64": base64.b64encode(rgb.tobytes()).decode("ascii"),
+                "expected_dropped_rgb_base64": base64.b64encode(dropped.tobytes()).decode("ascii"),
             }
         )
     manifest = {

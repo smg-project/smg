@@ -127,6 +127,14 @@ impl KimiK3Processor {
 }
 
 impl VisionPreProcessor for KimiK3Processor {
+    /// K3's reference processor receives the image as stored, alpha channel
+    /// included (the serving engines' loaders keep the original image mode for
+    /// this model), and composites transparent pixels over its configured
+    /// chessboard after the resize; the gateway decodes its frames the same way.
+    fn keeps_alpha(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         KIMI_K3_MEAN
     }

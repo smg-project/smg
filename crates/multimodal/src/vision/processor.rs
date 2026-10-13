@@ -86,6 +86,16 @@ pub trait VisionPreProcessor: Send + Sync {
         false
     }
 
+    /// Whether this processor takes an image that carries an alpha channel as
+    /// decoded and composites or drops the channel itself, because its
+    /// reference is handed the image as stored by the serving engines'
+    /// loaders. A frame for such a processor is decoded under
+    /// [`TransparencyPolicy::KeepAlpha`](crate::TransparencyPolicy::KeepAlpha)
+    /// whatever the destination engine's own rule.
+    fn keeps_alpha(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 

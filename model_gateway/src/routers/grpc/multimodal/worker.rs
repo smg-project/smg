@@ -15,7 +15,7 @@ use llm_multimodal::{
     configure_parallelism, registry::modality_limit_override, vision::PreProcessorConfig,
     FrameSampling, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
     MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
-    VisionProcessorRegistry, POOL_THREADS_ENV,
+    TransparencyPolicy, VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -554,6 +554,10 @@ impl WorkerMediaPipeline {
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
         validate_rendered_media_anchors(&plan, &placeholders, tokenizer, &prompt_token_ids)
             .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
+        // This pipeline runs inside the engine whose batches it assembles
+        // (`VllmAssembly`), so its frames decode under that engine's own
+        // transparency rule, the white composite of its image loader; a
+        // processor that keeps alpha overrides it inside the plan.
         let output = process_multimodal_plan(
             plan,
             &self.model_id,
@@ -563,6 +567,7 @@ impl WorkerMediaPipeline {
             CONFIG_KEY,
             &self.model_dir,
             self.assembly.image_wire_dtype(),
+            TransparencyPolicy::CompositeOverWhite,
         )
         .await
         .map_err(classify)?;

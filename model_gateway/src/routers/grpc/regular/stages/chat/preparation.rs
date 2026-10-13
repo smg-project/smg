@@ -281,6 +281,11 @@ pub(crate) async fn prepare_chat_like(
                     model_id,
                     wire_pools,
                 );
+                // The frames decode under the destination engine's own transparency rule.
+                let transparency = multimodal::engine_transparency_policy(
+                    &ctx.components.worker_registry,
+                    model_id,
+                );
                 match multimodal::process_multimodal_plan(
                     media_plan,
                     model_id,
@@ -290,6 +295,7 @@ pub(crate) async fn prepare_chat_like(
                     &tokenizer_id,
                     &tokenizer_source,
                     image_wire_dtype,
+                    transparency,
                 )
                 .await
                 {

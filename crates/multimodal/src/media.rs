@@ -29,6 +29,7 @@ use url::Url;
 use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
+    types::TransparencyPolicy,
     vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
 };
 
@@ -5441,6 +5442,7 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 pub(crate) fn decode_image_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
+    transparency: TransparencyPolicy,
 ) -> Result<image::DynamicImage, MediaConnectorError> {
     // The orientation tag is applied the way the engine's own loader applies
     // it, so a photo stored sideways reaches the model upright on both paths.
@@ -5478,7 +5480,11 @@ pub(crate) fn decode_image_bytes(
         },
     };
     image = narrow_sixteen_bit_colour(image);
-    image = flatten_transparency(image, bytes);
+    // The transparency policy applies before the cap: the compositing loader
+    // flattens to RGB first and resizes after, and a resample of straight
+    // alpha would mix the stored colour of transparent pixels into their
+    // neighbours.
+    image = apply_transparency(image, bytes, transparency);
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
 }
@@ -5571,28 +5577,38 @@ mod sixteen_bit_colour_tests {
     }
 }
 
-/// Flatten an image that carries transparency onto opaque white, as the
-/// serving engine's own loader does before its processor sees the pixels: per
-/// channel `out = (src * a + 255 * (255 - a) + 127) / 255`, the integer
+/// The decoded image under `policy` (see [`TransparencyPolicy`]): as it is
+/// without an alpha channel; with one, composited over opaque white, reduced
+/// to its stored colour, or kept. The composite is the compositing loader's:
+/// per channel `out = (src * a + 255 * (255 - a) + 127) / 255`, the integer
 /// paste-through-mask blend (exact rounding of the real blend, checked
-/// against the reference for every value and alpha). Dropping the alpha
-/// channel instead reads a fully transparent pixel, usually stored as
-/// `(0, 0, 0)`, as solid black, and every downstream tensor differs.
-///
-/// Images without an alpha channel pass through untouched; the processors
-/// convert grey and palette pixels as before. So does a truecolour PNG whose
-/// `tRNS` chunk names a colour key: the reference loader returns such an
-/// image as stored (its mode is already RGB, the key never becomes alpha),
-/// while the decoder here expands the key into an alpha channel, so that
-/// alpha is dropped rather than blended.
-fn flatten_transparency(image: image::DynamicImage, bytes: &[u8]) -> image::DynamicImage {
+/// against the reference for every value and alpha), and a truecolour PNG
+/// whose `tRNS` chunk names a colour key keeps its stored RGB, as that loader
+/// returns such an image (its mode is already RGB, the key never becomes
+/// alpha) while the decoder here expands the key into an alpha channel.
+/// `bytes` is the encoded image the pixels came from.
+pub(crate) fn apply_transparency(
+    image: image::DynamicImage,
+    bytes: &[u8],
+    policy: TransparencyPolicy,
+) -> image::DynamicImage {
     if !image.color().has_alpha() {
         return image;
     }
-    if png_colour_type(bytes) == Some(PNG_COLOUR_TYPE_TRUECOLOUR) {
-        return image::DynamicImage::ImageRgb8(image.to_rgb8());
+    match policy {
+        TransparencyPolicy::KeepAlpha => image,
+        TransparencyPolicy::DropAlpha => image::DynamicImage::ImageRgb8(image.to_rgb8()),
+        TransparencyPolicy::CompositeOverWhite => {
+            if png_colour_type(bytes) == Some(PNG_COLOUR_TYPE_TRUECOLOUR) {
+                return image::DynamicImage::ImageRgb8(image.to_rgb8());
+            }
+            let composited = match image {
+                image::DynamicImage::ImageRgba8(rgba) => composite_over_white(&rgba),
+                other => composite_over_white(&other.to_rgba8()),
+            };
+            image::DynamicImage::ImageRgb8(composited)
+        }
     }
-    image::DynamicImage::ImageRgb8(composite_over_white(&image.into_rgba8()))
 }
 
 /// The eight-byte PNG signature.
@@ -5666,11 +5682,35 @@ mod transparency_tests {
 
     #[test]
     fn opaque_images_pass_through_untouched() {
-        let grey = image::DynamicImage::new_luma8(2, 2);
-        assert!(matches!(
-            flatten_transparency(grey, &[]),
-            image::DynamicImage::ImageLuma8(_)
-        ));
+        for policy in [
+            TransparencyPolicy::KeepAlpha,
+            TransparencyPolicy::CompositeOverWhite,
+            TransparencyPolicy::DropAlpha,
+        ] {
+            let grey = image::DynamicImage::new_luma8(2, 2);
+            assert!(matches!(
+                apply_transparency(grey, &[], policy),
+                image::DynamicImage::ImageLuma8(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn each_policy_treats_a_transparent_pixel_its_own_way() {
+        let rgba = || {
+            image::DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(2, 1, vec![0, 0, 0, 0, 10, 20, 30, 255])
+                    .expect("2x1 RGBA"),
+            )
+        };
+        let white = apply_transparency(rgba(), &[], TransparencyPolicy::CompositeOverWhite);
+        assert_eq!(white.to_rgb8().as_raw(), &[255, 255, 255, 10, 20, 30]);
+        assert!(!white.color().has_alpha());
+        let dropped = apply_transparency(rgba(), &[], TransparencyPolicy::DropAlpha);
+        assert_eq!(dropped.to_rgb8().as_raw(), &[0, 0, 0, 10, 20, 30]);
+        assert!(!dropped.color().has_alpha());
+        let kept = apply_transparency(rgba(), &[], TransparencyPolicy::KeepAlpha);
+        assert!(kept.color().has_alpha());
     }
 }
 
@@ -5792,7 +5832,7 @@ mod exif_orientation_tests {
         let bytes = jpeg_with_orientation(6);
         let size = encoded_image_size(&bytes, None).expect("size");
         assert_eq!((size.width, size.height), (2, 4));
-        let img = decode_image_bytes(&bytes, None).expect("decode");
+        let img = decode_image_bytes(&bytes, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert_eq!(img.dimensions(), (2, 4));
         assert!(is_red(img.get_pixel(0, 0)) && is_red(img.get_pixel(1, 0)));
         assert!(is_blue(img.get_pixel(0, 3)) && is_blue(img.get_pixel(1, 3)));
@@ -5804,14 +5844,14 @@ mod exif_orientation_tests {
         let bytes = jpeg_with_orientation(2);
         let size = encoded_image_size(&bytes, None).expect("size");
         assert_eq!((size.width, size.height), (4, 2));
-        let img = decode_image_bytes(&bytes, None).expect("decode");
+        let img = decode_image_bytes(&bytes, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert!(is_blue(img.get_pixel(0, 0)) && is_red(img.get_pixel(3, 0)));
     }
 
     #[test]
     fn an_upright_jpeg_and_a_png_are_left_alone() {
         let bytes = jpeg_with_orientation(1);
-        let img = decode_image_bytes(&bytes, None).expect("decode");
+        let img = decode_image_bytes(&bytes, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert_eq!(img.dimensions(), (4, 2));
         assert!(is_red(img.get_pixel(0, 0)) && is_blue(img.get_pixel(3, 0)));
 
@@ -5820,7 +5860,9 @@ mod exif_orientation_tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("png");
         assert_eq!(
-            decode_image_bytes(&png, None).expect("decode").dimensions(),
+            decode_image_bytes(&png, None, TransparencyPolicy::KeepAlpha)
+                .expect("decode")
+                .dimensions(),
             (4, 2)
         );
         let size = encoded_image_size(&png, None).expect("size");
@@ -6298,7 +6340,7 @@ mod decode_limit_tests {
     fn a_decoded_size_over_the_allocation_limit_is_refused_before_the_allocation() {
         // 30000 x 30000 x 3 = 2.7 GB declared by a 70-byte file.
         let bomb = png_declaring(30_000);
-        match decode_image_bytes(&bomb, None) {
+        match decode_image_bytes(&bomb, None, TransparencyPolicy::KeepAlpha) {
             Err(MediaConnectorError::Image(image::ImageError::Limits(_))) => {}
             other => panic!("expected the crate's limit error, got {other:?}"),
         }
@@ -6314,7 +6356,7 @@ mod decode_limit_tests {
         image::RgbImage::from_pixel(3, 2, image::Rgb([10, 20, 30]))
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encode");
-        let image = decode_image_bytes(&png, None).expect("decode");
+        let image = decode_image_bytes(&png, None, TransparencyPolicy::KeepAlpha).expect("decode");
         assert_eq!((image.width(), image.height()), (3, 2));
     }
 }

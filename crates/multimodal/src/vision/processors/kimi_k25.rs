@@ -2,8 +2,11 @@
 //!
 //! Matches the HuggingFace `KimiK25VisionProcessor` preprocessing pipeline; the
 //! pipeline itself lives in [`super::moonvit`], which Kimi-K3 shares. K2.5
-//! ships no `transparent_bg_config`, so alpha is dropped rather than
-//! composited — the reference's `image.convert("RGB")` behavior.
+//! ships no `transparent_bg_config`: a frame that still carries an alpha
+//! channel (one decoded under `TransparencyPolicy::KeepAlpha`, the rule of an
+//! engine whose loader keeps it) has it dropped rather than composited, the
+//! reference's `image.convert("RGB")` behavior; an engine whose loader
+//! composites hands the processor RGB already.
 
 use image::DynamicImage;
 

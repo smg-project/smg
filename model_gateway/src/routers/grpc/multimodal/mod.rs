@@ -60,6 +60,7 @@ mod process;
 mod refs;
 mod serialize;
 mod settings;
+mod transparency;
 mod transport;
 pub mod worker;
 
@@ -91,6 +92,7 @@ pub(crate) use refs::{
 };
 pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
+pub(crate) use transparency::engine_transparency_policy;
 pub(crate) use transport::{
     init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype_over,
 };

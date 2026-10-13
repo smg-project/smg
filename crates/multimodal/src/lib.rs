@@ -37,8 +37,8 @@ pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
     ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,
-    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSamplingInfo,
-    VideoSource,
+    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, TransparencyPolicy, VideoClip,
+    VideoSamplingInfo, VideoSource,
 };
 // Re-export vision processing components
 pub use vision::execution::{configure_parallelism, parallelism, Parallelism, POOL_THREADS_ENV};

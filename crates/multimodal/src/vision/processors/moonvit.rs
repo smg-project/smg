@@ -126,7 +126,10 @@ pub struct ResizeConfig {
 /// composited at the configured stage; K3 ships `"after_resize"`, and the
 /// ordering is load-bearing because a chessboard is generated at the resolution
 /// of whatever it is painted onto. With `None` alpha is dropped *before* the
-/// resize, matching the reference's `.convert("RGB")` at load time.
+/// resize, matching the reference's `.convert("RGB")` at load time. A frame
+/// carries an alpha channel here only when the gateway decoded it under
+/// `TransparencyPolicy::KeepAlpha` (K3 asks for that through `keeps_alpha`;
+/// otherwise the destination engine's loader rule was applied at the decode).
 fn resize_pad_and_normalize(
     image: &DynamicImage,
     cfg: &ResizeConfig,
