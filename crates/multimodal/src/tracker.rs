@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
 use tokio::task::JoinHandle;
 
@@ -260,37 +260,21 @@ impl AsyncMultiModalTracker {
         uuid: Option<String>,
         max_long_side_pixel: Option<u32>,
     ) {
-        let modality = Modality::Image;
-        self.uuids.entry(modality).or_default().push(uuid);
-
         let config = ImageFetchConfig {
             detail,
             max_long_side_pixel,
             transparency: self.image_transparency,
         };
-        let source = Arc::new(FetchSource::from(source));
-        if let Some(first) = self.same_media_as(modality, format!("{config:?}"), &source) {
-            self.pending
-                .entry(modality)
-                .or_default()
-                .push(Slot::SameAs(first));
-            return;
-        }
-
-        let connector = Arc::clone(&self.media_connector);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
-        )]
-        let handle = tokio::spawn(async move {
-            let frame = connector.fetch_image_from(&source, config).await?;
-            Ok(TrackedMedia::Image(frame))
-        });
-
-        self.pending
-            .entry(modality)
-            .or_default()
-            .push(Slot::Fetch(handle));
+        self.enqueue(
+            Modality::Image,
+            uuid,
+            format!("{config:?}"),
+            source,
+            move |connector, source| async move {
+                let frame = connector.fetch_image_from(&source, config).await?;
+                Ok(TrackedMedia::Image(frame))
+            },
+        );
     }
 
     fn enqueue_video(
@@ -306,63 +290,61 @@ impl AsyncMultiModalTracker {
             self.default_video_sample_fps,
             self.video_frame_sampling,
         )?;
-
-        let modality = Modality::Video;
-        self.uuids.entry(modality).or_default().push(uuid);
-
-        let source = Arc::new(FetchSource::from(source));
-        if let Some(first) = self.same_media_as(modality, format!("{cfg:?}"), &source) {
-            self.pending
-                .entry(modality)
-                .or_default()
-                .push(Slot::SameAs(first));
-            return Ok(());
-        }
-
-        let connector = Arc::clone(&self.media_connector);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
-        )]
-        let handle = tokio::spawn(async move {
-            let clip = connector.fetch_video_from(&source, cfg).await?;
-            Ok(TrackedMedia::Video(clip))
-        });
-
-        self.pending
-            .entry(modality)
-            .or_default()
-            .push(Slot::Fetch(handle));
+        self.enqueue(
+            Modality::Video,
+            uuid,
+            format!("{cfg:?}"),
+            source,
+            move |connector, source| async move {
+                let clip = connector.fetch_video_from(&source, cfg).await?;
+                Ok(TrackedMedia::Video(clip))
+            },
+        );
         Ok(())
     }
 
     fn enqueue_audio(&mut self, source: MediaSource, uuid: Option<String>) {
-        let modality = Modality::Audio;
+        self.enqueue(
+            Modality::Audio,
+            uuid,
+            String::new(),
+            source,
+            |connector, source| async move {
+                let clip = connector.fetch_audio_from(&source).await?;
+                Ok(TrackedMedia::Audio(clip))
+            },
+        );
+    }
+
+    /// The slot of one media item: its uuid recorded, then either the fetch an
+    /// earlier item of the same modality, settings and bytes already runs, or
+    /// its own fetch spawned now and awaited in [`Self::finalize`].
+    fn enqueue<F, Fut>(
+        &mut self,
+        modality: Modality,
+        uuid: Option<String>,
+        settings: String,
+        source: MediaSource,
+        fetch: F,
+    ) where
+        F: FnOnce(Arc<MediaConnector>, Arc<FetchSource>) -> Fut,
+        Fut: Future<Output = MultiModalResult<TrackedMedia>> + Send + 'static,
+    {
         self.uuids.entry(modality).or_default().push(uuid);
 
         let source = Arc::new(FetchSource::from(source));
-        if let Some(first) = self.same_media_as(modality, String::new(), &source) {
-            self.pending
-                .entry(modality)
-                .or_default()
-                .push(Slot::SameAs(first));
-            return;
-        }
-
-        let connector = Arc::clone(&self.media_connector);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
-        )]
-        let handle = tokio::spawn(async move {
-            let clip = connector.fetch_audio_from(&source).await?;
-            Ok(TrackedMedia::Audio(clip))
-        });
-
-        self.pending
-            .entry(modality)
-            .or_default()
-            .push(Slot::Fetch(handle));
+        let slot = match self.same_media_as(modality, settings, &source) {
+            Some(first) => Slot::SameAs(first),
+            None => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
+                )]
+                let handle = tokio::spawn(fetch(Arc::clone(&self.media_connector), source));
+                Slot::Fetch(handle)
+            }
+        };
+        self.pending.entry(modality).or_default().push(slot);
     }
 }
 
