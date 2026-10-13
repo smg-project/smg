@@ -4,7 +4,8 @@ The SGLang and TokenSpeed servicers answer the standard gRPC health probe
 from a serving flag and one liveness rule: a scheduler that has pushed
 nothing for longer than :data:`STUCK_SCHEDULER_THRESHOLD_SECS` while
 requests are pending is stuck, and the service reports NOT_SERVING until it
-speaks again. An idle scheduler (nothing pending) is quiet, not stuck.
+speaks again or its pending requests drain (every waiting client gone). An
+idle scheduler (nothing pending) is quiet, not stuck.
 :class:`StallReport` is that rule with its reporting: probes arrive on
 their interval for as long as the stall holds, so the stall is said once
 when it starts and again only if it clears and comes back, and the
