@@ -1,7 +1,8 @@
-//! The exact SSE bytes of chat streams, pinned per scenario.
+//! The exact SSE bytes of chat and completion streams, pinned per scenario.
 //!
-//! Each scenario drives `process_streaming_chunks` over scripted engine frames
-//! and compares the concatenated SSE events, byte for byte, with
+//! Each scenario drives `process_streaming_chunks` (chat) or
+//! `process_completion_streaming_chunks` (completions) over scripted engine
+//! frames and compares the concatenated SSE events, byte for byte, with
 //! `fixtures/<scenario>.sse`. The fixtures hold the bytes the plain
 //! serialization of whole chunk structs produced, so any change to the wire
 //! format of a streamed chunk, intended or not, fails here. Set

@@ -4102,6 +4102,71 @@ mod usage_tests;
 mod tests {
     use super::*;
 
+    /// The frames write exactly the bytes of the serialized whole chunk
+    /// structs, so a field added to a struct turns up here, not on the wire
+    /// of the per-token chunks alone.
+    #[test]
+    fn chunk_frames_write_the_bytes_of_the_whole_structs() {
+        fn event(frame: &BytesMut) -> Vec<u8> {
+            frame
+                .strip_prefix(b"data: ")
+                .and_then(|body| body.strip_suffix(b"\n\n"))
+                .expect("one SSE data event")
+                .to_vec()
+        }
+        for fingerprint in [None, Some("v7")] {
+            let choice = CompletionStreamChoice {
+                text: "he said \"hi\"\n".to_string(),
+                index: 1,
+                logprobs: None,
+                finish_reason: Some("stop".to_string()),
+            };
+            let frame = CompletionChunkFrame::new("cmpl-1", "model-x", 1_700_000_000, fingerprint);
+            let mut buffer = BytesMut::new();
+            frame.write_chunk(&mut buffer, &choice);
+            let whole = CompletionStreamResponse {
+                id: "cmpl-1".to_string(),
+                object: "text_completion".to_string(),
+                created: 1_700_000_000,
+                choices: vec![choice],
+                model: "model-x".to_string(),
+                system_fingerprint: fingerprint.map(str::to_string),
+                usage: None,
+            };
+            assert_eq!(
+                event(&buffer),
+                serde_json::to_vec(&whole).unwrap(),
+                "completion, fingerprint {fingerprint:?}"
+            );
+
+            let choice = assistant_choice(0, Some("tok".to_string()), None, None);
+            let frame = ChatChunkFrame::new("chatcmpl-1", "model-x", 1_700_000_000, fingerprint);
+            for (usage, emit_usage_null) in [
+                (None, false),
+                (None, true),
+                (Some(Usage::from_counts(3, 2)), false),
+            ] {
+                let mut buffer = BytesMut::new();
+                frame.write_chunk(&mut buffer, &choice, usage.as_ref(), emit_usage_null);
+                let whole = ChatCompletionStreamResponse {
+                    id: "chatcmpl-1".to_string(),
+                    object: "chat.completion.chunk".to_string(),
+                    created: 1_700_000_000,
+                    model: "model-x".to_string(),
+                    system_fingerprint: fingerprint.map(str::to_string),
+                    choices: vec![choice.clone()],
+                    usage: usage.clone(),
+                };
+                assert_eq!(
+                    event(&buffer),
+                    serde_json::to_vec(&ChatChunkWithUsage::new(&whole, emit_usage_null)).unwrap(),
+                    "chat, fingerprint {fingerprint:?}, usage {}, placeholder {emit_usage_null}",
+                    usage.is_some()
+                );
+            }
+        }
+    }
+
     #[test]
     fn continuous_chat_usage_tracks_cumulative_counts_and_shared_prompt() {
         use smg_grpc_client::sglang_proto as proto;
