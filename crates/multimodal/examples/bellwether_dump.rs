@@ -28,10 +28,12 @@
 //! decoded RGB bytes), `u8_sha256` (the un-normalized u8 patches; `null` when the processor
 //! produces floats), `bf16_sha256` and `f32_sha256` (the wire bytes). An image that cannot
 //! be decoded or processed gets `name`, `path` and `error` instead, and the run goes on.
-//! `raw` writes the artifacts themselves, `<name>.rgb.raw`, `<name>.u8.raw` (when there are
-//! u8 patches), `<name>.bf16.raw` and `<name>.f32.raw`, with `meta.json` carrying the
-//! processor's name and the per-image lines without the digests, for the first differing
-//! element.
+//! `raw` writes the artifacts themselves under the image's name, `<name>.rgb.raw`,
+//! `<name>.u8.raw` (when there are u8 patches), `<name>.bf16.raw` and `<name>.f32.raw`; where
+//! several listed files share a name, each of them is written under
+//! `<position in the list>-<name>` instead, so no file writes over another's. `meta.json` carries
+//! the processor's name and the per-image lines without the digests, each with the stem its files
+//! were written under as `artifact`, for the first differing element.
 //!
 //! The exit status is 0 once every listed image has its line, errors included, and the last
 //! line on standard error is then `DUMP_DONE mode=<mode> processor=<name> ok=<n> err=<n>`. A
@@ -46,6 +48,7 @@
 //! ```
 
 use std::{
+    collections::HashMap,
     env,
     error::Error,
     fmt::Write as _,
@@ -346,6 +349,27 @@ fn listed(list: &Path) -> Result<Vec<(String, PathBuf)>, Fault> {
         .collect())
 }
 
+/// The stem each listed file's artifacts are written under in `raw` mode: its name, or, where
+/// several listed files share a name, the name behind the file's position in the list, so that
+/// two files of one name never write over each other.
+fn artifact_stems(names: &[String]) -> Vec<String> {
+    let mut shared: HashMap<&str, usize> = HashMap::new();
+    for name in names {
+        *shared.entry(name.as_str()).or_insert(0) += 1;
+    }
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            if shared.get(name.as_str()).copied().unwrap_or(0) > 1 {
+                format!("{}-{name}", index + 1)
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
+}
+
 /// Where the lines go: a file in `hash` mode, the directory's `meta.json` in `raw` mode.
 enum Sink {
     File(BufWriter<File>),
@@ -392,15 +416,19 @@ fn run() -> Result<(), Fault> {
             Sink::Meta(Vec::with_capacity(images.len()))
         }
     };
+    let names: Vec<String> = images.iter().map(|(name, _)| name.clone()).collect();
+    let stems = artifact_stems(&names);
     let (mut ok, mut failed) = (0usize, 0usize);
-    for (name, path) in &images {
+    for ((name, path), stem) in images.iter().zip(&stems) {
         let path_text = path.to_string_lossy();
         let result =
             one(processor.as_ref(), &config, path).and_then(|artifacts| match options.mode {
                 Mode::Hash => Ok(artifacts.line(name, &path_text)),
-                Mode::Raw => artifacts
-                    .write(&options.out, name)
-                    .map(|()| artifacts.describe(name, &path_text)),
+                Mode::Raw => artifacts.write(&options.out, stem).map(|()| {
+                    let mut described = artifacts.describe(name, &path_text);
+                    described["artifact"] = json!(stem);
+                    described
+                }),
             });
         let line = match result {
             Ok(line) => {
@@ -430,4 +458,63 @@ fn run() -> Result<(), Fault> {
         options.processor
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifacts(byte: u8) -> Artifacts {
+        Artifacts {
+            width: 1,
+            height: 1,
+            alpha: false,
+            grid: vec![1, 1, 1],
+            shape: vec![1, 3],
+            rgb: vec![byte; 3],
+            u8: None,
+            bf16: vec![byte; 6],
+            f32: vec![byte; 12],
+        }
+    }
+
+    #[test]
+    fn a_name_shared_by_listed_files_gets_each_of_them_its_position() {
+        let names: Vec<String> = ["x.png", "y.png", "x.png"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(artifact_stems(&names), ["1-x.png", "y.png", "3-x.png"]);
+        let unique: Vec<String> = ["x.png", "y.png"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(artifact_stems(&unique), ["x.png", "y.png"]);
+    }
+
+    #[test]
+    fn two_images_of_one_name_in_two_directories_write_two_sets_of_files() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let list = dir.path().join("list.txt");
+        fs::write(&list, "a/same.png\nb/same.png\n").expect("the list");
+        let listed = listed(&list).expect("two listed files");
+        let names: Vec<String> = listed.iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(names, ["same.png", "same.png"]);
+        let stems = artifact_stems(&names);
+        assert_eq!(stems, ["1-same.png", "2-same.png"]);
+        let out = dir.path().join("raw");
+        fs::create_dir_all(&out).expect("the output directory");
+        artifacts(1)
+            .write(&out, &stems[0])
+            .expect("the first image's files");
+        artifacts(2)
+            .write(&out, &stems[1])
+            .expect("the second image's files");
+        assert_eq!(
+            fs::read(out.join("1-same.png.rgb.raw")).expect("the first rgb"),
+            vec![1; 3]
+        );
+        assert_eq!(
+            fs::read(out.join("2-same.png.rgb.raw")).expect("the second rgb"),
+            vec![2; 3]
+        );
+        assert_eq!(fs::read_dir(&out).expect("the output directory").count(), 6);
+    }
 }

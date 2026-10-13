@@ -65,6 +65,11 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 cc = "1"
 pkg-config = "0.3"
 
+# The dump example for bellwether's multimodal suite carries unit tests of its own (`cargo test --example bellwether_dump`).
+[[example]]
+name = "bellwether_dump"
+test = true
+
 [[bench]]
 name = "image_preprocess"
 harness = false
