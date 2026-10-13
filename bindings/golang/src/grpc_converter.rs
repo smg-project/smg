@@ -358,21 +358,23 @@ async fn unstreamed_tool_output(
     Some((text, calls))
 }
 
-/// A parsed call, or a piece of its arguments, as the client's delta.
+/// A parsed call, or a piece of its arguments, as the client's delta: the
+/// call's id travels with its name, in the first delta of the call; a delta
+/// that continues the arguments carries none, as the gateway's own streaming
+/// path and the public API send it (a client keeping the latest id it sees
+/// would otherwise end up with a different one than the call's).
 fn tool_call_delta(handle: &GrpcResponseConverterHandle, item: ToolCallItem) -> ToolCallDelta {
-    let id = if let Some(ref name) = item.name {
+    let id = item.name.as_ref().map(|name| {
         generate_tool_call_id(
             &handle.model,
             name,
             item.tool_index,
             handle.history_tool_calls_count,
         )
-    } else {
-        format!("call_{}", item.tool_index)
-    };
+    });
     ToolCallDelta {
         index: item.tool_index as u32,
-        id: Some(id),
+        id,
         tool_type: item.name.as_ref().map(|_| "function".to_string()),
         function: Some(FunctionCallDelta {
             name: item.name,
@@ -1344,6 +1346,10 @@ mod tests {
             calls[0].function.as_ref().unwrap().name.as_deref(),
             Some("get_weather")
         );
+        // The id travels with the name; the deltas continuing the arguments
+        // carry none, so a client keeping the latest id keeps the call's.
+        assert!(calls[0].id.is_some(), "{calls:?}");
+        assert!(calls[1..].iter().all(|call| call.id.is_none()), "{calls:?}");
         assert_eq!(arguments_of(&calls), serde_json::json!({"city":"Paris"}));
     }
 
