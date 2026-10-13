@@ -2157,25 +2157,23 @@ impl CliArgs {
         Ok(rcf)
     }
 
-    /// The flags whose value has a required shape, refused by name when the
-    /// shape is wrong: a wrong shape used to be dropped or passed on in
-    /// silence, which narrowed a security policy or broke a health policy
-    /// without a word.
+    /// The flags whose value has a required shape and whose raw form never
+    /// reaches `RouterConfig`, refused by name when the shape is wrong: a
+    /// wrong shape used to be dropped or passed on in silence. The shapes of
+    /// the fields `RouterConfig` carries (the CORS origins, the health-check
+    /// endpoint, the request-id header names, the storage-context header
+    /// names, an empty API key) are checked by `ConfigValidator`, on every
+    /// construction path.
     fn validate_flag_formats(&self) -> ConfigResult<()> {
         let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
             field: field.to_string(),
             value: value.to_string(),
             reason: reason.to_string(),
         };
-        // `cors_allowed_origins` is checked by the shared `ConfigValidator`, which
-        // every construction path runs (this CLI through `builder.build()`).
-        if !self.health_check_endpoint.starts_with('/') {
-            return Err(invalid(
-                "health_check_endpoint",
-                &self.health_check_endpoint,
-                "must start with '/': it is appended to every HTTP worker's URL",
-            ));
-        }
+        // `cors_allowed_origins`, the health-check endpoint, the request-id
+        // header names and an empty API key are checked by the shared
+        // `ConfigValidator`, which every construction path runs (this CLI
+        // through `builder.build()`).
         let buckets = &self.prometheus_duration_buckets;
         if let Some(bad) = buckets.iter().find(|b| !b.is_finite() || **b <= 0.0) {
             return Err(invalid(
@@ -2197,24 +2195,6 @@ impl CliArgs {
                     "storage_context_headers",
                     entry,
                     "expected 'header-name=context-key'",
-                ));
-            }
-        }
-        for name in &self.request_id_headers {
-            if http::header::HeaderName::try_from(name.as_str()).is_err() {
-                return Err(invalid(
-                    "request_id_headers",
-                    name,
-                    "not a valid HTTP header name: it could never match a request",
-                ));
-            }
-        }
-        if let Some(key) = &self.api_key {
-            if key.trim().is_empty() {
-                return Err(invalid(
-                    "api_key",
-                    "",
-                    "an empty credential would switch authentication on with a key nothing can present",
                 ));
             }
         }
@@ -2921,7 +2901,7 @@ mod tests {
             ),
             (
                 vec!["--health-check-endpoint", "health"],
-                "health_check_endpoint",
+                "health_check.endpoint",
             ),
             (
                 vec!["--prometheus-duration-buckets", "2", "1"],

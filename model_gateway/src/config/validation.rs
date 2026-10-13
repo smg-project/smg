@@ -287,6 +287,7 @@ impl ConfigValidator {
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
+        Self::validate_value_shapes(config)?;
         Self::validate_log_dir(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
@@ -436,6 +437,42 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// The fields whose value has a required shape, refused by name when the
+    /// shape is wrong, on every path that builds a `RouterConfig` (the
+    /// command line, a configuration file, the language binding): checked on
+    /// the command line alone, a wrong shape from a binding still matched no
+    /// request's id header or switched authentication on with an empty
+    /// credential, in silence. The CORS origins and the health-check endpoint
+    /// have rules of their own (`validate_cors_allowed_origins`,
+    /// `validate_health_check`); the command line keeps the shapes of what
+    /// never reaches `RouterConfig`.
+    fn validate_value_shapes(config: &RouterConfig) -> ConfigResult<()> {
+        let invalid = |field: &str, value: &str, reason: &str| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value: value.to_string(),
+            reason: reason.to_string(),
+        };
+        for name in config.request_id_headers.iter().flatten() {
+            if HeaderName::try_from(name.as_str()).is_err() {
+                return Err(invalid(
+                    "request_id_headers",
+                    name,
+                    "not a valid HTTP header name: it could never match a request",
+                ));
+            }
+        }
+        if let Some(key) = &config.api_key {
+            if key.trim().is_empty() {
+                return Err(invalid(
+                    "api_key",
+                    "",
+                    "an empty credential would switch authentication on with a key nothing can present",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_storage_context_headers(config: &RouterConfig) -> ConfigResult<()> {
         let mut seen_context_keys = std::collections::HashSet::new();
 
@@ -446,6 +483,15 @@ impl ConfigValidator {
             if header_name.is_empty() {
                 return Err(ConfigError::ValidationFailed {
                     reason: "storage_context_headers must not contain empty header names"
+                        .to_string(),
+                });
+            }
+
+            if HeaderName::try_from(header_name).is_err() {
+                return Err(ConfigError::InvalidValue {
+                    field: "storage_context_headers".to_string(),
+                    value: header_name.to_string(),
+                    reason: "not a valid HTTP header name: it could never match a request"
                         .to_string(),
                 });
             }
@@ -1646,6 +1692,14 @@ impl ConfigValidator {
     /// interval is refused with probing disabled too: the checker's loop
     /// still sleeps on it between connect signals.
     fn validate_health_check(health_check: &HealthCheckConfig) -> ConfigResult<()> {
+        if !health_check.endpoint.starts_with('/') {
+            return Err(ConfigError::InvalidValue {
+                field: "health_check.endpoint".to_string(),
+                value: health_check.endpoint.clone(),
+                reason: "must start with '/': it is appended to every HTTP worker's URL"
+                    .to_string(),
+            });
+        }
         let knobs = [
             (
                 "health_check.check_interval_secs",
@@ -2072,6 +2126,70 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// A `RouterConfig` built directly, as a language binding or a library
+    /// caller builds one: the validator refuses each malformed shape by its
+    /// field, and accepts the well-formed values.
+    #[test]
+    fn malformed_value_shapes_are_refused_by_name_on_a_directly_built_router_config() {
+        let defaults = RouterConfig::default;
+        let cases: Vec<(&str, RouterConfig)> = vec![
+            (
+                "health_check.endpoint",
+                RouterConfig {
+                    health_check: HealthCheckConfig {
+                        endpoint: "health".to_owned(),
+                        ..HealthCheckConfig::default()
+                    },
+                    ..defaults()
+                },
+            ),
+            (
+                "request_id_headers",
+                RouterConfig {
+                    request_id_headers: Some(vec!["bad header".to_owned()]),
+                    ..defaults()
+                },
+            ),
+            (
+                "storage_context_headers",
+                RouterConfig {
+                    storage_context_headers: [("bad header".to_owned(), "tenant".to_owned())]
+                        .into_iter()
+                        .collect(),
+                    ..defaults()
+                },
+            ),
+            (
+                "api_key",
+                RouterConfig {
+                    api_key: Some(" ".to_owned()),
+                    ..defaults()
+                },
+            ),
+        ];
+        for (field, config) in cases {
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue { field: named, .. }) => {
+                    assert_eq!(named, field);
+                }
+                other => panic!("{field}: expected a refusal by name, got {other:?}"),
+            }
+        }
+        let accepted = RouterConfig {
+            health_check: HealthCheckConfig {
+                endpoint: "/health".to_owned(),
+                ..HealthCheckConfig::default()
+            },
+            request_id_headers: Some(vec!["x-request-id".to_owned()]),
+            storage_context_headers: [("x-tenant".to_owned(), "tenant".to_owned())]
+                .into_iter()
+                .collect(),
+            api_key: Some("secret".to_owned()),
+            ..defaults()
+        };
+        assert!(ConfigValidator::validate(&accepted).is_ok());
     }
 
     fn scheduler_config(path: Option<&str>) -> RouterConfig {
