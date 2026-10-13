@@ -244,19 +244,19 @@ impl std::fmt::Debug for NativeEncoder {
     }
 }
 
-/// A component of the tokenizer in its serialized form (`Null` when there
-/// is none), the shape the checks below read.
-fn serialized<T: Serialize>(component: T) -> Result<Value, Declined> {
+/// A component of the tokenizer (`what` names it in a decline) in its
+/// serialized form, `Null` when there is none: the shape the checks read.
+fn serialized<T: Serialize>(what: &str, component: T) -> Result<Value, Declined> {
     serde_json::to_value(component)
-        .map_err(|e| Declined::from(format!("a component does not serialize: {e}")))
+        .map_err(|e| Declined::from(format!("the {what} does not serialize: {e}")))
 }
 
-/// The `type` a serialized component names.
-fn type_of(component: &Value) -> Result<&str, Declined> {
+/// The `type` a serialized component (`what` names it) declares.
+fn type_of<'v>(what: &str, component: &'v Value) -> Result<&'v str, Declined> {
     component
         .get("type")
         .and_then(Value::as_str)
-        .ok_or_else(|| Declined::from("a component without a type"))
+        .ok_or_else(|| Declined::from(format!("a {what} without a type")))
 }
 
 impl NativeEncoder {
@@ -272,9 +272,14 @@ impl NativeEncoder {
         if !matches!(tokenizer.get_model(), ModelWrapper::BPE(_)) {
             return Err(Declined::from("the model is not BPE"));
         }
-        let normalizer = Self::normalizer_from(&serialized(tokenizer.get_normalizer())?)?;
-        let stages = Self::stages_from(&serialized(tokenizer.get_pre_tokenizer())?)?;
-        Self::post_processor_check(&serialized(tokenizer.get_post_processor())?)?;
+        let normalizer =
+            Self::normalizer_from(&serialized("normalizer", tokenizer.get_normalizer())?)?;
+        let stages =
+            Self::stages_from(&serialized("pre-tokenizer", tokenizer.get_pre_tokenizer())?)?;
+        Self::post_processor_check(&serialized(
+            "post-processor",
+            tokenizer.get_post_processor(),
+        )?)?;
         let (raw, normalized) = Self::added_tokens_of(tokenizer, normalizer)?;
         Ok(Self {
             normalizer,
@@ -292,7 +297,7 @@ impl NativeEncoder {
         if normalizer.is_null() {
             return Ok(Normalizer::None);
         }
-        match type_of(normalizer)? {
+        match type_of("normalizer", normalizer)? {
             "NFC" => Ok(Normalizer::Nfc),
             "Sequence" => {
                 let steps = normalizer
@@ -319,7 +324,7 @@ impl NativeEncoder {
         if post_processor.is_null() {
             return Ok(());
         }
-        match type_of(post_processor)? {
+        match type_of("post-processor", post_processor)? {
             "ByteLevel" => Ok(()),
             other => Err(Declined::from(format!(
                 "post-processor {other} (only ByteLevel or none)"
@@ -365,7 +370,12 @@ impl NativeEncoder {
     /// The `Split` stages of a pre-tokenizer that is zero or more `Split`s
     /// followed by one `ByteLevel` without prefix space.
     fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
-        let items: Vec<&Value> = match type_of(pre_tokenizer)? {
+        if pre_tokenizer.is_null() {
+            return Err(Declined::from(
+                "no pre-tokenizer (the path needs ByteLevel, after any Split stages)",
+            ));
+        }
+        let items: Vec<&Value> = match type_of("pre-tokenizer", pre_tokenizer)? {
             "Sequence" => pre_tokenizer
                 .get("pretokenizers")
                 .and_then(Value::as_array)
@@ -401,7 +411,7 @@ impl NativeEncoder {
     /// One `Split` before the `ByteLevel` as a stage: a regex or a literal
     /// the pattern engine takes, `Isolated`, or `Removed` inverted.
     fn split_stage(split: &Value) -> Result<Stage, Declined> {
-        match type_of(split)? {
+        match type_of("pre-tokenizer stage", split)? {
             "Split" => {}
             other => {
                 return Err(Declined::from(format!(
@@ -597,7 +607,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        encode_path::{encode_fallbacks, EncodeFallbacks},
+        encode_path::{encode_fallbacks, EncodeFallbacks, EncodePath},
         huggingface::HuggingFaceTokenizer,
     };
 
@@ -1013,6 +1023,13 @@ mod tests {
         );
         let tokenizer = HfTokenizer::new(WordLevel::default());
         assert_eq!(declined(&tokenizer), "the model is not BPE");
+        // No pre-tokenizer at all.
+        let mut tokenizer = tokenizer_of(base, &mut state);
+        tokenizer.with_pre_tokenizer(None::<PreTokenizerWrapper>);
+        assert_eq!(
+            declined(&tokenizer),
+            "no pre-tokenizer (the path needs ByteLevel, after any Split stages)"
+        );
     }
 
     #[test]
@@ -1191,6 +1208,9 @@ mod tests {
         let shape = &shapes()[0];
         let reference = tokenizer_of(shape, &mut state);
         let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+        // The count applies to the direct path: with the v1 feature on, the
+        // shape's split pattern is one the pipeline declines today.
+        assert_eq!(ours.encode_path(), EncodePath::Native);
         let not_nfc = |stats: &[EncodeFallbacks; 2]| {
             stats
                 .iter()

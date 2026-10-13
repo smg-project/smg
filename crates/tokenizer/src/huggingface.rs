@@ -177,13 +177,25 @@ impl DirectEncoders {
             Err(declined) => (None, EncodePath::Tokenizers, Some(declined.to_string())),
         };
         encode_path::note_load(path);
+        // The opt-in pipeline is for BPE tokenizers: one of those it declines
+        // is worth a warning (the opt-in did not take where it could have);
+        // any other model kind was never its business.
         #[cfg(feature = "tokenizers-v1")]
-        tracing::warn!(
-            path = %path,
-            v1_declined = %v1_declined,
-            native_declined = native_declined.as_deref(),
-            "the opt-in tokenizers v1 pipeline declined this tokenizer; its encodes take the next path"
-        );
+        if matches!(tokenizer.get_model(), ModelWrapper::BPE(_)) {
+            tracing::warn!(
+                path = %path,
+                v1_declined = %v1_declined,
+                native_declined = native_declined.as_deref(),
+                "the opt-in tokenizers v1 pipeline declined this BPE tokenizer; its encodes take the next path"
+            );
+        } else {
+            tracing::info!(
+                path = %path,
+                v1_declined = %v1_declined,
+                native_declined = native_declined.as_deref(),
+                "tokenizer encode path (the opt-in v1 pipeline takes BPE models only)"
+            );
+        }
         #[cfg(not(feature = "tokenizers-v1"))]
         tracing::info!(
             path = %path,
