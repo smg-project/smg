@@ -19,8 +19,9 @@ use tool_parser::ToolParser;
 
 use super::{
     error::{clear_error_message, set_error_message, SglErrorCode},
+    forced_tool_choice::tool_parser_for,
     proto_parse::parse_proto_response,
-    runtime::{PARSER_FACTORY, RUNTIME},
+    runtime::RUNTIME,
     stream_state::StreamStateManager,
     tokenizer::TokenizerHandle,
     utils::generate_tool_call_id,
@@ -145,12 +146,10 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
         serde_json::from_str::<Vec<u32>>(ids_str).ok()
     };
 
-    // Create tool parser if tools are provided
+    // Create tool parser if tools are provided: the model's, or the generic
+    // reader of a forced choice (see `forced_tool_choice`).
     let tool_parser = if tools.is_some() {
-        PARSER_FACTORY
-            .registry()
-            .create_for_model(model_str)
-            .map(|p| Arc::new(TokioMutex::new(p)))
+        tool_parser_for(model_str, tool_choice.as_ref()).map(|p| Arc::new(TokioMutex::new(p)))
     } else {
         None
     };

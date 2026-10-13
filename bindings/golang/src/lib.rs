@@ -77,6 +77,7 @@ pub use tool_parser::{
 // Sub-modules
 mod client;
 mod error;
+mod forced_tool_choice;
 mod grpc_converter;
 mod memory;
 mod policy;
