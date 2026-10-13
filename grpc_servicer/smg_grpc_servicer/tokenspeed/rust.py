@@ -32,17 +32,19 @@ import multiprocessing
 import os
 import signal
 import threading
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 
-# The lifecycle's defaults, re-exported: this launcher's own documented defaults.
+# The lifecycle's defaults and the switch's choices, re-exported: this
+# launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
+    IMPLS,
     EngineProcess,
     EngineProcessGroup,
     FaultLatch,
@@ -54,6 +56,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     on_fault_signal,
     read_launcher_knobs,
     resolve_tokenizer_dir,
+    servicer_switch,
     supervise,
     wait_for_ready_reports,
 )
@@ -80,12 +83,7 @@ _OFF_VALUES = ("0", "false", "no", "off")
 # the ZMQ publisher, with TokenSpeed's own defaults for the rest (the
 # endpoint, the topic).
 DEFAULT_KV_EVENTS_CONFIG = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
-IMPLS = ("python", "rust")
 SERVICER_IMPL_FLAG = "--servicer-impl"
-# Where the implementation choice came from, for the startup log line.
-SOURCE_FLAG = "flag"
-SOURCE_ENV = "env"
-SOURCE_DEFAULT = "default"
 
 
 def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
@@ -119,24 +117,10 @@ def servicer_impl_source(
     args: Any = None, environ: Mapping[str, str] | None = None
 ) -> tuple[str, str]:
     """:func:`resolve_servicer_impl`'s answer with where it came from:
-    ``flag``, ``env`` or ``default``.
-
-    A decision made with the launcher's flag in hand is written back to the
-    environment, so the scheduler processes this process starts and anything
-    that reads only the variable agree with it when ``--servicer-impl python``
-    overrides an exported ``rust``."""
-    source = os.environ if environ is None else environ
-    value = getattr(args, "servicer_impl", None) if args is not None else None
-    origin = SOURCE_FLAG
-    if not value:
-        value = source.get(SERVICER_IMPL_ENV)
-        origin = SOURCE_ENV if value else SOURCE_DEFAULT
-    value = str(value or "python").strip().lower()
-    if value not in IMPLS:
-        raise ServicerConfigError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
-        source[SERVICER_IMPL_ENV] = value
-    return value, origin
+    ``flag``, ``env`` or ``default`` (the shared
+    :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`, which writes a
+    flag decision back to the environment the scheduler processes inherit)."""
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ)
 
 
 # ---------------------------------------------------------------------------

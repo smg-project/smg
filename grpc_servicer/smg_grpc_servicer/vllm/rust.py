@@ -46,16 +46,18 @@ import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port
 
-# The lifecycle's defaults, re-exported: this launcher's own documented defaults.
+# The lifecycle's defaults and the switch's choices, re-exported: this
+# launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
+    IMPLS,
     EngineProcess,
     EngineProcessGroup,
     ServicerConfigError,
@@ -63,6 +65,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     free_port,
     read_launcher_knobs,
     resolve_tokenizer_dir,
+    servicer_switch,
     supervise,
 )
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
@@ -90,7 +93,6 @@ _OFF_VALUES = ("0", "false", "no", "off")
 # vLLM's own knob for how it starts its processes; the engine cores launched
 # from this process are spawned unless the deployment chose otherwise.
 MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
-IMPLS = ("python", "rust")
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
 
@@ -613,21 +615,12 @@ def resolve_servicer_impl(
     args: argparse.Namespace | None = None, environ: Mapping[str, str] | None = None
 ) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when the
-    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else python.
-
-    A decision made with the launcher's flag in hand is written back to the
-    environment, so :func:`require_python_impl` (which has no flag) agrees with
-    it when ``--servicer-impl python`` overrides an exported ``rust``."""
-    source = os.environ if environ is None else environ
-    value = getattr(args, "servicer_impl", None) if args is not None else None
-    if not value:
-        value = source.get(SERVICER_IMPL_ENV) or "python"
-    value = str(value).strip().lower()
-    if value not in IMPLS:
-        raise ServicerConfigError(f"{SERVICER_IMPL_ENV} must be one of {IMPLS}, got {value!r}")
-    if args is not None and isinstance(source, MutableMapping):
-        source[SERVICER_IMPL_ENV] = value
-    return value
+    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else python
+    (the shared :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`). A
+    decision made with the flag in hand is written back to the environment,
+    so :func:`require_python_impl` (which has no flag) agrees with it when
+    ``--servicer-impl python`` overrides an exported ``rust``."""
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ)[0]
 
 
 def require_python_impl(environ: Mapping[str, str] | None = None) -> None:

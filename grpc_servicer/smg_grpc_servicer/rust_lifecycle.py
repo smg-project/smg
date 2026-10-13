@@ -1,10 +1,11 @@
 """The Python-owned lifecycle around a Rust servicer, shared by the engine
-launchers: a free port and socket directory for the handshake, the engine as
-a ``Popen``-shaped handle (one spawned headless engine, the engine cores a
-manager started from this process, or the scheduler processes this process
-started itself), its termination, and the supervision loop that drains on a
-signal and exits with the engine or the server. Nothing here knows which
-engine it supervises.
+launchers: the servicer switch (which implementation serves the process, from
+the launcher's flag or the engine's variable), the launcher's knobs, a free
+port and socket directory for the handshake, the engine as a ``Popen``-shaped
+handle (one spawned headless engine, the engine cores a manager started from
+this process, or the scheduler processes this process started itself), its
+termination, and the supervision loop that drains on a signal and exits with
+the engine or the server. Nothing here knows which engine it supervises.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, MutableMapping
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,55 @@ def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger)
     no traceback."""
     log.error("servicer configuration error: %s", error)
     return SystemExit(CONFIG_ERROR_EXIT_CODE)
+
+
+# ---------------------------------------------------------------------------
+# The servicer switch: which implementation serves this process
+# ---------------------------------------------------------------------------
+
+IMPLS = ("python", "rust")
+# Where the implementation choice came from, for the startup log line.
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_DEFAULT = "default"
+
+
+def servicer_switch(
+    env_name: str,
+    args: Any = None,
+    environ: Mapping[str, str] | None = None,
+    *,
+    parsed_flag: str | None = None,
+) -> tuple[str, str]:
+    """Which implementation serves this process and where the choice came
+    from, as ``(impl, origin)``: the launcher's ``--servicer-impl``
+    (``args.servicer_impl``, else ``parsed_flag``, the value a launcher's
+    plugin kept when the engine's namespace carries only the engine's own
+    fields), else ``environ[env_name]``, else ``python``; the origin is
+    ``flag``, ``env`` or ``default``. A value outside :data:`IMPLS` is a
+    :class:`ServicerConfigError` naming the variable.
+
+    A decision made with the flag in hand is written back to the
+    environment, so the engine processes this process starts and anything
+    that reads only the variable (the Python servicer's guard against a
+    switch that never ran) agree with it when ``--servicer-impl python``
+    overrides an exported ``rust``. A value that came from the environment
+    or from the default is not written: what the engine inherits there is
+    what the operator exported, spelled as they exported it, and nothing
+    when they exported nothing."""
+    source = os.environ if environ is None else environ
+    value = getattr(args, "servicer_impl", None) if args is not None else None
+    value = value or parsed_flag
+    origin = SOURCE_FLAG
+    if not value:
+        value = source.get(env_name)
+        origin = SOURCE_ENV if value else SOURCE_DEFAULT
+    value = str(value or "python").strip().lower()
+    if value not in IMPLS:
+        raise ServicerConfigError(f"{env_name} must be one of {IMPLS}, got {value!r}")
+    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
+        source[env_name] = value
+    return value, origin
 
 
 # How long a servicer that decided to exit over its engine may spend in the
