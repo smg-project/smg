@@ -2219,80 +2219,93 @@ impl CliArgs {
     }
 
     /// The flags that only act with a companion, named when the companion is
-    /// absent: each used to be ignored in silence.
+    /// absent: each used to be ignored in silence. One row per warning, in
+    /// the order they are printed: when it applies, and its text.
     fn ignored_companions(
         &self,
         prefill_urls: &[(String, Option<u16>)],
         encode_urls: &[(String, Option<u16>)],
     ) -> Vec<String> {
-        let mut ignored = Vec::new();
-        if !(self.pd_disaggregation || self.epd_disaggregation) {
-            for (flag, given) in [
-                ("--prefill", !prefill_urls.is_empty()),
-                ("--decode", !self.decode.is_empty()),
-                ("--prefill-policy", self.prefill_policy.is_some()),
-                ("--decode-policy", self.decode_policy.is_some()),
-            ] {
-                if given {
-                    ignored.push(format!(
-                        "{flag} is ignored without --pd-disaggregation (or --epd-disaggregation)"
-                    ));
-                }
-            }
-        }
-        if !self.epd_disaggregation {
-            for (flag, given) in [
-                ("--encode", !encode_urls.is_empty()),
-                ("--encode-policy", self.encode_policy.is_some()),
-            ] {
-                if given {
-                    ignored.push(format!("{flag} is ignored without --epd-disaggregation"));
-                }
-            }
-        }
+        const PD: &str = "without --pd-disaggregation (or --epd-disaggregation)";
+        const EPD: &str = "without --epd-disaggregation";
+        let pd = self.pd_disaggregation || self.epd_disaggregation;
+        let epd = self.epd_disaggregation;
         // The selectors select Kubernetes pods: another provider ignores them
         // as the absence of any does.
         let provider = self.selected_discovery_provider();
-        if provider != Some(DiscoveryProvider::Kubernetes) {
-            let without = match provider {
-                None => "without --service-discovery".to_string(),
-                Some(provider) => format!(
-                    "under --discovery-provider {}: it selects Kubernetes pods",
-                    provider.flag_value()
-                ),
-            };
-            for (flag, given) in [
-                ("--selector", !self.selector.is_empty()),
-                ("--prefill-selector", !self.prefill_selector.is_empty()),
-                ("--decode-selector", !self.decode_selector.is_empty()),
-                ("--encode-selector", !self.encode_selector.is_empty()),
-                ("--router-selector", !self.router_selector.is_empty()),
-            ] {
-                if given {
-                    ignored.push(format!("{flag} is ignored {without}"));
-                }
-            }
-        }
-        if let Some(provider) = provider {
-            if !self.worker_urls.is_empty() {
-                let source = if self.service_discovery {
-                    "--service-discovery".to_string()
-                } else {
-                    format!("--discovery-provider {}", provider.flag_value())
-                };
-                ignored.push(format!(
+        let kubernetes = provider == Some(DiscoveryProvider::Kubernetes);
+        let selectors = match provider {
+            None => "without --service-discovery".to_string(),
+            Some(provider) => format!(
+                "under --discovery-provider {}: it selects Kubernetes pods",
+                provider.flag_value()
+            ),
+        };
+        // Two worker sources are both honoured, which is worth a line of its
+        // own, naming the source as it was given.
+        let source = if self.service_discovery {
+            "--service-discovery".to_string()
+        } else {
+            provider.map_or_else(String::new, |provider| {
+                format!("--discovery-provider {}", provider.flag_value())
+            })
+        };
+        let ignored = |flag: &str, needs: &str| format!("{flag} is ignored {needs}");
+        let warnings = [
+            (!prefill_urls.is_empty() && !pd, ignored("--prefill", PD)),
+            (!self.decode.is_empty() && !pd, ignored("--decode", PD)),
+            (
+                self.prefill_policy.is_some() && !pd,
+                ignored("--prefill-policy", PD),
+            ),
+            (
+                self.decode_policy.is_some() && !pd,
+                ignored("--decode-policy", PD),
+            ),
+            (!encode_urls.is_empty() && !epd, ignored("--encode", EPD)),
+            (
+                self.encode_policy.is_some() && !epd,
+                ignored("--encode-policy", EPD),
+            ),
+            (
+                !self.selector.is_empty() && !kubernetes,
+                ignored("--selector", selectors.as_str()),
+            ),
+            (
+                !self.prefill_selector.is_empty() && !kubernetes,
+                ignored("--prefill-selector", selectors.as_str()),
+            ),
+            (
+                !self.decode_selector.is_empty() && !kubernetes,
+                ignored("--decode-selector", selectors.as_str()),
+            ),
+            (
+                !self.encode_selector.is_empty() && !kubernetes,
+                ignored("--encode-selector", selectors.as_str()),
+            ),
+            (
+                !self.router_selector.is_empty() && !kubernetes,
+                ignored("--router-selector", selectors.as_str()),
+            ),
+            (
+                provider.is_some() && !self.worker_urls.is_empty(),
+                format!(
                     "--worker-urls and {source} are both given: both are worker sources, \
                      the listed workers register first and the discovered ones join them"
-                ));
-            }
-        }
-        if self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled {
-            ignored.push(
-                "--priority-scheduler-config is ignored without --priority-scheduler-enabled"
-                    .to_string(),
-            );
-        }
-        ignored
+                ),
+            ),
+            (
+                self.priority_scheduler_config.is_some() && !self.priority_scheduler_enabled,
+                ignored(
+                    "--priority-scheduler-config",
+                    "without --priority-scheduler-enabled",
+                ),
+            ),
+        ];
+        warnings
+            .into_iter()
+            .filter_map(|(applies, warning)| applies.then_some(warning))
+            .collect()
     }
 
     /// The companion warnings of [`ignored_companions`](Self::ignored_companions), one
@@ -2308,55 +2321,57 @@ impl CliArgs {
         }
     }
 
-    fn to_router_config(
+    /// The routing mode the flags select. A vendor backend (`--backend
+    /// openai|anthropic|gemini`) routes to that vendor whatever else is set;
+    /// otherwise `--epd-disaggregation` wins over `--pd-disaggregation`, and
+    /// neither is the regular mode over `--worker-urls`. IGW mode does not
+    /// change the routing mode: it only affects router initialization.
+    fn routing_mode(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
-    ) -> ConfigResult<RouterConfig> {
-        self.validate_flag_formats()?;
-        self.warn_ignored_companions(&prefill_urls, &encode_urls);
-
-        // Determine routing mode based on backend type and PD disaggregation flag
-        // IGW mode doesn't change routing mode, only affects router initialization
-        let mode = if matches!(self.backend, Some(Backend::Openai)) {
-            RoutingMode::OpenAI {
+    ) -> RoutingMode {
+        let policy = |name: Option<&String>| name.map(|p| self.parse_policy(p));
+        match (
+            self.backend,
+            self.epd_disaggregation,
+            self.pd_disaggregation,
+        ) {
+            (Some(Backend::Openai), _, _) => RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, Some(Backend::Anthropic)) {
-            RoutingMode::Anthropic {
+            },
+            (Some(Backend::Anthropic), _, _) => RoutingMode::Anthropic {
                 worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, Some(Backend::Gemini)) {
-            RoutingMode::Gemini {
+            },
+            (Some(Backend::Gemini), _, _) => RoutingMode::Gemini {
                 worker_urls: self.worker_urls.clone(),
-            }
-        } else if self.epd_disaggregation {
-            RoutingMode::EncodePrefillDecode {
+            },
+            (_, true, _) => RoutingMode::EncodePrefillDecode {
                 encode_urls,
                 prefill_urls,
                 decode_urls: self.decode.clone(),
-                encode_policy: self.encode_policy.as_ref().map(|p| self.parse_policy(p)),
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
-            }
-        } else if self.pd_disaggregation {
-            RoutingMode::PrefillDecode {
+                encode_policy: policy(self.encode_policy.as_ref()),
+                prefill_policy: policy(self.prefill_policy.as_ref()),
+                decode_policy: policy(self.decode_policy.as_ref()),
+            },
+            (_, false, true) => RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls: self.decode.clone(),
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
-            }
-        } else {
-            RoutingMode::Regular {
+                prefill_policy: policy(self.prefill_policy.as_ref()),
+                decode_policy: policy(self.decode_policy.as_ref()),
+            },
+            (_, false, false) => RoutingMode::Regular {
                 worker_urls: self.worker_urls.clone(),
-            }
-        };
+            },
+        }
+    }
 
-        let policy = self.parse_policy(&self.policy);
-
-        // A provider's own flags are ignored under another provider, as the
-        // Kubernetes flags always were without discovery. The file flags have
-        // no other use, so giving them without the file provider is an error.
+    /// The discovery configuration of the selected provider, or none. A
+    /// provider's own flags are ignored under another provider, as the
+    /// Kubernetes flags always were without discovery; the file flags have
+    /// no other use, so giving them without the file provider is an error,
+    /// as is the file provider without its manifest.
+    fn discovery_config(&self) -> ConfigResult<Option<DiscoveryConfig>> {
         let provider = self.selected_discovery_provider();
         if provider != Some(DiscoveryProvider::File)
             && (self.discovery_file.is_some() || self.discovery_check_interval_secs.is_some())
@@ -2367,7 +2382,7 @@ impl CliArgs {
                     .to_string(),
             });
         }
-        let discovery = match provider {
+        Ok(match provider {
             None => None,
             Some(DiscoveryProvider::Kubernetes) => {
                 Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
@@ -2398,99 +2413,64 @@ impl CliArgs {
                     .discovery_check_interval_secs
                     .unwrap_or(DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS),
             })),
-        };
+        })
+    }
 
-        let metrics = Some(MetricsConfig {
-            port: self.prometheus_port,
-            host: self.metrics_host(),
-        });
-
-        let trace_config = Some(TraceConfig {
-            enable_trace: self.enable_trace,
-            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
-        });
-
-        let mut all_urls = Vec::new();
-        match &mode {
-            RoutingMode::Regular { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
+    /// Every worker url the mode starts with, in the order the flags list
+    /// them (encode, prefill, decode for the disaggregated modes): the first
+    /// url that declares a wire protocol decides the connection mode.
+    fn startup_worker_urls(mode: &RoutingMode) -> Vec<String> {
+        match mode {
+            RoutingMode::Regular { worker_urls }
+            | RoutingMode::OpenAI { worker_urls }
+            | RoutingMode::Anthropic { worker_urls }
+            | RoutingMode::Gemini { worker_urls } => worker_urls.clone(),
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
                 ..
-            } => {
-                for (url, _) in prefill_urls {
-                    all_urls.push(url.clone());
-                }
-                all_urls.extend(decode_urls.clone());
-            }
+            } => prefill_urls
+                .iter()
+                .map(|(url, _)| url.clone())
+                .chain(decode_urls.iter().cloned())
+                .collect(),
             RoutingMode::EncodePrefillDecode {
                 encode_urls,
                 prefill_urls,
                 decode_urls,
                 ..
-            } => {
-                for (url, _) in encode_urls.iter().chain(prefill_urls.iter()) {
-                    all_urls.push(url.clone());
-                }
-                all_urls.extend(decode_urls.clone());
-            }
-            RoutingMode::OpenAI { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
-            RoutingMode::Anthropic { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
-            RoutingMode::Gemini { worker_urls } => {
-                all_urls.extend(worker_urls.clone());
-            }
+            } => encode_urls
+                .iter()
+                .chain(prefill_urls.iter())
+                .map(|(url, _)| url.clone())
+                .chain(decode_urls.iter().cloned())
+                .collect(),
         }
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+    }
 
-        // `--backend` normally only steers the routing mode. Over ZMQ it
-        // additionally pins the startup workers' runtime: the shared EngineCore
-        // handshake carries no engine identity, so the wire protocol cannot be
-        // probed and must be declared. HTTP/gRPC keep auto-detection (None).
-        let startup_worker_runtime_type = if connection_mode == ConnectionMode::Zmq {
-            match self.backend {
-                Some(Backend::Vllm) => Some(RuntimeType::Vllm),
-                Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
-                Some(Backend::Sglang) => Some(RuntimeType::Sglang),
-                _ => None,
-            }
-        } else {
-            None
-        };
+    /// `--backend` normally only steers the routing mode. Over ZMQ it
+    /// additionally pins the startup workers' runtime: the shared EngineCore
+    /// handshake carries no engine identity, so the wire protocol cannot be
+    /// probed and must be declared. HTTP/gRPC keep auto-detection (None).
+    fn startup_worker_runtime_type(&self, connection_mode: ConnectionMode) -> Option<RuntimeType> {
+        if connection_mode != ConnectionMode::Zmq {
+            return None;
+        }
+        match self.backend {
+            Some(Backend::Vllm) => Some(RuntimeType::Vllm),
+            Some(Backend::Tokenspeed) => Some(RuntimeType::TokenSpeed),
+            Some(Backend::Sglang) => Some(RuntimeType::Sglang),
+            _ => None,
+        }
+    }
 
-        let history_backend = match self.history_backend.as_str() {
-            "none" => HistoryBackend::None,
-            "oracle" => HistoryBackend::Oracle,
-            "postgres" => HistoryBackend::Postgres,
-            "redis" => HistoryBackend::Redis,
-            _ => HistoryBackend::Memory,
-        };
-
-        let schema = self.load_schema_config()?;
-
-        let tenant_api_keys = self
-            .tenant_api_keys
-            .iter()
-            .map(|k| parse_tenant_api_key(k))
-            .collect::<ConfigResult<Vec<_>>>()?;
-
-        let (oracle, postgres, redis) = match history_backend {
-            HistoryBackend::Oracle => (Some(self.build_oracle_config(schema)?), None, None),
-            HistoryBackend::Postgres => (None, Some(self.build_postgres_config(schema)?), None),
-            HistoryBackend::Redis => (None, None, Some(self.build_redis_config(schema)?)),
-            _ => (None, None, None),
-        };
-
-        // clap validated each entry's shape; here we only reject the same
-        // alias naming two different canonical models, which would make the
-        // routing outcome depend on argument order.
+    /// The `--model-alias` entries as a map. clap validated each entry's
+    /// shape; here only the same alias naming two different canonical models
+    /// is refused, which would make the routing outcome depend on argument
+    /// order.
+    fn model_aliases(entries: &[String]) -> ConfigResult<HashMap<String, String>> {
         let mut model_aliases: HashMap<String, String> = HashMap::new();
-        for entry in &self.model_alias {
+        for entry in entries {
             let Some((alias, canonical)) = entry.split_once('=') else {
                 return Err(ConfigError::InvalidValue {
                     field: "model_alias".to_string(),
@@ -2508,6 +2488,55 @@ impl CliArgs {
                 }
             }
         }
+        Ok(model_aliases)
+    }
+
+    /// The router configuration of the flags. A refusal is raised in this
+    /// order: the flag shapes, the discovery flags, the schema file, the
+    /// tenant keys, the history store, the model aliases, and last the
+    /// shared validator over the built configuration, which the builder
+    /// runs.
+    fn to_router_config(
+        &self,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
+    ) -> ConfigResult<RouterConfig> {
+        self.validate_flag_formats()?;
+        self.warn_ignored_companions(&prefill_urls, &encode_urls);
+
+        let mode = self.routing_mode(prefill_urls, encode_urls);
+        let policy = self.parse_policy(&self.policy);
+        let discovery = self.discovery_config()?;
+        let metrics = Some(MetricsConfig {
+            port: self.prometheus_port,
+            host: self.metrics_host(),
+        });
+        let trace_config = Some(TraceConfig {
+            enable_trace: self.enable_trace,
+            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+        });
+        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
+        let startup_worker_runtime_type = self.startup_worker_runtime_type(connection_mode);
+        let history_backend = match self.history_backend.as_str() {
+            "none" => HistoryBackend::None,
+            "oracle" => HistoryBackend::Oracle,
+            "postgres" => HistoryBackend::Postgres,
+            "redis" => HistoryBackend::Redis,
+            _ => HistoryBackend::Memory,
+        };
+        let schema = self.load_schema_config()?;
+        let tenant_api_keys = self
+            .tenant_api_keys
+            .iter()
+            .map(|k| parse_tenant_api_key(k))
+            .collect::<ConfigResult<Vec<_>>>()?;
+        let (oracle, postgres, redis) = match history_backend {
+            HistoryBackend::Oracle => (Some(self.build_oracle_config(schema)?), None, None),
+            HistoryBackend::Postgres => (None, Some(self.build_postgres_config(schema)?), None),
+            HistoryBackend::Redis => (None, None, Some(self.build_redis_config(schema)?)),
+            _ => (None, None, None),
+        };
+        let model_aliases = Self::model_aliases(&self.model_alias)?;
 
         let builder = RouterConfig::builder()
             .mode(mode)
