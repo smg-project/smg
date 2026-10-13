@@ -205,7 +205,7 @@ def server_facts(vllm_config: Any) -> dict[str, Any]:
         "kv_connector": str(kv_connector or ""),
         "kv_role": view.kv_transfer.role,
         "kv_engine_id": str(kv_engine_id or ""),
-        "data_parallel_size": int(view.parallel.data_parallel_size),
+        "data_parallel_size": view.data_parallel_size,
         "multimodal_encoder_dtype": encoder_dtype,
         "max_num_seqs": view.max_num_seqs,
         "shm_namespace_id": mm_shm.shm_namespace_id(),

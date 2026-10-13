@@ -90,5 +90,5 @@ def rank_sources_for(config: object, engine: object) -> list[RankSource]:
         if sources:
             return sources
     dp_size = EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_size
-    dp_size = int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1
+    dp_size = dp_size or 1
     return rank_sources(config, range(dp_size))

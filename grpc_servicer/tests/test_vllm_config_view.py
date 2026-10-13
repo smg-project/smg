@@ -74,6 +74,7 @@ def test_every_section_reads_the_config_it_was_given():
     assert view.multimodal.limit_per_prompt("image") == 8
     assert view.model_dtype == "torch.bfloat16"
     assert view.parallel.data_parallel_size == 2 and view.parallel.data_parallel_rank == 1
+    assert view.data_parallel_size == 2
     assert view.max_num_seqs == 64
     assert (view.cache.cache_dtype, view.cache.block_size, view.cache.num_gpu_blocks) == (
         "auto",
@@ -98,6 +99,9 @@ def test_a_config_without_a_section_reads_as_the_defaults(config):
     section is its defaults, and nothing is invented."""
     view = EngineConfigView(config)
     assert view.model_dtype is None
+    multimodal = view.multimodal
+    assert (multimodal.is_multimodal, multimodal.device_do_normalize) == (False, False)
+    assert multimodal.limit_per_prompt is None
     assert view.parallel.data_parallel_size is None and view.parallel.data_parallel_rank == 0
     assert view.max_num_seqs == 0
     assert (view.cache.cache_dtype, view.cache.block_size, view.cache.num_gpu_blocks) == (
@@ -125,6 +129,13 @@ def test_the_model_section_requires_the_facts_a_model_must_have():
             ModelSection.read(config)
     with pytest.raises(AttributeError):
         EngineConfigView(SimpleNamespace()).model  # noqa: B018 -- the read is the point
+    # The data-parallel width the server is told is required too, by name.
+    with pytest.raises(AttributeError, match="parallel_config"):
+        EngineConfigView(SimpleNamespace()).data_parallel_size  # noqa: B018
+    with pytest.raises(AttributeError, match="data_parallel_size"):
+        EngineConfigView(SimpleNamespace(parallel_config=SimpleNamespace())).data_parallel_size  # noqa: B018
+    two = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=2))
+    assert EngineConfigView(two).data_parallel_size == 2
 
 
 def test_the_model_section_degrades_the_rest_to_the_proto_defaults():

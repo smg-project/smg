@@ -10,11 +10,13 @@ this module's tests and the Python servicer's live lane. Engine-free at
 import: the config objects are taken as given and nothing from vLLM is
 imported.
 
-A section is read when first asked for, once per view: the Python servicer
-builds a view per answer, the Rust launcher one per start. The sections are
-lenient (a missing section reads as its defaults) except :attr:`model`, the
-facts of ``GetModelInfo``, which fails on a config without the model's name,
-context length or vocabulary rather than advertise an invented value.
+A section is read when first asked for, once per view; a reader builds a
+view where it reads (a view holds a reference and nothing else until a
+section is asked for). The sections are lenient (a missing section reads as
+its defaults, a view over ``None`` reads every section so) except the two
+facts the servicers never invent: :attr:`model`, the facts of
+``GetModelInfo``, fails on a config without the model's name, context length
+or vocabulary, and :attr:`data_parallel_size` on a config without one.
 """
 
 from __future__ import annotations
@@ -119,17 +121,18 @@ class MultimodalSection:
 
 @dataclasses.dataclass(frozen=True)
 class ParallelSection:
-    """``ParallelConfig``: the data-parallel width, and the first rank this
+    """``ParallelConfig`` as a lenient read: the data-parallel width when the
+    config carries a count (``None`` otherwise), and the first rank this
     process serves (0 unless the config says otherwise)."""
 
-    data_parallel_size: Any
+    data_parallel_size: int | None
     data_parallel_rank: int
 
     @classmethod
     def read(cls, vllm_config: Any) -> ParallelSection:
         parallel = getattr(vllm_config, "parallel_config", None)
         return cls(
-            data_parallel_size=getattr(parallel, "data_parallel_size", None),
+            data_parallel_size=_positive_int(getattr(parallel, "data_parallel_size", None)),
             data_parallel_rank=_positive_int(getattr(parallel, "data_parallel_rank", 0)) or 0,
         )
 
@@ -234,7 +237,7 @@ class EngineConfigView:
 
     @cached_property
     def multimodal(self) -> MultimodalSection:
-        return MultimodalSection.read(self._config.model_config)
+        return MultimodalSection.read(getattr(self._config, "model_config", None))
 
     @cached_property
     def model_dtype(self) -> str | None:
@@ -246,6 +249,13 @@ class EngineConfigView:
     @cached_property
     def parallel(self) -> ParallelSection:
         return ParallelSection.read(self._config)
+
+    @cached_property
+    def data_parallel_size(self) -> int:
+        """The data-parallel width the Rust server and ``GetServerInfo`` are
+        told; required of the config (a reader that can do without one reads
+        :attr:`parallel` instead)."""
+        return int(self._config.parallel_config.data_parallel_size)
 
     @cached_property
     def max_num_seqs(self) -> int:
