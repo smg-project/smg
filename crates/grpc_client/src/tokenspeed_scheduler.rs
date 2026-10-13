@@ -21,7 +21,7 @@ use openai_protocol::{
 use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector, NoopTraceInjector};
+use crate::{deadline::deadline_request, AbortOnDropClient, BoxedTraceInjector, NoopTraceInjector};
 
 #[expect(clippy::allow_attributes)]
 pub mod tokenspeed_proto {
@@ -92,7 +92,7 @@ impl TokenSpeedSchedulerClient {
         let request_id = req.request_id.clone();
 
         let mut client = self.client.clone();
-        let mut request = Request::new(req);
+        let (deadline, mut request) = deadline_request(req);
 
         if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
             warn!("Failed to inject trace context: {}", e);
@@ -100,11 +100,10 @@ impl TokenSpeedSchedulerClient {
 
         let response = client.generate(request).await?;
 
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
+        Ok(
+            AbortOnDropStream::new(response.into_inner(), request_id, self.clone())
+                .with_deadline(deadline),
+        )
     }
 
     pub async fn health_check(

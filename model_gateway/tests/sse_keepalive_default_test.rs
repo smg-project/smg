@@ -21,7 +21,7 @@ use support::{app, stream, MODEL};
 async fn the_default_configuration_keeps_a_silent_chat_stream_alive_within_the_proxy_idle_window() {
     // The engine never speaks within the budget: whatever arrives is the
     // gateway's own keep-alive.
-    let (app, server) = app(Duration::from_secs(120), None).await;
+    let (app, server) = app(Duration::from_secs(120), None, None, false).await;
     let body = json!({
         "model": MODEL,
         "messages": [{"role": "user", "content": "Hello"}],

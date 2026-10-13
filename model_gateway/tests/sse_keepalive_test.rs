@@ -111,7 +111,7 @@ fn keep_alives<'a>(arrivals: &'a [Arrival], keep_alive: &str) -> Vec<&'a Arrival
 
 #[tokio::test]
 async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_silence() {
-    let (app, server) = app(SILENCE, Some(1)).await;
+    let (app, server) = app(SILENCE, Some(1), None, false).await;
     for endpoint in endpoints() {
         let (arrivals, eof) =
             stream_to_end(&app, endpoint.path, endpoint.body.clone(), BUDGET).await;
@@ -160,7 +160,7 @@ async fn every_streaming_endpoint_carries_a_keep_alive_through_the_engine_s_sile
 
 #[tokio::test]
 async fn an_interval_of_zero_sends_nothing_through_the_silence() {
-    let (app, server) = app(SILENCE, Some(0)).await;
+    let (app, server) = app(SILENCE, Some(0), None, false).await;
     let endpoints = endpoints();
     let chat = &endpoints[0];
     let arrivals = stream(&app, chat.path, chat.body.clone(), BUDGET).await;

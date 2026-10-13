@@ -2,10 +2,13 @@
 
 use axum::response::Response;
 use http::StatusCode;
-use smg_grpc_client::{is_transport_failure, WorkerMediaFault};
+use smg_grpc_client::{is_call_deadline, is_transport_failure, WorkerMediaFault};
 use tonic::Code;
 
-use crate::routers::error;
+use crate::routers::{common::retry::mark_non_retryable, error};
+
+/// The HTTP path's code for its upstream client's timeout.
+pub(crate) const REQUEST_TIMEOUT_CODE: &str = "call_upstream_timeout";
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
@@ -51,6 +54,11 @@ impl TonicStatusExt for tonic::Status {
             Some(WorkerMediaFault::Transient) => return StatusCode::BAD_GATEWAY,
             None => {}
         }
+        // The call's own deadline (`--request-timeout-secs`): the HTTP path's
+        // 504 for its client timeout, whichever code it reached us under.
+        if is_call_deadline(self) {
+            return StatusCode::GATEWAY_TIMEOUT;
+        }
         // tonic makes a status of a failure in the HTTP/2 layer under the
         // call (the connection went away: a GOAWAY of either side, the one
         // the gateway's own client issues over too many locally-reset
@@ -86,6 +94,13 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn to_http_error(&self, code: &str, msg: String) -> Response {
+        // The HTTP path's answer for its client timeout, terminal for the
+        // retry layer (a replay would hold the client for a second timeout).
+        if is_call_deadline(self) {
+            let mut response = error::gateway_timeout(REQUEST_TIMEOUT_CODE, self.message());
+            mark_non_retryable(&mut response);
+            return response;
+        }
         error::create_error(self.http_status(), code, msg)
     }
 
