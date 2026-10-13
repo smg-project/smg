@@ -268,7 +268,10 @@ pub(crate) fn init_metrics() {
          response has gone out in full (its last frame, or the length it declared); a \
          request whose client closed the connection first counts as status_code 499 \
          with error_code client_closed_request, as does the rare request the server \
-         dropped unanswered (a handler panic, a forced shutdown)"
+         dropped unanswered (a handler panic, a forced shutdown); a response whose body \
+         failed after its head (an upstream stream that broke mid-body) keeps its head's \
+         status_code with error_code stream_error, unless the head carried a gateway \
+         error code"
     );
     describe_gauge!(
         "smg_http_connections_active",
