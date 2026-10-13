@@ -202,8 +202,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     @functools.cached_property
     def _config(self) -> EngineConfigView:
         """The launcher's server args and the engine's model config, read once:
-        neither changes for the servicer's life, and the load record reads
-        them on every KV-event batch."""
+        the load record reads them on every KV-event batch. One field of the
+        args does change for the servicer's life, ``weight_version`` (an RL
+        weight update writes the new version back onto the args), so
+        ``GetModelInfo`` reads it live through a fresh view, not from here."""
         return EngineConfigView(self.server_args, getattr(self.async_llm, "model_config", None))
 
     @functools.cached_property
@@ -497,7 +499,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             model_path=args.model,
             tokenizer_path=args.tokenizer,
             default_sampling_params_json=args.preferred_sampling_params or "",
-            weight_version=args.weight_version,
+            # Live, not from the cached view: an RL weight update rewrites it.
+            weight_version=EngineConfigView(self.server_args).server_args.weight_version,
             served_model_name=(args.served_model_name or args.model),
             max_context_length=int(self.async_llm.context_len),
             vocab_size=model.vocab_size,

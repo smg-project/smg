@@ -152,3 +152,15 @@ def test_a_section_is_read_once_per_view():
     view = EngineConfigView(Args())
     assert view.server_args.page_size == 8 and view.server_args.page_size == 8
     assert reads == [1]
+
+
+def test_a_fresh_view_reads_a_weight_version_written_back_onto_the_args():
+    """An RL weight update writes the new version onto the launcher's args while
+    the servicer runs; a view built earlier keeps what it read, so the live
+    answer of ``GetModelInfo`` comes from a fresh view over the same args."""
+    args = _server_args(weight_version="v7")
+    earlier = EngineConfigView(args)
+    assert earlier.server_args.weight_version == "v7"
+    args.weight_version = "v8"
+    assert earlier.server_args.weight_version == "v7"
+    assert EngineConfigView(args).server_args.weight_version == "v8"
