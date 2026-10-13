@@ -37,6 +37,7 @@ from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
+from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
@@ -107,11 +108,9 @@ def _prompt_length(prompt) -> int:
 
 def _kv_capacity_tokens(engine) -> int:
     """The KV cache's token capacity, when the engine config exposes it."""
-    cache = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
-    blocks = getattr(cache, "num_gpu_blocks", None)
-    block_size = getattr(cache, "block_size", None)
-    if isinstance(blocks, int) and isinstance(block_size, int) and blocks > 0 and block_size > 0:
-        return blocks * block_size
+    cache = EngineConfigView(getattr(engine, "vllm_config", None)).cache
+    if cache.num_gpu_blocks is not None and cache.block_size is not None:
+        return cache.num_gpu_blocks * cache.block_size
     return 0
 
 
@@ -132,9 +131,7 @@ def _first_rank(engine) -> int:
         ranks = [rank for rank in managed if isinstance(rank, int)]
         if ranks:
             return min(ranks)
-    parallel = getattr(getattr(engine, "vllm_config", None), "parallel_config", None)
-    start = getattr(parallel, "data_parallel_rank", 0)
-    return start if isinstance(start, int) and start > 0 else 0
+    return EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_rank
 
 
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
@@ -429,8 +426,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
                     if cache_salt is not None:
                         prompt["cache_salt"] = cache_salt
-                    model_config = getattr(self.engine, "model_config", None)
-                    if model_config is not None and getattr(model_config, "uses_mrope", False):
+                    if uses_mrope(getattr(self.engine, "model_config", None)):
                         logger.warning(
                             "Request %s carries mm identity but no grid tensors on an "
                             "M-RoPE model; decode-side positions will be text-only",

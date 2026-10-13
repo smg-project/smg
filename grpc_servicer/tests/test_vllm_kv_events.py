@@ -352,6 +352,7 @@ def _load_record_method():
     import logging
 
     from smg_grpc_proto.generated import common_pb2
+    from smg_grpc_servicer.vllm.config_view import EngineConfigView
 
     package = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm"
     spec = importlib.util.spec_from_file_location("vllm_loads_for_the_record", package / "loads.py")
@@ -366,6 +367,7 @@ def _load_record_method():
     ]
     assert {node.name for node in defs} == wanted
     namespace = {
+        "EngineConfigView": EngineConfigView,
         "common_pb2": common_pb2,
         "load_record": loads_mod.load_record,
         "logger": logging.getLogger("vllm_servicer_under_test"),
