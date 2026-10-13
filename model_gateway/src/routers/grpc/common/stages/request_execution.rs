@@ -1733,6 +1733,10 @@ async fn execute_sequential_pd(
                     "MoRIIOConnector PD is supported by the HTTP PD router only",
                 ));
             }
+            KvConnectorMode::Store => debug!(
+                "vLLM PD (KV store): the prefill writes its blocks to the shared store and the \
+                 decode reads them back by prefix hash; no connector params on either leg"
+            ),
             KvConnectorMode::Passthrough => {
                 // Warn once: PD without a discovered connector usually means GetServerInfo
                 // lacks kv fields or labels.kv_connector is missing in worker config
@@ -1979,7 +1983,10 @@ async fn execute_sequential_pd(
             decode_request.set_kv_transfer_params(host.clone(), *port);
             handed_off = true;
         }
-        (KvConnectorMode::Nixl | KvConnectorMode::Passthrough, Some(json)) if relay_kv_params => {
+        (
+            KvConnectorMode::Nixl | KvConnectorMode::Store | KvConnectorMode::Passthrough,
+            Some(json),
+        ) if relay_kv_params => {
             debug!(
                 request_id = %decode_request.request_id(),
                 params_len = json.len(),

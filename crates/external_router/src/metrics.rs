@@ -166,6 +166,7 @@ pub mod metrics_labels {
     pub const KV_CONNECTOR_MORIIO: &str = "moriio";
     pub const KV_CONNECTOR_NIXL: &str = "nixl";
     pub const KV_CONNECTOR_PASSTHROUGH: &str = "passthrough";
+    pub const KV_CONNECTOR_STORE: &str = "store";
 
     // Storage types
     pub const STORAGE_RESPONSE: &str = "response";

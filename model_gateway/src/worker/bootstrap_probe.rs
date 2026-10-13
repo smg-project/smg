@@ -17,9 +17,12 @@ use std::time::Duration;
 
 use openai_protocol::worker::{RuntimeType, WorkerType};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use super::{worker::WorkerTypeExt, Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR};
+use super::{
+    pd_pairing::KvTransferProfile, worker::WorkerTypeExt, Worker, DEFAULT_BOOTSTRAP_PORT,
+    MOONCAKE_CONNECTOR,
+};
 use crate::observability::metrics::Metrics;
 
 /// How long the probe waits for the connection: long enough for a far host,
@@ -52,19 +55,31 @@ impl BootstrapPortSource {
     }
 }
 
+/// A prefill leg whose connector writes to a shared store: its partners read
+/// its blocks back from the store and are handed no port, whatever port the
+/// leg was registered with.
+fn is_store_prefill_leg(worker: &dyn Worker) -> bool {
+    matches!(worker.worker_type(), WorkerType::Prefill)
+        && worker.pd_pairing().profile() == Some(KvTransferProfile::Store)
+}
+
 /// The bootstrap port the gateway hands a partner of `worker`, and where it
 /// comes from; `None` when no partner is handed one.
 ///
-/// A registered port is the one, for any worker. Without one, the request
-/// path applies [`DEFAULT_BOOTSTRAP_PORT`] to the legs whose partners
-/// rendezvous on a bootstrap server: an encode leg, and a prefill leg of every
-/// runtime whose rendezvous travels in the request (the SGLang-style
-/// bootstrap metadata and the KV bootstrap room), or of vLLM on the Mooncake
-/// connector, whose decode-leg `remote_bootstrap_addr` is minted with it. A
-/// vLLM prefill leg on another connector (NIXL, MoRI-IO, none) carries its own
-/// side channel and is never handed a bootstrap port, and neither is a decode
-/// or a regular worker.
+/// A registered port is the one, for any worker but a prefill leg on a KV
+/// store (see [`is_store_prefill_leg`]). Without one, the request path
+/// applies [`DEFAULT_BOOTSTRAP_PORT`] to the legs whose partners rendezvous
+/// on a bootstrap server: an encode leg, and a prefill leg of every runtime
+/// whose rendezvous travels in the request (the SGLang-style bootstrap
+/// metadata and the KV bootstrap room), or of vLLM on the Mooncake connector,
+/// whose decode-leg `remote_bootstrap_addr` is minted with it. A vLLM prefill
+/// leg on another connector (NIXL, MoRI-IO, a store, none) carries its own
+/// side channel or meets its partners in the store and is never handed a
+/// bootstrap port, and neither is a decode or a regular worker.
 pub(crate) fn effective_bootstrap_port(worker: &dyn Worker) -> Option<(u16, BootstrapPortSource)> {
+    if is_store_prefill_leg(worker) {
+        return None;
+    }
     if let Some(port) = worker.bootstrap_port() {
         return Some((port, BootstrapPortSource::Registered));
     }
@@ -106,8 +121,22 @@ pub(crate) async fn probe_bootstrap_port(
 /// Probe the bootstrap port the partners of `worker` are handed (see
 /// [`effective_bootstrap_port`]), off the registration path. Nothing happens
 /// for a worker no partner is handed one for, or for a transport that
-/// carries no host.
+/// carries no host; a port registered on a prefill leg whose partners meet
+/// it in a KV store is said to be unused instead of probed.
 pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
+    if is_store_prefill_leg(worker) {
+        if let Some(port) = worker.bootstrap_port() {
+            info!(
+                worker = %worker.url(),
+                bootstrap_port = port,
+                kv_connector = worker.metadata().spec.kv_connector.as_deref().unwrap_or(""),
+                "Bootstrap port registered on a prefill leg whose KV connector writes to a \
+                 shared store is not used: its decode partners read the blocks back from \
+                 the store, nothing rendezvous on the port"
+            );
+        }
+        return;
+    }
     let Some((port, source)) = effective_bootstrap_port(worker) else {
         return;
     };
@@ -297,6 +326,43 @@ mod tests {
                 "{worker_type} {runtime} {connector:?}"
             );
         }
+    }
+
+    /// A prefill leg whose connector writes to a shared store hands no
+    /// partner a port, whatever port it was registered with: its decode
+    /// partners read the blocks back from the store. The rendezvous variant
+    /// of the same family keeps its probe.
+    #[test]
+    fn a_store_prefill_leg_is_not_probed_whatever_port_it_was_registered_with() {
+        for connector in [
+            "MooncakeStoreConnector",
+            "LMCacheConnectorV1",
+            "SharedStorageConnector",
+        ] {
+            for port in [Some(8998), Some(9090), None] {
+                let worker = leg(
+                    WorkerType::Prefill,
+                    RuntimeType::Vllm,
+                    Some(connector),
+                    port,
+                );
+                assert_eq!(
+                    effective_bootstrap_port(&worker),
+                    None,
+                    "{connector} {port:?}"
+                );
+            }
+        }
+        let rendezvous = leg(
+            WorkerType::Prefill,
+            RuntimeType::Vllm,
+            Some(MOONCAKE_CONNECTOR),
+            Some(8998),
+        );
+        assert_eq!(
+            effective_bootstrap_port(&rendezvous),
+            Some((8998, BootstrapPortSource::Registered))
+        );
     }
 
     /// For a vLLM prefill leg the probe's decision is the request path's: the

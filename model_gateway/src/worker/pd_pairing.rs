@@ -71,12 +71,29 @@ impl PairingMismatch {
     }
 }
 
+/// How a KV transport moves blocks between the legs of a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvTransferProfile {
+    /// A rendezvous or side channel per pair: the prefill hands its blocks
+    /// to the one decode the request names (a bootstrap address, a peer's
+    /// side channel, a transfer id), so the gateway tags the legs and probes
+    /// the port the partners meet on.
+    P2p,
+    /// A shared store keyed by prefix hash: the prefill writes its blocks to
+    /// the store and whichever decode follows reads them back. Nothing is
+    /// agreed per pair and nothing listens for a partner, so the gateway
+    /// tags no leg, mints no handoff and probes no port; it only runs the
+    /// decode after the prefill.
+    Store,
+}
+
 /// What one PD worker offers a rendezvous partner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdPairing {
     runtime: RuntimeType,
     explicit: Option<String>,
     transport: Option<String>,
+    profile: Option<KvTransferProfile>,
     version: Option<String>,
     /// The reported KV layout facts by short name (see `LAYOUT_FACTS`).
     kv_layout: BTreeMap<&'static str, String>,
@@ -93,10 +110,13 @@ impl PdPairing {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let transport = transport_of(spec);
+        let profile = profile_of(spec, transport.is_some());
         Self {
             runtime: spec.runtime_type,
             explicit,
-            transport: transport_of(spec),
+            transport,
+            profile,
             version: non_empty(labels.get("version")),
             kv_layout: kv_layout_of(labels),
         }
@@ -110,6 +130,12 @@ impl PdPairing {
     /// The KV transport, when known.
     pub fn transport(&self) -> Option<&str> {
         self.transport.as_deref()
+    }
+
+    /// How the transport moves blocks between the legs, when the transport
+    /// is known.
+    pub fn profile(&self) -> Option<KvTransferProfile> {
+        self.profile
     }
 
     /// The engine version, when reported.
@@ -225,17 +251,61 @@ fn non_empty(value: Option<&String>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The connector a vLLM worker names: on its spec, else as a discovered label.
+fn vllm_connector(spec: &WorkerSpec) -> Option<String> {
+    spec.kv_connector
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| non_empty(spec.labels.get("kv_connector")))
+}
+
+/// The transfer profile by runtime: a vLLM connector's name says whether it
+/// writes to a store (see [`connector_profile`]); the transfer backends of
+/// SGLang and TokenSpeed all rendezvous per pair. Unknown when the transport
+/// is.
+fn profile_of(spec: &WorkerSpec, transport_known: bool) -> Option<KvTransferProfile> {
+    match spec.runtime_type {
+        RuntimeType::Vllm => vllm_connector(spec).map(|connector| connector_profile(&connector)),
+        RuntimeType::Sglang | RuntimeType::TokenSpeed => {
+            transport_known.then_some(KvTransferProfile::P2p)
+        }
+        RuntimeType::Trtllm
+        | RuntimeType::Mlx
+        | RuntimeType::Generic
+        | RuntimeType::External
+        | RuntimeType::Unspecified => None,
+    }
+}
+
+/// Name fragments (lower-cased) of the connectors that write to a shared
+/// store instead of handing blocks to a partner: the Mooncake store, the
+/// LMCache family, the shared-storage, offloading, FlexKV and 3FS
+/// connectors.
+const STORE_CONNECTOR_MARKERS: [&str; 6] =
+    ["store", "lmcache", "storage", "offload", "flexkv", "hf3fs"];
+
+/// The profile a connector's name implies. A name that says nothing is a
+/// rendezvous connector: what every P2P connector is, and what the request
+/// path's passthrough handling of an unknown connector assumes.
+pub fn connector_profile(connector: &str) -> KvTransferProfile {
+    let lower = connector.to_ascii_lowercase();
+    if STORE_CONNECTOR_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        KvTransferProfile::Store
+    } else {
+        KvTransferProfile::P2p
+    }
+}
+
 /// The KV transport by runtime: vLLM names a connector, SGLang a transfer
 /// backend, TokenSpeed has only Mooncake.
 fn transport_of(spec: &WorkerSpec) -> Option<String> {
     let labels = &spec.labels;
     match spec.runtime_type {
-        RuntimeType::Vllm => spec
-            .kv_connector
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| non_empty(labels.get("kv_connector")))
+        RuntimeType::Vllm => vllm_connector(spec)
             .map(|connector| normalise_connector(&connector))
             // MoRI-IO READ and WRITE engines cannot hand KV to each other.
             .map(|transport| {
@@ -259,18 +329,24 @@ fn transport_of(spec: &WorkerSpec) -> Option<String> {
     }
 }
 
-/// `NixlConnector` / `MooncakeConnector` (and their store variants) fold to
-/// the transport name; anything else is kept lower-cased.
+/// `NixlConnector` / `MooncakeConnector` fold to the transport name and
+/// their store variants to `<transport>-store`: legs that meet in a store
+/// cannot hand KV to legs that rendezvous, so the two never pair. Anything
+/// else is kept lower-cased.
 fn normalise_connector(connector: &str) -> String {
     let lower = connector.to_ascii_lowercase();
-    if lower.contains("nixl") {
-        "nixl".to_string()
+    let family = if lower.contains("nixl") {
+        "nixl"
     } else if lower.contains("mooncake") {
-        "mooncake".to_string()
+        "mooncake"
     } else if lower.contains("moriio") {
-        "moriio".to_string()
+        "moriio"
     } else {
-        lower
+        return lower;
+    };
+    match connector_profile(connector) {
+        KvTransferProfile::P2p => family.to_string(),
+        KvTransferProfile::Store => format!("{family}-store"),
     }
 }
 
@@ -327,7 +403,91 @@ mod tests {
             RuntimeType::Vllm,
             &[("kv_connector", "MooncakeStoreConnector")],
         );
-        assert_eq!(PdPairing::derive(&s).transport(), Some("mooncake"));
+        assert_eq!(PdPairing::derive(&s).transport(), Some("mooncake-store"));
+    }
+
+    /// The connector's name says how its legs meet: the P2P connectors
+    /// rendezvous per pair, the store connectors meet in a shared store; the
+    /// other runtimes' transfer backends all rendezvous, and a worker with no
+    /// known transport has no profile.
+    #[test]
+    fn a_connectors_name_says_whether_its_legs_rendezvous_or_meet_in_a_store() {
+        let vllm = |connector: &str| {
+            let mut s = spec(RuntimeType::Vllm, &[]);
+            s.kv_connector = Some(connector.to_string());
+            PdPairing::derive(&s)
+        };
+        for (connector, profile) in [
+            ("MooncakeConnector", KvTransferProfile::P2p),
+            ("NixlConnector", KvTransferProfile::P2p),
+            ("NixlPullConnector", KvTransferProfile::P2p),
+            ("MoRIIOConnector", KvTransferProfile::P2p),
+            ("P2pNcclConnector", KvTransferProfile::P2p),
+            ("MooncakeStoreConnector", KvTransferProfile::Store),
+            ("LMCacheConnectorV1", KvTransferProfile::Store),
+            ("LMCacheMPConnector", KvTransferProfile::Store),
+            ("SharedStorageConnector", KvTransferProfile::Store),
+            ("OffloadingConnector", KvTransferProfile::Store),
+            ("FlexKVConnectorV1", KvTransferProfile::Store),
+            ("HF3FSKVConnector", KvTransferProfile::Store),
+        ] {
+            assert_eq!(connector_profile(connector), profile, "{connector}");
+            assert_eq!(vllm(connector).profile(), Some(profile), "{connector}");
+        }
+        let sglang = spec(
+            RuntimeType::Sglang,
+            &[("disaggregation_transfer_backend", "mooncake")],
+        );
+        assert_eq!(
+            PdPairing::derive(&sglang).profile(),
+            Some(KvTransferProfile::P2p)
+        );
+        assert_eq!(
+            PdPairing::derive(&spec(RuntimeType::TokenSpeed, &[])).profile(),
+            Some(KvTransferProfile::P2p)
+        );
+        assert_eq!(
+            PdPairing::derive(&spec(RuntimeType::Vllm, &[])).profile(),
+            None
+        );
+        assert_eq!(
+            PdPairing::derive(&spec(RuntimeType::Sglang, &[])).profile(),
+            None
+        );
+    }
+
+    /// A store variant of a rendezvous connector family is its own transport:
+    /// a store leg and a rendezvous leg cannot hand KV to each other, so they
+    /// never pair in a mode that compares transports.
+    #[test]
+    fn a_store_connector_is_its_own_transport_and_never_pairs_with_a_rendezvous_leg() {
+        let vllm = |connector: &str| {
+            let mut s = spec(RuntimeType::Vllm, &[]);
+            s.kv_connector = Some(connector.to_string());
+            PdPairing::derive(&s)
+        };
+        let store = vllm("MooncakeStoreConnector");
+        let rendezvous = vllm("MooncakeConnector");
+        assert_eq!(store.transport(), Some("mooncake-store"));
+        assert_eq!(store.key(), "vllm/mooncake-store/?");
+        assert_eq!(rendezvous.transport(), Some("mooncake"));
+        for mode in [PdPairingMode::Lenient, PdPairingMode::Strict] {
+            assert_eq!(
+                store.mismatch(&rendezvous, mode),
+                Some(PairingMismatch::Transport)
+            );
+            assert_eq!(
+                rendezvous.mismatch(&store, mode),
+                Some(PairingMismatch::Transport)
+            );
+            assert!(store.compatible(&store.clone(), mode));
+        }
+        assert!(store.compatible(&rendezvous, PdPairingMode::Off));
+        // A store connector of its own family keeps its own name, as before.
+        assert_eq!(
+            vllm("LMCacheConnectorV1").transport(),
+            Some("lmcacheconnectorv1")
+        );
     }
 
     #[test]

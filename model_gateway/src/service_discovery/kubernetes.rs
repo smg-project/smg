@@ -27,7 +27,11 @@ use super::{
 };
 use crate::{
     app_context::AppContext,
-    worker::{endpoint::Endpoint, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
+    worker::{
+        endpoint::Endpoint,
+        pd_pairing::{connector_profile, KvTransferProfile},
+        MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+    },
 };
 
 /// Labels Kubernetes discovery has always stamped on the workers it registers,
@@ -316,7 +320,10 @@ impl PodInfo {
         };
         let kv_connector = config.and_then(|config| {
             let connector = annotation_value(pod, &config.kv_connector_annotation)?;
-            if connector != MOONCAKE_CONNECTOR && connector != NIXL_CONNECTOR {
+            if connector != MOONCAKE_CONNECTOR
+                && connector != NIXL_CONNECTOR
+                && connector_profile(connector) != KvTransferProfile::Store
+            {
                 warn!(
                     "Pod {}: {} annotation '{}' is not a connector with explicit PD handling; \
                      using passthrough behavior",

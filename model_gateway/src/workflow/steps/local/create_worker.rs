@@ -904,6 +904,24 @@ mod tests {
         bootstrap_port: Option<u16>,
         registration_mode: WorkerRegistrationMode,
     ) -> WorkflowContext<WorkerWorkflowData> {
+        leg_context_on(
+            worker_type,
+            bootstrap_port,
+            registration_mode,
+            RuntimeType::Unspecified,
+            None,
+        )
+    }
+
+    /// A registration context for a disaggregated leg of `runtime` on
+    /// `kv_connector`, at a loopback URL.
+    fn leg_context_on(
+        worker_type: WorkerType,
+        bootstrap_port: Option<u16>,
+        registration_mode: WorkerRegistrationMode,
+        runtime: RuntimeType,
+        kv_connector: Option<&str>,
+    ) -> WorkflowContext<WorkerWorkflowData> {
         use openai_protocol::worker::WorkerModels;
         use wfaas::WorkflowInstanceId;
 
@@ -913,6 +931,8 @@ mod tests {
         spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
         spec.worker_type = worker_type;
         spec.bootstrap_port = bootstrap_port;
+        spec.runtime_type = runtime;
+        spec.kv_connector = kv_connector.map(str::to_string);
         let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
@@ -1078,6 +1098,53 @@ mod tests {
                 && counted.contains(r#"phase="probe""#)
                 && counted.ends_with(" 1"),
             "{counted}"
+        );
+    }
+
+    /// A prefill leg on a KV store registered with the bootstrap port the
+    /// rendezvous recipe carries: no partner is ever handed it, so nothing is
+    /// probed and no probe failure is counted once the leg is registered.
+    #[tokio::test]
+    async fn a_store_prefill_legs_registered_bootstrap_port_is_not_probed() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        let closed_port = closed_loopback_port();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let mut ctx = leg_context_on(
+            WorkerType::Prefill,
+            Some(closed_port),
+            WorkerRegistrationMode::Upsert,
+            RuntimeType::Vllm,
+            Some("MooncakeStoreConnector"),
+        );
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let worker = Arc::clone(&ctx.data.actual_workers.as_ref().unwrap()[0]);
+        assert_eq!(
+            worker.bootstrap_port(),
+            Some(closed_port),
+            "the spec keeps what was registered"
+        );
+        assert_eq!(
+            worker.metadata().spec.kv_connector.as_deref(),
+            Some("MooncakeStoreConnector")
+        );
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        // A probe of the closed loopback port is refused and counted at once;
+        // wait longer than that before reading nothing.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_pd_rendezvous_failures_total"),
+            "{rendered}"
         );
     }
 

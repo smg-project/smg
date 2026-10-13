@@ -1545,7 +1545,10 @@ impl PDRouter {
                 None
             }
             (
-                KvConnectorMode::Nixl | KvConnectorMode::MoriIo | KvConnectorMode::Passthrough,
+                KvConnectorMode::Nixl
+                | KvConnectorMode::MoriIo
+                | KvConnectorMode::Store
+                | KvConnectorMode::Passthrough,
                 Some(params),
             ) if relay => Some(params),
             (KvConnectorMode::Nixl, None) if relay => {
