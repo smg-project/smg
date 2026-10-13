@@ -4109,6 +4109,181 @@ mod video_sampling_tests {
         }
     }
 
+    /// The described selection run through ffmpeg itself, where it is
+    /// installed: a synthetic clip longer than the list limit, the filter as
+    /// the crate builds it (both spreads: the loader's and the rate-based
+    /// one), the frames ffmpeg hands back matched against a plain decode of
+    /// every frame, so the source indices picked are the Rust selection's.
+    #[tokio::test]
+    async fn the_described_selection_picks_the_same_frames_through_ffmpeg() {
+        use std::process::{Command as Sync, Stdio};
+        let have = |tool: &str| {
+            Sync::new(tool)
+                .arg("-version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        if !have("ffmpeg") {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let total = 900usize;
+        let fps = 30.0;
+        let path = dir.path().join("clip.mp4");
+        // Frame i carries i in its pixels: sixteen 4x4 blocks, white where
+        // the bit is set, black elsewhere, kept exact by lossless coding, so
+        // a decoded frame names its own source index.
+        let side = 16usize;
+        let mut raw = Vec::with_capacity(total * side * side * 3);
+        for index in 0..total {
+            for y in 0..side {
+                for x in 0..side {
+                    let bit = (y / 4) * 4 + x / 4;
+                    let value = if (index >> bit) & 1 == 1 { 255u8 } else { 0u8 };
+                    raw.extend_from_slice(&[value, value, value]);
+                }
+            }
+        }
+        let mut encode = Sync::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-s",
+                "16x16",
+                "-r",
+                "30",
+                "-i",
+                "pipe:0",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "30",
+            ])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg runs");
+        {
+            use std::io::Write;
+            let mut stdin = encode.stdin.take().expect("ffmpeg stdin");
+            stdin.write_all(&raw).expect("frames written");
+        }
+        let status = encode.wait().expect("ffmpeg finishes");
+        assert!(status.success());
+        // every frame, decoded the way the selected frames are decoded
+        let mut all = ffmpeg_decode_command(2, true);
+        all.arg(&path);
+        all.args([
+            "-vf",
+            RGB_CONVERSION,
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "ppm",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]);
+        let all = run_video_command_output(all, "ffmpeg")
+            .await
+            .expect("full decode");
+        assert!(all.status.success());
+        let every_frame = parse_ppm_stream(&all.stdout).expect("ppm frames");
+        assert_eq!(every_frame.len(), total, "the clip holds every frame");
+        let index_of = |frame: &image::DynamicImage| -> usize {
+            let rgb = frame.to_rgb8();
+            assert_eq!((rgb.width(), rgb.height()), (16, 16));
+            (0..16u32).fold(0usize, |index, bit| {
+                let (x, y) = (bit % 4 * 4 + 2, bit / 4 * 4 + 2);
+                let bright = rgb.get_pixel(x, y)[0] > 127;
+                index | (usize::from(bright) << bit)
+            })
+        };
+        assert_eq!(
+            every_frame.iter().map(index_of).collect::<Vec<_>>(),
+            (0..total).collect::<Vec<_>>(),
+            "the clip's frames decode to their own indices, in order"
+        );
+        // The loader's spread and an exact rate spread are the described
+        // form; a rate whose picks end on the clip's last frame has no spread
+        // formula and stays a list past the limit: both shapes go through
+        // ffmpeg.
+        for (label, config, described) in [
+            ("loader spread", up_to_cfg(300), true),
+            ("rate spread, listed", interval_cfg(15.0, 768), false),
+            (
+                "rate spread, described",
+                VideoFetchConfig {
+                    sample_fps: 12.0,
+                    max_frames: 768,
+                    ..cfg()
+                },
+                true,
+            ),
+        ] {
+            let selection = FrameSelection::from_metadata(metadata(Some(fps), Some(total)), config)
+                .expect("frame rate and count are known");
+            assert!(
+                selection.unique_count() > FFMPEG_MAX_SELECT_TERMS,
+                "{label}: {} distinct frames are past the list limit",
+                selection.unique_count()
+            );
+            let filter = selection.select_filter();
+            assert_eq!(
+                filter.starts_with("select='eq(n\\,floor("),
+                described,
+                "{label}: {filter}"
+            );
+            let mut command = ffmpeg_decode_command(2, true);
+            command.arg(&path);
+            FfmpegFrameArgs::selected(&selection)
+                .await
+                .apply(&mut command);
+            command.args([
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "ppm",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ]);
+            let output = run_video_command_output(command, "ffmpeg")
+                .await
+                .expect("selected decode");
+            assert!(
+                output.status.success(),
+                "{label}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let picked = parse_ppm_stream(&output.stdout).expect("ppm frames");
+            let indices: Vec<usize> = picked.iter().map(index_of).collect();
+            let expected: Vec<usize> = selection
+                .unique_frames
+                .iter()
+                .map(|(index, _)| *index)
+                .collect();
+            assert_eq!(
+                indices, expected,
+                "{label}: ffmpeg picked other frames than the selection"
+            );
+        }
+    }
+
     #[test]
     fn the_described_selection_covers_the_same_frames() {
         // ffmpeg evaluates the expression per frame with its own `round` (half
