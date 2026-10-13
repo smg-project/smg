@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    audio::DecodedAudio, error::MediaConnectorError, media::decode_image_bytes, vision::execution,
+    audio::DecodedAudio,
+    error::MediaConnectorError,
+    media::{apply_transparency, decode_image_bytes},
+    vision::execution,
 };
 
 /// Supported multimodal modalities.
@@ -191,6 +194,10 @@ pub struct ImageFrame {
     /// The policy the decode applies to an alpha channel: `KeepAlpha` unless
     /// the frame was built [`with_transparency`](Self::with_transparency).
     transparency: TransparencyPolicy,
+    /// Whether the frame was built from pixels ([`new`](Self::new)) rather
+    /// than from bytes it decodes: a later policy applies to those pixels,
+    /// as there is nothing to decode again.
+    from_pixels: bool,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -458,6 +465,7 @@ impl ImageFrame {
             source,
             hash,
             transparency: TransparencyPolicy::KeepAlpha,
+            from_pixels: true,
         }
     }
 
@@ -480,6 +488,7 @@ impl ImageFrame {
             source,
             hash,
             transparency: TransparencyPolicy::KeepAlpha,
+            from_pixels: false,
         }
     }
 
@@ -505,8 +514,25 @@ impl ImageFrame {
     /// ([`hash_image_with_transparency`](crate::hasher::hash_image_with_transparency)),
     /// so the caches that key on the hash never serve one policy's pixels for
     /// another's; a caller building frames itself does the same.
+    ///
+    /// The pixels always agree with [`transparency`](Self::transparency): a
+    /// frame already decoded from its bytes drops that decode and decodes
+    /// them again under `policy` when next asked (the policy applies before
+    /// the long-side cap, as in any decode); a frame built from pixels has
+    /// `policy` applied to the pixels it holds (an alpha channel is
+    /// composited over white or dropped; `KeepAlpha` leaves them as given).
+    /// The same policy again changes nothing.
     pub fn with_transparency(mut self, policy: TransparencyPolicy) -> Self {
+        if policy == self.transparency {
+            return self;
+        }
         self.transparency = policy;
+        if let Some(pixels) = self.decoded.take() {
+            if self.from_pixels {
+                // The cell is empty after `take`, so this first `set` holds.
+                let _ = self.decoded.set(apply_transparency(pixels, &[], policy));
+            }
+        }
         self
     }
     /// Decode the pixels of every frame that is still encoded, in parallel on
@@ -924,6 +950,101 @@ mod tests {
             b"completed",
         )
         .expect("record completed regression test");
+    }
+
+    /// A 2x1 RGBA PNG: a fully transparent black pixel, then an opaque colour.
+    fn transparent_png() -> bytes::Bytes {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        transparent_pixels()
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode RGBA fixture");
+        encoded.into_inner().into()
+    }
+
+    fn transparent_pixels() -> DynamicImage {
+        DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(2, 1, vec![0, 0, 0, 0, 10, 20, 30, 255]).expect("2x1"),
+        )
+    }
+
+    fn encoded_frame(bytes: bytes::Bytes) -> ImageFrame {
+        ImageFrame::encoded(
+            bytes,
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(2, 1),
+            None,
+        )
+    }
+
+    #[test]
+    fn with_transparency_decodes_an_already_decoded_frame_again_under_the_new_policy() {
+        let frame = encoded_frame(transparent_png());
+        assert!(frame.image().expect("decode").color().has_alpha());
+        let frame = frame.with_transparency(TransparencyPolicy::CompositeOverWhite);
+        assert_eq!(frame.transparency(), TransparencyPolicy::CompositeOverWhite);
+        assert!(
+            frame.decoded.get().is_none(),
+            "the previous decode is dropped"
+        );
+        assert_eq!(
+            frame.image().expect("decode").to_rgb8().as_raw(),
+            &[255, 255, 255, 10, 20, 30]
+        );
+        let frame = frame.with_transparency(TransparencyPolicy::DropAlpha);
+        assert_eq!(
+            frame.image().expect("decode").to_rgb8().as_raw(),
+            &[0, 0, 0, 10, 20, 30]
+        );
+        let frame = frame.with_transparency(TransparencyPolicy::KeepAlpha);
+        assert!(frame.image().expect("decode").color().has_alpha());
+    }
+
+    #[test]
+    fn with_transparency_keeps_the_decode_when_the_policy_is_the_same() {
+        let frame = encoded_frame(transparent_png());
+        frame.image().expect("decode");
+        let frame = frame.with_transparency(TransparencyPolicy::KeepAlpha);
+        assert!(frame.decoded.get().is_some());
+        let frame = frame.with_transparency(TransparencyPolicy::DropAlpha);
+        frame.image().expect("decode");
+        let frame = frame.with_transparency(TransparencyPolicy::DropAlpha);
+        assert!(frame.decoded.get().is_some());
+        assert!(!frame.image().expect("decode").color().has_alpha());
+    }
+
+    #[test]
+    fn with_transparency_applies_the_policy_to_a_frame_built_from_pixels() {
+        let built = |policy| {
+            ImageFrame::new(
+                transparent_pixels(),
+                bytes::Bytes::new(),
+                ImageDetail::Auto,
+                ImageSource::InlineBytes,
+                String::new(),
+            )
+            .with_transparency(policy)
+        };
+        let white = built(TransparencyPolicy::CompositeOverWhite);
+        assert_eq!(white.transparency(), TransparencyPolicy::CompositeOverWhite);
+        assert!(!white.image().expect("pixels").color().has_alpha());
+        assert_eq!(
+            white.image().expect("pixels").to_rgb8().as_raw(),
+            &[255, 255, 255, 10, 20, 30]
+        );
+        let dropped = built(TransparencyPolicy::DropAlpha);
+        assert!(!dropped.image().expect("pixels").color().has_alpha());
+        assert_eq!(
+            dropped.image().expect("pixels").to_rgb8().as_raw(),
+            &[0, 0, 0, 10, 20, 30]
+        );
+        let kept = built(TransparencyPolicy::KeepAlpha);
+        assert!(kept.image().expect("pixels").color().has_alpha());
+        assert_eq!(
+            kept.image().expect("pixels").as_bytes(),
+            transparent_pixels().as_bytes()
+        );
     }
 
     #[test]
