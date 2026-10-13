@@ -1356,8 +1356,8 @@ mod tests {
     #[tokio::test]
     async fn text_the_parser_releases_over_two_chunks_reaches_the_client_once() {
         let tokenizer = byte_fallback_tokenizer();
-        let first = r#"{"note":"chec"#;
-        let second = r#"king"} {"name":"get_weather","arguments":{"city":"Paris"}}"#;
+        let first = r#"{"note":"check"#;
+        let second = r#"ing"} {"name":"get_weather","arguments":{"city":"Paris"}}"#;
         let mut handle = tool_test_handle(tokenizer.clone(), None);
         // The parser holds a value that may still become a call: nothing is
         // sent, so the value does not come twice once it is released.
