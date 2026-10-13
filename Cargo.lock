@@ -8097,6 +8097,7 @@ dependencies = [
  "smg-grpc-client",
  "smg-mesh",
  "smg-rl",
+ "smg-symphony",
  "tikv-jemallocator",
  "tokio",
  "tool-parser",

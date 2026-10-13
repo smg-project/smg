@@ -2,12 +2,19 @@
 //! [`Engine`] per choice in place of the tool and reasoning parser crates.
 //!
 //! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `legacy` by default),
-//! which a request's `X-SMG-Parser` header overrides for that one request ([`choice`]):
-//! `symphony` turns the path on for every model Symphony's registry knows
-//! (`symphony::formats::for_model`). Every other model, and every request read with `legacy`,
-//! keeps the older parsers. The response names the parser that read it in `x-smg-parser`, legacy
-//! when the choice was Symphony but no table took the request, so a client comparing the two can
-//! tell which one read each answer.
+//! which a request's `X-SMG-Parser` header overrides for that one request ([`choice`]). With
+//! `symphony` on, the parser names set for the model decide ([`reads`]): the `tool_parser` and
+//! `reasoning_parser` of the model's card (worker labels), else the `--tool-call-parser` and
+//! `--reasoning-parser` flags, resolved as the legacy path resolves them (`ParserResolver`).
+//! Names that are one Symphony table's (`symphony::formats::Table::name`; both the same, or one
+//! alone) read every request for the model with that table, whatever the model is; a legacy
+//! parser's name keeps the legacy parsers, which is the way back for one model when its table
+//! misbehaves; no name at all takes the registry's table for the model
+//! (`symphony::formats::for_model`), and the legacy parsers with their own detection when it has
+//! none. The names are checked at startup and at a worker's registration ([`check_names`]).
+//! Every request read with `legacy` keeps the older parsers. The response names the parser that
+//! read it in `x-smg-parser`, legacy when the choice was Symphony but no table took the request,
+//! so a client comparing the two can tell which one read each answer.
 //!
 //! Request building assigns Symphony to a request ([`assign`]) and stores the [`Assignment`] in
 //! the response spec: the table, and the part of the rendered prompt the engine replays to find
@@ -25,13 +32,13 @@ use openai_protocol::{
     common::{Tool, ToolChoice, ToolChoiceValue},
 };
 use symphony::{
-    formats::for_model, Declared, Engine, EngineFinish, Event, Events, Format, Input, Parser as _,
-    TokenSpan,
+    formats::{for_model, table_for, Table},
+    Declared, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, TokenSpan,
 };
 use tool_parser::ToolConstraint;
 use tracing::debug;
 
-use crate::config::ParserChoice;
+use crate::{config::ParserChoice, routers::grpc::utils::Names};
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
 /// gateway's `--parser` flag.
@@ -52,11 +59,33 @@ pub(crate) fn choice(
         .ok_or_else(|| format!("{HEADER} must be legacy or symphony, not {spelled:?}"))
 }
 
-/// The table that reads `request`'s response, if one does: `parser` is Symphony, the registry
-/// knows the model, and the request asks nothing the older path answers differently (the
-/// response separates reasoning, and `tool_choice` is not `none`). Preparation and request
-/// building both decide with this one predicate.
-pub(crate) fn reads(parser: ParserChoice, request: &ChatCompletionRequest) -> Option<Format> {
+/// The table the parser names set for a model select, when they do: every name set is one
+/// table's ([`Table::named`]), the same one. A legacy parser's name, or two different tables,
+/// select none; so do no names at all.
+pub(crate) fn named_table(names: &Names) -> Option<Table> {
+    let tables: Vec<Option<Table>> = [&names.tool, &names.reasoning]
+        .into_iter()
+        .flatten()
+        .map(|name| Table::named(name))
+        .collect();
+    let first = *tables.first()?;
+    if tables.iter().any(|table| *table != first) {
+        return None;
+    }
+    first
+}
+
+/// The table that reads `request`'s response, if one does: `parser` is Symphony, the request
+/// asks nothing the older path answers differently (the response separates reasoning, and
+/// `tool_choice` is not `none`), and a table is there to read it: the one the model's parser
+/// `names` select ([`named_table`]), whatever the model, or the registry's for the model when no
+/// name is set. A legacy parser's name leaves the response to the legacy parsers. Preparation
+/// and request building both decide with this one predicate.
+pub(crate) fn reads(
+    parser: ParserChoice,
+    names: &Names,
+    request: &ChatCompletionRequest,
+) -> Option<Format> {
     if parser != ParserChoice::Symphony
         || !request.separate_reasoning
         || matches!(
@@ -66,7 +95,70 @@ pub(crate) fn reads(parser: ParserChoice, request: &ChatCompletionRequest) -> Op
     {
         return None;
     }
-    for_model(&request.model)
+    if names.tool.is_none() && names.reasoning.is_none() {
+        return for_model(&request.model);
+    }
+    let table = named_table(names)?;
+    // The registry's table comes with the model's own turn opener; a table named for a model
+    // the registry reads with another, or does not know, replays from the table's own.
+    match for_model(&request.model) {
+        Some(format) if table_for(&request.model) == Some(table) => Some(format),
+        _ => Some(table.format()),
+    }
+}
+
+/// Whether the parser names set for a model (the flags, or one worker's labels) are names the
+/// gateway reads with under `parser`: a legacy parser's, or, with Symphony on, a table's.
+/// `legacy_tool` and `legacy_reasoning` say whether the legacy registries have each name. A
+/// table no legacy parser shares binds the other name to the same table or to nothing: the
+/// legacy parsers read what a table declines (a response without separate reasoning, a
+/// `tool_choice` of `none`) by the names they are given, and have no parser of that name. The
+/// error says what is wrong with which name, for the startup or registration failure.
+pub(crate) fn check_names(
+    parser: ParserChoice,
+    names: &Names,
+    legacy_tool: bool,
+    legacy_reasoning: bool,
+) -> Result<(), String> {
+    let symphony = parser == ParserChoice::Symphony;
+    let kinds = [
+        ("tool-call", &names.tool, legacy_tool, &names.reasoning),
+        ("reasoning", &names.reasoning, legacy_reasoning, &names.tool),
+    ];
+    for (kind, name, legacy, other) in kinds {
+        let Some(name) = name else {
+            continue;
+        };
+        if legacy {
+            continue;
+        }
+        match (symphony, Table::named(name)) {
+            (true, Some(table)) => {
+                if let Some(other) = other {
+                    if Table::named(other) != Some(table) {
+                        return Err(format!(
+                            "{kind} parser '{name}' is a Symphony table's name and no legacy \
+                             parser's, so the other parser must name the same table or \
+                             nothing, not '{other}'"
+                        ));
+                    }
+                }
+            }
+            (true, None) => {
+                return Err(format!(
+                    "unknown {kind} parser '{name}': neither a legacy parser nor a Symphony table"
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(format!(
+                    "unknown {kind} parser '{name}': a Symphony table's name, which --parser \
+                     symphony reads with"
+                ));
+            }
+            (false, None) => return Err(format!("unknown {kind} parser '{name}'")),
+        }
+    }
+    Ok(())
 }
 
 /// Whether `tool_choice` leaves the model no choice but a call: a named function, `required`,
@@ -86,11 +178,12 @@ fn forces_call(tool_choice: &ToolChoice) -> bool {
 /// call syntax yet; the older registry then decides as before.
 pub(crate) fn constraint(
     parser: ParserChoice,
+    names: &Names,
     request: &ChatCompletionRequest,
     tools: &[Tool],
     reasoning_open: bool,
 ) -> Option<ToolConstraint> {
-    let format = reads(parser, request)?;
+    let format = reads(parser, names, request)?;
     if !request.tool_choice.as_ref().is_some_and(forces_call) {
         return None;
     }
@@ -112,11 +205,12 @@ pub(crate) struct Assignment {
 /// has no grammar for its syntax yet.
 pub(crate) fn assign(
     parser: ParserChoice,
+    names: &Names,
     request: &ChatCompletionRequest,
     constraint: Option<&(String, String)>,
     prompt: &str,
 ) -> Option<Assignment> {
-    let format = reads(parser, request)?;
+    let format = reads(parser, names, request)?;
     if constraint.is_some_and(|(kind, _)| kind == "json_schema") {
         return None;
     }
@@ -364,6 +458,143 @@ mod tests {
 
     const PROMPT: &str = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
 
+    fn names(tool: Option<&str>, reasoning: Option<&str>) -> Names {
+        Names {
+            tool: tool.map(str::to_string),
+            reasoning: reasoning.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_names_select_a_table_when_they_are_one_tables_and_nothing_otherwise() {
+        assert_eq!(named_table(&Names::default()), None);
+        assert_eq!(
+            named_table(&names(Some("kimi_k3"), Some("kimi_k3"))),
+            Some(Table::KimiK3)
+        );
+        assert_eq!(named_table(&names(None, Some("Ling"))), Some(Table::Ling));
+        assert_eq!(
+            named_table(&names(Some("qwen3_tagged"), None)),
+            Some(Table::Qwen3Tagged)
+        );
+        // A legacy parser's name, alone or beside a table's, and two tables select none.
+        assert_eq!(named_table(&names(Some("qwen"), None)), None);
+        assert_eq!(named_table(&names(Some("qwen"), Some("qwen3"))), None);
+        assert_eq!(named_table(&names(Some("kimi_k3"), Some("qwen3"))), None);
+    }
+
+    #[test]
+    fn explicit_names_win_over_the_registry() {
+        // A table named for a model the registry does not know reads it; a legacy name leaves a
+        // model the registry knows to the legacy parsers; a table named for a model the registry
+        // reads with another wins, and replays from its own opener.
+        let unknown = request(json!({"model": "unknown"}));
+        let ling = names(Some("ling"), Some("ling"));
+        let assigned = assign(ParserChoice::Symphony, &ling, &unknown, None, PROMPT);
+        assert_eq!(assigned.expect("assigned").format.name(), "ling");
+        let legacy = names(Some("qwen"), Some("qwen3"));
+        assert!(assign(
+            ParserChoice::Symphony,
+            &legacy,
+            &request(json!({})),
+            None,
+            PROMPT
+        )
+        .is_none());
+        let required = request(json!({"tool_choice": "required"}));
+        let reasoning_only = names(None, Some("deepseek_r1"));
+        assert!(constraint(
+            ParserChoice::Symphony,
+            &reasoning_only,
+            &required,
+            &tools(),
+            false
+        )
+        .is_none());
+        let kimi = names(Some("kimi_k3"), None);
+        let assigned = assign(
+            ParserChoice::Symphony,
+            &kimi,
+            &request(json!({})),
+            None,
+            PROMPT,
+        );
+        let assigned = assigned.expect("assigned");
+        assert_eq!(assigned.format.name(), "kimi_k3");
+        assert_eq!(
+            assigned.prompt, PROMPT,
+            "no Kimi opener in a Qwen prompt: the whole replays"
+        );
+        // The registry's own table named for its model keeps the model's turn opener.
+        let exaone = request(json!({"model": "LGAI-EXAONE/K-EXAONE-236B-A23B"}));
+        let prompt = "<|user|>hi<|endofturn|><|assistant|>\n<think>\n";
+        let qwen3 = names(Some("qwen3"), Some("qwen3"));
+        let by_name = assign(ParserChoice::Symphony, &qwen3, &exaone, None, prompt);
+        let by_registry = assign(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &exaone,
+            None,
+            prompt,
+        );
+        assert_eq!(
+            by_name.expect("assigned").prompt,
+            "<|assistant|>\n<think>\n"
+        );
+        assert_eq!(
+            by_registry.expect("assigned").prompt,
+            "<|assistant|>\n<think>\n"
+        );
+        // Under legacy the names change nothing.
+        assert!(assign(ParserChoice::Legacy, &ling, &unknown, None, PROMPT).is_none());
+    }
+
+    #[test]
+    fn names_are_checked_against_both_registries_by_the_parser_in_force() {
+        let legacy = ParserChoice::Legacy;
+        let symphony = ParserChoice::Symphony;
+        assert_eq!(check_names(legacy, &Names::default(), true, true), Ok(()));
+        assert_eq!(
+            check_names(legacy, &names(Some("qwen"), Some("qwen3")), true, true),
+            Ok(())
+        );
+        let why = check_names(legacy, &names(Some("nonsense"), None), false, true);
+        assert_eq!(
+            why.expect_err("unknown"),
+            "unknown tool-call parser 'nonsense'"
+        );
+        let why = check_names(legacy, &names(None, Some("ling")), true, false);
+        assert_eq!(
+            why.expect_err("a table under legacy"),
+            "unknown reasoning parser 'ling': a Symphony table's name, which --parser symphony \
+             reads with"
+        );
+        // Under Symphony a table's name passes alone or doubled, and binds the other name.
+        assert_eq!(
+            check_names(symphony, &names(Some("ling"), None), false, true),
+            Ok(())
+        );
+        assert_eq!(
+            check_names(symphony, &names(Some("ling"), Some("LING")), false, false),
+            Ok(())
+        );
+        assert_eq!(
+            check_names(symphony, &names(Some("kimi_k3"), Some("qwen3")), true, true),
+            Ok(())
+        );
+        let why = check_names(symphony, &names(Some("ling"), Some("qwen3")), false, true);
+        assert_eq!(
+            why.expect_err("bound to the table"),
+            "tool-call parser 'ling' is a Symphony table's name and no legacy parser's, so the \
+             other parser must name the same table or nothing, not 'qwen3'"
+        );
+        let why = check_names(symphony, &names(None, Some("nonsense")), true, false);
+        assert_eq!(
+            why.expect_err("unknown"),
+            "unknown reasoning parser 'nonsense': neither a legacy parser nor a Symphony table"
+        );
+    }
+
     #[test]
     fn the_header_names_the_parser_over_the_flag_and_an_unknown_name_is_refused() {
         assert_eq!(choice(ParserChoice::Legacy, None), Ok(ParserChoice::Legacy));
@@ -389,9 +620,23 @@ mod tests {
 
     #[test]
     fn the_legacy_choice_assigns_nothing_and_asks_for_no_constraint() {
-        assert!(assign(ParserChoice::Legacy, &request(json!({})), None, PROMPT).is_none());
+        assert!(assign(
+            ParserChoice::Legacy,
+            &Names::default(),
+            &request(json!({})),
+            None,
+            PROMPT
+        )
+        .is_none());
         let required = request(json!({"tool_choice": "required"}));
-        assert!(constraint(ParserChoice::Legacy, &required, &tools(), false).is_none());
+        assert!(constraint(
+            ParserChoice::Legacy,
+            &Names::default(),
+            &required,
+            &tools(),
+            false
+        )
+        .is_none());
     }
 
     #[test]
@@ -400,17 +645,51 @@ mod tests {
         // in the table's syntax would hand them a call they cannot read: the older registry
         // decides, as it does for the whole request.
         let unread = request(json!({"tool_choice": "required", "separate_reasoning": false}));
-        assert!(assign(ParserChoice::Symphony, &unread, None, PROMPT).is_none());
-        assert!(constraint(ParserChoice::Symphony, &unread, &tools(), false).is_none());
+        assert!(assign(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &unread,
+            None,
+            PROMPT
+        )
+        .is_none());
+        assert!(constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &unread,
+            &tools(),
+            false
+        )
+        .is_none());
         let read = request(json!({"tool_choice": "required"}));
-        assert!(assign(ParserChoice::Symphony, &read, None, PROMPT).is_some());
-        assert!(constraint(ParserChoice::Symphony, &read, &tools(), false).is_some());
+        assert!(assign(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &read,
+            None,
+            PROMPT
+        )
+        .is_some());
+        assert!(constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &read,
+            &tools(),
+            false
+        )
+        .is_some());
     }
 
     #[test]
     fn a_known_model_is_assigned_its_table_and_the_prompts_replay() {
-        let assignment =
-            assign(ParserChoice::Symphony, &request(json!({})), None, PROMPT).expect("assigned");
+        let assignment = assign(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &request(json!({})),
+            None,
+            PROMPT,
+        )
+        .expect("assigned");
         assert_eq!(assignment.format.name(), "qwen3");
         assert_eq!(assignment.prompt, "<|im_start|>assistant\n<think>\n");
     }
@@ -419,6 +698,7 @@ mod tests {
     fn an_unknown_model_and_requests_the_older_path_answers_differently_are_not_assigned() {
         assert!(assign(
             ParserChoice::Symphony,
+            &Names::default(),
             &request(json!({"model": "unknown"})),
             None,
             PROMPT
@@ -426,6 +706,7 @@ mod tests {
         .is_none());
         assert!(assign(
             ParserChoice::Symphony,
+            &Names::default(),
             &request(json!({"separate_reasoning": false})),
             None,
             PROMPT
@@ -433,6 +714,7 @@ mod tests {
         .is_none());
         assert!(assign(
             ParserChoice::Symphony,
+            &Names::default(),
             &request(json!({"tool_choice": "none"})),
             None,
             PROMPT
@@ -441,6 +723,7 @@ mod tests {
         let schema = ("json_schema".to_string(), "{}".to_string());
         assert!(assign(
             ParserChoice::Symphony,
+            &Names::default(),
             &request(json!({})),
             Some(&schema),
             PROMPT
@@ -449,6 +732,7 @@ mod tests {
         let tag = ("structural_tag".to_string(), "{}".to_string());
         assert!(assign(
             ParserChoice::Symphony,
+            &Names::default(),
             &request(json!({})),
             Some(&tag),
             PROMPT
@@ -459,17 +743,35 @@ mod tests {
     #[test]
     fn a_forced_call_takes_the_tables_structural_tag_and_auto_takes_none() {
         let required = request(json!({"tool_choice": "required"}));
-        let Some(ToolConstraint::StructuralTag(tag)) =
-            constraint(ParserChoice::Symphony, &required, &tools(), false)
-        else {
+        let Some(ToolConstraint::StructuralTag(tag)) = constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &required,
+            &tools(),
+            false,
+        ) else {
             panic!("a structural tag");
         };
         let tag: Value = serde_json::from_str(&tag).expect("JSON");
         assert!(tag["format"].is_object(), "{tag}");
         let auto = request(json!({"tool_choice": "auto"}));
-        assert!(constraint(ParserChoice::Symphony, &auto, &tools(), false).is_none());
+        assert!(constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &auto,
+            &tools(),
+            false
+        )
+        .is_none());
         let unknown = request(json!({"model": "unknown", "tool_choice": "required"}));
-        assert!(constraint(ParserChoice::Symphony, &unknown, &tools(), false).is_none());
+        assert!(constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &unknown,
+            &tools(),
+            false
+        )
+        .is_none());
     }
 
     #[test]

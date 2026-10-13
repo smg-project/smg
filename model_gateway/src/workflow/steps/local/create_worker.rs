@@ -13,7 +13,11 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
-    routers::grpc::{multimodal::SUPPORTS_VISION_LABEL, zmq_client::zmq_handshake_address},
+    config::ParserChoice,
+    routers::grpc::{
+        multimodal::SUPPORTS_VISION_LABEL, regular::symphony::check_names, utils::Names,
+        zmq_client::zmq_handshake_address,
+    },
     worker::{
         circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
@@ -101,6 +105,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         validate_parser_overrides(
             &model_card,
             &config.url,
+            app_context.router_config.parser,
             app_context.tool_parser_factory.as_ref(),
             app_context.reasoning_parser_factory.as_ref(),
         )
@@ -394,33 +399,35 @@ fn warn_on_conflicting_parser_overrides(
     }
 }
 
-/// Reject parser-override names the registries don't know. Skipped when a
-/// factory is absent (parsers unused in that configuration).
+/// Reject parser-override names the registries don't know: the legacy parsers', and, under
+/// `--parser symphony`, Symphony's tables (`regular::symphony::check_names`). A name whose
+/// factory is absent is not checked (parsers unused in that configuration).
 fn validate_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
+    parser: ParserChoice,
     tool_parser_factory: Option<&tool_parser::ParserFactory>,
     reasoning_parser_factory: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
-    if let (Some(name), Some(factory)) = (card.tool_parser.as_deref(), tool_parser_factory) {
-        if !factory.registry().has_parser(name) {
-            return Err(format!(
-                "worker {} declares unknown tool_parser '{}' for model '{}'",
-                worker_url, name, card.id
-            ));
-        }
-    }
-    if let (Some(name), Some(factory)) =
-        (card.reasoning_parser.as_deref(), reasoning_parser_factory)
-    {
-        if !factory.registry().has_parser(name) {
-            return Err(format!(
-                "worker {} declares unknown reasoning_parser '{}' for model '{}'",
-                worker_url, name, card.id
-            ));
-        }
-    }
-    Ok(())
+    let names = Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    };
+    let legacy_tool = match (&names.tool, tool_parser_factory) {
+        (Some(name), Some(factory)) => factory.registry().has_parser(name),
+        _ => true,
+    };
+    let legacy_reasoning = match (&names.reasoning, reasoning_parser_factory) {
+        (Some(name), Some(factory)) => factory.registry().has_parser(name),
+        _ => true,
+    };
+    check_names(parser, &names, legacy_tool, legacy_reasoning).map_err(|why| {
+        format!(
+            "worker {worker_url} declares a parser override for model '{}' the gateway cannot \
+             read with: {why}",
+            card.id
+        )
+    })
 }
 
 fn build_model_card(
@@ -1738,6 +1745,7 @@ mod tests {
             validate_parser_overrides(
                 &card,
                 "grpc://engine:50051",
+                ParserChoice::Legacy,
                 Some(&tool_factory),
                 Some(&reasoning_factory),
             )
@@ -1751,6 +1759,39 @@ mod tests {
     }
 
     #[test]
+    fn a_symphony_table_is_a_parser_override_under_parser_symphony_alone() {
+        let tool_factory = tool_parser::ParserFactory::default();
+        let reasoning_factory = reasoning_parser::ParserFactory::default();
+        let mut card = ModelCard::new("m");
+        card.tool_parser = Some("ling".to_string());
+        card.reasoning_parser = Some("ling".to_string());
+        let check = |card: &ModelCard, parser| {
+            validate_parser_overrides(
+                card,
+                "http://w:1",
+                parser,
+                Some(&tool_factory),
+                Some(&reasoning_factory),
+            )
+        };
+        assert!(check(&card, ParserChoice::Symphony).is_ok());
+        let err = check(&card, ParserChoice::Legacy).expect_err("a table is no legacy parser");
+        assert!(
+            err.contains("'ling'") && err.contains("--parser symphony"),
+            "{err}"
+        );
+        // A table no legacy parser shares binds the other override to the same table.
+        card.reasoning_parser = Some("qwen3".to_string());
+        let err = check(&card, ParserChoice::Symphony).expect_err("bound to the table");
+        assert!(err.contains("same table"), "{err}");
+        // A name both registries have passes under either parser.
+        card.tool_parser = Some("kimi_k3".to_string());
+        card.reasoning_parser = Some("kimi_k3".to_string());
+        assert!(check(&card, ParserChoice::Symphony).is_ok());
+        assert!(check(&card, ParserChoice::Legacy).is_ok());
+    }
+
+    #[test]
     fn unknown_parser_override_fails_validation() {
         let tool_factory = tool_parser::ParserFactory::default();
         let reasoning_factory = reasoning_parser::ParserFactory::default();
@@ -1760,6 +1801,7 @@ mod tests {
         assert!(validate_parser_overrides(
             &card,
             "http://w:1",
+            ParserChoice::Legacy,
             Some(&tool_factory),
             Some(&reasoning_factory)
         )
@@ -1767,21 +1809,43 @@ mod tests {
 
         // Known tool parser passes; unknown names fail loudly.
         let card = ModelCard::new("m").with_tool_parser("json");
-        assert!(validate_parser_overrides(&card, "http://w:1", Some(&tool_factory), None).is_ok());
+        assert!(validate_parser_overrides(
+            &card,
+            "http://w:1",
+            ParserChoice::Legacy,
+            Some(&tool_factory),
+            None
+        )
+        .is_ok());
 
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
-        let err = validate_parser_overrides(&card, "http://w:1", Some(&tool_factory), None)
-            .expect_err("unknown tool parser must fail registration");
+        let err = validate_parser_overrides(
+            &card,
+            "http://w:1",
+            ParserChoice::Legacy,
+            Some(&tool_factory),
+            None,
+        )
+        .expect_err("unknown tool parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
 
         let card = ModelCard::new("m").with_reasoning_parser("definitely-not-a-parser");
-        let err = validate_parser_overrides(&card, "http://w:1", None, Some(&reasoning_factory))
-            .expect_err("unknown reasoning parser must fail registration");
+        let err = validate_parser_overrides(
+            &card,
+            "http://w:1",
+            ParserChoice::Legacy,
+            None,
+            Some(&reasoning_factory),
+        )
+        .expect_err("unknown reasoning parser must fail registration");
         assert!(err.contains("definitely-not-a-parser"), "{err}");
 
         // Absent factories skip validation (parsers unused in that config).
         let card = ModelCard::new("m").with_tool_parser("definitely-not-a-parser");
-        assert!(validate_parser_overrides(&card, "http://w:1", None, None).is_ok());
+        assert!(
+            validate_parser_overrides(&card, "http://w:1", ParserChoice::Legacy, None, None)
+                .is_ok()
+        );
     }
 }
 

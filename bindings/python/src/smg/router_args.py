@@ -1939,8 +1939,11 @@ class RouterArgs:
             default=RouterArgs.parser,
             choices=["legacy", "symphony"],
             help="Which parser reads a chat completion's reasoning and tool calls: the per-model "
-            "parsers (legacy, the default) or Symphony for the models its registry knows. "
-            "A request's X-SMG-Parser header overrides it for that request.",
+            "parsers (legacy, the default) or Symphony. With Symphony, the parser names set for a model "
+            "decide (its worker labels, else --tool-call-parser and --reasoning-parser): a Symphony table's "
+            "name reads with that table, a legacy parser's keeps the legacy parsers, and no name takes "
+            "Symphony's registry for the models it knows. A request's X-SMG-Parser header overrides the "
+            "flag for that request.",
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l0",
@@ -1980,7 +1983,9 @@ class RouterArgs:
             type=str,
             default=None,
             choices=reasoning_parser_choices,
-            help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3)",
+            help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3). Under --parser symphony, "
+            "a Symphony table's name here (and in --tool-call-parser, or here alone) reads every model with "
+            "that table; a legacy parser's name keeps the legacy parsers",
         )
         tool_call_parser_choices = get_available_tool_call_parsers()
         parser_group.add_argument(
@@ -1988,7 +1993,9 @@ class RouterArgs:
             type=str,
             default=None,
             choices=tool_call_parser_choices,
-            help="Specify the parser for tool-call interactions (e.g., json, qwen)",
+            help="Specify the parser for tool-call interactions (e.g., json, qwen). Under --parser symphony, "
+            "a Symphony table's name here (and in --reasoning-parser, or here alone) reads every model with "
+            "that table; a legacy parser's name keeps the legacy parsers",
         )
         parser_group.add_argument(
             f"--{prefix}mcp-config-path",

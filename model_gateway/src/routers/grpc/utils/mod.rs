@@ -31,7 +31,7 @@ pub(crate) use parsers::{
     create_reasoning_parser, create_tool_parser, get_tool_parser,
     messages_reasoning_starts_in_prefill, reasoning_parser_requires_special_tokens,
     reasoning_starts_in_prefill, rendered_prompt_reasoning_in_prefill,
-    should_mark_reasoning_started, tool_constraints_for_worker, ParserResolver,
+    should_mark_reasoning_started, tool_constraints_for_worker, Names, ParserResolver,
 };
 pub(crate) use pd_bootstrap::account_pd_leg_failure;
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};

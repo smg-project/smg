@@ -360,8 +360,9 @@ pub(crate) async fn prepare_chat_like(
             // stage chooses a parser: transcription, which shares this
             // preparation, keeps the legacy parsers.
             let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
+            let names = ctx.components.parser_resolver.names(&request.model);
             let symphony_constraint =
-                symphony::constraint(parser, request, &constraint_tools, reasoning);
+                symphony::constraint(parser, &names, request, &constraint_tools, reasoning);
             match symphony_constraint {
                 Some(constraint) => Some(constraint),
                 None => ctx
@@ -369,10 +370,7 @@ pub(crate) async fn prepare_chat_like(
                     .tool_parser_factory
                     .registry()
                     .generate_tool_constraint(
-                        ctx.components
-                            .parser_resolver
-                            .tool_parser(&request.model)
-                            .as_deref(),
+                        names.tool.as_deref(),
                         &constraint_tools,
                         tool_choice,
                         reasoning,

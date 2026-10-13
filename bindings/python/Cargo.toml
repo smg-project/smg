@@ -36,6 +36,9 @@ workspace = true
 [dependencies.smg-grpc-client]
 workspace = true
 
+[dependencies.smg-symphony]
+workspace = true
+
 [dependencies.bytes]
 workspace = true
 

@@ -1990,9 +1990,22 @@ fn get_available_tool_call_parsers() -> Vec<String> {
     PARSERS
         .get_or_init(|| {
             let factory = tool_parser::ParserFactory::new();
-            factory.list_parsers()
+            with_symphony_tables(factory.list_parsers())
         })
         .clone()
+}
+
+/// The legacy parsers' names and Symphony's tables' (`symphony::formats::Table::name`), which
+/// `--parser symphony` reads with when both flags name one, sorted, each once.
+fn with_symphony_tables(mut names: Vec<String>) -> Vec<String> {
+    names.extend(
+        symphony::formats::Table::ALL
+            .iter()
+            .map(|table| table.name().to_string()),
+    );
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Get the list of available reasoning parsers from the Rust factory.
@@ -2002,7 +2015,7 @@ fn get_available_reasoning_parsers() -> Vec<String> {
     PARSERS
         .get_or_init(|| {
             let factory = reasoning_parser::ParserFactory::new();
-            factory.list_parsers()
+            with_symphony_tables(factory.list_parsers())
         })
         .clone()
 }

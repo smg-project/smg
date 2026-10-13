@@ -29,8 +29,10 @@ pub enum ParserChoice {
     /// The tool-call and reasoning parser crates, one parser per model family.
     #[default]
     Legacy,
-    /// Symphony's tables, for the models its registry knows; every other model keeps the
-    /// legacy parsers.
+    /// Symphony's tables: the one a model's parser names select (its worker labels, else the
+    /// `--tool-call-parser` and `--reasoning-parser` flags) when they name a table, the registry's
+    /// for the models it knows when they name nothing; a legacy parser's name, and every other
+    /// model, keep the legacy parsers.
     Symphony,
 }
 

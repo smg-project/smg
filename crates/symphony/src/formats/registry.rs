@@ -28,7 +28,9 @@ use crate::{
 };
 
 /// A table under [`formats`](super), by the function that builds it and, where the function
-/// takes one, its call syntax.
+/// takes one, its call syntax. [`Table::name`] is how an operator names one: the gateway's
+/// `--tool-call-parser` and `--reasoning-parser` flags, and a worker's labels, take a table's
+/// name in place of a legacy parser's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Table {
     /// [`qwen3()`] with JSON calls.
@@ -80,6 +82,70 @@ pub enum Table {
 }
 
 impl Table {
+    /// Every table, in this order.
+    pub const ALL: [Table; 23] = [
+        Self::Qwen3,
+        Self::Qwen3Tagged,
+        Self::Qwen3TaggedDirect,
+        Self::Qwen2_5,
+        Self::DeepSeekV4_1,
+        Self::SeedOss,
+        Self::Hy4,
+        Self::Ling,
+        Self::IQuest,
+        Self::Olmo3,
+        Self::Lfm2_5,
+        Self::Xlam,
+        Self::MinimaxM2,
+        Self::MinimaxM3,
+        Self::KimiK3,
+        Self::Inkling,
+        Self::MiniCpm5,
+        Self::Dots3,
+        Self::Gemma4,
+        Self::Glm,
+        Self::Glm4,
+        Self::K2Horizon,
+        Self::Plain,
+    ];
+
+    /// The table's name, as an operator spells it: its format's name, with the call syntax after
+    /// it where the function takes one (`qwen3`, `qwen3_tagged`, `qwen3_tagged_direct`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Qwen3 => "qwen3",
+            Self::Qwen3Tagged => "qwen3_tagged",
+            Self::Qwen3TaggedDirect => "qwen3_tagged_direct",
+            Self::Qwen2_5 => "qwen2.5",
+            Self::DeepSeekV4_1 => "deepseek_v4.1",
+            Self::SeedOss => "seed_oss",
+            Self::Hy4 => "hy4",
+            Self::Ling => "ling",
+            Self::IQuest => "iquest",
+            Self::Olmo3 => "olmo3",
+            Self::Lfm2_5 => "lfm2.5",
+            Self::Xlam => "xlam",
+            Self::MinimaxM2 => "minimax_m2",
+            Self::MinimaxM3 => "minimax_m3",
+            Self::KimiK3 => "kimi_k3",
+            Self::Inkling => "inkling",
+            Self::MiniCpm5 => "minicpm5",
+            Self::Dots3 => "dots3",
+            Self::Gemma4 => "gemma4",
+            Self::Glm => "glm",
+            Self::Glm4 => "glm4",
+            Self::K2Horizon => "k2_horizon",
+            Self::Plain => "plain",
+        }
+    }
+
+    /// The table `name` spells ([`Table::name`], in any case, spaces around it ignored); `None`
+    /// for any other text, a legacy parser's name among them.
+    pub fn named(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|table| table.name() == name)
+    }
+
     /// The table, built.
     pub fn format(self) -> Format {
         match self {
@@ -636,6 +702,39 @@ mod tests {
             granite.turn_opener(),
             Some("<|start_of_role|>assistant<|end_of_role|>")
         );
+    }
+
+    #[test]
+    fn every_table_has_a_name_of_its_own_that_spells_it_back() {
+        let mut seen: Vec<&str> = Vec::new();
+        for table in Table::ALL {
+            let name = table.name();
+            assert!(!seen.contains(&name), "{name} names two tables");
+            seen.push(name);
+            assert_eq!(Table::named(name), Some(table), "{name}");
+            assert_eq!(
+                Table::named(&format!(" {} ", name.to_uppercase())),
+                Some(table)
+            );
+            // A format built once per table: the name is the format's where the function takes
+            // no call syntax, and the format's with the syntax after it where it does.
+            let format = table.format();
+            if matches!(table, Table::Qwen3Tagged | Table::Qwen3TaggedDirect) {
+                assert!(name.starts_with(&format!("{}_", format.name())), "{name}");
+            } else {
+                assert_eq!(name, format.name());
+            }
+        }
+        assert_eq!(seen.len(), Table::ALL.len());
+        assert_eq!(
+            Table::named("qwen"),
+            None,
+            "a legacy parser's name is no table"
+        );
+        assert_eq!(Table::named(""), None);
+        for group in GROUPS {
+            assert!(Table::ALL.contains(&group.table), "{}", group.model);
+        }
     }
 
     #[test]

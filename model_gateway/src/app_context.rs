@@ -18,7 +18,7 @@ use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::{KvIndexKind, RouterConfig},
+    config::{KvIndexKind, ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -28,7 +28,11 @@ use crate::{
             openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
         },
         gateway::Gateway,
-        grpc::multimodal::MultimodalConfigRegistry,
+        grpc::{
+            multimodal::MultimodalConfigRegistry,
+            regular::symphony::{check_names, named_table},
+            utils::Names,
+        },
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
@@ -412,32 +416,56 @@ impl AppContextBuilder {
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
-        // Validate configured parser names against their registries at startup
-        if let (Some(name), Some(factory)) =
-            (&configured_reasoning_parser, &self.reasoning_parser_factory)
-        {
-            if !factory.registry().has_parser(name) {
-                tracing::error!(
-                    parser = %name,
-                    available = %factory.list_parsers().join(", "),
-                    "Unknown reasoning parser"
-                );
-                return Err(AppContextBuildError::InvalidConfig(format!(
-                    "unknown reasoning parser '{name}'"
-                )));
-            }
+        // The configured parser names are checked against the registries at startup: the
+        // legacy parsers', and Symphony's tables under `--parser symphony`
+        // (`regular::symphony::check_names`). A name whose factory is absent is not checked,
+        // as before.
+        let names = Names {
+            tool: configured_tool_parser.clone(),
+            reasoning: configured_reasoning_parser.clone(),
+        };
+        let legacy_tool = match (&names.tool, &self.tool_parser_factory) {
+            (Some(name), Some(factory)) => factory.has_parser(name),
+            _ => true,
+        };
+        let legacy_reasoning = match (&names.reasoning, &self.reasoning_parser_factory) {
+            (Some(name), Some(factory)) => factory.registry().has_parser(name),
+            _ => true,
+        };
+        if let Err(why) = check_names(router_config.parser, &names, legacy_tool, legacy_reasoning) {
+            let listed = |names: Option<Vec<String>>| names.unwrap_or_default().join(", ");
+            let legacy_tool_parsers =
+                listed(self.tool_parser_factory.as_ref().map(|f| f.list_parsers()));
+            let legacy_reasoning_parsers = listed(
+                self.reasoning_parser_factory
+                    .as_ref()
+                    .map(|f| f.list_parsers()),
+            );
+            let symphony_tables: Vec<&str> = symphony::formats::Table::ALL
+                .iter()
+                .map(|table| table.name())
+                .collect();
+            tracing::error!(
+                tool_call_parser = ?names.tool,
+                reasoning_parser = ?names.reasoning,
+                legacy_tool_parsers = %legacy_tool_parsers,
+                legacy_reasoning_parsers = %legacy_reasoning_parsers,
+                symphony_tables = %symphony_tables.join(", "),
+                "Unknown parser name"
+            );
+            return Err(AppContextBuildError::InvalidConfig(why));
         }
-        if let (Some(name), Some(factory)) = (&configured_tool_parser, &self.tool_parser_factory) {
-            if !factory.has_parser(name) {
-                tracing::error!(
-                    parser = %name,
-                    available = %factory.list_parsers().join(", "),
-                    "Unknown tool-call parser"
-                );
-                return Err(AppContextBuildError::InvalidConfig(format!(
-                    "unknown tool-call parser '{name}'"
-                )));
-            }
+        if router_config.parser == ParserChoice::Symphony
+            && (names.tool.is_some() || names.reasoning.is_some())
+            && named_table(&names).is_none()
+        {
+            tracing::warn!(
+                tool_call_parser = ?names.tool,
+                reasoning_parser = ?names.reasoning,
+                "The configured parser names are the legacy parsers', so every model is read by \
+                 the legacy parsers under --parser symphony; a Symphony table's name in both \
+                 flags reads with that table"
+            );
         }
 
         let worker_registry = self

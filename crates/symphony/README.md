@@ -45,7 +45,7 @@ and a client that wants the raw text back can have it.
 |---|---|
 | `Parser` (`feed`) | The one trait: one instance per generated choice, fed `Input`s, filling `Events`. |
 | `Input`, `TokenSpan`, `EngineFinish` | The lifecycle steps and the token-to-byte alignment the gateway's decoder gives. |
-| `formats::for_model`, `formats::Table` | The registry: the table that reads a model id's output, with the model's own turn opener, for every checkpoint in the models table below with a table. |
+| `formats::for_model`, `formats::Table` | The registry: the table that reads a model id's output, with the model's own turn opener, for every checkpoint in the models table below with a table; `Table::named` the table an operator names (`Table::name`: the gateway's `--tool-call-parser` and `--reasoning-parser`, or a worker's labels, take one in place of a legacy parser's name). |
 | `Event`, `Events`, `Text` | The output: `Content`, `ReasoningStart`/`Reasoning`/`ReasoningEnd`, `ToolCallStart`/`ToolCallArguments`/`ToolCallEnd`, `Dropped`, `Malformed`, `Finish`. `Text` carries the bytes and the engine tokens they cost. |
 | `DropReason`, `MalformedReason`, `FinishReason` | Why bytes were dropped, why a region could not be parsed, and the refined finish (`tool_calls` when calls were made). |
 | `ParseError` | Buffer overflow, lifecycle misuse, or a defect in a parser; what was pushed before the error is final. |

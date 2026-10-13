@@ -72,6 +72,15 @@ impl ParserResolver {
             .or_else(|| self.configured_reasoning_parser.clone())
     }
 
+    /// Both names for `model`, as [`Self::tool_parser`] and [`Self::reasoning_parser`] resolve
+    /// them: Symphony reads them as a pair (`regular::symphony::reads`).
+    pub(crate) fn names(&self, model: &str) -> Names {
+        Names {
+            tool: self.tool_parser(model),
+            reasoning: self.reasoning_parser(model),
+        }
+    }
+
     fn card_parser(
         &self,
         model: &str,
@@ -110,6 +119,14 @@ impl ParserResolver {
         }
         chosen
     }
+}
+
+/// The parser names set for one model, resolved by [`ParserResolver`]: the tool-call parser's
+/// and the reasoning parser's, each `None` when nothing names one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Names {
+    pub tool: Option<String>,
+    pub reasoning: Option<String>,
 }
 
 /// Determine if thinking is effectively ON based on the template's thinking

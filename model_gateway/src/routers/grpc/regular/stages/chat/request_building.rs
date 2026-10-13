@@ -280,8 +280,10 @@ impl BuildStage for ChatRequestBuildingStage {
         // parser asked for is the one chat preparation chose for this request;
         // the one that reads the response is Symphony only when a table takes
         // the request, so the state records that for the response's header.
+        let names = ctx.components.parser_resolver.names(&chat_request.model);
         let assignment = symphony::assign(
             ctx.state.parser.unwrap_or_default(),
+            &names,
             chat_request.as_ref(),
             tool_constraints.as_ref(),
             &processed_messages.text,
