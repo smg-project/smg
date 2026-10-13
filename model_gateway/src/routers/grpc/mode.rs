@@ -3,7 +3,7 @@
 use crate::{
     config::types::{RouterConfig, RoutingMode},
     routers::grpc::{common::stages::WorkerSelectionMode, context::ExecutionPlanKind},
-    worker::ConnectionMode,
+    worker::{ConnectionMode, RoutingPool},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +14,22 @@ pub(crate) enum Mode {
 }
 
 impl Mode {
+    /// The pools whose workers a request of this mode can be served by, the
+    /// legs its pixels can reach: the regular pool; the prefill and decode
+    /// legs; the encode, prefill and decode legs. The multimodal wire dtype
+    /// is resolved over them before any worker is selected.
+    pub(crate) fn multimodal_wire_pools(self) -> &'static [RoutingPool] {
+        match self {
+            Mode::Regular => &[RoutingPool::GrpcPipelineRegular],
+            Mode::PrefillDecode => &[RoutingPool::GrpcPrefill, RoutingPool::GrpcDecode],
+            Mode::EncodePrefillDecode => &[
+                RoutingPool::GrpcEncode,
+                RoutingPool::GrpcPrefill,
+                RoutingPool::GrpcDecode,
+            ],
+        }
+    }
+
     pub(crate) fn worker_selection(self) -> WorkerSelectionMode {
         match self {
             Mode::Regular => WorkerSelectionMode::Regular,

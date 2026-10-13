@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 use super::{serialize::wire_dtype, settings::mm_settings};
 use crate::{
     routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable},
-    worker::Worker,
+    worker::{RoutingPool, Worker, WorkerRegistry},
 };
 
 const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;
@@ -509,6 +509,27 @@ impl DtypeOverrides {
 /// it is.
 pub(crate) fn mm_shared_image_wire_dtype(workers: &[Arc<dyn Worker>]) -> Option<EncoderDtype> {
     shared_image_wire_dtype(workers, &DtypeOverrides::from_env())
+}
+
+/// [`mm_shared_image_wire_dtype`] over the union of the model's routing
+/// pools `pools` (the pipeline mode's legs), as the selection draws them:
+/// the wildcard model id resolves over the global snapshot there too.
+pub(crate) fn mm_shared_image_wire_dtype_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+) -> Option<EncoderDtype> {
+    let workers: Vec<Arc<dyn Worker>> = pools
+        .iter()
+        .flat_map(|pool| {
+            registry
+                .get_routing_pool(model_id, *pool)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    mm_shared_image_wire_dtype(&workers)
 }
 
 fn shared_image_wire_dtype(

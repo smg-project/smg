@@ -15,7 +15,7 @@ use crate::routers::{
         },
         multimodal::{
             assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
-            reserve_multimodal_inflight, WireMismatch,
+            assembly_error_response, reserve_multimodal_inflight,
         },
         spec::{MessagesResponseSpec, ResponseSpec},
         utils,
@@ -113,13 +113,7 @@ impl BuildStage for MessageRequestBuildingStage {
             };
             Some(assembled.map_err(|e| {
                 error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to assemble multimodal request");
-                if WireMismatch::is(&e) {
-                    // The gateway's own transient state (the model's workers changed
-                    // between preparation and selection): retryable, not the client's error.
-                    error::service_unavailable("multimodal_wire_changed", format!("{e}"))
-                } else {
-                    error::bad_request("multimodal_not_supported", format!("{e}"))
-                }
+                assembly_error_response(&e)
             })?)
         } else {
             None

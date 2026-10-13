@@ -26,7 +26,17 @@ use crate::{
 /// Parallel to `ChatPreparationStage` but works with `CreateMessageRequest`.
 /// Converts Anthropic Messages API types into the internal chat template format,
 /// tokenizes, and builds tool constraints.
-pub(crate) struct MessagePreparationStage;
+pub(crate) struct MessagePreparationStage {
+    /// The pools whose workers this pipeline's requests can reach (the
+    /// mode's legs): the multimodal wire dtype is resolved over them.
+    wire_pools: &'static [RoutingPool],
+}
+
+impl MessagePreparationStage {
+    pub(crate) fn new(wire_pools: &'static [RoutingPool]) -> Self {
+        Self { wire_pools }
+    }
+}
 
 #[async_trait]
 impl PipelineStage for MessagePreparationStage {
@@ -159,12 +169,12 @@ impl MessagePreparationStage {
             } else {
                 // The dtype every worker the selection can pick reads image
                 // pixels in, when they agree: the preprocessor then writes it
-                // directly. The same pool the selection draws from, so the
-                // wildcard model id resolves over the same workers.
-                let image_wire_dtype = multimodal::mm_shared_image_wire_dtype(
-                    &ctx.components
-                        .worker_registry
-                        .get_routing_pool(model_id, RoutingPool::GrpcPipelineRegular),
+                // directly. Resolved over the pools of this pipeline's mode,
+                // the legs the pixels can reach, as the selection draws them.
+                let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
+                    &ctx.components.worker_registry,
+                    model_id,
+                    self.wire_pools,
                 );
                 match multimodal::process_multimodal_plan(
                     media_plan,

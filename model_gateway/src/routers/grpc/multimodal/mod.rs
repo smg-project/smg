@@ -17,13 +17,14 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use axum::response::Response;
 use llm_multimodal::{
     AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
     PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
-use crate::routers::grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS;
+use crate::routers::{error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS};
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
 /// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the
@@ -91,8 +92,20 @@ pub(crate) use refs::{
 pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transport::{
-    init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype,
+    init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype_over,
 };
+
+/// The response for an error of assembling or planning a request's
+/// multimodal data: the typed wire mismatch is the gateway's own transient
+/// state (the model's workers changed between preparation and selection),
+/// answered with a retryable status; anything else is the request's.
+pub(crate) fn assembly_error_response(error: &anyhow::Error) -> Response {
+    if WireMismatch::is(error) {
+        error::service_unavailable("multimodal_wire_changed", format!("{error}"))
+    } else {
+        error::bad_request("multimodal_not_supported", format!("{error}"))
+    }
+}
 
 /// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
 /// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal

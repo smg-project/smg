@@ -26,20 +26,18 @@ use uuid::Uuid;
 
 use super::PipelineStage;
 use crate::{
-    routers::{
-        error,
-        grpc::{
-            backend_client::BackendClient,
-            client::GrpcClient,
-            context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
-            multimodal::{
-                assemble_tokenspeed_for_encode, mm_rdma_exporter, MultimodalIntermediate,
-            },
-            proto_wrapper::{
-                cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
-                collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
-                EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
-            },
+    routers::grpc::{
+        backend_client::BackendClient,
+        client::GrpcClient,
+        context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
+        multimodal::{
+            assemble_tokenspeed_for_encode, assembly_error_response, mm_rdma_exporter,
+            MultimodalIntermediate,
+        },
+        proto_wrapper::{
+            cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
+            collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
+            EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
         },
     },
     worker::{RuntimeType, DEFAULT_BOOTSTRAP_PORT},
@@ -80,7 +78,7 @@ impl PipelineStage for EncodeStage {
         )
         .map_err(|e| {
             error!(function = "EncodeStage::execute", error = %e, "Failed to plan EPD encode");
-            error::bad_request("multimodal_not_supported", format!("{e}"))
+            assembly_error_response(&e)
         })?;
 
         // No items resolved to encode work: leave `encode_outputs` unset so
