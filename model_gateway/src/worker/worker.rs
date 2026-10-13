@@ -4860,6 +4860,9 @@ mod tests {
         // Retried until both calls land in the same millisecond.
         let mut aligned = false;
         for _ in 0..1_000 {
+            // A fresh millisecond: the runtime's own construction stamp (or the
+            // previous attempt's) must not be the one the first token repeats.
+            thread::sleep(Duration::from_millis(2));
             let ms = crate::worker::liveness::now_ms();
             runtime.note_token_progress();
             assert!(permit(50), "the first token leaves the notifier's permit");
@@ -4869,9 +4872,8 @@ mod tests {
                 break;
             }
             // The millisecond turned between the two: the second one stamped
-            // and left a permit; drain it and try again from a fresh millisecond.
+            // and left a permit; drain it and try again.
             let _ = permit(50);
-            thread::sleep(Duration::from_millis(2));
         }
         assert!(aligned, "two tokens never landed in one millisecond");
         assert!(
