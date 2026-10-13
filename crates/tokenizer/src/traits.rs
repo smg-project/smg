@@ -362,6 +362,15 @@ pub trait Tokenizer: Encoder + Decoder {
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &[]
     }
+
+    /// The added tokens that are not special: strings the tokenizer still
+    /// extracts whole before pre-tokenization. A cache that splits text at
+    /// special tokens must not split inside one of these (a special token can
+    /// be a substring of a longer added token), so it matches them too, as
+    /// text that is never a boundary. Empty when a tokenizer has none.
+    fn added_token_strings(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Contains the results of tokenizing text: token IDs, string tokens, and their spans

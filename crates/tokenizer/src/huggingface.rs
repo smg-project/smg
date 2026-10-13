@@ -1221,6 +1221,15 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         &self.eos_token_ids
     }
 
+    fn added_token_strings(&self) -> Vec<String> {
+        self.tokenizer
+            .get_added_tokens_decoder()
+            .values()
+            .filter(|token| !token.special)
+            .map(|token| token.content.clone())
+            .collect()
+    }
+
     fn apply_chat_template(
         &self,
         messages: &[serde_json::Value],

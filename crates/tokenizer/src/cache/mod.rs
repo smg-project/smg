@@ -101,9 +101,13 @@ impl CachedTokenizer {
             None
         };
 
-        // Extract special tokens once at construction time
-        let special_tokens =
-            SpecialTokenBoundaries::new(&Self::extract_special_token_strings(&inner));
+        // The special tokens the cache splits at: those whose splice the
+        // tokenizer reproduces, found once at construction.
+        let special_tokens = SpecialTokenBoundaries::for_encoder(
+            &Self::extract_special_token_strings(&inner),
+            &inner.added_token_strings(),
+            inner.as_ref(),
+        );
 
         Self {
             inner,
@@ -186,41 +190,67 @@ impl Encoder for CachedTokenizer {
         }
 
         // L1 path (prefix match at special token boundaries): a hit splices the
-        // shared cached prefix with a fresh suffix encode; a miss tokenizes the
-        // input once, seeding every boundary entry along the way.
+        // shared cached prefix with the suffix encoded after the boundary's
+        // special token, as it is in the whole text; a miss tokenizes the input
+        // once, seeding every boundary entry along the way. Where the splice
+        // cannot be shown exact for this input (the boundary's token does not
+        // come back as itself in front of the suffix), the plain encode serves
+        // the request and nothing is cached from it.
         if let Some(l1) = &self.l1 {
+            let inner = self.inner.as_ref();
+            let plain = || inner.encode(input, add_special_tokens);
             let encoding =
                 match l1.lookup_with_seeds(input, &self.special_tokens, add_special_tokens) {
-                    PrefixLookup::Hit(prefix_tokens, prefix_len, Some((deepest, digest))) => {
+                    PrefixLookup::Hit(prefix_tokens, hit, Some(deepest)) => {
                         // Also cache this input's deepest boundary: a later input that extends
                         // it (the next turn of the same conversation) then matches there, not at
                         // the shorter prefix this one shares with other conversations.
-                        let middle = self.inner.encode(&input[prefix_len..deepest], false)?;
-                        let mut merged_tokens =
-                            Vec::with_capacity(prefix_tokens.len() + middle.token_ids().len());
-                        merged_tokens.extend_from_slice(&prefix_tokens);
-                        merged_tokens.extend_from_slice(middle.token_ids());
-                        l1.insert_prefix(digest, deepest, &merged_tokens);
-                        let tail = self.inner.encode(&input[deepest..], false)?;
-                        merged_tokens.extend_from_slice(tail.token_ids());
-                        Encoding::Plain(merged_tokens)
+                        let middle = self.special_tokens.encode_after(
+                            hit.special,
+                            &input[hit.end..deepest.end],
+                            inner,
+                        );
+                        match middle {
+                            Ok(middle) => {
+                                let mut merged_tokens =
+                                    Vec::with_capacity(prefix_tokens.len() + middle.len());
+                                merged_tokens.extend_from_slice(&prefix_tokens);
+                                merged_tokens.extend_from_slice(&middle);
+                                l1.insert_prefix(deepest.digest, deepest.end, &merged_tokens);
+                                match self.special_tokens.encode_after(
+                                    deepest.special,
+                                    &input[deepest.end..],
+                                    inner,
+                                ) {
+                                    Ok(tail) => {
+                                        merged_tokens.extend_from_slice(&tail);
+                                        Encoding::Plain(merged_tokens)
+                                    }
+                                    Err(_) => plain()?,
+                                }
+                            }
+                            Err(_) => plain()?,
+                        }
                     }
-                    PrefixLookup::Hit(prefix_tokens, prefix_len, None)
-                        if prefix_len < input.len() =>
-                    {
-                        let suffix = &input[prefix_len..];
-                        // The cached prefix already carries any leading special tokens,
-                        // so the suffix must never re-add them (it is never segment 0).
-                        let suffix_encoding = self.inner.encode(suffix, false)?;
-                        let suffix_tokens = suffix_encoding.token_ids();
-
-                        // Splice with exact capacity: one allocation and a single copy
-                        // of the shared prefix.
-                        let mut merged_tokens =
-                            Vec::with_capacity(prefix_tokens.len() + suffix_tokens.len());
-                        merged_tokens.extend_from_slice(&prefix_tokens);
-                        merged_tokens.extend_from_slice(suffix_tokens);
-                        Encoding::Plain(merged_tokens)
+                    PrefixLookup::Hit(prefix_tokens, hit, None) if hit.end < input.len() => {
+                        // The cached prefix already carries any leading special tokens;
+                        // the suffix is encoded after the boundary's token (never as segment 0).
+                        match self.special_tokens.encode_after(
+                            hit.special,
+                            &input[hit.end..],
+                            inner,
+                        ) {
+                            Ok(suffix_tokens) => {
+                                // Splice with exact capacity: one allocation and a single copy
+                                // of the shared prefix.
+                                let mut merged_tokens =
+                                    Vec::with_capacity(prefix_tokens.len() + suffix_tokens.len());
+                                merged_tokens.extend_from_slice(&prefix_tokens);
+                                merged_tokens.extend_from_slice(&suffix_tokens);
+                                Encoding::Plain(merged_tokens)
+                            }
+                            Err(_) => plain()?,
+                        }
                     }
                     // Defensive: boundaries always exclude input.len(), so a full-input
                     // match cannot occur; if it ever did, the entry is keyed on the whole
@@ -230,21 +260,20 @@ impl Encoder for CachedTokenizer {
                     }
                     // No special token boundaries — nothing cacheable; single plain encode
                     // (preserves the inner tokenizer's native encoding variant).
-                    PrefixLookup::Miss(seeds) if seeds.is_empty() => {
-                        self.inner.encode(input, add_special_tokens)?
-                    }
+                    PrefixLookup::Miss(seeds) if seeds.is_empty() => plain()?,
                     PrefixLookup::Miss(seeds) => {
                         match l1.populate_with_seeds(
                             input,
                             &seeds,
-                            self.inner.as_ref(),
+                            inner,
+                            &self.special_tokens,
                             add_special_tokens,
                         ) {
                             Ok(encoding) => encoding,
-                            // Seeding failed mid-segment (nothing was inserted) — fall
-                            // back to the plain uncached encode, matching the previous
-                            // behavior where boundary-insert errors were swallowed.
-                            Err(_) => self.inner.encode(input, add_special_tokens)?,
+                            // Seeding failed mid-segment (nothing was inserted): the
+                            // plain uncached encode, as before, and when a boundary's
+                            // splice is not exact for this input.
+                            Err(_) => plain()?,
                         }
                     }
                 };
@@ -477,13 +506,46 @@ mod tests {
         }
     }
 
+    /// The special tokens of the test encoders: atomic (one id each from
+    /// 200), extracted leftmost-longest as a BPE tokenizer's added vocabulary
+    /// does it; one id per byte otherwise.
+    const TEST_SPECIALS: [&str; 3] = ["<bos>", "<|im_start|>", "<|im_end|>"];
+
+    fn atomic_ids(input: &str, ids: &mut Vec<TokenIdType>) {
+        let matcher = aho_corasick::AhoCorasickBuilder::new()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(TEST_SPECIALS)
+            .unwrap();
+        let mut last = 0;
+        for found in matcher.find_iter(input) {
+            ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
+            ids.push(200 + found.pattern().as_u32());
+            last = found.end();
+        }
+        ids.extend(input[last..].bytes().map(TokenIdType::from));
+    }
+
+    /// The bytes of the special tokens an L1 encode re-reads: each boundary's
+    /// token is encoded in front of the segment after it.
+    fn boundary_token_bytes(input: &str) -> usize {
+        let matcher = aho_corasick::AhoCorasickBuilder::new()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build(TEST_SPECIALS)
+            .unwrap();
+        matcher
+            .find_iter(input)
+            .filter(|found| found.end() < input.len())
+            .map(|found| found.len())
+            .sum()
+    }
+
     impl Encoder for BosTokenizer {
         fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
             let mut ids: Vec<TokenIdType> = Vec::new();
             if add_special_tokens {
                 ids.push(BOS_ID);
             }
-            ids.extend(input.bytes().map(TokenIdType::from));
+            atomic_ids(input, &mut ids);
             Ok(Encoding::Plain(ids))
         }
 
@@ -606,16 +668,19 @@ mod tests {
     fn test_l1_miss_tokenizes_input_exactly_once() {
         let counting = Arc::new(CountingTokenizer::new());
         let cached = CachedTokenizer::new(counting.clone(), l1_only_config());
+        // The construction probed the special tokens; the request path starts here.
+        counting.reset();
 
         let input = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nquery<|im_end|>";
 
-        // Cold miss: the fused path must tokenize each input byte exactly once.
+        // Cold miss: the fused path tokenizes each input byte exactly once,
+        // plus each boundary's special token in front of the segment after it.
         // (Previously: one full encode for the result + a re-encode of every
         // boundary prefix while seeding — roughly 2x the input.)
         let first = cached.encode(input, true).unwrap();
         assert_eq!(
             counting.bytes_encoded(),
-            input.len(),
+            input.len() + boundary_token_bytes(input),
             "miss path must tokenize the input exactly once"
         );
 
@@ -628,8 +693,8 @@ mod tests {
         let second = cached.encode(input, true).unwrap();
         assert_eq!(
             counting.bytes_encoded(),
-            input.len() - deepest_boundary,
-            "hit path must tokenize only the suffix"
+            input.len() - deepest_boundary + "<|im_start|>".len(),
+            "hit path must tokenize only the suffix, after the boundary's token"
         );
         assert_eq!(
             counting.encode_calls(),
@@ -667,9 +732,12 @@ mod tests {
         );
         counting.reset();
         let encoded = cached.encode(&turn_two, true).unwrap();
+        // The text past the previous turn's deepest boundary, encoded in two
+        // parts (up to this turn's deepest boundary, then its tail), each after
+        // the `<|im_start|>` that ends its boundary.
         assert_eq!(
             counting.bytes_encoded(),
-            turn_two.len() - deepest,
+            turn_two.len() - deepest + 2 * "<|im_start|>".len(),
             "the next turn must match its own previous turn, not the shared prefix"
         );
         let fresh = BosTokenizer::new().encode(&turn_two, true).unwrap();
@@ -846,6 +914,84 @@ mod tests {
             got.token_ids(),
             want.token_ids(),
             "a hit on the short token's prefix splits the long token"
+        );
+    }
+
+    /// Tokenizer whose first piece of an input gets a marker id, like a
+    /// pre-tokenizer that prepends a word marker to the first piece only: the
+    /// same text encodes differently at the start of an input and after a
+    /// special token, so a suffix encoded on its own is wrong.
+    struct PrependsToFirstPiece;
+
+    const MARKER_ID: TokenIdType = 7;
+
+    impl Encoder for PrependsToFirstPiece {
+        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
+            let mut ids: Vec<TokenIdType> = Vec::new();
+            atomic_ids(input, &mut ids);
+            if ids.first().is_some_and(|&id| id < 200) {
+                ids.insert(0, MARKER_ID);
+            }
+            Ok(Encoding::Plain(ids))
+        }
+
+        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+            inputs
+                .iter()
+                .map(|i| self.encode(i, add_special_tokens))
+                .collect()
+        }
+    }
+
+    impl Decoder for PrependsToFirstPiece {
+        fn decode(&self, _token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl traits::Tokenizer for PrependsToFirstPiece {
+        fn vocab_size(&self) -> usize {
+            256
+        }
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            static SPECIALS: std::sync::OnceLock<SpecialTokens> = std::sync::OnceLock::new();
+            SPECIALS.get_or_init(|| SpecialTokens {
+                additional_special_tokens: vec!["<|im_start|>".into(), "<|im_end|>".into()],
+                ..Default::default()
+            })
+        }
+        fn token_to_id(&self, _token: &str) -> Option<TokenIdType> {
+            None
+        }
+        fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
+            None
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn segments_after_a_boundary_are_encoded_as_in_the_whole_text() {
+        // A segment encoded on its own would get the first-piece marker the
+        // whole text gives only to its very first piece; encoded after the
+        // boundary's special token it does not. The miss (segment by segment)
+        // and the hit (a cached prefix plus the suffix) both equal the plain
+        // encode.
+        let tokenizer = Arc::new(PrependsToFirstPiece);
+        let cached = CachedTokenizer::new(tokenizer.clone(), l1_only_config());
+        let first = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nq<|im_end|>";
+        let second = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nq2<|im_end|>";
+        for input in [first, second, "plain start<|im_end|>then more"] {
+            for add_special_tokens in [false, true] {
+                let got = cached.encode(input, add_special_tokens).unwrap();
+                let want = tokenizer.encode(input, add_special_tokens).unwrap();
+                assert_eq!(got.token_ids(), want.token_ids(), "{input:?}");
+            }
+        }
+        assert!(
+            cached.l1_cache_stats().unwrap().hits >= 1,
+            "the second input hit the first's prefix"
         );
     }
 
