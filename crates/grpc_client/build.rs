@@ -36,6 +36,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .extern_path(".smg.grpc.common", "crate::common_proto")
+        // The inline tensor payloads are `Bytes`: a multi-megabyte pixel
+        // tensor is then shared, not copied, by every clone of the request
+        // that carries it (a retry attempt's, a disaggregated leg's). The
+        // wire encoding is the same `bytes` field.
+        .bytes(".tokenspeed.grpc.scheduler.TensorData.inline")
+        .bytes(".vllm.grpc.engine.TensorData.inline")
+        .bytes(".sglang.grpc.scheduler.TensorData.data")
+        // Each message is encoded into a buffer reserved to its length once
+        // (see `crate::codec`), not into one that doubles under a tensor.
+        .codec_path("crate::codec::SizedProstCodec")
         .type_attribute("GetModelInfoResponse", "#[derive(serde::Serialize)]")
         // Some ServerInfo protos contain prost_types::{Struct, Timestamp};
         // those are handled separately at the wrapper layer.

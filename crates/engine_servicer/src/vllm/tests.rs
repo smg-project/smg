@@ -2432,7 +2432,7 @@ async fn media_processed_as_router_batches_is_translated_for_the_engine() {
         pixel_values: Some(vllm::TensorData {
             shape: vec![1, 4],
             dtype: "uint8".to_string(),
-            payload: Some(vllm::tensor_data::Payload::Inline(vec![9, 8, 7, 6])),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![9, 8, 7, 6].into())),
         }),
         mm_placeholders: vec![vllm::PlaceholderRange {
             offset: 1,

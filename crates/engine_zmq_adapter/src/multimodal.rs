@@ -92,7 +92,7 @@ fn payload_bytes(
     payload: Option<vllm::tensor_data::Payload>,
 ) -> Result<Vec<u8>, String> {
     match payload {
-        Some(vllm::tensor_data::Payload::Inline(data)) => Ok(data),
+        Some(vllm::tensor_data::Payload::Inline(data)) => Ok(Vec::from(data)),
         Some(vllm::tensor_data::Payload::Shm(handle)) => read_shm_payload(name, &handle),
         Some(vllm::tensor_data::Payload::Remote(_)) => Err(format!(
             "multimodal tensor {name:?}: TensorData.remote payload is not implemented yet"
@@ -582,7 +582,7 @@ mod tests {
         vllm::TensorData {
             shape,
             dtype: dtype.to_string(),
-            payload: Some(vllm::tensor_data::Payload::Inline(data)),
+            payload: Some(vllm::tensor_data::Payload::Inline(data.into())),
         }
     }
 

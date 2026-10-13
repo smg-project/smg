@@ -15,6 +15,7 @@ pub mod common_proto {
 }
 pub mod abort_on_drop;
 pub mod channel;
+pub mod codec;
 pub mod engine_load;
 pub mod media_fault;
 pub mod mlx_engine;

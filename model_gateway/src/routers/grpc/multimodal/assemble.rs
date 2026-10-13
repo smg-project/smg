@@ -11,8 +11,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use llm_multimodal::{
-    EncoderDtype, EncoderFieldLayouts, EncoderInputView, FieldLayout, Modality, ModelSpecificValue,
-    PlaceholderRange, PreprocessedEncoderInputs,
+    EncoderDtype, EncoderFieldLayouts, EncoderInput, EncoderInputView, FieldLayout, Modality,
+    ModelSpecificValue, PlaceholderRange, PreprocessedEncoderInputs,
 };
 use smg_grpc_client::common_proto as common;
 use tracing::{info, warn};
@@ -22,7 +22,7 @@ use super::{
     log_mm_timing_enabled,
     serialize::{
         model_specific_to_tensor_bytes, serialize_encoder_input_owned, serialize_model_specific,
-        serialize_tokenspeed_encoder_input, wire_dtype,
+        serialize_tokenspeed_encoder_input, serialize_tokenspeed_encoder_input_owned, wire_dtype,
     },
     transport::{
         mm_encoder_input_dtype, mm_vllm_device_normalizes, mm_vllm_encoder_input_dtype,
@@ -164,7 +164,7 @@ async fn spawn_tokenspeed_assembly(
 ) -> Result<TokenSpeedMultimodalData> {
     let batches = intermediate.into_batches();
     let pending = tokio::task::spawn_blocking(move || {
-        assemble_tokenspeed_batches(&batches, options).map(PendingTokenSpeedAssembly::new)
+        assemble_tokenspeed_batches_owned(batches, options).map(PendingTokenSpeedAssembly::new)
     })
     .await
     .context("TokenSpeed multimodal assembly task failed")??;
@@ -431,7 +431,7 @@ fn assemble_tokenspeed(
     validate_precomputed_batch(intermediate)?;
     let options =
         tokenspeed_assembly_options(intermediate.media.modality(), workers, skip_pixel_values);
-    assemble_tokenspeed_with_options(intermediate, options)
+    assemble_tokenspeed_with_options(intermediate, options, None)
 }
 
 pub(crate) fn assemble_tokenspeed_for_encode(
@@ -467,9 +467,13 @@ fn tokenspeed_assembly_options(
     }
 }
 
+/// `owned_input` is the batch's encoder input when the caller handed it over
+/// whole (see [`take_whole_encoder_input`]); its one item then moves those
+/// bytes into its payload instead of writing a copy of its view.
 fn assemble_tokenspeed_with_options(
     intermediate: &PrecomputedMultimodalIntermediate,
     options: TokenSpeedAssemblyOptions,
+    mut owned_input: Option<EncoderInput>,
 ) -> Result<TokenSpeedMultimodalData> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -522,6 +526,19 @@ fn assemble_tokenspeed_with_options(
         // the per-item slice + serialize entirely when skip_pixel_values is set.
         let encoder_input = if skip_pixel_values {
             TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.clone())
+        } else if let Some(input) = owned_input.take() {
+            match serialize_tokenspeed_encoder_input_owned(
+                input,
+                &encoder_input_dtype,
+                shm_enabled,
+                shm_min_bytes,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    cleanup_tokenspeed_items_encoder_shm(&items, None);
+                    return Err(error);
+                }
+            }
         } else {
             let item_encoder_input = match encoder_input_for_item(
                 &intermediate.preprocessed,
@@ -603,12 +620,60 @@ fn assemble_tokenspeed_with_options(
     })
 }
 
+/// Batches the caller keeps: every item's encoder input is written from its
+/// view.
 fn assemble_tokenspeed_batches(
     batches: &[PrecomputedMultimodalIntermediate],
     options: Vec<TokenSpeedAssemblyOptions>,
 ) -> Result<TokenSpeedMultimodalData> {
+    let none = batches.iter().map(|_| None).collect();
+    assemble_tokenspeed_batches_with(batches, options, none)
+}
+
+/// Batches the caller hands over: a batch whose one item is the whole encoder
+/// input moves that input into the item's payload instead of writing a copy.
+fn assemble_tokenspeed_batches_owned(
+    mut batches: Vec<PrecomputedMultimodalIntermediate>,
+    options: Vec<TokenSpeedAssemblyOptions>,
+) -> Result<TokenSpeedMultimodalData> {
+    let owned = batches.iter_mut().map(take_whole_encoder_input).collect();
+    assemble_tokenspeed_batches_with(&batches, options, owned)
+}
+
+/// The encoder input of a batch whose single item spans all of it, taken out
+/// of the batch; an empty tensor stays in its place, which no per-item step
+/// reads. `None` for every other batch, whose items are written from views.
+fn take_whole_encoder_input(batch: &mut PrecomputedMultimodalIntermediate) -> Option<EncoderInput> {
+    let [binding] = batch.bindings.as_slice() else {
+        return None;
+    };
+    let item_index = binding.item_index;
+    if batch.media.len() != 1 {
+        return None;
+    }
+    let whole = batch.preprocessed.encoder_input.view();
+    let item = encoder_input_for_item(
+        &batch.preprocessed,
+        &batch.field_layouts.encoder_input,
+        item_index,
+    )
+    .ok()?;
+    if whole.is_empty() || item.len() != whole.len() {
+        return None;
+    }
+    Some(std::mem::replace(
+        &mut batch.preprocessed.encoder_input,
+        EncoderInput::F32(ndarray::ArrayD::zeros(ndarray::IxDyn(&[0]))),
+    ))
+}
+
+fn assemble_tokenspeed_batches_with(
+    batches: &[PrecomputedMultimodalIntermediate],
+    options: Vec<TokenSpeedAssemblyOptions>,
+    owned_inputs: Vec<Option<EncoderInput>>,
+) -> Result<TokenSpeedMultimodalData> {
     anyhow::ensure!(
-        batches.len() == options.len(),
+        batches.len() == options.len() && batches.len() == owned_inputs.len(),
         "multimodal batch/assembly option count mismatch"
     );
 
@@ -619,8 +684,8 @@ fn assemble_tokenspeed_batches(
     let shm_min_bytes = options.first().map(|opts| opts.shm_min_bytes).unwrap_or(0);
     let mut ordered_items: Vec<(usize, TokenSpeedMultimodalItem)> = Vec::new();
 
-    for (batch, options) in batches.iter().zip(options) {
-        match assemble_tokenspeed_with_options(batch, options) {
+    for ((batch, options), owned_input) in batches.iter().zip(options).zip(owned_inputs) {
+        match assemble_tokenspeed_with_options(batch, options, owned_input) {
             Ok(data) => {
                 let mut ordinals = batch
                     .bindings
@@ -1061,8 +1126,103 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// One image whose flat span is the whole encoder input: the tensor
+    /// handed over by value moves into the item's payload, and the item is
+    /// the same as the one written from a view of it.
+    fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
+        let mut model_specific = HashMap::new();
+        model_specific.insert(
+            "patches_per_image".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![4],
+                shape: vec![1],
+            },
+        );
+        let preprocessed = PreprocessedEncoderInputs {
+            encoder_input: ArrayD::from_shape_vec(
+                IxDyn(&[4, 2]),
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            )
+            .unwrap()
+            .into(),
+            feature_token_counts: vec![4],
+            item_sizes: vec![(1, 1)],
+            model_specific,
+        };
+        PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
+                image::DynamicImage::new_rgb8(1, 1),
+                bytes::Bytes::from_static(b"a"),
+                ImageDetail::Auto,
+                llm_multimodal::ImageSource::InlineBytes,
+                "hash-a".to_string(),
+            ))]),
+            bindings: vec![PromptBinding {
+                item_index: 0,
+                prompt_ordinal: 0,
+                structural: PlaceholderRange {
+                    offset: 10,
+                    length: 4,
+                },
+                patches: vec![PlaceholderRange {
+                    offset: 10,
+                    length: 4,
+                }],
+            }],
+            placeholder_token_id: Some(151655),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([("patches_per_image".to_string(), FieldLayout::Batched)]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    }
+
     #[test]
-    fn assemble_tokenspeed_splits_image_items() {
+    fn a_single_whole_item_moves_its_encoder_input_into_the_same_payload() {
+        use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;
+
+        let borrowed = assemble_tokenspeed(&single_image_intermediate(), None, false).unwrap();
+        let mut taken = single_image_intermediate();
+        assert!(take_whole_encoder_input(&mut taken).is_some());
+        assert_eq!(taken.preprocessed.encoder_input.view().len(), 0);
+
+        let options = vec![tokenspeed_assembly_options(Modality::Image, None, false)];
+        let owned =
+            assemble_tokenspeed_batches_owned(vec![single_image_intermediate()], options).unwrap();
+        assert_eq!(owned.items.len(), 1);
+        let (a, b) = (
+            &borrowed.items[0].encoder_input,
+            &owned.items[0].encoder_input,
+        );
+        assert_eq!(a.shape, b.shape);
+        assert_eq!(a.dtype, b.dtype);
+        match (&a.storage, &b.storage) {
+            (TokenSpeedTensorStorage::Inline(x), TokenSpeedTensorStorage::Inline(y)) => {
+                assert_eq!(x, y);
+                // Eight bfloat16 values, two bytes each.
+                assert_eq!(x.len(), 16);
+            }
+            other => panic!("inline payloads expected, got {other:?}"),
+        }
+        assert_eq!(
+            owned.items[0].mm_placeholders,
+            borrowed.items[0].mm_placeholders
+        );
+        assert_eq!(owned.items[0].content_hash, borrowed.items[0].content_hash);
+    }
+
+    /// Two items share one tensor: both are written from views, nothing moves.
+    #[test]
+    fn a_batch_of_two_items_keeps_its_encoder_input() {
+        let mut two = two_image_intermediate();
+        assert!(take_whole_encoder_input(&mut two).is_none());
+        assert_eq!(two.preprocessed.encoder_input.view().len(), 8);
+    }
+
+    fn two_image_intermediate() -> PrecomputedMultimodalIntermediate {
         let mut model_specific = HashMap::new();
         model_specific.insert(
             "patches_per_image".to_string(),
@@ -1108,7 +1268,7 @@ mod tests {
             )),
         ];
 
-        let intermediate = PrecomputedMultimodalIntermediate {
+        PrecomputedMultimodalIntermediate {
             preprocessed,
             media: MediaBatch::Images(images),
             bindings: vec![
@@ -1147,8 +1307,12 @@ mod tests {
             ),
             keep_on_cpu_keys: vec![],
             encoder_input_key: None,
-        };
+        }
+    }
 
+    #[test]
+    fn assemble_tokenspeed_splits_image_items() {
+        let intermediate = two_image_intermediate();
         let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
         assert_eq!(assembled.items.len(), 2);
 
@@ -1396,6 +1560,7 @@ mod tests {
                 encoder_input_dtype: "bfloat16".to_string(),
                 skip_pixel_values: false,
             },
+            None,
         )
         .unwrap();
 

@@ -62,49 +62,95 @@ pub(super) fn serialize_tokenspeed_encoder_input(
     shm_enabled: bool,
     shm_min_bytes: usize,
 ) -> anyhow::Result<TokenSpeedTensor> {
-    // TokenSpeed reads float widths only.
-    let dtype = wire_dtype(dtype, false);
-    // Decided before any segment is created for it.
-    input
-        .writable_as(dtype)
-        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
-    let shape = shape_u32(input);
-    let nbytes = input.len() * dtype.element_size();
-
-    if shm_enabled && nbytes >= shm_min_bytes {
-        let started = Instant::now();
-        match write_tokenspeed_shm_with(nbytes, |output| {
-            input
-                .write_into(dtype, output)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
-        }) {
-            Ok(handle) => {
-                if log_mm_timing_enabled() {
-                    info!(
-                        nbytes,
-                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                        "smg_mm_timing tokenspeed_shm_write_direct"
-                    );
-                }
-                return Ok(TokenSpeedTensor::shm(handle, shape, dtype.to_string()));
-            }
-            Err(error) => {
-                use crate::observability::metrics::Metrics;
-                warn!(
-                    ?error,
-                    nbytes,
-                    %dtype,
-                    "Failed to write TokenSpeed encoder input directly to SHM; falling back to bytes path"
-                );
-                Metrics::record_mm_shm_write_failure("tokenspeed");
-            }
-        }
+    let (dtype, shape) = tokenspeed_wire_shape(input, dtype)?;
+    if let Some(tensor) = tokenspeed_shm_tensor(input, dtype, &shape, shm_enabled, shm_min_bytes) {
+        return Ok(tensor);
     }
-
     let bytes = input
         .try_write_as(dtype)
         .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
     Ok(TokenSpeedTensor::inline(bytes, shape, dtype.to_string()))
+}
+
+/// [`serialize_tokenspeed_encoder_input`] for an input the caller hands over
+/// whole: bytes already in the wire dtype move into the payload instead of
+/// being written again.
+pub(super) fn serialize_tokenspeed_encoder_input_owned(
+    input: EncoderInput,
+    dtype: &str,
+    shm_enabled: bool,
+    shm_min_bytes: usize,
+) -> anyhow::Result<TokenSpeedTensor> {
+    let view = input.view();
+    let (dtype, shape) = tokenspeed_wire_shape(&view, dtype)?;
+    if let Some(tensor) = tokenspeed_shm_tensor(&view, dtype, &shape, shm_enabled, shm_min_bytes) {
+        return Ok(tensor);
+    }
+    let bytes = input
+        .into_bytes_as(dtype)
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
+    Ok(TokenSpeedTensor::inline(bytes, shape, dtype.to_string()))
+}
+
+/// The dtype TokenSpeed reads for `dtype` and the input's shape in it,
+/// checked before any segment is created for it.
+fn tokenspeed_wire_shape(
+    input: &EncoderInputView<'_>,
+    dtype: &str,
+) -> anyhow::Result<(EncoderDtype, Vec<u32>)> {
+    // TokenSpeed reads float widths only.
+    let dtype = wire_dtype(dtype, false);
+    input
+        .writable_as(dtype)
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
+    Ok((dtype, shape_u32(input)))
+}
+
+/// The input written straight into a shared-memory segment when the transport
+/// takes one of its size; `None` leaves it to the bytes path.
+fn tokenspeed_shm_tensor(
+    input: &EncoderInputView<'_>,
+    dtype: EncoderDtype,
+    shape: &[u32],
+    shm_enabled: bool,
+    shm_min_bytes: usize,
+) -> Option<TokenSpeedTensor> {
+    let nbytes = input.len() * dtype.element_size();
+    if !shm_enabled || nbytes < shm_min_bytes {
+        return None;
+    }
+    let started = Instant::now();
+    match write_tokenspeed_shm_with(nbytes, |output| {
+        input
+            .write_into(dtype, output)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    }) {
+        Ok(handle) => {
+            if log_mm_timing_enabled() {
+                info!(
+                    nbytes,
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "smg_mm_timing tokenspeed_shm_write_direct"
+                );
+            }
+            Some(TokenSpeedTensor::shm(
+                handle,
+                shape.to_vec(),
+                dtype.to_string(),
+            ))
+        }
+        Err(error) => {
+            use crate::observability::metrics::Metrics;
+            warn!(
+                ?error,
+                nbytes,
+                %dtype,
+                "Failed to write TokenSpeed encoder input directly to SHM; falling back to bytes path"
+            );
+            Metrics::record_mm_shm_write_failure("tokenspeed");
+            None
+        }
+    }
 }
 
 /// The dtype `asked` names, or `float32` for one the receiver may not share:

@@ -3326,7 +3326,7 @@ mod tests {
                     vllm::TensorData {
                         shape: vec![2, 3],
                         dtype: "int64".to_string(),
-                        payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 48])),
+                        payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 48].into())),
                     },
                 )]),
                 batched_keys: vec!["image_grid_thw".to_string()],
@@ -3460,7 +3460,7 @@ mod tests {
         let grid = vllm::TensorData {
             shape: vec![1, 3],
             dtype: "int64".to_string(),
-            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24])),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24].into())),
         };
         let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
             request_id: "pd-2".to_string(),
@@ -3586,7 +3586,7 @@ mod tests {
         let grid = vllm::TensorData {
             shape: vec![1, 3],
             dtype: "int64".to_string(),
-            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24])),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24].into())),
         };
         let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
             request_id: "pd-lmo".to_string(),

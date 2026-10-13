@@ -453,7 +453,7 @@ pub(crate) fn wire_tensor_tokenspeed(
     tensor: tokenspeed_proto::TensorData,
 ) -> Result<WireTensor, String> {
     let bytes = match tensor.payload {
-        Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => bytes,
+        Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => Vec::from(bytes),
         Some(_) => {
             return Err(
                 "ZMQ multimodal requires inline tensor payloads; got a SHM/remote handle"
@@ -899,20 +899,18 @@ mod tests {
             encoder_input: Some(tokenspeed_proto::TensorData {
                 shape: vec![2, 4],
                 dtype: "bfloat16".to_string(),
-                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
-                    0u8;
-                    16
-                ])),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                    vec![0u8; 16].into(),
+                )),
             }),
             model_specific_tensors: [(
                 "vit_grid".to_string(),
                 tokenspeed_proto::TensorData {
                     shape: vec![1, 3],
                     dtype: "uint32".to_string(),
-                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
-                        0u8;
-                        12
-                    ])),
+                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                        vec![0u8; 12].into(),
+                    )),
                 },
             )]
             .into(),
@@ -1000,10 +998,9 @@ mod tests {
             tokenspeed_proto::TensorData {
                 shape: vec![1, 3],
                 dtype: "uint32".to_string(),
-                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
-                    0u8;
-                    12
-                ])),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                    vec![0u8; 12].into(),
+                )),
             },
         );
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });

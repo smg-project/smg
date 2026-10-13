@@ -306,7 +306,7 @@ impl SglangMultimodalData {
                 (
                     k,
                     sglang::TensorData {
-                        data: v.data,
+                        data: v.data.into(),
                         shape: v.shape,
                         dtype: v.dtype,
                     },
@@ -329,7 +329,7 @@ impl SglangMultimodalData {
             audio_data: vec![],
             modalities: vec!["image".to_string()],
             pixel_values: Some(sglang::TensorData {
-                data: self.pixel_values,
+                data: self.pixel_values.into(),
                 shape: self.pixel_values_shape,
                 dtype: self.pixel_values_dtype,
             }),
@@ -679,7 +679,7 @@ fn tokenspeed_tensor_payload(
     rdma: Option<MmRdmaExport<'_>>,
 ) -> tokenspeed::tensor_data::Payload {
     match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "tokenspeed", rdma) {
-        MmTensorPayload::Inline(data) => tokenspeed::tensor_data::Payload::Inline(data),
+        MmTensorPayload::Inline(data) => tokenspeed::tensor_data::Payload::Inline(data.into()),
         MmTensorPayload::Shm(handle) => tokenspeed::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => tokenspeed::tensor_data::Payload::Remote(handle),
     }
@@ -692,7 +692,7 @@ fn vllm_tensor_payload(
     rdma: Option<MmRdmaExport<'_>>,
 ) -> vllm::tensor_data::Payload {
     match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "vllm", rdma) {
-        MmTensorPayload::Inline(data) => vllm::tensor_data::Payload::Inline(data),
+        MmTensorPayload::Inline(data) => vllm::tensor_data::Payload::Inline(data.into()),
         MmTensorPayload::Shm(handle) => vllm::tensor_data::Payload::Shm(handle),
         MmTensorPayload::Remote(handle) => vllm::tensor_data::Payload::Remote(handle),
     }
@@ -4411,7 +4411,7 @@ mod tests {
 
     fn inline_tensor_data(tensor: &tokenspeed::TensorData) -> &[u8] {
         match tensor.payload.as_ref() {
-            Some(tokenspeed::tensor_data::Payload::Inline(data)) => data,
+            Some(tokenspeed::tensor_data::Payload::Inline(data)) => data.as_ref(),
             _ => panic!("expected inline TensorData payload"),
         }
     }
