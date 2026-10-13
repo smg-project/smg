@@ -2895,12 +2895,24 @@ impl PrefillTicket {
     /// stream by [`ProtoStream::tracked_prefill_leg_booked`]; dropped before
     /// that (the call failed or was retired), it releases the prompt untimed.
     pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Self> {
+        Self::book_as(worker, prompt_tokens, true)
+    }
+
+    /// [`Self::book`] with the prompt's prefill `timed` or not: a regular
+    /// dispatch times it when the engine streams the generation (the first
+    /// response is the first token) and books it untimed otherwise (the one
+    /// response of a non-streaming generation is its whole answer).
+    pub(crate) fn book_as(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        timed: bool,
+    ) -> Option<Self> {
         (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens, true);
+            worker.note_prefill_started(prompt_tokens, timed);
             Self {
                 worker: Arc::clone(worker),
                 tokens: prompt_tokens,
-                timed: true,
+                timed,
                 released: false,
             }
         })
@@ -2926,12 +2938,39 @@ impl Drop for PrefillTicket {
     }
 }
 
+/// What a regular dispatch books on its worker before its call is polled
+/// (see [`PrefillTicket::book`]): the prompt as pending prefill, timed when
+/// the engine streams the generation, and, for a streaming generation, the
+/// request's place in the worker's pile. [`ProtoStream::tracked_booked`]
+/// hands both to the call's stream; dropped before that (the call failed),
+/// the booking gives both back.
+pub(crate) struct DispatchBooking {
+    prefill: Option<PrefillTicket>,
+    progress: Option<ProgressTicket>,
+}
+
+impl DispatchBooking {
+    pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        let progress = streaming.then(|| {
+            worker.note_tracked_started();
+            ProgressTicket {
+                worker: Arc::clone(worker),
+            }
+        });
+        Self {
+            prefill: PrefillTicket::book_as(worker, prompt_tokens, streaming),
+            progress,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tracked_tests {
     use std::sync::Arc;
 
     use super::{
-        sglang, vllm, FanoutStream, FirstItem, PrefillTicket, ProtoGenerateResponse, ProtoStream,
+        sglang, vllm, DispatchBooking, FanoutStream, FirstItem, PrefillTicket,
+        ProtoGenerateResponse, ProtoStream,
     };
     use crate::worker::{BasicWorkerBuilder, Worker};
 
@@ -3131,6 +3170,40 @@ mod tracked_tests {
         assert!(stream.next().await.is_none(), "the held end is replayed");
         assert!(stream.next().await.is_none(), "and the stream stays ended");
     }
+
+    #[test]
+    fn a_dispatch_booking_holds_the_prompt_and_the_pile_until_its_stream_takes_over() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let books = |worker: &Arc<dyn Worker>| (worker.prefill_backlog(), worker.tracked_load());
+        // 4,096 prompt tokens at the cold prior read as 409 ms of backlog.
+        let pending = std::time::Duration::from_millis(409);
+        let none = (std::time::Duration::ZERO, 0);
+        // A streaming generation: its prompt timed, its place in the pile.
+        let booking = DispatchBooking::book(&worker, 4_096, true);
+        assert_eq!(
+            books(&worker),
+            (pending, 1),
+            "booked at the dispatch, before the call has answered"
+        );
+        assert!(booking.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_booked(Arc::clone(&worker), booking);
+        assert_eq!(
+            books(&worker),
+            (pending, 1),
+            "handed to the stream: booked once, not again"
+        );
+        drop(stream);
+        assert_eq!(books(&worker), none, "released with the stream");
+        // A non-streaming generation: its prompt pending untimed, no pile slot.
+        let booking = DispatchBooking::book(&worker, 4_096, false);
+        assert_eq!(books(&worker), (pending, 0));
+        assert!(booking.prefill.as_ref().is_some_and(|ticket| !ticket.timed));
+        assert!(booking.progress.is_none());
+        // Dropped before a stream took it over (the call failed): given back.
+        drop(booking);
+        assert_eq!(books(&worker), none);
+    }
 }
 
 /// The message of the `Internal` status a stream ends with when the engine
@@ -3168,21 +3241,17 @@ impl ProtoStream {
     /// from first tokens only.
     #[must_use]
     pub fn tracked(self, worker: Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
-        let progress = streaming.then(|| {
-            worker.note_tracked_started();
-            ProgressTicket {
-                worker: Arc::clone(&worker),
-            }
-        });
-        let prefill = (prompt_tokens > 0).then(|| {
-            worker.note_prefill_started(prompt_tokens, streaming);
-            PrefillTicket {
-                worker: Arc::clone(&worker),
-                tokens: prompt_tokens,
-                timed: streaming,
-                released: false,
-            }
-        });
+        let booking = DispatchBooking::book(&worker, prompt_tokens, streaming);
+        self.tracked_booked(worker, booking)
+    }
+
+    /// [`Self::tracked`] for a request booked at its dispatch (see
+    /// [`DispatchBooking::book`]): the stream takes the booking over, so the
+    /// prompt's span runs from before the call was polled to the first
+    /// response, and the request has been in the pile since the dispatch.
+    #[must_use]
+    pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
+        let DispatchBooking { prefill, progress } = booking;
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
             worker,
