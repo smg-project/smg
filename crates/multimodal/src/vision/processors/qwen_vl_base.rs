@@ -963,7 +963,7 @@ impl QwenVLProcessorBase {
         let block_out = merge_size * merge_size * 3 * frames.len() * patch_size * patch_size;
         // One sub-patch's channel block: `[temporal, patch_h, patch_w]`.
         let channel = frames.len() * patch_size * patch_size;
-        let vector = rgb_runs::vector_runs();
+        let splitter = rgb_runs::RgbSplitter::detect();
         for (bi, chunk) in band.chunks_mut(block_out).enumerate() {
             let blk = block_start + bi;
             let pr = blk / pc_blocks;
@@ -982,12 +982,11 @@ impl QwenVLProcessorBase {
                             let row = (y0 + mh * patch_size + py) * width + x0 + mw * patch_size;
                             let pixels = &raw[row * 3..(row + patch_size) * 3];
                             let at = tp * patch_size * patch_size + py * patch_size;
-                            rgb_runs::split_rgb_run(
+                            splitter.split(
                                 pixels,
                                 &mut red[at..at + patch_size],
                                 &mut green[at..at + patch_size],
                                 &mut blue[at..at + patch_size],
-                                vector,
                             );
                         }
                     }
@@ -1071,7 +1070,7 @@ impl QwenVLProcessorBase {
         let block_out = merge_size * merge_size * 3 * temporal_patch_size * patch_size * patch_size;
         // One sub-patch's channel block: `[temporal, patch_h, patch_w]`.
         let channel = temporal_patch_size * patch_size * patch_size;
-        let vector = rgb_runs::vector_runs();
+        let splitter = rgb_runs::RgbSplitter::detect();
         for (bi, chunk) in band.chunks_mut(block_out).enumerate() {
             let blk = block_start + bi;
             let pr = blk / pc_blocks;
@@ -1092,12 +1091,11 @@ impl QwenVLProcessorBase {
                         let pixels = &raw[row * 3..(row + patch_size) * 3];
                         for tp in 0..temporal_patch_size {
                             let at = tp * patch_size * patch_size + py * patch_size;
-                            rgb_runs::split_rgb_run(
+                            splitter.split(
                                 pixels,
                                 &mut red[at..at + patch_size],
                                 &mut green[at..at + patch_size],
                                 &mut blue[at..at + patch_size],
-                                vector,
                             );
                         }
                     }

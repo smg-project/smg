@@ -10,35 +10,50 @@
 //! chunk of a slice.
 #![cfg_attr(target_arch = "aarch64", allow(unsafe_code))]
 
-/// Whether [`split_rgb_run`] takes the vector path on this machine: decided
-/// once per caller rather than once per run.
-#[must_use]
-pub(crate) fn vector_runs() -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        std::arch::is_aarch64_feature_detected!("neon")
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        false
-    }
+/// The run splitter for this machine: the vector path where the vector unit
+/// was detected, the scalar one otherwise. Only [`detect`](Self::detect)
+/// builds one (and the test-only [`scalar`](Self::scalar)), so the vector
+/// call it makes rests on a detection of its own, not on a flag a caller
+/// passes; a caller detects once and splits many runs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RgbSplitter {
+    vector: bool,
 }
 
-/// `pixels` (`3 * n` bytes, interleaved) into `r`, `g` and `b` (`n` bytes
-/// each); `vector` is [`vector_runs`]'s answer.
-#[inline]
-pub(crate) fn split_rgb_run(pixels: &[u8], r: &mut [u8], g: &mut [u8], b: &mut [u8], vector: bool) {
-    debug_assert_eq!(pixels.len(), r.len() * 3);
-    debug_assert_eq!(r.len(), g.len());
-    debug_assert_eq!(r.len(), b.len());
-    #[cfg(target_arch = "aarch64")]
-    if vector {
-        // SAFETY: `vector` is `vector_runs()`, which detected NEON.
-        unsafe { neon::split(pixels, r, g, b) };
-        return;
+impl RgbSplitter {
+    /// The splitter for this machine, the detection done once.
+    #[must_use]
+    pub(crate) fn detect() -> Self {
+        #[cfg(target_arch = "aarch64")]
+        let vector = std::arch::is_aarch64_feature_detected!("neon");
+        #[cfg(not(target_arch = "aarch64"))]
+        let vector = false;
+        Self { vector }
     }
-    let _ = vector;
-    split_scalar(pixels, r, g, b);
+
+    /// The scalar path, for comparing the two.
+    #[cfg(test)]
+    pub(crate) fn scalar() -> Self {
+        Self { vector: false }
+    }
+
+    /// `pixels` (`3 * n` bytes, interleaved) into `r`, `g` and `b` (`n` bytes
+    /// each).
+    #[inline]
+    pub(crate) fn split(self, pixels: &[u8], r: &mut [u8], g: &mut [u8], b: &mut [u8]) {
+        debug_assert_eq!(pixels.len(), r.len() * 3);
+        debug_assert_eq!(r.len(), g.len());
+        debug_assert_eq!(r.len(), b.len());
+        #[cfg(target_arch = "aarch64")]
+        if self.vector {
+            // SAFETY: `vector` is set by `detect` alone, which detected NEON.
+            unsafe { neon::split(pixels, r, g, b) };
+            return;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = self.vector;
+        split_scalar(pixels, r, g, b);
+    }
 }
 
 fn split_scalar(pixels: &[u8], r: &mut [u8], g: &mut [u8], b: &mut [u8]) {
@@ -117,14 +132,14 @@ mod tests {
     fn every_run_length_splits_into_its_channels() {
         for n in 0..=40 {
             let pixels: Vec<u8> = (0..3 * n).map(|i| (i * 37 % 251) as u8).collect();
-            for vector in [vector_runs(), false] {
+            for splitter in [RgbSplitter::detect(), RgbSplitter::scalar()] {
                 let (mut r, mut g, mut b) = (vec![0u8; n], vec![0u8; n], vec![0u8; n]);
-                split_rgb_run(&pixels, &mut r, &mut g, &mut b, vector);
+                splitter.split(&pixels, &mut r, &mut g, &mut b);
                 for i in 0..n {
                     assert_eq!(
                         (r[i], g[i], b[i]),
                         (pixels[3 * i], pixels[3 * i + 1], pixels[3 * i + 2]),
-                        "n {n} vector {vector} pixel {i}"
+                        "n {n} {splitter:?} pixel {i}"
                     );
                 }
             }
