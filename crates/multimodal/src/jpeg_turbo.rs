@@ -20,8 +20,9 @@
 //! are decoded as CMYK, which is the one output TurboJPEG offers for them, and
 //! converted to RGB the way PIL converts them: see [`pil_cmyk_to_rgb`].
 //!
-//! This module is the crate's only FFI surface, so it locally overrides the
-//! workspace-wide `unsafe_code = "deny"` for the C bindings.
+//! This module is one of the crate's FFI surfaces (with `webp_native` and the
+//! optional `opencv_buffer`), so it locally overrides the workspace-wide
+//! `unsafe_code = "deny"` for the C bindings.
 #![allow(unsafe_code)]
 
 use std::{

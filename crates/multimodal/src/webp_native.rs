@@ -14,8 +14,9 @@
 //! file whose header says it carries alpha is decoded as RGBA, the rest as
 //! RGB, the same image types the fallback produces for them.
 //!
-//! This module is one of the crate's two FFI surfaces, so it locally overrides
-//! the workspace-wide `unsafe_code = "deny"` for the C bindings.
+//! This module is one of the crate's FFI surfaces (with `jpeg_turbo` and the
+//! optional `opencv_buffer`), so it locally overrides the workspace-wide
+//! `unsafe_code = "deny"` for the C bindings.
 #![allow(unsafe_code)]
 
 use std::{
@@ -56,6 +57,8 @@ fn load_webp() -> Option<WebP> {
     const CANDIDATES: &[&str] = &[
         "libwebpdecoder.so.3",
         "libwebp.so.7",
+        // libwebp 0.6 (older Debian and Ubuntu bases): the same four entry points.
+        "libwebp.so.6",
         "libwebpdecoder.so",
         "libwebp.so",
         "libwebpdecoder.3.dylib",

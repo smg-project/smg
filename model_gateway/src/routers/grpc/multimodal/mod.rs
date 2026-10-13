@@ -232,9 +232,10 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     pub encoder_input_key: Option<String>,
 }
 
-/// Say once which JPEG decoder this process has, and publish it: without
-/// libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a few
-/// levels, an embedding shift against an engine that decodes with PIL.
+/// Say once which JPEG and WebP decoders this process has, and publish them:
+/// without libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a
+/// few levels, an embedding shift against an engine that decodes with PIL;
+/// without libwebp the WebP fallback is correct but several times slower.
 pub(crate) fn report_jpeg_decoder() {
     use crate::observability::metrics::Metrics;
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
