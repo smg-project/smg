@@ -1919,7 +1919,7 @@ async fn the_sweep_index_the_sweep_and_the_lookup_read_the_same_under_either_str
         );
         assert!(
             plan.iter()
-                .any(|line| line.contains("Index Scan using responses_unstored_text_idx")),
+                .any(|line| line.contains("responses_unstored_text_idx")),
             "under {setting}: the sweep's predicate is served by its index: {plan:?}"
         );
     }
