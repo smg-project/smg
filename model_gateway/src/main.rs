@@ -296,10 +296,11 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
     parse_usize_in_range(value, 100_000)
 }
 
-// The flags in the order `--help` lists them, one `help_heading` section
-// each; a field's doc comment is its help text. The second spellings, each a
-// `visible_alias` of its field and mirrored by the Python launcher's
-// `RouterArgs`: --cache-match-threshold (--cache-threshold),
+// clap renders `--help` by `help_heading`: the headings in first-use order,
+// the fields of a heading in declaration order, so a heading's fields need
+// not be contiguous below; a field's doc comment is its help text. The second
+// spellings, each a `visible_alias` of its field and mirrored by the Python
+// launcher's `RouterArgs`: --cache-match-threshold (--cache-threshold),
 // --spill-abs-threshold (--balance-abs-threshold), --spill-rel-threshold
 // (--balance-rel-threshold), --sticky-key-idle-secs (--max-idle-secs),
 // --sticky-sessions (--routing-key-override) and --worker-auto-recovery
@@ -2813,19 +2814,19 @@ impl CliArgs {
 
     /// Phase 2, announce: the banner and the lines under it, printed before
     /// the configuration is built so an operator sees what was asked for
-    /// even when it is refused. Selecting a discovery provider turns IGW
-    /// mode on here, before anything reads `enable_igw`; nothing else is
-    /// changed. The logger is not up yet: this is plain stdout.
+    /// even when it is refused; nothing is changed. The logger is not up
+    /// yet: this is plain stdout.
     #[expect(
         clippy::print_stdout,
         reason = "pre-logger startup output: the banner and the flags' summary"
     )]
     fn announce(
-        &mut self,
+        &self,
+        igw_enabled_for_discovery: bool,
         prefill_urls: &[(String, Option<u16>)],
         encode_urls: &[(String, Option<u16>)],
     ) {
-        if self.enable_igw_for_discovery() {
+        if igw_enabled_for_discovery {
             println!("INFO: IGW mode automatically enabled because service discovery is turned on");
         }
         version::print_banner(&self.host, self.port, &self.banner_mode());
@@ -2871,19 +2872,25 @@ fn version_flag(args: &[String]) -> Option<String> {
 /// Phase 1, parse: clap over the command line with the `--prefill` /
 /// `--encode` occurrences already taken out, `smg launch ...` and the bare
 /// form alike. A usage error or `--help` ends the process here, before the
-/// banner.
-fn parse_cli_args(clap_args: Vec<String>) -> CliArgs {
+/// banner. Selecting a discovery provider turns IGW mode on here as well, so
+/// the flags are final when this returns and the phases after it only read
+/// them; the second value says whether this call turned IGW on, for the
+/// announcement.
+fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
     let cli = Cli::parse_from(clap_args);
-    match cli.command {
+    let mut cli_args = match cli.command {
         Some(Commands::Launch { args }) => args,
         None => cli.router_args,
-    }
+    };
+    let igw_enabled_for_discovery = cli_args.enable_igw_for_discovery();
+    (cli_args, igw_enabled_for_discovery)
 }
 
 /// Phase 4, serve: the async runtime (tokio's container-aware default size
 /// unless `--runtime-worker-threads` pins one; the size is logged by
 /// `startup` once the log subscriber is up), the server until it stops,
-/// then the log writers flushed and the tracer shut down. The runtime is
+/// then the log writers flushed; the tracer is shut down after a clean stop
+/// (a failed start-up returns before it, as it always did). The runtime is
 /// built only now: a refusal before this point costs no threads.
 fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = match server_config.runtime_worker_threads {
@@ -2915,8 +2922,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let command_line = CommandLine::split(&args);
-    let mut cli_args = parse_cli_args(command_line.clap_args);
-    cli_args.announce(&command_line.prefill_urls, &command_line.encode_urls);
+    let (cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
+    cli_args.announce(
+        igw_enabled_for_discovery,
+        &command_line.prefill_urls,
+        &command_line.encode_urls,
+    );
     let server_config = cli_args.configure(command_line.prefill_urls, command_line.encode_urls)?;
     serve(server_config)
 }
