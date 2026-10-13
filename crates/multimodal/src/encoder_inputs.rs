@@ -234,6 +234,29 @@ impl EncoderInput {
         self.len() == 0
     }
 
+    /// A [`Wire`](Self::Wire) whose byte count is checked against its shape
+    /// and dtype, the invariant every reader of the variant relies on.
+    pub fn wire(
+        bytes: Vec<u8>,
+        dtype: EncoderDtype,
+        shape: Vec<usize>,
+        norm: PixelNorm,
+    ) -> Result<Self, String> {
+        let expected = shape.iter().product::<usize>() * dtype.element_size();
+        if bytes.len() != expected {
+            return Err(format!(
+                "wire holds {} bytes, {expected} needed for {shape:?} in {dtype}",
+                bytes.len()
+            ));
+        }
+        Ok(Self::Wire {
+            bytes,
+            dtype,
+            shape,
+            norm,
+        })
+    }
+
     /// Bytes per element as stored.
     pub fn element_size(&self) -> usize {
         match self {
@@ -303,13 +326,25 @@ impl EncoderInput {
 
     /// The input as little-endian bytes of `dtype`, consuming it: bytes
     /// already in `dtype` move out; anything else is written as
-    /// [`EncoderInputView::write_as`] writes it.
-    pub fn into_bytes_as(self, dtype: EncoderDtype) -> Vec<u8> {
+    /// [`EncoderInputView::try_write_as`] writes it, with its errors.
+    pub fn into_bytes_as(self, dtype: EncoderDtype) -> Result<Vec<u8>, String> {
         match self {
             Self::Wire {
-                bytes, dtype: own, ..
-            } if own == dtype => bytes,
-            other => other.view().write_as(dtype),
+                bytes,
+                dtype: own,
+                shape,
+                ..
+            } if own == dtype => {
+                let expected = shape.iter().product::<usize>() * dtype.element_size();
+                if bytes.len() != expected {
+                    return Err(format!(
+                        "wire holds {} bytes, {expected} needed for {shape:?} in {dtype}",
+                        bytes.len()
+                    ));
+                }
+                Ok(bytes)
+            }
+            other => other.view().try_write_as(dtype),
         }
     }
 
@@ -399,12 +434,7 @@ impl EncoderInput {
                 if let Some(first_dim) = joined.first_mut() {
                     *first_dim = rows;
                 }
-                Ok(Self::Wire {
-                    bytes,
-                    dtype: *dtype,
-                    shape: joined,
-                    norm: *norm,
-                })
+                Self::wire(bytes, *dtype, joined, *norm).map_err(anyhow::Error::msg)
             }
             Self::F32(_) => {
                 let views = parts
@@ -566,24 +596,42 @@ impl<'a> EncoderInputView<'a> {
     /// bytes is the bytes themselves; from floats it is the rounded, clamped
     /// value, for a caller that knows its floats are whole numbers.
     pub fn write_as(&self, dtype: EncoderDtype) -> Vec<u8> {
-        if let Self::Wire {
-            bytes, dtype: own, ..
-        } = self
-        {
-            if *own == dtype {
-                return bytes.to_vec();
-            }
-        }
-        let mut out = vec![0u8; self.len() * dtype.element_size()];
-        // The buffer is sized by this input and dtype; the other error, a
-        // wire that cannot be written in the dtype asked for, leaves nothing
+        // A wire that cannot be written in the dtype asked for leaves nothing
         // behind (an empty tensor the destination rejects) rather than values
-        // that are not the reference's.
-        if let Err(message) = self.write_into(dtype, &mut out) {
+        // that are not the reference's; the paths that build a request use
+        // [`try_write_as`](Self::try_write_as) and report it instead.
+        self.try_write_as(dtype).unwrap_or_else(|message| {
             tracing::error!(%message, "encoder input not written");
-            return Vec::new();
+            Vec::new()
+        })
+    }
+
+    /// [`write_as`](Self::write_as) with its error: a wire written in another
+    /// dtype than its own (a `float32` wire narrows to the half widths; no
+    /// other conversion is exact), or a wire whose bytes do not match its
+    /// shape.
+    pub fn try_write_as(&self, dtype: EncoderDtype) -> Result<Vec<u8>, String> {
+        let mut out = vec![0u8; self.len() * dtype.element_size()];
+        self.write_into(dtype, &mut out)?;
+        Ok(out)
+    }
+
+    /// Whether [`write_into`](Self::write_into) can write this input in
+    /// `dtype`, decided before a destination (a shared-memory segment) is
+    /// prepared for it.
+    pub fn writable_as(&self, dtype: EncoderDtype) -> Result<(), String> {
+        match self {
+            Self::Wire { dtype: own, .. }
+                if *own != dtype
+                    && !(*own == EncoderDtype::Float32
+                        && matches!(dtype, EncoderDtype::BFloat16 | EncoderDtype::Float16)) =>
+            {
+                Err(format!(
+                    "encoder input holds {own} wire values, which cannot be written as {dtype}"
+                ))
+            }
+            _ => Ok(()),
         }
-        out
     }
 
     /// [`write_as`](Self::write_as) into a buffer the caller owns (a
@@ -602,10 +650,26 @@ impl<'a> EncoderInputView<'a> {
             Self::Wire {
                 bytes, dtype: own, ..
             } => match (own, dtype) {
-                (own, asked) if own == &asked => out.copy_from_slice(bytes),
+                (own, asked) if own == &asked => {
+                    if bytes.len() != out.len() {
+                        return Err(format!(
+                            "wire holds {} bytes, {} needed for its shape in {own}",
+                            bytes.len(),
+                            out.len()
+                        ));
+                    }
+                    out.copy_from_slice(bytes);
+                }
                 // A float32 wire holds the normalized values exactly; the
                 // narrower floats round from them as the float path rounds.
                 (EncoderDtype::Float32, EncoderDtype::BFloat16 | EncoderDtype::Float16) => {
+                    if bytes.len() != 2 * out.len() {
+                        return Err(format!(
+                            "wire holds {} bytes, {} needed for its shape in float32",
+                            bytes.len(),
+                            2 * out.len()
+                        ));
+                    }
                     let convert: fn(f32) -> u16 = if dtype == EncoderDtype::BFloat16 {
                         f32_to_bf16_bits
                     } else {
@@ -733,7 +797,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
             } else {
                 // Subnormal: normalize the mantissa.
                 let shift = mant.leading_zeros() - 21;
-                let mant = (mant << (shift + 1)) & 0x3ff;
+                let mant = (mant << shift) & 0x3ff;
                 ((113 - shift) << 23) | (mant << 13)
             }
         }
@@ -1586,6 +1650,75 @@ mod tests {
     /// A wire input built from a byte input's own write: the same shape and
     /// bytes, its rows sliced and stacked by byte ranges, written as itself
     /// without a conversion, as a narrower float only from `float32`.
+    /// Every `float16` bit pattern decodes to its IEEE value: subnormals as
+    /// `mantissa * 2^-24`, normals as `(1024 + mantissa) * 2^(exponent - 25)`,
+    /// the top exponent as infinities and NaNs.
+    #[test]
+    fn every_half_float_pattern_decodes_exactly() {
+        for bits in 0..=u16::MAX {
+            let got = f16_bits_to_f32(bits);
+            let sign = if bits >> 15 == 1 { -1.0f64 } else { 1.0 };
+            let exp = i32::from((bits >> 10) & 0x1f);
+            let mant = f64::from(bits & 0x3ff);
+            match exp {
+                0 => assert_eq!(got, (sign * mant * 2f64.powi(-24)) as f32, "{bits:#06x}"),
+                0x1f if mant == 0.0 => {
+                    assert!(
+                        got.is_infinite() && (got < 0.0) == (sign < 0.0),
+                        "{bits:#06x}"
+                    );
+                }
+                0x1f => assert!(got.is_nan(), "{bits:#06x}"),
+                _ => assert_eq!(
+                    got,
+                    (sign * (1024.0 + mant) * 2f64.powi(exp - 25)) as f32,
+                    "{bits:#06x}"
+                ),
+            }
+        }
+    }
+
+    /// A wire's bytes are checked against its shape and dtype by the
+    /// constructor, and a malformed one built by hand is refused at the
+    /// write, not a panic or a silent truncation.
+    #[test]
+    fn a_wire_is_checked_against_its_shape_and_dtype() {
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [0.0; 3],
+            divisor: [1.0; 3],
+            channel_block: 1,
+        };
+        assert!(
+            EncoderInput::wire(vec![0u8; 12], EncoderDtype::BFloat16, vec![2, 3], norm).is_ok()
+        );
+        assert!(
+            EncoderInput::wire(vec![0u8; 11], EncoderDtype::BFloat16, vec![2, 3], norm).is_err()
+        );
+        let short = EncoderInput::Wire {
+            bytes: vec![0u8; 10],
+            dtype: EncoderDtype::BFloat16,
+            shape: vec![2, 3],
+            norm,
+        };
+        let mut out = vec![0u8; 12];
+        assert!(short
+            .view()
+            .write_into(EncoderDtype::BFloat16, &mut out)
+            .is_err());
+        assert!(short.view().try_write_as(EncoderDtype::BFloat16).is_err());
+        assert!(short.into_bytes_as(EncoderDtype::BFloat16).is_err());
+        let wide =
+            EncoderInput::wire(vec![0u8; 24], EncoderDtype::Float32, vec![2, 3], norm).unwrap();
+        assert!(wide.view().writable_as(EncoderDtype::BFloat16).is_ok());
+        assert!(wide.view().try_write_as(EncoderDtype::Float16).is_ok());
+        let half =
+            EncoderInput::wire(vec![0u8; 12], EncoderDtype::BFloat16, vec![2, 3], norm).unwrap();
+        assert!(half.view().writable_as(EncoderDtype::Float32).is_err());
+        assert!(half.view().try_write_as(EncoderDtype::Float32).is_err());
+        assert!(half.into_bytes_as(EncoderDtype::Float32).is_err());
+    }
+
     #[test]
     fn a_wire_input_carries_its_bytes_and_slices_by_rows() {
         let norm = PixelNorm {
@@ -1626,6 +1759,15 @@ mod tests {
             let stacked = EncoderInput::concat(&[&rows, &wire.slice_axis0(0, 1).unwrap()]).unwrap();
             assert_eq!(stacked.shape(), &[3, 12]);
             assert_eq!(stacked.nbytes(), 3 * 12 * dtype.element_size());
+            if dtype == EncoderDtype::Float16 {
+                // the wire's own rounded values, decoded exactly
+                let rounded: Vec<f32> = patches
+                    .as_f32()
+                    .iter()
+                    .map(|value| f16_bits_to_f32(f32_to_f16_bits(*value)))
+                    .collect();
+                assert_eq!(wire.as_f32().as_slice().unwrap(), &rounded[..]);
+            }
             if dtype == EncoderDtype::Float32 {
                 // the normalized values themselves, so the narrower floats derive exactly
                 assert_eq!(

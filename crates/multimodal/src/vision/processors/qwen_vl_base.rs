@@ -1290,12 +1290,11 @@ impl QwenVLProcessorBase {
             return Some(Err(error));
         }
         let shape = vec![batch.total_patches, batch.patch_features];
-        Some(Ok(batch.result(EncoderInput::Wire {
-            bytes: wire,
-            dtype,
-            shape,
-            norm: batch.norm,
-        })))
+        Some(
+            EncoderInput::wire(wire, dtype, shape, batch.norm)
+                .map(|encoder_input| batch.result(encoder_input))
+                .map_err(TransformError::ShapeError),
+        )
     }
 
     /// [`patchify_image_rgb_into`](Self::patchify_image_rgb_into) writing

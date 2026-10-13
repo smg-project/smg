@@ -650,6 +650,10 @@ async fn preprocess_image_cached(
         image_wire_dtype,
     )
     .await?;
+    // The entry is the form the request is sent in: the wire bytes when a
+    // dtype was resolved (twice the neutral bytes at the half widths, four
+    // times at float32, against the same budget), so a hit skips the write
+    // pass; the neutral patches otherwise.
     cache.insert(
         key,
         Arc::new(CachedPreprocessedItem {

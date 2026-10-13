@@ -18,11 +18,21 @@ use crate::routers::grpc::proto_wrapper::{
 pub(super) fn serialize_encoder_input_owned(
     encoder_input: EncoderInput,
     dtype: &str,
-) -> (Vec<u8>, Vec<u32>, String) {
+) -> anyhow::Result<(Vec<u8>, Vec<u32>, String)> {
     let dtype = wire_dtype(dtype, true);
     let shape = shape_u32(&encoder_input.view());
-    (encoder_input.into_bytes_as(dtype), shape, dtype.to_string())
+    let bytes = encoder_input
+        .into_bytes_as(dtype)
+        .map_err(|message| anyhow::anyhow!("{WIRE_MISMATCH}: {message}"))?;
+    Ok((bytes, shape, dtype.to_string()))
 }
+
+/// The request error for an encoder input that was laid out for one wire
+/// dtype and is asked for in another at assembly: only a change of the model's
+/// workers between the two steps can produce it, and it is this request's
+/// error, not the worker's.
+const WIRE_MISMATCH: &str =
+    "the images were prepared for another encoder dtype than the selected worker reads";
 
 /// One item's encoder input for TokenSpeed: written straight into shared
 /// memory when enabled and large enough, inline otherwise.
@@ -31,9 +41,13 @@ pub(super) fn serialize_tokenspeed_encoder_input(
     dtype: &str,
     shm_enabled: bool,
     shm_min_bytes: usize,
-) -> TokenSpeedTensor {
+) -> anyhow::Result<TokenSpeedTensor> {
     // TokenSpeed reads float widths only.
     let dtype = wire_dtype(dtype, false);
+    // Decided before any segment is created for it.
+    input
+        .writable_as(dtype)
+        .map_err(|message| anyhow::anyhow!("{WIRE_MISMATCH}: {message}"))?;
     let shape = shape_u32(input);
     let nbytes = input.len() * dtype.element_size();
 
@@ -52,7 +66,7 @@ pub(super) fn serialize_tokenspeed_encoder_input(
                         "smg_mm_timing tokenspeed_shm_write_direct"
                     );
                 }
-                return TokenSpeedTensor::shm(handle, shape, dtype.to_string());
+                return Ok(TokenSpeedTensor::shm(handle, shape, dtype.to_string()));
             }
             Err(error) => {
                 use crate::observability::metrics::Metrics;
@@ -67,7 +81,10 @@ pub(super) fn serialize_tokenspeed_encoder_input(
         }
     }
 
-    TokenSpeedTensor::inline(input.write_as(dtype), shape, dtype.to_string())
+    let bytes = input
+        .try_write_as(dtype)
+        .map_err(|message| anyhow::anyhow!("{WIRE_MISMATCH}: {message}"))?;
+    Ok(TokenSpeedTensor::inline(bytes, shape, dtype.to_string()))
 }
 
 /// The dtype `asked` names, or `float32` for one the receiver may not share:
@@ -200,7 +217,7 @@ mod tests {
             ("float16", f32_to_f16_bits as fn(f32) -> u16),
         ] {
             let (actual, _, written) =
-                serialize_encoder_input_owned(preprocessed.encoder_input.clone(), dtype);
+                serialize_encoder_input_owned(preprocessed.encoder_input.clone(), dtype).unwrap();
             assert_eq!(written, dtype);
             assert_eq!(actual, le_bytes(values.iter().map(|&value| convert(value))));
         }
@@ -223,7 +240,7 @@ mod tests {
             ("float64", "float32", 4),
         ] {
             let (data, shape, dtype) =
-                serialize_encoder_input_owned(preprocessed.encoder_input.clone(), asked);
+                serialize_encoder_input_owned(preprocessed.encoder_input.clone(), asked).unwrap();
 
             assert_eq!(dtype, expected_dtype, "asked for {asked}");
             assert_eq!(shape, vec![2, 2]);
@@ -243,14 +260,14 @@ mod tests {
             .collect();
 
         let (data, shape, dtype) =
-            serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "uint8");
+            serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "uint8").unwrap();
         assert_eq!(
             (data, shape, dtype.as_str()),
             (vec![0, 255, 51, 102, 153, 204], vec![1, 6], "uint8")
         );
 
         let (data, _, dtype) =
-            serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "float32");
+            serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "float32").unwrap();
         assert_eq!(dtype, "float32");
         let floats: Vec<f32> = data
             .as_chunks::<4>()
@@ -265,7 +282,8 @@ mod tests {
             "uint8",
             false,
             usize::MAX,
-        );
+        )
+        .unwrap();
         assert_eq!(tensor.dtype, "float32");
         assert_eq!(tensor.shape, vec![1, 6]);
     }
@@ -313,12 +331,14 @@ mod tests {
 
         // Below the threshold: stays inline even with SHM enabled.
         let tensor =
-            serialize_tokenspeed_encoder_input(&below.encoder_input.view(), "float32", true, 16);
+            serialize_tokenspeed_encoder_input(&below.encoder_input.view(), "float32", true, 16)
+                .unwrap();
         assert!(matches!(tensor.storage, TokenSpeedTensorStorage::Inline(_)));
 
         // At/above the threshold: uses SHM (/dev/shm is writable on Linux CI).
         let tensor =
-            serialize_tokenspeed_encoder_input(&at.encoder_input.view(), "float32", true, 16);
+            serialize_tokenspeed_encoder_input(&at.encoder_input.view(), "float32", true, 16)
+                .unwrap();
         match tensor.storage {
             TokenSpeedTensorStorage::Shm(handle) => {
                 let path = Path::new("/dev/shm").join(&handle.name);
