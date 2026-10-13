@@ -31,7 +31,7 @@ const DEFAULT_VIDEO_SAMPLE_FPS: f32 = 1.0;
 /// `]<]image[>[` (or `]<]video[>[`) with no surrounding markers, so this spec
 /// owns the whole wrapper: each placeholder expands to
 /// `<start> + N * <pad> + <end>`, with
-/// N = `grid_t * grid_h * grid_w / merge_size^2`. That mirrors vLLM's
+/// N = `grid_t * grid_h * grid_w / merge_size^2`. That mirrors the engine's
 /// `_get_prompt_updates`, which builds
 /// `[start_token_id] + [image_token_id] * N + [end_token_id]`.
 ///
@@ -328,7 +328,8 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         Self::image_token_id(metadata)
     }
 
-    /// The bare `]<]image[>[` / `]<]video[>[` are vLLM's single-token targets.
+    /// The bare `]<]image[>[` / `]<]video[>[` are the single-token targets the
+    /// serving engine expands itself.
     fn worker_expandable(&self, modality: Modality) -> bool {
         matches!(modality, Modality::Image | Modality::Video)
     }
@@ -456,7 +457,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        // Mirrors vLLM's `_get_mm_fields_config` for M3: the pixel tensors are
+        // Mirrors the engine's `_get_mm_fields_config` for M3: the pixel tensors are
         // flat over patches and sliced per item by the grid product, while the
         // grid triples are batched one row per item. The frame spacing the
         // shared video processor emits is listed too: M3 reads the timing off
@@ -504,7 +505,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
-        // vLLM marks both grid tensors keep_on_cpu=True.
+        // The engine marks both grid tensors keep_on_cpu=True.
         vec!["image_grid_thw".to_string(), "video_grid_thw".to_string()]
     }
 }
@@ -1341,7 +1342,7 @@ mod tests {
 
     #[test]
     fn grid_tensors_stay_on_cpu() {
-        // vLLM marks both grid tensors keep_on_cpu=True.
+        // The engine marks both grid tensors keep_on_cpu=True.
         let spec = MiniMaxM3VisionSpec;
         let keys = spec.keep_on_cpu_keys();
 

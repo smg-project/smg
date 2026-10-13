@@ -1,6 +1,6 @@
 //! Nemotron-H Omni prompt contract.
 //!
-//! Mirrors vLLM's Nemotron-Omni processor. The chat template renders one
+//! Mirrors the serving engine's Nemotron-Omni processor. The chat template renders one
 //! `<image>` per image, one `<so_embedding>` per audio and the literal text
 //! `<video>` per video. An image's anchor becomes `<img>`, one `<image>` per
 //! embedding of its patch grid after the 2x2 pixel shuffle, and `</img>`; an
@@ -8,11 +8,11 @@
 //! over its 30-second clips, and `<so_end>`. A video becomes, per tubelet of
 //! two frames, a separator naming the frames and their timestamps followed
 //! by the tubelet's `<img>`, `<image>` run and `</img>`; the separator is
-//! tokenized on its own, as vLLM does. `<video>` is several tokens, so the
+//! tokenized on its own, as the engine does. `<video>` is several tokens, so the
 //! gateway rewrites it to a reserved, otherwise unused token as the anchor.
 //! Only the `<image>` and `<so_embedding>` runs are feature positions.
 //!
-//! Frames are sampled as vLLM's default loader samples them: every frame of
+//! Frames are sampled as the engine's default loader samples them: every frame of
 //! a clip with at most 32, else 32 spread evenly across the clip. A clip whose
 //! decoder reported no frame rate or indices cannot be stamped and is refused.
 //!
@@ -48,9 +48,9 @@ const AUDIO_PLACEHOLDER: &str = "<so_embedding>";
 /// gateway rewrites it to as the video's anchor.
 const VIDEO_MARKER: &str = "<video>";
 const VIDEO_ANCHOR: &str = "<SPECIAL_30>";
-/// vLLM's default video loader keeps at most this many frames of a clip.
+/// The engine's default video loader keeps at most this many frames of a clip.
 const MAX_SAMPLED_FRAMES: usize = 32;
-/// vLLM leaves these counts unlimited; they are per-request defaults a
+/// The engine leaves these counts unlimited; they are per-request defaults a
 /// deployment changes with `SMG_IMAGE_MAX_COUNT` / `SMG_VIDEO_MAX_COUNT` /
 /// `SMG_AUDIO_MAX_COUNT`.
 const MAX_IMAGES_PER_REQUEST: usize = 16;
@@ -251,7 +251,7 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         Ok(Self::tokens(metadata, modality)?.1)
     }
 
-    /// The processors emit packed patch rows and mel frames, not vLLM's
+    /// The processors emit packed patch rows and mel frames, not the engine's
     /// `pixel_values_flat` / `pixel_values_flat_video` inputs.
     fn encoder_input_format(&self) -> EncoderInputFormat {
         EncoderInputFormat::Packed

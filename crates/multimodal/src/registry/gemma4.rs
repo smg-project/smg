@@ -1,6 +1,6 @@
 //! Gemma 4 prompt contract.
 //!
-//! Mirrors vLLM's Gemma 4 multimodal processor, which is what the engine
+//! Mirrors the serving engine's Gemma 4 multimodal processor, which is what the engine
 //! expects around the tensors [`crate::vision::Gemma4Processor`] produces.
 //! The chat template renders one `<|image|>` per image and one `<|video|>`
 //! per video. An image's anchor becomes `<|image>` (begin), one `<|image|>`
@@ -9,7 +9,7 @@
 //! frame, `MM:SS <|image> <|video|> x n <image|>` with the frames' timestamps
 //! (the source frame index over the source rate) and the groups separated by
 //! spaces, the first timestamp encoded as `"MM:SS "` and the later ones as
-//! `" MM:SS "`, as vLLM tokenizes them. The begin/end markers and timestamps
+//! `" MM:SS "`, as the engine tokenizes them. The begin/end markers and timestamps
 //! are structural; only the soft tokens are feature positions.
 //!
 //! Frames are sampled as the engine's default loader samples them: every
@@ -35,9 +35,9 @@ use crate::{
 
 /// The engine's default loader keeps at most this many frames of a clip.
 const MAX_SAMPLED_FRAMES: usize = 32;
-/// The rate vLLM assumes for timestamps when the decoder reported none.
+/// The rate the engine assumes for timestamps when the decoder reported none.
 const FALLBACK_FPS: f64 = 24.0;
-/// vLLM leaves both counts unlimited for this family; these caps are the
+/// The engine leaves both counts unlimited for this family; these caps are the
 /// per-request defaults a deployment raises or lowers with
 /// `SMG_IMAGE_MAX_COUNT` / `SMG_VIDEO_MAX_COUNT` or the worker's item cap.
 const MAX_IMAGES_PER_REQUEST: usize = 128;
@@ -121,7 +121,7 @@ impl Gemma4Spec {
 
     /// The seconds of each sampled frame: its source index over the source
     /// rate, or the frame's ordinal at the fallback rate when the decoder
-    /// reported no sampling, as vLLM falls back.
+    /// reported no sampling, as the engine falls back.
     fn frame_seconds(frames: usize, sampling: Option<&VideoSamplingInfo>) -> Vec<f64> {
         (0..frames)
             .map(|frame| match sampling {
@@ -203,7 +203,7 @@ impl ModelProcessorSpec for Gemma4Spec {
         MediaPartOrder::Authored
     }
 
-    /// Image, video and native audio anchors are expanded by vLLM.
+    /// Image, video and native audio anchors are expanded by the serving engine.
     /// Audio is worker-only; the router has no Gemma 4 audio tensor processor.
     fn worker_expandable(&self, modality: Modality) -> bool {
         matches!(
@@ -332,7 +332,7 @@ impl ModelProcessorSpec for Gemma4Spec {
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        // vLLM's `_get_mm_fields_config`: images batched per item, video
+        // The engine's `_get_mm_fields_config`: images batched per item, video
         // frames flat over the batch and sliced per clip by its frame count.
         HashMap::from([
             ("pixel_values".to_string(), FieldLayout::Batched),

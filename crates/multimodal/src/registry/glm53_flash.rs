@@ -218,7 +218,7 @@ impl ModelProcessorSpec for Glm53FlashSpec {
         }
     }
 
-    /// `<|image|>` is vLLM's single-token image target; video is not, its
+    /// `<|image|>` is the engine's single-token image target; video is not, its
     /// target is the three-token `<|begin_of_video|>…<|end_of_video|>` block.
     fn worker_expandable(&self, modality: Modality) -> bool {
         matches!(modality, Modality::Image)

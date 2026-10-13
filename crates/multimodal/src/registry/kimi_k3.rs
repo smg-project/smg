@@ -25,7 +25,7 @@ const MEDIA_END: &str = "<|media_end|>";
 ///
 /// That block cannot be built while rendering — the chat template runs before
 /// any media is fetched, so the dimensions do not exist yet. It is built here
-/// instead, from the sizes the preprocessor reports, as vLLM does in
+/// instead, from the sizes the preprocessor reports, as the reference implementation does in
 /// `kimi_k3.py::_get_prompt_updates`.
 pub(super) struct KimiK3VisionSpec;
 
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    /// vLLM's `kimi_k3` prompt updates target `<|kimi_image_placeholder|>`
+    /// The engine's `kimi_k3` prompt updates target `<|kimi_image_placeholder|>`
     /// (id 163838), not the gateway's `<|media_pad|>` anchor (id 163605), so
     /// a forwarded reference fails the engine's prompt replacement: media
     /// stay router-side.
