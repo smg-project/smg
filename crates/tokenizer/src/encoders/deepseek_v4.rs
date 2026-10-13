@@ -12,16 +12,23 @@ use serde_json::{json, Value};
 // reachable within `encoders` on their own — this `pub use` is what makes it
 // visible to callers outside `encoders` (e.g. `huggingface.rs`) again.
 pub use super::deepseek_common::DsEncodingError;
-// Message-shape preprocessing, drop-thinking and DSML argument rendering are
-// identical to the upcoming V4.1 renderer except for the tag strings; see
-// `deepseek_common` for the shared implementation and its own doc comments.
-use super::deepseek_common::{
-    at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml, find_last_user_index,
-    merge_tool_messages, sort_tool_results_by_call_order, DsmlTags,
-};
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
+// Message-shape preprocessing, drop-thinking and DSML argument rendering are
+// identical to the upcoming V4.1 renderer except for the tag strings; see
+// `deepseek_common` for the shared implementation and its own doc comments.
+use super::{
+    deepseek_common::{
+        at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
+        find_last_user_index, merge_tool_messages, sort_tool_results_by_call_order, DsmlTags,
+    },
+    RendererProfile,
+};
+use crate::{
+    chat_template::{ThinkingKeyName, ThinkingToggle},
+    traits::RendererCapabilities,
+};
 
 /// Which reasoning-effort prompt revision the checkpoint was trained with.
 ///
@@ -44,6 +51,35 @@ impl EffortEncoding {
         match self {
             Self::Original => &["high", "max"],
             Self::V0731 => &["low", "high", "max"],
+        }
+    }
+
+    /// What this renderer answers around a render under this effort
+    /// encoding (see [`RendererProfile`]).
+    pub(crate) fn profile(self) -> RendererProfile {
+        RendererProfile {
+            // No opinion on content parts: the (usually absent) template's format.
+            content_format: None,
+            // Thinking defaults ON like the engine's own server: `thinking:
+            // false`, its `enable_thinking` alias or `reasoning_effort:
+            // "none"` turns it off.
+            thinking_toggle: ThinkingToggle::DefaultOn,
+            thinking_key_name: ThinkingKeyName::Thinking,
+            native_effort_values: self.valid_native_values(),
+            // `reasoning_effort` is read as the engine's own server reads it:
+            // `"none"` is chat mode, every other value (`"minimal"` included,
+            // which the engine maps to the low effort) keeps thinking on.
+            // Declaring the off word keeps the gateway's parser arming on
+            // that rule.
+            native_effort_off_values: &["none"],
+            // `<｜Assistant｜><think>` ends the prompt when thinking is on.
+            think_in_prefill: true,
+            // The shim reads the engine's `enable_thinking` alias too.
+            capabilities: RendererCapabilities {
+                enable_thinking_alias: true,
+                ..RendererProfile::NO_CAPABILITIES
+            },
+            thinking_mode: None,
         }
     }
 

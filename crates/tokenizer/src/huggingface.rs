@@ -24,7 +24,7 @@ use crate::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
-    encoders::{deepseek_v32, deepseek_v4, deepseek_v41},
+    encoders::{deepseek_v32, deepseek_v4, deepseek_v41, RendererProfile},
     native::NativeEncoder,
     traits::{
         DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens, TokenIdType,
@@ -40,6 +40,19 @@ enum Renderer {
     DeepseekV41,
 }
 
+impl Renderer {
+    /// The answers of a renderer with its own encoder (see
+    /// [`RendererProfile`]); the Jinja renderer answers from the template.
+    fn profile(self) -> Option<RendererProfile> {
+        match self {
+            Self::Jinja => None,
+            Self::DeepseekV32 => Some(deepseek_v32::PROFILE),
+            Self::DeepseekV4(encoding) => Some(encoding.profile()),
+            Self::DeepseekV41 => Some(deepseek_v41::PROFILE),
+        }
+    }
+}
+
 /// HuggingFace tokenizer wrapper
 pub struct HuggingFaceTokenizer {
     tokenizer: HfTokenizer,
@@ -51,6 +64,9 @@ pub struct HuggingFaceTokenizer {
     eos_token_ids: Vec<TokenIdType>,
     /// Which renderer applies chat templates for this model.
     renderer: Renderer,
+    /// What that renderer answers around a render when it has an encoder of
+    /// its own ([`Renderer::profile`]), built once with it.
+    profile: Option<RendererProfile>,
     /// Bytes per id, when the decoder is a plain `ByteLevel` (see `byte_level`).
     byte_level: Option<Arc<ByteLevelTable>>,
     /// The direct encode path for byte-level BPE tokenizers of the common
@@ -380,6 +396,7 @@ impl HuggingFaceTokenizer {
             reverse_vocab,
             chat_template: ChatTemplateState::new(chat_template_str)?,
             eos_token_ids,
+            profile: renderer.profile(),
             renderer,
             has_byte_fallback,
             byte_fallback_values,
@@ -551,6 +568,7 @@ impl HuggingFaceTokenizer {
             chat_template: ChatTemplateState::empty(),
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
+            profile: None,
             has_byte_fallback,
             byte_fallback_values,
         }
@@ -1209,111 +1227,56 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
-        match self.renderer {
-            // V4.1 wants message parts preserved (OpenAI wire format) so the
-            // gateway passes `image_url`/`image` parts through as a list
-            // instead of flattening to a string; the encoder turns each part
-            // into a placeholder at its position. Part *order* is still the
-            // gateway's media-part order (the V4.1 multimodal spec declares
-            // `Authored`; without a spec the gateway moves media first).
-            // V3.2/V4 have no native opinion here and fall back to whatever
-            // the (usually absent) Jinja template reports.
-            Renderer::DeepseekV41 => ChatTemplateContentFormat::OpenAI,
-            Renderer::Jinja | Renderer::DeepseekV32 | Renderer::DeepseekV4(_) => {
-                self.chat_template.content_format()
-            }
-        }
+        self.profile
+            .and_then(|profile| profile.content_format)
+            .unwrap_or_else(|| self.chat_template.content_format())
     }
 
     fn thinking_toggle(&self) -> ThinkingToggle {
-        match self.renderer {
-            // The DeepSeek V3.2 encoder gates thinking on the `thinking`
-            // kwarg, default off. The Jinja processor has no knowledge of
-            // the native encoder so we must report it directly.
-            Renderer::DeepseekV32 => ThinkingToggle::DefaultOff,
-            // V4 defaults thinking ON like the engine's own server (its
-            // `tokenizers/deepseek_v4.py`): `thinking: false`, its
-            // `enable_thinking` alias or `reasoning_effort: "none"` turns it
-            // off. V4.1 defaults thinking ON: `reasoning_effort: "none"` or an
-            // explicit `thinking: false` (or the engine's `enable_thinking` alias,
-            // see `renderer_capabilities`) turns it off.
-            Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => ThinkingToggle::DefaultOn,
-            Renderer::Jinja => self.chat_template.thinking_toggle(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.thinking_toggle(),
+            |profile| profile.thinking_toggle,
+        )
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
-        match self.renderer {
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => {
-                Some(ThinkingKeyName::Thinking)
-            }
-            Renderer::Jinja => self.chat_template.thinking_key_name(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.thinking_key_name(),
+            |profile| Some(profile.thinking_key_name),
+        )
     }
+
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
-        match self.renderer {
-            Renderer::DeepseekV4(encoding) => encoding.valid_native_values(),
-            Renderer::DeepseekV41 => deepseek_v41::NATIVE_EFFORT_VALUES,
-            Renderer::DeepseekV32 => &[],
-            Renderer::Jinja => self.chat_template.native_reasoning_effort_values(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.native_reasoning_effort_values(),
+            |profile| profile.native_effort_values,
+        )
     }
 
     fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
-        match self.renderer {
-            // V4 reads `reasoning_effort` as the engine's own server does:
-            // `"none"` is chat mode, every other value (`"minimal"` included,
-            // which the engine maps to the low effort) keeps thinking on. Declaring
-            // the off word keeps the gateway's parser arming on that rule.
-            Renderer::DeepseekV4(_) => &["none"],
-            // The native V3.2/V4.1 renderers switch off on the protocol's
-            // `none`/`minimal`, so they declare no words of their own.
-            Renderer::DeepseekV32 | Renderer::DeepseekV41 => &[],
-            Renderer::Jinja => self.chat_template.native_reasoning_effort_off_values(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.native_reasoning_effort_off_values(),
+            |profile| profile.native_effort_off_values,
+        )
     }
 
     fn think_in_prefill(&self) -> bool {
-        match self.renderer {
-            // All three native encoders emit `<｜Assistant｜><think>` at the end
-            // of the prompt when thinking mode is on; the completion therefore
-            // starts mid-reasoning and the parser must be told so.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => true,
-            Renderer::Jinja => self.chat_template.think_in_prefill(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.think_in_prefill(),
+            |profile| profile.think_in_prefill,
+        )
     }
 
     fn prefill_opens_think_block(&self) -> bool {
-        match self.renderer {
-            // The native renderers all report a thinking switch, so this flag
-            // (read only for a switchless template) mirrors `think_in_prefill`.
-            Renderer::DeepseekV32 | Renderer::DeepseekV4(_) | Renderer::DeepseekV41 => {
-                self.think_in_prefill()
-            }
-            Renderer::Jinja => self.chat_template.prefill_opens_think_block(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.prefill_opens_think_block(),
+            |profile| profile.think_in_prefill,
+        )
     }
 
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
-        match self.renderer {
-            // The V4.1 shim honours the engine's `enable_thinking` alias, renders a
-            // trailing assistant message itself when `add_generation_prompt`
-            // is false, and parses tool-call `arguments` strings with the
-            // reference's tolerance.
-            Renderer::DeepseekV41 => crate::traits::RendererCapabilities {
-                enable_thinking_alias: true,
-                native_assistant_continuation: true,
-                raw_tool_call_arguments: true,
-            },
-            // The V4 shim reads the engine's `enable_thinking` alias too.
-            Renderer::DeepseekV4(_) => crate::traits::RendererCapabilities {
-                enable_thinking_alias: true,
-                ..crate::traits::RendererCapabilities::default()
-            },
-            Renderer::DeepseekV32 | Renderer::Jinja => {
-                crate::traits::RendererCapabilities::default()
-            }
-        }
+        self.profile
+            .map_or_else(Default::default, |profile| profile.capabilities)
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {

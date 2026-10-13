@@ -17,16 +17,23 @@ use serde_json::{json, Value};
 // here because it is part of this module's public API, and `pub(super)` items
 // are not reachable from outside `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
-// Message-shape preprocessing, drop-thinking and DSML argument rendering are
-// identical to V4 except for the tag strings and the last-user definition; see
-// `deepseek_common` for the shared implementation and its own doc comments.
-use super::deepseek_common::{
-    at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml, merge_tool_messages,
-    sort_tool_results_by_call_order, DsmlTags,
-};
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
+// Message-shape preprocessing, drop-thinking and DSML argument rendering are
+// identical to V4 except for the tag strings and the last-user definition; see
+// `deepseek_common` for the shared implementation and its own doc comments.
+use super::{
+    deepseek_common::{
+        at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
+        merge_tool_messages, sort_tool_results_by_call_order, DsmlTags,
+    },
+    RendererProfile,
+};
+use crate::{
+    chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
+    traits::RendererCapabilities,
+};
 
 // ---------------------------------------------------------------------------
 // Special-token constants — copied verbatim from the Python source.
@@ -74,6 +81,37 @@ fn task_sp_token(task: &str) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 /// The effort names the Python encoder accepts (`REASONING_EFFORT_MAPPINGS`).
 pub const NATIVE_EFFORT_VALUES: &[&str] = &["low", "high", "xhigh", "max"];
+
+/// What this renderer answers around a render (see [`RendererProfile`]).
+pub(crate) const PROFILE: RendererProfile = RendererProfile {
+    // Message parts are preserved (OpenAI wire format) so the gateway passes
+    // `image_url` / `image` parts through as a list instead of flattening to
+    // a string; the encoder turns each part into a placeholder at its
+    // position. Part *order* is still the gateway's media-part order (the
+    // multimodal spec declares `Authored`; without a spec the gateway moves
+    // media first).
+    content_format: Some(ChatTemplateContentFormat::OpenAI),
+    // Thinking defaults ON: `reasoning_effort: "none"` or an explicit
+    // `thinking: false` (or the engine's `enable_thinking` alias, see the
+    // capabilities) turns it off.
+    thinking_toggle: ThinkingToggle::DefaultOn,
+    thinking_key_name: ThinkingKeyName::Thinking,
+    native_effort_values: NATIVE_EFFORT_VALUES,
+    // Switches off on the protocol's `none` / `minimal`: no words of its own.
+    native_effort_off_values: &[],
+    // `<｜Assistant｜><think>` ends the prompt when thinking is on.
+    think_in_prefill: true,
+    // The shim honours the engine's `enable_thinking` alias, renders a
+    // trailing assistant message itself when `add_generation_prompt` is
+    // false, and parses tool-call `arguments` strings with the reference's
+    // tolerance.
+    capabilities: RendererCapabilities {
+        enable_thinking_alias: true,
+        native_assistant_continuation: true,
+        raw_tool_call_arguments: true,
+    },
+    thinking_mode: None,
+};
 pub const REASONING_EFFORT_TEMPLATE: &str =
     "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
 const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;

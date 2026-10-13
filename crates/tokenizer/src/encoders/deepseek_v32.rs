@@ -10,7 +10,11 @@ use thiserror::Error;
 // duplicated a third time. V3.2's other tool/drop-thinking helpers are
 // genuinely different algorithms (not just a naming coincidence) and are
 // intentionally kept local to this file.
-use super::deepseek_common::{at_or_after_last_user, find_last_user_index};
+use super::{
+    deepseek_common::{at_or_after_last_user, find_last_user_index},
+    RendererProfile,
+};
+use crate::chat_template::{ThinkingKeyName, ThinkingToggle};
 
 /// Mode for thinking/reasoning rendering.
 ///
@@ -83,6 +87,22 @@ pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
 pub const THINKING_START_TOKEN: &str = "<think>";
 pub const THINKING_END_TOKEN: &str = "</think>";
 pub const DSML_TOKEN: &str = "｜DSML｜";
+
+/// What this renderer answers around a render (see [`RendererProfile`]).
+pub(crate) const PROFILE: RendererProfile = RendererProfile {
+    // No opinion on content parts: the (usually absent) template's format.
+    content_format: None,
+    // Thinking is gated on the `thinking` kwarg, default off.
+    thinking_toggle: ThinkingToggle::DefaultOff,
+    thinking_key_name: ThinkingKeyName::Thinking,
+    // Switches off on the protocol's `none` / `minimal`: no words of its own.
+    native_effort_values: &[],
+    native_effort_off_values: &[],
+    // `<｜Assistant｜><think>` ends the prompt when thinking is on.
+    think_in_prefill: true,
+    capabilities: RendererProfile::NO_CAPABILITIES,
+    thinking_mode: None,
+};
 
 const USER_PREFIX: &str = "<｜User｜>";
 const ASSISTANT_SUFFIX: &str = "<｜Assistant｜>";

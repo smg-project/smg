@@ -40,7 +40,44 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 
-use crate::chat_template::ChatTemplateParams;
+use super::RendererProfile;
+use crate::{
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+    },
+    traits::RendererCapabilities,
+};
+
+/// What this renderer answers around a render (see [`RendererProfile`]).
+pub(crate) const PROFILE: RendererProfile = RendererProfile {
+    // Content parts are rendered positionally, so the gateway passes them through.
+    content_format: Some(ChatTemplateContentFormat::OpenAI),
+    // No Jinja template; the native renderer defaults thinking ON (the
+    // reference's `build_chat_segments(thinking=True)`).
+    thinking_toggle: ThinkingToggle::DefaultOn,
+    thinking_key_name: ThinkingKeyName::Thinking,
+    // The levels the encoder renders as a `thinking-effort` directive;
+    // `"none"` switches thinking off (the engine's own server maps the kwarg
+    // the same way before rendering), so the reasoning parser is armed from
+    // the kwarg like the prompt is.
+    native_effort_values: &["low", "high", "max"],
+    native_effort_off_values: &[],
+    // The generation-prompt tail opens `<think>` when thinking is on (the
+    // default), so completions start mid-reasoning.
+    think_in_prefill: true,
+    // The encoder parses `arguments` itself; the gateway forwards them as
+    // written. The engine's own server rewrites `enable_thinking` into the
+    // encoder's `thinking` before rendering, so the renderer and the parser
+    // read the alias.
+    capabilities: RendererCapabilities {
+        raw_tool_call_arguments: true,
+        enable_thinking_alias: true,
+        ..RendererProfile::NO_CAPABILITIES
+    },
+    // The encoder resolves the mode by its own rule; the parser is armed
+    // from the same answer the prompt was rendered with.
+    thinking_mode: Some(resolve_thinking),
+};
 
 const OPEN_TOKEN: &str = "<|open|>";
 const CLOSE_TOKEN: &str = "<|close|>";

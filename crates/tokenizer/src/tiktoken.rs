@@ -22,9 +22,10 @@ use crate::{
     encoders::{
         kimi_k25_tools::apply_kimi_k25_tools,
         kimi_k3_xtml::{
-            apply_kimi_k3_xtml_with_effort_default, join_segments, render_kimi_k3_xtml_prompt,
-            resolve_thinking as resolve_k3_thinking, PromptSegment, RenderedXtml,
+            self, apply_kimi_k3_xtml_with_effort_default, join_segments,
+            render_kimi_k3_xtml_prompt, PromptSegment, RenderedXtml,
         },
+        RendererProfile,
     },
     factory::discover_chat_template_in_dir,
     kimi_k2_tokenizer,
@@ -42,6 +43,17 @@ enum Renderer {
     /// Kimi-K3 renders its prompt entirely in the native XTML encoder (no Jinja
     /// chat template). See [`crate::encoders::kimi_k3_xtml`].
     KimiK3Xtml,
+}
+
+impl Renderer {
+    /// The answers of a renderer with its own encoder (see
+    /// [`RendererProfile`]); the others answer from the template.
+    fn profile(self) -> Option<RendererProfile> {
+        match self {
+            Self::Jinja | Self::KimiK25Tools => None,
+            Self::KimiK3Xtml => Some(kimi_k3_xtml::PROFILE),
+        }
+    }
 }
 
 /// Regex pattern for cl100k_base tokenization.
@@ -192,6 +204,9 @@ pub struct TiktokenTokenizer {
     eos_token_ids: Vec<TokenIdType>,
     skip_token_ids: HashSet<TokenIdType>,
     renderer: Renderer,
+    /// What that renderer answers around a render when it has an encoder of
+    /// its own ([`Renderer::profile`]), built once with it.
+    profile: Option<RendererProfile>,
     /// Bytes per id, for the per-stream decoder (see `byte_level`); `None`
     /// for a vocabulary whose ids lie too far apart for a dense table, which
     /// streams through the generic decoder.
@@ -263,6 +278,7 @@ impl TiktokenTokenizer {
             eos_token_ids: Vec::new(), // No directory path in from_model
             skip_token_ids,
             renderer: Renderer::Jinja,
+            profile: None,
             byte_level,
             checkpoint_pieces: false,
         })
@@ -380,6 +396,7 @@ impl TiktokenTokenizer {
             chat_template: ChatTemplateState::new(chat_template)?,
             eos_token_ids,
             skip_token_ids: config.skip_token_ids,
+            profile: renderer.profile(),
             renderer,
             byte_level,
             // The same file gives the pattern and the piece rule.
@@ -848,80 +865,60 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
-        match self.renderer {
-            // K3 renders content parts positionally, so the gateway passes them through.
-            Renderer::KimiK3Xtml => ChatTemplateContentFormat::OpenAI,
-            Renderer::Jinja | Renderer::KimiK25Tools => self.chat_template.content_format(),
-        }
+        self.profile
+            .and_then(|profile| profile.content_format)
+            .unwrap_or_else(|| self.chat_template.content_format())
     }
 
     fn thinking_toggle(&self) -> ThinkingToggle {
-        match self.renderer {
-            // K3 has no Jinja template; its native renderer defaults thinking
-            // ON (Python `build_chat_segments(thinking=True)`).
-            Renderer::KimiK3Xtml => ThinkingToggle::DefaultOn,
-            _ => self.chat_template.thinking_toggle(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.thinking_toggle(),
+            |profile| profile.thinking_toggle,
+        )
     }
 
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
-        match self.renderer {
-            Renderer::KimiK3Xtml => Some(ThinkingKeyName::Thinking),
-            _ => self.chat_template.thinking_key_name(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.thinking_key_name(),
+            |profile| Some(profile.thinking_key_name),
+        )
     }
 
     fn native_reasoning_effort_values(&self) -> &'static [&'static str] {
-        match self.renderer {
-            // The levels the K3 encoder renders as a `thinking-effort`
-            // directive; `"none"` switches thinking off (the engine's own
-            // server maps the kwarg the same way before rendering), so the
-            // reasoning parser is armed from the kwarg like the prompt is.
-            Renderer::KimiK3Xtml => &["low", "high", "max"],
-            _ => self.chat_template.native_reasoning_effort_values(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.native_reasoning_effort_values(),
+            |profile| profile.native_effort_values,
+        )
     }
 
     fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
-        match self.renderer {
-            Renderer::KimiK3Xtml => &[],
-            _ => self.chat_template.native_reasoning_effort_off_values(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.native_reasoning_effort_off_values(),
+            |profile| profile.native_effort_off_values,
+        )
     }
+
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &self.eos_token_ids
     }
 
     fn think_in_prefill(&self) -> bool {
-        match self.renderer {
-            // K3's generation-prompt tail opens `<think>` when thinking is on
-            // (the default), so completions start mid-reasoning.
-            Renderer::KimiK3Xtml => true,
-            _ => self.chat_template.think_in_prefill(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.think_in_prefill(),
+            |profile| profile.think_in_prefill,
+        )
     }
 
     fn prefill_opens_think_block(&self) -> bool {
-        match self.renderer {
-            // The native renderers all report a thinking switch, so this flag
-            // (read only for a switchless template) mirrors `think_in_prefill`.
-            Renderer::KimiK3Xtml => self.think_in_prefill(),
-            _ => self.chat_template.prefill_opens_think_block(),
-        }
+        self.profile.map_or_else(
+            || self.chat_template.prefill_opens_think_block(),
+            |profile| profile.think_in_prefill,
+        )
     }
 
     fn renderer_capabilities(&self) -> RendererCapabilities {
-        match self.renderer {
-            // The K3 encoder parses `arguments` itself; the gateway forwards them as written.
-            // The engine's own server rewrites `enable_thinking` into the encoder's
-            // `thinking` before rendering, so the renderer and the parser read the alias.
-            Renderer::KimiK3Xtml => RendererCapabilities {
-                raw_tool_call_arguments: true,
-                enable_thinking_alias: true,
-                ..RendererCapabilities::default()
-            },
-            Renderer::Jinja | Renderer::KimiK25Tools => RendererCapabilities::default(),
-        }
+        self.profile
+            .map_or_else(Default::default, |profile| profile.capabilities)
     }
 
     fn native_thinking_mode(
@@ -929,12 +926,9 @@ impl TokenizerTrait for TiktokenTokenizer {
         template_kwargs: Option<&HashMap<String, serde_json::Value>>,
         thinking: Option<bool>,
     ) -> Option<bool> {
-        match self.renderer {
-            // The K3 encoder resolves the mode by its own rule; the parser is
-            // armed from the same answer the prompt was rendered with.
-            Renderer::KimiK3Xtml => Some(resolve_k3_thinking(template_kwargs, thinking)),
-            Renderer::Jinja | Renderer::KimiK25Tools => None,
-        }
+        self.profile
+            .and_then(|profile| profile.thinking_mode)
+            .map(|resolve| resolve(template_kwargs, thinking))
     }
 
     fn set_chat_template(&mut self, template: String) -> Result<()> {
