@@ -496,21 +496,17 @@ impl DtypeOverrides {
     }
 }
 
-/// The dtype every worker of `workers` reads its image encoder input in,
-/// resolved before any of them is selected from what each already advertises
-/// (its runtime, its `multimodal_encoder_dtype` label) and the router's
-/// overrides, by the rules assembly applies to the selected worker. The
-/// caller passes the pool the selection will draw from (the routing pool of
-/// the model id, which for the wildcard id is the global snapshot), so the
-/// workers resolved here are the workers that can be picked. `None` for an
-/// empty or a disagreeing set, and whenever a worker is served otherwise (the
-/// pixels' own bytes for an engine that normalizes on device, a wire that
-/// carries no preprocessed floats): the per-destination write then stays as
-/// it is.
-///
-/// Resolved over the union of the model's routing pools `pools` (the
-/// pipeline mode's legs), as the selection draws them: the wildcard model id
-/// resolves over the global snapshot there too.
+/// The dtype every worker of the model's routing pools `pools` (the
+/// pipeline mode's legs) reads its image encoder input in, resolved before
+/// any of them is selected from what each already advertises (its runtime,
+/// its `multimodal_encoder_dtype` label) and the router's overrides, by the
+/// rules assembly applies to the selected worker. The pools are read as the
+/// selection reads them (the wildcard model id resolves over the global
+/// snapshot), so the workers resolved here are the workers that can be
+/// picked. `None` for an empty or a disagreeing set, and whenever a worker is
+/// served otherwise (the pixels' own bytes for an engine that normalizes on
+/// device, a wire that carries no preprocessed floats): the per-destination
+/// write then stays as it is.
 pub(crate) fn mm_shared_image_wire_dtype_over(
     registry: &WorkerRegistry,
     model_id: &str,
