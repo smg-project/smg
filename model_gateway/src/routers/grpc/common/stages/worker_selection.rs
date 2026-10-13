@@ -230,6 +230,27 @@ impl WorkerSelectionStage {
             )),
         }
     }
+
+    /// A disaggregated selection admitted within the budget
+    /// ([`Self::admit_within_budget`]) and still within it afterwards: an
+    /// admission that lands right at the bound gives its claim back instead
+    /// of taking a worker.
+    async fn admit_selection_within_budget<T, F>(
+        &self,
+        ctx: &RequestContext,
+        accepted: Option<Instant>,
+        admission: F,
+    ) -> Result<(T, PrefillLoadGuard), Response>
+    where
+        F: std::future::Future<Output = Result<(T, PrefillLoadGuard), Response>>,
+    {
+        let (selected, guard) = self.admit_within_budget(ctx, accepted, admission).await?;
+        if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
+            drop(guard);
+            return Err(refused);
+        }
+        Ok((selected, guard))
+    }
 }
 
 /// How long a request accepted at `accepted` has waited by `now`, when that
@@ -398,20 +419,12 @@ impl WorkerSelectionStage {
             }
             WorkerSelectionMode::PrefillDecode => {
                 let (pair, guard) = self
-                    .admit_within_budget(
+                    .admit_selection_within_budget(
                         ctx,
                         accepted,
                         self.admit_pd_pair(model_id, inputs, sticky_key, None, media_refs, demand),
                     )
                     .await?;
-                // An admission that lands right at the bound still gives its
-                // claim back instead of taking a worker.
-                if let Some(refused) =
-                    accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted))
-                {
-                    drop(guard);
-                    return Err(refused);
-                }
                 ctx.state.pd_prefill_guard = Some(guard);
                 disaggregated(pair)
             }
@@ -437,7 +450,7 @@ impl WorkerSelectionStage {
                     }
                 };
                 let ((encode_assignments, prefill, decode, runtime_type), guard) = self
-                    .admit_within_budget(
+                    .admit_selection_within_budget(
                         ctx,
                         accepted,
                         self.admit_encode_prefill_decode_workers(
@@ -448,12 +461,6 @@ impl WorkerSelectionStage {
                         ),
                     )
                     .await?;
-                if let Some(refused) =
-                    accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted))
-                {
-                    drop(guard);
-                    return Err(refused);
-                }
                 ctx.state.pd_prefill_guard = Some(guard);
                 WorkerSelection::Disaggregated {
                     encode_assignments: if encode_assignments.is_empty() {
@@ -865,15 +872,50 @@ impl MediaDemands {
     }
 }
 
-/// A leg's name in a refusal's text.
-fn leg_name(leg: WorkerType) -> &'static str {
+/// A leg as a refusal names it, and the pool the gRPC pipeline draws it
+/// from: the one table behind every leg verdict, refusal line and pair
+/// failure of this stage.
+const fn leg_entry(leg: WorkerType) -> (&'static str, RoutingPool) {
     match leg {
-        WorkerType::Regular => "regular",
-        WorkerType::Prefill => "prefill",
-        WorkerType::Decode => "decode",
-        WorkerType::Encode => "encode",
+        WorkerType::Regular => ("regular", RoutingPool::GrpcPipelineRegular),
+        WorkerType::Prefill => ("prefill", RoutingPool::GrpcPrefill),
+        WorkerType::Decode => ("decode", RoutingPool::GrpcDecode),
+        WorkerType::Encode => ("encode", RoutingPool::GrpcEncode),
     }
 }
+
+/// A leg's name in a refusal's text.
+fn leg_name(leg: WorkerType) -> &'static str {
+    leg_entry(leg).0
+}
+
+/// The pool a leg's candidates come from.
+fn leg_pool(leg: WorkerType) -> RoutingPool {
+    leg_entry(leg).1
+}
+
+/// The leg of a pair placement as the leg table knows it; `Single` is the
+/// pair's whole and has no entry.
+fn pair_leg(leg: WorkerLeg) -> Option<WorkerType> {
+    match leg {
+        WorkerLeg::Prefill => Some(WorkerType::Prefill),
+        WorkerLeg::Decode => Some(WorkerType::Decode),
+        WorkerLeg::Single => None,
+    }
+}
+
+/// The legs each selection mode draws from, in the order a refusal line
+/// names them.
+const REGULAR_LEGS: [(&str, RoutingPool); 1] = [leg_entry(WorkerType::Regular)];
+const PREFILL_DECODE_LEGS: [(&str, RoutingPool); 2] = [
+    leg_entry(WorkerType::Prefill),
+    leg_entry(WorkerType::Decode),
+];
+const ENCODE_PREFILL_DECODE_LEGS: [(&str, RoutingPool); 3] = [
+    leg_entry(WorkerType::Encode),
+    leg_entry(WorkerType::Prefill),
+    leg_entry(WorkerType::Decode),
+];
 
 /// Runtime of the leg that builds the generate request: the sole worker in
 /// regular mode, the prefill worker in disaggregated (PD/EPD) mode.
@@ -918,17 +960,11 @@ impl WorkerSelectionStage {
                 WorkerType::Regular => placement::single_failure(
                     &self.worker_registry,
                     model_id,
-                    RoutingPool::GrpcPipelineRegular,
+                    leg_pool(WorkerType::Regular),
                     wire,
                 ),
-                WorkerType::Prefill => {
-                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcPrefill, wire)
-                }
-                WorkerType::Decode => {
-                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcDecode, wire)
-                }
-                WorkerType::Encode => {
-                    self.disaggregated_leg_verdict(model_id, RoutingPool::GrpcEncode, wire)
+                WorkerType::Prefill | WorkerType::Decode | WorkerType::Encode => {
+                    self.disaggregated_leg_verdict(model_id, leg_pool(*leg), wire)
                 }
             };
             match verdict {
@@ -982,13 +1018,8 @@ impl WorkerSelectionStage {
     ) -> Response {
         let mut unavailable = false;
         for leg in legs {
-            let pool = match leg {
-                WorkerType::Regular => RoutingPool::GrpcPipelineRegular,
-                WorkerType::Prefill => RoutingPool::GrpcPrefill,
-                WorkerType::Decode => RoutingPool::GrpcDecode,
-                WorkerType::Encode => RoutingPool::GrpcEncode,
-            };
-            let candidates = placement::candidates(&self.worker_registry, model_id, pool, wire);
+            let candidates =
+                placement::candidates(&self.worker_registry, model_id, leg_pool(*leg), wire);
             let candidates = candidates.as_slice();
             if candidates.is_empty() {
                 continue;
@@ -1122,24 +1153,11 @@ impl WorkerSelectionStage {
     /// draws from.
     fn refusal_site(&self, function: &'static str) -> RefusalSite<'static> {
         let (mode, legs): (&'static str, &'static [(&'static str, RoutingPool)]) = match self.mode {
-            WorkerSelectionMode::Regular => {
-                ("Regular", &[("regular", RoutingPool::GrpcPipelineRegular)])
+            WorkerSelectionMode::Regular => ("Regular", &REGULAR_LEGS),
+            WorkerSelectionMode::PrefillDecode => ("PrefillDecode", &PREFILL_DECODE_LEGS),
+            WorkerSelectionMode::EncodePrefillDecode => {
+                ("EncodePrefillDecode", &ENCODE_PREFILL_DECODE_LEGS)
             }
-            WorkerSelectionMode::PrefillDecode => (
-                "PrefillDecode",
-                &[
-                    ("prefill", RoutingPool::GrpcPrefill),
-                    ("decode", RoutingPool::GrpcDecode),
-                ],
-            ),
-            WorkerSelectionMode::EncodePrefillDecode => (
-                "EncodePrefillDecode",
-                &[
-                    ("encode", RoutingPool::GrpcEncode),
-                    ("prefill", RoutingPool::GrpcPrefill),
-                    ("decode", RoutingPool::GrpcDecode),
-                ],
-            ),
         };
         RefusalSite {
             function,
@@ -1198,11 +1216,7 @@ impl WorkerSelectionStage {
     /// the missing leg), and a leg whose workers are all unavailable is the
     /// 503 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
-        let leg = match failure.leg {
-            WorkerLeg::Prefill => "prefill",
-            WorkerLeg::Decode => "decode",
-            WorkerLeg::Single => "worker",
-        };
+        let leg = pair_leg(failure.leg).map_or("worker", leg_name);
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => shed,
             PlacementFailure::Unavailable => Self::workers_unavailable(model_id),
@@ -1246,8 +1260,8 @@ impl WorkerSelectionStage {
             // is one nobody serves.
             PlacementFailure::NoCandidates => {
                 let partner = match failure.leg {
-                    WorkerLeg::Prefill => Some(RoutingPool::GrpcDecode),
-                    WorkerLeg::Decode => Some(RoutingPool::GrpcPrefill),
+                    WorkerLeg::Prefill => Some(leg_pool(WorkerType::Decode)),
+                    WorkerLeg::Decode => Some(leg_pool(WorkerType::Prefill)),
                     WorkerLeg::Single => None,
                 };
                 let partner_registered = partner.is_some_and(|pool| {
