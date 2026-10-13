@@ -1923,20 +1923,19 @@ async fn decode_video_with_ffmpeg_runners(
             // probe's metadata before anything frames raw output by a size
             // the decoder may not produce; a probe that cannot run leaves the
             // mismatch standing, which the headed PNG runner below takes.
-            if let Err(error) = &headed {
-                log_video_decode_backend_timing(
-                    "ffmpeg_ppm_file",
-                    started,
-                    input_bytes,
-                    cfg,
-                    Some(error),
-                );
-            }
             match probe_video_info(input_path)
                 .await
                 .and_then(|info| video_metadata_from(info, false))
             {
                 Ok(probed) => {
+                    // The first decode's own entry; the retry is timed apart.
+                    log_video_decode_backend_timing(
+                        "ffmpeg_ppm_file",
+                        started,
+                        input_bytes,
+                        cfg,
+                        headed.as_ref().err(),
+                    );
                     metadata = probed;
                     started = Instant::now();
                     headed =
@@ -2472,7 +2471,25 @@ fn probed_from_container(container: &crate::mp4_metadata::ContainerVideoInfo) ->
     }
 }
 
+/// A test switch: on this thread the probe tool is treated as unable to run.
+#[cfg(test)]
+mod probe_switch {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
+    }
+}
+
 async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaConnectorError> {
+    #[cfg(test)]
+    {
+        if probe_switch::UNAVAILABLE.with(|off| off.get()) {
+            return Err(MediaConnectorError::VideoDecode(
+                "the probe tool is switched off for this test".to_string(),
+            ));
+        }
+    }
     let mut command = Command::new("ffprobe");
     command
         .args([
@@ -4461,38 +4478,67 @@ mod video_sampling_tests {
         }
     }
 
+    /// `(offset, header length, size)` of the first `kind` box in
+    /// `bytes[start..end]`.
+    fn mp4_child(bytes: &[u8], start: usize, end: usize, kind: [u8; 4]) -> (usize, usize, usize) {
+        let mut offset = start;
+        while offset + 8 <= end {
+            let stated = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let (size, header) = match stated {
+                1 => (
+                    u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap()) as usize,
+                    16,
+                ),
+                0 => (end - offset, 8),
+                stated => (stated as usize, 8),
+            };
+            if bytes[offset + 4..offset + 8] == kind {
+                return (offset, header, size);
+            }
+            offset += size;
+        }
+        panic!("no {} box", String::from_utf8_lossy(&kind));
+    }
+
+    /// The payload bounds of the box at the end of `kinds`, each kind
+    /// the first of its name inside the previous one.
+    fn mp4_payload(bytes: &[u8], kinds: &[[u8; 4]]) -> (usize, usize) {
+        let (mut start, mut end) = (0, bytes.len());
+        for kind in kinds {
+            let (offset, header, size) = mp4_child(bytes, start, end, *kind);
+            start = offset + header;
+            end = offset + size;
+        }
+        (start, end)
+    }
+
+    /// Writes `width` into the first track's first sample entry, the muxer's
+    /// stated size the container reader reports: a clip whose stated size is
+    /// not the decoder's.
+    fn narrow_first_sample_entry(path: &Path, width: u16) {
+        use std::fs as std_fs;
+        let mut bytes = std_fs::read(path).expect("clip bytes");
+        let (stsd, _) = mp4_payload(
+            &bytes,
+            &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd"],
+        );
+        // After the sample description's version, flags and entry count, the
+        // first entry: its width sits 32 bytes in (the sample entry header,
+        // then the visual entry's reserved fields).
+        let entry = stsd + 8;
+        bytes[entry + 32..entry + 34].copy_from_slice(&width.to_be_bytes());
+        std_fs::write(path, bytes).expect("clip rewritten");
+    }
+
     /// Writes a 90-degree display rotation into the first track's header
     /// matrix, the way a phone stores a portrait recording: the rotation lives
     /// in the container, the coded size stays what it was. Written by hand
     /// because not every ffmpeg build turns a `rotate` tag into the matrix.
     fn rotate_first_track(path: &Path) {
         use std::fs as std_fs;
-        fn child(bytes: &[u8], start: usize, end: usize, kind: [u8; 4]) -> (usize, usize, usize) {
-            let mut offset = start;
-            while offset + 8 <= end {
-                let stated = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
-                let (size, header) = match stated {
-                    1 => (
-                        u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap())
-                            as usize,
-                        16,
-                    ),
-                    0 => (end - offset, 8),
-                    stated => (stated as usize, 8),
-                };
-                if bytes[offset + 4..offset + 8] == kind {
-                    return (offset, header, size);
-                }
-                offset += size;
-            }
-            panic!("no {} box", String::from_utf8_lossy(&kind));
-        }
         let mut bytes = std_fs::read(path).expect("clip bytes");
-        let (moov, moov_header, moov_size) = child(&bytes, 0, bytes.len(), *b"moov");
-        let (trak, trak_header, trak_size) =
-            child(&bytes, moov + moov_header, moov + moov_size, *b"trak");
-        let (tkhd, tkhd_header, _) = child(&bytes, trak + trak_header, trak + trak_size, *b"tkhd");
-        let payload = tkhd + tkhd_header;
+        let (tkhd, _) = mp4_payload(&bytes, &[*b"moov", *b"trak", *b"tkhd"]);
+        let payload = tkhd;
         let matrix = payload + if bytes[payload] == 1 { 52 } else { 40 };
         let rotated: [i32; 9] = [0, 65536, 0, -65536, 0, 0, 0, 0, 1 << 30];
         let (slots, _) = bytes[matrix..matrix + 36].as_chunks_mut::<4>();
@@ -4502,13 +4548,9 @@ mod video_sampling_tests {
         std_fs::write(path, bytes).expect("clip rewritten");
     }
 
-    /// A clip stored with a 90-degree display rotation (the portrait phone
-    /// shape) through both runners, where the tools are installed: the headed
-    /// decode autorotates and hands back the transposed size, which the size
-    /// check accepts on the first decode; the raw runner, without
-    /// autorotation, frames the coded size.
-    #[tokio::test]
-    async fn a_rotated_clip_decodes_through_both_runners() {
+    /// A one-second 64x48 clip at 24 fps written by ffmpeg into `dir`, or
+    /// `None` where the tools are not installed.
+    fn small_clip(dir: &Path, name: &str) -> Option<PathBuf> {
         use std::process::Command as Sync;
         let have = |tool: &str| {
             Sync::new(tool)
@@ -4518,10 +4560,9 @@ mod video_sampling_tests {
                 .unwrap_or(false)
         };
         if !have("ffmpeg") || !have("ffprobe") {
-            return;
+            return None;
         }
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("rotated.mp4");
+        let path = dir.join(name);
         let encoded = Sync::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -4546,6 +4587,20 @@ mod video_sampling_tests {
             "ffmpeg wrote the clip: {}",
             String::from_utf8_lossy(&encoded.stderr)
         );
+        Some(path)
+    }
+
+    /// A clip stored with a 90-degree display rotation (the portrait phone
+    /// shape) through both runners, where the tools are installed: the headed
+    /// decode autorotates and hands back the transposed size, which the size
+    /// check accepts on the first decode; the raw runner, without
+    /// autorotation, frames the coded size.
+    #[tokio::test]
+    async fn a_rotated_clip_decodes_through_both_runners() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Some(path) = small_clip(dir.path(), "rotated.mp4") else {
+            return;
+        };
         rotate_first_track(&path);
         let metadata = probe_video_metadata(&path).await.expect("metadata");
         assert_eq!(
@@ -4566,6 +4621,78 @@ mod video_sampling_tests {
             .expect("the raw decode frames the coded size");
         assert_eq!(raw.frames.len(), selection.frame_indices.len());
         assert_eq!((raw.frames[0].width, raw.frames[0].height), (64, 48));
+    }
+
+    /// A clip whose sample entry states half its width: the container path
+    /// reports that size, the headed decode fails on the frames' real size,
+    /// the probe is read, and the second headed decode returns the frames at
+    /// the probe's size.
+    #[tokio::test]
+    async fn a_container_size_the_decoder_disagrees_with_is_re_read_from_the_probe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Some(path) = small_clip(dir.path(), "narrow.mp4") else {
+            return;
+        };
+        narrow_first_sample_entry(&path, 32);
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        assert!(metadata.from_container, "read from the container's tables");
+        assert_eq!(
+            (metadata.width, metadata.height),
+            (32, 48),
+            "the stated size"
+        );
+        let config = up_to_cfg(4);
+        let selection = FrameSelection::from_metadata(metadata, config)
+            .expect("frame rate and count are known");
+        let input_bytes = std::fs::metadata(&path).expect("clip size").len() as usize;
+        let decoded = decode_video_with_ffmpeg_runners(
+            &path,
+            input_bytes,
+            config,
+            Some(metadata),
+            Some(&selection),
+        )
+        .await
+        .expect("the retry on the probe's size succeeds");
+        let DecodedVideoFrames::Rgb { video, .. } = decoded else {
+            panic!("the second headed decode returns raw RGB frames");
+        };
+        assert_eq!(video.frames.len(), selection.frame_indices.len());
+        assert_eq!((video.frames[0].width, video.frames[0].height), (64, 48));
+    }
+
+    /// The same clip with the probe unable to run: the mismatch stands and
+    /// the request ends in the headed PNG runner, whose frames carry their
+    /// own size, never framed raw by the container's.
+    #[tokio::test]
+    async fn a_container_size_mismatch_with_no_probe_ends_in_the_headed_png_runner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Some(path) = small_clip(dir.path(), "narrow-no-probe.mp4") else {
+            return;
+        };
+        narrow_first_sample_entry(&path, 32);
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        assert!(metadata.from_container);
+        let config = up_to_cfg(4);
+        let selection = FrameSelection::from_metadata(metadata, config)
+            .expect("frame rate and count are known");
+        let input_bytes = std::fs::metadata(&path).expect("clip size").len() as usize;
+        probe_switch::UNAVAILABLE.with(|off| off.set(true));
+        let decoded = decode_video_with_ffmpeg_runners(
+            &path,
+            input_bytes,
+            config,
+            Some(metadata),
+            Some(&selection),
+        )
+        .await;
+        probe_switch::UNAVAILABLE.with(|off| off.set(false));
+        let DecodedVideoFrames::Images { frames, .. } = decoded.expect("the headed PNG runner")
+        else {
+            panic!("a size mismatch without a probe ends in the headed PNG runner");
+        };
+        assert_eq!(frames.len(), selection.frame_indices.len());
+        assert_eq!((frames[0].width(), frames[0].height()), (64, 48));
     }
 
     #[test]
