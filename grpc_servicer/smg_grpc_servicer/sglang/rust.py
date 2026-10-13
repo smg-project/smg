@@ -219,7 +219,9 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         "scheduler_info_json": "{}",
         "sglang_version": str(sglang_version),
         "max_running_requests": args.max_running_requests or 0,
-        "data_parallel_size": args.dp_size or 1,
+        # The schedulers that dial, on either engine release: the engine count
+        # the lifecycle waits for, and the handshake's `data_parallel_size`.
+        "data_parallel_size": args.scheduler_count,
         "kv_events_endpoint": kv_events_endpoint,
         "kv_events_replay_endpoint": kv_events_replay_endpoint,
         "kv_events_topic": kv_events_topic,

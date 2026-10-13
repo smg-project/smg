@@ -47,6 +47,9 @@ class ServerArgsSection:
     # into ``attn_dp_size=N, dp_size=1, enable_dp_attention=False``; the pinned
     # release has no such attribute and keeps the flag as given.
     attn_dp_size: int | None
+    # The attention context-parallel width when the args carry it (the newer
+    # releases; it splits one attention group's TP width further), else ``None``.
+    attn_cp_size: int | None
     kv_events_config: Any
     disaggregation_mode: str
     language_only: bool
@@ -65,6 +68,7 @@ class ServerArgsSection:
             dp_size=_positive_int(getattr(server_args, "dp_size", None)),
             enable_dp_attention=bool(getattr(server_args, "enable_dp_attention", False)),
             attn_dp_size=_positive_int(getattr(server_args, "attn_dp_size", None)),
+            attn_cp_size=_positive_int(getattr(server_args, "attn_cp_size", None)),
             kv_events_config=getattr(server_args, "kv_events_config", None),
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
             language_only=bool(getattr(server_args, "language_only", False)),

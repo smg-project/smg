@@ -180,3 +180,11 @@ def test_a_section_is_read_once_per_view():
     view = EngineConfigView(Args())
     assert view.server_args.dp_size == 2 and view.server_args.dp_size == 2
     assert reads == [1]
+
+
+def test_the_attention_context_parallel_width_reads_as_a_count_or_none():
+    """The newer releases' attention context parallelism splits one attention
+    group's TP width further; the pinned release has no such attribute."""
+    assert EngineConfigView(SimpleNamespace(attn_cp_size=2)).server_args.attn_cp_size == 2
+    assert EngineConfigView(SimpleNamespace()).server_args.attn_cp_size is None
+    assert EngineConfigView(SimpleNamespace(attn_cp_size=0)).server_args.attn_cp_size is None

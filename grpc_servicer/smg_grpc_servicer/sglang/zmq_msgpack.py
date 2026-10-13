@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import zmq
 
+from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.request_traces import TRACE_HEADERS_KEY, RequestTraces
 
 if TYPE_CHECKING:
@@ -977,30 +978,57 @@ def _sglang_version() -> str:
 
 
 def scheduler_dp_rank(scheduler: Scheduler) -> int:
-    """The scheduler's DP rank, 0 without DP. SGLang <= 0.5.20 keeps it on the
-    scheduler's own parallel state; later versions publish it on the parallel
-    context (which the older context raises for)."""
+    """The scheduler's rank among the engine's schedulers, 0 without DP: the
+    identity it dials with and the ``data_parallel_rank`` it reports. SGLang
+    <= 0.5.20 keeps the DP rank on the scheduler's own parallel state; later
+    versions publish it on the parallel context (which the older context
+    raises for). On the pinned release ``dp_rank`` is the attention-DP rank
+    under ``--enable-dp-attention``. The newer releases, which resolve the
+    flag into ``attn_dp_size``, keep the attention group's rank in
+    ``attn_dp_rank``: that is the scheduler's rank once ``attn_dp_size`` is
+    above one, whichever index ``dp_rank`` then carries (the engine runs one
+    of ``dp_size`` and ``attn_dp_size`` at 1: attention DP does not run inside
+    replicas); plain data parallelism on those releases resolves to an
+    ``attn_dp_size`` of 1 and keeps ``dp_rank``, the replica index, so every
+    scheduler dials with its own identity."""
     state = getattr(scheduler, "ps", None)
     if state is None:
         from sglang.srt.runtime_context import get_parallel
 
         state = get_parallel()
+    rank = _parallel_rank(state, "dp_rank") or 0
+    if (EngineConfigView(scheduler.server_args).server_args.attn_dp_size or 1) <= 1:
+        return rank
+    attn_rank = _parallel_rank(state, "attn_dp_rank")
+    return rank if attn_rank is None else attn_rank
+
+
+def _parallel_rank(state: Any, name: str) -> int | None:
+    """``state.<name>`` as an int; ``None`` when the state has no such rank."""
     try:
-        rank = state.dp_rank
+        rank = getattr(state, name)
     except AttributeError:
-        rank = None
-    return int(rank) if rank is not None else 0
+        return None
+    return int(rank) if rank is not None else None
 
 
 def ready_response_for_scheduler(scheduler: Scheduler) -> WireEngineCoreReadyResponse:
     """The facts SMG reads at registration, from a loaded scheduler."""
     args = scheduler.server_args
+    view = EngineConfigView(args).server_args
     page_size = int(getattr(scheduler, "page_size", 1) or 1)
     max_total = int(getattr(scheduler, "max_total_num_tokens", 0) or 0)
     chunked_prefill_size = getattr(scheduler, "chunked_prefill_size", None) or 0
-    tp_size, pp_size, dp_size = int(args.tp_size), int(args.pp_size), int(args.dp_size)
-    # Attention DP splits the TP group; otherwise each DP rank is a full replica.
-    attn_tp_size = tp_size // dp_size if args.enable_dp_attention else tp_size
+    tp_size, pp_size = int(args.tp_size), int(args.pp_size)
+    # The attention-DP width on either engine release (the pinned release's
+    # `dp_size` under `--enable-dp-attention`, the newer releases' resolved
+    # `attn_dp_size`): attention DP splits the TP group across it, and the
+    # newer releases' attention context parallelism (`attn_cp_size`) splits
+    # one attention group's TP width further; otherwise each data-parallel
+    # rank is a full replica with the whole TP group.
+    attention_dp_width = view.attention_dp_width
+    attention_split = attention_dp_width * (view.attn_cp_size or 1)
+    attn_tp_size = max(1, tp_size // attention_split) if attention_split > 1 else tp_size
     return WireEngineCoreReadyResponse(
         max_model_len=int(scheduler.model_config.context_len),
         num_gpu_blocks=max_total // page_size,
@@ -1008,11 +1036,17 @@ def ready_response_for_scheduler(scheduler: Scheduler) -> WireEngineCoreReadyRes
         dtype=wire_dtype(scheduler.model_config.dtype),
         vllm_version=f"sglang-{_sglang_version()}",
         world_size=tp_size * pp_size,
-        data_parallel_size=dp_size,
+        # The schedulers the engine runs, one handshake each, as the launcher
+        # counts them (`data_parallel_size` in its server facts).
+        data_parallel_size=view.scheduler_count,
         tensor_parallel_size=attn_tp_size,
         pipeline_parallel_size=pp_size,
         data_parallel_rank=scheduler_dp_rank(scheduler),
-        max_num_seqs=int(getattr(scheduler, "max_running_requests", 0) or 0),
+        # The scheduler's bound is one attention-DP worker's share of the
+        # flag; the Rust servicer reports the handshake's figure as the
+        # worker's window, so it goes out in the flag's units (what an
+        # explicit --max-running-requests reports), as GetServerInfo's does.
+        max_num_seqs=int(getattr(scheduler, "max_running_requests", 0) or 0) * attention_dp_width,
         # A disabled chunked prefill is -1 here; the wire field is a cap >= 0.
         max_num_batched_tokens=max(0, int(chunked_prefill_size)),
         instance_id=str(args.served_model_name or scheduler.model_config.model_path),

@@ -297,6 +297,14 @@ def test_server_facts_carry_the_router_labels_and_the_window(monkeypatch):
     # Without --limit-mm-data-per-request the engine has no per-request media
     # limit to advertise: the Router keeps its own caps.
     assert "mm_item_limits" not in args
+    # A newer engine resolves --dp-size 8 --enable-dp-attention into
+    # attn_dp_size=8, dp_size=1: eight schedulers dial, as on the pinned release.
+    rewritten = rust.server_facts(
+        _server_args(dp_size=1, attn_dp_size=8, enable_dp_attention=False)
+    )
+    assert rewritten["data_parallel_size"] == 8
+    groups = rust.server_facts(_server_args(dp_size=2, attn_dp_size=4, enable_dp_attention=False))
+    assert groups["data_parallel_size"] == 8
 
 
 def test_server_facts_carry_the_engines_media_limits_flat(monkeypatch):
