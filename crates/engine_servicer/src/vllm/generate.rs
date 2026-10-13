@@ -23,7 +23,7 @@ use tonic::Status;
 
 use super::{media::process_media_refs, State};
 use crate::{
-    requests::{CancelReason, Registration},
+    requests::{settle_shutdown, CancelReason, HeldTerminal, Registration},
     stop_match::{stop_decoder, StopMatcher},
     BoxStream,
 };
@@ -213,6 +213,7 @@ async fn submit(
         choices,
         cancel,
         aborted: None,
+        cut: None,
         _registration: registration,
         _loads: loads,
     }))
@@ -323,6 +324,35 @@ impl ChoiceStream {
     }
 }
 
+impl HeldTerminal for ChoiceStream {
+    type Response = vllm::GenerateResponse;
+
+    /// The terminal this choice already holds, when the engine (or a stop
+    /// string) finished it before the poll that would have yielded it: the
+    /// `Complete` it was about to yield, or the engine's parked one. `None`
+    /// for a choice still open, which is left as it is.
+    fn finished(&mut self) -> Option<vllm::GenerateResponse> {
+        if let Some(complete) = self.pending.take() {
+            self.inner = None;
+            return Some(self.stamped(complete));
+        }
+        let inner = self.inner.as_mut()?;
+        if !inner.has_parked_complete() {
+            return None;
+        }
+        // `complete_aborted` yields the parked `Complete` when there is one.
+        let complete = inner.complete_aborted();
+        self.inner = None;
+        Some(self.stamped(complete))
+    }
+
+    /// Whether this choice is still open: neither ended nor holding its
+    /// terminal.
+    fn is_open(&self) -> bool {
+        self.pending.is_none() && self.inner.is_some()
+    }
+}
+
 type ChoiceItem = Result<vllm::GenerateResponse, Status>;
 
 impl Stream for ChoiceStream {
@@ -415,6 +445,9 @@ struct GenerateStream {
     /// Set once aborted: the terminal `Complete` of every choice still open
     /// at that point, yielded before the stream ends.
     aborted: Option<VecDeque<vllm::GenerateResponse>>,
+    /// The status a shutdown ends the stream with once `aborted` is drained,
+    /// when it cut a choice still open; `None` ends it plainly.
+    cut: Option<Status>,
     _registration: Registration,
     _loads: LoadsGuard,
 }
@@ -426,7 +459,13 @@ impl Stream for GenerateStream {
         let this = self.get_mut();
         loop {
             if let Some(aborted) = this.aborted.as_mut() {
-                return Poll::Ready(aborted.pop_front().map(Ok));
+                if let Some(response) = aborted.pop_front() {
+                    return Poll::Ready(Some(Ok(response)));
+                }
+                // The completions the choices already held went out; a
+                // shutdown that cut a choice still open ends the stream with
+                // its status, a plain abort just ends it.
+                return Poll::Ready(this.cut.take().map(Err));
             }
             // The cancellation names its cause. An `Abort` RPC is the caller's
             // own abort: the request ends as the Python servicer ends it, with
@@ -439,11 +478,14 @@ impl Stream for GenerateStream {
             // Either way dropping the choices aborts the engine side.
             if let Poll::Ready(reason) = Pin::new(&mut this.cancel).poll(cx) {
                 if reason == Ok(CancelReason::Shutdown) {
-                    this.choices.clear();
-                    this.aborted = Some(VecDeque::new());
-                    return Poll::Ready(Some(Err(Status::unavailable(
-                        crate::requests::SHUTDOWN_MESSAGE,
-                    ))));
+                    // A choice the engine (or a stop string) finished before
+                    // this poll keeps its completion; only a choice still
+                    // open is cut, and only then does the stream end with the
+                    // status (see `settle_shutdown`).
+                    let (finished, cut) = settle_shutdown(&mut this.choices);
+                    this.aborted = Some(finished);
+                    this.cut = cut.then(|| Status::unavailable(crate::requests::SHUTDOWN_MESSAGE));
+                    continue;
                 }
                 // The abort, or a sender dropped without a word (the registry
                 // entry went away): the completion it always was.

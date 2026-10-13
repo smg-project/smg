@@ -5,13 +5,14 @@
 //! and a shutdown under an open request as the failure it is.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
 };
 
+use futures::stream::{SelectAll, Stream};
 use tokio::sync::oneshot;
 use tonic::Status;
 
@@ -132,5 +133,137 @@ impl RequestRegistry {
             .lock()
             .map(|entries| u32::try_from(entries.len()).unwrap_or(u32::MAX))
             .unwrap_or(0)
+    }
+}
+
+/// A choice of a request's stream as a shutdown sees it: it may already hold
+/// its terminal (the engine finished it on the tick before, or a stop string
+/// matched, and the `Complete` waits for the next poll), still be open, or
+/// have ended.
+pub(crate) trait HeldTerminal {
+    type Response;
+    /// The terminal this choice already holds, taken; `None` for a choice
+    /// still open (left as it is) or already ended.
+    fn finished(&mut self) -> Option<Self::Response>;
+    /// Whether the choice is still open: neither ended nor holding its
+    /// terminal.
+    fn is_open(&self) -> bool;
+}
+
+/// What a shutdown yields for a request's choices, in this order: every
+/// terminal a choice already holds (those completions go out as they would
+/// have), then whether a choice was still really open (only then does the
+/// stream end with a status), then the choices are dropped (which aborts the
+/// engine side). Taking the terminals first is the point: a request the
+/// engine had finished on the tick before the shutdown keeps its completion.
+pub(crate) fn settle_shutdown<C: HeldTerminal + Stream + Unpin>(
+    choices: &mut SelectAll<C>,
+) -> (VecDeque<C::Response>, bool) {
+    let finished = choices
+        .iter_mut()
+        .filter_map(HeldTerminal::finished)
+        .collect();
+    let cut = choices.iter().any(HeldTerminal::is_open);
+    choices.clear();
+    (finished, cut)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use super::*;
+
+    /// A choice as the shutdown sees it; never polled here.
+    struct Choice {
+        terminal: Option<&'static str>,
+        open: bool,
+    }
+
+    impl Stream for Choice {
+        type Item = &'static str;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl HeldTerminal for Choice {
+        type Response = &'static str;
+
+        fn finished(&mut self) -> Option<&'static str> {
+            let terminal = self.terminal.take();
+            if terminal.is_some() {
+                self.open = false;
+            }
+            terminal
+        }
+
+        fn is_open(&self) -> bool {
+            self.open
+        }
+    }
+
+    fn choices(items: Vec<Choice>) -> SelectAll<Choice> {
+        let mut all = SelectAll::new();
+        for item in items {
+            all.push(item);
+        }
+        all
+    }
+
+    #[test]
+    fn a_held_terminal_goes_out_and_an_open_choice_is_cut() {
+        let mut all = choices(vec![
+            Choice {
+                terminal: Some("length"),
+                open: true,
+            },
+            Choice {
+                terminal: None,
+                open: true,
+            },
+        ]);
+        let (finished, cut) = settle_shutdown(&mut all);
+        assert_eq!(finished, ["length"]);
+        assert!(cut, "the choice still open is what the shutdown cuts");
+        assert!(all.is_empty(), "the choices are dropped afterwards");
+    }
+
+    #[test]
+    fn a_request_whose_every_choice_had_finished_is_not_cut() {
+        let mut all = choices(vec![
+            Choice {
+                terminal: Some("stop"),
+                open: true,
+            },
+            Choice {
+                terminal: Some("length"),
+                open: true,
+            },
+        ]);
+        let (finished, cut) = settle_shutdown(&mut all);
+        // `SelectAll` has no order of its own; both completions are there.
+        let mut finished: Vec<_> = finished.into_iter().collect();
+        finished.sort_unstable();
+        assert_eq!(finished, ["length", "stop"]);
+        assert!(
+            !cut,
+            "nothing was open: the stream ends with its completions, no status"
+        );
+    }
+
+    #[test]
+    fn an_ended_choice_neither_yields_nor_cuts() {
+        let mut all = choices(vec![Choice {
+            terminal: None,
+            open: false,
+        }]);
+        let (finished, cut) = settle_shutdown(&mut all);
+        assert!(finished.is_empty());
+        assert!(!cut);
     }
 }
