@@ -43,12 +43,12 @@ pub(crate) enum KvConnectorMode {
     /// or, dispatched concurrently, tag decode with the prefill peer (see
     /// [`moriio_decode_params`]).
     MoriIo,
-    /// A connector that writes to a shared store (the Mooncake store, the
-    /// LMCache family, shared-storage and offloading connectors; see
+    /// A connector whose legs meet in a store the deployment shares (the
+    /// Mooncake store, the shared-storage, FlexKV and 3FS connectors; see
     /// [`KvTransferProfile::Store`]): the decode engine reads the prefill's
-    /// blocks back by prefix hash, so neither leg is tagged and nothing is
-    /// minted; params the engine does return are relayed, for a store that
-    /// runs a handoff of its own.
+    /// blocks back by prefix hash, so the gateway mints nothing: neither leg
+    /// is tagged; params the engine does return are relayed, for a store
+    /// that runs a handoff of its own.
     Store,
     /// Unknown/absent connector: relay returned params opportunistically.
     Passthrough,
@@ -1132,10 +1132,9 @@ mod tests {
     fn kv_connector_mode_store_connectors_take_the_store_mode() {
         for connector in [
             "MooncakeStoreConnector",
-            "LMCacheConnectorV1",
-            "LMCacheMPConnector",
             "SharedStorageConnector",
-            "OffloadingConnector",
+            "FlexKVConnectorV1",
+            "HF3FSKVConnector",
         ] {
             assert_eq!(
                 kv_connector_mode(
@@ -1151,12 +1150,24 @@ mod tests {
         assert_eq!(KvConnectorMode::Store.metrics_label(), "store");
     }
 
+    /// Unknown connectors, and the connectors whose blocks stay in the engine
+    /// or whose disaggregated mode the request would have to address, keep
+    /// the passthrough handling.
     #[test]
     fn kv_connector_mode_unknown_or_missing_is_passthrough() {
-        assert_eq!(
-            kv_connector_mode(Some("P2pNcclConnector"), "host", None, None),
-            KvConnectorMode::Passthrough
-        );
+        for connector in [
+            "P2pNcclConnector",
+            "OffloadingConnector",
+            "SimpleCPUOffloadConnector",
+            "LMCacheConnectorV1",
+            "LMCacheMPConnector",
+        ] {
+            assert_eq!(
+                kv_connector_mode(Some(connector), "host", None, None),
+                KvConnectorMode::Passthrough,
+                "{connector}"
+            );
+        }
         assert_eq!(
             kv_connector_mode(None, "host", None, None),
             KvConnectorMode::Passthrough

@@ -79,11 +79,12 @@ pub enum KvTransferProfile {
     /// side channel, a transfer id), so the gateway tags the legs and probes
     /// the port the partners meet on.
     P2p,
-    /// A shared store keyed by prefix hash: the prefill writes its blocks to
-    /// the store and whichever decode follows reads them back. Nothing is
-    /// agreed per pair and nothing listens for a partner, so the gateway
-    /// tags no leg, mints no handoff and probes no port; it only runs the
-    /// decode after the prefill.
+    /// A store the deployment shares, keyed by prefix hash: the prefill
+    /// writes its blocks to the store and whichever decode follows reads
+    /// them back. Nothing is agreed per pair and nothing listens for a
+    /// partner, so the gateway mints nothing: it tags no leg, hands no
+    /// bootstrap port and probes none; it only runs the decode after the
+    /// prefill. Whether the blocks arrive is the store's business.
     Store,
 }
 
@@ -278,21 +279,24 @@ fn profile_of(spec: &WorkerSpec, transport_known: bool) -> Option<KvTransferProf
     }
 }
 
-/// Name fragments (lower-cased) of the connectors that write to a shared
-/// store instead of handing blocks to a partner: the Mooncake store, the
-/// LMCache family, the shared-storage, offloading, FlexKV and 3FS
-/// connectors.
-const STORE_CONNECTOR_MARKERS: [&str; 6] =
-    ["store", "lmcache", "storage", "offload", "flexkv", "hf3fs"];
+/// The connectors whose legs meet in a store the deployment shares, by
+/// exact name or family prefix: the Mooncake store, the shared-storage
+/// connector, the FlexKV and 3FS families. Connectors whose blocks stay in
+/// the engine (offloading) or whose disaggregated mode is a per-pair push
+/// the request has to address (the LMCache family) are not listed: they
+/// keep the unknown-connector handling.
+const STORE_CONNECTORS: [&str; 2] = ["MooncakeStoreConnector", "SharedStorageConnector"];
+const STORE_CONNECTOR_FAMILIES: [&str; 2] = ["FlexKV", "HF3FS"];
 
-/// The profile a connector's name implies. A name that says nothing is a
-/// rendezvous connector: what every P2P connector is, and what the request
-/// path's passthrough handling of an unknown connector assumes.
+/// The profile a connector's name implies. A name not in the store table
+/// is a rendezvous connector: what every P2P connector is, and what the
+/// request path's passthrough handling of an unknown connector assumes.
 pub fn connector_profile(connector: &str) -> KvTransferProfile {
-    let lower = connector.to_ascii_lowercase();
-    if STORE_CONNECTOR_MARKERS
-        .iter()
-        .any(|marker| lower.contains(marker))
+    let connector = connector.trim();
+    if STORE_CONNECTORS.contains(&connector)
+        || STORE_CONNECTOR_FAMILIES
+            .iter()
+            .any(|family| connector.starts_with(family))
     {
         KvTransferProfile::Store
     } else {
@@ -424,12 +428,15 @@ mod tests {
             ("MoRIIOConnector", KvTransferProfile::P2p),
             ("P2pNcclConnector", KvTransferProfile::P2p),
             ("MooncakeStoreConnector", KvTransferProfile::Store),
-            ("LMCacheConnectorV1", KvTransferProfile::Store),
-            ("LMCacheMPConnector", KvTransferProfile::Store),
             ("SharedStorageConnector", KvTransferProfile::Store),
-            ("OffloadingConnector", KvTransferProfile::Store),
             ("FlexKVConnectorV1", KvTransferProfile::Store),
             ("HF3FSKVConnector", KvTransferProfile::Store),
+            // Their blocks stay in the engine, or their disaggregated mode is
+            // a per-pair push the request has to address: not a shared store.
+            ("OffloadingConnector", KvTransferProfile::P2p),
+            ("SimpleCPUOffloadConnector", KvTransferProfile::P2p),
+            ("LMCacheConnectorV1", KvTransferProfile::P2p),
+            ("LMCacheMPConnector", KvTransferProfile::P2p),
         ] {
             assert_eq!(connector_profile(connector), profile, "{connector}");
             assert_eq!(vllm(connector).profile(), Some(profile), "{connector}");
@@ -483,10 +490,11 @@ mod tests {
             assert!(store.compatible(&store.clone(), mode));
         }
         assert!(store.compatible(&rendezvous, PdPairingMode::Off));
-        // A store connector of its own family keeps its own name, as before.
+        // A connector outside the Mooncake and NIXL families keeps its own
+        // name, as before.
         assert_eq!(
-            vllm("LMCacheConnectorV1").transport(),
-            Some("lmcacheconnectorv1")
+            vllm("SharedStorageConnector").transport(),
+            Some("sharedstorageconnector")
         );
     }
 

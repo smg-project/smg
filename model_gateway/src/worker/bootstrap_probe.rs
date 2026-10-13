@@ -336,8 +336,8 @@ mod tests {
     fn a_store_prefill_leg_is_not_probed_whatever_port_it_was_registered_with() {
         for connector in [
             "MooncakeStoreConnector",
-            "LMCacheConnectorV1",
             "SharedStorageConnector",
+            "FlexKVConnectorV1",
         ] {
             for port in [Some(8998), Some(9090), None] {
                 let worker = leg(
