@@ -481,8 +481,8 @@ mod tests {
     }
 
     /// The numeric and boolean env knobs keep their lenient reading: an
-    /// unreadable value is ignored, and only the exact legacy spellings switch
-    /// the RDMA lane on.
+    /// unreadable value is ignored, and a switch spelling outside `1`, `true`,
+    /// `yes`, `on` leaves the switch off.
     #[test]
     fn unreadable_numeric_env_and_unknown_switch_values_fall_back() {
         let settings = MultimodalSettings::resolve_with(
