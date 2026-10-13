@@ -1839,8 +1839,11 @@ mod tests {
                         );
                     }
                     // The end of input, where nothing is pending that a lost
-                    // run would make the counters record.
-                    if ids.last().is_some_and(|&id| (1..=7).contains(&id)) {
+                    // run would make the counters record: the last id closes
+                    // any run (a skipped special does not).
+                    if ids.last().is_some_and(|&id| {
+                        (3..=7).contains(&id) || (!skip && (1..=2).contains(&id))
+                    }) {
                         let fa = with
                             .finish_decode(&mut a.0, &mut a.1, &mut a.2, skip)
                             .unwrap();

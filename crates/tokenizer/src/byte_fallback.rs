@@ -70,26 +70,20 @@ impl PieceTable {
             [b, c, d] if *b == byte_fallback && *c == fuse && *d == strip => true,
             _ => return None,
         };
-        let vocab = tokenizer.get_vocab(true);
-        let max_id = vocab.values().copied().max()?;
-        let specials: std::collections::HashSet<TokenIdType> = tokenizer
-            .get_added_tokens_decoder()
-            .iter()
-            .filter(|(_, token)| token.special)
-            .map(|(&id, _)| id)
-            .collect();
-        let mut by_id: Vec<Option<&str>> = vec![None; max_id as usize + 1];
-        for (token, &id) in &vocab {
-            by_id[id as usize] = Some(token.as_str());
-        }
-        let mut offsets = Vec::with_capacity(by_id.len() + 1);
+        // Each id through the lookups the decode uses: `id_to_token` (an added
+        // token before a model piece that shares its id) and the added
+        // vocabulary's own notion of special, as the byte-level table does.
+        let max_id = tokenizer.get_vocab(true).values().copied().max()?;
+        let added = tokenizer.get_added_vocabulary();
+        let ids = max_id as usize + 1;
+        let mut offsets = Vec::with_capacity(ids + 1);
         offsets.push(0);
-        let mut text = Vec::with_capacity(by_id.len() * 4);
-        let mut piece = Vec::with_capacity(by_id.len());
-        for (id, token) in by_id.iter().enumerate() {
-            let kind = match token {
+        let mut text = Vec::with_capacity(ids * 4);
+        let mut piece = Vec::with_capacity(ids);
+        for id in 0..=max_id {
+            let kind = match tokenizer.id_to_token(id) {
                 None => Piece::Absent,
-                Some(token) => match byte_token(token) {
+                Some(token) => match byte_token(&token) {
                     Some(byte) => Piece::Byte(byte),
                     None => {
                         for ch in token.chars() {
@@ -101,7 +95,7 @@ impl PieceTable {
                             let mut buf = [0u8; 4];
                             text.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
-                        if specials.contains(&(id as TokenIdType)) {
+                        if added.is_special_token(&token) {
                             Piece::Special
                         } else {
                             Piece::Text
