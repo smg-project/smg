@@ -1627,15 +1627,18 @@ mod tests {
     }
 
     /// A disaggregated pair with one leg missing (the other restarting) is
-    /// still that family's: the request goes to its router, whose selection
-    /// refuses it with the missing leg (a retryable 503), not to the default
-    /// router, which answers that the model does not exist. With no leg of
-    /// the model registered at all the default router's answer stands, and
-    /// with a regular worker beside the incomplete pair the weights decide,
-    /// as before.
+    /// still that family's: the request goes to its router (the one of its
+    /// wire), whose selection refuses it with the missing leg (a retryable
+    /// 503), not to the default router, which answers that the model does
+    /// not exist. With no leg of the model registered at all the default
+    /// router's answer stands, and with a regular worker beside the
+    /// incomplete pair the weights decide, as before.
     #[test]
     fn an_incomplete_disaggregated_pair_keeps_its_family_instead_of_the_default_router() {
-        fn gateway_with(legs: &[(WorkerType, ConnectionMode)]) -> Arc<Gateway> {
+        fn gateway_with(
+            legs: &[(WorkerType, ConnectionMode)],
+            families: &[(&RouterId, &'static str)],
+        ) -> Arc<Gateway> {
             let registry = Arc::new(WorkerRegistry::new());
             for (idx, (worker_type, mode)) in legs.iter().enumerate() {
                 let mut labels = HashMap::new();
@@ -1651,36 +1654,64 @@ mod tests {
             let mut manager = Gateway::new(registry);
             manager.enable_igw = true;
             let manager = Arc::new(manager);
-            // The first router registered is the default one.
+            // The first router registered is the default one; the families
+            // answer with their own names.
             manager.register_router(router_ids::HTTP_REGULAR, Arc::new(StubRouter));
-            manager.register_router(router_ids::GRPC_PD, Arc::new(PdStubRouter));
-            manager.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+            for (id, name) in families {
+                manager.register_router((*id).clone(), Arc::new(NamedMessagesRouter(name)));
+            }
             manager
         }
-        let picked = |legs: &[(WorkerType, ConnectionMode)]| {
-            gateway_with(legs)
+        let both_pd = [
+            (&router_ids::GRPC_PD, "grpc_pd"),
+            (&router_ids::HTTP_PD, "http_pd"),
+        ];
+        let picked = |legs: &[(WorkerType, ConnectionMode)],
+                      families: &[(&RouterId, &'static str)]| {
+            gateway_with(legs, families)
                 .select_router_for_request(Some("model-x"))
                 .expect("a router")
                 .router_type()
         };
 
         // Only the decode leg of a gRPC pair is registered (the prefill is
-        // restarting): the pair's router, not the default one.
-        assert_eq!(picked(&[(WorkerType::Decode, ConnectionMode::Grpc)]), "pd");
+        // restarting): the gRPC PD router, not the default one.
+        assert_eq!(
+            picked(&[(WorkerType::Decode, ConnectionMode::Grpc)], &both_pd),
+            "grpc_pd"
+        );
         // Only the prefill leg: the same.
-        assert_eq!(picked(&[(WorkerType::Prefill, ConnectionMode::Grpc)]), "pd");
-        // An HTTP pair missing its prefill leg: the HTTP PD router.
-        assert_eq!(picked(&[(WorkerType::Decode, ConnectionMode::Http)]), "pd");
+        assert_eq!(
+            picked(&[(WorkerType::Prefill, ConnectionMode::Grpc)], &both_pd),
+            "grpc_pd"
+        );
+        // An HTTP pair missing its prefill leg: the HTTP PD router, the one
+        // that selects from the HTTP pools.
+        assert_eq!(
+            picked(&[(WorkerType::Decode, ConnectionMode::Http)], &both_pd),
+            "http_pd"
+        );
+        // gRPC legs with only the EPD router mounted: the family's second id.
+        assert_eq!(
+            picked(
+                &[(WorkerType::Decode, ConnectionMode::Grpc)],
+                &[(&router_ids::GRPC_EPD, "grpc_epd")]
+            ),
+            "grpc_epd"
+        );
         // No leg of the model at all: the default router answers for a model
         // nobody serves.
-        assert_eq!(picked(&[]), "stub");
+        assert_eq!(picked(&[], &both_pd), "stub");
         // A regular worker beside the incomplete pair: the weights decide,
         // and the incomplete family has none.
         assert_eq!(
-            picked(&[
-                (WorkerType::Decode, ConnectionMode::Grpc),
-                (WorkerType::Regular, ConnectionMode::Http),
-            ]),
+            picked(
+                &[
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                    (WorkerType::Regular, ConnectionMode::Http),
+                ],
+                &both_pd
+            ),
             "stub"
         );
     }

@@ -865,8 +865,6 @@ impl MediaDemands {
     }
 }
 
-/// Runtime of the leg that builds the generate request: the sole worker in
-/// regular mode, the prefill worker in disaggregated (PD/EPD) mode.
 /// A leg's name in a refusal's text.
 fn leg_name(leg: WorkerType) -> &'static str {
     match leg {
@@ -877,6 +875,8 @@ fn leg_name(leg: WorkerType) -> &'static str {
     }
 }
 
+/// Runtime of the leg that builds the generate request: the sole worker in
+/// regular mode, the prefill worker in disaggregated (PD/EPD) mode.
 fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
     match workers {
         WorkerSelection::Single { worker } => worker.metadata().spec.runtime_type,
@@ -1251,11 +1251,10 @@ impl WorkerSelectionStage {
                     WorkerLeg::Single => None,
                 };
                 let partner_registered = partner.is_some_and(|pool| {
-                    self.worker_registry
+                    !self
+                        .worker_registry
                         .get_routing_pool(model_id, pool)
-                        .iter()
-                        .next()
-                        .is_some()
+                        .is_empty()
                 });
                 if partner_registered {
                     Self::leg_missing(model_id, &[leg])
@@ -2544,7 +2543,10 @@ mod tests {
     }
 
     /// A disaggregated leg whose only worker is down is the same 503, both
-    /// through the per-leg fallback and through the pair verdict.
+    /// through the per-leg fallback and through the pair verdict; a leg
+    /// nobody serves beside a registered partner leg is that 503 too, naming
+    /// the leg (the pair is incomplete), where it was the 404 of a model
+    /// nobody serves.
     #[test]
     fn an_unavailable_decode_leg_answers_503_not_404() {
         use openai_protocol::worker::WorkerStatus;
@@ -2595,7 +2597,16 @@ mod tests {
                 verdict: PlacementFailure::NoCandidates,
             },
         );
-        assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+        assert_eq!(absent.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&absent),
+            "no_available_workers"
+        );
+        assert!(
+            placement::refusal_reason(&absent)
+                .is_some_and(|reason| reason.contains("No decode worker")),
+            "the refusal names the missing leg"
+        );
     }
 
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
@@ -3610,8 +3621,9 @@ mod tests {
     }
 
     /// Both PD legs process the references, so both must advertise.
-    /// A leg with no members is "no worker serves the model", not a capability
-    /// shed: the PD path judges emptiness before capability, like the single path.
+    /// A leg with no members beside a registered partner leg is the
+    /// incomplete pair's 503 (no worker of that leg), not a capability shed:
+    /// the PD path judges emptiness before capability, like the single path.
     #[test]
     fn media_refs_pd_selection_empty_leg_keeps_its_own_verdict() {
         let model_id = "test-model-media-refs-pd-empty-leg";
@@ -3649,7 +3661,11 @@ mod tests {
             )
             .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
             .expect_err("no prefill worker at all");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
         assert_ne!(
             error::extract_error_code_from_response(&response),
             "no_media_ref_capable_worker"
