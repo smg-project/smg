@@ -893,9 +893,8 @@ impl RedisResponseStorage {
     }
 
     /// The writes that go with a stored response besides its hash: one key
-    /// per output item id (with the response's retention), the set of the
-    /// open background responses (joined while the record is open, left with
-    /// its terminal store), and the hash's expiry.
+    /// per output item id (with the response's retention) and the hash's
+    /// expiry.
     fn index_writes(&self, pipe: &mut redis::Pipeline, key: &str, response: &StoredResponse) {
         let sr = &self.store.schema.responses;
         let response_id_str = response.id.0.as_str();
@@ -1170,7 +1169,7 @@ impl ResponseStorage for RedisResponseStorage {
             .map_err(ResponseStorageError::from_redis)?;
         match outcome.as_str() {
             "stored" => {
-                // The open set and the output-item keys follow the object.
+                // The output-item keys and the expiry follow the object.
                 let mut moved = StoredResponse::new(None);
                 moved.id = id.clone();
                 moved.raw_response = raw_response;
