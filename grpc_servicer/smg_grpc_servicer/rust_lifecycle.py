@@ -707,16 +707,36 @@ def _start_time(pid: int) -> str | None:
     return fields[19]
 
 
+def mark_not_serving(server: Any) -> None:
+    """Health flips to NOT_SERVING (the Router stops routing here); a failure
+    to flip it is logged, never raised: the caller's own outcome is the one
+    that propagates."""
+    try:
+        server.set_serving(False)
+    except Exception:
+        logger.exception("Failed to mark the servicer as draining")
+
+
+async def stop_server(server: Any, timeout: float) -> None:
+    """Stop the Rust server off the event loop, within ``timeout``; a failure
+    to stop is logged, never raised, for the same reason."""
+    try:
+        await asyncio.to_thread(server.stop, timeout)
+    except Exception:
+        logger.exception("Failed to stop the Rust servicer cleanly")
+
+
 async def launch_or_stop(server: Any, launch: Callable[[], Any]) -> Any:
     """Start the engine behind an already-bound server: ``launch()``'s handle,
-    or, when the launch raises, the error after the server was marked not
-    serving and stopped. The server owns the port and a runtime thread; a
-    launch that fails must not leave them to the process exit."""
+    or, when the launch raises, that error after the server was marked not
+    serving and stopped, each step best effort. The server owns the port and
+    a runtime thread; a launch that fails must not leave them to the process
+    exit, and the launch error is what the entry point reports."""
     try:
         return launch()
     except BaseException:
-        server.set_serving(False)
-        await asyncio.to_thread(server.stop, SERVER_STOP_SECS)
+        mark_not_serving(server)
+        await stop_server(server, SERVER_STOP_SECS)
         raise
 
 
@@ -789,16 +809,10 @@ async def supervise(
             except asyncio.TimeoutError:  # noqa: UP041 -- distinct from the builtin before 3.11
                 pass
     finally:
-        try:
-            server.set_serving(False)
-        except Exception:
-            logger.exception("Failed to mark the servicer as draining")
+        mark_not_serving(server)
         if stop_event.is_set() and drain_secs > 0 and engine.poll() is None:
             logger.info("Draining for %.1fs before stopping", drain_secs)
             await asyncio.sleep(drain_secs)
-        try:
-            await asyncio.to_thread(server.stop, stop_timeout)
-        except Exception:
-            logger.exception("Failed to stop the Rust servicer cleanly")
+        await stop_server(server, stop_timeout)
         terminate_engine(engine)
     return exit_code
