@@ -48,7 +48,9 @@ use crate::{
         inflight_tracker::{InFlightGuard, InFlightRequestTracker},
         metrics::{method_to_static_str, Metrics},
     },
-    routers::error::extract_error_code_from_response,
+    routers::{
+        error::extract_error_code_from_response, grpc::utils::stream_failure::STREAM_ERROR_TYPE,
+    },
 };
 
 /// The `error_code` label of a response: the code the gateway's error builder
@@ -77,8 +79,9 @@ pub const CLIENT_CLOSED_REQUEST_CODE: &str = "client_closed_request";
 /// (the relay's upstream stream broke mid-body): the sample keeps the head's
 /// status; a gateway error code the head carried stays, else this code names
 /// the failure where an empty code would say the response went out in full.
-/// The type the SSE error event gives a stream the worker failed.
-pub const BODY_FAILED_CODE: &str = "stream_error";
+/// The type the SSE error event gives a stream the worker failed, shared with
+/// it so the two names cannot drift apart.
+pub const BODY_FAILED_CODE: &str = STREAM_ERROR_TYPE;
 
 /// The length a response declares for its body: its `Content-Length`, or
 /// else what the body itself knows exactly. An HTTP/1.1 server writes that
