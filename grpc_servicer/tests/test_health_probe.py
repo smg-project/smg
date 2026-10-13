@@ -20,13 +20,9 @@ def test_silence_with_pending_work_is_a_stall_and_idle_silence_is_not(caplog):
         assert report.stuck(long_ago, pending=0) is False
         assert report.stuck(time.time(), pending=3) is False
         assert report.stuck(long_ago, pending=3) is True
-    assert (
-        _lines(caplog, logging.WARNING)
-        == [
-            f"Scheduler not responsive: {time.time() - long_ago:.1f}s since last receive, 3 pending requests"
-        ]
-        or len(_lines(caplog, logging.WARNING)) == 1
-    )
+    (warning,) = _lines(caplog, logging.WARNING)
+    assert warning.startswith("Scheduler not responsive: ")
+    assert warning.endswith("s since last receive, 3 pending requests")
 
 
 def test_a_stall_is_said_once_and_its_recovery_once(caplog):
