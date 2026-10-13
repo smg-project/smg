@@ -426,9 +426,11 @@ pub trait ModelProcessorSpec: Send + Sync {
 
     /// Declare the neutral primary/side-tensor layout contract for one modality.
     ///
-    /// The default converts the legacy reference-shaped field map so existing
-    /// vision specs remain source-compatible. New multimodal specs should
-    /// override this method and keep backend-specific field names at adapters.
+    /// A hooked modality reads its layouts from [`ModelProcessorSpec::hooks`];
+    /// otherwise the default converts the legacy reference-shaped field map so
+    /// existing vision specs remain source-compatible. New multimodal specs
+    /// declare their layouts in `hooks()` rather than override this, and keep
+    /// backend-specific field names at adapters.
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
         match self.hooks(modality) {
             Some(hooks) => (hooks.layouts)(),
@@ -448,7 +450,8 @@ pub trait ModelProcessorSpec: Send + Sync {
 
     /// Tensor keys that should remain on CPU for one modality.
     ///
-    /// The default preserves the legacy model-wide declaration.
+    /// A hooked modality reads them from [`ModelProcessorSpec::hooks`];
+    /// otherwise the default preserves the legacy model-wide declaration.
     fn keep_on_cpu_keys_for(&self, modality: Modality) -> Vec<String> {
         match self.hooks(modality) {
             Some(hooks) => hooks
