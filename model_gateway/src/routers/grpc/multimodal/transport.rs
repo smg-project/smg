@@ -496,14 +496,17 @@ impl DtypeOverrides {
     }
 }
 
-/// The dtype every worker registered for a model reads its image encoder
-/// input in, resolved before any of them is selected from what each already
-/// advertises (its runtime, its `multimodal_encoder_dtype` label) and the
-/// router's overrides, by the rules assembly applies to the selected worker.
-/// `None` for an empty or a disagreeing set, and whenever a worker is served
-/// otherwise (the pixels' own bytes for an engine that normalizes on device,
-/// a wire that carries no preprocessed floats): the per-destination write
-/// then stays as it is.
+/// The dtype every worker of `workers` reads its image encoder input in,
+/// resolved before any of them is selected from what each already advertises
+/// (its runtime, its `multimodal_encoder_dtype` label) and the router's
+/// overrides, by the rules assembly applies to the selected worker. The
+/// caller passes the pool the selection will draw from (the routing pool of
+/// the model id, which for the wildcard id is the global snapshot), so the
+/// workers resolved here are the workers that can be picked. `None` for an
+/// empty or a disagreeing set, and whenever a worker is served otherwise (the
+/// pixels' own bytes for an engine that normalizes on device, a wire that
+/// carries no preprocessed floats): the per-destination write then stays as
+/// it is.
 pub(crate) fn mm_shared_image_wire_dtype(workers: &[Arc<dyn Worker>]) -> Option<EncoderDtype> {
     shared_image_wire_dtype(workers, &DtypeOverrides::from_env())
 }

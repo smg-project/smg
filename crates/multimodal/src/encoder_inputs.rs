@@ -1647,9 +1647,6 @@ mod tests {
         }
     }
 
-    /// A wire input built from a byte input's own write: the same shape and
-    /// bytes, its rows sliced and stacked by byte ranges, written as itself
-    /// without a conversion, as a narrower float only from `float32`.
     /// Every `float16` bit pattern decodes to its IEEE value: subnormals as
     /// `mantissa * 2^-24`, normals as `(1024 + mantissa) * 2^(exponent - 25)`,
     /// the top exponent as infinities and NaNs.
@@ -1719,6 +1716,9 @@ mod tests {
         assert!(half.into_bytes_as(EncoderDtype::Float32).is_err());
     }
 
+    /// A wire input built from a byte input's own write: the same shape and
+    /// bytes, its rows sliced and stacked by byte ranges, written as itself
+    /// without a conversion, as a narrower float only from `float32`.
     #[test]
     fn a_wire_input_carries_its_bytes_and_slices_by_rows() {
         let norm = PixelNorm {

@@ -88,6 +88,7 @@ pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, resolve_mm_processing,
     worker_accepts_media_refs, MmProcessing, MmRefsError,
 };
+pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
 pub(crate) use transport::{
     init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype,

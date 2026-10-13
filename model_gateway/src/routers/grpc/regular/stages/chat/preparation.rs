@@ -8,13 +8,16 @@ use openai_protocol::{
 };
 use tracing::{debug, error};
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext},
-        multimodal, utils, ProcessedMessages,
+use crate::{
+    routers::{
+        error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{PreparationOutput, RequestContext},
+            multimodal, utils, ProcessedMessages,
+        },
     },
+    worker::RoutingPool,
 };
 
 /// Chat preparation stage
@@ -258,10 +261,14 @@ pub(crate) async fn prepare_chat_like(
                 );
                 multimodal_refs = Some(media_plan);
             } else {
-                // The dtype every worker of the model reads image pixels in,
-                // when they agree: the preprocessor then writes it directly.
+                // The dtype every worker the selection can pick reads image
+                // pixels in, when they agree: the preprocessor then writes it
+                // directly. The same pool the selection draws from, so the
+                // wildcard model id resolves over the same workers.
                 let image_wire_dtype = multimodal::mm_shared_image_wire_dtype(
-                    &ctx.components.worker_registry.get_by_model(model_id),
+                    &ctx.components
+                        .worker_registry
+                        .get_routing_pool(model_id, RoutingPool::GrpcPipelineRegular),
                 );
                 match multimodal::process_multimodal_plan(
                     media_plan,

@@ -23,16 +23,36 @@ pub(super) fn serialize_encoder_input_owned(
     let shape = shape_u32(&encoder_input.view());
     let bytes = encoder_input
         .into_bytes_as(dtype)
-        .map_err(|message| anyhow::anyhow!("{WIRE_MISMATCH}: {message}"))?;
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
     Ok((bytes, shape, dtype.to_string()))
 }
 
-/// The request error for an encoder input that was laid out for one wire
-/// dtype and is asked for in another at assembly: only a change of the model's
-/// workers between the two steps can produce it, and it is this request's
-/// error, not the worker's.
-const WIRE_MISMATCH: &str =
-    "the images were prepared for another encoder dtype than the selected worker reads";
+/// An encoder input laid out for one wire dtype and asked for in another at
+/// assembly: the dtype was resolved over the pool the selection draws from, so
+/// only a change of that pool between the two steps produces it. It is the
+/// gateway's own transient error, not the worker's and not the client's: the
+/// request builders answer it with a retryable status.
+#[derive(Debug)]
+pub(crate) struct WireMismatch(String);
+
+impl std::fmt::Display for WireMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the images were prepared for another encoder dtype than the selected worker reads: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for WireMismatch {}
+
+impl WireMismatch {
+    /// Whether an assembly error is a wire mismatch (anywhere in its chain).
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<WireMismatch>())
+    }
+}
 
 /// One item's encoder input for TokenSpeed: written straight into shared
 /// memory when enabled and large enough, inline otherwise.
@@ -47,7 +67,7 @@ pub(super) fn serialize_tokenspeed_encoder_input(
     // Decided before any segment is created for it.
     input
         .writable_as(dtype)
-        .map_err(|message| anyhow::anyhow!("{WIRE_MISMATCH}: {message}"))?;
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
     let shape = shape_u32(input);
     let nbytes = input.len() * dtype.element_size();
 
@@ -83,7 +103,7 @@ pub(super) fn serialize_tokenspeed_encoder_input(
 
     let bytes = input
         .try_write_as(dtype)
-        .map_err(|message| anyhow::anyhow!("{WIRE_MISMATCH}: {message}"))?;
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
     Ok(TokenSpeedTensor::inline(bytes, shape, dtype.to_string()))
 }
 
@@ -203,6 +223,26 @@ mod tests {
 
     fn le_bytes<T: IntoIterator<Item = u16>>(values: T) -> Vec<u8> {
         values.into_iter().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// A wire written for another dtype than the worker reads is the typed
+    /// mismatch, on the owned path and on the per-item path alike.
+    #[test]
+    fn a_wire_dtype_mismatch_is_the_typed_error() {
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [0.0; 3],
+            divisor: [1.0; 3],
+            channel_block: 1,
+        };
+        let wire =
+            EncoderInput::wire(vec![0u8; 12], EncoderDtype::BFloat16, vec![2, 3], norm).unwrap();
+        let error = serialize_encoder_input_owned(wire.clone(), "float32").unwrap_err();
+        assert!(WireMismatch::is(&error), "{error:#}");
+        let error = serialize_tokenspeed_encoder_input(&wire.view(), "float32", false, usize::MAX)
+            .unwrap_err();
+        assert!(WireMismatch::is(&error), "{error:#}");
+        assert!(serialize_encoder_input_owned(wire, "bfloat16").is_ok());
     }
 
     #[test]
