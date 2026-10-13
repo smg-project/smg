@@ -23,14 +23,15 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use tracing::warn;
 
 use crate::core::{
-    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemResult,
-    ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-    ConversationResult, ConversationStorage, ConversationStorageError, ListParams, NewConversation,
-    NewConversationItem, ResponseId, ResponseResult, ResponseStorage, ResponseStorageError,
-    StoredResponse,
+    ConditionalStore, Conversation, ConversationId, ConversationItem, ConversationItemId,
+    ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
+    ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
+    ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult, ResponseStorage,
+    ResponseStorageError, StoredResponse,
 };
 
 /// The bound of one store call, with the backend's name for the error message
@@ -178,6 +179,34 @@ impl ResponseStorage for BoundedResponseStorage {
             .run(
                 "expire_response",
                 self.inner.expire_response(response_id, after),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        self.bound
+            .run(
+                "store_response_if_open",
+                self.inner.store_response_if_open(response),
+                ResponseStorageError::Timeout,
+            )
+            .await
+    }
+
+    async fn update_response_object_if_open(
+        &self,
+        response_id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        self.bound
+            .run(
+                "update_response_object_if_open",
+                self.inner
+                    .update_response_object_if_open(response_id, raw_response),
                 ResponseStorageError::Timeout,
             )
             .await

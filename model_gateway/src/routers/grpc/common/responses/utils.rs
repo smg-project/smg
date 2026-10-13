@@ -24,7 +24,10 @@ use crate::{
         common::{
             mcp_utils::ensure_request_mcp_client,
             openai_bridge,
-            persistence_utils::{persist_conversation_items, PersistError, PersistStep},
+            persistence_utils::{
+                persist_conversation_items, persist_conversation_items_if_open, PersistError,
+                PersistStep,
+            },
         },
         error,
     },
@@ -451,20 +454,6 @@ pub(crate) async fn persist_response_if_needed(
     } else {
         "foreground"
     };
-    // A background response's record may have been closed while the work
-    // ran (a cancel, here or on another gateway sharing the store), or
-    // deleted: a terminal record is not rewritten by a late result and a
-    // deleted one is not re-created by it.
-    if background
-        && background::is_closed(&response_storage, &response.id, request_context.clone()).await
-    {
-        debug!(
-            response_id = %response.id,
-            "Background response record already closed or deleted; the result is not stored"
-        );
-        return Ok(());
-    }
-
     let response_json = match to_value(response) {
         Ok(json) => json,
         Err(e) => {
@@ -477,34 +466,59 @@ pub(crate) async fn persist_response_if_needed(
             };
         }
     };
-    // A background response's terminal write is retried at the status-watch
-    // cadence within the terminal write window while the store answers with
-    // an error: the result of a run that outlived a store blip is stored once
-    // the store is back. Only the write of the response record is retried:
-    // once it landed, the conversation linking runs once (as before), so a
-    // retry can neither store the record twice nor link the items twice. A
-    // foreground response is written once, as before: its client is waiting
-    // for the answer. A background stream attached through the Harmony paths
-    // receives its terminal event after this persist, so during a store
-    // outage that event can wait for up to the window; the regular streaming
-    // paths emit it first.
+    // A background response's record may have been closed while the work
+    // ran (a cancel, here or on another gateway sharing the store): its
+    // terminal object is stored with one conditional write, so
+    // a closed record is never rewritten by a late result. The write is
+    // retried at the status-watch cadence within the terminal write window
+    // while the store answers with an error: the result of a run that
+    // outlived a store blip is stored once the store is back, and a record
+    // closed meanwhile refuses it then. Only the write of the response record
+    // is retried: once it landed, the conversation linking runs once (as
+    // before), so a retry can neither store the record twice nor link the
+    // items twice. A foreground response is written once, as before: its
+    // client is waiting for the answer. A background stream attached through
+    // the Harmony paths receives its terminal event after this persist, so
+    // during a store outage that event can wait for up to the window; the
+    // regular streaming paths emit it first.
     let every = background::STATUS_WATCH;
     let deadline = tokio::time::Instant::now() + background::terminal_write_window(every);
     let mut attempts = 0u32;
     loop {
-        match persist_conversation_items(
-            conversation_storage.clone(),
-            conversation_item_storage.clone(),
-            response_storage.clone(),
-            &response_json,
-            original_request,
-            tenant,
-            request_context.clone(),
-        )
-        .await
-        {
-            Ok(()) => {
+        let persisted = if background {
+            persist_conversation_items_if_open(
+                conversation_storage.clone(),
+                conversation_item_storage.clone(),
+                response_storage.clone(),
+                &response_json,
+                original_request,
+                tenant,
+                request_context.clone(),
+            )
+            .await
+        } else {
+            persist_conversation_items(
+                conversation_storage.clone(),
+                conversation_item_storage.clone(),
+                response_storage.clone(),
+                &response_json,
+                original_request,
+                tenant,
+                request_context.clone(),
+            )
+            .await
+            .map(|()| true)
+        };
+        match persisted {
+            Ok(true) => {
                 debug!("Persisted response: {}", response.id);
+                return Ok(());
+            }
+            Ok(false) => {
+                debug!(
+                    response_id = %response.id,
+                    "Background response record already closed; the result is not stored"
+                );
                 return Ok(());
             }
             Err(e)
@@ -524,18 +538,6 @@ pub(crate) async fn persist_response_if_needed(
                 }
                 attempts += 1;
                 tokio::time::sleep(every).await;
-                // A cancel or a delete that landed meanwhile wins: a closed
-                // record is not rewritten by the result that waited for the
-                // store, a deleted one not re-created.
-                if background::is_closed(&response_storage, &response.id, request_context.clone())
-                    .await
-                {
-                    debug!(
-                        response_id = %response.id,
-                        "Background response record was closed or deleted while its result waited for the store; the result is not stored"
-                    );
-                    return Ok(());
-                }
             }
             Err(e)
                 if matches!(

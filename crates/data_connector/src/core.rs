@@ -544,6 +544,46 @@ impl StoredResponse {
     }
 }
 
+/// The statuses a response does not leave any more: a record in one of them
+/// is closed, and [`ResponseStorage::store_response_if_open`] refuses to
+/// rewrite it. The one list behind the gateway's notion of a closed record
+/// and the stores' conditional writes.
+pub const TERMINAL_RESPONSE_STATUSES: [&str; 4] =
+    ["completed", "incomplete", "failed", "cancelled"];
+
+/// `values` as a quoted, comma-separated SQL list (`'a', 'b'`), for the
+/// stores' `IN (...)` predicates over the status lists above.
+pub(crate) fn sql_string_list(values: &[&str]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{value}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl StoredResponse {
+    /// Whether the stored object's status is one a response does not leave
+    /// any more.
+    pub fn is_closed(&self) -> bool {
+        self.raw_response["status"]
+            .as_str()
+            .is_some_and(|status| TERMINAL_RESPONSE_STATUSES.contains(&status))
+    }
+}
+
+/// What [`ResponseStorage::store_response_if_open`] found under the id.
+#[derive(Debug, Clone)]
+pub enum ConditionalStore {
+    /// The record was open (or carried no status) and now reads as the
+    /// response given.
+    Stored,
+    /// The record had reached a terminal status and stays as it is: this is
+    /// it.
+    Closed(Box<StoredResponse>),
+    /// Nothing is stored under the id; nothing was written.
+    Missing,
+}
+
 /// Response chain - a sequence of related responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseChain {
@@ -811,6 +851,56 @@ pub trait ResponseStorage: Send + Sync {
     /// its terminal object when the work ends, under the one id its client
     /// polls.
     async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId>;
+
+    /// Store `response` under its id unless the record stored there has
+    /// reached a terminal status ([`TERMINAL_RESPONSE_STATUSES`]) or is
+    /// missing: the write of a background response's status transition
+    /// (`in_progress`, `cancelled`, `failed`, the terminal
+    /// object) is one conditional write, so a record closed on one gateway
+    /// is never rewritten by another whatever the timing.
+    ///
+    /// The default reads then writes, two round trips with a window between
+    /// them; every backend of this crate overrides it with one atomic
+    /// operation (a check under the lock, a conditional `UPDATE`, a script).
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        match self.get_response(&response.id).await? {
+            None => Ok(ConditionalStore::Missing),
+            Some(current) if current.is_closed() => Ok(ConditionalStore::Closed(Box::new(current))),
+            Some(_) => {
+                self.store_response(response).await?;
+                Ok(ConditionalStore::Stored)
+            }
+        }
+    }
+
+    /// Moves the stored object of the record under `id` to `raw_response`
+    /// unless the record has reached a terminal status or is missing: the
+    /// write of a status transition (`in_progress`, `cancelled`, `failed`),
+    /// which changes the object alone. The columns written when the record
+    /// was created (the request's context, a hook's extra columns) are left
+    /// as they are: a transition written under no request context must not
+    /// reset them.
+    ///
+    /// The default reads the record and writes it whole through
+    /// [`Self::store_response_if_open`]; every backend of this crate
+    /// overrides it with one conditional write of the object's column.
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        match self.get_response(id).await? {
+            None => Ok(ConditionalStore::Missing),
+            Some(current) if current.is_closed() => Ok(ConditionalStore::Closed(Box::new(current))),
+            Some(mut current) => {
+                current.raw_response = raw_response;
+                self.store_response_if_open(current).await
+            }
+        }
+    }
 
     /// Get a response by ID
     async fn get_response(

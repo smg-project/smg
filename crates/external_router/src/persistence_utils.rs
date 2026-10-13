@@ -9,10 +9,10 @@ use openai_protocol::responses::{
 };
 use serde_json::{json, Value};
 use smg_data_connector::{
-    with_request_context, AddedAtSequence, ConversationId, ConversationItem, ConversationItemId,
-    ConversationItemStorage, ConversationStorage, NewConversationItem,
-    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, StorageFailure,
-    StoredResponse,
+    with_request_context, AddedAtSequence, ConditionalStore, ConversationId, ConversationItem,
+    ConversationItemId, ConversationItemStorage, ConversationStorage, NewConversationItem,
+    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
+    StorageFailure, StoredResponse,
 };
 use tracing::{debug, info, warn};
 
@@ -449,6 +449,37 @@ pub async fn persist_conversation_items(
         response_json,
         original_body,
         tenant,
+        false,
+    );
+    match request_context {
+        Some(ctx) => with_request_context(ctx, inner).await,
+        None => inner.await,
+    }
+    .map(|_| ())
+}
+
+/// [`persist_conversation_items`] for a response whose record may have been
+/// closed while it ran (a background response: cancelled on any gateway
+/// sharing the store): the response is stored with
+/// one conditional write, refused once the record is closed or gone, and
+/// nothing is linked then. `Ok(true)` when it was stored.
+pub async fn persist_conversation_items_if_open(
+    conversation_storage: Arc<dyn ConversationStorage>,
+    item_storage: Arc<dyn ConversationItemStorage>,
+    response_storage: Arc<dyn ResponseStorage>,
+    response_json: &Value,
+    original_body: &ResponsesRequest,
+    tenant: Option<&str>,
+    request_context: Option<StorageRequestContext>,
+) -> Result<bool, PersistError> {
+    let inner = persist_conversation_items_inner(
+        conversation_storage,
+        item_storage,
+        response_storage,
+        response_json,
+        original_body,
+        tenant,
+        true,
     );
     match request_context {
         Some(ctx) => with_request_context(ctx, inner).await,
@@ -512,10 +543,11 @@ async fn persist_conversation_items_inner(
     response_json: &Value,
     original_body: &ResponsesRequest,
     tenant: Option<&str>,
-) -> Result<(), PersistError> {
+    if_open: bool,
+) -> Result<bool, PersistError> {
     // Respect store=false: skip persistence entirely (matches official API behavior)
     if !original_body.store.unwrap_or(true) {
-        return Ok(());
+        return Ok(false);
     }
 
     // Clone once, then strip multi-MB base64 from any `image_generation_call`
@@ -560,16 +592,42 @@ async fn persist_conversation_items_inner(
     stored_response.input = Value::Array(input_items.clone());
     stored_response.tenant = tenant.map(str::to_string);
 
-    response_storage
-        .store_response(stored_response)
-        .await
-        .map_err(|e| {
-            PersistError::new(
-                PersistStep::ResponseRecord,
-                e.is_unavailable(),
-                format!("Failed to store response: {e}"),
-            )
-        })?;
+    let store_error = |e: ResponseStorageError| {
+        PersistError::new(
+            PersistStep::ResponseRecord,
+            e.is_unavailable(),
+            format!("Failed to store response: {e}"),
+        )
+    };
+    if if_open {
+        match response_storage
+            .store_response_if_open(stored_response)
+            .await
+            .map_err(store_error)?
+        {
+            ConditionalStore::Stored => {}
+            ConditionalStore::Closed(current) => {
+                debug!(
+                    response_id = %response_id.0,
+                    status = current.raw_response["status"].as_str().unwrap_or(""),
+                    "Response record already closed; its late result is not stored"
+                );
+                return Ok(false);
+            }
+            ConditionalStore::Missing => {
+                debug!(
+                    response_id = %response_id.0,
+                    "Response record gone; its late result is not stored"
+                );
+                return Ok(false);
+            }
+        }
+    } else {
+        response_storage
+            .store_response(stored_response)
+            .await
+            .map_err(store_error)?;
+    }
 
     // Check if conversation is provided and validate it exists
     let conv_id_opt = if let Some(conv_ref) = &original_body.conversation {
@@ -624,7 +682,7 @@ async fn persist_conversation_items_inner(
         );
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]

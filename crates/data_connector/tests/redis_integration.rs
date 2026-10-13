@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{TimeDelta, Utc};
 use data_connector::{
-    create_storage, ConversationItemId, HistoryBackend, ListParams, NewConversation,
-    NewConversationItem, RedisConfig, SortOrder, StorageBundle, StorageFactoryConfig,
-    StoredResponse,
+    create_storage, ConditionalStore, ConversationItemId, HistoryBackend, ListParams,
+    NewConversation, NewConversationItem, RedisConfig, SortOrder, StorageBundle,
+    StorageFactoryConfig, StoredResponse,
 };
 use serde_json::json;
 
@@ -471,4 +471,74 @@ async fn responses_and_conversations_keep_their_tenant_and_the_identifier_querie
     assert_eq!(updated.metadata, metadata);
     // The conversation is left in place: the Redis delete of a conversation is
     // covered on its own, and the server keeps the keys of earlier runs anyway.
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conditional_store_replaces_an_open_record_and_refuses_a_closed_or_missing_one() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url).await.expect("create storage");
+    let storage = bundle.response_storage;
+
+    let base = StoredResponse::new(None);
+    let record = |status: &str| {
+        let mut stored = base.clone();
+        stored.raw_response =
+            json!({"id": stored.id.0, "background": true, "status": status, "output": []});
+        stored
+    };
+    // Missing: nothing is written.
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("in_progress"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Missing
+    ));
+    assert!(storage.get_response(&base.id).await.expect("get").is_none());
+
+    // Open: replaced.
+    storage
+        .store_response(record("queued"))
+        .await
+        .expect("store");
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("in_progress"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    let stored = storage
+        .get_response(&base.id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.raw_response["status"], "in_progress");
+    assert!(matches!(
+        storage
+            .store_response_if_open(record("cancelled"))
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+
+    // Closed: refused, the record handed back as it is.
+    let ConditionalStore::Closed(current) = storage
+        .store_response_if_open(record("completed"))
+        .await
+        .expect("conditional store")
+    else {
+        panic!("a cancelled record is closed");
+    };
+    assert_eq!(current.raw_response["status"], "cancelled");
+    let stored = storage
+        .get_response(&base.id)
+        .await
+        .expect("get")
+        .expect("stored");
+    assert_eq!(stored.raw_response["status"], "cancelled");
+    storage.delete_response(&base.id).await.expect("delete");
 }

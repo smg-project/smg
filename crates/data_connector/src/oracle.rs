@@ -9,11 +9,11 @@ use oracle::{sql_type::ToSql, Connection, Connector, Row};
 use serde_json::Value;
 
 use super::core::{
-    make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
-    ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-    ConversationStorage, ConversationStorageError, Failure, ListParams, NewConversation,
-    NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError, SortOrder,
-    StoredResponse,
+    make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
+    ConversationItem, ConversationItemId, ConversationItemStorage, ConversationItemStorageError,
+    ConversationMetadata, ConversationStorage, ConversationStorageError, Failure, ListParams,
+    NewConversation, NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError,
+    SortOrder, StoredResponse, TERMINAL_RESPONSE_STATUSES,
 };
 use crate::{
     common::{
@@ -1491,6 +1491,38 @@ fn last_stamp_per_item(items: Vec<(String, DateTime<Utc>)>) -> Vec<(String, Date
     rows
 }
 
+/// The statement of `store_response_if_open`, with the names of its binds
+/// in the columns' order: an UPDATE of every column but the id of the row
+/// under the id, applied only while the stored object's status is not
+/// terminal (`open`; none when the schema skips the column, so the update
+/// is plain). The values are bound by name as in `store_response_sql`.
+fn update_if_open_sql(table: &str, columns: &[&str], open: Option<&str>) -> (String, Vec<String>) {
+    let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
+    let id_col = columns.first().copied().unwrap_or("id");
+    let id_bind = binds.first().cloned().unwrap_or_else(|| "v1".to_string());
+    let updates: Vec<String> = columns
+        .iter()
+        .zip(&binds)
+        .skip(1)
+        .map(|(col, bind)| format!("{col} = :{bind}"))
+        .collect();
+    let condition = open.map(|open| format!(" AND {open}")).unwrap_or_default();
+    let sql = format!(
+        "UPDATE {table} SET {} WHERE {id_col} = :{id_bind}{condition}",
+        updates.join(", ")
+    );
+    (sql, binds)
+}
+
+/// The condition of `update_if_open_sql` over the stored object's JSON text
+/// (a record without a status counts as open).
+fn oracle_open_predicate(col_raw: &str) -> String {
+    format!(
+        "COALESCE(JSON_VALUE({col_raw}, '$.status'), ' ') NOT IN ({})",
+        sql_string_list(&TERMINAL_RESPONSE_STATUSES)
+    )
+}
+
 #[async_trait]
 impl ResponseStorage for OracleResponseStorage {
     async fn store_response(
@@ -1570,6 +1602,120 @@ impl ResponseStorage for OracleResponseStorage {
             .map_err(ResponseStorageError::from_failure)?;
 
         Ok(return_id)
+    }
+
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> Result<ConditionalStore, ResponseStorageError> {
+        let StoredResponse {
+            id,
+            previous_response_id,
+            input,
+            created_at,
+            safety_identifier,
+            model,
+            conversation_id,
+            raw_response,
+            tenant,
+        } = response;
+        let read_back = id.clone();
+        let response_id_str = id.0;
+        let previous_id = previous_response_id.map(|r| r.0);
+        let json_input = serde_json::to_string(&input)?;
+        let json_raw_response = serde_json::to_string(&raw_response)?;
+        let schema = self.store.schema.clone();
+        let hook_extra = current_extra_columns().unwrap_or_default();
+
+        let updated = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                let table = s.qualified_table(schema.owner.as_deref());
+                let logical_fields: &[(&str, &dyn ToSql)] = &[
+                    ("id", &response_id_str),
+                    ("previous_response_id", &previous_id),
+                    ("input", &json_input),
+                    ("created_at", &created_at),
+                    ("safety_identifier", &safety_identifier),
+                    ("model", &model),
+                    ("conversation_id", &conversation_id),
+                    ("raw_response", &json_raw_response),
+                    ("tenant", &tenant),
+                ];
+                let mut columns = Vec::new();
+                let mut params: Vec<&dyn ToSql> = Vec::new();
+                for &(logical, val) in logical_fields {
+                    if logical != "id" && s.is_skipped(logical) {
+                        continue;
+                    }
+                    columns.push(s.col(logical));
+                    params.push(val);
+                }
+                let extra_cols: Vec<(&str, Option<String>)> =
+                    resolve_extra_column_values(s, &hook_extra);
+                for (name, val) in &extra_cols {
+                    columns.push(*name);
+                    params.push(val);
+                }
+                let open = (!s.is_skipped("raw_response"))
+                    .then(|| oracle_open_predicate(s.col("raw_response")));
+                let (sql, binds) = update_if_open_sql(&table, &columns, open.as_deref());
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                stmt.row_count().map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::from_failure)?;
+        if updated > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        Ok(match self.get_response(&read_back).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
+    }
+
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> Result<ConditionalStore, ResponseStorageError> {
+        let read_back = id.clone();
+        let id_str = id.0.clone();
+        let json_raw_response = serde_json::to_string(&raw_response)?;
+        let schema = self.store.schema.clone();
+        let updated = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                if s.is_skipped("raw_response") {
+                    // No object column: nothing a transition could move.
+                    return Ok(1);
+                }
+                let table = s.qualified_table(schema.owner.as_deref());
+                let open = oracle_open_predicate(s.col("raw_response"));
+                let (sql, binds) =
+                    update_if_open_sql(&table, &[s.col("id"), s.col("raw_response")], Some(&open));
+                let params: Vec<&dyn ToSql> = vec![&id_str, &json_raw_response];
+                let named: Vec<(&str, &dyn ToSql)> =
+                    binds.iter().map(String::as_str).zip(params).collect();
+                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                stmt.row_count().map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::from_failure)?;
+        if updated > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        Ok(match self.get_response(&read_back).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
     }
 
     async fn get_response(
@@ -1940,6 +2086,22 @@ mod tests {
                 ("c".to_string(), t(4)),
             ]
         );
+    }
+
+    #[test]
+    fn update_if_open_sql_updates_the_row_under_its_id_only_while_its_status_is_open() {
+        let open = oracle_open_predicate("raw_response");
+        let (sql, binds) =
+            update_if_open_sql("responses", &["id", "input", "raw_response"], Some(&open));
+        assert_eq!(binds, ["v1", "v2", "v3"]);
+        assert_eq!(
+            sql,
+            "UPDATE responses SET input = :v2, raw_response = :v3 WHERE id = :v1 AND \
+             COALESCE(JSON_VALUE(raw_response, '$.status'), ' ') NOT IN ('completed', \
+             'incomplete', 'failed', 'cancelled')"
+        );
+        let (plain, _) = update_if_open_sql("r", &["response_key", "input"], None);
+        assert_eq!(plain, "UPDATE r SET input = :v2 WHERE response_key = :v1");
     }
 
     #[test]

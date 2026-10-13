@@ -13,11 +13,12 @@ use crate::{
     config::RedisConfig,
     context::current_extra_columns,
     core::{
-        make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
-        ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
-        ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
-        ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult,
-        ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
+        make_item_id, ConditionalStore, Conversation, ConversationId, ConversationItem,
+        ConversationItemId, ConversationItemResult, ConversationItemStorage,
+        ConversationItemStorageError, ConversationMetadata, ConversationResult,
+        ConversationStorage, ConversationStorageError, ListParams, NewConversation,
+        NewConversationItem, ResponseId, ResponseResult, ResponseStorage, ResponseStorageError,
+        SortOrder, StoredResponse, TERMINAL_RESPONSE_STATUSES,
     },
     factory::StoreContactError,
     schema::SchemaConfig,
@@ -836,6 +837,106 @@ impl RedisResponseStorage {
         Ok(out)
     }
 
+    /// The fields of the response's hash, in the order they are written,
+    /// skipping the configured `skip_columns` and appending the extra
+    /// columns of hooks or defaults.
+    fn hash_fields<'a>(
+        &'a self,
+        response: &'a StoredResponse,
+    ) -> Result<Vec<(&'a str, String)>, ResponseStorageError> {
+        let sr = &self.store.schema.responses;
+        let mut fields: Vec<(&str, String)> = vec![(sr.col("id"), response.id.0.clone())];
+        if !sr.is_skipped("previous_response_id") {
+            if let Some(prev) = &response.previous_response_id {
+                fields.push((sr.col("previous_response_id"), prev.0.clone()));
+            }
+        }
+        if !sr.is_skipped("conversation_id") {
+            if let Some(cid) = &response.conversation_id {
+                fields.push((sr.col("conversation_id"), cid.clone()));
+            }
+        }
+        if !sr.is_skipped("input") {
+            fields.push((sr.col("input"), serde_json::to_string(&response.input)?));
+        }
+        if !sr.is_skipped("created_at") {
+            fields.push((sr.col("created_at"), response.created_at.to_rfc3339()));
+        }
+        if !sr.is_skipped("safety_identifier") {
+            if let Some(safety) = &response.safety_identifier {
+                fields.push((sr.col("safety_identifier"), safety.clone()));
+            }
+        }
+        if !sr.is_skipped("model") {
+            if let Some(model) = &response.model {
+                fields.push((sr.col("model"), model.clone()));
+            }
+        }
+        if !sr.is_skipped("tenant") {
+            if let Some(tenant) = &response.tenant {
+                fields.push((sr.col("tenant"), tenant.clone()));
+            }
+        }
+        if !sr.is_skipped("raw_response") {
+            fields.push((
+                sr.col("raw_response"),
+                serde_json::to_string(&response.raw_response)?,
+            ));
+        }
+        let hook_extra = current_extra_columns().unwrap_or_default();
+        for (name, val) in resolve_extra_column_values(sr, &hook_extra) {
+            if let Some(v) = val {
+                fields.push((name, v));
+            }
+        }
+        Ok(fields)
+    }
+
+    /// The writes that go with a stored response besides its hash: one key
+    /// per output item id (with the response's retention), the set of the
+    /// open background responses (joined while the record is open, left with
+    /// its terminal store), and the hash's expiry.
+    fn index_writes(&self, pipe: &mut redis::Pipeline, key: &str, response: &StoredResponse) {
+        let sr = &self.store.schema.responses;
+        let response_id_str = response.id.0.as_str();
+        if !sr.is_skipped("raw_response") {
+            for item_id in output_item_ids(&response.raw_response) {
+                let item_key = self.output_item_key(item_id);
+                match self.store.retention_days {
+                    Some(days) => {
+                        pipe.set_ex(item_key, response_id_str, days * 24 * 60 * 60);
+                    }
+                    None => {
+                        pipe.set(item_key, response_id_str);
+                    }
+                }
+            }
+        }
+        if let Some(days) = self.store.retention_days {
+            pipe.expire(key, (days * 24 * 60 * 60) as i64);
+        }
+    }
+
+    /// Index the response by its safety identifier, if it has one.
+    async fn index_by_identifier(
+        &self,
+        conn: &mut Connection,
+        response: &StoredResponse,
+    ) -> ResponseResult<()> {
+        let sr = &self.store.schema.responses;
+        if sr.is_skipped("safety_identifier") {
+            return Ok(());
+        }
+        if let Some(safety) = &response.safety_identifier {
+            let safety_key = self.safety_key(safety);
+            let score = response.created_at.timestamp_millis() as f64;
+            conn.zadd::<_, _, _, ()>(safety_key, response.id.0.as_str(), score)
+                .await
+                .map_err(ResponseStorageError::from_redis)?;
+        }
+        Ok(())
+    }
+
     /// Build a `StoredResponse` from the Redis hash map returned by `HGETALL`.
     /// Fields listed in `skip_columns` use defaults since they were not stored.
     fn build_response_from_map(
@@ -967,13 +1068,9 @@ impl ResponseStorage for RedisResponseStorage {
         &self,
         response: StoredResponse,
     ) -> Result<ResponseId, ResponseStorageError> {
-        let sr = &self.store.schema.responses;
         let response_id = response.id.clone();
-        let response_id_str = response_id.0.as_str();
-        let key = self.response_key(response_id_str);
-
-        let json_input = serde_json::to_string(&response.input)?;
-        let json_raw_response = serde_json::to_string(&response.raw_response)?;
+        let key = self.response_key(&response_id.0);
+        let fields = self.hash_fields(&response)?;
 
         let mut conn = self
             .store
@@ -983,87 +1080,116 @@ impl ResponseStorage for RedisResponseStorage {
             .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
         let mut pipe = redis::pipe();
-
-        pipe.hset(&key, sr.col("id"), response_id_str);
-        if !sr.is_skipped("previous_response_id") {
-            if let Some(prev) = &response.previous_response_id {
-                pipe.hset(&key, sr.col("previous_response_id"), &prev.0);
-            }
+        for (field, value) in &fields {
+            pipe.hset(&key, *field, value);
         }
-        if !sr.is_skipped("conversation_id") {
-            if let Some(cid) = &response.conversation_id {
-                pipe.hset(&key, sr.col("conversation_id"), cid);
-            }
-        }
-        if !sr.is_skipped("input") {
-            pipe.hset(&key, sr.col("input"), &json_input);
-        }
-        if !sr.is_skipped("created_at") {
-            pipe.hset(&key, sr.col("created_at"), response.created_at.to_rfc3339());
-        }
-        if !sr.is_skipped("safety_identifier") {
-            if let Some(safety) = &response.safety_identifier {
-                pipe.hset(&key, sr.col("safety_identifier"), safety);
-            }
-        }
-        if !sr.is_skipped("model") {
-            if let Some(model) = &response.model {
-                pipe.hset(&key, sr.col("model"), model);
-            }
-        }
-        if !sr.is_skipped("raw_response") {
-            pipe.hset(&key, sr.col("raw_response"), &json_raw_response);
-        }
-        if !sr.is_skipped("tenant") {
-            if let Some(tenant) = &response.tenant {
-                pipe.hset(&key, sr.col("tenant"), tenant);
-            }
-        }
-
-        // Append extra columns from hooks or defaults
-        let hook_extra = current_extra_columns().unwrap_or_default();
-        for (name, val) in resolve_extra_column_values(sr, &hook_extra) {
-            if let Some(v) = val {
-                pipe.hset(&key, name, v);
-            }
-        }
-
-        // One key per output item id -> this response, with the response's
-        // retention, for the lookup by output item id.
-        if !sr.is_skipped("raw_response") {
-            for item_id in output_item_ids(&response.raw_response) {
-                let item_key = self.output_item_key(item_id);
-                match self.store.retention_days {
-                    Some(days) => {
-                        pipe.set_ex(item_key, response_id_str, days * 24 * 60 * 60);
-                    }
-                    None => {
-                        pipe.set(item_key, response_id_str);
-                    }
-                }
-            }
-        }
-
-        if let Some(days) = self.store.retention_days {
-            pipe.expire(&key, (days * 24 * 60 * 60) as i64);
-        }
-
+        self.index_writes(&mut pipe, &key, &response);
         pipe.query_async::<()>(&mut conn)
             .await
             .map_err(ResponseStorageError::from_redis)?;
-
-        // Index by safety identifier if present
-        if !sr.is_skipped("safety_identifier") {
-            if let Some(safety) = &response.safety_identifier {
-                let safety_key = self.safety_key(safety);
-                let score = response.created_at.timestamp_millis() as f64;
-                conn.zadd::<_, _, _, ()>(safety_key, response_id_str, score)
-                    .await
-                    .map_err(ResponseStorageError::from_redis)?;
-            }
-        }
+        self.index_by_identifier(&mut conn, &response).await?;
 
         Ok(response_id)
+    }
+
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        let sr = &self.store.schema.responses;
+        let key = self.response_key(&response.id.0);
+        let fields = self.hash_fields(&response)?;
+
+        let mut conn = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+
+        // The status check and the hash write run as one script: nothing
+        // closes the record between them.
+        let script = redis::Script::new(&store_if_open_script());
+        let mut invocation = script.key(&key);
+        invocation.arg(sr.col("raw_response"));
+        for (field, value) in &fields {
+            invocation.arg(*field).arg(value);
+        }
+        let outcome: String = invocation
+            .invoke_async(&mut conn)
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
+        match outcome.as_str() {
+            "stored" => {
+                let mut pipe = redis::pipe();
+                self.index_writes(&mut pipe, &key, &response);
+                pipe.query_async::<()>(&mut conn)
+                    .await
+                    .map_err(ResponseStorageError::from_redis)?;
+                self.index_by_identifier(&mut conn, &response).await?;
+                Ok(ConditionalStore::Stored)
+            }
+            "closed" => {
+                drop(conn);
+                Ok(match self.get_response(&response.id).await? {
+                    Some(current) => ConditionalStore::Closed(Box::new(current)),
+                    None => ConditionalStore::Missing,
+                })
+            }
+            _ => Ok(ConditionalStore::Missing),
+        }
+    }
+
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        let sr = &self.store.schema.responses;
+        if sr.is_skipped("raw_response") {
+            // No object field: nothing a transition could move.
+            return Ok(ConditionalStore::Stored);
+        }
+        let key = self.response_key(&id.0);
+        let json_raw_response = serde_json::to_string(&raw_response)?;
+        let mut conn = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        // The same script as the full store, with the object's field alone.
+        let script = redis::Script::new(&store_if_open_script());
+        let outcome: String = script
+            .key(&key)
+            .arg(sr.col("raw_response"))
+            .arg(sr.col("raw_response"))
+            .arg(&json_raw_response)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
+        match outcome.as_str() {
+            "stored" => {
+                // The open set and the output-item keys follow the object.
+                let mut moved = StoredResponse::new(None);
+                moved.id = id.clone();
+                moved.raw_response = raw_response;
+                let mut pipe = redis::pipe();
+                self.index_writes(&mut pipe, &key, &moved);
+                pipe.query_async::<()>(&mut conn)
+                    .await
+                    .map_err(ResponseStorageError::from_redis)?;
+                Ok(ConditionalStore::Stored)
+            }
+            "closed" => {
+                drop(conn);
+                Ok(match self.get_response(id).await? {
+                    Some(current) => ConditionalStore::Closed(Box::new(current)),
+                    None => ConditionalStore::Missing,
+                })
+            }
+            _ => Ok(ConditionalStore::Missing),
+        }
     }
 
     async fn get_response(
@@ -1301,6 +1427,32 @@ impl ResponseStorage for RedisResponseStorage {
 
         Ok(count)
     }
+}
+
+/// The script of [`ResponseStorage::store_response_if_open`]: `KEYS[1]` is
+/// the response's hash, `ARGV[1]` the name of the field holding the stored
+/// object, `ARGV[2..]` the hash's fields and values. It writes the fields
+/// only while the stored object's status is not terminal
+/// ([`TERMINAL_RESPONSE_STATUSES`]; a hash without one counts as open) and
+/// answers `stored`, `closed` or `missing`.
+fn store_if_open_script() -> String {
+    let closed = TERMINAL_RESPONSE_STATUSES
+        .iter()
+        .map(|status| format!("status == '{status}'"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    format!(
+        "
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+if not raw then return 'missing' end
+local status = ''
+local ok, doc = pcall(cjson.decode, raw)
+if ok and type(doc) == 'table' and type(doc['status']) == 'string' then status = doc['status'] end
+if {closed} then return 'closed' end
+for i = 2, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
+return 'stored'
+"
+    )
 }
 
 /// The ids of the output items of a stored response (`raw_response.output[].id`).

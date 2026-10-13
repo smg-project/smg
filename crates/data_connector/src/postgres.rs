@@ -15,11 +15,12 @@ use crate::{
     config::PostgresConfig,
     context::current_extra_columns,
     core::{
-        make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
-        ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
-        ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
-        ListParams, NewConversation, NewConversationItem, ResponseId, ResponseResult,
-        ResponseStorage, ResponseStorageError, SortOrder, StoredResponse,
+        make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
+        ConversationItem, ConversationItemId, ConversationItemResult, ConversationItemStorage,
+        ConversationItemStorageError, ConversationMetadata, ConversationResult,
+        ConversationStorage, ConversationStorageError, ListParams, NewConversation,
+        NewConversationItem, ResponseId, ResponseResult, ResponseStorage, ResponseStorageError,
+        SortOrder, StoredResponse, TERMINAL_RESPONSE_STATUSES,
     },
     factory::StoreContactError,
     postgres_migrations::POSTGRES_HISTORY_MIGRATIONS,
@@ -1686,6 +1687,91 @@ fn locked_merge_sql(table: &str, col_names: &[&str]) -> String {
     )
 }
 
+/// The columns a response is written to and their values, in the order of
+/// the statement's parameters (the id first), skipping the configured
+/// `skip_columns` and appending the extra columns of hooks or defaults.
+#[expect(
+    clippy::ref_option,
+    reason = "the previous id is pushed as a `&dyn ToSql` that lives as long as the caller's `Option<String>`"
+)]
+fn write_columns<'a>(
+    s: &'a crate::schema::TableConfig,
+    response: &'a StoredResponse,
+    previous_id: &'a Option<String>,
+    extra_cols: &'a [(&'a str, Option<String>)],
+) -> (Vec<&'a str>, Vec<&'a (dyn ToSql + Sync)>) {
+    let mut col_names: Vec<&str> = vec![s.col("id")];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&response.id.0];
+    if !s.is_skipped("conversation_id") {
+        col_names.push(s.col("conversation_id"));
+        params.push(&response.conversation_id);
+    }
+    if !s.is_skipped("previous_response_id") {
+        col_names.push(s.col("previous_response_id"));
+        params.push(previous_id);
+    }
+    if !s.is_skipped("input") {
+        col_names.push(s.col("input"));
+        params.push(&response.input);
+    }
+    if !s.is_skipped("created_at") {
+        col_names.push(s.col("created_at"));
+        params.push(&response.created_at);
+    }
+    if !s.is_skipped("safety_identifier") {
+        col_names.push(s.col("safety_identifier"));
+        params.push(&response.safety_identifier);
+    }
+    if !s.is_skipped("model") {
+        col_names.push(s.col("model"));
+        params.push(&response.model);
+    }
+    if !s.is_skipped("raw_response") {
+        col_names.push(s.col("raw_response"));
+        params.push(&response.raw_response);
+    }
+    if !s.is_skipped("tenant") {
+        col_names.push(s.col("tenant"));
+        params.push(&response.tenant);
+    }
+    for (name, val) in extra_cols {
+        col_names.push(*name);
+        params.push(val);
+    }
+    (col_names, params)
+}
+
+/// The condition under which [`ResponseStorage::store_response_if_open`]
+/// writes: the stored object's status is not terminal
+/// ([`TERMINAL_RESPONSE_STATUSES`]; a record without a status counts as
+/// open), read as [`nul_safe_json_text`] reads it.
+fn open_predicate(col_raw: &str) -> String {
+    format!(
+        "COALESCE({}, '') NOT IN ({})",
+        nul_safe_json_text(col_raw, "status"),
+        sql_string_list(&TERMINAL_RESPONSE_STATUSES)
+    )
+}
+
+/// The statement of [`ResponseStorage::store_response_if_open`]: an UPDATE of
+/// every column of the row under the id, applied only while `open` holds
+/// (none: the schema skips the status' column, so the update is plain). The
+/// condition is evaluated on the row's current version under its lock, so a
+/// close that lands first makes this statement update nothing.
+fn update_if_open_sql(table: &str, col_names: &[&str], open: Option<&str>) -> String {
+    let id_col = col_names.first().copied().unwrap_or("id");
+    let assignments: Vec<String> = col_names
+        .iter()
+        .enumerate()
+        .map(|(i, col)| format!("{col} = ${}", i + 1))
+        .collect();
+    let condition = open.map(|open| format!(" AND {open}")).unwrap_or_default();
+    format!(
+        "UPDATE {table} SET {} WHERE {id_col} = $1{condition}",
+        assignments.join(", ")
+    )
+}
+
 /// The lock statement of the locked path, sent through the simple query
 /// protocol (one round trip, nothing to prepare): the key is a locally
 /// computed integer.
@@ -1712,66 +1798,13 @@ impl ResponseStorage for PostgresResponseStorage {
         &self,
         response: StoredResponse,
     ) -> Result<ResponseId, ResponseStorageError> {
-        let StoredResponse {
-            id: response_id,
-            previous_response_id,
-            input,
-            created_at,
-            safety_identifier,
-            model,
-            conversation_id,
-            raw_response,
-            tenant,
-        } = response;
-        let previous_id = previous_response_id.map(|r| r.0);
-
         let s = &self.store.schema.responses;
         let table = s.qualified_table(self.store.schema.owner.as_deref());
-
-        // Build dynamic column/param lists, skipping configured skip_columns
-        let mut col_names: Vec<&str> = vec![s.col("id")];
-        let mut params: Vec<&(dyn ToSql + Sync)> = vec![&response_id.0];
-
-        if !s.is_skipped("conversation_id") {
-            col_names.push(s.col("conversation_id"));
-            params.push(&conversation_id);
-        }
-        if !s.is_skipped("previous_response_id") {
-            col_names.push(s.col("previous_response_id"));
-            params.push(&previous_id);
-        }
-        if !s.is_skipped("input") {
-            col_names.push(s.col("input"));
-            params.push(&input);
-        }
-        if !s.is_skipped("created_at") {
-            col_names.push(s.col("created_at"));
-            params.push(&created_at);
-        }
-        if !s.is_skipped("safety_identifier") {
-            col_names.push(s.col("safety_identifier"));
-            params.push(&safety_identifier);
-        }
-        if !s.is_skipped("model") {
-            col_names.push(s.col("model"));
-            params.push(&model);
-        }
-        if !s.is_skipped("raw_response") {
-            col_names.push(s.col("raw_response"));
-            params.push(&raw_response);
-        }
-        if !s.is_skipped("tenant") {
-            col_names.push(s.col("tenant"));
-            params.push(&tenant);
-        }
-
-        // Append extra columns from hooks or defaults
+        let previous_id = response.previous_response_id.as_ref().map(|r| r.0.clone());
         let hook_extra = current_extra_columns().unwrap_or_default();
         let extra_cols: Vec<(&str, Option<String>)> = resolve_extra_column_values(s, &hook_extra);
-        for (name, val) in &extra_cols {
-            col_names.push(*name);
-            params.push(val);
-        }
+        let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
+        let response_id = response.id.clone();
 
         let mut client = self
             .store
@@ -1824,6 +1857,75 @@ impl ResponseStorage for PostgresResponseStorage {
             "Response stored in Postgres"
         );
         Ok(response_id)
+    }
+
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        let s = &self.store.schema.responses;
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let previous_id = response.previous_response_id.as_ref().map(|r| r.0.clone());
+        let hook_extra = current_extra_columns().unwrap_or_default();
+        let extra_cols: Vec<(&str, Option<String>)> = resolve_extra_column_values(s, &hook_extra);
+        let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
+        let open = (!s.is_skipped("raw_response")).then(|| open_predicate(s.col("raw_response")));
+        let sql = update_if_open_sql(&table, &col_names, open.as_deref());
+
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let rows = execute_cached(&client, &sql, &params)
+            .await
+            .map_err(ResponseStorageError::from_pg)?;
+        if rows > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        // Nothing moved: the record is closed, or gone.
+        drop(client);
+        Ok(match self.get_response(&response.id).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
+    }
+
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> ResponseResult<ConditionalStore> {
+        let s = &self.store.schema.responses;
+        if s.is_skipped("raw_response") {
+            // No object column: nothing a transition could move.
+            return Ok(ConditionalStore::Stored);
+        }
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        let sql = update_if_open_sql(
+            &table,
+            &[s.col("id"), col_raw],
+            Some(&open_predicate(col_raw)),
+        );
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let rows = execute_cached(&client, &sql, &[&id.0, &raw_response])
+            .await
+            .map_err(ResponseStorageError::from_pg)?;
+        if rows > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        drop(client);
+        Ok(match self.get_response(id).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
+        })
     }
 
     async fn get_response(
@@ -2198,6 +2300,26 @@ mod tests {
             link_sql("l", &["conversation_id", "item_id"]),
             "INSERT INTO l (conversation_id, item_id) VALUES ($1, $2) \
              ON CONFLICT (conversation_id, item_id) DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn update_if_open_sql_updates_the_row_under_its_id_only_while_its_status_is_open() {
+        let open = open_predicate("raw_response");
+        assert_eq!(
+            open,
+            "COALESCE(replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status', '') \
+             NOT IN ('completed', 'incomplete', 'failed', 'cancelled')"
+        );
+        assert_eq!(
+            update_if_open_sql("responses", &["id", "input", "raw_response"], Some(&open)),
+            "UPDATE responses SET id = $1, input = $2, raw_response = $3 WHERE id = $1 AND \
+             COALESCE(replace(raw_response::text, $$\\u0000$$, $$\\u0020$$)::json->>'status', '') \
+             NOT IN ('completed', 'incomplete', 'failed', 'cancelled')"
+        );
+        assert_eq!(
+            update_if_open_sql("r", &["response_key", "input"], None),
+            "UPDATE r SET response_key = $1, input = $2 WHERE response_key = $1"
         );
     }
 
