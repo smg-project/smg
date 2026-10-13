@@ -1121,7 +1121,15 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("temporal_patch_size"), "{error}");
+        // The registry's own error, naming the key, with the construction
+        // path's reason behind it.
+        assert!(
+            error.starts_with(
+                "config field 'img_token_compression_config.temporal_patch_size' is present but unusable: "
+            ),
+            "{error}"
+        );
+        assert!(error.contains("must be a positive integer"), "{error}");
     }
 
     #[test]
