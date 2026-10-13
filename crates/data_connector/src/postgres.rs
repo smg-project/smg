@@ -382,6 +382,7 @@ impl PostgresConversationStorage {
             ))),
         }
     }
+
     /// The columns a conversation is read with: the id, then its creation
     /// time, metadata and tenant when the schema keeps them.
     fn row_columns(s: &crate::schema::TableConfig) -> Vec<String> {
