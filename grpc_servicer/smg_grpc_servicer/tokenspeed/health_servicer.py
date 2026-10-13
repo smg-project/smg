@@ -7,7 +7,6 @@ can auto-detect the backend via the health probe.
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
@@ -15,13 +14,12 @@ import grpc
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
 
+from smg_grpc_servicer.health_probe import StallReport
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
 
 logger = logging.getLogger(__name__)
-
-# Seconds of scheduler silence (with pending requests) before reporting NOT_SERVING.
-STUCK_SCHEDULER_THRESHOLD_SEC = 30.0
 
 # Sourced from the proto descriptor so a package/service rename stays in sync.
 TOKENSPEED_SCHEDULER_SERVICE_NAME = tokenspeed_scheduler_pb2.DESCRIPTOR.services_by_name[
@@ -52,7 +50,7 @@ class TokenSpeedHealthServicer(health_pb2_grpc.HealthServicer):
             self.OVERALL_SERVER: health_pb2.HealthCheckResponse.NOT_SERVING,
             self.TOKENSPEED_SERVICE: health_pb2.HealthCheckResponse.NOT_SERVING,
         }
-        self._stuck_reported = False
+        self._stall = StallReport(logger)
         logger.info("TokenSpeed gRPC health service initialized")
 
     def set_serving(self) -> None:
@@ -92,28 +90,13 @@ class TokenSpeedHealthServicer(health_pb2_grpc.HealthServicer):
             if base != health_pb2.HealthCheckResponse.SERVING:
                 return health_pb2.HealthCheckResponse(status=base)
 
-            # Scheduler-stuck check: pending work but no recent output.
-            time_since_last_receive = time.time() - self.async_llm.last_receive_tstamp
-            pending = len(self.async_llm.rid_to_state)
-            if time_since_last_receive > STUCK_SCHEDULER_THRESHOLD_SEC and pending > 0:
-                # Probes keep arriving on their interval for as long as this
-                # holds, so say it when it starts and again only if it clears
-                # and comes back; repeating it every interval buries whatever
-                # else the scheduler is trying to report.
-                if not self._stuck_reported:
-                    self._stuck_reported = True
-                    logger.warning(
-                        "Scheduler appears stuck: %.1fs since last receive, %d pending requests",
-                        time_since_last_receive,
-                        pending,
-                    )
+            # A scheduler silent beyond the threshold with requests pending is stuck.
+            if self._stall.stuck(
+                self.async_llm.last_receive_tstamp, len(self.async_llm.rid_to_state)
+            ):
                 return health_pb2.HealthCheckResponse(
                     status=health_pb2.HealthCheckResponse.NOT_SERVING
                 )
-
-            if self._stuck_reported:
-                self._stuck_reported = False
-                logger.info("Scheduler is responsive again")
             return health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.SERVING)
 
         context.set_code(grpc.StatusCode.NOT_FOUND)

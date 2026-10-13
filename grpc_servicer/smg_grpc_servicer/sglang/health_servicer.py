@@ -6,11 +6,12 @@ native Kubernetes gRPC health probes for liveness and readiness checks.
 """
 
 import logging
-import time
 from collections.abc import AsyncIterator
 
 import grpc
 from grpc_health.v1 import health_pb2, health_pb2_grpc
+
+from smg_grpc_servicer.health_probe import StallReport
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class SGLangHealthServicer(health_pb2_grpc.HealthServicer):
         self.request_manager = request_manager
         self.scheduler_info = scheduler_info
         self._serving_status = {}
-        self._stuck_reported = False
+        self._stall = StallReport(logger)
 
         # Initially set to NOT_SERVING until model is loaded
         self._serving_status[self.OVERALL_SERVER] = health_pb2.HealthCheckResponse.NOT_SERVING
@@ -110,33 +111,13 @@ class SGLangHealthServicer(health_pb2_grpc.HealthServicer):
                 logger.debug("Service health check: NOT_SERVING (base status)")
                 return health_pb2.HealthCheckResponse(status=base_status)
 
-            # Check if scheduler is responsive (received data recently)
-            time_since_last_receive = time.time() - self.request_manager.last_receive_tstamp
-
-            # If no recent activity and we have active requests, might be stuck
-            # NOTE: 30s timeout is hardcoded. This is more conservative than
-            # HEALTH_CHECK_TIMEOUT (20s) used for custom HealthCheck RPC.
-            # Consider making this configurable via environment variable in the future
-            # if different workloads need different responsiveness thresholds.
-            if time_since_last_receive > 30 and len(self.request_manager.rid_to_state) > 0:
-                # Probes keep arriving on their interval for as long as this
-                # holds, so say it when it starts and again only if it clears
-                # and comes back; repeating it every interval buries whatever
-                # else the scheduler is trying to report.
-                if not self._stuck_reported:
-                    self._stuck_reported = True
-                    logger.warning(
-                        f"Service health check: Scheduler not responsive "
-                        f"({time_since_last_receive:.1f}s since last receive, "
-                        f"{len(self.request_manager.rid_to_state)} pending requests)"
-                    )
+            # A scheduler silent beyond the threshold with requests pending is stuck.
+            if self._stall.stuck(
+                self.request_manager.last_receive_tstamp, len(self.request_manager.rid_to_state)
+            ):
                 return health_pb2.HealthCheckResponse(
                     status=health_pb2.HealthCheckResponse.NOT_SERVING
                 )
-
-            if self._stuck_reported:
-                self._stuck_reported = False
-                logger.info("Service health check: scheduler is responsive again")
             logger.debug("Service health check: SERVING")
             return health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.SERVING)
 
