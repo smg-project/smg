@@ -1922,20 +1922,21 @@ async fn decode_video_with_ffmpeg_runners(
             // container's size nor its transpose is retried once on the
             // probe's metadata before anything frames raw output by a size
             // the decoder may not produce; a probe that cannot run leaves the
-            // mismatch standing, which the headed PNG runner below takes.
+            // mismatch standing, which the headed PNG runner takes straight
+            // away. The first decode's entry is logged before the probe runs,
+            // so it carries the decode's own duration; the retry is timed apart.
+            log_video_decode_backend_timing(
+                "ffmpeg_ppm_file",
+                started,
+                input_bytes,
+                cfg,
+                headed.as_ref().err(),
+            );
             match probe_video_info(input_path)
                 .await
                 .and_then(|info| video_metadata_from(info, false))
             {
                 Ok(probed) => {
-                    // The first decode's own entry; the retry is timed apart.
-                    log_video_decode_backend_timing(
-                        "ffmpeg_ppm_file",
-                        started,
-                        input_bytes,
-                        cfg,
-                        headed.as_ref().err(),
-                    );
                     metadata = probed;
                     started = Instant::now();
                     headed =
@@ -1946,6 +1947,15 @@ async fn decode_video_with_ffmpeg_runners(
                         error = %error,
                         "video probe after a frame size mismatch failed; the container's metadata stands"
                     );
+                    return decode_video_png_frames(
+                        input_path,
+                        input_bytes,
+                        cfg,
+                        Some(metadata),
+                        selection,
+                        sampling,
+                    )
+                    .await;
                 }
             }
         }
