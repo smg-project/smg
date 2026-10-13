@@ -113,24 +113,34 @@ impl Agreement {
 
     /// The verdict on a hard fact: a known difference is `differ`; a side
     /// that does not report the fact leaves it unknown, which only `Strict`
-    /// refuses; a fact nobody reports is unknown too when the component
-    /// always exists (a runtime, a transport) and not a fact at all when the
-    /// engines may not carry it (a layout fact).
+    /// refuses; a fact nobody reports is what `unreported` says of the
+    /// component.
     fn hard_fact(
         self,
         differ: PairingMismatch,
         name: &'static str,
         strict: bool,
-        unreported_is_unknown: bool,
+        unreported: Unreported,
     ) -> Option<PairingMismatch> {
         let unknown = strict.then_some(PairingMismatch::Unknown(name));
         match self {
             Self::Differ => Some(differ),
             Self::OneSided => unknown,
-            Self::Unreported if unreported_is_unknown => unknown,
+            Self::Unreported if unreported == Unreported::Unknown => unknown,
             Self::Agree | Self::Unreported => None,
         }
     }
+}
+
+/// What it means when neither side of a pair reports a component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unreported {
+    /// The component always exists (a runtime, a transport): two workers
+    /// that name neither leave it unknown, which only `Strict` refuses.
+    Unknown,
+    /// The engines may not carry the fact (a KV layout fact): nothing to
+    /// compare.
+    NotAFact,
 }
 
 /// What one PD worker offers a rendezvous partner.
@@ -239,11 +249,14 @@ impl PdPairing {
         // The hard facts, judged in this order by [`Agreement::hard_fact`].
         // A worker whose runtime probe failed has an unknown runtime, not a
         // different one.
-        let runtime = |runtime: &RuntimeType| {
-            (*runtime != RuntimeType::Unspecified).then(|| runtime.as_str())
-        };
-        if let Some(mismatch) = Agreement::of(runtime(&self.runtime), runtime(&other.runtime))
-            .hard_fact(PairingMismatch::Runtime, "runtime", strict, true)
+        let runtime = |runtime: RuntimeType| runtime.is_specified().then(|| runtime.as_str());
+        if let Some(mismatch) = Agreement::of(runtime(self.runtime), runtime(other.runtime))
+            .hard_fact(
+                PairingMismatch::Runtime,
+                "runtime",
+                strict,
+                Unreported::Unknown,
+            )
         {
             return Some(mismatch);
         }
@@ -260,7 +273,12 @@ impl PdPairing {
             Agreement::OneSided | Agreement::Unreported => {}
         }
         if let Some(mismatch) = Agreement::of(self.transport.as_deref(), other.transport.as_deref())
-            .hard_fact(PairingMismatch::Transport, "transport", strict, true)
+            .hard_fact(
+                PairingMismatch::Transport,
+                "transport",
+                strict,
+                Unreported::Unknown,
+            )
         {
             return Some(mismatch);
         }
@@ -269,9 +287,12 @@ impl PdPairing {
                 self.kv_layout.get(short).map(String::as_str),
                 other.kv_layout.get(short).map(String::as_str),
             );
-            if let Some(mismatch) =
-                agreement.hard_fact(PairingMismatch::KvLayout(label), label, strict, false)
-            {
+            if let Some(mismatch) = agreement.hard_fact(
+                PairingMismatch::KvLayout(label),
+                label,
+                strict,
+                Unreported::NotAFact,
+            ) {
                 return Some(mismatch);
             }
         }
