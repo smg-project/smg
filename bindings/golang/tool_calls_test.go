@@ -3,6 +3,7 @@ package smg
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -36,11 +37,11 @@ func TestToolCallStreamedInPiecesAssemblesIntoOneCall(t *testing.T) {
 // each with its own arguments.
 func TestInterleavedToolCallsAssembleByIndex(t *testing.T) {
 	var calls toolCallAssembler
-	calls.add([]ToolCallDelta{{Index: 1, ID: "call_2", Type: "function", Function: FunctionCall{Name: "get_time"}}})
-	calls.add([]ToolCallDelta{{Index: 0, ID: "call_1", Type: "function", Function: FunctionCall{Name: "get_weather"}}})
-	calls.add([]ToolCallDelta{{Index: 1, Function: FunctionCall{Arguments: `{"zone":`}}})
-	calls.add([]ToolCallDelta{{Index: 0, Function: FunctionCall{Arguments: `{"city":"Paris"}`}}})
-	calls.add([]ToolCallDelta{{Index: 1, Function: FunctionCall{Arguments: `"UTC"}`}}})
+	calls.add([]ToolCallDelta{{Index: 1, ID: "call_2", Type: "function", Function: FunctionCallDelta{Name: "get_time"}}})
+	calls.add([]ToolCallDelta{{Index: 0, ID: "call_1", Type: "function", Function: FunctionCallDelta{Name: "get_weather"}}})
+	calls.add([]ToolCallDelta{{Index: 1, Function: FunctionCallDelta{Arguments: `{"zone":`}}})
+	calls.add([]ToolCallDelta{{Index: 0, Function: FunctionCallDelta{Arguments: `{"city":"Paris"}`}}})
+	calls.add([]ToolCallDelta{{Index: 1, Function: FunctionCallDelta{Arguments: `"UTC"}`}}})
 	want := []ToolCall{
 		{ID: "call_1", Type: "function", Function: FunctionCall{Name: "get_weather", Arguments: `{"city":"Paris"}`}},
 		{ID: "call_2", Type: "function", Function: FunctionCall{Name: "get_time", Arguments: `{"zone":"UTC"}`}},
@@ -56,5 +57,18 @@ func TestNoToolCallDeltasLeaveToolCallsUnset(t *testing.T) {
 	calls.add(nil)
 	if got := calls.toolCalls(); got != nil {
 		t.Fatalf("got %+v, want nil", got)
+	}
+}
+
+// A delta that continues a call's arguments carries no name; re-marshalled,
+// it still carries none, the shape the converter sent.
+func TestContinuationDeltaOmitsTheName(t *testing.T) {
+	delta := ToolCallDelta{Index: 0, Function: FunctionCallDelta{Arguments: `"Paris"}`}}
+	encoded, err := json.Marshal(delta)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(encoded), `"name"`) || strings.Contains(string(encoded), `"id"`) {
+		t.Fatalf("continuation delta re-marshalled as %s", encoded)
 	}
 }

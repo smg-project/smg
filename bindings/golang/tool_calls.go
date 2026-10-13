@@ -7,10 +7,19 @@ import "sort"
 // name; every later delta of that index carries a further piece of the
 // arguments, with no id and no name.
 type ToolCallDelta struct {
-	Index    int          `json:"index"`
-	ID       string       `json:"id,omitempty"`
-	Type     string       `json:"type,omitempty"`
-	Function FunctionCall `json:"function"`
+	Index    int               `json:"index"`
+	ID       string            `json:"id,omitempty"`
+	Type     string            `json:"type,omitempty"`
+	Function FunctionCallDelta `json:"function"`
+}
+
+// FunctionCallDelta is the function part of a tool-call delta: the name with
+// the first delta of a call, a piece of the arguments with every delta that
+// carries one. A field the delta does not carry is omitted, so a delta
+// re-marshalled by a consumer keeps the shape the converter sent.
+type FunctionCallDelta struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // toolCallAssembler rebuilds the tool calls a stream delivers in pieces, by
