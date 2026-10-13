@@ -1279,6 +1279,16 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .map_or_else(Default::default, |profile| profile.capabilities)
     }
 
+    fn native_thinking_mode(
+        &self,
+        template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        thinking: Option<bool>,
+    ) -> Option<bool> {
+        self.profile
+            .and_then(|profile| profile.thinking_mode)
+            .map(|resolve| resolve(template_kwargs, thinking))
+    }
+
     fn set_chat_template(&mut self, template: String) -> Result<()> {
         self.chat_template.set(template)
     }
