@@ -177,10 +177,50 @@ mod tests {
 
     use super::*;
 
-    /// A choice as the shutdown sees it; never polled here.
+    /// A choice as the shutdown sees it, in the shape of the servicers' own:
+    /// a `Complete` queued for the next poll, an engine stream that may hold
+    /// the engine's parked `Complete`, or no engine stream once the
+    /// completion is out (or the choice ended). Never polled here.
     struct Choice {
-        terminal: Option<&'static str>,
-        open: bool,
+        pending: Option<&'static str>,
+        inner: Option<Inner>,
+    }
+
+    struct Inner {
+        parked: Option<&'static str>,
+    }
+
+    impl Choice {
+        fn open() -> Self {
+            Self {
+                pending: None,
+                inner: Some(Inner { parked: None }),
+            }
+        }
+
+        fn queued(terminal: &'static str) -> Self {
+            Self {
+                pending: Some(terminal),
+                inner: Some(Inner { parked: None }),
+            }
+        }
+
+        fn parked(terminal: &'static str) -> Self {
+            Self {
+                pending: None,
+                inner: Some(Inner {
+                    parked: Some(terminal),
+                }),
+            }
+        }
+
+        /// The completion already went out (or the choice ended).
+        fn done() -> Self {
+            Self {
+                pending: None,
+                inner: None,
+            }
+        }
     }
 
     impl Stream for Choice {
@@ -195,15 +235,17 @@ mod tests {
         type Response = &'static str;
 
         fn finished(&mut self) -> Option<&'static str> {
-            let terminal = self.terminal.take();
-            if terminal.is_some() {
-                self.open = false;
+            if let Some(terminal) = self.pending.take() {
+                self.inner = None;
+                return Some(terminal);
             }
-            terminal
+            let parked = self.inner.as_mut()?.parked.take()?;
+            self.inner = None;
+            Some(parked)
         }
 
         fn is_open(&self) -> bool {
-            self.open
+            self.pending.is_none() && self.inner.is_some()
         }
     }
 
@@ -217,16 +259,7 @@ mod tests {
 
     #[test]
     fn a_held_terminal_goes_out_and_an_open_choice_is_cut() {
-        let mut all = choices(vec![
-            Choice {
-                terminal: Some("length"),
-                open: true,
-            },
-            Choice {
-                terminal: None,
-                open: true,
-            },
-        ]);
+        let mut all = choices(vec![Choice::queued("length"), Choice::open()]);
         let (finished, cut) = settle_shutdown(&mut all);
         assert_eq!(finished, ["length"]);
         assert!(cut, "the choice still open is what the shutdown cuts");
@@ -235,16 +268,7 @@ mod tests {
 
     #[test]
     fn a_request_whose_every_choice_had_finished_is_not_cut() {
-        let mut all = choices(vec![
-            Choice {
-                terminal: Some("stop"),
-                open: true,
-            },
-            Choice {
-                terminal: Some("length"),
-                open: true,
-            },
-        ]);
+        let mut all = choices(vec![Choice::queued("stop"), Choice::parked("length")]);
         let (finished, cut) = settle_shutdown(&mut all);
         // `SelectAll` has no order of its own; both completions are there.
         let mut finished: Vec<_> = finished.into_iter().collect();
@@ -258,12 +282,28 @@ mod tests {
 
     #[test]
     fn an_ended_choice_neither_yields_nor_cuts() {
-        let mut all = choices(vec![Choice {
-            terminal: None,
-            open: false,
-        }]);
+        let mut all = choices(vec![Choice::done()]);
         let (finished, cut) = settle_shutdown(&mut all);
         assert!(finished.is_empty());
         assert!(!cut);
+    }
+
+    /// The engine's own `Complete` already went out and the shutdown lands
+    /// before the next poll: the choice holds nothing and is not open (its
+    /// engine stream went with the completion), so the request keeps the
+    /// clean end it had; only a choice still generating is cut.
+    #[test]
+    fn a_choice_whose_completion_already_went_out_is_not_cut() {
+        let mut all = choices(vec![Choice::done()]);
+        let (finished, cut) = settle_shutdown(&mut all);
+        assert!(finished.is_empty());
+        assert!(
+            !cut,
+            "nothing was open: no status after a completion that went out"
+        );
+        let mut mixed = choices(vec![Choice::done(), Choice::open()]);
+        let (finished, cut) = settle_shutdown(&mut mixed);
+        assert!(finished.is_empty());
+        assert!(cut, "the choice still generating is the one cut");
     }
 }

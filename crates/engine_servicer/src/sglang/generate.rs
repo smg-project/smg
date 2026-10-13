@@ -163,8 +163,20 @@ impl Stream for ChoiceStream {
                 continue;
             }
             // The engine's own terminal `Complete` passes through as-is; the
-            // engine stream ends after it.
-            return Poll::Ready(Some(Ok(this.convert(item))));
+            // engine stream ends after it, and the choice is no longer open
+            // once the `Complete` is out (a shutdown landing before the next
+            // poll must not cut it; the engine stream has already seen the
+            // finish, so dropping it sends no abort). `convert` reads the
+            // engine stream, so it goes first.
+            let ended = matches!(
+                item.response,
+                Some(vllm::generate_response::Response::Complete(_))
+            );
+            let response = this.convert(item);
+            if ended {
+                this.inner = None;
+            }
+            return Poll::Ready(Some(Ok(response)));
         }
     }
 }

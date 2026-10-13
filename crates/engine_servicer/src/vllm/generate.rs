@@ -385,13 +385,23 @@ impl Stream for ChoiceStream {
             let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
             else {
                 // The engine's own terminal `Complete` (or an empty response)
-                // passes through as-is; the engine stream ends after it.
+                // passes through as-is; the engine stream ends after it, and
+                // the choice is no longer open once the `Complete` is out (a
+                // shutdown landing before the next poll must not cut it; the
+                // engine stream has already seen the finish, so dropping it
+                // sends no abort).
+                let mut ended = false;
                 if let Some(vllm::generate_response::Response::Complete(complete)) =
                     item.response.as_ref()
                 {
                     this.count_prompt(complete.prompt_tokens, complete.cached_tokens);
+                    ended = true;
                 }
-                return Poll::Ready(Some(Ok(this.stamped(item))));
+                let response = this.stamped(item);
+                if ended {
+                    this.inner = None;
+                }
+                return Poll::Ready(Some(Ok(response)));
             };
             this.count_prompt(chunk.prompt_tokens, chunk.cached_tokens);
             this.state
