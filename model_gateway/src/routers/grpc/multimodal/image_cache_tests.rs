@@ -451,6 +451,7 @@ async fn run_probe(
         spec,
         "tok",
         config,
+        None,
         policy,
     )
     .await

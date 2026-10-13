@@ -9,7 +9,7 @@
 use std::{sync::Arc, time::Instant};
 
 use llm_multimodal::{
-    ImageDetail, ImageFetchConfig, ImageFrame, MediaConnector, MediaConnectorConfig, MediaSource,
+    ImageFetchConfig, ImageFrame, MediaConnector, MediaConnectorConfig, MediaSource,
 };
 
 mod common;
@@ -21,10 +21,7 @@ async fn frames(connector: &MediaConnector, bytes: &[u8], count: usize) -> Vec<A
             connector
                 .fetch_image(
                     MediaSource::InlineBytes(bytes.to_vec()),
-                    ImageFetchConfig {
-                        detail: ImageDetail::default(),
-                        max_long_side_pixel: None,
-                    },
+                    ImageFetchConfig::default(),
                 )
                 .await
                 .expect("frame from bytes"),

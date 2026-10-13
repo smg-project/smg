@@ -23,6 +23,7 @@ use super::{
     log_mm_timing_enabled,
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
+    transparency::frame_transparency,
     MediaBatch, MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
     PromptBinding, RegistryTokenizer,
 };
@@ -77,15 +78,12 @@ pub(crate) async fn process_multimodal_plan(
         .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
     // The frames decode under the destination engine's transparency policy,
     // unless the processor takes the image as decoded and handles alpha itself.
-    let transparency = if components
-        .vision_processor_registry
-        .find(model_id, model_type)
-        .is_some_and(|processor| processor.keeps_alpha())
-    {
-        TransparencyPolicy::KeepAlpha
-    } else {
-        transparency
-    };
+    let transparency = frame_transparency(
+        &components.vision_processor_registry,
+        model_id,
+        model_type,
+        transparency,
+    );
     let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
 
     let media_started = Instant::now();
@@ -94,7 +92,8 @@ pub(crate) async fn process_multimodal_plan(
         .with_video_frame_sampling(
             spec.video_frame_sampling()
                 .with_frame_budget(components.video_frame_budget),
-        );
+        )
+        .with_image_transparency(transparency);
 
     for part in plan.into_parts() {
         tracker
@@ -120,14 +119,6 @@ pub(crate) async fn process_multimodal_plan(
                 .collect()
         })
         .unwrap_or_default();
-    for frame in &images {
-        if !frame.set_transparency(transparency) {
-            tracing::warn!(
-                policy = ?transparency,
-                "an image frame was decoded before its transparency policy was set"
-            );
-        }
-    }
 
     let videos: Vec<Arc<VideoClip>> = tracker_output
         .data

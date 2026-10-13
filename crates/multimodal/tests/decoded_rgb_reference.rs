@@ -158,12 +158,13 @@ fn keep_alpha_decodes_the_file_as_it_is() {
 }
 
 #[test]
-fn the_policy_is_fixed_by_the_first_decode() {
+fn with_transparency_sets_the_policy_the_frame_decodes_under() {
     let (_, bytes) = cases().into_iter().next().unwrap();
-    let frame = frame(&bytes, TransparencyPolicy::CompositeOverWhite);
-    assert!(frame.set_transparency(TransparencyPolicy::CompositeOverWhite));
-    assert!(!frame.set_transparency(TransparencyPolicy::DropAlpha));
-    frame.image().unwrap();
-    assert!(!frame.set_transparency(TransparencyPolicy::KeepAlpha));
-    assert_eq!(frame.transparency(), TransparencyPolicy::CompositeOverWhite);
+    for policy in [
+        TransparencyPolicy::KeepAlpha,
+        TransparencyPolicy::CompositeOverWhite,
+        TransparencyPolicy::DropAlpha,
+    ] {
+        assert_eq!(frame(&bytes, policy).transparency(), policy);
+    }
 }

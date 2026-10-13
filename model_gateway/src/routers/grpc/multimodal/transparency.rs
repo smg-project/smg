@@ -2,7 +2,7 @@
 //! engine's own image loader does with an alpha channel before its processor
 //! runs, resolved from the runtime of the model's registered workers.
 
-use llm_multimodal::TransparencyPolicy;
+use llm_multimodal::{TransparencyPolicy, VisionProcessorRegistry};
 
 use crate::worker::{RuntimeType, WorkerRegistry};
 
@@ -28,6 +28,27 @@ pub(crate) fn engine_transparency_policy(
         return TransparencyPolicy::KeepAlpha;
     }
     runtime_transparency_policy(first)
+}
+
+/// The policy the frames of a request to `model_id` decode under: `engine`
+/// (the destination fleet's rule), unless the model's processor takes the
+/// image as decoded and handles alpha itself
+/// ([`VisionPreProcessor::keeps_alpha`](llm_multimodal::VisionPreProcessor::keeps_alpha)).
+/// The lookup is the one the preprocessing stage makes for the same request.
+pub(crate) fn frame_transparency(
+    registry: &VisionProcessorRegistry,
+    model_id: &str,
+    model_type: Option<&str>,
+    engine: TransparencyPolicy,
+) -> TransparencyPolicy {
+    if registry
+        .find(model_id, model_type)
+        .is_some_and(|processor| processor.keeps_alpha())
+    {
+        TransparencyPolicy::KeepAlpha
+    } else {
+        engine
+    }
 }
 
 /// What one engine's own image loader does with an alpha channel.
@@ -58,6 +79,9 @@ pub(crate) fn runtime_transparency_policy(runtime: RuntimeType) -> TransparencyP
 mod tests {
     use std::sync::Arc;
 
+    use llm_multimodal::{
+        PreProcessorConfig, PreprocessedEncoderInputs, TransformError, VisionPreProcessor,
+    };
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -153,5 +177,72 @@ mod tests {
             engine_transparency_policy(&other_model, "another-model"),
             TransparencyPolicy::KeepAlpha
         );
+    }
+
+    /// A processor that takes the image as decoded (`keeps_alpha`), or not.
+    struct Probe {
+        keeps_alpha: bool,
+    }
+
+    impl VisionPreProcessor for Probe {
+        fn keeps_alpha(&self) -> bool {
+            self.keeps_alpha
+        }
+        fn default_mean(&self) -> [f64; 3] {
+            [0.0; 3]
+        }
+        fn default_std(&self) -> [f64; 3] {
+            [1.0; 3]
+        }
+        fn calculate_num_tokens(&self, _: u32, _: u32, _: &PreProcessorConfig) -> usize {
+            1
+        }
+        fn model_name(&self) -> &'static str {
+            "probe"
+        }
+        fn preprocess(
+            &self,
+            _: &[image::DynamicImage],
+            _: &PreProcessorConfig,
+        ) -> Result<PreprocessedEncoderInputs, TransformError> {
+            Err(TransformError::ShapeError("probe".to_string()))
+        }
+    }
+
+    const POLICIES: [TransparencyPolicy; 3] = [
+        TransparencyPolicy::CompositeOverWhite,
+        TransparencyPolicy::DropAlpha,
+        TransparencyPolicy::KeepAlpha,
+    ];
+
+    /// One per policy: a processor that keeps alpha overrides the fleet's rule.
+    #[test]
+    fn a_processor_that_keeps_alpha_decodes_as_stored_under_every_fleet() {
+        let mut registry = VisionProcessorRegistry::new();
+        registry.register("keeps-alpha-model", Box::new(Probe { keeps_alpha: true }));
+        for engine in POLICIES {
+            assert_eq!(
+                frame_transparency(&registry, "keeps-alpha-model", None, engine),
+                TransparencyPolicy::KeepAlpha,
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_processor_without_the_override_follows_the_fleet() {
+        let mut registry = VisionProcessorRegistry::new();
+        registry.register("plain-model", Box::new(Probe { keeps_alpha: false }));
+        for engine in POLICIES {
+            assert_eq!(
+                frame_transparency(&registry, "plain-model", None, engine),
+                engine
+            );
+            assert_eq!(
+                frame_transparency(&registry, "no-such-model", None, engine),
+                engine,
+                "a model without a processor keeps the fleet's rule"
+            );
+        }
     }
 }

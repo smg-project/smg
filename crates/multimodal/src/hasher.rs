@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::media::FrameSampling;
+use crate::{media::FrameSampling, types::TransparencyPolicy};
 
 /// Domain tag for digests that mix media bytes with request parameters.
 ///
@@ -49,6 +49,28 @@ pub fn hash_image_with_resolution_cap(
     hasher.update(MEDIA_PARAM_DOMAIN);
     write_len_prefixed(&mut hasher, raw_bytes);
     hasher.update(&cap.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The hash of an image whose decoded pixels depend on the resolution cap and
+/// on the [`TransparencyPolicy`] the frame decodes under. `KeepAlpha` keeps
+/// [`hash_image_with_resolution_cap`]'s value (the identity before policies
+/// existed, so cached entries stay valid); another policy folds its name in,
+/// so the gateway's pixel cache and the `mm_hashes` the backend keys its own
+/// caches on never serve one policy's tensors for another's.
+pub fn hash_image_with_transparency(
+    raw_bytes: &[u8],
+    max_long_side_pixel: Option<u32>,
+    transparency: TransparencyPolicy,
+) -> String {
+    let base = hash_image_with_resolution_cap(raw_bytes, max_long_side_pixel);
+    if transparency == TransparencyPolicy::KeepAlpha {
+        return base;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MEDIA_PARAM_DOMAIN);
+    write_len_prefixed(&mut hasher, base.as_bytes());
+    hasher.update(transparency.as_str().as_bytes());
     hasher.finalize().to_hex().to_string()
 }
 
@@ -125,6 +147,31 @@ pub fn hash_images(raw_bytes: &[impl AsRef<[u8]>]) -> BTreeMap<String, Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_transparency_policy_is_part_of_the_hash_except_keep_alpha() {
+        let bytes = b"fake-encoded-image-bytes";
+        let keep = hash_image_with_transparency(bytes, Some(504), TransparencyPolicy::KeepAlpha);
+        assert_eq!(keep, hash_image_with_resolution_cap(bytes, Some(504)));
+        assert_eq!(
+            hash_image_with_transparency(bytes, None, TransparencyPolicy::KeepAlpha),
+            hash_image(bytes)
+        );
+        let white =
+            hash_image_with_transparency(bytes, Some(504), TransparencyPolicy::CompositeOverWhite);
+        let drop = hash_image_with_transparency(bytes, Some(504), TransparencyPolicy::DropAlpha);
+        assert_ne!(white, keep);
+        assert_ne!(drop, keep);
+        assert_ne!(white, drop);
+        assert_eq!(
+            white,
+            hash_image_with_transparency(bytes, Some(504), TransparencyPolicy::CompositeOverWhite)
+        );
+        assert_ne!(
+            white,
+            hash_image_with_transparency(bytes, Some(252), TransparencyPolicy::CompositeOverWhite)
+        );
+    }
 
     #[test]
     fn test_hash_deterministic() {

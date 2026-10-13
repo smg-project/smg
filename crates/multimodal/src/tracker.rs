@@ -11,6 +11,7 @@ use super::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
 };
+use crate::types::TransparencyPolicy;
 
 type PendingTask = JoinHandle<MultiModalResult<TrackedMedia>>;
 
@@ -77,6 +78,10 @@ pub struct AsyncMultiModalTracker {
     /// keeps the connector default.
     default_video_sample_fps: Option<f32>,
     video_frame_sampling: FrameSampling,
+    /// The policy the fetched image frames decode an alpha channel under (see
+    /// [`TransparencyPolicy`]); `KeepAlpha` unless the request's processing
+    /// stage set the destination engine's.
+    image_transparency: TransparencyPolicy,
 }
 
 impl AsyncMultiModalTracker {
@@ -88,7 +93,15 @@ impl AsyncMultiModalTracker {
             first_slot: HashMap::new(),
             default_video_sample_fps: None,
             video_frame_sampling: FrameSampling::default(),
+            image_transparency: TransparencyPolicy::KeepAlpha,
         }
+    }
+
+    /// Decode the request's image frames under `policy` (the destination
+    /// engine's own transparency rule); it becomes part of each frame's hash.
+    pub fn with_image_transparency(mut self, policy: TransparencyPolicy) -> Self {
+        self.image_transparency = policy;
+        self
     }
 
     /// Sample videos that name no `fps` at this rate (the model's reference
@@ -253,6 +266,7 @@ impl AsyncMultiModalTracker {
         let config = ImageFetchConfig {
             detail,
             max_long_side_pixel,
+            transparency: self.image_transparency,
         };
         let source = Arc::new(FetchSource::from(source));
         if let Some(first) = self.same_media_as(modality, format!("{config:?}"), &source) {
@@ -579,6 +593,40 @@ mod repeat_tests {
             .data
             .remove(&Modality::Image)
             .expect("the request carries images")
+    }
+
+    #[tokio::test]
+    async fn the_tracker_s_transparency_policy_reaches_the_frame_and_its_hash() {
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        let png = BASE64_STANDARD
+            .decode(TINY_PNG_URL.split_once(',').expect("data url").1)
+            .expect("base64");
+        for policy in [
+            TransparencyPolicy::KeepAlpha,
+            TransparencyPolicy::CompositeOverWhite,
+            TransparencyPolicy::DropAlpha,
+        ] {
+            let mut tracker = tracker().with_image_transparency(policy);
+            tracker.push_part(image_part(None)).expect("part");
+            let items = images(tracker).await;
+            let Some(TrackedMedia::Image(frame)) = items.first() else {
+                panic!("the slot must hold an image");
+            };
+            assert_eq!(frame.transparency(), policy);
+            assert_eq!(
+                frame.hash,
+                crate::hasher::hash_image_with_transparency(&png, None, policy),
+                "{policy:?}"
+            );
+        }
+        let mut tracker = tracker();
+        tracker.push_part(image_part(None)).expect("part");
+        let items = images(tracker).await;
+        let Some(TrackedMedia::Image(frame)) = items.first() else {
+            panic!("the slot must hold an image");
+        };
+        assert_eq!(frame.transparency(), TransparencyPolicy::KeepAlpha);
+        assert_eq!(frame.hash, crate::hasher::hash_image(&png));
     }
 
     #[tokio::test]

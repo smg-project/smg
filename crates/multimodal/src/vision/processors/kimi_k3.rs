@@ -177,6 +177,12 @@ mod tests {
     use image::{Rgb, RgbImage, Rgba, RgbaImage};
     use serde_json::json;
 
+    #[test]
+    fn k3_keeps_alpha_for_its_own_background_and_k25_does_not() {
+        assert!(KimiK3Processor::new().keeps_alpha());
+        assert!(!KimiK25Processor::new().keeps_alpha());
+    }
+
     use super::*;
     use crate::vision::processors::kimi_k25::{
         KimiK25Processor, DEFAULT_IN_PATCH_LIMIT as K25_LIM,

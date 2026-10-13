@@ -162,6 +162,17 @@ pub enum TransparencyPolicy {
     DropAlpha,
 }
 
+impl TransparencyPolicy {
+    /// The policy's name as the configuration and the cache keys spell it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KeepAlpha => "keep_alpha",
+            Self::CompositeOverWhite => "composite_over_white",
+            Self::DropAlpha => "drop_alpha",
+        }
+    }
+}
+
 /// Concrete image payload captured by the media connector: the encoded bytes
 /// with their identity and size, decoded on first use, so a request whose
 /// pixels are already cached never pays for the decode.
@@ -177,9 +188,9 @@ pub struct ImageFrame {
     pub source: ImageSource,
     /// Blake3 hex-digest of `raw_bytes` and the resolution cap.
     pub hash: String,
-    /// The policy the decode applies to an alpha channel; `KeepAlpha` until
-    /// [`set_transparency`](Self::set_transparency) is called, before the decode.
-    transparency: OnceLock<TransparencyPolicy>,
+    /// The policy the decode applies to an alpha channel: `KeepAlpha` unless
+    /// the frame was built [`with_transparency`](Self::with_transparency).
+    transparency: TransparencyPolicy,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -446,7 +457,7 @@ impl ImageFrame {
             detail,
             source,
             hash,
-            transparency: OnceLock::new(),
+            transparency: TransparencyPolicy::KeepAlpha,
         }
     }
 
@@ -468,7 +479,7 @@ impl ImageFrame {
             detail,
             source,
             hash,
-            transparency: OnceLock::new(),
+            transparency: TransparencyPolicy::KeepAlpha,
         }
     }
 
@@ -484,25 +495,18 @@ impl ImageFrame {
         })
     }
 
-    /// The transparency policy the decode applies (see [`TransparencyPolicy`]);
-    /// `KeepAlpha` until one is set.
+    /// The transparency policy the decode applies (see [`TransparencyPolicy`]).
     pub fn transparency(&self) -> TransparencyPolicy {
-        self.transparency.get().copied().unwrap_or_default()
+        self.transparency
     }
 
-    /// Set the policy before the first decode. Returns `false` when the pixels
-    /// are already decoded or another policy was set: the decode is final, so
-    /// the caller's policy did not take effect.
-    pub fn set_transparency(&self, policy: TransparencyPolicy) -> bool {
-        if self.decoded.get().is_some() {
-            return false;
-        }
-        self.transparency.set(policy).is_ok() || self.transparency.get() == Some(&policy)
-    }
-
-    /// [`set_transparency`](Self::set_transparency) for a frame being built.
-    pub fn with_transparency(self, policy: TransparencyPolicy) -> Self {
-        self.set_transparency(policy);
+    /// The frame decoded under `policy`. The media connector builds frames
+    /// this way with a `hash` computed for the same policy
+    /// ([`hash_image_with_transparency`](crate::hasher::hash_image_with_transparency)),
+    /// so the caches that key on the hash never serve one policy's pixels for
+    /// another's; a caller building frames itself does the same.
+    pub fn with_transparency(mut self, policy: TransparencyPolicy) -> Self {
+        self.transparency = policy;
         self
     }
     /// Decode the pixels of every frame that is still encoded, in parallel on
