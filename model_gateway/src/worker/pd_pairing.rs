@@ -88,6 +88,51 @@ pub enum KvTransferProfile {
     Store,
 }
 
+/// How the two sides of a would-be pair report one component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Agreement {
+    /// Both report it, the same.
+    Agree,
+    /// Both report it, differently.
+    Differ,
+    /// One side reports it, the other does not.
+    OneSided,
+    /// Neither reports it.
+    Unreported,
+}
+
+impl Agreement {
+    fn of(mine: Option<&str>, theirs: Option<&str>) -> Self {
+        match (mine, theirs) {
+            (Some(a), Some(b)) if a == b => Self::Agree,
+            (Some(_), Some(_)) => Self::Differ,
+            (None, None) => Self::Unreported,
+            _ => Self::OneSided,
+        }
+    }
+
+    /// The verdict on a hard fact: a known difference is `differ`; a side
+    /// that does not report the fact leaves it unknown, which only `Strict`
+    /// refuses; a fact nobody reports is unknown too when the component
+    /// always exists (a runtime, a transport) and not a fact at all when the
+    /// engines may not carry it (a layout fact).
+    fn hard_fact(
+        self,
+        differ: PairingMismatch,
+        name: &'static str,
+        strict: bool,
+        unreported_is_unknown: bool,
+    ) -> Option<PairingMismatch> {
+        let unknown = strict.then_some(PairingMismatch::Unknown(name));
+        match self {
+            Self::Differ => Some(differ),
+            Self::OneSided => unknown,
+            Self::Unreported if unreported_is_unknown => unknown,
+            Self::Agree | Self::Unreported => None,
+        }
+    }
+}
+
 /// What one PD worker offers a rendezvous partner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdPairing {
@@ -191,57 +236,49 @@ impl PdPairing {
             return None;
         }
         let strict = mode == PdPairingMode::Strict;
-        let unknown = |name: &'static str| strict.then_some(PairingMismatch::Unknown(name));
-        match (self.runtime, other.runtime) {
-            (RuntimeType::Unspecified, _) | (_, RuntimeType::Unspecified) => {
-                if let Some(mismatch) = unknown("runtime") {
-                    return Some(mismatch);
-                }
-            }
-            (mine, theirs) if mine != theirs => return Some(PairingMismatch::Runtime),
-            _ => {}
+        // The hard facts, judged in this order by [`Agreement::hard_fact`].
+        // A worker whose runtime probe failed has an unknown runtime, not a
+        // different one.
+        let runtime = |runtime: &RuntimeType| {
+            (*runtime != RuntimeType::Unspecified).then(|| runtime.as_str())
+        };
+        if let Some(mismatch) = Agreement::of(runtime(&self.runtime), runtime(&other.runtime))
+            .hard_fact(PairingMismatch::Runtime, "runtime", strict, true)
+        {
+            return Some(mismatch);
         }
         // Two explicit protocols are the operators' assertion, compared
-        // whole. One explicit protocol cannot be checked against derived
-        // facts: strict refuses, lenient falls through to the facts rather
-        // than pairing blindly.
-        match (&self.explicit, &other.explicit) {
-            (Some(a), Some(b)) => return (a != b).then_some(PairingMismatch::Explicit),
-            (None, None) => {}
-            _ => {
-                if let Some(mismatch) = unknown("pairing_protocol") {
-                    return Some(mismatch);
-                }
+        // whole: equal ones settle the pair. One explicit protocol cannot be
+        // checked against derived facts: strict refuses, lenient falls
+        // through to the facts rather than pairing blindly.
+        match Agreement::of(self.explicit.as_deref(), other.explicit.as_deref()) {
+            Agreement::Agree => return None,
+            Agreement::Differ => return Some(PairingMismatch::Explicit),
+            Agreement::OneSided if strict => {
+                return Some(PairingMismatch::Unknown("pairing_protocol"))
             }
+            Agreement::OneSided | Agreement::Unreported => {}
         }
-        match (&self.transport, &other.transport) {
-            (Some(a), Some(b)) if a != b => return Some(PairingMismatch::Transport),
-            (Some(_), Some(_)) => {}
-            _ => {
-                if let Some(mismatch) = unknown("transport") {
-                    return Some(mismatch);
-                }
-            }
+        if let Some(mismatch) = Agreement::of(self.transport.as_deref(), other.transport.as_deref())
+            .hard_fact(PairingMismatch::Transport, "transport", strict, true)
+        {
+            return Some(mismatch);
         }
         for (short, label, _) in LAYOUT_FACTS {
-            match (self.kv_layout.get(short), other.kv_layout.get(short)) {
-                (Some(a), Some(b)) if a != b => return Some(PairingMismatch::KvLayout(label)),
-                (Some(_), Some(_)) | (None, None) => {}
-                _ => {
-                    if let Some(mismatch) = unknown(label) {
-                        return Some(mismatch);
-                    }
-                }
+            let agreement = Agreement::of(
+                self.kv_layout.get(short).map(String::as_str),
+                other.kv_layout.get(short).map(String::as_str),
+            );
+            if let Some(mismatch) =
+                agreement.hard_fact(PairingMismatch::KvLayout(label), label, strict, false)
+            {
+                return Some(mismatch);
             }
         }
-        if strict {
-            if let (Some(mine), Some(theirs)) = (&self.version, &other.version) {
-                if mine != theirs {
-                    return Some(PairingMismatch::Version);
-                }
-            }
-        }
-        None
+        // The soft fact: a version difference counts only under `Strict`, and
+        // only when both sides report one.
+        let versions = Agreement::of(self.version.as_deref(), other.version.as_deref());
+        (strict && versions == Agreement::Differ).then_some(PairingMismatch::Version)
     }
 }
 
@@ -333,23 +370,26 @@ fn transport_of(spec: &WorkerSpec) -> Option<String> {
     }
 }
 
-/// `NixlConnector` / `MooncakeConnector` fold to the transport name and
-/// their store variants to `<transport>-store`: legs that meet in a store
-/// cannot hand KV to legs that rendezvous, so the two never pair. Anything
-/// else is kept lower-cased.
+/// The transports a connector name may carry: `NixlConnector`,
+/// `MooncakeConnector` and `MoRIIOConnector`, with their variants, name the
+/// transport they contain.
+const CONNECTOR_TRANSPORTS: [&str; 3] = ["nixl", "mooncake", "moriio"];
+
+/// A connector name folded to its transport, and a store variant to
+/// `<transport>-store`: legs that meet in a store cannot hand KV to legs
+/// that rendezvous, so the two never pair. A name that carries no known
+/// transport is kept lower-cased, so two workers naming the same unknown
+/// connector still pair.
 fn normalise_connector(connector: &str) -> String {
     let lower = connector.to_ascii_lowercase();
-    let family = if lower.contains("nixl") {
-        "nixl"
-    } else if lower.contains("mooncake") {
-        "mooncake"
-    } else if lower.contains("moriio") {
-        "moriio"
-    } else {
+    let Some(family) = CONNECTOR_TRANSPORTS
+        .iter()
+        .find(|transport| lower.contains(*transport))
+    else {
         return lower;
     };
     match connector_profile(connector) {
-        KvTransferProfile::P2p => family.to_string(),
+        KvTransferProfile::P2p => (*family).to_string(),
         KvTransferProfile::Store => format!("{family}-store"),
     }
 }
