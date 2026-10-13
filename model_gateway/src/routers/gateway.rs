@@ -313,14 +313,14 @@ impl Gateway {
     /// the family's labels. Falling to the default router instead answered
     /// that the model does not exist (404 `model_not_found`) and counted the
     /// refusal under that router's labels, for a model that is served and
-    /// merely has no complete pair at the moment. The legs counted are the
-    /// prefill and decode ones: an encode leg alone is no incomplete pair
-    /// (it takes the default router, whose refusal is counted and logged as
-    /// regular traffic, as before), and an encode leg registered beside a
-    /// missing prefill or decode leg makes the EPD family the first choice.
-    /// `None` when no prefill or decode leg of the model is registered on
-    /// either wire: the default router's answer stands for a model nobody
-    /// serves.
+    /// merely has no complete pair at the moment. An encode leg is the EPD
+    /// family's alone: registered beside a missing prefill or decode leg it
+    /// makes that family the first choice, and registered alone it takes the
+    /// EPD router when one is mounted (whose selection answers the incomplete
+    /// set itself) and the default router otherwise, never the PD router,
+    /// whose refusal would count and log it as prefill/decode traffic.
+    /// `None` when no leg of the model is registered on either wire, or no
+    /// family's router is mounted: the default router's answer stands.
     fn incomplete_disaggregated_router(
         &self,
         grpc_encode: usize,
@@ -329,11 +329,11 @@ impl Gateway {
     ) -> Option<Arc<dyn RouterTrait>> {
         let routers = self.routers.load();
         let family = |ids: &[&RouterId]| ids.iter().find_map(|id| routers.get(*id).cloned());
-        if grpc_pair_legs > 0 {
-            let ids: &[&RouterId] = if grpc_encode > 0 {
-                &[&router_ids::GRPC_EPD, &router_ids::GRPC_PD]
-            } else {
-                &[&router_ids::GRPC_PD, &router_ids::GRPC_EPD]
+        if grpc_pair_legs > 0 || grpc_encode > 0 {
+            let ids: &[&RouterId] = match (grpc_encode > 0, grpc_pair_legs > 0) {
+                (true, true) => &[&router_ids::GRPC_EPD, &router_ids::GRPC_PD],
+                (true, false) => &[&router_ids::GRPC_EPD],
+                _ => &[&router_ids::GRPC_PD, &router_ids::GRPC_EPD],
             };
             if let Some(router) = family(ids) {
                 return Some(router);
@@ -1711,20 +1711,26 @@ mod tests {
             ),
             "grpc_epd"
         );
-        // An encode leg alone is no incomplete pair: the default router, as
-        // for a model nobody serves (its refusal counted and logged as
-        // regular traffic, not as the PD family's).
+        // An encode leg alone is the EPD family's: with no EPD router mounted
+        // the default router answers (as for a model nobody serves, its
+        // refusal counted and logged as regular traffic), never the PD
+        // router; with one mounted (every router is, under IGW) the EPD
+        // router, whose selection answers the incomplete set itself.
         assert_eq!(
             picked(&[(WorkerType::Encode, ConnectionMode::Grpc)], &both_pd),
             "stub"
         );
-        // An encode leg beside a decode leg (the prefill missing): the EPD
-        // family first when it is mounted, the PD family otherwise.
         let with_epd = [
             (&router_ids::GRPC_PD, "grpc_pd"),
             (&router_ids::HTTP_PD, "http_pd"),
             (&router_ids::GRPC_EPD, "grpc_epd"),
         ];
+        assert_eq!(
+            picked(&[(WorkerType::Encode, ConnectionMode::Grpc)], &with_epd),
+            "grpc_epd"
+        );
+        // An encode leg beside a decode leg (the prefill missing): the EPD
+        // family first when it is mounted, the PD family otherwise.
         assert_eq!(
             picked(
                 &[
