@@ -106,6 +106,19 @@ class TestEffectiveRunningWindow:
         assert loads_mod.effective_running_window(ranks, attention_dp_size=1) == 2048
         assert loads_mod.effective_running_window([], attention_dp_size=8) == 0
 
+    def test_the_figure_is_clamped_to_what_the_gateway_label_can_carry(self, loads_mod):
+        # The gateway parses the label as a 16-bit count: 32 attention-DP
+        # workers publishing 2048 each (65536) would read as no window.
+        ranks = [_snapshot(None) for _ in range(32)]
+        for rank, snapshot in enumerate(ranks):
+            snapshot.dp_rank, snapshot.max_running_requests = rank, 2048
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=32) == 65535
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=31) == 63488
+        wide = _snapshot(None)
+        wide.max_running_requests = 70000
+        assert loads_mod.effective_running_window([wide]) == 65535
+        assert loads_mod.MAX_REPORTED_RUNNING_WINDOW == 65535
+
     def test_no_snapshot_or_no_figure_means_no_window(self, loads_mod):
         unset = _snapshot(None)
         unset.max_running_requests = 0

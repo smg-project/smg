@@ -23,6 +23,11 @@ if TYPE_CHECKING:
 # worker, so the gateway never received load reports from PD SGLang workers.
 _PREFILL_QUEUE_ATTRS = ("prefill_bootstrap_queue_reqs", "prefill_prealloc_queue_reqs")
 
+# The gateway reads the running-window label as a 16-bit count; a wider figure
+# does not parse and reads as no window at all, so the computed figure is
+# clamped to the widest window the label can carry.
+MAX_REPORTED_RUNNING_WINDOW = 65535
+
 
 def _first_attr(obj: Any, names: tuple[str, ...], default: Any = 0) -> Any:
     """Return the first attribute of ``obj`` present in ``names``."""
@@ -49,7 +54,10 @@ def effective_running_window(snapshots: Iterable[Any], attention_dp_size: int = 
     and each scheduler publishes its own share, so the flag's units are the
     smallest published share (one rank's bound is the bound a request meets)
     times ``attention_dp_size`` (1 without attention DP, where every scheduler
-    runs the whole flag).
+    runs the whole flag). The result is clamped to
+    ``MAX_REPORTED_RUNNING_WINDOW``: a wider figure would not parse at the
+    gateway and would read as no window (32 attention-DP workers publishing
+    2048 each are such a case).
     """
     windows = []
     for snapshot in snapshots:
@@ -57,7 +65,8 @@ def effective_running_window(snapshots: Iterable[Any], attention_dp_size: int = 
         if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
             continue
         windows.append(window)
-    return min(windows, default=0) * max(1, int(attention_dp_size))
+    window = min(windows, default=0) * max(1, int(attention_dp_size))
+    return min(window, MAX_REPORTED_RUNNING_WINDOW)
 
 
 def convert_loads_to_protobuf(result: LoadSnapshot) -> sglang_scheduler_pb2.SchedulerLoad:
