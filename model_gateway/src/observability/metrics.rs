@@ -71,10 +71,7 @@ mod handles {
     use std::{
         cell::RefCell,
         collections::HashMap,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            OnceLock,
-        },
+        sync::atomic::{AtomicBool, Ordering},
     };
 
     use metrics::{Counter, Gauge, Histogram};
@@ -106,11 +103,9 @@ mod handles {
         pub(super) static HTTP_RESPONSES: RefCell<ByPathStatusAndError> = RefCell::new(HashMap::new());
         /// `smg_http_rate_limit_total` by result.
         pub(super) static HTTP_RATE_LIMITS: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_http_connections_active`: one series, a handle to it per worker.
+        pub(super) static HTTP_CONNECTIONS_ACTIVE: RefCell<Option<Gauge>> = const { RefCell::new(None) };
     }
-
-    /// `smg_http_connections_active` has one series; its handle serves the
-    /// process.
-    pub(super) static HTTP_CONNECTIONS_ACTIVE: OnceLock<Gauge> = OnceLock::new();
 
     /// Uses the handle under `key`, building and keeping it on first sight.
     /// The key is only allocated for a new entry.
@@ -131,14 +126,11 @@ mod handles {
 
     /// The inner map under `key`, created on first sight; the key is only
     /// allocated for a new entry.
-    pub(super) fn nested<'m, V: Default>(
-        map: &'m mut HashMap<String, V>,
-        key: &str,
-    ) -> Option<&'m mut V> {
+    pub(super) fn nested<'m, V: Default>(map: &'m mut HashMap<String, V>, key: &str) -> &'m mut V {
         if !map.contains_key(key) {
             map.insert(key.to_owned(), V::default());
         }
-        map.get_mut(key)
+        map.get_mut(key).expect("inserted above")
     }
 
     #[cfg(test)]
@@ -148,6 +140,7 @@ mod handles {
         HTTP_DURATIONS.with_borrow_mut(HashMap::clear);
         HTTP_RESPONSES.with_borrow_mut(HashMap::clear);
         HTTP_RATE_LIMITS.with_borrow_mut(HashMap::clear);
+        HTTP_CONNECTIONS_ACTIVE.set(None);
     }
 
     #[cfg(test)]
@@ -180,8 +173,8 @@ mod handles {
         #[test]
         fn a_nested_map_is_created_once() {
             let mut map: HashMap<String, Vec<u8>> = HashMap::new();
-            nested(&mut map, "/a").expect("created").push(1);
-            nested(&mut map, "/a").expect("found").push(2);
+            nested(&mut map, "/a").push(1);
+            nested(&mut map, "/a").push(2);
             assert_eq!(map.len(), 1);
             assert_eq!(map["/a"], [1, 2]);
         }
@@ -1482,9 +1475,11 @@ impl Metrics {
             gauge!("smg_http_connections_active").set(count as f64);
             return;
         }
-        handles::HTTP_CONNECTIONS_ACTIVE
-            .get_or_init(|| gauge!("smg_http_connections_active"))
-            .set(count as f64);
+        handles::HTTP_CONNECTIONS_ACTIVE.with_borrow_mut(|gauge| {
+            gauge
+                .get_or_insert_with(|| gauge!("smg_http_connections_active"))
+                .set(count as f64);
+        });
     }
 
     /// Record HTTP response.
@@ -1505,12 +1500,10 @@ impl Metrics {
             return;
         }
         handles::HTTP_RESPONSES.with_borrow_mut(|by_path| {
-            let Some(by_status) = handles::nested(by_path, path) else {
-                build().increment(1);
-                return;
-            };
             handles::with_handle(
-                by_status.entry(status_code).or_default(),
+                handles::nested(by_path, path)
+                    .entry(status_code)
+                    .or_default(),
                 error_code,
                 build,
                 |counter| counter.increment(1),
