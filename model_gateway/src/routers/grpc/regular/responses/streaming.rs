@@ -1803,7 +1803,6 @@ mod tests {
             .contains("connection reset"));
     }
 
-    /// One chat chunk as the SSE event the chat stream writes for it.
     /// One reader for the chat stream's events: chunks, the error event as
     /// the terminal's error object (`code`, else `type`, else `server_error`;
     /// `message`, else the generic wording), the terminator, and every other
@@ -1846,6 +1845,7 @@ mod tests {
         );
     }
 
+    /// One chat chunk as the SSE event the chat stream writes for it.
     fn chat_event(delta: Value, finish_reason: Option<&str>) -> String {
         format!(
             "data: {}\n\n",
