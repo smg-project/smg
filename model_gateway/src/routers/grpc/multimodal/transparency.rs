@@ -1,33 +1,40 @@
 //! The transparency policy of a request's image frames: what the destination
 //! engine's own image loader does with an alpha channel before its processor
-//! runs, resolved from the runtime of the model's registered workers.
+//! runs, resolved from the runtime of the workers the request can reach.
 
 use llm_multimodal::{TransparencyPolicy, VisionProcessorRegistry};
 
-use crate::worker::{RuntimeType, WorkerRegistry};
+use crate::worker::{RoutingPool, RuntimeType, WorkerRegistry};
 
-/// The policy for the frames of a request to `model_id`.
+/// The policy for the frames of a request to `model_id` served from the
+/// routing pools `pools`: the legs of the pipeline's mode, read as the
+/// selection reads them, so the workers resolved here are the workers that
+/// can be picked (the image wire dtype is resolved over the same pools).
 ///
-/// Every worker of the model shares one runtime in a deployment the router
-/// can match; that runtime's loader rule applies. A model whose workers mix
-/// runtimes, or has none registered, keeps the frame as decoded, which is the
-/// behaviour before this policy existed: no engine family changes behaviour
-/// without being named below.
+/// Every worker of those pools shares one runtime in a deployment the router
+/// can match; that runtime's loader rule applies. A model whose workers in
+/// the pools mix runtimes, or has none there, keeps the frame as decoded,
+/// which is the behaviour before this policy existed: no engine family
+/// changes behaviour without being named below.
 pub(crate) fn engine_transparency_policy(
     registry: &WorkerRegistry,
     model_id: &str,
+    pools: &[RoutingPool],
 ) -> TransparencyPolicy {
-    let workers = registry.get_by_model(model_id);
-    let mut runtimes = workers
-        .iter()
-        .map(|worker| worker.metadata().spec.runtime_type);
-    let Some(first) = runtimes.next() else {
-        return TransparencyPolicy::KeepAlpha;
-    };
-    if runtimes.any(|runtime| runtime != first) {
-        return TransparencyPolicy::KeepAlpha;
+    // One pool's snapshot after the other, nothing allocated: the shared
+    // runtime, or the frame as decoded as soon as two disagree.
+    let mut shared: Option<RuntimeType> = None;
+    for pool in pools {
+        for worker in registry.get_routing_pool(model_id, *pool).iter() {
+            let runtime = worker.metadata().spec.runtime_type;
+            match shared {
+                None => shared = Some(runtime),
+                Some(existing) if existing == runtime => {}
+                Some(_) => return TransparencyPolicy::KeepAlpha,
+            }
+        }
     }
-    runtime_transparency_policy(first)
+    shared.map_or(TransparencyPolicy::KeepAlpha, runtime_transparency_policy)
 }
 
 /// The policy the frames of a request to `model_id` decode under: `engine`
@@ -77,7 +84,7 @@ pub(crate) fn runtime_transparency_policy(runtime: RuntimeType) -> TransparencyP
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     use llm_multimodal::{
         PreProcessorConfig, PreprocessedEncoderInputs, TransformError, VisionPreProcessor,
@@ -85,15 +92,24 @@ mod tests {
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType};
+    use crate::{
+        routers::grpc::mode::Mode,
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType},
+    };
 
     const MODEL: &str = "vision-model";
+    /// The regular pipeline's pool, where the test fleets' workers are.
+    const REGULAR: &[RoutingPool] = &[RoutingPool::GrpcPipelineRegular];
 
     fn worker(url: &str, runtime: RuntimeType) -> Arc<dyn Worker> {
+        leg(url, WorkerType::Regular, runtime)
+    }
+
+    fn leg(url: &str, worker_type: WorkerType, runtime: RuntimeType) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .model(ModelCard::new(MODEL))
-                .worker_type(WorkerType::Regular)
+                .worker_type(worker_type)
                 .runtime_type(runtime)
                 .connection_mode(ConnectionMode::Grpc)
                 .health_config(HealthCheckConfig {
@@ -120,7 +136,7 @@ mod tests {
             worker("http://w2:8000", RuntimeType::Vllm),
         ]);
         assert_eq!(
-            engine_transparency_policy(&registry, MODEL),
+            engine_transparency_policy(&registry, MODEL, REGULAR),
             TransparencyPolicy::CompositeOverWhite
         );
     }
@@ -129,7 +145,7 @@ mod tests {
     fn an_sglang_fleet_drops_the_alpha_channel() {
         let registry = registry_with(vec![worker("http://w1:8000", RuntimeType::Sglang)]);
         assert_eq!(
-            engine_transparency_policy(&registry, MODEL),
+            engine_transparency_policy(&registry, MODEL, REGULAR),
             TransparencyPolicy::DropAlpha
         );
     }
@@ -138,7 +154,7 @@ mod tests {
     fn a_tokenspeed_fleet_keeps_the_frame_as_decoded() {
         let registry = registry_with(vec![worker("http://w1:8000", RuntimeType::TokenSpeed)]);
         assert_eq!(
-            engine_transparency_policy(&registry, MODEL),
+            engine_transparency_policy(&registry, MODEL, REGULAR),
             TransparencyPolicy::KeepAlpha
         );
     }
@@ -165,17 +181,129 @@ mod tests {
             worker("http://w2:8000", RuntimeType::Sglang),
         ]);
         assert_eq!(
-            engine_transparency_policy(&mixed, MODEL),
+            engine_transparency_policy(&mixed, MODEL, REGULAR),
             TransparencyPolicy::KeepAlpha
         );
         assert_eq!(
-            engine_transparency_policy(&registry_with(vec![]), MODEL),
+            engine_transparency_policy(&registry_with(vec![]), MODEL, REGULAR),
             TransparencyPolicy::KeepAlpha
         );
         let other_model = registry_with(vec![worker("http://w1:8000", RuntimeType::Vllm)]);
         assert_eq!(
-            engine_transparency_policy(&other_model, "another-model"),
+            engine_transparency_policy(&other_model, "another-model", REGULAR),
             TransparencyPolicy::KeepAlpha
+        );
+    }
+
+    /// Regular workers of one family next to prefill and decode legs of
+    /// another: the whole model's workers disagree, the legs a mode's request
+    /// can reach do not.
+    fn fleet_with_legs() -> WorkerRegistry {
+        registry_with(vec![
+            leg(
+                "grpc://regular-1:8000",
+                WorkerType::Regular,
+                RuntimeType::Vllm,
+            ),
+            leg(
+                "grpc://regular-2:8000",
+                WorkerType::Regular,
+                RuntimeType::Vllm,
+            ),
+            leg(
+                "grpc://prefill-1:8000",
+                WorkerType::Prefill,
+                RuntimeType::Sglang,
+            ),
+            leg(
+                "grpc://decode-1:8000",
+                WorkerType::Decode,
+                RuntimeType::Sglang,
+            ),
+        ])
+    }
+
+    /// The policy is resolved over the legs a mode's request can reach, as
+    /// the wire dtype is: the regular pipeline sees its regular workers, a
+    /// disaggregated one its prefill and decode legs; only a mode whose own
+    /// legs disagree, or an empty one, keeps the frame as decoded.
+    #[test]
+    fn the_policy_over_a_modes_pools_is_the_legs_the_request_can_reach() {
+        let registry = fleet_with_legs();
+        assert_eq!(
+            engine_transparency_policy(&registry, MODEL, Mode::Regular.multimodal_wire_pools()),
+            TransparencyPolicy::CompositeOverWhite,
+            "the regular pipeline reaches the vLLM workers only"
+        );
+        assert_eq!(
+            engine_transparency_policy(
+                &registry,
+                MODEL,
+                Mode::PrefillDecode.multimodal_wire_pools()
+            ),
+            TransparencyPolicy::DropAlpha,
+            "the disaggregated pipeline reaches the SGLang legs only"
+        );
+        assert_eq!(
+            engine_transparency_policy(
+                &registry,
+                MODEL,
+                Mode::EncodePrefillDecode.multimodal_wire_pools()
+            ),
+            TransparencyPolicy::DropAlpha,
+            "no encode leg registered: the prefill and decode legs decide"
+        );
+        assert_eq!(
+            engine_transparency_policy(
+                &registry,
+                MODEL,
+                &[
+                    RoutingPool::GrpcPipelineRegular,
+                    RoutingPool::GrpcPrefill,
+                    RoutingPool::GrpcDecode,
+                ]
+            ),
+            TransparencyPolicy::KeepAlpha,
+            "legs of two families keep the frame as decoded"
+        );
+        assert_eq!(
+            engine_transparency_policy(&registry, MODEL, &[RoutingPool::GrpcEncode]),
+            TransparencyPolicy::KeepAlpha,
+            "an empty pool has nothing to agree on"
+        );
+    }
+
+    /// The resolver's cost per request over the four-worker fleet, next to
+    /// the whole-model walk it replaces; a timing, not a check:
+    /// `cargo test --release -p smg --lib -- resolution_cost --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing; run in release with --nocapture"]
+    #[expect(clippy::print_stderr, reason = "a timing, read from the test output")]
+    fn resolution_cost_over_pools_and_over_the_model() {
+        let registry = fleet_with_legs();
+        let pools = Mode::PrefillDecode.multimodal_wire_pools();
+        let rounds = 200_000u32;
+        let started = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..rounds {
+            sink += engine_transparency_policy(&registry, MODEL, pools) as usize;
+        }
+        let over_pools = started.elapsed().as_nanos() as f64 / f64::from(rounds);
+        let started = Instant::now();
+        for _ in 0..rounds {
+            let workers = registry.get_by_model(MODEL);
+            let mut runtimes = workers
+                .iter()
+                .map(|worker| worker.metadata().spec.runtime_type);
+            sink += runtimes
+                .next()
+                .filter(|first| runtimes.all(|runtime| runtime == *first))
+                .map_or(TransparencyPolicy::KeepAlpha, runtime_transparency_policy)
+                as usize;
+        }
+        let over_model = started.elapsed().as_nanos() as f64 / f64::from(rounds);
+        eprintln!(
+            "RESOLUTION_COST ns/call: over the mode's pools {over_pools:.0}, over the whole model {over_model:.0} (sink {sink})"
         );
     }
 

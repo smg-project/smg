@@ -176,10 +176,12 @@ impl MessagePreparationStage {
                     model_id,
                     self.wire_pools,
                 );
-                // The frames decode under the destination engine's own transparency rule.
+                // The frames decode under the destination engine's own
+                // transparency rule, resolved over the same legs as the dtype.
                 let transparency = multimodal::engine_transparency_policy(
                     &ctx.components.worker_registry,
                     model_id,
+                    self.wire_pools,
                 );
                 match multimodal::process_multimodal_plan(
                     media_plan,
