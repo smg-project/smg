@@ -1,8 +1,9 @@
 """The Python launcher's side of the gateway's command line.
 
-``RouterArgs`` carries every router setting the Rust core's ``Router`` takes,
-in a frozen positional order (new fields are appended at the end, never
-inserted: callers build it positionally). ``add_cli_args`` is the argparse
+``RouterArgs`` carries the router settings the launcher exposes (the Rust
+core's ``Router`` takes one more, the drain settle time, which the launcher
+leaves at its default), in a frozen positional order (new fields are appended
+at the end, never inserted: callers build it positionally). ``add_cli_args`` is the argparse
 mapping of those settings, one option per Rust CLI flag with the same name,
 default and second spelling, grouped as the CLI's help headings;
 ``from_cli_args`` reads a parsed namespace back into ``RouterArgs`` (with the
@@ -2521,7 +2522,10 @@ class RouterArgs:
     def _parse_selector(selector_list):
         """``key=value`` entries as ``{key: value}``: the label selectors, and
         ``--storage-context-headers``, whose key is the header name and whose
-        value is the context key (the same orientation as the Rust CLI's)."""
+        value is the context key (the same orientation as the Rust CLI's). A
+        token without ``=`` is skipped here where the Rust CLI refuses it, and
+        one argv item may carry several space-separated pairs: the launcher's
+        own allowances (smg-lab#431 tracks the first)."""
         if not selector_list:
             return {}
 
