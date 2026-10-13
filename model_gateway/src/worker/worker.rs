@@ -4026,16 +4026,22 @@ mod tests {
         let ops_per_sec = iterations as f64 / duration.as_secs_f64();
         eprintln!("Load counter operations per second: {ops_per_sec:.0}");
 
-        // An asked-for floor is an assertion; a malformed one is an error,
-        // not a silently skipped check.
-        if let Ok(floor) = std::env::var("SMG_TEST_LOAD_COUNTER_FLOOR") {
-            let floor: f64 = floor.parse().unwrap_or_else(|_| {
-                panic!("SMG_TEST_LOAD_COUNTER_FLOOR {floor:?} is not a number")
-            });
-            assert!(
-                ops_per_sec > floor,
-                "load counter: {ops_per_sec:.0} ops/s, under the asked-for floor of {floor:.0}"
-            );
+        // An asked-for floor is an assertion; an unreadable or malformed one
+        // is an error, not a silently skipped check: only an absent variable
+        // means no floor was asked for.
+        match std::env::var("SMG_TEST_LOAD_COUNTER_FLOOR") {
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("SMG_TEST_LOAD_COUNTER_FLOOR is unreadable: {error}"),
+            Ok(floor) => {
+                let floor: f64 = match floor.parse::<f64>() {
+                    Ok(floor) if floor.is_finite() => floor,
+                    _ => panic!("SMG_TEST_LOAD_COUNTER_FLOOR {floor:?} is not a finite number"),
+                };
+                assert!(
+                    ops_per_sec > floor,
+                    "load counter: {ops_per_sec:.0} ops/s, under the asked-for floor of {floor:.0}"
+                );
+            }
         }
     }
 
