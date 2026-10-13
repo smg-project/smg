@@ -171,9 +171,11 @@ fn a_held_listener_port_starts_no_mesh_member() {
         let [free_port, mesh_port, _] = free_ports();
         let (name, port, metrics_port, watch) = if hold_http_port {
             // The metrics and probe listeners are up when the HTTP bind
-            // fails (they bind earlier, by design): the mesh port alone is
-            // watched here.
-            ("port-held", held_port, free_port, vec![mesh_port])
+            // fails (they bind earlier, by design), and so is the mesh
+            // listener's socket, bound just before it and dropped with the
+            // failed start: no port is watched here; the log shows below
+            // that the mesh server never served from that socket.
+            ("port-held", held_port, free_port, vec![])
         } else {
             (
                 "metrics-port-held",
@@ -192,6 +194,11 @@ fn a_held_listener_port_starts_no_mesh_member() {
             &dir.path().join(format!("{name}.log")),
         );
         assert_refused(name, &launch, &["Address already in use"]);
+        assert!(
+            !launch.log.contains("Mesh server listening on"),
+            "{name}: the mesh server started although a listener port was held\n{}",
+            launch.log
+        );
         drop(held);
     }
 }
