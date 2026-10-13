@@ -107,12 +107,6 @@ impl UpstreamClass {
         }
     }
 
-    /// The class of a status the engine answered a dispatch with: the same
-    /// as after the first chunk ([`UpstreamClass::of`]).
-    pub(crate) fn of_dispatch(status: &tonic::Status) -> Self {
-        Self::of(status)
-    }
-
     /// Count a dispatch the worker answered `status` to, in the worker-error
     /// family under the worker's labels, when the status is the worker's
     /// failure: a refusal before the first token is the worker's exactly as
@@ -126,7 +120,7 @@ impl UpstreamClass {
         connection_mode: &'static str,
         status: &tonic::Status,
     ) {
-        Self::of_dispatch(status).account_worker_failure(worker_type, connection_mode);
+        Self::of(status).account_worker_failure(worker_type, connection_mode);
     }
 
     /// Count a stream `status` ended with against the worker that served it,
@@ -954,30 +948,14 @@ mod tests {
         );
     }
 
+    /// One classifier serves both sides of the first chunk: a cancelled
+    /// dispatch (the worker's side ending the call, its connection closed
+    /// under the leg's start) is the same cut by the engine's server as a
+    /// cancelled stream, a bad gateway the worker is charged for, never the
+    /// request's fault.
     #[test]
     fn a_dispatch_status_is_classed_as_the_same_status_after_the_first_chunk() {
-        for status in [
-            tonic::Status::unavailable("gone"),
-            tonic::Status::internal("broke"),
-            tonic::Status::internal(ENGINE_ERROR_MESSAGE),
-            tonic::Status::deadline_exceeded("too slow"),
-            tonic::Status::resource_exhausted("full"),
-            tonic::Status::invalid_argument("bad"),
-            tonic::Status::not_found("no such model"),
-            tonic::Status::cancelled("gone away"),
-        ] {
-            assert_eq!(
-                UpstreamClass::of_dispatch(&status),
-                UpstreamClass::of(&status),
-                "{status:?}"
-            );
-        }
-        // A cancelled dispatch is the worker's side ending the call (its
-        // connection closed under the leg's start), the same cut by the
-        // engine's server as after the first chunk: a bad gateway the worker
-        // is charged for, never the request's fault.
-        let cancelled =
-            UpstreamClass::of_dispatch(&tonic::Status::cancelled("operation was canceled"));
+        let cancelled = UpstreamClass::of(&tonic::Status::cancelled("operation was canceled"));
         assert_eq!(
             (
                 cancelled.http,
