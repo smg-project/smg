@@ -60,12 +60,7 @@ def reference_load(data: bytes) -> Image.Image:
 
 
 def png_chunk(kind: bytes, data: bytes) -> bytes:
-    return (
-        struct.pack(">I", len(data))
-        + kind
-        + data
-        + struct.pack(">I", zlib.crc32(kind + data))
-    )
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
 
 def png_16bit(samples: np.ndarray, colour_type: int, trns: bytes = b"") -> bytes:
@@ -73,11 +68,7 @@ def png_16bit(samples: np.ndarray, colour_type: int, trns: bytes = b"") -> bytes
     no 16-bit truecolour, so the file is assembled here (filter 0 rows)."""
     height, width = samples.shape[:2]
     rows = b"".join(b"\x00" + samples[y].astype(">u2").tobytes() for y in range(height))
-    chunks = [
-        png_chunk(
-            b"IHDR", struct.pack(">IIBBBBB", width, height, 16, colour_type, 0, 0, 0)
-        )
-    ]
+    chunks = [png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 16, colour_type, 0, 0, 0))]
     if trns:
         chunks.append(png_chunk(b"tRNS", trns))
     chunks += [png_chunk(b"IDAT", zlib.compress(rows, 6)), png_chunk(b"IEND", b"")]
@@ -99,9 +90,9 @@ def rgb16() -> bytes:
 def rgb16_trns() -> bytes:
     """16-bit truecolour with a colour key: the loader keeps the stored RGB."""
     v = sixteen_bit_samples()
-    rgb = np.stack(
-        [v, 65535 - v, (v.astype(np.uint32) * 7 + 128) % 65536], axis=-1
-    ).astype(np.uint16)
+    rgb = np.stack([v, 65535 - v, (v.astype(np.uint32) * 7 + 128) % 65536], axis=-1).astype(
+        np.uint16
+    )
     key = rgb[1, 5]
     return png_16bit(rgb, 2, struct.pack(">HHH", *(int(c) for c in key)))
 
