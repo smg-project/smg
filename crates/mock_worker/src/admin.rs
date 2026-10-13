@@ -70,7 +70,52 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/fail", post(fault_fail))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
+        // What a gRPC worker reports about itself, by port: whether its
+        // health check answers serving, and the info the gateway turns into
+        // labels. For beds that change an engine's reported settings between
+        // two health transitions.
+        .route("/admin/serving/{port}", get(serving_get).post(serving_set))
+        .route("/admin/info/{port}", get(info_get).post(info_patch))
         .with_state(state)
+}
+
+async fn serving_get(Path(port): Path<u16>) -> Json<Value> {
+    Json(json!({ "port": port, "serving": crate::overrides::for_port(port).serving() }))
+}
+
+/// Body `{"serving": true|false}`: whether the worker's gRPC health check
+/// answers healthy from now on.
+async fn serving_set(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
+    match body.get("serving").and_then(Value::as_bool) {
+        Some(serving) => {
+            crate::overrides::for_port(port).set_serving(serving);
+            Json(json!({ "port": port, "serving": serving })).into_response()
+        }
+        None => (StatusCode::BAD_REQUEST, "body: {\"serving\": true|false}").into_response(),
+    }
+}
+
+async fn info_get(Path(port): Path<u16>) -> Json<Value> {
+    Json(Value::Object(
+        crate::overrides::for_port(port)
+            .info()
+            .into_iter()
+            .collect(),
+    ))
+}
+
+/// Body: a JSON object merged into the info the worker reports (its gRPC
+/// `server_args`, and `supports_vision` of its model info); a `null` removes
+/// a key. Answers the info as it is now.
+async fn info_patch(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
+    match body.as_object() {
+        Some(patch) => {
+            let overrides = crate::overrides::for_port(port);
+            overrides.patch_info(patch);
+            Json(Value::Object(overrides.info().into_iter().collect())).into_response()
+        }
+        None => (StatusCode::BAD_REQUEST, "body: a JSON object").into_response(),
+    }
 }
 
 /// Serve the admin API on `port` until the process exits.

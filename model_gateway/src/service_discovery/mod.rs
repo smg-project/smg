@@ -24,7 +24,7 @@ mod provider;
 mod reconciler;
 mod runtime;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 pub use file::FileProviderConfig;
 #[cfg(feature = "test-util")]

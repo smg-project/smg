@@ -42,6 +42,14 @@ pub enum Job {
         url: String,
         update: Box<WorkerUpdateRequest>,
     },
+    /// Re-read a registered worker's labels from its engine and rebuild the
+    /// worker if they changed: the worker came into service, as a restarted
+    /// engine on the same address or one that finished loading after it was
+    /// registered on provisional information. Runs through the update
+    /// workflow.
+    RefreshWorkerLabels {
+        url: String,
+    },
     RemoveWorker {
         url: String,
         /// Per-worker revision guards keyed by registry worker id. A DP group
@@ -79,6 +87,7 @@ impl Job {
         match self {
             Job::AddWorker { .. } => "AddWorker",
             Job::UpdateWorker { .. } => "UpdateWorker",
+            Job::RefreshWorkerLabels { .. } => "RefreshWorkerLabels",
             Job::RemoveWorker { .. } => "RemoveWorker",
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
             Job::InitializeMcpServers { .. } => "InitializeMcpServers",
@@ -95,6 +104,7 @@ impl Job {
         match self {
             Job::AddWorker { config, .. } => &config.url,
             Job::UpdateWorker { url, .. } => url,
+            Job::RefreshWorkerLabels { url } => url,
             Job::RemoveWorker { url, .. } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
             Job::InitializeMcpServers { .. } => "startup",
@@ -438,6 +448,41 @@ impl JobQueue {
                 engines
                     .worker_update
                     .wait_for_completion(instance_id, url, timeout_duration)
+                    .await
+            }
+            Job::RefreshWorkerLabels { url } => {
+                let engines = context
+                    .workflow_engines
+                    .get()
+                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+
+                let mut workflow_data = create_worker_update_workflow_data(
+                    url.to_string(),
+                    WorkerUpdateRequest {
+                        priority: None,
+                        cost: None,
+                        labels: None,
+                        api_key: None,
+                        health: None,
+                    },
+                    Arc::clone(context),
+                );
+                workflow_data.refresh_discovered_labels = true;
+
+                let instance_id = engines
+                    .worker_update
+                    .start_workflow(WorkflowId::new("worker_update"), workflow_data)
+                    .await
+                    .map_err(|e| format!("Failed to start worker label refresh workflow: {e:?}"))?;
+
+                debug!(
+                    "Started worker label refresh workflow for {} (instance: {})",
+                    url, instance_id
+                );
+
+                engines
+                    .worker_update
+                    .wait_for_completion(instance_id, url, Duration::from_secs(30))
                     .await
             }
             Job::RemoveWorker {

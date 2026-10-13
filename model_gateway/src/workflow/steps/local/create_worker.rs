@@ -263,7 +263,18 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
                     .overload_defaults(overload_defaults)
-                    .labels(labels_for_rank(&labels, dp, &config.labels));
+                    .labels(labels_for_rank(&labels, dp, &config.labels))
+                    // The engine's report in this rank's space, sized by the
+                    // width the worker's own labels use, minus the keys the
+                    // operator's config sets: those are the operator's whatever
+                    // value they carry (the same value as the engine's
+                    // included), so a later refresh leaves them alone.
+                    .discovered_labels(
+                        report_for_rank(&context.data.discovered_labels, dp, &labels)
+                            .into_iter()
+                            .filter(|(key, _)| !config.labels.contains_key(key))
+                            .collect(),
+                    );
 
                 if let Some((rank, size)) = dp {
                     builder = builder.dp_config(rank, size);
@@ -818,8 +829,11 @@ fn validate_zmq_worker_type(
 /// A window the operator set by hand on the worker (`set_by_hand`, the
 /// spec's own labels, which win the merge) is the operator's statement
 /// about each rank worker and stays as set (`merge_labels` already made it
-/// the worker's only window); only a discovered window is shared.
-fn labels_for_rank(
+/// the worker's only window); only a discovered window is shared. The
+/// discovered record and a refresh's fresh labels pass through the same rule
+/// (with no operator labels), so a refresh compares like with like in rank
+/// space.
+pub(super) fn labels_for_rank(
     labels: &HashMap<String, String>,
     dp: Option<(usize, usize)>,
     set_by_hand: &HashMap<String, String>,
@@ -852,6 +866,38 @@ fn labels_for_rank(
     }
     labels
 }
+
+/// The engine's report `report` in a rank's space, with the attention-DP
+/// width read from `width_source` rather than from the report itself. A
+/// worker's labels and the record it keeps of the engine's share must agree
+/// on the width, and the worker's can come from the operator: a DP flag set
+/// in the config over an engine that does not report one, or reports it
+/// differently. The width labels themselves stay as the report has them.
+pub(super) fn report_for_rank(
+    report: &HashMap<String, String>,
+    dp: Option<(usize, usize)>,
+    width_source: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut sized = report.clone();
+    for key in DP_WIDTH_LABELS {
+        match width_source.get(key) {
+            Some(value) => sized.insert(key.to_string(), value.clone()),
+            None => sized.remove(key),
+        };
+    }
+    let mut mapped = labels_for_rank(&sized, dp, &HashMap::new());
+    for key in DP_WIDTH_LABELS {
+        match report.get(key) {
+            Some(value) => mapped.insert(key.to_string(), value.clone()),
+            None => mapped.remove(key),
+        };
+    }
+    mapped
+}
+
+/// The labels that size a rank's share of the engine's window
+/// (`attention_dp_width`).
+pub(super) const DP_WIDTH_LABELS: [&str; 2] = ["attn_dp_size", "enable_dp_attention"];
 
 /// How many attention-DP workers the engine's labels say its running window
 /// is split across, `None` for an engine that runs the whole window on every
@@ -926,8 +972,17 @@ mod tests {
     use super::*;
 
     fn make_app_context() -> Arc<crate::app_context::AppContext> {
+        app_context_with(
+            crate::config::RouterConfig::builder()
+                .worker_startup_timeout_secs(1)
+                .build_unchecked(),
+        )
+    }
+
+    fn app_context_with(
+        router_config: crate::config::RouterConfig,
+    ) -> Arc<crate::app_context::AppContext> {
         use crate::{
-            config::RouterConfig,
             middleware::{AuthConfig, TokenBucket},
             observability::inflight_tracker::InFlightRequestTracker,
             routers::{
@@ -937,9 +992,6 @@ mod tests {
             worker::WorkerService,
         };
 
-        let router_config = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .build_unchecked();
         let registry = Arc::new(WorkerRegistry::new());
         let job_queue = Arc::new(std::sync::OnceLock::new());
 
@@ -1040,6 +1092,154 @@ mod tests {
         assert_eq!(spec.labels["tier"], "gold");
         assert_eq!(spec.dp_rank, None);
         assert_eq!(spec.dp_size, None);
+    }
+
+    /// What a registration records as engine-discovered is the engine's
+    /// report minus every key the operator's config sets, whatever value the
+    /// config carries: a config label equal to the engine's value is still
+    /// the operator's, so a later refresh does not rewrite it as the engine's.
+    #[tokio::test]
+    async fn a_config_label_equal_to_the_engines_value_is_not_recorded_as_discovered() {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("http://worker:8000");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.labels = HashMap::from([
+            ("page_size".to_string(), "256".to_string()),
+            ("tier".to_string(), "gold".to_string()),
+        ]);
+
+        let mut data =
+            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.discovered_labels = HashMap::from([
+            ("page_size".to_string(), "256".to_string()),
+            ("max_num_seqs".to_string(), "8".to_string()),
+        ]);
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let worker = &ctx.data.actual_workers.as_ref().unwrap()[0];
+        let labels = &worker.metadata().spec.labels;
+        assert_eq!(labels["page_size"], "256");
+        assert_eq!(labels["tier"], "gold");
+        assert_eq!(labels["max_num_seqs"], "8");
+        assert_eq!(
+            *worker.metadata().discovered_labels,
+            HashMap::from([("max_num_seqs".to_string(), "8".to_string())])
+        );
+    }
+
+    /// On a dp-aware registration the engine's report is mapped to the rank's
+    /// space before the config's keys leave it: a DP label the config also
+    /// names still sizes the window share the record carries, so a later
+    /// refresh reads that share, not the whole engine window, as the engine's.
+    #[tokio::test]
+    async fn a_dp_label_the_config_also_sets_still_sizes_the_recorded_window_share() {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("http://worker:8000");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.labels = HashMap::from([("enable_dp_attention".to_string(), "true".to_string())]);
+        let router_config = crate::config::RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .dp_aware(true)
+            .build_unchecked();
+
+        let mut data = create_worker_workflow_data(
+            spec,
+            WorkerRegistrationMode::Upsert,
+            app_context_with(router_config),
+        );
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.discovered_labels = HashMap::from([
+            ("enable_dp_attention".to_string(), "true".to_string()),
+            ("max_running_requests".to_string(), "256".to_string()),
+        ]);
+        data.dp_info = Some(DpInfo {
+            dp_size: 8,
+            model_id: "m".to_string(),
+        });
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let workers = ctx.data.actual_workers.as_ref().unwrap();
+        assert_eq!(workers.len(), 8);
+        for worker in workers {
+            let labels = &worker.metadata().spec.labels;
+            assert_eq!(labels["enable_dp_attention"], "true");
+            assert_eq!(labels["max_running_requests"], "32");
+            assert_eq!(
+                *worker.metadata().discovered_labels,
+                HashMap::from([("max_running_requests".to_string(), "32".to_string())])
+            );
+        }
+    }
+
+    /// The width the worker's labels use sizes the record too when only the
+    /// config names it: an operator's DP flag over an engine that reports no
+    /// such label still leaves the engine's share, not its whole window, in
+    /// the record, so a refresh reads the share as the engine's.
+    #[tokio::test]
+    async fn a_dp_flag_only_the_config_sets_sizes_the_recorded_window_share_too() {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("http://worker:8000");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        spec.labels = HashMap::from([("enable_dp_attention".to_string(), "true".to_string())]);
+        let router_config = crate::config::RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .dp_aware(true)
+            .build_unchecked();
+
+        let mut data = create_worker_workflow_data(
+            spec,
+            WorkerRegistrationMode::Upsert,
+            app_context_with(router_config),
+        );
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Http);
+        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.discovered_labels =
+            HashMap::from([("max_running_requests".to_string(), "256".to_string())]);
+        data.dp_info = Some(DpInfo {
+            dp_size: 8,
+            model_id: "m".to_string(),
+        });
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let workers = ctx.data.actual_workers.as_ref().unwrap();
+        assert_eq!(workers.len(), 8);
+        for worker in workers {
+            assert_eq!(worker.metadata().spec.labels["max_running_requests"], "32");
+            assert_eq!(
+                *worker.metadata().discovered_labels,
+                HashMap::from([("max_running_requests".to_string(), "32".to_string())])
+            );
+        }
     }
 
     /// A loopback port nothing listens on.
