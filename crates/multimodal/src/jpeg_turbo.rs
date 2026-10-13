@@ -159,17 +159,83 @@ pub fn pil_cmyk_to_rgb(c: u8, m: u8, y: u8, k: u8) -> [u8; 3] {
 }
 
 /// Convert a packed CMYK8 buffer (as decoded by libjpeg) to packed RGB8, PIL's
-/// way, pixel by pixel, in place: pixel `i` is read from `4i..4i+4` before
-/// `3i..3i+3` is written, so no unread byte is overwritten, and the decoded
-/// buffer stays the one allocation `MAX_DECODED_BYTES` bounds.
+/// way, in place: pixel `i` is read from `4i..4i+4` before `3i..3i+3` is
+/// written, so no unread byte is overwritten and the decoded buffer stays the
+/// one allocation `MAX_DECODED_BYTES` bounds. On AArch64 the vector unit does
+/// sixteen pixels at a time with the same arithmetic in 16-bit lanes; the
+/// rest, and every other target, is the formula pixel by pixel.
 fn cmyk_to_rgb_like_pil(mut buf: Vec<u8>) -> Vec<u8> {
     let pixels = buf.len() / 4;
-    for i in 0..pixels {
+    #[cfg(target_arch = "aarch64")]
+    let start = neon::convert_in_place(&mut buf[..4 * pixels]);
+    #[cfg(not(target_arch = "aarch64"))]
+    let start = 0;
+    for i in start..pixels {
         let [c, m, y, k] = [buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]];
         buf[3 * i..3 * i + 3].copy_from_slice(&pil_cmyk_to_rgb(c, m, y, k));
     }
     buf.truncate(pixels * 3);
     buf
+}
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use core::arch::aarch64::{
+        uint16x8_t, uint8x16_t, uint8x16x3_t, vaddq_u16, vcombine_u8, vdupq_n_u16, vget_low_u8,
+        vld4q_u8, vmlal_high_u8, vmlal_u8, vshrn_n_u16, vshrq_n_u16, vst3q_u8,
+    };
+
+    /// The leading whole blocks of sixteen CMYK pixels of `buf` (`4 * n`
+    /// bytes) converted in place to RGB at `3i`; returns the pixels done, the
+    /// rest (fewer than sixteen) is the caller's. Zero on a core without the
+    /// vector unit.
+    pub(super) fn convert_in_place(buf: &mut [u8]) -> usize {
+        if !std::arch::is_aarch64_feature_detected!("neon") {
+            return 0;
+        }
+        // SAFETY: the vector unit was detected just above.
+        unsafe { convert_blocks(buf) }
+    }
+
+    /// `MULDIV255(ink, k)` on sixteen pixels in 16-bit lanes: `ink * k + 128`
+    /// is at most 65,153 and `t + (t >> 8)` at most 65,407, both within a
+    /// `u16`, and the high byte of the latter is the scalar formula's value.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn muldiv255(ink: uint8x16_t, k: uint8x16_t) -> uint8x16_t {
+        let bias: uint16x8_t = vdupq_n_u16(128);
+        let low = vmlal_u8(bias, vget_low_u8(ink), vget_low_u8(k));
+        let high = vmlal_high_u8(bias, ink, k);
+        let low = vaddq_u16(low, vshrq_n_u16::<8>(low));
+        let high = vaddq_u16(high, vshrq_n_u16::<8>(high));
+        vcombine_u8(vshrn_n_u16::<8>(low), vshrn_n_u16::<8>(high))
+    }
+
+    #[target_feature(enable = "neon")]
+    fn convert_blocks(buf: &mut [u8]) -> usize {
+        let pixels = buf.len() / 4;
+        let full = pixels - pixels % 16;
+        let base = buf.as_mut_ptr();
+        let mut i = 0;
+        while i < full {
+            // SAFETY: `i + 16 <= full <= pixels`, so the 64 bytes read at
+            // `4 * i` and the 48 bytes written at `3 * i` (which end before
+            // `4 * i + 64`) lie within `buf`; the read completes before the
+            // write, so their overlap within this block is harmless, and no
+            // pixel still to be read is overwritten.
+            unsafe {
+                let pixel = vld4q_u8(base.add(4 * i).cast_const());
+                let rgb = uint8x16x3_t(
+                    muldiv255(pixel.0, pixel.3),
+                    muldiv255(pixel.1, pixel.3),
+                    muldiv255(pixel.2, pixel.3),
+                );
+                vst3q_u8(base.add(3 * i), rgb);
+            }
+            i += 16;
+        }
+        full
+    }
 }
 
 /// Whether libjpeg-turbo was found, so JPEGs decode to PIL's pixels.
@@ -302,6 +368,43 @@ mod tests {
 
     /// The shortcut `MULDIV255(C, K)` is PIL's `CMYK;I` inversion followed by
     /// `cmyk2rgb`, written out literally, on every pair of bytes.
+    /// The buffer conversion is the pixel formula on every pixel, for every
+    /// pixel count around and across the vector block size, tails included.
+    #[test]
+    fn cmyk_to_rgb_like_pil_converts_every_pixel_whatever_the_count() {
+        for pixels in (0..=300).chain([511, 512, 513, 1000, 4096 + 7]) {
+            let cmyk: Vec<u8> = (0..pixels * 4)
+                .map(|j| ((j * 97 + 13) ^ (j >> 3)) as u8)
+                .collect();
+            let expected: Vec<u8> = cmyk
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| pil_cmyk_to_rgb(p[0], p[1], p[2], p[3]))
+                .collect();
+            assert_eq!(cmyk_to_rgb_like_pil(cmyk), expected, "{pixels} pixels");
+        }
+    }
+
+    /// Every `(ink, k)` byte pair through the buffer conversion (the vector
+    /// path on AArch64), against the pixel formula.
+    #[test]
+    fn cmyk_to_rgb_like_pil_agrees_with_the_formula_on_every_ink_and_k() {
+        let cmyk: Vec<u8> = (0..=255u8)
+            .flat_map(|k| {
+                (0..=255u8)
+                    .flat_map(move |ink| [ink, ink.wrapping_add(85), ink.wrapping_add(170), k])
+            })
+            .collect();
+        let expected: Vec<u8> = cmyk
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| pil_cmyk_to_rgb(p[0], p[1], p[2], p[3]))
+            .collect();
+        assert_eq!(cmyk_to_rgb_like_pil(cmyk), expected);
+    }
+
     #[test]
     fn pil_cmyk_to_rgb_equals_pils_literal_formula_on_every_byte_pair() {
         fn muldiv255(a: i32, b: i32) -> i32 {
