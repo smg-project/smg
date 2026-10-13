@@ -48,7 +48,11 @@ from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
-from smg_grpc_servicer.sglang.loads import convert_loads_to_protobuf, load_record
+from smg_grpc_servicer.sglang.loads import (
+    convert_loads_to_protobuf,
+    effective_running_window,
+    load_record,
+)
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
@@ -122,6 +126,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     Standalone gRPC service implementation using GrpcRequestManager.
     Fully separated from HTTP server with its own process and no shared globals.
     """
+
+    # The running window the schedulers computed, once a load snapshot has
+    # shown it (the bound does not change for the engine's lifetime); 0 until
+    # then. See `_running_window`.
+    _computed_running_window: int = 0
 
     def __init__(
         self,
@@ -517,6 +526,17 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 self.server_args, sglang_structured_outputs_start(self.server_args)
             )
         )
+        # The gateway reads this worker's running window (its PD admission
+        # bound, its share of the fleet's capacity) from `max_running_requests`
+        # here, which is None unless the operator set the flag: the scheduler
+        # then computes the bound itself and publishes it with its load
+        # snapshots. Report the bound the scheduler enforces under the
+        # argument's name, so a default start advertises the window a flag
+        # would; the operator's flag, when set, stays the figure reported.
+        if not serializable_args.get("max_running_requests"):
+            window = self._running_window()
+            if window > 0:
+                serializable_args["max_running_requests"] = window
         server_args_struct.update(serializable_args)
 
         # Convert scheduler_info to Struct
@@ -545,6 +565,33 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             start_time=start_timestamp,
             max_total_num_tokens=self.scheduler_info.get("max_total_num_tokens", 0),
         )
+
+    def _running_window(self) -> int:
+        """The running window the schedulers enforce: the operator's
+        `--max-running-requests` when set, else the figure the schedulers
+        publish in their load snapshots (cached once seen), else 0 (no
+        snapshot published yet, or a request manager without the reader)."""
+        configured = getattr(self.server_args, "max_running_requests", None)
+        if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+            return configured
+        if self._computed_running_window > 0:
+            return self._computed_running_window
+        reader = getattr(self.request_manager, "load_snapshot_reader", None)
+        if reader is None:
+            return 0
+        try:
+            snapshots = reader.read_all()
+        except Exception as e:  # noqa: BLE001 - the window is advisory; GetServerInfo must answer
+            logger.debug("load snapshots unreadable while resolving the running window: %s", e)
+            return 0
+        window = effective_running_window(snapshots)
+        if window > 0:
+            self._computed_running_window = window
+            logger.info(
+                "max_running_requests is unset: reporting the scheduler's computed window %d",
+                window,
+            )
+        return window
 
     async def GetLoads(
         self,

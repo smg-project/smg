@@ -32,6 +32,29 @@ def _first_attr(obj: Any, names: tuple[str, ...], default: Any = 0) -> Any:
     return default
 
 
+def effective_running_window(snapshots: Iterable[Any]) -> int:
+    """The running window the schedulers enforce, read off their published
+    load snapshots: the smallest positive ``max_running_requests`` across the
+    ranks (one rank's bound is the bound a request meets), or 0 while no rank
+    has published one.
+
+    The server argument of the same name is ``None`` unless the operator set
+    ``--max-running-requests``; the scheduler then computes the bound itself
+    (from its memory pool, capped by its state cache) and the gateway, which
+    reads the window off the server arguments, saw none: its PD admission
+    gate stayed off for the worker and its fleet capacity fell back to an
+    estimate. The snapshot carries the computed figure, the one ``GetLoads``
+    already reports.
+    """
+    windows = []
+    for snapshot in snapshots:
+        window = getattr(snapshot, "max_running_requests", 0)
+        if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+            continue
+        windows.append(window)
+    return min(windows, default=0)
+
+
 def convert_loads_to_protobuf(result: LoadSnapshot) -> sglang_scheduler_pb2.SchedulerLoad:
     """Convert a LoadSnapshot to a protobuf SchedulerLoad message."""
     scheduler_load = sglang_scheduler_pb2.SchedulerLoad(

@@ -88,15 +88,74 @@ class _OlderServerArgs(msgspec.Struct):
     model_path: str = "org/model"
 
 
-def _server_info(servicer_mod, server_args):
+class _WindowServerArgs(msgspec.Struct):
+    """Server arguments with the running-window flag, None unless set."""
+
+    model_path: str = "org/model"
+    max_running_requests: int | None = None
+
+
+def _servicer(servicer_mod, server_args, **request_manager):
     servicer = servicer_mod.SGLangSchedulerServicer.__new__(servicer_mod.SGLangSchedulerServicer)
     servicer.server_args = server_args
     servicer.scheduler_info = {}
     servicer.start_time = 0.0
     servicer.request_manager = SimpleNamespace(
-        get_server_info=lambda: {"active_requests": 0, "paused": False, "last_receive_time": 0.0}
+        get_server_info=lambda: {"active_requests": 0, "paused": False, "last_receive_time": 0.0},
+        **request_manager,
     )
+    return servicer
+
+
+def _info(servicer):
     return asyncio.run(servicer.GetServerInfo(sglang_scheduler_pb2.GetServerInfoRequest(), None))
+
+
+def _server_info(servicer_mod, server_args):
+    return _info(_servicer(servicer_mod, server_args))
+
+
+def _snapshots(*windows):
+    return [
+        SimpleNamespace(dp_rank=rank, max_running_requests=window)
+        for rank, window in enumerate(windows)
+    ]
+
+
+def test_server_info_reports_the_window_the_scheduler_computed_when_the_flag_is_unset(
+    servicer_mod, monkeypatch
+):
+    """The gateway reads the worker's running window (its PD admission bound) off
+    `max_running_requests`; unset, the scheduler computes one and publishes it
+    with its load snapshots, and that figure is what the servicer reports."""
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    reader = SimpleNamespace(read_all=lambda: _snapshots(1574))
+    computed = _servicer(servicer_mod, _WindowServerArgs(), load_snapshot_reader=reader)
+    assert _info(computed).server_args["max_running_requests"] == 1574
+
+    # The operator's flag stays the figure reported, whatever the scheduler publishes.
+    explicit = _servicer(
+        servicer_mod, _WindowServerArgs(max_running_requests=8), load_snapshot_reader=reader
+    )
+    assert _info(explicit).server_args["max_running_requests"] == 8
+
+
+def test_server_info_reports_the_window_once_a_snapshot_is_published(servicer_mod, monkeypatch):
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    published = []
+    reader = SimpleNamespace(read_all=lambda: list(published))
+    servicer = _servicer(servicer_mod, _WindowServerArgs(), load_snapshot_reader=reader)
+    # Before the schedulers' first snapshot the argument is reported as it is.
+    assert _info(servicer).server_args["max_running_requests"] is None
+    published.extend(_snapshots(0, 314))
+    assert _info(servicer).server_args["max_running_requests"] == 314
+    # Cached from then on: the bound does not change for the engine's lifetime.
+    published.clear()
+    assert _info(servicer).server_args["max_running_requests"] == 314
+
+    # A request manager without the reader (an older layout) reports as before.
+    bare = _server_info(servicer_mod, _WindowServerArgs())
+    assert bare.server_args["max_running_requests"] is None
 
 
 def test_server_info_carries_where_the_engine_starts_a_grammar(servicer_mod, monkeypatch):

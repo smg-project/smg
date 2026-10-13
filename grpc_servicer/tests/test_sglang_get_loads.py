@@ -85,6 +85,26 @@ class TestDisaggregationMetrics:
         assert not load.HasField("disaggregation")
 
 
+class TestEffectiveRunningWindow:
+    """The window the schedulers enforce, off their published snapshots (the
+    figure `GetServerInfo` reports when `--max-running-requests` is unset)."""
+
+    def test_the_smallest_published_window_is_the_bound(self, loads_mod):
+        first, second = _snapshot(None), _snapshot(None)
+        first.max_running_requests, second.max_running_requests = 1574, 314
+        second.dp_rank = 1
+        assert loads_mod.effective_running_window([first, second]) == 314
+
+    def test_no_snapshot_or_no_figure_means_no_window(self, loads_mod):
+        unset = _snapshot(None)
+        unset.max_running_requests = 0
+        assert loads_mod.effective_running_window([]) == 0
+        assert loads_mod.effective_running_window([unset]) == 0
+        # A rank that has not computed one yet does not hide its peers' bound.
+        published = _snapshot(None)
+        assert loads_mod.effective_running_window([unset, published]) == 8
+
+
 class TestLoadRecord:
     """The record the KV-event stream carries: the published snapshot of the
     batch's rank, converted as GetLoads converts it."""
