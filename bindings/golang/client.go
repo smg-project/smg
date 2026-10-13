@@ -297,9 +297,9 @@ type StreamChoice struct {
 
 // MessageDelta represents incremental message updates
 type MessageDelta struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	ToolCalls []ToolCallDelta `json:"tool_calls,omitempty"`
 }
 
 // CreateChatCompletion creates a non-streaming chat completion with context support.
@@ -332,7 +332,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 	defer stream.Close()
 
 	var fullContent strings.Builder
-	var fullToolCalls []ToolCall
+	var toolCalls toolCallAssembler
 	var finishReason string
 	var usage Usage
 	var responseID string
@@ -371,9 +371,7 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 			if choice.Delta.Content != "" {
 				fullContent.WriteString(choice.Delta.Content)
 			}
-			if len(choice.Delta.ToolCalls) > 0 {
-				fullToolCalls = append(fullToolCalls, choice.Delta.ToolCalls...)
-			}
+			toolCalls.add(choice.Delta.ToolCalls)
 			if choice.FinishReason != "" {
 				finishReason = choice.FinishReason
 			}
@@ -385,11 +383,9 @@ func (c *Client) CreateChatCompletion(ctx context.Context, req ChatCompletionReq
 	}
 
 	message := Message{
-		Role:    "assistant",
-		Content: fullContent.String(),
-	}
-	if len(fullToolCalls) > 0 {
-		message.ToolCalls = fullToolCalls
+		Role:      "assistant",
+		Content:   fullContent.String(),
+		ToolCalls: toolCalls.toolCalls(),
 	}
 
 	if finishReason == "" {
