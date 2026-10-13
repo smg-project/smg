@@ -298,7 +298,14 @@ fn process(
         EncoderInput::U8 { patches, .. } => {
             Some(patches.as_standard_layout().iter().copied().collect())
         }
-        EncoderInput::F32(_) => None,
+        // A wire input holds the same patch layout, already in the destination's
+        // dtype: the bytes are the pixel values themselves only for a u8 wire.
+        EncoderInput::Wire {
+            bytes,
+            dtype: EncoderDtype::Uint8,
+            ..
+        } => Some(bytes.clone()),
+        EncoderInput::Wire { .. } | EncoderInput::F32(_) => None,
     };
     Ok(Artifacts {
         width,
