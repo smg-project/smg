@@ -212,6 +212,10 @@ type ChatMessage struct {
 	Role    string      `json:"role"`
 	Content interface{} `json:"content"`
 	Name    string      `json:"name,omitempty"`
+	// Tools declared on this message (a system or developer message, for the
+	// provider profiles that define them); they stand next to the request's
+	// Tools for the tool-choice constraint and the response parser.
+	Tools []Tool `json:"tools,omitempty"`
 }
 
 // Tool represents a tool/function that can be called

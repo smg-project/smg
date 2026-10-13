@@ -45,7 +45,7 @@ use super::{
     runtime::RUNTIME,
     stream::SglangStreamHandle,
     tokenizer::TokenizerHandle,
-    tool_constraint::tool_constraint_for,
+    tool_constraint::{effective_tools_json, tool_constraint_for},
     utils::chat_requires_reasoning,
 };
 
@@ -675,10 +675,9 @@ pub unsafe extern "C" fn sgl_multi_client_chat_completion_stream(
 
     // Create response converter
     // Use and_then with CString::new to safely handle potential null bytes in JSON strings
-    let tools_json = chat_request
-        .tools
-        .as_ref()
-        .and_then(|t| serde_json::to_string(t).ok())
+    // The tools the response parser resolves calls against: request-level and
+    // message-declared, the set the constraint was built from.
+    let tools_json = effective_tools_json(&chat_request)
         .and_then(|s| CString::new(s).ok())
         .map(|s| s.into_raw());
     let tool_choice_json = chat_request

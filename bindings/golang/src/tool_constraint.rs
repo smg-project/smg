@@ -1,4 +1,6 @@
-//! The decoding constraint of a request's tool choice.
+//! The tools of a request as the bindings read them: the decoding constraint
+//! of its tool choice, and the tool list its response parser resolves calls
+//! against.
 
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -8,27 +10,48 @@ use tool_parser::ToolConstraint;
 
 use super::runtime::PARSER_FACTORY;
 
+/// Every tool the model sees: the request-level `tools` followed by the tools
+/// declared on messages, as the request's provider profile defines them (the
+/// gateway's `effective_tools`). The constraint and the response parser both
+/// work from this set, so a forced call can land on a message-declared tool
+/// and a call to one comes back as a call, not as text.
+fn effective_tools(request: &ChatCompletionRequest) -> Vec<Tool> {
+    request.effective_tools().cloned().collect()
+}
+
+/// The tools the response parser resolves calls against, as the JSON array
+/// the converter takes; `None` when the request declares none.
+pub(crate) fn effective_tools_json(request: &ChatCompletionRequest) -> Option<String> {
+    let tools = effective_tools(request);
+    if tools.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&tools).ok()
+}
+
 /// The constraint the engine is held to for the request's tool choice, built
-/// from the request's tools narrowed by the choice (the named function, an
-/// allowed-tools list), the way the gateway's preparation stage narrows the
-/// tools it constrains with; the bindings' response parser reads the same
-/// request-level tools. Built from `tools` as a whole, a named choice is
-/// constrained with the first tool's schema. `None` when the request has no
-/// tools or its choice forces no call; an error when the choice narrows the
-/// tools to none (a function the request does not declare, an allowed-tools
-/// list naming none of them), which the gateway's validation rejects.
+/// from the request's effective tools narrowed by the choice (the named
+/// function, an allowed-tools list), the gateway's callable set. Built from
+/// `tools` as a whole, a named choice is constrained with the first tool's
+/// schema. `None` when the request declares no tool or its choice forces no
+/// call; an error when the choice narrows the tools to none (a function the
+/// request does not declare, an allowed-tools list naming none of them),
+/// which the gateway's validation rejects.
 pub(crate) fn tool_constraint_for(
     request: &ChatCompletionRequest,
 ) -> Result<Option<ToolConstraint>, String> {
-    let (Some(tools), Some(tool_choice)) = (request.tools.as_ref(), request.tool_choice.as_ref())
-    else {
+    let Some(tool_choice) = request.tool_choice.as_ref() else {
         return Ok(None);
     };
-    let narrowed = tool_choice.narrow_tools(tools);
+    let tools = effective_tools(request);
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    let narrowed = tool_choice.narrow_tools(&tools);
     let tools: &[Tool] = match &narrowed {
         Some(narrowed) if narrowed.is_empty() => return Err(narrowed_to_none(tool_choice)),
         Some(narrowed) => narrowed,
-        None => tools,
+        None => &tools,
     };
     // No parser is configured here, so the registry falls back to a JSON
     // schema, which carries no reasoning prefix.
@@ -75,11 +98,43 @@ mod tests {
         .unwrap()
     }
 
+    /// A request for a provider profile that declares tools on messages:
+    /// `get_weather` on a system message, `tools` as given at the request
+    /// level (a list, or null for none).
+    fn request_with_message_tool(tools: Value, tool_choice: Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [
+                    {"type": "function", "function": {"name": "get_weather", "parameters":
+                        {"type": "object", "properties": {"city": {"type": "string"}}}}}
+                ]},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": tools,
+            "tool_choice": tool_choice
+        }))
+        .unwrap()
+    }
+
+    fn time_tool() -> Value {
+        json!([{"type": "function", "function": {"name": "get_time", "parameters":
+            {"type": "object", "properties": {"zone": {"type": "string"}}}}}])
+    }
+
     fn schema_of(request: &ChatCompletionRequest) -> Value {
         match tool_constraint_for(request).unwrap() {
             Some(ToolConstraint::JsonSchema(schema)) => serde_json::from_str(&schema).unwrap(),
             other => panic!("expected a JSON schema constraint, got {other:?}"),
         }
+    }
+
+    fn tool_names(json: &str) -> Vec<String> {
+        serde_json::from_str::<Vec<Tool>>(json)
+            .unwrap()
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect()
     }
 
     /// A choice naming the second tool is constrained with that tool's
@@ -127,5 +182,56 @@ mod tests {
         }));
         let error = tool_constraint_for(&allowed).unwrap_err();
         assert!(error.contains("not found in 'tools'"), "{error}");
+    }
+
+    /// `required` constrains to every tool the model sees: the request-level
+    /// one and the message-declared one.
+    #[test]
+    fn a_required_choice_keeps_a_message_declared_tool() {
+        let schema =
+            schema_of(&request_with_message_tool(time_tool(), json!("required"))).to_string();
+        assert!(
+            schema.contains("get_time") && schema.contains("get_weather"),
+            "{schema}"
+        );
+    }
+
+    /// A choice naming a message-declared tool is constrained with its schema.
+    #[test]
+    fn a_choice_naming_a_message_declared_tool_is_constrained_with_its_schema() {
+        let schema = schema_of(&request_with_message_tool(
+            time_tool(),
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+        ));
+        assert_eq!(
+            schema,
+            json!({"type": "object", "properties": {"city": {"type": "string"}}})
+        );
+    }
+
+    /// A request whose only tool is message-declared is constrained too.
+    #[test]
+    fn a_request_whose_only_tool_is_message_declared_is_constrained() {
+        let schema =
+            schema_of(&request_with_message_tool(Value::Null, json!("required"))).to_string();
+        assert!(schema.contains("get_weather"), "{schema}");
+    }
+
+    /// The response parser's tool list is the same set: the request-level
+    /// tools first, then the message-declared ones; none when the request
+    /// declares none.
+    #[test]
+    fn the_parser_tools_include_the_message_declared_tool() {
+        let json =
+            effective_tools_json(&request_with_message_tool(time_tool(), json!("auto"))).unwrap();
+        assert_eq!(tool_names(&json), ["get_time", "get_weather"]);
+        let json =
+            effective_tools_json(&request_with_message_tool(Value::Null, json!("auto"))).unwrap();
+        assert_eq!(tool_names(&json), ["get_weather"]);
+        let none: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "kimi-k3", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(effective_tools_json(&none).is_none());
     }
 }

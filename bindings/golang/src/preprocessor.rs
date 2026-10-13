@@ -21,7 +21,7 @@ use super::{
     error::{set_error_message, SglErrorCode},
     memory::{sgl_free_string, sgl_free_token_ids},
     tokenizer::TokenizerHandle,
-    tool_constraint::tool_constraint_for,
+    tool_constraint::{effective_tools_json, tool_constraint_for},
     utils::chat_requires_reasoning,
 };
 
@@ -30,6 +30,7 @@ struct PreprocessResult {
     prompt_text: CString,
     token_ids: Vec<u32>,
     tool_constraints: Option<CString>,
+    tools_json: Option<CString>,
     prompt_tokens: i32,
 }
 
@@ -84,6 +85,18 @@ fn preprocess_impl(
         }
     };
 
+    // The tools the response parser resolves calls against (request-level and
+    // message-declared), for the caller's converter.
+    let tools_json = match effective_tools_json(chat_request) {
+        Some(json) => Some(CString::new(json).map_err(|e| {
+            (
+                SglErrorCode::MemoryError,
+                format!("Failed to create C string: {e}"),
+            )
+        })?),
+        None => None,
+    };
+
     // Create prompt text CString
     let prompt_text = CString::new(processed_messages.text).map_err(|e| {
         (
@@ -96,6 +109,7 @@ fn preprocess_impl(
         prompt_text,
         token_ids,
         tool_constraints,
+        tools_json,
         prompt_tokens,
     })
 }
@@ -110,6 +124,7 @@ unsafe fn write_preprocess_outputs(
     token_ids_out: *mut *mut c_uint,
     token_ids_len_out: *mut usize,
     tool_constraints_json_out: *mut *mut c_char,
+    tools_json_out: *mut *mut c_char,
     prompt_tokens_out: *mut c_int,
 ) {
     *prompt_text_out = result.prompt_text.into_raw();
@@ -129,6 +144,13 @@ unsafe fn write_preprocess_outputs(
             .map(|c| c.into_raw())
             .unwrap_or(ptr::null_mut());
     }
+
+    if !tools_json_out.is_null() {
+        *tools_json_out = result
+            .tools_json
+            .map(|t| t.into_raw())
+            .unwrap_or(ptr::null_mut());
+    }
 }
 
 /// Preprocess a chat completion request
@@ -145,6 +167,7 @@ unsafe fn write_preprocess_outputs(
 /// * `token_ids_out` - Pointer to receive token IDs array (must be freed with sgl_free_token_ids)
 /// * `token_ids_len_out` - Pointer to receive token IDs array length
 /// * `tool_constraints_json_out` - Optional pointer to receive tool constraints JSON (must be freed with sgl_free_string)
+/// * `tools_json_out` - Optional pointer to receive the tools the response parser resolves calls against, request-level and message-declared, as JSON (freed by sgl_preprocessed_request_free)
 /// * `prompt_tokens_out` - Pointer to receive prompt token count
 /// * `error_out` - Optional pointer to receive error message
 ///
@@ -155,6 +178,7 @@ unsafe fn write_preprocess_outputs(
 /// - `request_json` and `tokenizer_path` must be valid null-terminated C strings
 /// - `prompt_text_out`, `token_ids_out`, `token_ids_len_out`, `prompt_tokens_out` must be valid pointers
 /// - `tool_constraints_json_out` may be null; if non-null, must point to writable memory
+/// - `tools_json_out` may be null; if non-null, must point to writable memory
 /// - `error_out` may be null; if non-null, must point to writable memory
 /// - Caller must free allocated strings with `sgl_free_string` and token IDs with `sgl_free_token_ids`
 #[no_mangle]
@@ -165,6 +189,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
     token_ids_out: *mut *mut c_uint,
     token_ids_len_out: *mut usize,
     tool_constraints_json_out: *mut *mut c_char,
+    tools_json_out: *mut *mut c_char,
     prompt_tokens_out: *mut c_int,
     error_out: *mut *mut c_char,
 ) -> SglErrorCode {
@@ -219,6 +244,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
                 token_ids_out,
                 token_ids_len_out,
                 tool_constraints_json_out,
+                tools_json_out,
                 prompt_tokens_out,
             );
             SglErrorCode::Success
@@ -243,6 +269,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
 /// * `token_ids_out` - Pointer to receive token IDs array (must be freed with sgl_free_token_ids)
 /// * `token_ids_len_out` - Pointer to receive token IDs array length
 /// * `tool_constraints_json_out` - Optional pointer to receive tool constraints JSON (must be freed with sgl_free_string)
+/// * `tools_json_out` - Optional pointer to receive the tools the response parser resolves calls against, request-level and message-declared, as JSON (freed by sgl_preprocessed_request_free)
 /// * `prompt_tokens_out` - Pointer to receive prompt token count
 /// * `error_out` - Optional pointer to receive error message
 ///
@@ -254,6 +281,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
 /// - `tokenizer_handle` must be a valid pointer returned by `sgl_tokenizer_create`
 /// - `prompt_text_out`, `token_ids_out`, `token_ids_len_out`, `prompt_tokens_out` must be valid pointers
 /// - `tool_constraints_json_out` may be null; if non-null, must point to writable memory
+/// - `tools_json_out` may be null; if non-null, must point to writable memory
 /// - `error_out` may be null; if non-null, must point to writable memory
 /// - Caller must free allocated strings with `sgl_free_string` and token IDs with `sgl_free_token_ids`
 #[no_mangle]
@@ -264,6 +292,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request_with_tokenizer(
     token_ids_out: *mut *mut c_uint,
     token_ids_len_out: *mut usize,
     tool_constraints_json_out: *mut *mut c_char,
+    tools_json_out: *mut *mut c_char,
     prompt_tokens_out: *mut c_int,
     error_out: *mut *mut c_char,
 ) -> SglErrorCode {
@@ -304,6 +333,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request_with_tokenizer(
                 token_ids_out,
                 token_ids_len_out,
                 tool_constraints_json_out,
+                tools_json_out,
                 prompt_tokens_out,
             );
             SglErrorCode::Success
@@ -325,6 +355,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request_with_tokenizer(
 /// - `token_ids` must be a valid pointer allocated by `sgl_preprocess_chat_request`, or null
 /// - `token_ids_len` must match the actual length of the `token_ids` array
 /// - `tool_constraints_json` must be a valid pointer allocated by `sgl_preprocess_chat_request`, or null
+/// - `tools_json` must be a valid pointer allocated by `sgl_preprocess_chat_request`, or null
 /// - These pointers must not be used after this call
 #[no_mangle]
 pub unsafe extern "C" fn sgl_preprocessed_request_free(
@@ -332,6 +363,7 @@ pub unsafe extern "C" fn sgl_preprocessed_request_free(
     token_ids: *mut c_uint,
     token_ids_len: usize,
     tool_constraints_json: *mut c_char,
+    tools_json: *mut c_char,
 ) {
     if !prompt_text.is_null() {
         sgl_free_string(prompt_text);
@@ -343,6 +375,10 @@ pub unsafe extern "C" fn sgl_preprocessed_request_free(
 
     if !tool_constraints_json.is_null() {
         sgl_free_string(tool_constraints_json);
+    }
+
+    if !tools_json.is_null() {
+        sgl_free_string(tools_json);
     }
 }
 

@@ -220,11 +220,10 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC stream: %w", err)
 	}
-	toolsJSON := ""
-	if tools, ok := reqMap["tools"].([]interface{}); ok && len(tools) > 0 {
-		toolsBytes, _ := json.Marshal(tools)
-		toolsJSON = string(toolsBytes)
-	}
+	// The tools the response parser resolves calls against: the request-level
+	// tools and the tools declared on messages, as the preprocessor resolved
+	// them (the set its constraint was built from).
+	toolsJSON := preprocessed.ToolsJSON
 
 	toolChoiceJSON := ""
 	if toolChoice, ok := reqMap["tool_choice"]; ok {
