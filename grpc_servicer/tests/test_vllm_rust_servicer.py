@@ -1052,7 +1052,7 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     supervised: dict = {}
 
@@ -1060,7 +1060,7 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
         supervised["server"], supervised["engine"] = server, engine
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     args = argparse.Namespace(
         model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
     )
@@ -1115,7 +1115,7 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     _stub_engine_exceptions(monkeypatch)
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     constructed: dict = {}
 
@@ -1123,7 +1123,7 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
         constructed["kwargs"] = server.kwargs
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     args = argparse.Namespace(
         model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
     )
@@ -1188,7 +1188,7 @@ def _run_supervise(server, engine, *, before, drain_secs=0.0):
     async def run():
         stop = asyncio.Event()
         task = asyncio.create_task(
-            rust.supervise(
+            rust_lifecycle.supervise(
                 server,
                 engine,
                 drain_secs=drain_secs,
@@ -1413,7 +1413,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
 
     monkeypatch.setattr(rust, "launch_engine_cores", fake_launch)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
     monkeypatch.setattr(sys, "argv", ["vllm", "serve", "org/m", "--grpc", "--port", "50051"])
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     monkeypatch.setenv("SMG_VLLM_SERVICER_DRAIN_SECS", "0")
@@ -1422,7 +1422,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
         recorded["supervised"] = (server, engine, drain_secs)
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
 
     args = argparse.Namespace(
         model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096

@@ -666,7 +666,7 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         supervised["server"], supervised["engine"] = server, engine
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     args = _preparable_args(recorded)
 
     assert asyncio.run(rust.serve_rust(args)) == 0
@@ -708,7 +708,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
         assert isinstance(server, FakeServer) and engine == "engine"
         return 7
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     args = _server_args()
     assert asyncio.run(rust.serve_rust(args)) == 7
     assert created["bind_address"] == "127.0.0.1:30011"
@@ -751,7 +751,7 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
     async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     assert asyncio.run(rust.serve_rust(_server_args())) == 0
     return created
 
@@ -979,7 +979,7 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
         pytest.fail("a failed launch was supervised")
 
     monkeypatch.setattr(rust, "launch_scheduler_ranks", failing_launch)
-    monkeypatch.setattr(rust, "supervise", never_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", never_supervise)
     with pytest.raises(RuntimeError, match="scheduler would not start"):
         asyncio.run(rust.serve_rust(_server_args()))
     assert events == ["serving:False", "stop:5.0"]
