@@ -869,12 +869,12 @@ async fn dispatch_single_booked(
     prompt_tokens: u64,
     streaming: bool,
 ) -> StreamResult {
-    let booking = worker.map(|worker| DispatchBooking::book(worker, prompt_tokens, streaming));
+    let Some(worker) = worker else {
+        return call.await;
+    };
+    let booking = DispatchBooking::book(worker, prompt_tokens, streaming);
     let stream = call.await?;
-    Ok(match (worker, booking) {
-        (Some(worker), Some(booking)) => stream.tracked_booked(Arc::clone(worker), booking),
-        _ => stream,
-    })
+    Ok(stream.tracked_booked(Arc::clone(worker), booking))
 }
 
 /// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
