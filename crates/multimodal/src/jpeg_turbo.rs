@@ -366,8 +366,6 @@ mod tests {
         assert_eq!(pil_cmyk_to_rgb(200, 100, 50, 180), [141, 71, 35]);
     }
 
-    /// The shortcut `MULDIV255(C, K)` is PIL's `CMYK;I` inversion followed by
-    /// `cmyk2rgb`, written out literally, on every pair of bytes.
     /// The buffer conversion is the pixel formula on every pixel, for every
     /// pixel count around and across the vector block size, tails included.
     #[test]
@@ -405,6 +403,8 @@ mod tests {
         assert_eq!(cmyk_to_rgb_like_pil(cmyk), expected);
     }
 
+    /// The shortcut `MULDIV255(C, K)` is PIL's `CMYK;I` inversion followed by
+    /// `cmyk2rgb`, written out literally, on every pair of bytes.
     #[test]
     fn pil_cmyk_to_rgb_equals_pils_literal_formula_on_every_byte_pair() {
         fn muldiv255(a: i32, b: i32) -> i32 {
