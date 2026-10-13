@@ -507,17 +507,23 @@ impl DtypeOverrides {
 /// pixels' own bytes for an engine that normalizes on device, a wire that
 /// carries no preprocessed floats): the per-destination write then stays as
 /// it is.
-pub(crate) fn mm_shared_image_wire_dtype(workers: &[Arc<dyn Worker>]) -> Option<EncoderDtype> {
-    shared_image_wire_dtype(workers, &DtypeOverrides::from_env())
-}
-
-/// [`mm_shared_image_wire_dtype`] over the union of the model's routing
-/// pools `pools` (the pipeline mode's legs), as the selection draws them:
-/// the wildcard model id resolves over the global snapshot there too.
+///
+/// Resolved over the union of the model's routing pools `pools` (the
+/// pipeline mode's legs), as the selection draws them: the wildcard model id
+/// resolves over the global snapshot there too.
 pub(crate) fn mm_shared_image_wire_dtype_over(
     registry: &WorkerRegistry,
     model_id: &str,
     pools: &[RoutingPool],
+) -> Option<EncoderDtype> {
+    shared_image_wire_dtype_over(registry, model_id, pools, &DtypeOverrides::from_env())
+}
+
+fn shared_image_wire_dtype_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+    overrides: &DtypeOverrides,
 ) -> Option<EncoderDtype> {
     let workers: Vec<Arc<dyn Worker>> = pools
         .iter()
@@ -529,7 +535,7 @@ pub(crate) fn mm_shared_image_wire_dtype_over(
                 .collect::<Vec<_>>()
         })
         .collect();
-    mm_shared_image_wire_dtype(&workers)
+    shared_image_wire_dtype(&workers, overrides)
 }
 
 fn shared_image_wire_dtype(
@@ -837,6 +843,92 @@ mod tests {
         assert_eq!(
             shared_image_wire_dtype(&[worker("http://f", RuntimeType::Sglang, &[])], &plain),
             Some(EncoderDtype::Float32)
+        );
+    }
+
+    /// The dtype is resolved over the legs a mode's request can reach:
+    /// the regular workers for the regular pipeline, the prefill and decode
+    /// legs for a disaggregated one. A fleet whose legs read another width
+    /// than its regular workers keeps the per-destination write (`None`)
+    /// over the union, never a wire for the wrong leg.
+    #[test]
+    fn the_wire_dtype_over_a_modes_pools_is_the_legs_the_pixels_can_reach() {
+        use crate::{
+            routers::grpc::mode::Mode,
+            worker::{ConnectionMode, WorkerRegistry},
+        };
+
+        let plain = DtypeOverrides::default();
+        let registry = WorkerRegistry::new();
+        let leg = |url: &str, worker_type: WorkerType, runtime: RuntimeType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new("qwen3-vl"))
+                    .worker_type(worker_type)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(runtime)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        // Regular workers reading bfloat16 (the TokenSpeed default) next to
+        // prefill and decode legs pinned to float32 (SGLang).
+        for worker in [
+            leg(
+                "grpc://regular-1:8000",
+                WorkerType::Regular,
+                RuntimeType::TokenSpeed,
+            ),
+            leg(
+                "grpc://regular-2:8000",
+                WorkerType::Regular,
+                RuntimeType::TokenSpeed,
+            ),
+            leg(
+                "grpc://prefill-1:8000",
+                WorkerType::Prefill,
+                RuntimeType::Sglang,
+            ),
+            leg(
+                "grpc://decode-1:8000",
+                WorkerType::Decode,
+                RuntimeType::Sglang,
+            ),
+        ] {
+            registry.register(worker).expect("register");
+        }
+        let over = |pools: &[RoutingPool]| {
+            shared_image_wire_dtype_over(&registry, "qwen3-vl", pools, &plain)
+        };
+        assert_eq!(
+            over(Mode::Regular.multimodal_wire_pools()),
+            Some(EncoderDtype::BFloat16)
+        );
+        assert_eq!(
+            over(Mode::PrefillDecode.multimodal_wire_pools()),
+            Some(EncoderDtype::Float32)
+        );
+        assert_eq!(
+            over(Mode::EncodePrefillDecode.multimodal_wire_pools()),
+            Some(EncoderDtype::Float32),
+            "no encode leg registered: the prefill and decode legs decide"
+        );
+        assert_eq!(
+            over(&[
+                RoutingPool::GrpcPipelineRegular,
+                RoutingPool::GrpcPrefill,
+                RoutingPool::GrpcDecode,
+            ]),
+            None,
+            "legs that disagree with the regular workers keep the per-destination write"
+        );
+        assert_eq!(
+            over(&[RoutingPool::GrpcEncode]),
+            None,
+            "an empty pool has nothing to agree on"
         );
     }
 

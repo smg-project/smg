@@ -36,12 +36,6 @@ impl ChatGeneratePreparationStage {
     }
 }
 
-impl Default for ChatGeneratePreparationStage {
-    fn default() -> Self {
-        Self::new(&[RoutingPool::GrpcPipelineRegular])
-    }
-}
-
 #[async_trait]
 impl PipelineStage for ChatGeneratePreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
