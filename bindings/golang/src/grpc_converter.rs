@@ -15,7 +15,6 @@ use openai_protocol::common::{
 use serde_json::Value;
 use smg::routers::grpc::utils::create_stop_decoder;
 use smg_grpc_client::sglang_proto as proto;
-use tokio::sync::Mutex as TokioMutex;
 use tool_parser::{types::ToolCallItem, ToolParser};
 
 use super::{
@@ -32,8 +31,8 @@ use super::{
 #[repr(C)]
 pub struct GrpcResponseConverterHandle {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    /// The tool parser of each choice, by choice index (see `choice_tool_parser`).
-    pub(crate) tool_parsers: HashMap<u32, Option<SharedToolParser>>,
+    /// The tool parser of each choice, by choice index (see `tool_parser_output`).
+    pub(crate) tool_parsers: HashMap<u32, Option<Box<dyn ToolParser>>>,
     pub(crate) stop: Option<StringOrArray>,
     pub(crate) stop_token_ids: Option<Vec<u32>>,
     pub(crate) model: String,
@@ -274,9 +273,6 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_convert_chunk(
     }
 }
 
-/// A choice's tool parser as the handle holds it.
-pub(crate) type SharedToolParser = Arc<TokioMutex<Box<dyn ToolParser>>>;
-
 /// Whether a tool parser reads this stream: tools declared and a tool choice
 /// that allows calls.
 fn tool_parsing_on(handle: &GrpcResponseConverterHandle) -> bool {
@@ -287,53 +283,49 @@ fn tool_parsing_on(handle: &GrpcResponseConverterHandle) -> bool {
         )
 }
 
-/// The tool parser of one choice, with the request's tools, when one reads
-/// this stream. Every choice of an `n > 1` request has its own, created on
-/// the choice's first text from the request's tool choice (the model's parser,
-/// or the generic reader of a forced choice, see `tool_parser_for`): a
-/// parser's state, its buffer and whether it announced a call's name, belongs
-/// to one choice, so the choices never share one. `None` when no parser reads
-/// the stream, or none exists for the request.
-fn choice_tool_parser(
-    handle: &mut GrpcResponseConverterHandle,
-    index: u32,
-) -> Option<(&[Tool], SharedToolParser)> {
-    if !tool_parsing_on(handle) {
-        return None;
-    }
-    let parser = handle
-        .tool_parsers
-        .entry(index)
-        .or_insert_with(|| {
-            tool_parser_for(&handle.model, handle.tool_choice.as_ref())
-                .map(|parser| Arc::new(TokioMutex::new(parser)))
-        })
-        .clone()?;
-    Some((handle.tools.as_deref()?, parser))
-}
-
-/// What the parser released for `text`: its text (a value that is not a
-/// declared call, a marker prefix) and its calls, both empty while it holds
-/// the text as a prospective call. `None` when no parser reads the stream:
-/// the text is content as it is. A parser error keeps the converter's
+/// What the choice's parser released for `text`: its text (a value that is
+/// not a declared call, a marker prefix) and its calls, both empty while it
+/// holds the text as a prospective call. `None` when no parser reads the
+/// stream: the text is content as it is. A parser error keeps the converter's
 /// fallback: the text is content.
+///
+/// Every choice of an `n > 1` request has its own parser, created on the
+/// choice's first text from the request's tool choice (the model's parser, or
+/// the generic reader of a forced choice, see `tool_parser_for`) and owned by
+/// the handle, as the gateway's streaming path owns its parsers: a parser's
+/// state, its buffer and whether it announced a call's name, belongs to one
+/// choice, so the choices never share one.
 async fn tool_parser_output(
     handle: &mut GrpcResponseConverterHandle,
     index: u32,
     text: &str,
 ) -> Option<(String, Vec<ToolCallDelta>)> {
-    if text.is_empty() {
-        return tool_parsing_on(handle).then(|| (String::new(), Vec::new()));
+    if !tool_parsing_on(handle) {
+        return None;
     }
-    let (tools, tool_parser) = choice_tool_parser(handle, index)?;
-    let mut parser = tool_parser.lock().await;
+    if text.is_empty() {
+        return Some((String::new(), Vec::new()));
+    }
+    let GrpcResponseConverterHandle {
+        tool_parsers,
+        tools,
+        model,
+        tool_choice,
+        history_tool_calls_count,
+        ..
+    } = handle;
+    let parser = tool_parsers
+        .entry(index)
+        .or_insert_with(|| tool_parser_for(model, tool_choice.as_ref()))
+        .as_mut()?;
+    let tools = tools.as_deref()?;
     match parser.parse_incremental(text, tools).await {
         Ok(result) => Some((
             result.normal_text,
             result
                 .calls
                 .into_iter()
-                .map(|item| tool_call_delta(handle, item))
+                .map(|item| tool_call_delta(model, *history_tool_calls_count, item))
                 .collect(),
         )),
         Err(error) => {
@@ -347,12 +339,11 @@ async fn tool_parser_output(
 /// never became a call (content, as the gateway's own streaming path sends
 /// it) and arguments it parsed but did not stream. The parser goes with the
 /// choice. `None` when no parser read the choice.
-async fn unstreamed_tool_output(
+fn unstreamed_tool_output(
     handle: &mut GrpcResponseConverterHandle,
     index: u32,
 ) -> Option<(String, Vec<ToolCallDelta>)> {
-    let tool_parser = handle.tool_parsers.remove(&index).flatten()?;
-    let mut parser = tool_parser.lock().await;
+    let mut parser = handle.tool_parsers.remove(&index).flatten()?;
     let text = parser.take_unstreamed_normal_text();
     let calls = parser
         .get_unstreamed_tool_args()
@@ -376,15 +367,15 @@ async fn unstreamed_tool_output(
 /// that continues the arguments carries none, as the gateway's own streaming
 /// path and the public API send it (a client keeping the latest id it sees
 /// would otherwise end up with a different one than the call's).
-fn tool_call_delta(handle: &GrpcResponseConverterHandle, item: ToolCallItem) -> ToolCallDelta {
-    let id = item.name.as_ref().map(|name| {
-        generate_tool_call_id(
-            &handle.model,
-            name,
-            item.tool_index,
-            handle.history_tool_calls_count,
-        )
-    });
+fn tool_call_delta(
+    model: &str,
+    history_tool_calls_count: usize,
+    item: ToolCallItem,
+) -> ToolCallDelta {
+    let id = item
+        .name
+        .as_ref()
+        .map(|name| generate_tool_call_id(model, name, item.tool_index, history_tool_calls_count));
     ToolCallDelta {
         index: item.tool_index as u32,
         id,
@@ -585,7 +576,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     Some(released) => released,
                     None => (pending_text, Vec::new()),
                 };
-            if let Some((held_text, held_calls)) = unstreamed_tool_output(handle, index).await {
+            if let Some((held_text, held_calls)) = unstreamed_tool_output(handle, index) {
                 final_text.push_str(&held_text);
                 eof_tool_calls.extend(held_calls);
             }
@@ -889,9 +880,7 @@ mod tests {
             tokenizer,
             tool_parsers: HashMap::from([(
                 0,
-                Some(Arc::new(TokioMutex::new(
-                    Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>,
-                ))),
+                Some(Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>),
             )]),
             stop: Some(StringOrArray::Array(vec!["NEVER".into()])),
             stop_token_ids: None,
