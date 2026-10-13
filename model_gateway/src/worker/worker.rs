@@ -4840,12 +4840,47 @@ mod tests {
     #[test]
     fn a_token_within_the_stamped_millisecond_records_nothing_new_and_keeps_the_semantics() {
         let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
-        runtime.note_token_progress();
-        let stamped = runtime.progress_reference_ms();
-        let contact = runtime.contact_age();
+        let wake = runtime.contact_wake();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // Whether the notifier holds a permit: `notify_one` leaves one for a
+        // later waiter, so a waiter that returns within the bound found it.
+        let permit = |bound_ms: u64| {
+            rt.block_on(async {
+                time::timeout(Duration::from_millis(bound_ms), wake.notified())
+                    .await
+                    .is_ok()
+            })
+        };
+
+        // Two tokens inside one millisecond: the first stamps and leaves the
+        // permit, the second has nothing new to record and leaves none.
+        // Retried until both calls land in the same millisecond.
+        let mut aligned = false;
+        for _ in 0..1_000 {
+            let ms = crate::worker::liveness::now_ms();
+            runtime.note_token_progress();
+            assert!(permit(50), "the first token leaves the notifier's permit");
+            runtime.note_token_progress();
+            if crate::worker::liveness::now_ms() == ms {
+                aligned = true;
+                break;
+            }
+            // The millisecond turned between the two: the second one stamped
+            // and left a permit; drain it and try again from a fresh millisecond.
+            let _ = permit(50);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(aligned, "two tokens never landed in one millisecond");
+        assert!(
+            !permit(10),
+            "a token within the stamped millisecond leaves no new permit"
+        );
 
         // A transport failure flagged between two tokens of one millisecond is
-        // cleared by the second token all the same.
+        // cleared by the next token all the same, and that token stamps.
         runtime.note_transport_failure();
         assert!(runtime.transport_failure_pending());
         runtime.note_token_progress();
@@ -4853,22 +4888,17 @@ mod tests {
             !runtime.transport_failure_pending(),
             "progress clears a transport failure, same millisecond or not"
         );
-        assert!(runtime.progress_reference_ms() >= stamped);
-        assert!(runtime.contact_age() <= contact + Duration::from_millis(5));
-
-        // The wake's permit is there for a waiter that comes after the tokens.
-        let wake = runtime.contact_wake();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        rt.block_on(async { time::timeout(Duration::from_millis(50), wake.notified()).await })
-            .expect("the tokens left the notifier's permit for a later waiter");
+        assert!(permit(50), "the clearing token wakes the notifier");
 
         // Once the millisecond turns, the next token stamps again.
+        let stamped = runtime.progress_reference_ms();
         thread::sleep(Duration::from_millis(3));
         runtime.note_token_progress();
         assert!(runtime.progress_reference_ms() > stamped);
+        assert!(
+            permit(50),
+            "a token in a new millisecond wakes the notifier"
+        );
     }
 
     #[test]
