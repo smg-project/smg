@@ -165,6 +165,21 @@ impl<'a> ModelMetadata<'a> {
             })
     }
 
+    /// `text` encoded on its own by the model tokenizer, the way a spec
+    /// splices a frame stamp or a dimension line into a replacement. A
+    /// tokenizer that cannot encode it is the request's error, never an
+    /// empty splice: a replacement missing a stamp would reach the engine
+    /// with a layout its reference processor does not write.
+    pub fn encode_plain(&self, spec: &'static str, text: &str) -> RegistryResult<Vec<TokenId>> {
+        let ids = self.tokenizer.encode_text(text).ok_or_else(|| {
+            ModelRegistryError::TextEncodingFailed {
+                spec,
+                text: text.to_string(),
+            }
+        })?;
+        Ok(ids.into_iter().map(|id| id as TokenId).collect())
+    }
+
     pub fn config_u32(&self, path: &[&str]) -> Option<u32> {
         Self::find_value(self.config, path).and_then(|value| value.as_u64().map(|v| v as u32))
     }
@@ -410,6 +425,46 @@ mod tests {
         registry::test_helpers::{test_preprocessed_with_tokens, TestTokenizer},
         types::ImageSize,
     };
+
+    #[test]
+    fn encode_plain_maps_the_ids_or_names_the_spec_and_the_text() {
+        let config = json!({});
+        let encoding = TestTokenizer::new(&[]).with_byte_encoder(1000);
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &encoding,
+            config: &config,
+        };
+        assert_eq!(
+            metadata.encode_plain("test", "ab").unwrap(),
+            vec![1097 as TokenId, 1098]
+        );
+
+        struct NoText;
+        impl Tokenizer for NoText {
+            fn token_to_id(&self, _: &str) -> Option<u32> {
+                None
+            }
+            fn id_to_token(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn encode_text(&self, _: &str) -> Option<Vec<u32>> {
+                None
+            }
+        }
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &NoText,
+            config: &config,
+        };
+        assert_eq!(
+            metadata.encode_plain("test", "<0.2 seconds>").unwrap_err(),
+            ModelRegistryError::TextEncodingFailed {
+                spec: "test",
+                text: "<0.2 seconds>".to_string(),
+            }
+        );
+    }
 
     struct TestSpec;
 

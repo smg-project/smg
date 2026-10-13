@@ -39,21 +39,6 @@ impl KimiK3VisionSpec {
                 field: "media_placeholder_token_id".to_string(),
             })
     }
-
-    /// Encode ordinary text into token ids.
-    ///
-    /// The dimension text sits between two special tokens, which are hard
-    /// segment boundaries for the encoder, so encoding it alone yields the same
-    /// ids as the reference's one-shot encoding of the whole block.
-    fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
-        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
-            ModelRegistryError::TextEncodingFailed {
-                spec: "kimi_k3",
-                text: text.to_string(),
-            }
-        })?;
-        Ok(ids.into_iter().map(|id| id as TokenId).collect())
-    }
 }
 
 impl ModelProcessorSpec for KimiK3VisionSpec {
@@ -112,7 +97,11 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
             .iter()
             .zip(&preprocessed.item_sizes)
             .map(|(&num_tokens, &(width, height))| {
-                let dims = Self::encode_plain_text(metadata, &format!("image {width}x{height}"))?;
+                // The dimension text sits between two special tokens, which
+                // are hard segment boundaries for the encoder, so encoding it
+                // alone yields the same ids as the reference's one-shot
+                // encoding of the whole block.
+                let dims = metadata.encode_plain("kimi_k3", &format!("image {width}x{height}"))?;
                 let mut tokens = Vec::with_capacity(dims.len() + num_tokens + 3);
                 tokens.push(media_begin);
                 tokens.extend(dims);

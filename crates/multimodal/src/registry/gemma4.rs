@@ -65,16 +65,6 @@ impl Gemma4Spec {
             })
     }
 
-    fn encode(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
-        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
-            ModelRegistryError::TextEncodingFailed {
-                spec: "gemma4",
-                text: text.to_string(),
-            }
-        })?;
-        Ok(ids.into_iter().map(|id| id as TokenId).collect())
-    }
-
     fn unsupported(modality: Modality) -> ModelRegistryError {
         ModelRegistryError::UnsupportedModality {
             spec: "gemma4",
@@ -176,7 +166,7 @@ impl Gemma4Spec {
                     } else {
                         format!(" {stamp} ")
                     };
-                    tokens.extend(Self::encode(metadata, &prefix)?);
+                    tokens.extend(metadata.encode_plain("gemma4", &prefix)?);
                     tokens.push(begin);
                     ranges.push(PlaceholderRange {
                         offset: tokens.len(),

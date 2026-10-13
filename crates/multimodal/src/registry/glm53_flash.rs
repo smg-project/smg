@@ -40,16 +40,6 @@ impl Glm53FlashSpec {
             })
     }
 
-    fn encode(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
-        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
-            ModelRegistryError::TextEncodingFailed {
-                spec: "glm53_flash",
-                text: text.to_string(),
-            }
-        })?;
-        Ok(ids.into_iter().map(|id| id as TokenId).collect())
-    }
-
     /// The timestamp the engine's own server writes before each temporal
     /// group of a clip its loader sampled: the whole second of the group's
     /// first frame, the groups being consecutive pairs of the distinct
@@ -136,7 +126,9 @@ impl Glm53FlashSpec {
                     let second = sampled
                         .and_then(|seconds| seconds.get(index).copied())
                         .unwrap_or_else(|| f64::from(index as f32 * per_grid_seconds));
-                    tokens.extend(Self::encode(metadata, &format!("{second:.1} seconds"))?);
+                    tokens.extend(
+                        metadata.encode_plain("glm53_flash", &format!("{second:.1} seconds"))?,
+                    );
                 }
                 Ok(PromptReplacement::sequence(Modality::Video, VIDEO, tokens)
                     .with_feature_ranges(ranges))
@@ -395,7 +387,11 @@ mod tests {
             [BEGIN_ID, IMAGE_ID, IMAGE_ID, END_ID]
                 .into_iter()
                 .map(|id| id as TokenId)
-                .chain(Glm53FlashSpec::encode(&metadata, &format!("{second} seconds")).unwrap())
+                .chain(
+                    metadata
+                        .encode_plain("glm53_flash", &format!("{second} seconds"))
+                        .unwrap(),
+                )
                 .collect()
         };
         let stamped = spec
@@ -473,7 +469,7 @@ mod tests {
         assert_eq!(replacement.tokens[0], BEGIN_ID as TokenId);
         assert_eq!(replacement.tokens[1], IMAGE_ID as TokenId);
         assert_eq!(replacement.tokens[3], END_ID as TokenId);
-        let timestamp = Glm53FlashSpec::encode(&metadata, "0.0 seconds").unwrap();
+        let timestamp = metadata.encode_plain("glm53_flash", "0.0 seconds").unwrap();
         assert_eq!(&replacement.tokens[4..15], timestamp.as_slice());
 
         let legacy = json!({"model_type":"glm5_next"});

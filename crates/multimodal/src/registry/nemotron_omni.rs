@@ -92,16 +92,6 @@ impl NemotronOmniSpec {
         ))
     }
 
-    fn encode(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
-        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
-            ModelRegistryError::TextEncodingFailed {
-                spec: "nemotron_omni",
-                text: text.to_string(),
-            }
-        })?;
-        Ok(ids.into_iter().map(|id| id as TokenId).collect())
-    }
-
     /// `(frames, rows, cols)` per video, as the paired processor emits them.
     fn video_grids(preprocessed: &PreprocessedEncoderInputs) -> RegistryResult<Vec<[usize; 3]>> {
         let invalid = || ModelRegistryError::InvalidPreprocessedField {
@@ -182,7 +172,7 @@ impl NemotronOmniSpec {
                 let mut ranges = Vec::new();
                 for tubelet in 0..frames.div_ceil(VIDEO_TEMPORAL_PATCH_SIZE) {
                     let separator = Self::tubelet_separator(tubelet, frames, sampling)?;
-                    tokens.extend(Self::encode(metadata, &separator)?);
+                    tokens.extend(metadata.encode_plain("nemotron_omni", &separator)?);
                     tokens.push(begin);
                     ranges.push(PlaceholderRange {
                         offset: tokens.len(),

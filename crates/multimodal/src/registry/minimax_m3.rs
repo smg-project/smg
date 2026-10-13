@@ -102,17 +102,6 @@ impl MiniMaxM3VisionSpec {
             || metadata.token_id(Self::VIDEO_TOKEN).is_ok()
     }
 
-    /// Encode timestamp text on its own with no special tokens, as vLLM does.
-    fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
-        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
-            ModelRegistryError::TextEncodingFailed {
-                spec: "minimax_m3",
-                text: text.to_string(),
-            }
-        })?;
-        Ok(ids.into_iter().map(|id| id as TokenId).collect())
-    }
-
     /// The `]<]X.X seconds[>[` stamp for one temporal frame, from its first sampled source frame clamped to the last one; `None` when nothing was sampled.
     fn timestamp_text(
         frame: usize,
@@ -229,7 +218,9 @@ impl MiniMaxM3VisionSpec {
         let mut ranges = Vec::with_capacity(grid_t);
         for frame in 0..grid_t {
             if let Some(stamps) = &stamps {
-                tokens.extend(Self::encode_plain_text(metadata, &stamps[frame])?);
+                // The stamp is encoded on its own, with no special tokens, as the
+                // reference processor encodes it.
+                tokens.extend(metadata.encode_plain("minimax_m3", &stamps[frame])?);
             }
             tokens.push(start_id);
             ranges.push(PlaceholderRange {

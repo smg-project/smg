@@ -141,47 +141,41 @@ impl Qwen3VLVisionSpec {
         }
     }
 
-    fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> Vec<TokenId> {
-        metadata
-            .tokenizer
-            .encode_text(text)
-            .map(|ids| ids.into_iter().map(|id| id as TokenId).collect())
-            .unwrap_or_default()
-    }
-
     /// The per-frame video placeholder body of the Qwen3-VL family: for every
     /// temporal group its `<seconds>` stamp, then `<|vision_start|>`, the
     /// group's pad tokens and `<|vision_end|>`, which is how the family's
     /// reference processor expands the bare `<|video_pad|>`; the chat
     /// template's outer `<|vision_start|>`/`<|vision_end|>` pair stays around
     /// it. Each stamp is encoded on its own, as the reference does, with one
-    /// decimal place. Returns `None` when the layout cannot apply (no markers
-    /// or ragged token counts), leaving the caller to fall back to a flat pad
+    /// decimal place; a stamp the tokenizer cannot encode is the request's
+    /// error. Returns `None` when the layout cannot apply (no markers or
+    /// ragged token counts), leaving the caller to fall back to a flat pad
     /// block.
     fn per_frame_video_tokens(
         metadata: &ModelMetadata,
         pad_token_id: TokenId,
         num_tokens: usize,
         timestamps: &[f64],
-    ) -> Option<Vec<TokenId>> {
+    ) -> RegistryResult<Option<Vec<TokenId>>> {
         let grid_t = timestamps.len();
         if grid_t == 0 || num_tokens == 0 || !num_tokens.is_multiple_of(grid_t) {
-            return None;
+            return Ok(None);
         }
-        let vision_start = Self::vision_start_token_id(metadata)?;
-        let vision_end = Self::vision_end_token_id(metadata)?;
+        let (Some(vision_start), Some(vision_end)) = (
+            Self::vision_start_token_id(metadata),
+            Self::vision_end_token_id(metadata),
+        ) else {
+            return Ok(None);
+        };
         let tokens_per_grid = num_tokens / grid_t;
         let mut tokens = Vec::with_capacity(num_tokens + grid_t * 10);
         for &seconds in timestamps {
-            tokens.extend(Self::encode_plain_text(
-                metadata,
-                &format!("<{seconds:.1} seconds>"),
-            ));
+            tokens.extend(metadata.encode_plain("qwen3_vl", &format!("<{seconds:.1} seconds>"))?);
             tokens.push(vision_start);
             tokens.extend(std::iter::repeat_n(pad_token_id, tokens_per_grid));
             tokens.push(vision_end);
         }
-        Some(tokens)
+        Ok(Some(tokens))
     }
 
     /// One replacement per video, stamped from each clip's sampling when the
@@ -197,7 +191,7 @@ impl Qwen3VLVisionSpec {
         let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
         let temporal_patch_size = Self::temporal_patch_size(metadata, preprocessor_config);
         let sample_fps = Self::sample_fps(preprocessor_config);
-        Ok(preprocessed
+        preprocessed
             .feature_token_counts
             .iter()
             .enumerate()
@@ -205,8 +199,8 @@ impl Qwen3VLVisionSpec {
                 // Every model routed to this spec (base VL and the 3.5/3.6
                 // family) takes the per-frame layout; a flat pad block only
                 // when the grid is unknown.
-                let tokens = Self::video_grid_t(preprocessed, item)
-                    .and_then(|grid_t| {
+                let per_frame = match Self::video_grid_t(preprocessed, item) {
+                    Some(grid_t) => {
                         let timestamps = Self::group_timestamps(
                             sampling.get(item).copied().flatten(),
                             grid_t,
@@ -218,12 +212,18 @@ impl Qwen3VLVisionSpec {
                             pad_token_id,
                             num_tokens,
                             &timestamps,
-                        )
-                    })
-                    .unwrap_or_else(|| vec![pad_token_id; num_tokens]);
-                PromptReplacement::sequence(Modality::Video, &placeholder_token, tokens)
+                        )?
+                    }
+                    None => None,
+                };
+                let tokens = per_frame.unwrap_or_else(|| vec![pad_token_id; num_tokens]);
+                Ok(PromptReplacement::sequence(
+                    Modality::Video,
+                    &placeholder_token,
+                    tokens,
+                ))
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -232,7 +232,8 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         "qwen3_vl"
     }
 
-    /// `<|image_pad|>` / `<|video_pad|>` are vLLM's single-token targets.
+    /// `<|image_pad|>` / `<|video_pad|>` are the single-token targets the
+    /// serving engine expands itself.
     fn worker_expandable(&self, modality: Modality) -> bool {
         matches!(modality, Modality::Image | Modality::Video)
     }
@@ -790,5 +791,54 @@ mod tests {
             );
         }
         assert!(!image.model_specific.contains_key("patches_per_video"));
+    }
+
+    /// Knows the family's markers but cannot encode plain text.
+    struct NoTextTokenizer(TestTokenizer);
+
+    impl crate::registry::Tokenizer for NoTextTokenizer {
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.0.token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.0.id_to_token(id)
+        }
+
+        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+            None
+        }
+    }
+
+    #[test]
+    fn unencodable_stamp_text_is_rejected() {
+        // A stamp the tokenizer cannot encode is the request's error, as the
+        // sibling specs report it; a replacement is never built without it.
+        let tokenizer = NoTextTokenizer(video_tokenizer());
+        let config = video_config("qwen3_vl");
+        let metadata = ModelMetadata {
+            model_id: "Qwen/Qwen3-VL-8B-Instruct",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).expect("qwen3_vl spec");
+        let preprocessed = test_preprocessed_with_tokens(&[ImageSize::new(320, 256)], &[160])
+            .with_extra(
+                "video_grid_thw",
+                ModelSpecificValue::int_2d(vec![2, 16, 20], 1, 3),
+            );
+
+        let err = spec
+            .prompt_replacements_for(&metadata, &preprocessed, Modality::Video)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            crate::registry::ModelRegistryError::TextEncodingFailed {
+                spec: "qwen3_vl",
+                text: "<0.2 seconds>".to_string(),
+            }
+        );
     }
 }
