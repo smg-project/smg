@@ -1214,6 +1214,66 @@ mod tests {
         assert_eq!(owned.items[0].content_hash, borrowed.items[0].content_hash);
     }
 
+    /// The production case of the move: the one-pass wire buffer, already
+    /// in the dtype the worker reads, handed over whole.
+    fn single_image_wire_intermediate() -> PrecomputedMultimodalIntermediate {
+        use llm_multimodal::PixelNorm;
+        let mut intermediate = single_image_intermediate();
+        // Eight bfloat16 values with the shape [4, 2]: 1.0, 2.0, ... 8.0.
+        let bytes: Vec<u8> = [
+            0x3f80u16, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100,
+        ]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+        intermediate.preprocessed.encoder_input = EncoderInput::wire(
+            bytes,
+            EncoderDtype::BFloat16,
+            vec![4, 2],
+            PixelNorm {
+                scale: 1.0,
+                offset: [0.0; 3],
+                divisor: [1.0; 3],
+                channel_block: 512,
+            },
+        )
+        .expect("a wire of the shape's length");
+        intermediate
+    }
+
+    #[test]
+    fn a_single_whole_wire_item_moves_its_own_bytes_into_the_payload() {
+        use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;
+
+        let wire_bytes = match &single_image_wire_intermediate().preprocessed.encoder_input {
+            EncoderInput::Wire { bytes, .. } => bytes.clone(),
+            other => panic!("a wire input expected, got {other:?}"),
+        };
+        let borrowed = assemble_tokenspeed(&single_image_wire_intermediate(), None, false).unwrap();
+        let options = vec![tokenspeed_assembly_options(Modality::Image, None, false)];
+        let owned =
+            assemble_tokenspeed_batches_owned(vec![single_image_wire_intermediate()], options)
+                .unwrap();
+        let (a, b) = (
+            &borrowed.items[0].encoder_input,
+            &owned.items[0].encoder_input,
+        );
+        assert_eq!(a.shape, vec![4, 2]);
+        assert_eq!(a.shape, b.shape);
+        assert_eq!(a.dtype, "bfloat16");
+        assert_eq!(a.dtype, b.dtype);
+        match (&a.storage, &b.storage) {
+            (TokenSpeedTensorStorage::Inline(x), TokenSpeedTensorStorage::Inline(y)) => {
+                assert_eq!(
+                    x, &wire_bytes,
+                    "the view-written item carries the wire's bytes"
+                );
+                assert_eq!(y, &wire_bytes, "the moved item carries the wire's bytes");
+            }
+            other => panic!("inline payloads expected, got {other:?}"),
+        }
+    }
+
     /// Two items share one tensor: both are written from views, nothing moves.
     #[test]
     fn a_batch_of_two_items_keeps_its_encoder_input() {

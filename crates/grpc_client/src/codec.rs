@@ -4,8 +4,9 @@
 //! tonic's prost encoder writes a message into a growing `BytesMut`, so a
 //! multi-megabyte pixel tensor is copied again at every doubling of the
 //! buffer, into fresh pages each time. Here the buffer is reserved to the
-//! message's encoded length before the write, which prost computes anyway for
-//! its capacity check, so the payload is written once into one allocation.
+//! message's encoded length before the write (prost computes that length for
+//! its capacity check as well), so the payload is written once into one
+//! allocation.
 //! Decoding is prost's own decoder, unchanged. tonic builds the encode
 //! buffer itself, so the reservation is exercised by every client call of
 //! the gateway's gRPC tests rather than by a unit test here.
@@ -63,8 +64,13 @@ impl<T: Message> Encoder for SizedProstEncoder<T> {
 
     fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
         buf.reserve(item.encoded_len());
-        item.encode_raw(buf);
-        Ok(())
+        // `encode` walks the field lengths once more for its capacity check
+        // (no payload bytes touched); it is the public API, where
+        // `encode_raw` is prost's own. The buffer was reserved to the length
+        // it checks, so the error is unreachable; it is still a status, not
+        // a panic, in a request path.
+        item.encode(buf)
+            .map_err(|error| Status::internal(format!("message encoding failed: {error}")))
     }
 
     fn buffer_settings(&self) -> BufferSettings {

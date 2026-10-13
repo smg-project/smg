@@ -28,6 +28,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".tokenspeed.grpc.scheduler",
             "crate::tokenspeed_scheduler::tokenspeed_proto",
         )
+        // The encoder's Encode RPC carries the same pixel tensor as the
+        // scheduler's Generate: the same sized codec (see `crate::codec`).
+        .codec_path("crate::codec::SizedProstCodec")
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(&["proto/tokenspeed_encoder.proto"], &["proto"])?;
 
