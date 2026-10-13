@@ -297,8 +297,9 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
 }
 
 // clap renders `--help` by `help_heading`: the headings in first-use order,
-// the fields of a heading in declaration order, so a heading's fields need
-// not be contiguous below; a field's doc comment is its help text. The second
+// the fields of a heading in declaration order. The sections below follow
+// that grouping, one header per heading, so a field is added under its
+// heading's header; a field's doc comment is its help text. The second
 // spellings, each a `visible_alias` of its field and mirrored by the Python
 // launcher's `RouterArgs`: --cache-match-threshold (--cache-threshold),
 // --spill-abs-threshold (--balance-abs-threshold), --spill-rel-threshold
@@ -334,6 +335,30 @@ struct CliArgs {
     /// List of worker URLs (supports IPv4 and IPv6)
     #[arg(long, num_args = 0.., help_heading = "Worker Configuration")]
     worker_urls: Vec<String>,
+
+    /// Max pending control-plane jobs (worker add/remove, tokenizer, MCP,
+    /// WASM). Size to fleet scale so a service-discovery reconcile pass can
+    /// enqueue every worker without blocking.
+    #[arg(long, default_value_t = 1000, value_parser = parse_job_queue_capacity, help_heading = "Worker Configuration")]
+    job_queue_capacity: usize,
+
+    /// Max control-plane jobs dispatched concurrently
+    #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
+    job_queue_concurrency: usize,
+
+    /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
+    /// worker whose handshake awaits this many engines on one socket set.
+    #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
+    zmq_engine_count: Option<usize>,
+
+    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
+    /// engine-directed connections — request dispatch and health/probe traffic
+    /// alike — multiplexing every request to a worker over one connection.
+    /// Negotiated per worker at registration: a worker that does not answer
+    /// HTTP/2 stays on HTTP/1.1, so mixed fleets roll out in any order.
+    /// `http_pool.http2` on a worker spec pins the version instead.
+    #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
+    upstream_http2: bool,
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
@@ -598,6 +623,61 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 
+    /// Warm-up slice for cache-aware routing: for this many seconds after a
+    /// worker becomes routable, until its index has grown by
+    /// --worker-warmup-blocks blocks, one cache miss in 1/--worker-warmup-share
+    /// is routed to it so it builds a cache instead of idling. 0 disables.
+    #[arg(long, default_value_t = 60, help_heading = "Routing Policy")]
+    worker_warmup_secs: u64,
+
+    /// Share of cache misses offered to warming workers (a finite value from
+    /// 0.0 to 1.0).
+    #[arg(long, default_value_t = 0.25, help_heading = "Routing Policy")]
+    worker_warmup_share: f32,
+
+    /// A worker whose index has grown by this many blocks since it became
+    /// thin is warm.
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    worker_warmup_blocks: usize,
+
+    /// A worker whose index holds less than this share of the fleet's median
+    /// (or nothing) is thin and receives the warm-up slice until it has grown
+    /// by --worker-warmup-blocks, whatever emptied it (a resync after a
+    /// publisher restart, an out-of-range or data-loss resubscription, an
+    /// engine that came back empty). A finite value from 0.0 to 1.0; 0 keeps
+    /// the age rule alone.
+    #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
+    worker_warmup_thin_ratio: f32,
+
+    /// One cache hit in this many is diverted to a thin worker although
+    /// another worker holds its prefix (shallow overlaps first, one in flight
+    /// per thin worker), so an index emptied by a resync refills on a
+    /// workload where every request has a holder. 0 disables.
+    #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
+    worker_warmup_divert_every: u64,
+
+    /// TTL in seconds for event-driven cache-aware indexer entries: entries
+    /// neither stored nor read by a query within this window are pruned.
+    /// Bounds index growth when a backend stops emitting removal events.
+    /// Unset or 0 disables the TTL pass.
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_ttl_secs: Option<u64>,
+
+    /// Capacity ceiling per model for the event-driven cache-aware indexer;
+    /// beyond it, oldest-touched entries are pruned down to 90% of the
+    /// ceiling. Unset or 0 disables the ceiling.
+    #[arg(long, help_heading = "Routing Policy")]
+    kv_indexer_max_entries: Option<usize>,
+
+    /// The event-driven KV index behind cache-aware routing: `positional`
+    /// (one entry per block position, the default) or `chain` (chains as runs
+    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
+    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
+    /// positional index only; the chain index holds what the engines report
+    /// and shrinks with their removals.
+    #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
+    kv_index: KvIndexKind,
+
     // ==================== RL Control Plane ====================
     /// Mount the RL control plane under /v1/rl (worker discovery,
     /// engine-route passthrough, fan-out). Off by default; when off, no RL
@@ -666,30 +746,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "PD Disaggregation")]
     worker_startup_check_interval: u64,
 
-    /// Max pending control-plane jobs (worker add/remove, tokenizer, MCP,
-    /// WASM). Size to fleet scale so a service-discovery reconcile pass can
-    /// enqueue every worker without blocking.
-    #[arg(long, default_value_t = 1000, value_parser = parse_job_queue_capacity, help_heading = "Worker Configuration")]
-    job_queue_capacity: usize,
-
-    /// Max control-plane jobs dispatched concurrently
-    #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
-    job_queue_concurrency: usize,
-
-    /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
-    /// worker whose handshake awaits this many engines on one socket set.
-    #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
-    zmq_engine_count: Option<usize>,
-
-    /// Speak HTTP/2 to workers via prior knowledge (h2c on cleartext) on all
-    /// engine-directed connections — request dispatch and health/probe traffic
-    /// alike — multiplexing every request to a worker over one connection.
-    /// Negotiated per worker at registration: a worker that does not answer
-    /// HTTP/2 stays on HTTP/1.1, so mixed fleets roll out in any order.
-    /// `http_pool.http2` on a worker spec pins the version instead.
-    #[arg(long, default_value_t = false, help_heading = "Worker Configuration")]
-    upstream_http2: bool,
-
+    // ==================== Load Monitoring ====================
     /// Interval in seconds between load monitor checks for PowerOfTwo routing
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
@@ -730,39 +787,6 @@ struct CliArgs {
     #[arg(long, default_value_t = 15, help_heading = "Load Monitoring")]
     worker_stale_secs: u64,
 
-    /// Warm-up slice for cache-aware routing: for this many seconds after a
-    /// worker becomes routable, until its index has grown by
-    /// --worker-warmup-blocks blocks, one cache miss in 1/--worker-warmup-share
-    /// is routed to it so it builds a cache instead of idling. 0 disables.
-    #[arg(long, default_value_t = 60, help_heading = "Routing Policy")]
-    worker_warmup_secs: u64,
-
-    /// Share of cache misses offered to warming workers (a finite value from
-    /// 0.0 to 1.0).
-    #[arg(long, default_value_t = 0.25, help_heading = "Routing Policy")]
-    worker_warmup_share: f32,
-
-    /// A worker whose index has grown by this many blocks since it became
-    /// thin is warm.
-    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
-    worker_warmup_blocks: usize,
-
-    /// A worker whose index holds less than this share of the fleet's median
-    /// (or nothing) is thin and receives the warm-up slice until it has grown
-    /// by --worker-warmup-blocks, whatever emptied it (a resync after a
-    /// publisher restart, an out-of-range or data-loss resubscription, an
-    /// engine that came back empty). A finite value from 0.0 to 1.0; 0 keeps
-    /// the age rule alone.
-    #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
-    worker_warmup_thin_ratio: f32,
-
-    /// One cache hit in this many is diverted to a thin worker although
-    /// another worker holds its prefix (shallow overlaps first, one in flight
-    /// per thin worker), so an index emptied by a resync refills on a
-    /// workload where every request has a holder. 0 disables.
-    #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
-    worker_warmup_divert_every: u64,
-
     /// Only poll worker loads when a load-aware routing policy,
     /// --engine-metrics, or worker overload protection needs the data. By
     /// default every worker group is polled from registration onward; this
@@ -789,28 +813,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 30, help_heading = "Load Monitoring")]
     pd_admission_wait_secs: u64,
 
-    /// TTL in seconds for event-driven cache-aware indexer entries: entries
-    /// neither stored nor read by a query within this window are pruned.
-    /// Bounds index growth when a backend stops emitting removal events.
-    /// Unset or 0 disables the TTL pass.
-    #[arg(long, help_heading = "Routing Policy")]
-    kv_indexer_ttl_secs: Option<u64>,
-
-    /// Capacity ceiling per model for the event-driven cache-aware indexer;
-    /// beyond it, oldest-touched entries are pruned down to 90% of the
-    /// ceiling. Unset or 0 disables the ceiling.
-    #[arg(long, help_heading = "Routing Policy")]
-    kv_indexer_max_entries: Option<usize>,
-
-    /// The event-driven KV index behind cache-aware routing: `positional`
-    /// (one entry per block position, the default) or `chain` (chains as runs
-    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
-    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
-    /// positional index only; the chain index holds what the engines report
-    /// and shrinks with their removals.
-    #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
-    kv_index: KvIndexKind,
-
+    // ==================== Multimodal ====================
     /// Multimodal tensor transport mode: `inline` (default), `shm` (same-host
     /// /dev/shm), or `auto` (shm only when the worker shares /dev/shm). A
     /// per-worker `WorkerSpec.multimodal_tensor_transport` overrides this.
@@ -901,25 +904,6 @@ struct CliArgs {
     )]
     service_discovery: bool,
 
-    /// Worker discovery provider. Give this or `--service-discovery`, not both
-    #[arg(
-        long,
-        value_enum,
-        conflicts_with = "service_discovery",
-        help_heading = "Service Discovery"
-    )]
-    discovery_provider: Option<DiscoveryProvider>,
-
-    /// JSON manifest listing the workers, for `--discovery-provider file`. It
-    /// may be created after startup
-    #[arg(long, help_heading = "Service Discovery (File)")]
-    discovery_file: Option<PathBuf>,
-
-    /// Seconds between periodic rereads of the `--discovery-file` manifest,
-    /// which is also reread as soon as it changes (default: 30)
-    #[arg(long, help_heading = "Service Discovery (File)")]
-    discovery_check_interval_secs: Option<u64>,
-
     /// Label selector for Kubernetes service discovery (format: key=value)
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     selector: Vec<String>,
@@ -983,6 +967,27 @@ struct CliArgs {
     /// both names.
     #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
     model_alias: Vec<String>,
+
+    // ==================== Service Discovery ====================
+    /// Worker discovery provider. Give this or `--service-discovery`, not both
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "service_discovery",
+        help_heading = "Service Discovery"
+    )]
+    discovery_provider: Option<DiscoveryProvider>,
+
+    // ==================== Service Discovery (File) ====================
+    /// JSON manifest listing the workers, for `--discovery-provider file`. It
+    /// may be created after startup
+    #[arg(long, help_heading = "Service Discovery (File)")]
+    discovery_file: Option<PathBuf>,
+
+    /// Seconds between periodic rereads of the `--discovery-file` manifest,
+    /// which is also reread as soon as it changes (default: 30)
+    #[arg(long, help_heading = "Service Discovery (File)")]
+    discovery_check_interval_secs: Option<u64>,
 
     // ==================== Logging ====================
     /// Directory for the log files, created at start-up when missing (under
@@ -1145,6 +1150,19 @@ struct CliArgs {
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 
+    /// Sustained admission rate in requests per second, bursting up to
+    /// --max-concurrent-requests, which keeps bounding standing concurrency
+    /// (a completed request frees its slot, not rate budget). Unset or 0 =
+    /// no rate limit: --max-concurrent-requests bounds concurrency alone.
+    #[arg(long, allow_negative_numbers = true, help_heading = "Rate Limiting")]
+    rate_limit_tokens_per_second: Option<i32>,
+
+    /// Most Responses API requests with background: true in flight at once;
+    /// one beyond answers 429. 0 switches background mode off: such requests
+    /// then run in the foreground.
+    #[arg(long, default_value_t = 1024, help_heading = "Rate Limiting")]
+    max_background_responses: usize,
+
     // ==================== Priority Scheduler ====================
     /// Enable the priority-aware admission scheduler. When unset (default),
     /// the legacy concurrency-limit middleware stays wired.
@@ -1177,19 +1195,6 @@ struct CliArgs {
     /// `--tenant-rate-limit-enabled` is set.
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
-
-    /// Sustained admission rate in requests per second, bursting up to
-    /// --max-concurrent-requests, which keeps bounding standing concurrency
-    /// (a completed request frees its slot, not rate budget). Unset or 0 =
-    /// no rate limit: --max-concurrent-requests bounds concurrency alone.
-    #[arg(long, allow_negative_numbers = true, help_heading = "Rate Limiting")]
-    rate_limit_tokens_per_second: Option<i32>,
-
-    /// Most Responses API requests with background: true in flight at once;
-    /// one beyond answers 429. 0 switches background mode off: such requests
-    /// then run in the foreground.
-    #[arg(long, default_value_t = 1024, help_heading = "Rate Limiting")]
-    max_background_responses: usize,
 
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
@@ -1502,14 +1507,6 @@ struct CliArgs {
     #[arg(long, help_heading = "Control Plane Authentication")]
     api_key: Option<String>,
 
-    /// Per-tenant API keys for serving-path auth (format: tenant_id:key,
-    /// repeatable). Layers on top of `--api-key`, each resolving to its own
-    /// tenant identity. Stored responses and conversations are scoped to the
-    /// tenant that created them: another tenant's id answers 404; records
-    /// stored without a tenant identity stay readable by every caller.
-    #[arg(long = "tenant-api-key", action = ArgAction::Append, help_heading = "Data Plane Authentication")]
-    tenant_api_keys: Vec<String>,
-
     /// JWT issuer URL for OIDC authentication
     #[arg(
         long,
@@ -1558,6 +1555,15 @@ struct CliArgs {
         help_heading = "Control Plane Authentication"
     )]
     disable_audit_logging: bool,
+
+    // ==================== Data Plane Authentication ====================
+    /// Per-tenant API keys for serving-path auth (format: tenant_id:key,
+    /// repeatable). Layers on top of `--api-key`, each resolving to its own
+    /// tenant identity. Stored responses and conversations are scoped to the
+    /// tenant that created them: another tenant's id answers 404; records
+    /// stored without a tenant identity stay readable by every caller.
+    #[arg(long = "tenant-api-key", action = ArgAction::Append, help_heading = "Data Plane Authentication")]
+    tenant_api_keys: Vec<String>,
 
     // ==================== Mesh Server ====================
     #[arg(long, default_value_t = false)]
