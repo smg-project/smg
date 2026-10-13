@@ -707,3 +707,55 @@ def test_a_cancelled_launch_task_still_stops_the_server():
 
     asyncio.run(run())
     assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}", "cancelled"]
+
+
+def test_the_kv_events_default_turns_the_publisher_on_unless_told_otherwise(caplog):
+    """The rule the three launchers share: a target without a configuration
+    gets the engine's default, the engine's variable keeps the publisher off,
+    an explicit configuration is kept as given, frozen server args are left
+    alone."""
+    apply = rust_lifecycle.apply_kv_events_default
+    env = "SMG_TEST_SERVICER_KV_EVENTS"
+    built: list[str] = []
+
+    def build():
+        built.append("built")
+        return {"publisher": "zmq"}
+
+    # Nothing given (no attribute, None, an empty string): the default, as a
+    # value or built on demand.
+    target = types.SimpleNamespace()
+    assert apply(target, "zmq", env_name=env, environ={}) == "zmq"
+    assert target.kv_events_config == "zmq"
+    for target in (
+        types.SimpleNamespace(),
+        types.SimpleNamespace(kv_events_config=None),
+        types.SimpleNamespace(kv_events_config=""),
+    ):
+        assert apply(target, build, env_name=env, environ={}) == {"publisher": "zmq"}
+        assert target.kv_events_config == {"publisher": "zmq"}
+    assert built == ["built"] * 3
+    # The opt-out: the engine's variable, case and whitespace aside; nothing is
+    # built for a publisher left off. Any other value is not the opt-out.
+    for value in ("0", "false", "No", " off "):
+        target = types.SimpleNamespace(kv_events_config=None)
+        assert apply(target, build, env_name=env, environ={env: value}) is None
+        assert target.kv_events_config is None
+    assert apply(types.SimpleNamespace(), "zmq", env_name=env, environ={env: "1"}) == "zmq"
+    assert built == ["built"] * 3
+    # An explicit configuration is kept as given, off and empty included.
+    for given in ('{"publisher": "null"}', {}, types.SimpleNamespace(publisher="null")):
+        target = types.SimpleNamespace(kv_events_config=given)
+        assert apply(target, build, env_name=env, environ={}) is None
+        assert target.kv_events_config is given
+    assert built == ["built"] * 3
+    # Server args that cannot be written are left alone, with a warning.
+
+    class Frozen:
+        __slots__ = ()
+        kv_events_config = None
+
+    with caplog.at_level("WARNING", logger=rust_lifecycle.logger.name):
+        assert apply(Frozen(), "zmq", env_name=env, environ={}) is None
+    warning = "kv_events_config cannot be set on Frozen; KV event publishing stays as configured"
+    assert warning in caplog.text

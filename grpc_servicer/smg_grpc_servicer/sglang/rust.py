@@ -50,6 +50,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     RustLauncher,
     SchedulerProcesses,
     ServicerConfigError,
+    apply_kv_events_default,
     ensure_spawn_start_method,
     on_fault_signal,
     resolve_tokenizer_dir,
@@ -71,7 +72,6 @@ STARTUP_CEILING_SECS_ENV = "SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep SGLang's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_SGLANG_SERVICER_KV_EVENTS"
-_OFF_VALUES = ("0", "false", "no", "off")
 # What a launcher without --kv-events-config gets under the Rust servicer:
 # the ZMQ publisher, with SGLang's own defaults for the rest (the endpoint,
 # the topic; no replay socket).
@@ -253,32 +253,13 @@ def default_kv_events_config(
     server_args: Any, environ: Mapping[str, str] | None = None
 ) -> str | None:
     """Turn SGLang's KV event publisher on when the launcher was given no
-    ``--kv-events-config``; returns the configuration applied, or None.
-
-    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
-    SGLang publishes none unless started with ``--kv-events-config
-    '{"publisher": "zmq"}'``: a launcher without it got a router that routed
-    blind, with one WARN per worker as the only trace. Under the Rust
-    servicer the server args that lack the option get exactly that
-    configuration before the facts and the headless scheduler are built from
-    them, so publisher and relay agree. An explicit ``--kv-events-config`` is
-    kept as given, off included; ``SMG_SGLANG_SERVICER_KV_EVENTS=0`` keeps
-    the publisher off without one.
-    """
-    source = os.environ if environ is None else environ
-    if EngineConfigView(server_args).server_args.kv_events_config:
-        return None
-    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
-        return None
-    try:
-        server_args.kv_events_config = DEFAULT_KV_EVENTS_CONFIG
-    except AttributeError:  # frozen server args: left as they are
-        logger.warning(
-            "kv_events_config cannot be set on %s; KV event publishing stays as configured",
-            type(server_args).__name__,
-        )
-        return None
-    return DEFAULT_KV_EVENTS_CONFIG
+    ``--kv-events-config``; returns the configuration applied, or None: the
+    shared rule (``rust_lifecycle.apply_kv_events_default``) with
+    ``DEFAULT_KV_EVENTS_CONFIG``, applied to the server args before the facts
+    and the headless scheduler are built from them."""
+    return apply_kv_events_default(
+        server_args, DEFAULT_KV_EVENTS_CONFIG, env_name=KV_EVENTS_ENV, environ=environ
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,13 +1,15 @@
 """The Python-owned lifecycle around a Rust servicer, shared by the engine
 launchers: the servicer switch (which implementation serves the process, from
-the launcher's flag or the engine's variable), the launcher's knobs, a free
-port and socket directory for the handshake, the engine as a ``Popen``-shaped
-handle (one spawned headless engine, the engine cores a manager started from
-this process, or the scheduler processes this process started itself), its
-termination, the supervision loop that drains on a signal and exits with the
-engine or the server, and :class:`RustLauncher`, the one sequence from the
-knobs to the supervision that every launcher runs with its engine's hooks
-filled in. Nothing here knows which engine it supervises.
+the launcher's flag or the engine's variable), the launcher's knobs, the
+KV-events default (the engine's publisher on unless the launcher or its
+variable says otherwise), a free port and socket directory for the handshake,
+the engine as a ``Popen``-shaped handle (one spawned headless engine, the
+engine cores a manager started from this process, or the scheduler processes
+this process started itself), its termination, the supervision loop that
+drains on a signal and exits with the engine or the server, and
+:class:`RustLauncher`, the one sequence from the knobs to the supervision that
+every launcher runs with its engine's hooks filled in. Nothing here knows
+which engine it supervises.
 """
 
 from __future__ import annotations
@@ -309,6 +311,54 @@ def servicer_switch(
     if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
         source[env_name] = value
     return value, origin
+
+
+# The values of a launcher's KV-events variable (``RustLauncher.kv_events_env``)
+# that keep the engine's KV event publisher off when the launcher was given no
+# --kv-events-config.
+KV_EVENTS_OFF_VALUES = ("0", "false", "no", "off")
+
+
+def apply_kv_events_default(
+    target: Any,
+    default: Any,
+    *,
+    env_name: str,
+    environ: Mapping[str, str] | None = None,
+) -> Any | None:
+    """Turn the engine's KV event publisher on when the launcher was given no
+    ``--kv-events-config``; returns the configuration applied, or ``None``.
+
+    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
+    no engine publishes any unless started with a ``--kv-events-config`` that
+    names its ZMQ publisher: a launcher without it got a router that routed
+    blind, with one WARN per worker as the only trace. Under the Rust servicer
+    ``target`` (the parsed launcher namespace or the engine's server args,
+    whichever the engine builds its configuration from) gets ``default`` (the
+    engine's ZMQ-publisher configuration, or a callable building it) as its
+    ``kv_events_config`` before the facts and the engine are built from it, so
+    publisher and relay agree. An explicit configuration, anything but ``None``
+    or an empty string, is kept as given, off included; ``env_name`` set to
+    one of ``KV_EVENTS_OFF_VALUES`` keeps the publisher off without one; a
+    ``target`` that cannot be written (frozen server args) is left as it is,
+    with a warning.
+    """
+    source = os.environ if environ is None else environ
+    given = getattr(target, "kv_events_config", None)
+    if given is not None and given != "":
+        return None
+    if str(source.get(env_name, "")).strip().lower() in KV_EVENTS_OFF_VALUES:
+        return None
+    config = default() if callable(default) else default
+    try:
+        target.kv_events_config = config
+    except AttributeError:  # frozen server args: left as they are
+        logger.warning(
+            "kv_events_config cannot be set on %s; KV event publishing stays as configured",
+            type(target).__name__,
+        )
+        return None
+    return config
 
 
 # How long a servicer that decided to exit over its engine may spend in the
@@ -876,7 +926,8 @@ class RustLauncher:
 
     def kv_events_default(self, args: Any) -> Any | None:
         """Turn the engine's KV event publisher on when the launcher was given
-        no ``--kv-events-config``: the configuration applied, or ``None``."""
+        no ``--kv-events-config``: the configuration applied, or ``None``
+        (``apply_kv_events_default`` with the engine's own default)."""
         raise NotImplementedError
 
     def facts(self, args: Any) -> dict[str, Any]:

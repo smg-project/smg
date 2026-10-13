@@ -59,6 +59,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     EngineProcess,
     EngineProcessGroup,
     RustLauncher,
+    apply_kv_events_default,
     resolve_tokenizer_dir,
     servicer_switch,
 )
@@ -84,7 +85,6 @@ STARTUP_CEILING_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_CEILING_SECS"
 # Set to 0/false/no/off to keep vLLM's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
-_OFF_VALUES = ("0", "false", "no", "off")
 # vLLM's own knob for how it starts its processes; the engine cores launched
 # from this process are spawned unless the deployment chose otherwise.
 MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
@@ -145,30 +145,26 @@ def default_kv_events_config(
     """Turn vLLM's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None.
 
-    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
-    vLLM publishes none unless started with ``--kv-events-config
-    '{"enable_kv_cache_events": true, "publisher": "zmq"}'``: a launcher
-    without it got a router that routed blind, with one WARN per worker as
-    the only trace. Under the Rust servicer the namespace that lacks the
-    option gets exactly that configuration (vLLM's own defaults for the rest:
-    the ZMQ endpoint and its port, the topic), before the engine args and the
-    engine cores are built from it, so publisher and relay agree. An explicit
-    ``--kv-events-config`` is kept as given, off included;
-    ``SMG_VLLM_SERVICER_KV_EVENTS=0`` keeps the publisher off without one.
+    The shared rule (``rust_lifecycle.apply_kv_events_default``) with vLLM's
+    default, applied to the namespace before the engine args and the engine
+    cores are built from it: the typed ``KVEventsConfig`` once ``vllm.config``
+    is importable, else the JSON form the launcher's parser takes; vLLM's own
+    defaults for the rest (the ZMQ endpoint and its port, the topic).
     """
-    source = os.environ if environ is None else environ
-    if getattr(args, "kv_events_config", None) is not None:
-        return None
-    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
-        return None
+    return apply_kv_events_default(
+        args, _zmq_publisher_config, env_name=KV_EVENTS_ENV, environ=environ
+    )
+
+
+def _zmq_publisher_config() -> Any:
+    """vLLM's configuration of its ZMQ KV event publisher: the typed form once
+    ``vllm.config`` is importable, else as the launcher's parser takes it."""
     try:
         from vllm.config import KVEventsConfig
 
-        config: Any = KVEventsConfig(enable_kv_cache_events=True, publisher="zmq")
+        return KVEventsConfig(enable_kv_cache_events=True, publisher="zmq")
     except ImportError:  # the launcher's parser hands the config over as JSON too
-        config = {"enable_kv_cache_events": True, "publisher": "zmq"}
-    args.kv_events_config = config
-    return config
+        return {"enable_kv_cache_events": True, "publisher": "zmq"}
 
 
 def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[str, Any] | None:
