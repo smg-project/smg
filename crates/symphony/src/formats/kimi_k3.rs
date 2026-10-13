@@ -6,35 +6,7 @@
 //! `<|open|>call tool="…" index="N"<|sep|>` and `<|close|>call<|sep|>`, and the whole turn closed
 //! by `<|close|>message<|sep|>`. As recorded for `moonshotai/Kimi-K3`.
 //!
-//! What this table says beyond the DeepSeek one:
-//!
-//! - **The turn itself is a state.** Between the regions there is nothing: the template writes
-//!   the regions back to back, and the end-of-turn tag after the last. `message` is that
-//!   wrapping, so a byte there is `Dropped { Wrapper }` when it is whitespace and `Malformed`
-//!   otherwise, and it is the state the turn opener leaves the engine in. Content is only what the
-//!   `response` region holds, every byte of it; the recorded answers match it exactly.
-//! - **Two states for the calls**, as for DSML: `tools` is the wrapping between calls, and `call`
-//!   is one call's arguments, read by the XTML assembler ([`tagged::xtml`](crate::tagged::xtml)).
-//!   The call tag's opening is the terminal that enters `call`, so the assembler starts inside the
-//!   function's name; the call's closing tag leaves it, and the call's end carries its bytes. A
-//!   second call before the first closed ends the first (`call + call_open = call`), and the
-//!   block's close ends a call still open (`call + tools_close = message`).
-//! - **The end-of-turn tag ends whatever is open.** `<|close|>message<|sep|>` is a token the model
-//!   cannot write by accident, so from any state it ends the region and returns to `message`: a
-//!   thought or an answer cut by it is closed, a call is closed into its object, and the tag
-//!   itself is dropped as wrapping. The same holds for a region's opening inside the thought
-//!   (`reasoning + response_open = content`, `reasoning + tools_open = tools`) and for a tools
-//!   block opened inside the answer (`content + tools_open = tools`): the region ended, however
-//!   the model left it, since the tags are tokens the model cannot write as text.
-//! - **The prompt opens the thought.** The template ends the generation prompt with
-//!   `<|open|>message role="assistant"<|sep|><|open|>think<|sep|>`, so an empty thought writes
-//!   `<|close|>think<|sep|>` at once, and the engine's prompt replay puts the output inside the
-//!   thought first. The turn opener is the message tag with the assistant's role, so an earlier
-//!   turn's regions move nothing.
-//! - **`<|open|>` and `<|close|>` are structural tokens.** Each is one token of the vocabulary,
-//!   so an output cut by `max_tokens` inside a tag (`<|close|>message` with no `<|sep|>` after
-//!   it) ends in a tail the model cannot have written as text: the engine drops it at the end of
-//!   the output, as the engine's own streaming parser does, instead of releasing it as content.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},

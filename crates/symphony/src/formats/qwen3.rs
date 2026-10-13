@@ -6,17 +6,7 @@
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
 //! [`Placement`](crate::tagged::Placement) says.
 //!
-//! The definition is the table below; the [`Engine`](crate::Engine) runs it, and decides
-//! everything the module doc of [`engine`](crate::engine) lists. Two things are Qwen3's own:
-//!
-//! - `calls + call_open = calls`: a new `<tool_call>` before the previous block closed ends the
-//!   call that was open and starts the next.
-//! - No row leaves reasoning on a call marker: Qwen3 closes its thought with `</think>` before a
-//!   call, so a `<tool_call>` inside the thought is reasoning text.
-//! - The turn opener is ChatML's `<|im_start|>assistant`.
-//!
-//! The tests here are the engine's as much as this format's: they were written against the
-//! hand-written parser this table replaced, and hold the table to the same events.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::format::{CallSyntax, Emits, Format};
 #[cfg(test)]

@@ -1,15 +1,7 @@
 //! Gemma 4: reasoning between `<|channel>thought\n` and `<channel|>`, each call between
 //! `<|tool_call>` and `<tool_call|>` in Gemma's own spelling (`call:NAME{key:value,…}`, a string
-//! between `<|"|>` tokens, [`gemma`](crate::gemma)), everything else content. The template writes
-//! the thought as `<|channel>thought\n`, the reasoning, `\n<channel|>`, then a turn's calls one
-//! right after another with nothing between them, then the content; the newline before
-//! `<channel|>` is the model's to write and reaches the reasoning stream (bellwether #17's
-//! question, as for Qwen3). The thought is the model's to write: the generation prompt is
-//! `<|turn>model\n` alone whatever the request says (the template opens the thought channel only
-//! after a tool response, and `enable_thinking` is off unless the request sets it), so the output
-//! starts in content. A turn opens with `<|turn>model`, so the prompt's replay starts there.
-//! Recorded as `gemma-4-e4b-it` (google/gemma-4-E4B-it), 54,416 parse cases, 15,669 of them with
-//! calls:
+//! between `<|"|>` tokens, [`gemma`](crate::gemma)), everything else content. Recorded as
+//! `gemma-4-e4b-it` (google/gemma-4-E4B-it), 54,416 parse cases, 15,669 of them with calls:
 //!
 //! ```text
 //! <|channel>thought
@@ -17,11 +9,7 @@
 //! <channel|><|tool_call>call:play{artist:<|"|>Taylor Swift<|"|>,n:20}<tool_call|>
 //! ```
 //!
-//! The template sorts a call's keys, so a call's arguments come back with the keys in that order
-//! whatever order the request gave them: the replay counts such a case as respelled, not as a
-//! difference (bellwether #110). `Format::grammar` writes a forced call's tag in this spelling,
-//! the keys sorted the same way (the grammar's `gemma` module).
-
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::format::{CallSyntax, Emits, Format};
 
 /// The Gemma 4 table.

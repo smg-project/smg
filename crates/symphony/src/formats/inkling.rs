@@ -9,30 +9,7 @@
 //! writes the thought or not. Everything the markers do not frame is the message's text. Recorded
 //! as `inkling` (thinkingmachines/Inkling).
 //!
-//! What the table says beyond the others:
-//!
-//! - **Every message starts in the arguments state.** The call's name comes before the marker that
-//!   says the message is a call, so the state after `<|message_model|>` reads with the named-JSON
-//!   assembler ([`json::named`](crate::json::named)): `<|content_thinking|>` or `<|content_text|>`
-//!   there leaves it with nothing fed and no call started; the name and the marker are the
-//!   template's framing, dropped, and the object is the call. The call's end is the object's close;
-//!   `<|end_message|>` is the message's, dropped.
-//! - **The turn's end token is ignored.** The template writes `<|content_model_end_sampling|>`
-//!   after the turn; an engine that passes it through has it dropped wherever it stands.
-//! - **A forced call's tag is the gateway's.** `Format::grammar` writes the tag the gateway's old
-//!   Inkling parser hand-writes: the call marker triggers it inside whatever message the model is
-//!   writing, the first one included, then `{"name":"NAME","args":`, the schema, `}` and
-//!   `<|end_message|>`; the tool's name before the marker, a thought and the template's empty
-//!   answer are free text, so the recorded thinking turn stays writable. A marker outside a
-//!   message's header is writable under the tag too and reads as that message's text: the
-//!   grammar is wider than the table there, as the gateway's tag is.
-//!
-//! What the table leaves out, for want of fixtures: image and audio messages, which the template
-//! writes for the user and never for the model; and the text-mode invocation,
-//! `<|content_invoke_tool_text|>`, which the gateway's older Inkling parsers drop as protocol
-//! data. No recorded set holds one. The table has no terminal for it, so such a message sits in
-//! the named-JSON header until `<|end_message|>` and comes back whole as `Malformed` (a name
-//! without a call), no byte lost; a recording of one decides what it is.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::format::{CallSyntax, Emits, Format};
 

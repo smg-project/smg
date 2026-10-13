@@ -3,26 +3,7 @@
 //! XML tree of arguments, everything else content, and the separator token `]<]minimax[>[` before
 //! every tag, dropped wherever it stands. As recorded for `MiniMaxAI/MiniMax-M3`.
 //!
-//! What this table says beyond the DSML one:
-//!
-//! - **An ignored terminal.** The template writes `]<]minimax[>[` before `<tool_call>`, before
-//!   every tag inside an invoke and before `</tool_call>`; it is one token, and it never stands
-//!   inside prose. The table ignores it: the engine drops it in every state and moves nowhere,
-//!   and inside an invoke the assembler keeps its bytes in place.
-//! - **The model writes the thought, or closes an empty one.** The template renders an assistant
-//!   turn as `<mm:think>…</mm:think>` when it has reasoning and as `</mm:think>` alone when it has
-//!   none, and its generation prompt adds nothing in its default mode (`thinking_mode` unset or
-//!   `adaptive`), so an output starts with one or the other. The table starts in a `start` state
-//!   whose text is content: `<mm:think>` there opens the thought and `</mm:think>` there closes
-//!   the empty one, both dropped; later in the content both are text. With `thinking_mode` set,
-//!   the generation prompt ends with `<mm:think>` (`enabled`) or `</mm:think>` (`disabled`) after
-//!   the turn opener `]~b]ai\n`, and the replay puts the output inside the thought or in content.
-//! - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
-//!   has it; the recorded outputs close the thought first.
-//! - **Two states for the calls, as for DSML:** `calls` is the template's wrapping (a newline after
-//!   `<tool_call>` and after `</invoke>`), `invoke` one call's arguments, read by the XML assembler
-//!   ([`tagged::xml`](crate::tagged::xml)); a second invoke before the first closed ends the first,
-//!   and the block's close ends an invoke still open.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},

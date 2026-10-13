@@ -9,11 +9,7 @@
 //! a turn opens with `<|ifm|im_start|>assistant`, so the prompt's replay starts there. Recorded as
 //! `k2-horizon-36b` (IFM/K2-Horizon-36B).
 //!
-//! What the table leaves out, for want of fixtures: the template picks the thought's tag by
-//! `reasoning_effort` (`<ifm|think_fast>` and `<ifm|think_faster>` below the default), and it can
-//! write the calls as JSON objects or with a typed tag per argument (`tool_call_format`); the
-//! recorded sets hold the default thought and the default calls, read here. A thought under one of
-//! the other tags is content until a set shows it.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},

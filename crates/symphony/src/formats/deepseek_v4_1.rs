@@ -3,25 +3,7 @@
 //! `</｜DSML｜ invoke>`, everything else content. The design's section 4 example, as recorded for
 //! `deepseek-ai/DeepSeek-V4.1-Flash`.
 //!
-//! What this table says beyond the Qwen ones:
-//!
-//! - **Two states for the calls.** `calls` is the template's wrapping between invokes (a newline,
-//!   dropped; anything else malformed), and `invoke` is one call's arguments, read by the
-//!   attributed assembler with DSML's tags ([`tagged::attributed`](crate::tagged::attributed),
-//!   `Tags::DSML`), the `string` attribute typing each value. A block with several invokes gives
-//!   several calls, each with its own index, through the same two rows.
-//! - **The invoke tag's opening is the terminal** that enters the arguments state, so the
-//!   assembler starts inside the function's name; the closing tag is the terminal that leaves it,
-//!   and the call's end carries its bytes. A second invoke before the first closed ends the first
-//!   and starts the second (`invoke + invoke_open = invoke`), and the block's close ends an invoke
-//!   still open (`invoke + calls_close = content`), so the call closes into an object and the
-//!   prose after the block stays prose.
-//! - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
-//!   and SMG's V4.1 reasoning parser have it; the recorded outputs close the thought first.
-//! - **The prompt opens the thought.** The template ends the generation prompt with `<think>`, and
-//!   an empty thought writes `</think>` at once, so most recorded outputs start with
-//!   `</think>\n\n`; the engine's prompt replay puts the output inside the thought first. The
-//!   turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},

@@ -1,18 +1,8 @@
 //! dots3: reasoning between `<think>` and `</think>`, each call in its own `<dots_function_call>`
 //! block as `<invoke name="…">` with `<parameter name="…">` tags whose key is the attribute and
 //! whose value the request's tools type, everything else content: MiniMax M2's attributed syntax
-//! with a block per call and each value on a line of its own. The template writes the turn as
-//! `<think>\n`, the reasoning, `\n</think>\n\n`, the content, then for each call
-//! `\n<dots_function_call>\n<invoke name="NAME">`, for each argument `\n<parameter name="KEY">\n`,
-//! the value, `\n</parameter>`, then `\n</invoke>\n</dots_function_call>`; a string value as it is,
-//! every other value as JSON (`tojson`). The newlines the template writes after a parameter tag
-//! and before its closing tag frame the value and are not part of it; the ones around the thought
-//! and before a block are the model's to write and reach the reasoning and content streams
-//! (bellwether #17's question, as for Qwen3). The thought is the model's to write: the generation
-//! prompt is `<|assistant|>` alone, or with the thought closed empty (`<think>\n\n</think>\n\n`)
-//! when the request turns thinking off, as Qwen3's does; a turn opens with `<|assistant|>`, so the
-//! prompt's replay starts there. Recorded as `dots3-note-prev` (dots-studio/dots3-note-prev),
-//! 54,195 parse cases, 15,446 of them with calls:
+//! with a block per call and each value on a line of its own. Recorded as `dots3-note-prev`
+//! (dots-studio/dots3-note-prev), 54,195 parse cases, 15,446 of them with calls:
 //!
 //! ```text
 //! <think>
@@ -38,7 +28,8 @@
 //! </invoke>
 //! </dots_function_call>
 //! ```
-
+//!
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::{
     format::{CallSyntax, Emits, Format},
     tagged::attributed,

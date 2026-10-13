@@ -3,14 +3,12 @@
 //! request's tools, with the template's newline after the name, after each `</arg_key>` and after
 //! each `</arg_value>`. Everything else is content. A turn opens with `<|assistant|>`, so the
 //! prompt's replay starts there, and the model writes its own `<think>`: the template puts
-//! `\n<think></think>` into the prompt only when the request turns thinking off. The template also
-//! writes a newline before the thought, before the content and before every call, and strips the
-//! content's edges, so those newlines are the model's to write and reach the content stream;
-//! whose they are is bellwether #17's question, as for Qwen3. Recorded as `glm-4.6`
-//! (zai-org/GLM-4.6). GLM 4.7 and later write the tags with nothing between them and open the
-//! thought in the prompt ([`glm()`](super::glm())); Ling writes the newline before the close
-//! instead of after each pair, under its own turn opener ([`ling()`](super::ling())).
-
+//! `\n<think></think>` into the prompt only when the request turns thinking off. Recorded as
+//! `glm-4.6` (zai-org/GLM-4.6). GLM 4.7 and later write the tags with nothing between them and
+//! open the thought in the prompt ([`glm()`](super::glm())); Ling writes the newline before the
+//! close instead of after each pair, under its own turn opener ([`ling()`](super::ling())).
+//!
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::{
     format::{CallSyntax, Emits, Format},
     tagged::keyed,
