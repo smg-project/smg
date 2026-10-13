@@ -25,6 +25,7 @@ from smg_grpc_servicer.kv_relay import (
     relay,
 )
 from smg_grpc_servicer.load_record import LoadSource
+from smg_grpc_servicer.sglang.config_view import EngineConfigView
 
 __all__ = ["dp_rank_count", "endpoint_for_rank", "sources", "subscribe_kv_events"]
 
@@ -33,8 +34,7 @@ logger = logging.getLogger(__name__)
 
 def dp_rank_count(server_args: object) -> int:
     """How many KV-event publishers this SGLang instance runs: ``dp_size``."""
-    dp_size = getattr(server_args, "dp_size", None)
-    return int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1
+    return EngineConfigView(server_args).server_args.dp_size or 1
 
 
 def sources(config: object, server_args: object) -> list[RankSource]:

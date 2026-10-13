@@ -46,6 +46,7 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
+from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import (
@@ -594,17 +595,14 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """How many attention-DP workers the flag is split across: ``dp_size``
         under ``--enable-dp-attention``, else 1 (plain data parallelism runs the
         whole flag on every scheduler)."""
-        if not getattr(self.server_args, "enable_dp_attention", False):
+        if not EngineConfigView(self.server_args).server_args.enable_dp_attention:
             return 1
         return self._rank_count()
 
     def _rank_count(self) -> int:
         """How many schedulers publish a load snapshot: ``dp_size``, 1 when
         the server arguments do not carry it."""
-        dp_size = getattr(self.server_args, "dp_size", 1)
-        if isinstance(dp_size, bool) or not isinstance(dp_size, int) or dp_size < 1:
-            return 1
-        return dp_size
+        return EngineConfigView(self.server_args).server_args.dp_size or 1
 
     def _running_window(self) -> int:
         """The running window the schedulers enforce, in the flag's units: the
@@ -616,8 +614,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         reader skips the ranks that have not published yet) is reported as it
         stands and read again on the next call, so a rank with a smaller bound
         still corrects it."""
-        configured = getattr(self.server_args, "max_running_requests", None)
-        if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
+        configured = EngineConfigView(self.server_args).server_args.max_running_requests
+        if configured is not None:
             return configured
         if self._computed_running_window > 0:
             return self._computed_running_window

@@ -55,6 +55,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
 )
+from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.structured_outputs import (
     grammar_start_labels,
     sglang_structured_outputs_start,
@@ -123,7 +124,7 @@ def _json_safe(obj: Any) -> Any:
 
 
 def _preferred_sampling_params(server_args: Any) -> dict[str, Any] | None:
-    preferred = getattr(server_args, "preferred_sampling_params", None)
+    preferred = EngineConfigView(server_args).server_args.preferred_sampling_params
     if isinstance(preferred, str):
         try:
             preferred = json.loads(preferred)
@@ -138,50 +139,35 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
     servicer's ``GetModelInfo`` fields, computed up front from the model
     config (the handshake supplies the scheduler's capacity figures later)."""
     model_config = model_config if model_config is not None else _model_config(server_args)
-    hf_config = getattr(model_config, "hf_config", None)
-    eos = getattr(model_config, "hf_eos_token_id", None)
-    if isinstance(eos, int):
-        eos_token_ids = [eos]
-    elif isinstance(eos, list | tuple | set | frozenset):
-        eos_token_ids = sorted(int(value) for value in eos)
-    else:
-        eos_token_ids = []
-    # Classification heads, as the Python servicer derives them.
-    id2label = getattr(hf_config, "id2label", None) if hf_config is not None else None
-    num_labels = (getattr(hf_config, "num_labels", 0) or 0) if hf_config is not None else 0
-    if not id2label and num_labels:
-        id2label = {index: f"LABEL_{index}" for index in range(num_labels)}
-    elif id2label and not num_labels:
-        num_labels = len(id2label)
+    view = EngineConfigView(server_args, model_config)
+    args, model = view.server_args, view.model
     defaults = dict(model_config.get_default_sampling_params() or {})
     preferred = _preferred_sampling_params(server_args)
     if preferred:
         defaults.update(preferred)
-    model_path = str(getattr(server_args, "model_path", "") or "")
-    context_len = int(getattr(model_config, "context_len", 0) or 0)
     return {
-        "model_path": model_path,
-        "tokenizer_path": str(getattr(server_args, "tokenizer_path", None) or model_path),
-        "served_model_name": str(getattr(server_args, "served_model_name", None) or model_path),
-        "is_generation": bool(getattr(model_config, "is_generation", True)),
-        "model_type": str((getattr(hf_config, "model_type", "") or "") if hf_config else ""),
-        "architectures": list((getattr(hf_config, "architectures", []) or []) if hf_config else []),
-        "max_context_length": context_len,
-        "max_req_input_len": context_len,
-        "vocab_size": int(getattr(model_config, "vocab_size", 0) or 0),
-        "eos_token_ids": eos_token_ids,
-        "pad_token_id": int((getattr(hf_config, "pad_token_id", 0) or 0) if hf_config else 0),
-        "bos_token_id": int((getattr(hf_config, "bos_token_id", 0) or 0) if hf_config else 0),
-        "weight_version": str(getattr(server_args, "weight_version", None) or ""),
+        "model_path": args.model_path,
+        "tokenizer_path": str(args.tokenizer_path or args.model_path),
+        "served_model_name": str(args.served_model_name or args.model_path),
+        "is_generation": model.is_generation,
+        "model_type": model.model_type,
+        "architectures": model.architectures,
+        "max_context_length": model.context_len,
+        "max_req_input_len": model.context_len,
+        "vocab_size": model.vocab_size,
+        "eos_token_ids": model.eos_token_ids,
+        "pad_token_id": model.pad_token_id,
+        "bos_token_id": model.bos_token_id,
+        "weight_version": args.weight_version,
         "preferred_sampling_params": (
             json.dumps(preferred, separators=(",", ":"), sort_keys=True) if preferred else ""
         ),
         "default_sampling_params_json": (
             json.dumps(defaults, separators=(",", ":"), sort_keys=True) if defaults else ""
         ),
-        "supports_vision": bool(getattr(model_config, "is_multimodal", False)),
-        "id2label_json": json.dumps(_json_safe(id2label)) if id2label else "",
-        "num_labels": int(num_labels or 0),
+        "supports_vision": model.is_multimodal,
+        "id2label_json": json.dumps(_json_safe(model.id2label)) if model.id2label else "",
+        "num_labels": model.num_labels,
     }
 
 
@@ -222,7 +208,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang
         sglang_version = ""
-    dp_size = getattr(server_args, "dp_size", None)
+    dp_size = EngineConfigView(server_args).server_args.dp_size
     kv_events_endpoint, kv_events_replay_endpoint, kv_events_topic = kv_events_publisher(
         server_args
     )
@@ -232,8 +218,8 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         "server_args_json": json.dumps(args_dict, sort_keys=True, allow_nan=False),
         "scheduler_info_json": "{}",
         "sglang_version": str(sglang_version),
-        "max_running_requests": int(getattr(server_args, "max_running_requests", None) or 0),
-        "data_parallel_size": int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1,
+        "max_running_requests": EngineConfigView(server_args).server_args.max_running_requests or 0,
+        "data_parallel_size": dp_size or 1,
         "kv_events_endpoint": kv_events_endpoint,
         "kv_events_replay_endpoint": kv_events_replay_endpoint,
         "kv_events_topic": kv_events_topic,
@@ -247,7 +233,7 @@ def kv_events_publisher(server_args: Any) -> tuple[str, str, str]:
     replay endpoint when SGLang runs no replay socket. The Rust servicer relays
     this publisher on ``SubscribeKvEvents`` and asks the replay socket for gaps
     and for the batches published before its subscription joined."""
-    raw = getattr(server_args, "kv_events_config", None)
+    raw = EngineConfigView(server_args).server_args.kv_events_config
     if not raw:
         return "", "", ""
     try:
@@ -280,7 +266,7 @@ def default_kv_events_config(
     the publisher off without one.
     """
     source = os.environ if environ is None else environ
-    if getattr(server_args, "kv_events_config", None):
+    if EngineConfigView(server_args).server_args.kv_events_config:
         return None
     if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
         return None
@@ -391,10 +377,8 @@ def launch_scheduler_ranks(
 
 def tokenizer_dir_for(server_args: Any) -> str | None:
     """The local tokenizer directory for the served model, or ``None``."""
-    tokenizer = getattr(server_args, "tokenizer_path", None) or getattr(
-        server_args, "model_path", ""
-    )
-    return resolve_tokenizer_dir(str(tokenizer), getattr(server_args, "revision", None))
+    args = EngineConfigView(server_args).server_args
+    return resolve_tokenizer_dir(str(args.tokenizer_path or args.model_path), args.revision)
 
 
 # ---------------------------------------------------------------------------
@@ -406,13 +390,13 @@ def refuse_disaggregation(server_args: Any) -> None:
     """PD/EPD stays with the Python servicer: the msgpack wire carries no
     bootstrap fields and this path starts no bootstrap server, so such a
     worker must not start rather than report SERVING and hang requests."""
-    mode = getattr(server_args, "disaggregation_mode", "null") or "null"
-    if mode != "null":
+    args = EngineConfigView(server_args).server_args
+    if args.disaggregation_mode != "null":
         raise ServicerConfigError(
             f"{SERVICER_IMPL_ENV}=rust does not support PD disaggregation "
-            f"(disaggregation_mode={mode!r}); unset it for this worker"
+            f"(disaggregation_mode={args.disaggregation_mode!r}); unset it for this worker"
         )
-    if getattr(server_args, "language_only", False) or getattr(server_args, "encoder_only", False):
+    if args.language_only or args.encoder_only:
         raise ServicerConfigError(
             f"{SERVICER_IMPL_ENV}=rust does not support EPD disaggregation "
             "(language_only / encoder_only); unset it for this worker"
