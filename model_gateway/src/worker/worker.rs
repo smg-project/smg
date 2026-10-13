@@ -3277,6 +3277,7 @@ mod tests {
     use super::*;
     use crate::worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        liveness::now_ms,
         BasicWorkerBuilder,
     };
 
@@ -4863,11 +4864,11 @@ mod tests {
             // A fresh millisecond: the runtime's own construction stamp (or the
             // previous attempt's) must not be the one the first token repeats.
             thread::sleep(Duration::from_millis(2));
-            let ms = crate::worker::liveness::now_ms();
+            let ms = now_ms();
             runtime.note_token_progress();
             assert!(permit(50), "the first token leaves the notifier's permit");
             runtime.note_token_progress();
-            if crate::worker::liveness::now_ms() == ms {
+            if now_ms() == ms {
                 aligned = true;
                 break;
             }
