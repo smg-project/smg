@@ -165,13 +165,20 @@ pub trait VisionPreProcessor: Send + Sync {
     /// Calculate the number of vision tokens for a given image size.
     ///
     /// This is used to determine how many placeholder tokens to insert
-    /// in the text input before the image has been fully processed.
+    /// in the text input before the image has been fully processed. A
+    /// config or a size that [`Self::preprocess`] would refuse is the same
+    /// error here, never a count of zero or one taken from other settings.
     ///
     /// # Arguments
     /// * `width` - Image width after preprocessing
     /// * `height` - Image height after preprocessing
     /// * `config` - Preprocessor configuration
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize;
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError>;
 
     /// Get the model family name for identification.
     fn model_name(&self) -> &'static str;

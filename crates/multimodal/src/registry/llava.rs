@@ -215,6 +215,7 @@ mod tests {
         let spec = registry.lookup(&metadata).expect("llava spec");
         assert!(spec
             .audio_processor(&config, &PreProcessorConfig::default())
+            .unwrap()
             .is_none());
     }
 }

@@ -509,7 +509,12 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         })
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         let processor = Self::from_preprocessor_config(config);
         let image_size = (height, width);
         // target_size from get_best_fit determines the canvas and tile count
@@ -519,7 +524,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         let num_tiles_h = target_size.0 as usize / tile;
         let num_tiles_w = target_size.1 as usize / tile;
 
-        processor.calculate_num_tokens_for_aspect_ratio((num_tiles_h, num_tiles_w))
+        Ok(processor.calculate_num_tokens_for_aspect_ratio((num_tiles_h, num_tiles_w)))
     }
 
     fn model_name(&self) -> &'static str {

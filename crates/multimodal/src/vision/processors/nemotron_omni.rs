@@ -378,8 +378,18 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         Self::video_patches(frames)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, _config: &PreProcessorConfig) -> usize {
-        Self::plan_grid(width, height).map_or(0, |(rows, cols)| grid_tokens(rows, cols))
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        _config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        let (rows, cols) = Self::plan_grid(width, height).ok_or_else(|| {
+            TransformError::ShapeError(format!(
+                "a {width}x{height} image is too thin for Nemotron-H Omni's patch grid"
+            ))
+        })?;
+        Ok(grid_tokens(rows, cols))
     }
 
     fn model_name(&self) -> &'static str {
@@ -406,6 +416,13 @@ mod tests {
         assert_eq!(tokens(4000, 3000), 3300);
         // Rounds to a zero-height grid; vLLM divides by its area and fails.
         assert_eq!(NemotronOmniProcessor::plan_grid(300_000, 8), None);
+        // The count refuses what the grid planner refuses, as the
+        // preprocessing does.
+        let error = NemotronOmniProcessor::new()
+            .calculate_num_tokens(300_000, 8, &PreProcessorConfig::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too thin"), "{error}");
     }
 
     /// Frame grids vLLM's `_compute_aspect_preserving_size` gives these sizes.

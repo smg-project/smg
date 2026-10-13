@@ -551,7 +551,12 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         })
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         let processor = Self::from_preprocessor_config(config);
         let base_res = processor.base_resolution as f64;
 
@@ -572,7 +577,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         let mask_area = target_h_crops * target_w_crops * half_res * half_res;
         let mask_col0 = target_h_crops * half_res;
 
-        256 + 1 + mask_area + mask_col0 + 16
+        Ok(256 + 1 + mask_area + mask_col0 + 16)
     }
 
     fn model_name(&self) -> &'static str {

@@ -485,6 +485,12 @@ async fn preprocess_modality(
     let audio_processor = if modality == Modality::Audio {
         Some(
             spec.audio_processor(&model_config.config, &model_config.preprocessor_config)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "The audio processor of model spec {} cannot be built: {error}",
+                        spec.name()
+                    )
+                })?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "No audio processor registered for model spec: {}",

@@ -398,10 +398,16 @@ impl VisionPreProcessor for DeepseekV41Processor {
         )
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.with_preprocessor_config(config)
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        Ok(self
+            .with_preprocessor_config(config)
             .plan_image_grid(width, height)
-            .num_image_tokens()
+            .num_image_tokens())
     }
 
     fn model_name(&self) -> &'static str {
@@ -533,13 +539,21 @@ mod tests {
         let config: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"max_image_tokens": 320})).unwrap();
 
-        assert!(processor.calculate_num_tokens(4000, 4000, &config) <= 320);
-        assert!(processor.calculate_num_tokens(4000, 4000, &PreProcessorConfig::default()) > 320);
+        assert!(processor.calculate_num_tokens(4000, 4000, &config).unwrap() <= 320);
+        assert!(
+            processor
+                .calculate_num_tokens(4000, 4000, &PreProcessorConfig::default())
+                .unwrap()
+                > 320
+        );
         // A budget below the geometry's minimum is floored instead of
         // underflowing the resize maths.
         let tiny: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"max_image_tokens": 1})).unwrap();
-        assert_eq!(processor.calculate_num_tokens(4000, 4000, &tiny), 4);
+        assert_eq!(
+            processor.calculate_num_tokens(4000, 4000, &tiny).unwrap(),
+            4
+        );
     }
 
     #[test]

@@ -290,7 +290,7 @@ fn test_llava_token_count() {
     let processor = LlavaProcessor::new();
 
     // LLaVA 1.5 with 336x336 and patch_size=14: (336/14)^2 = 576 tokens
-    let tokens = processor.calculate_num_tokens(336, 336, &config);
+    let tokens = processor.calculate_num_tokens(336, 336, &config).unwrap();
     assert_eq!(
         tokens, 576,
         "Expected 576 tokens for 336x336 with patch_size=14"

@@ -33,8 +33,13 @@ impl VisionPreProcessor for Processor {
     fn default_std(&self) -> [f64; 3] {
         [1.0; 3]
     }
-    fn calculate_num_tokens(&self, _: u32, _: u32, _: &PreProcessorConfig) -> usize {
-        1
+    fn calculate_num_tokens(
+        &self,
+        _: u32,
+        _: u32,
+        _: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        Ok(1)
     }
     fn model_name(&self) -> &'static str {
         "cache-test"
@@ -355,8 +360,13 @@ impl VisionPreProcessor for PixelProbe {
     fn default_std(&self) -> [f64; 3] {
         [1.0; 3]
     }
-    fn calculate_num_tokens(&self, _: u32, _: u32, _: &PreProcessorConfig) -> usize {
-        1
+    fn calculate_num_tokens(
+        &self,
+        _: u32,
+        _: u32,
+        _: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        Ok(1)
     }
     fn model_name(&self) -> &'static str {
         "pixel-probe"

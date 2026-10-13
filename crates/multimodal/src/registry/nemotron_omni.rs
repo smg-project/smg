@@ -201,18 +201,23 @@ impl NemotronOmniSpec {
         if !Self::has_audio(config) {
             return Ok(());
         }
-        match ParakeetAudioParams::from_model_config(config) {
-            Ok(_) => Ok(()),
-            Err(ParakeetConfigError::Missing(field)) => {
-                Err(ModelRegistryError::MissingConfigField {
-                    field: format!("sound_config.{field}"),
-                })
-            }
-            Err(ParakeetConfigError::Unsupported(field)) => {
-                Err(ModelRegistryError::UnsupportedModel(format!(
+        ParakeetAudioParams::from_model_config(config)
+            .map(|_| ())
+            .map_err(Self::audio_config_error)
+    }
+
+    /// The registry's reading of a `sound_config` the audio port refused:
+    /// a field it needs is missing, or set to a value it does not implement.
+    fn audio_config_error(error: ParakeetConfigError) -> ModelRegistryError {
+        match error {
+            ParakeetConfigError::Missing(field) => ModelRegistryError::MissingConfigField {
+                field: format!("sound_config.{field}"),
+            },
+            ParakeetConfigError::Unsupported(field) => {
+                ModelRegistryError::UnsupportedModel(format!(
                     "Nemotron-H Omni config sound_config.{field} differs from the gateway's \
                      preprocessing"
-                )))
+                ))
             }
         }
     }
@@ -290,9 +295,16 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         &self,
         model_config: &Value,
         _preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        let params = ParakeetAudioParams::from_model_config(model_config).ok()?;
-        Some(Box::new(ParakeetAudioProcessor::new(params)))
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        // No `sound_config` is a model without audio; a `sound_config` the
+        // port cannot serve is the configuration error `check_config` reports,
+        // not a missing processor.
+        if !Self::has_audio(model_config) {
+            return Ok(None);
+        }
+        let params = ParakeetAudioParams::from_model_config(model_config)
+            .map_err(Self::audio_config_error)?;
+        Ok(Some(Box::new(ParakeetAudioProcessor::new(params))))
     }
 
     fn prompt_replacements(
@@ -410,6 +422,32 @@ mod tests {
             },
             "sound_config": {"sampling_rate": 16000, "num_mel_bins": 128, "subsampling_factor": 8}
         })
+    }
+
+    #[test]
+    fn audio_processor_tells_no_audio_from_an_audio_config_it_cannot_serve() {
+        let spec = NemotronOmniSpec;
+        let default = PreProcessorConfig::default();
+
+        let mut config = checkpoint_config();
+        assert!(spec.audio_processor(&config, &default).unwrap().is_some());
+
+        config["sound_config"]["subsampling_factor"] = json!(4);
+        assert!(matches!(
+            spec.audio_processor(&config, &default).err().unwrap(),
+            ModelRegistryError::UnsupportedModel(message)
+                if message.contains("sound_config.subsampling_factor")
+        ));
+
+        config["sound_config"] = json!({"sampling_rate": 16000});
+        assert!(matches!(
+            spec.audio_processor(&config, &default).err().unwrap(),
+            ModelRegistryError::MissingConfigField { field }
+                if field.starts_with("sound_config.")
+        ));
+
+        config.as_object_mut().unwrap().remove("sound_config");
+        assert!(spec.audio_processor(&config, &default).unwrap().is_none());
     }
 
     #[test]

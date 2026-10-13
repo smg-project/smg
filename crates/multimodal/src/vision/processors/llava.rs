@@ -298,7 +298,7 @@ impl VisionPreProcessor for LlavaProcessor {
         let feature_token_counts: Vec<usize> = images
             .iter()
             .map(|_| self.calculate_num_tokens(self.image_size, self.image_size, config))
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         Ok(PreprocessedEncoderInputs::new(
             encoder_input,
@@ -312,7 +312,7 @@ impl VisionPreProcessor for LlavaProcessor {
         _width: u32,
         _height: u32,
         config: &PreProcessorConfig,
-    ) -> usize {
+    ) -> Result<usize, TransformError> {
         // For LLaVA 1.5, token count is based on processed image size and patch size
         let patch_size = config.get_patch_size(self.patch_size as usize) as u32;
         let image_size = config
@@ -321,7 +321,7 @@ impl VisionPreProcessor for LlavaProcessor {
             .unwrap_or(self.image_size);
 
         let patches_per_side = image_size / patch_size;
-        (patches_per_side * patches_per_side) as usize
+        Ok((patches_per_side * patches_per_side) as usize)
     }
 
     fn model_name(&self) -> &'static str {
@@ -564,7 +564,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
                 original_size.0,
                 original_size.1,
                 config,
-            ));
+            )?);
         }
 
         // Build 5D encoder_input [num_images, max_patches, C, H, W] matching the
@@ -603,7 +603,12 @@ impl VisionPreProcessor for LlavaNextProcessor {
         Ok(result)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         let original_size = (width, height);
 
         // Use effective geometry from config, falling back to base defaults.
@@ -646,7 +651,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         let unpadded_features = feat_h * feat_w;
         let newline_features = feat_h; // one newline token per row
 
-        unpadded_features + newline_features + base_features
+        Ok(unpadded_features + newline_features + base_features)
     }
 
     fn model_name(&self) -> &'static str {
@@ -815,7 +820,7 @@ mod tests {
         let config = PreProcessorConfig::default();
 
         // 336 / 14 = 24, 24 * 24 = 576
-        let tokens = processor.calculate_num_tokens(336, 336, &config);
+        let tokens = processor.calculate_num_tokens(336, 336, &config).unwrap();
         assert_eq!(tokens, 576);
     }
 

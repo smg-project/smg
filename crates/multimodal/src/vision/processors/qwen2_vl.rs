@@ -256,7 +256,12 @@ impl VisionPreProcessor for Qwen2VLProcessor {
         processor.inner.preprocess_wire(images, config, dtype)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         let processor = self.with_preprocessor_config(config);
         processor.inner.calculate_num_tokens(width, height, config)
     }
@@ -526,20 +531,34 @@ mod tests {
     }
 
     #[test]
+    fn token_count_refuses_the_aspect_ratio_the_resize_refuses() {
+        // An aspect ratio past the reference's limit fails the resize and
+        // therefore the preprocessing; the count fails the same way instead
+        // of counting the image at the minimum size.
+        let processor = Qwen2VLProcessor::new();
+        let error = processor
+            .calculate_num_tokens(4000, 10, &PreProcessorConfig::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("aspect ratio"), "{error}");
+    }
+
+    #[test]
     fn test_calculate_num_tokens_honors_config_max_pixels() {
         let processor = Qwen2VLProcessor::new();
 
         // A 1400x1400 image clamps to max_pixels before the grid is computed,
         // so a lower config max_pixels must yield fewer tokens.
-        let default_tokens =
-            processor.calculate_num_tokens(1400, 1400, &PreProcessorConfig::default());
+        let default_tokens = processor
+            .calculate_num_tokens(1400, 1400, &PreProcessorConfig::default())
+            .unwrap();
         assert_eq!(default_tokens, 1225); // resized to 980x980 -> (70*70)/4
 
         let config = PreProcessorConfig {
             max_pixels: Some(512 * 28 * 28), // 401,408, below the 1,003,520 default
             ..Default::default()
         };
-        let config_tokens = processor.calculate_num_tokens(1400, 1400, &config);
+        let config_tokens = processor.calculate_num_tokens(1400, 1400, &config).unwrap();
         assert_eq!(config_tokens, 484); // resized to 616x616 -> (44*44)/4
         assert_ne!(
             config_tokens, default_tokens,

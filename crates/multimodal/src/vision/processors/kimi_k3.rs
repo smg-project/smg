@@ -156,11 +156,17 @@ impl VisionPreProcessor for KimiK3Processor {
         )
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.params
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        Ok(self
+            .params
             .resolved(config)
             .compute_resize_config(width as usize, height as usize)
-            .num_tokens
+            .num_tokens)
     }
 
     fn model_name(&self) -> &'static str {
@@ -222,8 +228,8 @@ mod tests {
 
         // 4000x3000 is well past both budgets, so the difference shows up
         // directly in how far each model downscales.
-        let k3_tokens = k3.calculate_num_tokens(4000, 3000, &config);
-        let k25_tokens = k25.calculate_num_tokens(4000, 3000, &config);
+        let k3_tokens = k3.calculate_num_tokens(4000, 3000, &config).unwrap();
+        let k25_tokens = k25.calculate_num_tokens(4000, 3000, &config).unwrap();
         assert!(
             k3_tokens > k25_tokens,
             "K3 should keep more tokens than K2.5 ({k3_tokens} vs {k25_tokens})"

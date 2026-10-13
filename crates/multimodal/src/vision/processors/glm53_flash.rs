@@ -593,15 +593,18 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         preprocess_video_frames(frames, config)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        let Ok(params) = Params::from_config(config, false) else {
-            return 0;
-        };
-        let Ok(geometry) = params.geometry(params.temporal, height as usize, width as usize) else {
-            return 0;
-        };
-        geometry.target.0 / params.patch * (geometry.target.1 / params.patch)
-            / (params.merge * params.merge)
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        let params = Params::from_config(config, false)?;
+        let geometry = params.geometry(params.temporal, height as usize, width as usize)?;
+        Ok(
+            geometry.target.0 / params.patch * (geometry.target.1 / params.patch)
+                / (params.merge * params.merge),
+        )
     }
 
     fn model_name(&self) -> &'static str {
@@ -636,6 +639,28 @@ mod tests {
 
     /// The video processor config this family's checkpoint ships, the keys
     /// the engine's own processor reads.
+    #[test]
+    fn token_count_reports_an_unusable_expand_factor() {
+        // A present but unusable `patch_expand_factor` is the configuration
+        // error the parameters report, not a count of zero.
+        let mut config = PreProcessorConfig::default();
+        config
+            .extra
+            .insert("patch_expand_factor".to_string(), serde_json::json!("x"));
+        let processor = Glm53FlashProcessor::new();
+        let counted = processor
+            .calculate_num_tokens(448, 448, &config)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            counted,
+            Params::from_config(&config, false)
+                .err()
+                .unwrap()
+                .to_string()
+        );
+    }
+
     fn video_config() -> PreProcessorConfig {
         PreProcessorConfig::from_json(
             r#"{"do_rescale":true,"video_processor_type":"Glm5NextVideoProcessor",

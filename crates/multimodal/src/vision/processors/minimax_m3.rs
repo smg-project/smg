@@ -450,15 +450,20 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
             .preprocess_video_rgb(frames, config)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        // Infallible signature: a malformed config surfaces on the preprocess
-        // call, so fall back to this processor's own settings here.
-        let layered = self.for_request(config).unwrap_or_else(|_| self.clone());
-        let staged = config
-            .do_resize
-            .unwrap_or(true)
-            .then(|| layered.staging_dimensions(width, height).ok().flatten())
-            .flatten();
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        // The request's config layered over this processor's settings, as
+        // `preprocess` does; a config it refuses is refused here too.
+        let layered = self.for_request(config)?;
+        let staged = if config.do_resize.unwrap_or(true) {
+            layered.staging_dimensions(width, height)?
+        } else {
+            None
+        };
         let (width, height) = staged.unwrap_or((width, height));
         layered.inner.calculate_num_tokens(width, height, config)
     }
@@ -561,7 +566,10 @@ mod tests {
 
         // A 448x448 image is 32x32 patches at patch_size 14, which is
         // 16x16 = 256 tokens after the 2x2 merge.
-        assert_eq!(processor.calculate_num_tokens(448, 448, &config), 256);
+        assert_eq!(
+            processor.calculate_num_tokens(448, 448, &config).unwrap(),
+            256
+        );
     }
 
     #[test]
@@ -757,6 +765,26 @@ mod tests {
     }
 
     #[test]
+    fn token_count_refuses_the_config_construction_refuses() {
+        // A malformed compression block is the construction path's error for
+        // the count too, not a count taken from this processor's own settings.
+        let config: PreProcessorConfig = serde_json::from_str(
+            r#"{"img_token_compression_config": {"spatial_merge_size": "two"}}"#,
+        )
+        .unwrap();
+        let processor = MiniMaxM3VisionProcessor::new();
+        let counted = processor
+            .calculate_num_tokens(448, 448, &config)
+            .unwrap_err()
+            .to_string();
+        let constructed = MiniMaxM3VisionProcessor::from_preprocessor_config(&config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(counted, constructed);
+    }
+
+    #[test]
     fn layering_pairs_frames_by_the_temporal_patch_size_the_lookup_reports() {
         let mut flat = m3_config();
         flat.temporal_patch_size = Some(4);
@@ -892,10 +920,19 @@ mod tests {
         let processor = MiniMaxM3VisionProcessor::new();
         let config = m3_config();
         // 400x40 is raised to 1120x112: an 8x80 patch grid, 160 tokens after the 2x2 merge.
-        assert_eq!(processor.calculate_num_tokens(400, 40, &config), 160);
-        assert_eq!(processor.calculate_num_tokens(40, 400, &config), 160);
+        assert_eq!(
+            processor.calculate_num_tokens(400, 40, &config).unwrap(),
+            160
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(40, 400, &config).unwrap(),
+            160
+        );
         // A short side already at the floor is left alone.
-        assert_eq!(processor.calculate_num_tokens(400, 112, &config), 56);
+        assert_eq!(
+            processor.calculate_num_tokens(400, 112, &config).unwrap(),
+            56
+        );
     }
 
     #[test]
@@ -929,7 +966,7 @@ mod tests {
         let config = m3_config();
         let tokens: Vec<usize> = [90, 40, 20]
             .into_iter()
-            .map(|short| processor.calculate_num_tokens(400, short, &config))
+            .map(|short| processor.calculate_num_tokens(400, short, &config).unwrap())
             .collect();
         assert_eq!(tokens, vec![72, 160, 320]);
     }
@@ -943,7 +980,7 @@ mod tests {
         let config = m3_config();
         let tokens: Vec<usize> = [20, 10, 5]
             .into_iter()
-            .map(|short| processor.calculate_num_tokens(400, short, &config))
+            .map(|short| processor.calculate_num_tokens(400, short, &config).unwrap())
             .collect();
         assert_eq!(tokens, vec![320, 453, 428]);
     }
@@ -987,7 +1024,10 @@ mod tests {
         assert!(processor
             .preprocess(&[DynamicImage::new_rgb8(400, 40)], &config)
             .is_err());
-        assert_eq!(processor.calculate_num_tokens(400, 40, &config), 14);
+        assert_eq!(
+            processor.calculate_num_tokens(400, 40, &config).unwrap(),
+            14
+        );
     }
 
     #[test]
@@ -1056,7 +1096,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 out.feature_token_counts,
-                vec![processor.calculate_num_tokens(width, height, &config)],
+                vec![processor
+                    .calculate_num_tokens(width, height, &config)
+                    .unwrap()],
                 "{width}x{height}"
             );
         }
@@ -1074,7 +1116,9 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
             assert_eq!(
                 out.feature_token_counts,
-                vec![processor.calculate_num_tokens(width, height, &config)],
+                vec![processor
+                    .calculate_num_tokens(width, height, &config)
+                    .unwrap()],
                 "{width}x{height}"
             );
         }
@@ -1124,7 +1168,11 @@ mod tests {
         let config = m3_config();
         let tokens: Vec<usize> = [(400, 40), (300, 80), (112, 20), (40, 400), (80, 300)]
             .into_iter()
-            .map(|(width, height)| processor.calculate_num_tokens(width, height, &config))
+            .map(|(width, height)| {
+                processor
+                    .calculate_num_tokens(width, height, &config)
+                    .unwrap()
+            })
             .collect();
         assert_eq!(tokens, vec![160, 60, 88, 160, 60]);
     }
@@ -1141,7 +1189,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 out.feature_token_counts,
-                vec![processor.calculate_num_tokens(width, height, &config)],
+                vec![processor
+                    .calculate_num_tokens(width, height, &config)
+                    .unwrap()],
                 "{width}x{height}"
             );
         }
@@ -1160,7 +1210,10 @@ mod tests {
             layered.staging_dimensions(400, 3).unwrap(),
             Some((4089, 31))
         );
-        assert_eq!(processor.calculate_num_tokens(400, 3, &config), 129);
+        assert_eq!(
+            processor.calculate_num_tokens(400, 3, &config).unwrap(),
+            129
+        );
     }
 
     #[test]
@@ -1169,8 +1222,14 @@ mod tests {
         // a percent of the full raise's (293 and 339 tokens).
         let processor = MiniMaxM3VisionProcessor::new();
         let config = m3_config();
-        assert_eq!(processor.calculate_num_tokens(150, 1, &config), 292);
-        assert_eq!(processor.calculate_num_tokens(200, 1, &config), 336);
+        assert_eq!(
+            processor.calculate_num_tokens(150, 1, &config).unwrap(),
+            292
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(200, 1, &config).unwrap(),
+            336
+        );
     }
 
     #[test]
@@ -1254,7 +1313,7 @@ mod tests {
         let config = m3_config();
 
         // Well past the bound: the count must clamp to image_seq_length.
-        let tokens = processor.calculate_num_tokens(4096, 4096, &config);
+        let tokens = processor.calculate_num_tokens(4096, 4096, &config).unwrap();
         assert!(
             tokens <= 576,
             "expected at most image_seq_length (576) tokens, got {tokens}"

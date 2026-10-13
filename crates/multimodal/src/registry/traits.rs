@@ -310,7 +310,9 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// This is the single source of truth for audio-processor selection: the
     /// same spec that owns a model's prompt/placeholder logic also owns its
     /// audio preprocessor factory, so there is no separate string-keyed
-    /// registry to keep in sync. Audio-less specs use the default (`None`).
+    /// registry to keep in sync. Audio-less specs use the default
+    /// (`Ok(None)`); an audio config the spec cannot serve is an error
+    /// naming the field, never `None`.
     ///
     /// The processor is built from the current model config because its feature
     /// shapes and quantization parameters can be checkpoint-specific.
@@ -318,8 +320,8 @@ pub trait ModelProcessorSpec: Send + Sync {
         &self,
         _model_config: &Value,
         _preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        None
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        Ok(None)
     }
 
     /// Compute per-media prompt replacement token sequences.

@@ -190,7 +190,12 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
             .preprocess_video_rgb(frames, config)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         self.with_image_preprocessor_config(config)
             .inner
             .calculate_num_tokens(width, height, config)

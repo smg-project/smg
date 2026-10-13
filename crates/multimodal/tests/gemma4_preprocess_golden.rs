@@ -229,7 +229,9 @@ fn preprocess_matches_the_reference_fingerprints() {
                     case.name
                 );
                 assert_eq!(
-                    processor.calculate_num_tokens(case.width, case.height, &image_config),
+                    processor
+                        .calculate_num_tokens(case.width, case.height, &image_config)
+                        .unwrap(),
                     tokens,
                     "{}: calculate_num_tokens",
                     case.name

@@ -1702,20 +1702,18 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         Self::finish_video(plan, all_patches)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, _config: &PreProcessorConfig) -> usize {
-        // Calculate resized dimensions
-        let (new_height, new_width) = match self.smart_resize(height as usize, width as usize) {
-            Ok((h, w)) => (h, w),
-            Err(_) => {
-                // Fallback: use minimum size
-                let factor = self.get_factor();
-                (factor, factor)
-            }
-        };
-
-        // Calculate grid and tokens
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        _config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        // The size the image is resized to; a size the reference refuses
+        // (an aspect ratio past its limit) is refused here as it is at
+        // preprocessing, not counted at the minimum size.
+        let (new_height, new_width) = self.smart_resize(height as usize, width as usize)?;
         let (grid_t, grid_h, grid_w) = self.calculate_grid_thw(new_height, new_width, 1);
-        self.calculate_tokens_from_grid(grid_t, grid_h, grid_w)
+        Ok(self.calculate_tokens_from_grid(grid_t, grid_h, grid_w))
     }
 
     fn model_name(&self) -> &'static str {

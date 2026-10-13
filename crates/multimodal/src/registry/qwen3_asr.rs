@@ -349,11 +349,11 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
         &self,
         model_config: &Value,
         preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        Some(Box::new(Qwen3AudioProcessor::from_configs(
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        Ok(Some(Box::new(Qwen3AudioProcessor::from_configs(
             model_config,
             preprocessor_config,
-        )))
+        ))))
     }
 
     fn prompt_replacements(
@@ -489,6 +489,7 @@ mod tests {
         .unwrap();
         let processor = spec
             .audio_processor(&config, &preprocessor_config)
+            .unwrap()
             .expect("qwen3_asr spec must provide an audio processor");
 
         let clip = Arc::new(AudioClip::new(
