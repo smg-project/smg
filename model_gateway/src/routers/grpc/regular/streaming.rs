@@ -3439,8 +3439,12 @@ impl StreamingProcessor {
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
         let mut stopped_indices: HashSet<u32> = HashSet::new();
-        let mut sse_buffer = Vec::with_capacity(512);
-        let mut chunk_text = String::new();
+        // The per-chunk SSE frames: the bytes around a chunk's choice are the
+        // same for every chunk of this stream and are serialized once here;
+        // per chunk only its choice is serialized into `sse_buffer`, whose
+        // written bytes are split off for the channel instead of being copied.
+        let frame = CompletionChunkFrame::new(request_id, model, created, system_fingerprint);
+        let mut sse_buffer = BytesMut::with_capacity(4096);
         // For n>1, each index shares the same prompt — use max across Complete
         // messages rather than summing (same prompt tokenized once, not per-choice).
         let mut total_prompt = 0u32;
@@ -3493,38 +3497,29 @@ impl StreamingProcessor {
                         )
                     });
 
-                    let (decoded_text, stopped) =
+                    let (mut text, stopped) =
                         Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
-                    chunk_text.clear();
-                    chunk_text.push_str(&decoded_text);
 
                     if *is_first {
                         if echo {
-                            chunk_text.insert_str(0, prompt_text);
+                            text.insert_str(0, prompt_text);
                         }
                         *is_first = false;
                     }
 
-                    if !chunk_text.is_empty() {
-                        let stream_resp = CompletionStreamResponse {
-                            id: request_id.clone(),
-                            object: "text_completion".to_string(),
-                            created,
-                            choices: vec![CompletionStreamChoice {
-                                text: std::mem::take(&mut chunk_text),
+                    if !text.is_empty() {
+                        Self::send_completion_chunk(
+                            tx,
+                            &mut sse_buffer,
+                            &frame,
+                            &CompletionStreamChoice {
+                                text,
                                 index,
                                 logprobs: None,
                                 finish_reason: None,
-                            }],
-                            model: model.clone(),
-                            system_fingerprint: system_fingerprint.map(String::from),
-                            usage: None,
-                        };
-
-                        Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
-                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                            .await
-                            .map_err(|_| "Channel closed".to_string())?;
+                            },
+                        )
+                        .await?;
                     }
 
                     if stopped {
@@ -3534,44 +3529,32 @@ impl StreamingProcessor {
                         stopped_indices.insert(index);
 
                         if let Some(sfx) = suffix {
-                            let suffix_chunk = CompletionStreamResponse {
-                                id: request_id.clone(),
-                                object: "text_completion".to_string(),
-                                created,
-                                choices: vec![CompletionStreamChoice {
+                            Self::send_completion_chunk(
+                                tx,
+                                &mut sse_buffer,
+                                &frame,
+                                &CompletionStreamChoice {
                                     text: sfx.to_string(),
                                     index,
                                     logprobs: None,
                                     finish_reason: None,
-                                }],
-                                model: model.clone(),
-                                system_fingerprint: system_fingerprint.map(String::from),
-                                usage: None,
-                            };
-                            Self::format_completion_sse_into(&mut sse_buffer, &suffix_chunk);
-                            tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                                .await
-                                .map_err(|_| "Channel closed".to_string())?;
+                                },
+                            )
+                            .await?;
                         }
 
-                        let final_chunk = CompletionStreamResponse {
-                            id: request_id.clone(),
-                            object: "text_completion".to_string(),
-                            created,
-                            choices: vec![CompletionStreamChoice {
+                        Self::send_completion_chunk(
+                            tx,
+                            &mut sse_buffer,
+                            &frame,
+                            &CompletionStreamChoice {
                                 text: String::new(),
                                 index,
                                 logprobs: None,
                                 finish_reason: Some("stop".to_string()),
-                            }],
-                            model: model.clone(),
-                            system_fingerprint: system_fingerprint.map(String::from),
-                            usage: None,
-                        };
-                        Self::format_completion_sse_into(&mut sse_buffer, &final_chunk);
-                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                            .await
-                            .map_err(|_| "Channel closed".to_string())?;
+                            },
+                        )
+                        .await?;
                     }
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -3593,24 +3576,18 @@ impl StreamingProcessor {
                     // on the first event, but if no Chunks arrive we must emit it here.
                     let is_first = is_firsts.entry(index).or_insert(true);
                     if *is_first && echo && !prompt_text.is_empty() {
-                        let echo_chunk = CompletionStreamResponse {
-                            id: request_id.clone(),
-                            object: "text_completion".to_string(),
-                            created,
-                            choices: vec![CompletionStreamChoice {
+                        Self::send_completion_chunk(
+                            tx,
+                            &mut sse_buffer,
+                            &frame,
+                            &CompletionStreamChoice {
                                 text: prompt_text.to_string(),
                                 index,
                                 logprobs: None,
                                 finish_reason: None,
-                            }],
-                            model: model.clone(),
-                            system_fingerprint: system_fingerprint.map(String::from),
-                            usage: None,
-                        };
-                        Self::format_completion_sse_into(&mut sse_buffer, &echo_chunk);
-                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                            .await
-                            .map_err(|_| "Channel closed".to_string())?;
+                            },
+                        )
+                        .await?;
                         *is_first = false;
                     }
 
@@ -3624,47 +3601,35 @@ impl StreamingProcessor {
                         | SequenceDecoderOutput::StoppedWithText(text) = tail
                         {
                             if !text.is_empty() {
-                                let stream_resp = CompletionStreamResponse {
-                                    id: request_id.clone(),
-                                    object: "text_completion".to_string(),
-                                    created,
-                                    choices: vec![CompletionStreamChoice {
+                                Self::send_completion_chunk(
+                                    tx,
+                                    &mut sse_buffer,
+                                    &frame,
+                                    &CompletionStreamChoice {
                                         text,
                                         index,
                                         logprobs: None,
                                         finish_reason: None,
-                                    }],
-                                    model: model.clone(),
-                                    system_fingerprint: system_fingerprint.map(String::from),
-                                    usage: None,
-                                };
-                                Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
-                                tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                                    .await
-                                    .map_err(|_| "Channel closed".to_string())?;
+                                    },
+                                )
+                                .await?;
                             }
                         }
                     }
 
                     if let Some(sfx) = suffix {
-                        let stream_resp = CompletionStreamResponse {
-                            id: request_id.clone(),
-                            object: "text_completion".to_string(),
-                            created,
-                            choices: vec![CompletionStreamChoice {
+                        Self::send_completion_chunk(
+                            tx,
+                            &mut sse_buffer,
+                            &frame,
+                            &CompletionStreamChoice {
                                 text: sfx.to_string(),
                                 index,
                                 logprobs: None,
                                 finish_reason: None,
-                            }],
-                            model: model.clone(),
-                            system_fingerprint: system_fingerprint.map(String::from),
-                            usage: None,
-                        };
-                        Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
-                        tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                            .await
-                            .map_err(|_| "Channel closed".to_string())?;
+                            },
+                        )
+                        .await?;
                     }
 
                     let finish_reason = if stopped_indices.contains(&index) {
@@ -3695,24 +3660,18 @@ impl StreamingProcessor {
                         }
                     };
 
-                    let final_chunk = CompletionStreamResponse {
-                        id: request_id.clone(),
-                        object: "text_completion".to_string(),
-                        created,
-                        choices: vec![CompletionStreamChoice {
+                    Self::send_completion_chunk(
+                        tx,
+                        &mut sse_buffer,
+                        &frame,
+                        &CompletionStreamChoice {
                             text: String::new(),
                             index,
                             logprobs: None,
                             finish_reason,
-                        }],
-                        model: model.clone(),
-                        system_fingerprint: system_fingerprint.map(String::from),
-                        usage: None,
-                    };
-                    Self::format_completion_sse_into(&mut sse_buffer, &final_chunk);
-                    tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                        .await
-                        .map_err(|_| "Channel closed".to_string())?;
+                        },
+                    )
+                    .await?;
                 }
                 ProtoResponseVariant::None => continue,
             }
@@ -3740,24 +3699,18 @@ impl StreamingProcessor {
             if text.is_empty() && !stopped {
                 continue;
             }
-            let stream_resp = CompletionStreamResponse {
-                id: request_id.clone(),
-                object: "text_completion".to_string(),
-                created,
-                choices: vec![CompletionStreamChoice {
+            Self::send_completion_chunk(
+                tx,
+                &mut sse_buffer,
+                &frame,
+                &CompletionStreamChoice {
                     text,
                     index: *index,
                     logprobs: None,
                     finish_reason: stopped.then(|| "stop".to_string()),
-                }],
-                model: model.clone(),
-                system_fingerprint: system_fingerprint.map(String::from),
-                usage: None,
-            };
-            Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
-            tx.send(Ok(Bytes::from(sse_buffer.clone())))
-                .await
-                .map_err(|_| "Channel closed".to_string())?;
+                },
+            )
+            .await?;
         }
 
         grpc_stream.mark_completed();
@@ -3847,6 +3800,20 @@ impl StreamingProcessor {
         buffer.extend_from_slice(b"\n\n");
     }
 
+    /// Write one completion chunk carrying `choice` and hand it to the
+    /// channel as its own frame, without a copy.
+    async fn send_completion_chunk(
+        tx: &SseSender,
+        buffer: &mut BytesMut,
+        frame: &CompletionChunkFrame,
+        choice: &CompletionStreamChoice,
+    ) -> Result<(), String> {
+        frame.write_chunk(buffer, choice);
+        tx.send(Ok(buffer.split().freeze()))
+            .await
+            .map_err(|_| "Channel closed".to_string())
+    }
+
     /// Skeleton usage for the `message_start` event. Cache counters are
     /// integer zeros, never null: the Anthropic wire contract has
     /// always-present cache counters and clients do arithmetic on them; the
@@ -3919,22 +3886,17 @@ impl ChatChunkFrame {
     fn new(request_id: &str, model: &str, created: u64, system_fingerprint: Option<&str>) -> Self {
         let mut head = Vec::with_capacity(192);
         head.extend_from_slice(b"data: {\"id\":");
-        Self::push_json(&mut head, request_id);
+        push_json(&mut head, request_id);
         head.extend_from_slice(b",\"object\":\"chat.completion.chunk\",\"created\":");
-        Self::push_json(&mut head, &created);
+        push_json(&mut head, &created);
         head.extend_from_slice(b",\"model\":");
-        Self::push_json(&mut head, model);
+        push_json(&mut head, model);
         if let Some(system_fingerprint) = system_fingerprint {
             head.extend_from_slice(b",\"system_fingerprint\":");
-            Self::push_json(&mut head, system_fingerprint);
+            push_json(&mut head, system_fingerprint);
         }
         head.extend_from_slice(b",\"choices\":[");
         Self { head }
-    }
-
-    /// Serializing a string or an integer into memory cannot fail.
-    fn push_json<T: Serialize + ?Sized>(head: &mut Vec<u8>, value: &T) {
-        let _ = serde_json::to_writer(head, value);
     }
 
     /// Append `data: {...}\n\n` for `choice` (and `usage`, or the `null`
@@ -3967,6 +3929,69 @@ impl ChatChunkFrame {
             }
         }
         buffer.extend_from_slice(b"\n\n");
+    }
+}
+
+/// Serializing a string or an integer into memory cannot fail.
+fn push_json<T: Serialize + ?Sized>(buffer: &mut Vec<u8>, value: &T) {
+    let _ = serde_json::to_writer(buffer, value);
+}
+
+/// The SSE frame of the per-token chunks of one completion stream.
+///
+/// Every chunk of a stream repeats the same `id`, `object`, `created`,
+/// `model` and `system_fingerprint`; only its choice differs, and it sits
+/// between them. The head up to and including `"choices":[` and the tail
+/// from `]` to the end of the event are serialized once per stream and
+/// copied around each chunk's choice, so a chunk costs the serialization of
+/// its choice only. The bytes are exactly those of a serialized
+/// [`CompletionStreamResponse`] without `usage`, which a chunk of this
+/// stream never carries.
+struct CompletionChunkFrame {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+impl CompletionChunkFrame {
+    fn new(request_id: &str, model: &str, created: u64, system_fingerprint: Option<&str>) -> Self {
+        let mut head = Vec::with_capacity(128);
+        head.extend_from_slice(b"data: {\"id\":");
+        push_json(&mut head, request_id);
+        head.extend_from_slice(b",\"object\":\"text_completion\",\"created\":");
+        push_json(&mut head, &created);
+        head.extend_from_slice(b",\"choices\":[");
+        let mut tail = Vec::with_capacity(96);
+        tail.extend_from_slice(b"],\"model\":");
+        push_json(&mut tail, model);
+        if let Some(system_fingerprint) = system_fingerprint {
+            tail.extend_from_slice(b",\"system_fingerprint\":");
+            push_json(&mut tail, system_fingerprint);
+        }
+        tail.extend_from_slice(b"}\n\n");
+        Self { head, tail }
+    }
+
+    /// Append `data: {...}\n\n` for `choice` to `buffer`.
+    fn write_chunk(&self, buffer: &mut BytesMut, choice: &CompletionStreamChoice) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        match serde_json::to_writer((&mut *buffer).writer(), choice) {
+            Ok(()) => buffer.extend_from_slice(&self.tail),
+            Err(e) => {
+                error!("Failed to serialize completion SSE chunk: {}", e);
+                buffer.truncate(start);
+                buffer.extend_from_slice(b"data: ");
+                let error_msg = json!({
+                    "error": {
+                        "message": format!("Failed to serialize completion chunk: {e}"),
+                        "type": "internal_error"
+                    }
+                })
+                .to_string();
+                buffer.extend_from_slice(error_msg.as_bytes());
+                buffer.extend_from_slice(b"\n\n");
+            }
+        }
     }
 }
 
