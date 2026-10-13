@@ -4,19 +4,20 @@ vLLM offers no API for the facts the servicers advertise beyond its config
 attributes, and those move between releases: a section an older version does
 not carry, an attribute a newer one adds, a name that changes. One reader
 here knows the names and what stands in when they are absent;
-:mod:`.model_info`, :mod:`.kv_transfer`, :mod:`.kv_events` and the Python
-servicer read typed sections off it, so a vLLM rename is one fix, found by
-this module's tests and the Python servicer's live lane. Engine-free at
-import: the config objects are taken as given and nothing from vLLM is
-imported.
+:mod:`.model_info`, :mod:`.kv_transfer`, :mod:`.kv_events`, the Python
+servicer and the Rust launcher (:mod:`.rust`) read typed sections off it, so
+a vLLM rename is one fix, found by this module's tests and the Python
+servicer's live lane. Engine-free at import: the config objects are taken as
+given and nothing from vLLM is imported.
 
 A section is read when first asked for, once per view; a reader builds a
 view where it reads (a view holds a reference and nothing else until a
 section is asked for). The sections are lenient (a missing section reads as
-its defaults, a view over ``None`` reads every section so) except the two
-facts the servicers never invent: :attr:`model`, the facts of
-``GetModelInfo``, fails on a config without the model's name, context length
-or vocabulary, and :attr:`data_parallel_size` on a config without one.
+its defaults, a view over ``None`` reads every section so) except what the
+servicers never invent: :attr:`model`, the facts of ``GetModelInfo``, fails
+on a config without the model's name, context length or vocabulary;
+:attr:`data_parallel_size` on a config without one; and :attr:`launch`, the
+process manager's inputs, on a config without any of them.
 """
 
 from __future__ import annotations
