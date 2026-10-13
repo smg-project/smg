@@ -3743,6 +3743,7 @@ impl StreamingProcessor {
 
         let echo = completion_request.echo;
         let suffix = completion_request.suffix.as_deref();
+        let skip_special_tokens = stop_params.2;
 
         let mut stop_decoders: HashMap<u32, StopSequenceDecoder> = HashMap::new();
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
@@ -3750,7 +3751,7 @@ impl StreamingProcessor {
         // event carries those of the tokens it releases (the echoed prompt's
         // with the first), so tokens the stop decoder holds go with the text
         // they later release.
-        let mut logprobs: HashMap<u32, utils::CompletionLogprobs<'_>> = HashMap::new();
+        let mut logprobs: HashMap<u32, utils::CompletionLogprobs> = HashMap::new();
         let mut stopped_indices: HashSet<u32> = HashSet::new();
         // The per-chunk SSE frames: the bytes around a chunk's choice are the
         // same for every chunk of this stream and are serialized once here;
@@ -3813,9 +3814,13 @@ impl StreamingProcessor {
                     let (mut text, stopped) =
                         Self::process_chunk_tokens(stop_decoder, chunk.token_ids())?;
 
+                    // Generated tokens whose text the stop decoder holds keep
+                    // their logprobs for the event that releases it, also when
+                    // the echo sends this one.
+                    let mut held_logprobs = None;
                     if let Some(top_k) = completion_request.logprobs {
                         let choice_logprobs = logprobs.entry(index).or_insert_with(|| {
-                            utils::CompletionLogprobs::new(tokenizer.as_ref(), top_k)
+                            utils::CompletionLogprobs::new(&tokenizer, top_k, skip_special_tokens)
                         });
                         if *is_first && echo {
                             let input = utils::echoed_prompt_logprobs(
@@ -3823,10 +3828,14 @@ impl StreamingProcessor {
                                 chunk.prompt_tokens(),
                             )
                             .map_err(|e| e.to_string())?;
-                            choice_logprobs.push_prompt(&input);
+                            choice_logprobs.push_prompt(&input, prompt_text);
                         }
                         if let Some(output) = chunk.output_logprobs() {
-                            choice_logprobs.push_output(&output);
+                            if text.is_empty() {
+                                held_logprobs = Some(output);
+                            } else {
+                                choice_logprobs.push_output(&output);
+                            }
                         }
                     }
 
@@ -3850,6 +3859,11 @@ impl StreamingProcessor {
                             },
                         )
                         .await?;
+                    }
+                    if let (Some(output), Some(choice_logprobs)) =
+                        (held_logprobs, logprobs.get_mut(&index))
+                    {
+                        choice_logprobs.push_output(&output);
                     }
 
                     if stopped {
@@ -3915,9 +3929,13 @@ impl StreamingProcessor {
                             logprobs
                                 .entry(index)
                                 .or_insert_with(|| {
-                                    utils::CompletionLogprobs::new(tokenizer.as_ref(), top_k)
+                                    utils::CompletionLogprobs::new(
+                                        &tokenizer,
+                                        top_k,
+                                        skip_special_tokens,
+                                    )
                                 })
-                                .push_prompt(&input);
+                                .push_prompt(&input, prompt_text);
                         }
                     }
                     if *is_first && echo && !prompt_text.is_empty() {
@@ -4043,7 +4061,9 @@ impl StreamingProcessor {
                     text.push_str(sfx);
                 }
             }
-            if text.is_empty() && !stopped {
+            // The logprobs of the tokens whose text this releases.
+            let pending = logprobs.get_mut(index).and_then(|lp| lp.take());
+            if text.is_empty() && !stopped && pending.is_none() {
                 continue;
             }
             Self::send_completion_chunk(
@@ -4053,7 +4073,7 @@ impl StreamingProcessor {
                 &CompletionStreamChoice {
                     text,
                     index: *index,
-                    logprobs: None,
+                    logprobs: pending,
                     finish_reason: stopped.then(|| "stop".to_string()),
                 },
             )

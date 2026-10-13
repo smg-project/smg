@@ -1274,8 +1274,9 @@ impl ResponseProcessor {
                         completion_choice_logprobs(
                             &complete,
                             top_k,
-                            completion_req.echo,
-                            tokenizer.as_ref(),
+                            completion_req.echo.then_some(prompt_text),
+                            &tokenizer,
+                            completion_req.skip_special_tokens,
                         )
                     })
                     .transpose()?;
@@ -1348,21 +1349,23 @@ fn eager_token_ends(
     observed.starts_with(text).then_some(ends)
 }
 
-/// The legacy logprobs of one completion choice: with `echo` the prompt's
-/// tokens, then the generated ones. An echoed prompt the backend returned no
-/// logprobs for is refused rather than answered with positions missing.
+/// The legacy logprobs of one completion choice: with `echo` (the prompt's
+/// text as echoed) the prompt's tokens, then the generated ones. An echoed
+/// prompt the backend returned no logprobs for is refused rather than
+/// answered with positions missing.
 fn completion_choice_logprobs(
     complete: &ProtoGenerateComplete,
     top_k: u32,
-    echo: bool,
-    tokenizer: &dyn Tokenizer,
+    echo: Option<&str>,
+    tokenizer: &Arc<dyn Tokenizer>,
+    skip_special_tokens: bool,
 ) -> Result<LogProbs, axum::response::Response> {
-    let mut logprobs = utils::CompletionLogprobs::new(tokenizer, top_k);
-    if echo {
+    let mut logprobs = utils::CompletionLogprobs::new(tokenizer, top_k, skip_special_tokens);
+    if let Some(prompt_text) = echo {
         let input =
             utils::echoed_prompt_logprobs(complete.input_logprobs(), complete.prompt_tokens())
                 .map_err(utils::PromptLogprobsError::into_response)?;
-        logprobs.push_prompt(&input);
+        logprobs.push_prompt(&input, prompt_text);
     }
     if let Some(output) = complete.output_logprobs() {
         logprobs.push_output(&output);

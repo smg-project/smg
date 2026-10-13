@@ -982,6 +982,66 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
     }
 }
 
+/// A token whose text the decoder still holds when the stream ends without
+/// a `Complete` reports its logprob with the text the end releases.
+#[tokio::test]
+async fn byte_fallback_completion_transport_eof_keeps_the_held_tokens_logprob() {
+    let tokenizer = byte_fallback_tokenizer();
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+                         "ignore_eos":true, "logprobs":0}),
+    )
+    .unwrap();
+    let spec = CompletionResponseSpec::new(&request, &[]);
+    let chunks = byte_fallback_chunks(&[1, 2])
+        .into_iter()
+        .map(|mut response| {
+            if let Some(GenerationEvent::Chunk(chunk)) = &mut response.response {
+                chunk.output_logprobs = Some(proto::OutputLogProbs {
+                    token_logprobs: vec![-0.5],
+                    token_ids: chunk.token_ids.clone(),
+                    top_logprobs: Vec::new(),
+                });
+            }
+            response
+        })
+        .collect();
+    let (stream, server) = scripted_stream(chunks, "0").await;
+    let (tx, rx) = sse_channel();
+    processor(false)
+        .process_completion_streaming_chunks(
+            stream,
+            dispatch(),
+            tokenizer.clone(),
+            (None, None, false, false, true),
+            &spec,
+            "",
+            0,
+            &tx,
+        )
+        .await
+        .unwrap();
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    // `t` goes out with its own logprob; the unfinished byte after it goes
+    // out at the end of the stream, with its logprob.
+    let listed: Vec<(Value, Value)> = events
+        .iter()
+        .map(|event| {
+            let choice = &event["choices"][0];
+            (choice["text"].clone(), choice["logprobs"]["tokens"].clone())
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (json!("t"), json!(["t"])),
+            (json!("\u{fffd}"), json!(["\u{fffd}"])),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn byte_fallback_completion_transport_eof_reports_local_stop_without_complete() {
     let tokenizer = byte_fallback_reasoning_tokenizer();

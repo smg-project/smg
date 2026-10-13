@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use llm_tokenizer::traits::Tokenizer;
+use llm_tokenizer::{traits::Tokenizer, Sequence};
 use openai_protocol::common::{ChatLogProbs, ChatLogProbsContent, LogProbs, TopLogProb};
 
 use crate::routers::{
@@ -100,42 +100,59 @@ fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
 /// alternatives the engine ranked for its position (its first `logprobs`, in
 /// rank order; `null` where none were asked for and at the first prompt
 /// position, which has no logprob), and its character offset in the choice's
-/// text (the sum of the earlier tokens' lengths). Prompt tokens (`echo`) come
-/// before the generated ones. Two alternatives that decode to the same text
-/// share one entry, as a Python dict built in rank order holds them: at the
-/// first one's place, with the later (less likely) one's value. A client that
-/// builds the same map from the ranked ids with a Python dict gets the same
-/// entries, so per-text comparisons agree (byte-fallback pieces all decode to
-/// U+FFFD).
-pub(crate) struct CompletionLogprobs<'t> {
-    tokenizer: &'t dyn Tokenizer,
+/// text. Prompt tokens (`echo`) come before the generated ones. Two
+/// alternatives that decode to the same text share one entry, as a Python
+/// dict built in rank order holds them: at the first one's place, with the
+/// later (less likely) one's value. A client that builds the same map from
+/// the ranked ids with a Python dict gets the same entries, so per-text
+/// comparisons agree (byte-fallback pieces all decode to U+FFFD).
+///
+/// A token's own decode need not be what it adds to the text: a vocabulary
+/// can drop a word's leading space when the token is decoded alone, and a
+/// character split across byte tokens decodes to U+FFFD a token at a time.
+/// So the tokens are also decoded in order, as the choice's text is (the
+/// prompt with special tokens kept, the generated tokens as the request
+/// asks). When what a token adds ends with its own text, its offset is
+/// where that text starts; otherwise it is where what the token adds starts.
+pub(crate) struct CompletionLogprobs {
+    tokenizer: Arc<dyn Tokenizer>,
     top_k: usize,
+    /// Characters of the choice's text before what the next token adds.
     text_offset: u32,
     texts: HashMap<u32, String>,
     logprobs: LogProbs,
+    /// The generated tokens, decoded in order.
+    output: Sequence,
 }
 
-impl<'t> CompletionLogprobs<'t> {
-    pub fn new(tokenizer: &'t dyn Tokenizer, top_k: u32) -> Self {
+impl CompletionLogprobs {
+    /// `skip_special_tokens` as the generated text is decoded.
+    pub fn new(tokenizer: &Arc<dyn Tokenizer>, top_k: u32, skip_special_tokens: bool) -> Self {
         Self {
-            tokenizer,
+            tokenizer: tokenizer.clone(),
             top_k: top_k as usize,
             text_offset: 0,
             texts: HashMap::new(),
             logprobs: LogProbs::default(),
+            output: Sequence::new_with_options(tokenizer.clone(), skip_special_tokens),
         }
     }
 
-    /// Append the prompt's tokens, the first one without a logprob.
-    pub fn push_prompt(&mut self, input: &ProtoInputLogProbs) {
+    /// Append the prompt's tokens, the first one without a logprob; `text` is
+    /// the prompt as the choice echoes it, which the generated text follows.
+    pub fn push_prompt(&mut self, input: &ProtoInputLogProbs, text: &str) {
+        let start = self.text_offset;
+        let mut prompt = Sequence::new_with_options(self.tokenizer.clone(), false);
         for (i, (&id, &logprob)) in input
             .token_ids
             .iter()
             .zip(&input.token_logprobs)
             .enumerate()
         {
-            self.push(id, logprob, input.top_logprobs.get(i));
+            let added = prompt.append_token(id).unwrap_or_default();
+            self.push(id, logprob, input.top_logprobs.get(i), &added);
         }
+        self.text_offset = start.saturating_add(text.chars().count() as u32);
     }
 
     /// Append generated tokens.
@@ -146,7 +163,8 @@ impl<'t> CompletionLogprobs<'t> {
             .zip(&output.token_logprobs)
             .enumerate()
         {
-            self.push(id, Some(logprob), output.top_logprobs.get(i));
+            let added = self.output.append_token(id).unwrap_or_default();
+            self.push(id, Some(logprob), output.top_logprobs.get(i), &added);
         }
     }
 
@@ -161,7 +179,14 @@ impl<'t> CompletionLogprobs<'t> {
         self.logprobs
     }
 
-    fn push(&mut self, id: u32, logprob: Option<f32>, alternatives: Option<&ProtoTopLogProbs>) {
+    /// Append token `id`, which adds `added` to the choice's text.
+    fn push(
+        &mut self,
+        id: u32,
+        logprob: Option<f32>,
+        alternatives: Option<&ProtoTopLogProbs>,
+        added: &str,
+    ) {
         let token = self.text(id).to_owned();
         let top_k = self.top_k;
         let top = (logprob.is_some() && top_k > 0).then(|| {
@@ -179,16 +204,23 @@ impl<'t> CompletionLogprobs<'t> {
             }
             ranked.into_iter().collect()
         });
-        let length = token.chars().count() as u32;
+        let added_length = added.chars().count() as u32;
+        let own_text_at = if !token.is_empty() && added.ends_with(token.as_str()) {
+            added_length.saturating_sub(token.chars().count() as u32)
+        } else {
+            0
+        };
         self.logprobs.tokens.push(token);
         self.logprobs.token_logprobs.push(logprob);
         self.logprobs.top_logprobs.push(top);
-        self.logprobs.text_offset.push(self.text_offset);
-        self.text_offset = self.text_offset.saturating_add(length);
+        self.logprobs
+            .text_offset
+            .push(self.text_offset.saturating_add(own_text_at));
+        self.text_offset = self.text_offset.saturating_add(added_length);
     }
 
     fn text(&mut self, id: u32) -> &str {
-        let tokenizer = self.tokenizer;
+        let tokenizer = &self.tokenizer;
         self.texts.entry(id).or_insert_with(|| {
             tokenizer
                 .decode(&[id], false)
@@ -370,21 +402,27 @@ mod tests {
         }
     }
 
+    fn mock() -> Arc<dyn Tokenizer> {
+        Arc::new(llm_tokenizer::MockTokenizer::new())
+    }
+
     /// Prompt `Hello world`, then the generated `test`.
     fn echoed(top_k: u32) -> LogProbs {
-        let tokenizer = llm_tokenizer::MockTokenizer::new();
-        let mut logprobs = CompletionLogprobs::new(&tokenizer, top_k);
-        logprobs.push_prompt(&ProtoInputLogProbs {
-            token_logprobs: vec![None, Some(-1.0)],
-            token_ids: vec![1, 2],
-            top_logprobs: vec![
-                ProtoTopLogProbs {
-                    values: vec![],
-                    token_ids: vec![],
-                },
-                top(&[(2, -1.0), (3, -2.0), (4, -3.0)]),
-            ],
-        });
+        let mut logprobs = CompletionLogprobs::new(&mock(), top_k, false);
+        logprobs.push_prompt(
+            &ProtoInputLogProbs {
+                token_logprobs: vec![None, Some(-1.0)],
+                token_ids: vec![1, 2],
+                top_logprobs: vec![
+                    ProtoTopLogProbs {
+                        values: vec![],
+                        token_ids: vec![],
+                    },
+                    top(&[(2, -1.0), (3, -2.0), (4, -3.0)]),
+                ],
+            },
+            "Hello world",
+        );
         logprobs.push_output(&ProtoOutputLogProbs {
             token_logprobs: vec![-0.5],
             token_ids: vec![3],
@@ -417,7 +455,9 @@ mod tests {
                 Some(vec![("test".into(), -0.5), ("Hello".into(), -1.5)]),
             ]
         );
-        assert_eq!(logprobs.text_offset, vec![0, 5, 10]);
+        // Where each token starts in `Hello worldtest`: the mock vocabulary
+        // decodes `world` alone without the space it adds after `Hello`.
+        assert_eq!(logprobs.text_offset, vec![0, 6, 11]);
         // The alternatives serialize most likely first.
         let json = serde_json::to_string(&logprobs.top_logprobs[1]).expect("serialize");
         assert_eq!(json, r#"{"world":-1.0,"test":-2.0}"#);
@@ -432,8 +472,7 @@ mod tests {
 
     #[test]
     fn alternatives_that_decode_alike_share_the_first_place_with_the_later_value() {
-        let tokenizer = llm_tokenizer::MockTokenizer::new();
-        let mut logprobs = CompletionLogprobs::new(&tokenizer, 3);
+        let mut logprobs = CompletionLogprobs::new(&mock(), 3, false);
         // 77 and 78 are not in the mock vocabulary: both decode to "". Only
         // the first 3 alternatives count, as `{text: value for ...}` over the
         // engine's top 3 would hold them.
@@ -477,8 +516,7 @@ mod tests {
 
     #[test]
     fn taken_completion_logprobs_keep_counting_offsets() {
-        let tokenizer = llm_tokenizer::MockTokenizer::new();
-        let mut logprobs = CompletionLogprobs::new(&tokenizer, 1);
+        let mut logprobs = CompletionLogprobs::new(&mock(), 1, false);
         assert!(logprobs.take().is_none());
         let output = |id: u32| ProtoOutputLogProbs {
             token_logprobs: vec![-1.0],
@@ -492,7 +530,8 @@ mod tests {
         logprobs.push_output(&output(2));
         let second = logprobs.take().expect("two tokens");
         assert_eq!(second.tokens, vec!["token", "world"]);
-        assert_eq!(second.text_offset, vec![5, 10]);
+        // In `Hello token world`.
+        assert_eq!(second.text_offset, vec![6, 12]);
         // An engine that ranked nothing leaves the alternatives empty.
         assert_eq!(alternatives_of(&second), vec![Some(vec![]), Some(vec![])]);
     }

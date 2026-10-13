@@ -16,7 +16,9 @@ use std::{
 
 use axum::{body::to_bytes, http::StatusCode, response::Response as HttpResponse};
 use futures::{stream, Stream};
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+use llm_tokenizer::{
+    traits::Tokenizer, MockTokenizer, TiktokenModel, TiktokenTokenizer, TokenizerRegistry,
+};
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
 use smg::{
@@ -252,13 +254,18 @@ impl Gateway {
     }
 }
 
+/// The gateway with the mock vocabulary, in front of an [`EchoWorker`].
+async fn serve(prompt_logprobs: bool) -> Gateway {
+    serve_with(prompt_logprobs, Arc::new(MockTokenizer::new())).await
+}
+
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::disallowed_methods,
     reason = "test helper; the worker task is aborted when the gateway is dropped"
 )]
-async fn serve(prompt_logprobs: bool) -> Gateway {
+async fn serve_with(prompt_logprobs: bool, tokenizer: Arc<dyn Tokenizer>) -> Gateway {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -284,7 +291,6 @@ async fn serve(prompt_logprobs: bool) -> Gateway {
         .max_payload_size(1024 * 1024)
         .build_unchecked();
     config.health_check.disable_health_check = true;
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
     let tokenizers = Arc::new(TokenizerRegistry::new());
     tokenizers
         .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
@@ -405,7 +411,27 @@ fn assert_echoed(logprobs: &Value) {
         assert_eq!(alternatives.keys().next().map(String::as_str), Some(first));
     }
     assert_eq!(top[1]["world"], json!(-0.5));
-    assert_eq!(logprobs["text_offset"], json!([0, 5, 10, 14]));
+    // Where each token starts in the returned `Hello world testtoken`.
+    assert_eq!(logprobs["text_offset"], json!([0, 6, 12, 16]));
+}
+
+/// Every offset indexes into `text`, at the token's own text.
+#[expect(clippy::expect_used, reason = "test helper")]
+fn assert_offsets_index_into(text: &str, logprobs: &Value) {
+    let chars: Vec<char> = text.chars().collect();
+    let tokens = logprobs["tokens"].as_array().expect("tokens");
+    let offsets = logprobs["text_offset"].as_array().expect("text_offset");
+    assert_eq!(tokens.len(), offsets.len());
+    for (token, offset) in tokens.iter().zip(offsets) {
+        let token = token.as_str().expect("token text");
+        let offset = offset.as_u64().expect("offset") as usize;
+        let at: String = chars
+            .iter()
+            .skip(offset)
+            .take(token.chars().count())
+            .collect();
+        assert_eq!(at, token, "offset {offset} of {token:?} in {text:?}");
+    }
 }
 
 /// The scoring request: token ids, `echo`, five alternatives, one
@@ -421,6 +447,7 @@ async fn an_echoed_token_prompt_lists_every_prompt_logprob() {
     let choice = &response["choices"][0];
     assert_eq!(choice["text"], "Hello world testtoken");
     assert_echoed(&choice["logprobs"]);
+    assert_offsets_index_into("Hello world testtoken", &choice["logprobs"]);
     let sent = gateway.last_request();
     assert_eq!(sent.logprob_start_len, Some(0));
     assert_eq!(sent.top_logprobs_num, 5);
@@ -440,6 +467,38 @@ async fn an_echoed_token_prompt_lists_every_prompt_logprob() {
         .collect();
     assert_eq!(text, "Hello world testtoken");
     assert_echoed(&joined_logprobs(&events));
+    assert_offsets_index_into(&text, &joined_logprobs(&events));
+}
+
+/// A streamed echo whose generated token the stop decoder holds (a partial
+/// stop sequence): the echo goes out alone with the prompt's logprobs, and
+/// the token's logprob goes with the event that releases its text.
+#[tokio::test]
+async fn a_held_token_keeps_its_logprob_for_the_event_with_its_text() {
+    let gateway = serve(true).await;
+    let (status, body) = send(
+        &gateway,
+        request(json!({"stream": true, "stop": ["token!"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = events(&body);
+    let listed: Vec<(Value, Value)> = events
+        .iter()
+        .map(|event| {
+            let choice = &event["choices"][0];
+            (choice["text"].clone(), choice["logprobs"]["tokens"].clone())
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (json!("Hello world test"), json!(["Hello", "world", "test"])),
+            (json!("token"), json!(["token"])),
+            (json!(""), Value::Null),
+        ]
+    );
+    assert_echoed(&joined_logprobs(&events));
 }
 
 /// A text prompt is tokenized and echoed as written; its tokens are listed
@@ -451,6 +510,49 @@ async fn an_echoed_text_prompt_lists_its_tokens() {
     let response: Value = serde_json::from_slice(&body).expect("json body");
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_echoed(&response["choices"][0]["logprobs"]);
+    assert_offsets_index_into("Hello world testtoken", &response["choices"][0]["logprobs"]);
+}
+
+/// A byte-level vocabulary splits a character it has no token for into
+/// byte tokens, each of which decodes to U+FFFD on its own. The offsets
+/// still index into the returned text: every other token is found at its
+/// offset, those after the character included.
+#[tokio::test]
+async fn offsets_index_into_the_text_past_a_character_split_into_bytes() {
+    let tokenizer = TiktokenTokenizer::new(TiktokenModel::Cl100kBase).expect("cl100k_base");
+    let gateway = serve_with(true, Arc::new(tokenizer)).await;
+    // cl100k_base has no token for U+1FAE0: ` 🫠` is three byte tokens.
+    let prompt = "Hi 🫠 there";
+    let (status, body) = send(&gateway, request(json!({"prompt": prompt}))).await;
+    let response: Value = serde_json::from_slice(&body).expect("json body");
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let choice = &response["choices"][0];
+    let text = choice["text"].as_str().expect("text");
+    assert!(text.starts_with(prompt), "{text:?}");
+    let chars: Vec<char> = text.chars().collect();
+    let tokens = choice["logprobs"]["tokens"].as_array().expect("tokens");
+    let offsets = choice["logprobs"]["text_offset"]
+        .as_array()
+        .expect("text_offset");
+    let mut split = 0;
+    for (token, offset) in tokens.iter().zip(offsets) {
+        let token = token.as_str().expect("token text");
+        if token.contains('\u{fffd}') {
+            split += 1;
+            continue;
+        }
+        let offset = offset.as_u64().expect("offset") as usize;
+        let at: String = chars
+            .iter()
+            .skip(offset)
+            .take(token.chars().count())
+            .collect();
+        assert_eq!(
+            at, token,
+            "offset {offset} of {token:?} in {text:?}: {offsets:?}"
+        );
+    }
+    assert_eq!(split, 3, "the emoji is split into byte tokens: {tokens:?}");
 }
 
 /// Without `echo` only the generated tokens are listed, and no prompt
