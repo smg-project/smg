@@ -56,6 +56,8 @@ criterion = { version = "0.8", features = ["html_reports"] }
 futures.workspace = true
 http.workspace = true
 npyz = { version = "0.9", features = ["npz"] }
+# The dump example for bellwether's multimodal suite digests its artifacts with SHA-256, as the suite's references do.
+sha2 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
