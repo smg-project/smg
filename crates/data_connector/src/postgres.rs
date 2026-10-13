@@ -1965,8 +1965,15 @@ mod tests {
     /// kind alone (`error connecting to server`) says nothing of why.
     #[tokio::test]
     async fn the_start_up_contact_keeps_the_cause_of_a_refused_connection() {
+        // A port nothing listens on: bound and released here, so the OS
+        // picked it and no service of the host is assumed absent.
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a local port")
+            .local_addr()
+            .expect("local address")
+            .port();
         let store = PostgresStore::new(PostgresConfig {
-            db_url: "postgres://u:p@127.0.0.1:1/db".to_string(),
+            db_url: format!("postgres://u:p@127.0.0.1:{closed_port}/db"),
             pool_max: 1,
             op_timeout_secs: 2,
             schema: None,
@@ -1975,7 +1982,7 @@ mod tests {
         let err = store
             .contact(Duration::from_secs(5))
             .await
-            .expect_err("nothing listens on port 1");
+            .expect_err("nothing listens on the closed port");
         match err {
             StoreContactError::Failed(cause) => {
                 assert!(cause.contains("refused"), "{cause}");

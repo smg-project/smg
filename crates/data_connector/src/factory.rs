@@ -489,6 +489,10 @@ mod tests {
             err.contains("Postgres history backend") && err.contains("is unreachable at start-up"),
             "{err}"
         );
+        assert!(
+            err.contains("refused"),
+            "the cause of the refusal is in the text the operator sees: {err}"
+        );
         assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
     }
 
