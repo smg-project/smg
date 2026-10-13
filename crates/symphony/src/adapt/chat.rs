@@ -37,6 +37,7 @@ use openai_protocol::{
     common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
 };
 
+use super::fold::fold;
 use crate::event::{Event, FinishReason};
 
 /// The stream choice one event produces for the choice at `choice`, if it produces one.
@@ -141,59 +142,33 @@ pub fn deltas<'a>(
 /// fragments for a call that never started cannot occur under the `Event` contract; should one
 /// arrive, its text joins the content so that no byte is lost.
 pub fn message<'a>(choice: u32, events: impl IntoIterator<Item = &'a Event>) -> ChatChoice {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut calls: Vec<(u32, ToolCall)> = Vec::new();
-    let mut finish = None;
-    for event in events {
-        match event {
-            Event::Content(text) | Event::Malformed { text, .. } => content.push_str(&text.text),
-            Event::Reasoning(text) => reasoning.push_str(&text.text),
-            Event::ToolCallStart {
-                index, id, name, ..
-            } => calls.push((
-                *index,
-                ToolCall {
-                    id: id.clone(),
-                    tool_type: "function".to_string(),
-                    function: FunctionCallResponse {
-                        name: name.clone(),
-                        arguments: Some(String::new()),
-                    },
-                },
-            )),
-            Event::ToolCallArguments { index, json, .. } => {
-                match calls.iter_mut().find(|(started, _)| started == index) {
-                    Some((_, call)) => call
-                        .function
-                        .arguments
-                        .get_or_insert_with(String::new)
-                        .push_str(json),
-                    None => content.push_str(json),
-                }
-            }
-            Event::Finish {
-                reason, tool_calls, ..
-            } => finish = Some(finish_reason(reason, *tool_calls)),
-            Event::ReasoningStart
-            | Event::ReasoningEnd
-            | Event::ToolCallEnd { .. }
-            | Event::Dropped { .. } => {}
-        }
-    }
+    let folded = fold(events);
+    let calls: Vec<ToolCall> = folded
+        .calls
+        .into_iter()
+        .map(|call| ToolCall {
+            id: call.id,
+            tool_type: "function".to_string(),
+            function: FunctionCallResponse {
+                name: call.name,
+                arguments: Some(call.arguments),
+            },
+        })
+        .collect();
     ChatChoice {
         index: choice,
         message: ChatCompletionMessage {
             role: "assistant".to_string(),
-            content: (!content.trim().is_empty()).then_some(content),
+            content: (!folded.content.trim().is_empty()).then_some(folded.content),
             refusal: None,
             annotations: Vec::new(),
-            tool_calls: (!calls.is_empty())
-                .then(|| calls.into_iter().map(|(_, call)| call).collect()),
-            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+            tool_calls: (!calls.is_empty()).then_some(calls),
+            reasoning_content: (!folded.reasoning.is_empty()).then_some(folded.reasoning),
         },
         logprobs: None,
-        finish_reason: finish,
+        finish_reason: folded
+            .finish
+            .map(|finish| finish_reason(&finish.reason, finish.tool_calls)),
         matched_stop: None,
         hidden_states: None,
     }

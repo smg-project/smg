@@ -94,6 +94,7 @@ use openai_protocol::responses::{
 };
 use serde::{de::IgnoredAny, Serialize};
 
+use super::fold::{fold, Call};
 use crate::event::{Event, FinishReason};
 
 /// A whole output as the Responses API reports it: the items and the response status.
@@ -108,88 +109,28 @@ pub struct Output {
     pub incomplete_details: Option<IncompleteDetails>,
 }
 
-/// One started call and what its events said.
-#[derive(Clone, Debug)]
-struct Call {
-    index: u32,
-    id: String,
-    name: String,
-    arguments: String,
-    /// Whether `ToolCallEnd` came for it.
-    ended: bool,
-}
-
 /// The output of the response `response_id`, folded from a whole event sequence.
 pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>) -> Output {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut reasoning_ended = false;
-    let mut calls: Vec<Call> = Vec::new();
-    let mut finish = None;
-    for event in events {
-        match event {
-            Event::Content(text) | Event::Malformed { text, .. } => {
-                content.push_str(&text.text);
-                if !text.text.trim().is_empty() {
-                    reasoning_ended = true;
-                }
-            }
-            Event::Reasoning(text) => {
-                reasoning.push_str(&text.text);
-                reasoning_ended = false;
-            }
-            Event::ReasoningEnd => reasoning_ended = true,
-            Event::ToolCallStart {
-                index, id, name, ..
-            } => {
-                reasoning_ended = true;
-                calls.push(Call {
-                    index: *index,
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: String::new(),
-                    ended: false,
-                });
-            }
-            Event::ToolCallArguments { index, json, .. } => {
-                match calls.iter_mut().find(|call| call.index == *index) {
-                    Some(call) => call.arguments.push_str(json),
-                    None => {
-                        content.push_str(json);
-                        if !json.trim().is_empty() {
-                            reasoning_ended = true;
-                        }
-                    }
-                }
-            }
-            Event::ToolCallEnd { index, .. } => {
-                if let Some(call) = calls.iter_mut().find(|call| call.index == *index) {
-                    call.ended = true;
-                }
-            }
-            Event::Finish { reason, .. } => finish = Some(reason),
-            Event::ReasoningStart | Event::Dropped { .. } => {}
-        }
-    }
-
-    let (status, incomplete_details) = response_status(finish);
+    let folded = fold(events);
+    let (status, incomplete_details) =
+        response_status(folded.finish.as_ref().map(|finish| &finish.reason));
 
     let mut items = Vec::new();
-    if !reasoning.is_empty() {
+    if !folded.reasoning.is_empty() {
         items.push(reasoning_item(
             format!("rs_{response_id}"),
-            reasoning,
-            item_status(&status, reasoning_ended),
+            folded.reasoning,
+            item_status(&status, folded.reasoning_ended),
         ));
     }
-    if !content.trim().is_empty() {
+    if !folded.content.trim().is_empty() {
         items.push(message_item(
             format!("msg_{response_id}"),
-            content,
+            folded.content,
             item_status(&status, false),
         ));
     }
-    items.extend(calls.into_iter().map(|call| {
+    items.extend(folded.calls.into_iter().map(|call| {
         let status = item_status(&status, call.ended);
         call_item(call, status)
     }));

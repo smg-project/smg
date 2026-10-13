@@ -84,6 +84,7 @@ use openai_protocol::messages::{
 };
 use serde_json::{Map, Value};
 
+use super::fold::fold;
 use crate::event::{Event, FinishReason};
 
 /// A whole output as the Messages API reports it: the content blocks and the stop reason.
@@ -96,62 +97,23 @@ pub struct Output {
     pub stop_reason: Option<StopReason>,
 }
 
-/// One started call and what its events said.
-struct Call {
-    index: u32,
-    id: String,
-    name: String,
-    arguments: String,
-}
-
 /// The message's content and stop reason, folded from a whole event sequence.
 pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut calls: Vec<Call> = Vec::new();
-    let mut stop_reason = None;
-    for event in events {
-        match event {
-            Event::Content(text) | Event::Malformed { text, .. } => content.push_str(&text.text),
-            Event::Reasoning(text) => reasoning.push_str(&text.text),
-            Event::ToolCallStart {
-                index, id, name, ..
-            } => calls.push(Call {
-                index: *index,
-                id: id.clone(),
-                name: name.clone(),
-                arguments: String::new(),
-            }),
-            Event::ToolCallArguments { index, json, .. } => {
-                match calls.iter_mut().find(|call| call.index == *index) {
-                    Some(call) => call.arguments.push_str(json),
-                    None => content.push_str(json),
-                }
-            }
-            Event::Finish {
-                reason, tool_calls, ..
-            } => stop_reason = Some(stop(reason, *tool_calls)),
-            Event::ReasoningStart
-            | Event::ReasoningEnd
-            | Event::ToolCallEnd { .. }
-            | Event::Dropped { .. } => {}
-        }
-    }
-
+    let folded = fold(events);
     let mut blocks = Vec::new();
-    if !reasoning.is_empty() {
+    if !folded.reasoning.is_empty() {
         blocks.push(ContentBlock::Thinking {
-            thinking: reasoning,
+            thinking: folded.reasoning,
             signature: String::new(),
         });
     }
-    if !content.trim().is_empty() {
+    if !folded.content.trim().is_empty() {
         blocks.push(ContentBlock::Text {
-            text: content,
+            text: folded.content,
             citations: None,
         });
     }
-    blocks.extend(calls.into_iter().map(|call| ContentBlock::ToolUse {
+    blocks.extend(folded.calls.into_iter().map(|call| ContentBlock::ToolUse {
         id: tool_use_id(&call.id),
         name: call.name,
         input: input(&call.arguments),
@@ -160,7 +122,9 @@ pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
 
     Output {
         content: blocks,
-        stop_reason,
+        stop_reason: folded
+            .finish
+            .map(|finish| stop(&finish.reason, finish.tool_calls)),
     }
 }
 
