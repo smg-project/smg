@@ -1934,17 +1934,18 @@ async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earli
 
 /// A start on a database that still has the index an earlier release built
 /// drops it without blocking the table: while a transaction another session
-/// holds open on `responses` makes the drop wait, and a second start comes up
-/// next to it, a plain read and a plain write from a third session answer (a
-/// plain `DROP INDEX` wants an ACCESS EXCLUSIVE lock on the table, and the
-/// read would queue behind it until the first session ends; a second start
-/// asking for an index the table has would wait for a share lock behind the
-/// first's concurrent drop, and the write would queue behind that). On a
-/// database of its own.
+/// holds open on `responses` makes that start's drop wait, and a third start
+/// comes up next to it, a plain read and a plain write from another session
+/// answer (a plain `DROP INDEX` wants an ACCESS EXCLUSIVE lock on the table,
+/// and the read would queue behind it until the first session ends; a third
+/// start asking for an index the table has would wait for a share lock
+/// behind the waiting drop, and the write would queue behind that). The
+/// starts: the first prepares the database, the second's drop waits, the
+/// third comes up next to it. On a database of its own.
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 #[tokio::test]
 #[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
-async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() {
+async fn a_start_drops_the_earlier_index_without_blocking_a_read_or_a_write_on_the_table() {
     let Some(db_url) = test_db_url() else {
         return;
     };
@@ -1978,13 +1979,14 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() 
             .await
             .map_err(|e| format!("session 1's read: {e}"))?;
 
-        // Session 2: a second start, whose drop of the earlier index has to
-        // wait for session 1.
+        // Session 2: the second start, whose drop of the earlier index has
+        // to wait for session 1.
         let url = scratch.url.clone();
         let mut start = JoinSet::new();
         start.spawn(async move { postgres_bundle(&url).await.map(drop) });
 
-        // Seen from a fourth session: the start waits on a lock in its drop.
+        // Seen from a fourth session: the second start waits on a lock in
+        // its drop.
         let (watch, watch_connection) =
             tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
                 .await
@@ -2010,10 +2012,11 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() 
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // A second start while the first's drop waits (replicas come up
+        // A third start while the second's drop waits (replicas come up
         // together): it must take no lock on the table either, or every write
-        // queues behind it. Both starts are seen waiting before the third
-        // session's statements go out.
+        // queues behind it. Both are seen waiting in a drop (the third in its
+        // own concurrent drop, not in a share-lock request for an index the
+        // table has) before the third session's statements go out.
         let url = scratch.url.clone();
         start.spawn(async move { postgres_bundle(&url).await.map(drop) });
         let mut both_waiting = false;
@@ -2021,7 +2024,8 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() 
             let waiting: i64 = watch
                 .query_one(
                     "SELECT count(*) FROM pg_stat_activity \
-                     WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                     WHERE datname = current_database() AND query ILIKE 'DROP INDEX%' \
+                     AND wait_event_type = 'Lock'",
                     &[],
                 )
                 .await
@@ -2067,7 +2071,8 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() 
             });
         let write_took = writing.elapsed();
 
-        // Session 1 ends: the drop goes through and both starts complete.
+        // Session 1 ends: the drops go through and the second and third
+        // starts complete.
         holder
             .batch_execute("COMMIT")
             .await
@@ -2107,17 +2112,17 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() 
     let (waiting_drop, both_waiting, read, read_took, write, write_took, starts, indexes) =
         outcome.unwrap();
     println!(
-        "the first start's drop waited on {waiting_drop:?}; a second start waited with it: {both_waiting}; \
+        "the second start's drop waited on {waiting_drop:?}; a third start waited in its own drop: {both_waiting}; \
          the read meanwhile: {read:?} after {read_took:?}; the write: {write:?} after {write_took:?}; \
          the starts: {starts:?}; indexes after: {indexes:?}"
     );
     assert!(
         waiting_drop.is_some(),
-        "the start's drop of the earlier index did not wait for the open transaction"
+        "the second start's drop of the earlier index did not wait for the open transaction"
     );
     assert!(
         both_waiting,
-        "the second start was not seen waiting next to the first's drop"
+        "the third start was not seen waiting in its own drop next to the second's"
     );
     assert!(
         read.is_ok(),
@@ -2129,7 +2134,7 @@ async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() 
     );
     assert!(
         starts.len() == 2 && starts.iter().all(|s| s.is_ok()),
-        "the starts once session 1 ended: {starts:?}"
+        "the second and third starts once session 1 ended: {starts:?}"
     );
     assert!(
         !indexes

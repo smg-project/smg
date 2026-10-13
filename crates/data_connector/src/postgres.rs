@@ -263,9 +263,9 @@ impl PostgresStore {
                     })?,
                     Err(e) => {
                         tracing::warn!(
-                        "response index not created (the safety_identifier column may be missing): {}",
-                        describe_error(&e)
-                    );
+                            "response index not created (the safety_identifier column may be missing): {}",
+                            describe_error(&e)
+                        );
                         index.rollback().await.map_err(|e| {
                             format!(
                                 "failed to roll back the index savepoint: {}",
