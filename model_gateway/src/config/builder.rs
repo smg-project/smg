@@ -586,11 +586,6 @@ impl RouterConfigBuilder {
 
     // ==================== Discovery ====================
 
-    pub fn discovery_config(mut self, discovery: impl Into<DiscoveryConfig>) -> Self {
-        self.config.discovery = Some(discovery.into());
-        self
-    }
-
     /// Kubernetes discovery with default settings
     pub fn enable_discovery(mut self) -> Self {
         self.config.discovery = Some(KubernetesDiscoveryConfig::default().into());
@@ -764,23 +759,6 @@ impl RouterConfigBuilder {
 
     pub fn tokenizer_cache(mut self, cache: TokenizerCacheConfig) -> Self {
         self.config.tokenizer_cache = cache;
-        self
-    }
-
-    pub fn enable_l0_cache(mut self, max_entries: usize) -> Self {
-        self.config.tokenizer_cache.enable_l0 = true;
-        self.config.tokenizer_cache.l0_max_entries = max_entries;
-        self
-    }
-
-    pub fn l0_cache_max_memory(mut self, max_memory: usize) -> Self {
-        self.config.tokenizer_cache.l0_max_memory = max_memory;
-        self
-    }
-
-    pub fn enable_l1_cache(mut self, max_memory: usize) -> Self {
-        self.config.tokenizer_cache.enable_l1 = true;
-        self.config.tokenizer_cache.l1_max_memory = max_memory;
         self
     }
 

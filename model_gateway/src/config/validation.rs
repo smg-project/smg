@@ -1328,31 +1328,11 @@ impl ConfigValidator {
             {
                 // Logging start-up creates the missing part under the nearest
                 // existing ancestor, which must therefore be a directory the
-                // gateway can write; a file in the way is named, which
-                // explains the failure better than the OS error for the leaf.
-                let ancestor = path
-                    .ancestors()
-                    .skip(1)
-                    // A relative path's last ancestor is "", which is the
-                    // current directory but does not stat.
-                    .map(|ancestor| {
-                        if ancestor.as_os_str().is_empty() {
-                            Path::new(".")
-                        } else {
-                            ancestor
-                        }
-                    })
-                    .find(|ancestor| ancestor.exists())
-                    .ok_or_else(|| {
-                        invalid("cannot be created: no existing ancestor".to_string())
-                    })?;
-                if !ancestor.is_dir() {
-                    return Err(invalid(format!(
-                        "cannot be created: {} is not a directory",
-                        ancestor.display()
-                    )));
-                }
-                (ancestor, true)
+                // gateway can write.
+                (
+                    Self::nearest_existing_ancestor(path).map_err(&invalid)?,
+                    true,
+                )
             }
             Err(error) => return Err(invalid(format!("cannot be read: {error}"))),
         };
@@ -1369,6 +1349,35 @@ impl ConfigValidator {
                 invalid(format!("is not writable: {error}"))
             }
         })
+    }
+
+    /// The nearest existing ancestor of a path that does not exist: the
+    /// directory the missing part would be created under. A relative path's
+    /// last ancestor is "", which is the current directory but does not
+    /// stat, so it reads as ".". The error is the reason of the refusal when
+    /// there is no such ancestor or it is not a directory: a file in the way
+    /// is named, which explains the failure better than the OS error for the
+    /// leaf.
+    fn nearest_existing_ancestor(path: &Path) -> Result<&Path, String> {
+        let ancestor = path
+            .ancestors()
+            .skip(1)
+            .map(|ancestor| {
+                if ancestor.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    ancestor
+                }
+            })
+            .find(|ancestor| ancestor.exists())
+            .ok_or_else(|| "cannot be created: no existing ancestor".to_string())?;
+        if !ancestor.is_dir() {
+            return Err(format!(
+                "cannot be created: {} is not a directory",
+                ancestor.display()
+            ));
+        }
+        Ok(ancestor)
     }
 
     fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
@@ -1583,33 +1592,31 @@ impl ConfigValidator {
         if url.host_str().is_none_or(str::is_empty) {
             return Err(invalid(format!("{EXPECTED}: host part cannot be empty")));
         }
-        // `Url` drops a scheme-default port (`:80`, `:443`) from `port()`;
-        // accept one that was written, reject a missing port and port 0.
-        let authority = with_scheme
-            .split_once("://")
-            .map_or("", |(_, rest)| rest)
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("");
-        let written_default_port = url
-            .port_or_known_default()
-            .is_some_and(|default| authority.ends_with(&format!(":{default}")));
-        match url.port() {
-            Some(0) => {
-                return Err(invalid(format!(
-                    "{EXPECTED}: port must be a number between 1 and 65535"
-                )))
-            }
-            Some(_) => {}
-            None if written_default_port => {}
-            None => {
-                return Err(invalid(format!(
-                    "{EXPECTED}: port must be a number between 1 and 65535"
-                )))
-            }
+        // A missing port and port 0 are refused; a scheme-default port that
+        // was written passes although `Url::port()` drops it.
+        if !matches!(Self::written_port(&with_scheme, &url), Some(1..)) {
+            return Err(invalid(format!(
+                "{EXPECTED}: port must be a number between 1 and 65535"
+            )));
         }
 
         Ok(())
+    }
+
+    /// The port of `with_scheme` as written: `Url::port()` drops a
+    /// scheme-default port (`:80`, `:443`), so one that was written is read
+    /// back off the authority; `None` when the endpoint names no port.
+    fn written_port(with_scheme: &str, url: &::url::Url) -> Option<u16> {
+        url.port().or_else(|| {
+            let authority = with_scheme
+                .split_once("://")
+                .map_or("", |(_, rest)| rest)
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            url.port_or_known_default()
+                .filter(|default| authority.ends_with(&format!(":{default}")))
+        })
     }
 
     fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {

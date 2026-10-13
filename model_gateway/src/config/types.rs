@@ -3007,10 +3007,13 @@ discovery:
             .request_timeout_secs(120)
             .worker_startup_timeout_secs(60)
             .worker_startup_check_interval_secs(5)
-            .discovery_config(KubernetesDiscoveryConfig {
-                namespace: Some("sglang".to_string()),
-                ..Default::default()
-            })
+            .maybe_discovery(Some(
+                KubernetesDiscoveryConfig {
+                    namespace: Some("sglang".to_string()),
+                    ..Default::default()
+                }
+                .into(),
+            ))
             .enable_metrics("0.0.0.0", 9090)
             .enable_trace("localhost:4317")
             .log_dir("/var/log/sglang")
@@ -3044,13 +3047,16 @@ discovery:
             .request_timeout_secs(300)
             .worker_startup_timeout_secs(180)
             .worker_startup_check_interval_secs(15)
-            .discovery_config(KubernetesDiscoveryConfig {
-                namespace: None,
-                port: 8080,
-                check_interval_secs: 45,
-                selector,
-                ..Default::default()
-            })
+            .maybe_discovery(Some(
+                KubernetesDiscoveryConfig {
+                    namespace: None,
+                    port: 8080,
+                    check_interval_secs: 45,
+                    selector,
+                    ..Default::default()
+                }
+                .into(),
+            ))
             .metrics_config(MetricsConfig::default())
             .enable_trace("localhost:4317")
             .log_level("debug")
@@ -3080,22 +3086,25 @@ discovery:
             .request_timeout_secs(900)
             .worker_startup_timeout_secs(600)
             .worker_startup_check_interval_secs(20)
-            .discovery_config(KubernetesDiscoveryConfig {
-                namespace: Some("production".to_string()),
-                port: 8443,
-                check_interval_secs: 120,
-                selector: selectors.clone(),
-                encode_selector: selectors.clone(),
-                prefill_selector: selectors.clone(),
-                decode_selector: selectors,
-                bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
-                worker_ports_annotation: "smg.ai/worker-ports".to_string(),
-                kv_connector_annotation: "smg.ai/kv-connector".to_string(),
-                kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
-                router_selector: HashMap::new(),
-                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source: None,
-            })
+            .maybe_discovery(Some(
+                KubernetesDiscoveryConfig {
+                    namespace: Some("production".to_string()),
+                    port: 8443,
+                    check_interval_secs: 120,
+                    selector: selectors.clone(),
+                    encode_selector: selectors.clone(),
+                    prefill_selector: selectors.clone(),
+                    decode_selector: selectors,
+                    bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
+                    worker_ports_annotation: "smg.ai/worker-ports".to_string(),
+                    kv_connector_annotation: "smg.ai/kv-connector".to_string(),
+                    kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+                    router_selector: HashMap::new(),
+                    router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
+                    model_id_source: None,
+                }
+                .into(),
+            ))
             .enable_metrics("::", 9999) // IPv6 any
             .enable_trace("localhost:4317")
             .log_dir("/opt/logs/sglang")
