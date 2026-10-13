@@ -1915,6 +1915,26 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // One bind-host rule for every listener: IPv6 with or without brackets.
     let addr = crate::config::bind_socket_addr(&config.host, config.port)
         .map_err(|e| format!("Invalid address: {e}"))?;
+    // The mesh listener binds now too, eagerly, before the HTTP listener: a
+    // mesh port another process holds used to surface as one error line from
+    // the mesh server's task after the gateway was already serving, as a node
+    // outside the mesh, its rate limits and worker state shared with nobody.
+    // The bound socket is handed to the mesh server below.
+    let mesh_listener = match &config.mesh_server_config {
+        Some(mesh_server_config) => {
+            let mesh_addr = mesh_server_config.bind_addr;
+            Some(
+                tokio::net::TcpListener::bind(mesh_addr)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to bind the mesh listener on {mesh_addr} (--mesh-port): {e}"
+                        )
+                    })?,
+            )
+        }
+        None => None,
+    };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before the mesh server
     // below has joined the cluster. Bound through tokio, as axum-server
@@ -1930,14 +1950,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // The mesh server starts once every listener is bound: a member that
     // joined the cluster and vanished with a failed bind is the partial start
     // the checks above exist to prevent. The adapters registered their
-    // namespaces earlier, so gossip is safe to start.
-    if let Some(mesh_server) = mesh_server {
+    // namespaces earlier, so gossip is safe to start. It serves from the
+    // socket bound above.
+    if let (Some(mesh_server), Some(mesh_listener)) = (mesh_server, mesh_listener) {
         #[expect(
             clippy::disallowed_methods,
             reason = "mesh server runs for the lifetime of the process; shutdown is handled by the mesh handler"
         )]
         spawn(async move {
-            if let Err(e) = mesh_server.start().await {
+            if let Err(e) = mesh_server.start_with_listener(mesh_listener).await {
                 tracing::error!("Mesh server failed: {}", e);
             }
         });

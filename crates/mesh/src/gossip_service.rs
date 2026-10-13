@@ -186,7 +186,9 @@ impl GossipService {
         listener: tokio::net::TcpListener,
         signal: F,
     ) -> Result<()> {
-        let incoming = TcpIncoming::from(listener);
+        // The socket option the address path sets (tonic's server default):
+        // TCP_NODELAY on every accepted connection; no keepalive either way.
+        let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
         let mut server = self.server_builder().await?;
         let service = GossipServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)

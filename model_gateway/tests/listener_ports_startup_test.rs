@@ -195,3 +195,33 @@ fn a_held_listener_port_starts_no_mesh_member() {
         drop(held);
     }
 }
+
+/// The mesh port another process holds is refused like the other listeners'
+/// ports, with nothing served: the mesh listener binds with them, before the
+/// HTTP listener, where its failed bind used to be one error line from the
+/// mesh server's task while the gateway served outside the mesh.
+#[test]
+fn a_held_mesh_port_refuses_to_start() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let held = TcpListener::bind((IP, 0)).expect("a port to hold");
+    let held_port = held.local_addr().expect("the held address").port();
+    let [port, metrics_port, _] = free_ports();
+    let mut args = base_args(port, metrics_port);
+    args.extend(mesh_args(held_port));
+    // The metrics and probe listeners are up when the mesh bind fails (they
+    // bind earlier, by design): the HTTP port is watched, the one a gateway
+    // outside the mesh used to serve on.
+    let launch = launch_with(
+        &args,
+        &[port],
+        Until::Bound,
+        &dir.path().join("mesh-port-held.log"),
+    );
+    assert_refused(
+        "mesh-port-held",
+        &launch,
+        &["--mesh-port", "Address already in use"],
+    );
+    drop(held);
+}
