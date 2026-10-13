@@ -82,7 +82,8 @@ def test_the_upstream_spellings_of_the_model_and_tokenizer_are_both_read():
         SimpleNamespace(model="org/new", model_path="org/old", tokenizer=None, tokenizer_path="t")
     ).server_args
     assert (both.model, both.tokenizer) == ("org/new", "t")
-    assert (EngineConfigView(SimpleNamespace()).server_args.model, "") == ("", "")
+    bare = EngineConfigView(SimpleNamespace()).server_args
+    assert (bare.model, bare.tokenizer) == ("", "")
 
 
 def test_bare_server_args_read_as_the_defaults():

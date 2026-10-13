@@ -70,6 +70,7 @@ def servicer():
     converter = namespace["_sampling_params_from_proto"]
     instance = SimpleNamespace(
         server_args=SimpleNamespace(reasoning_parser=None),
+        _config=EngineConfigView(SimpleNamespace(reasoning_parser=None)),
         _sampling_params_from_proto=converter,
     )
     return converter, namespace["_build_generate_req"], instance
