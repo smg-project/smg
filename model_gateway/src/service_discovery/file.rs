@@ -394,41 +394,6 @@ fn concerns_manifest(event: &Event, name: Option<&OsStr>) -> bool {
     })
 }
 
-/// Start watching, or say why the provider is polling only. Polling alone is
-/// still correct: the tick rereads whatever the watch would have reported.
-/// `warned` records that a failure was logged, so retries do not repeat it
-/// and the watch starting is logged in turn.
-fn start_watch(
-    config: &FileProviderConfig,
-    wake: &mpsc::Sender<()>,
-    warned: &mut bool,
-) -> Option<ManifestWatch> {
-    match watch_manifest(&config.path, wake.clone()) {
-        Ok(watch) => {
-            if *warned {
-                info!(
-                    "Watching discovery manifest {} for changes",
-                    config.path.display()
-                );
-                *warned = false;
-            }
-            Some(watch)
-        }
-        Err(error) => {
-            if !*warned {
-                warn!(
-                    "Cannot watch discovery manifest {} ({error}); rereading every {}s, and retrying the watch every {}s",
-                    config.path.display(),
-                    config.check_interval.as_secs_f64(),
-                    REWATCH.as_secs_f64()
-                );
-                *warned = true;
-            }
-            None
-        }
-    }
-}
-
 /// Let a burst of events settle, then take every wake it sent as one.
 async fn settle(wake: &mut mpsc::Receiver<()>) {
     time::sleep(SETTLE).await;
@@ -457,74 +422,161 @@ pub(super) fn start_file_discovery(
         clippy::disallowed_methods,
         reason = "worker discovery runs for the lifetime of the server; shutdown aborts the handle"
     )]
-    let handle = task::spawn(async move {
-        let kind = DiscoveryKind::File;
-        let (wake_tx, mut wake_rx) = mpsc::channel(1);
-        let mut warned = false;
-        // Held for as long as this loop runs: dropping it stops the watch.
-        let mut watch = start_watch(&config, &wake_tx, &mut warned);
-        let mut last_good: Option<DesiredState> = None;
-        let mut interval = time::interval(config.check_interval);
-        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                Some(()) = wake_rx.recv() => settle(&mut wake_rx).await,
-                // Unwatched, because the directory does not exist (yet, or
-                // any more): retry soon rather than on the tick, and read
-                // once watching, since nothing reported changes until then.
-                () = time::sleep(REWATCH), if watch.is_none() => {
-                    watch = start_watch(&config, &wake_tx, &mut warned);
-                    if watch.is_none() {
-                        continue;
-                    }
-                }
-            }
-            if watch.as_ref().is_some_and(ManifestWatch::is_lost) {
-                warn!(
-                    "The directory of discovery manifest {} was removed or moved; watching it again once it exists",
-                    config.path.display()
-                );
-                // Logged here, so a failed retry stays quiet.
-                warned = true;
-                watch = start_watch(&config, &wake_tx, &mut warned);
-            }
-            let started_at = time::Instant::now();
-            match read_manifest(&config).await {
-                Ok(desired) => {
-                    if last_good.as_ref() != Some(&desired) {
-                        info!(
-                            "Discovery manifest {} lists {} worker(s)",
-                            config.path.display(),
-                            desired.workers.len()
-                        );
-                    }
-                    last_good = Some(desired);
-                }
-                Err(error) => {
-                    Metrics::record_discovery_snapshot_error(
-                        kind.metric_label(),
-                        error.metric_reason(),
-                    );
-                    if last_good.is_some() {
-                        warn!("{error}; keeping the last good manifest");
-                    } else {
-                        warn!("{error}; no workers discovered yet");
-                    }
-                }
-            }
-            if let Some(desired) = &last_good {
-                reconciler::reconcile(desired, kind, &app_context, started_at).await;
-            }
-        }
-    });
+    let handle = task::spawn(FileDiscovery::new(config, app_context).run());
 
     handle
+}
+
+/// The provider's loop and its state.
+///
+/// `watch` is `None` while the manifest's directory cannot be watched (it does
+/// not exist yet, or was removed): the loop then rereads on the tick alone and
+/// tries the watch again every [`REWATCH`]. `warned` records that the failure
+/// was logged, so the retries stay quiet and the watch starting is logged in
+/// turn. `last_good` is the snapshot every pass reconciles; a read that fails
+/// leaves it in place.
+struct FileDiscovery {
+    config: FileProviderConfig,
+    app_context: Arc<AppContext>,
+    /// The watch sends on `wake` whenever the manifest may have changed; the
+    /// loop takes the wakes from `woken`.
+    wake: mpsc::Sender<()>,
+    woken: mpsc::Receiver<()>,
+    /// Held for as long as the loop runs: dropping it stops the watch.
+    watch: Option<ManifestWatch>,
+    warned: bool,
+    last_good: Option<DesiredState>,
+}
+
+impl FileDiscovery {
+    fn new(config: FileProviderConfig, app_context: Arc<AppContext>) -> Self {
+        let (wake, woken) = mpsc::channel(1);
+        Self {
+            config,
+            app_context,
+            wake,
+            woken,
+            watch: None,
+            warned: false,
+            last_good: None,
+        }
+    }
+
+    async fn run(mut self) {
+        self.start_watch();
+        let mut interval = time::interval(self.config.check_interval);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        loop {
+            if !self.next_pass(&mut interval).await {
+                continue;
+            }
+            self.rewatch_if_lost();
+            let started_at = time::Instant::now();
+            self.reread().await;
+            if let Some(desired) = &self.last_good {
+                reconciler::reconcile(desired, DiscoveryKind::File, &self.app_context, started_at)
+                    .await;
+            }
+        }
+    }
+
+    /// Wait for what causes the next pass: the tick, a burst of change events
+    /// once it has settled, or the watch starting after the directory came
+    /// back, since nothing reported changes until then. `false` when the
+    /// directory is still missing, which is no pass at all.
+    async fn next_pass(&mut self, interval: &mut time::Interval) -> bool {
+        tokio::select! {
+            _ = interval.tick() => true,
+            Some(()) = self.woken.recv() => {
+                settle(&mut self.woken).await;
+                true
+            }
+            // Unwatched, because the directory does not exist (yet, or any
+            // more): retry soon rather than on the tick.
+            () = time::sleep(REWATCH), if self.watch.is_none() => {
+                self.start_watch();
+                self.watch.is_some()
+            }
+        }
+    }
+
+    /// Start the watch again once the directory it was on is gone.
+    fn rewatch_if_lost(&mut self) {
+        if self.watch.as_ref().is_some_and(ManifestWatch::is_lost) {
+            warn!(
+                "The directory of discovery manifest {} was removed or moved; watching it again once it exists",
+                self.config.path.display()
+            );
+            // Logged here, so a failed retry stays quiet.
+            self.warned = true;
+            self.start_watch();
+        }
+    }
+
+    /// Start watching, or say why the provider is polling only. Polling alone
+    /// is still correct: the tick rereads whatever the watch would have
+    /// reported.
+    fn start_watch(&mut self) {
+        self.watch = match watch_manifest(&self.config.path, self.wake.clone()) {
+            Ok(watch) => {
+                if self.warned {
+                    info!(
+                        "Watching discovery manifest {} for changes",
+                        self.config.path.display()
+                    );
+                    self.warned = false;
+                }
+                Some(watch)
+            }
+            Err(error) => {
+                if !self.warned {
+                    warn!(
+                        "Cannot watch discovery manifest {} ({error}); rereading every {}s, and retrying the watch every {}s",
+                        self.config.path.display(),
+                        self.config.check_interval.as_secs_f64(),
+                        REWATCH.as_secs_f64()
+                    );
+                    self.warned = true;
+                }
+                None
+            }
+        };
+    }
+
+    /// Read the manifest into the last good snapshot. A read that fails is
+    /// reported and leaves the snapshot in place, so a half-written or broken
+    /// file never removes a worker.
+    async fn reread(&mut self) {
+        match read_manifest(&self.config).await {
+            Ok(desired) => {
+                if self.last_good.as_ref() != Some(&desired) {
+                    info!(
+                        "Discovery manifest {} lists {} worker(s)",
+                        self.config.path.display(),
+                        desired.workers.len()
+                    );
+                }
+                self.last_good = Some(desired);
+            }
+            Err(error) => {
+                Metrics::record_discovery_snapshot_error(
+                    DiscoveryKind::File.metric_label(),
+                    error.metric_reason(),
+                );
+                if self.last_good.is_some() {
+                    warn!("{error}; keeping the last good manifest");
+                } else {
+                    warn!("{error}; no workers discovered yet");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service_discovery::testing::create_test_app_context;
 
     fn parse(json: &str, roles: Roles) -> Result<Vec<DiscoveredWorker>, String> {
         parse_manifest(json.as_bytes(), roles)
@@ -945,5 +997,88 @@ mod tests {
         let file = dir.path().join("a-file");
         std::fs::write(&file, "").unwrap();
         assert!(watch_manifest(&file.join("workers.json"), tx).is_err());
+    }
+
+    fn discovery(path: &Path) -> FileDiscovery {
+        let config = FileProviderConfig::new(
+            path.to_path_buf(),
+            Duration::from_secs(60),
+            &RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+        )
+        .unwrap();
+        FileDiscovery::new(config, create_test_app_context())
+    }
+
+    /// The endpoints of the last good snapshot, `None` before the first good
+    /// read.
+    fn listed(discovery: &FileDiscovery) -> Option<Vec<String>> {
+        discovery.last_good.as_ref().map(|desired| {
+            desired
+                .workers
+                .values()
+                .map(|worker| worker.endpoint.render())
+                .collect()
+        })
+    }
+
+    /// A read that fails leaves the last good snapshot in place, so a
+    /// half-written, broken or missing manifest never removes a worker; a
+    /// valid empty fleet does replace it.
+    #[tokio::test]
+    async fn a_failed_read_keeps_the_last_good_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workers.json");
+        let mut discovery = discovery(&path);
+
+        discovery.reread().await;
+        assert_eq!(listed(&discovery), None, "nothing read yet");
+
+        std::fs::write(&path, manifest(r#"{"url": "10.0.0.11:8000"}"#)).unwrap();
+        discovery.reread().await;
+        assert_eq!(listed(&discovery), Some(vec!["10.0.0.11:8000".to_string()]));
+
+        std::fs::write(&path, "{").unwrap();
+        discovery.reread().await;
+        assert_eq!(
+            listed(&discovery),
+            Some(vec!["10.0.0.11:8000".to_string()]),
+            "a half-written manifest replaced the snapshot"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        discovery.reread().await;
+        assert_eq!(
+            listed(&discovery),
+            Some(vec!["10.0.0.11:8000".to_string()]),
+            "a missing manifest replaced the snapshot"
+        );
+
+        std::fs::write(&path, manifest("")).unwrap();
+        discovery.reread().await;
+        assert_eq!(listed(&discovery), Some(vec![]), "an empty fleet is valid");
+    }
+
+    /// Until the manifest's directory exists the provider polls only: the
+    /// watch is retried after the one warning, and starts once the directory
+    /// is there.
+    #[test]
+    fn an_unwatchable_directory_leaves_the_provider_polling() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("smg");
+        let mut discovery = discovery(&dir.join("workers.json"));
+
+        discovery.start_watch();
+        assert!(discovery.watch.is_none());
+        assert!(discovery.warned, "the failure is logged");
+        discovery.start_watch();
+        assert!(discovery.watch.is_none());
+        assert!(discovery.warned, "a failed retry stays quiet");
+
+        std::fs::create_dir(&dir).unwrap();
+        discovery.start_watch();
+        assert!(discovery.watch.is_some(), "the directory exists now");
+        assert!(!discovery.warned, "the watch starting is logged in turn");
     }
 }
