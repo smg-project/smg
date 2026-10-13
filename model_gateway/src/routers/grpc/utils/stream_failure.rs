@@ -620,6 +620,26 @@ mod tests {
         assert_eq!(router_error_type(&rendered), "backend_error");
     }
 
+    /// A stream that ended with an HTTP/2 fault (the connection to the
+    /// worker went away under it) is the worker's backend error, a stream
+    /// error to the client and a breaker sample, whatever code tonic picked
+    /// from the frame's reason: never the rate-limit class a GOAWAY
+    /// ENHANCE_YOUR_CALM would read as.
+    #[test]
+    fn a_stream_cut_by_an_http2_fault_is_the_workers_backend_error() {
+        let status = tonic::Status::from_error(Box::new(smg_grpc_client::h2::Error::from(
+            smg_grpc_client::h2::Reason::ENHANCE_YOUR_CALM,
+        )));
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        let class = UpstreamClass::of(&status);
+        assert_eq!(
+            (class.http, class.error_type, class.breaker_sample),
+            (StatusCode::BAD_GATEWAY, "backend_error", Some(502))
+        );
+        assert!(class.is_worker_failure());
+        assert_eq!(class.client_type("stream_error"), "stream_error");
+    }
+
     #[test]
     fn a_failure_of_the_requests_media_takes_no_breaker_sample() {
         // A worker that predates the media-fault trailer reports the media

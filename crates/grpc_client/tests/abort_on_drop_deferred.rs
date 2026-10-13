@@ -6,7 +6,9 @@
 //! first response arrives (the disaggregated decode leg uses this so a client
 //! disconnect can never tear down a request mid-KV-handoff); dropping after
 //! the first response — or without the deferral — aborts promptly, and
-//! `mark_completed` suppresses the abort entirely.
+//! `mark_completed` suppresses the abort entirely. The dropped stream itself
+//! is released by the backend's own end of it after the abort, within a
+//! bound, not by an immediate reset.
 
 use std::{
     sync::{Arc, Mutex},
@@ -265,4 +267,55 @@ async fn flush_cache_forwards_timeout_and_result() {
     assert!(result.success);
     assert_eq!(result.message, "reset result");
     assert!(!client.flush_cache(0.0).await.unwrap().success);
+}
+
+/// A dropped stream is released by the backend's own end of it, not by a
+/// reset: after the abort it stays open on the wire until the backend ends
+/// it (a chunk the backend sends meanwhile still goes through; a reset would
+/// have closed the response body's channel on the backend's side).
+#[tokio::test]
+async fn a_dropped_stream_is_released_by_the_backends_own_end_not_a_reset() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+
+    let stream = client.generate(generate_request("rel-1")).await.unwrap();
+    drop(stream);
+    assert_eq!(wait_for_abort(&state).await, ["rel-1"]);
+
+    // Time for a reset, had one been sent, to reach the backend and close
+    // its response body's channel.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tx = state.lock_tx().clone().unwrap();
+    tx.send(Ok(chunk()))
+        .await
+        .expect("the stream stays open until the backend ends it");
+    // The backend's end of the stream.
+    drop(tx);
+}
+
+/// A backend that never ends a dropped stream holds it only for the release
+/// bound; past it the stream is released with a reset after all.
+#[tokio::test]
+async fn a_backend_that_never_ends_a_dropped_stream_is_reset_after_the_bound() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+
+    let stream = client
+        .generate(generate_request("rel-2"))
+        .await
+        .unwrap()
+        .with_release_drain_bound(Duration::from_millis(300));
+    drop(stream);
+    assert_eq!(wait_for_abort(&state).await, ["rel-2"]);
+
+    let tx = state.lock_tx().clone().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tx.send(Ok(chunk()))
+        .await
+        .expect("still open inside the bound");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        tx.send(Ok(chunk())).await.is_err(),
+        "past the bound the stream is released with a reset"
+    );
 }

@@ -32,6 +32,11 @@ prost-types.workspace = true
 # Async/concurrency
 futures.workspace = true
 
+# The HTTP/2 layer under tonic: the type of the transport fault a
+# `tonic::Status` made of one carries in its source chain
+# (`channel::is_transport_failure`); also the raw peer of the channel tests.
+h2 = "0.4.19"
+
 # Archive validation
 sha2 = "0.11"
 zip = "8.6"
@@ -42,8 +47,7 @@ tonic-prost-build = "0.14.6"
 prost-build = "0.14.4"
 
 [dev-dependencies]
-# Raw HTTP/2 peer for the channel window / data-frame budget tests.
-h2 = "0.4.19"
+# The in-memory IO of the channel tests' raw HTTP/2 peer.
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 # Mock-server harness for the abort-on-drop behavioral tests.

@@ -97,6 +97,28 @@ fn configured_endpoint(
         .initial_connection_window_size(Some(32 * 1024 * 1024)))
 }
 
+/// Whether `status` is what tonic makes of a failure in the HTTP/2 layer
+/// under a call, rather than an answer the worker gave: the connection went
+/// away (a GOAWAY of either side, the one this client issues once too many
+/// of its locally-reset streams received late frames included), the peer
+/// reset the stream below gRPC, a protocol fault. tonic picks such a
+/// status's code from the frame's reason (`ENHANCE_YOUR_CALM` reads as
+/// `RESOURCE_EXHAUSTED`, the code of a worker's own capacity pushback;
+/// `PROTOCOL_ERROR` as `INTERNAL`, the code of its own failure on a
+/// request), so the code cannot tell the two apart: the `h2::Error` in the
+/// status's source chain can. A status the worker answered with (its
+/// trailers) carries no such source.
+pub fn is_transport_failure(status: &tonic::Status) -> bool {
+    let mut source = std::error::Error::source(status);
+    while let Some(error) = source {
+        if error.is::<h2::Error>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -111,7 +133,9 @@ mod tests {
     use tonic::{codegen::http::Uri, transport::Endpoint};
     use tower::Service;
 
-    use super::{configured_endpoint, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT};
+    use super::{
+        configured_endpoint, is_transport_failure, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT,
+    };
 
     #[derive(Clone, Copy)]
     struct PendingConnector;
@@ -421,6 +445,206 @@ mod tests {
         assert!(
             matches!(outcome, BlastOutcome::StillOpen),
             "expected the connection to survive, got {outcome:?}"
+        );
+    }
+
+    // --- transport faults under a call ---------------------------------------
+
+    /// tonic's status for an HTTP/2 fault carries the h2 error as its source,
+    /// whatever code it picked from the frame's reason; a status a worker
+    /// answers with, or one made of some other error, carries none.
+    #[test]
+    fn a_status_made_of_an_http2_fault_is_a_transport_failure() {
+        for (reason, code) in [
+            (
+                h2::Reason::ENHANCE_YOUR_CALM,
+                tonic::Code::ResourceExhausted,
+            ),
+            (h2::Reason::PROTOCOL_ERROR, tonic::Code::Internal),
+            (h2::Reason::REFUSED_STREAM, tonic::Code::Unavailable),
+            (h2::Reason::CANCEL, tonic::Code::Cancelled),
+        ] {
+            let status = tonic::Status::from_error(Box::new(h2::Error::from(reason)));
+            assert_eq!(status.code(), code, "tonic's own code for {reason:?}");
+            assert!(is_transport_failure(&status), "{reason:?}");
+        }
+        assert!(!is_transport_failure(&tonic::Status::resource_exhausted(
+            "busy"
+        )));
+        assert!(!is_transport_failure(&tonic::Status::internal("boom")));
+        let other = tonic::Status::from_error(Box::new(io::Error::other("not http/2")));
+        assert_eq!(other.code(), tonic::Code::Unknown);
+        assert!(!is_transport_failure(&other));
+    }
+
+    // --- late frames on forgotten streams ------------------------------------
+    //
+    // A stream the client reset (a dropped response body) is remembered for
+    // one second, fifty at a time; a frame the peer sends on it after that is
+    // a frame on an unknown stream, which h2 answers with a library reset
+    // that counts toward the connection's limit of 1024, and past the limit
+    // it tears the connection down: GOAWAY ENHANCE_YOUR_CALM
+    // "too_many_internal_resets", every call in flight failed. The status
+    // tonic makes of that failure is a transport fault.
+
+    /// Serve `io` at the frame level: answer every request's HEADERS with
+    /// response headers at once and one DATA frame `late` afterwards, whatever
+    /// RST_STREAM the client sent in between; report the client's GOAWAY as
+    /// its (error code, debug data).
+    async fn serve_late_frames(io: DuplexStream, late: Duration) -> (u32, Vec<u8>) {
+        use std::sync::Arc;
+
+        use tokio::{
+            io::{AsyncReadExt as _, AsyncWriteExt as _, WriteHalf},
+            sync::Mutex,
+        };
+
+        async fn write_frame(
+            writer: &Mutex<WriteHalf<DuplexStream>>,
+            kind: u8,
+            flags: u8,
+            stream_id: u32,
+            payload: &[u8],
+        ) {
+            let mut frame = Vec::with_capacity(9 + payload.len());
+            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes()[1..]);
+            frame.push(kind);
+            frame.push(flags);
+            frame.extend_from_slice(&stream_id.to_be_bytes());
+            frame.extend_from_slice(payload);
+            let mut writer = writer.lock().await;
+            // The client closes its side after its GOAWAY: late writes may fail.
+            let _ = writer.write_all(&frame).await;
+            let _ = writer.flush().await;
+        }
+
+        let (mut reader, writer) = tokio::io::split(io);
+        let writer = Arc::new(Mutex::new(writer));
+        let mut preface = [0u8; 24];
+        reader
+            .read_exact(&mut preface)
+            .await
+            .expect("client preface");
+        assert_eq!(&preface[..16], b"PRI * HTTP/2.0\r\n");
+        write_frame(&writer, 0x4, 0, 0, &[]).await; // the server's SETTINGS
+        loop {
+            let mut header = [0u8; 9];
+            reader
+                .read_exact(&mut header)
+                .await
+                .expect("a frame header (the client left without a GOAWAY)");
+            let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+            let (kind, flags) = (header[3], header[4]);
+            let stream_id =
+                u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+            let mut payload = vec![0u8; len];
+            reader
+                .read_exact(&mut payload)
+                .await
+                .expect("a frame payload");
+            match kind {
+                // SETTINGS and PING are acknowledged; everything else the
+                // client sends, RST_STREAM above all, is ignored.
+                0x4 if flags & 0x1 == 0 => write_frame(&writer, 0x4, 0x1, 0, &[]).await,
+                0x6 if flags & 0x1 == 0 => write_frame(&writer, 0x6, 0x1, 0, &payload).await,
+                0x1 => {
+                    // `:status: 200` (static table index 8), END_HEADERS.
+                    write_frame(&writer, 0x1, 0x4, stream_id, &[0x88]).await;
+                    let writer = Arc::clone(&writer);
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "test-only h2 peer; the task ends with its one frame"
+                    )]
+                    tokio::spawn(async move {
+                        tokio::time::sleep(late).await;
+                        write_frame(&writer, 0x0, 0, stream_id, b"x").await;
+                    });
+                }
+                0x7 => {
+                    let code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    return (code, payload[8..].to_vec());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The limit under the production profile, reached by late frames alone:
+    /// the connection goes away with "too_many_internal_resets", and the
+    /// status a call in flight fails with is a transport fault (tonic reads
+    /// the reason as RESOURCE_EXHAUSTED, which answered as a 429 would tell
+    /// the client of a rate limit it never hit).
+    #[tokio::test]
+    async fn late_frames_on_forgotten_streams_end_the_connection_with_a_transport_failure() {
+        use std::pin::Pin;
+
+        use tonic::codegen::{http, Body as _};
+
+        // Past h2's limit of 1024 local resets per connection.
+        const ABANDONED: usize = 1_100;
+        // Past the one second h2 remembers a reset stream for.
+        const LATE: Duration = Duration::from_millis(1_500);
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        #[expect(clippy::disallowed_methods, reason = "test-only h2 peer, joined below")]
+        let server = tokio::spawn(serve_late_frames(server_io, LATE));
+
+        let mut client_io = Some(client_io);
+        let mut channel = configured_endpoint("http://unused.invalid", DEFAULT_CONNECT_TIMEOUT)
+            .expect("endpoint")
+            .connect_with_connector(tower::service_fn(move |_uri: Uri| {
+                let io = client_io.take().map(TokioIo::new).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "test connection already used")
+                });
+                std::future::ready(io)
+            }))
+            .await
+            .expect("connect");
+        let request = || {
+            http::Request::post("/smg.test.Late/Stream")
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(tonic::body::Body::empty())
+                .expect("request")
+        };
+        // One call stays in flight, to read the connection's end from.
+        std::future::poll_fn(|cx| channel.poll_ready(cx))
+            .await
+            .expect("channel ready");
+        let mut probe = channel
+            .call(request())
+            .await
+            .expect("probe headers")
+            .into_body();
+        for _ in 0..ABANDONED {
+            std::future::poll_fn(|cx| channel.poll_ready(cx))
+                .await
+                .expect("channel ready");
+            let response = channel.call(request()).await.expect("response headers");
+            // The body goes with it: RST_STREAM CANCEL.
+            drop(response);
+        }
+
+        let (code, debug) = tokio::time::timeout(Duration::from_secs(20), server)
+            .await
+            .expect("the client went away within the deadline")
+            .expect("server task");
+        assert_eq!(h2::Reason::from(code), h2::Reason::ENHANCE_YOUR_CALM);
+        assert_eq!(debug, b"too_many_internal_resets");
+
+        // The probe's own late frame arrives before the connection's end.
+        let failure = loop {
+            match std::future::poll_fn(|cx| Pin::new(&mut probe).poll_frame(cx)).await {
+                Some(Ok(_frame)) => continue,
+                Some(Err(failure)) => break failure,
+                None => panic!("the probe ended cleanly, not with the connection"),
+            }
+        };
+        assert!(is_transport_failure(&failure), "{failure:?}");
+        assert_eq!(
+            failure.code(),
+            tonic::Code::ResourceExhausted,
+            "{failure:?}"
         );
     }
 }

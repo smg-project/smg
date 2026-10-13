@@ -9,7 +9,7 @@ use std::{
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
-use smg_grpc_client::vllm_proto as vllm;
+use smg_grpc_client::{is_transport_failure, vllm_proto as vllm};
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
@@ -901,8 +901,10 @@ fn start_failure_response(
     let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
     // INTERNAL is the servicers' code for a request the engine took and failed
     // on: the worker's own answer for this payload, which the retry layer does
-    // not replay on it (see `routers::common::attempt_ledger`).
-    if e.code() == tonic::Code::Internal {
+    // not replay on it (see `routers::common::attempt_ledger`). tonic gives
+    // the same code to an HTTP/2 protocol fault under the call, which is no
+    // answer of the worker's (see `TonicStatusExt::http_status`).
+    if e.code() == tonic::Code::Internal && !is_transport_failure(e) {
         mark_upstream_answer(&mut response);
     }
     // The worker already spent its whole media-sidecar budget on this input;
@@ -2277,6 +2279,32 @@ mod tests {
             "decode_worker_failed_to_start"
         );
         assert!(is_retryable_response(&cancelled));
+    }
+
+    /// A leg start that failed in the HTTP/2 layer (the connection to the
+    /// worker went away under the call) is the worker's transport failure: a
+    /// retryable 502, not the worker's own answer for the payload, whatever
+    /// code tonic picked from the frame's reason.
+    #[test]
+    fn a_leg_start_lost_to_an_http2_fault_is_a_retryable_502_not_the_workers_answer() {
+        use smg_grpc_client::h2::{Error, Reason};
+
+        use crate::routers::common::{
+            attempt_ledger::is_definitive_failure, retry::is_retryable_response,
+        };
+
+        for reason in [Reason::ENHANCE_YOUR_CALM, Reason::PROTOCOL_ERROR] {
+            let status = tonic::Status::from_error(Box::new(Error::from(reason)));
+            let failed = start_failure_response(
+                &status,
+                "execute_parallel_pd",
+                PdLeg::Prefill.error_message(),
+                PdLeg::Prefill.error_code(),
+            );
+            assert_eq!(failed.status(), http::StatusCode::BAD_GATEWAY, "{reason:?}");
+            assert!(is_retryable_response(&failed), "{reason:?}");
+            assert!(!is_definitive_failure(&failed), "{reason:?}");
+        }
     }
 
     #[test]

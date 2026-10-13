@@ -30,8 +30,12 @@ use std::sync::Arc;
 
 pub use abort_on_drop::{AbortOnDropClient, AbortOnDropStream};
 pub use channel::{
-    connect_channel, connect_channel_with_timeout, normalize_grpc_endpoint, DEFAULT_CONNECT_TIMEOUT,
+    connect_channel, connect_channel_with_timeout, is_transport_failure, normalize_grpc_endpoint,
+    DEFAULT_CONNECT_TIMEOUT,
 };
+/// The HTTP/2 layer under the channels, re-exported for callers that build
+/// or classify the transport faults [`is_transport_failure`] recognises.
+pub use h2;
 pub use media_fault::WorkerMediaFault;
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
 pub use sglang_scheduler::{
