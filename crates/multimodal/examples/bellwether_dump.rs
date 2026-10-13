@@ -1,28 +1,29 @@
-//! SMG's media pipeline over a list of image files, for bellwether's multimodal suite.
+//! SMG's media pipeline over a list of image files, one JSON line per image, for comparison with
+//! bellwether's recorded multimodal fixtures.
 //!
-//! bellwether (smg-project/bellwether) keeps a corpus of public-benchmark images and, per
-//! processor family, what the reference implementation's own image path gives for each of
-//! them: the decoded RGB bytes, the u8 patches, the bf16 and the f32 pixel tensors, each as
-//! a SHA-256. `bellwether multimodal verify` runs this example over a tier of that corpus
-//! and compares its lines with the family's reference, image by image. The example decodes
-//! each listed file the way the gateway decodes inline image bytes (EXIF orientation
-//! applied, no size cap), runs the family's processor built from its
-//! `preprocessor_config.json`, and writes the pixel tensor as the gateway writes it on the
-//! wire, in bf16 and in f32.
+//! bellwether (smg-project/bellwether) records, per processor family, what the reference
+//! implementation's own image path gives for each image of its corpus: the decoded RGB bytes,
+//! the u8 patches, the bf16 and the f32 pixel tensors, each as a SHA-256. This example gives the
+//! same for SMG: each listed file decoded the way the gateway decodes inline image bytes (EXIF
+//! orientation applied, no size cap), the family's processor built from its
+//! `preprocessor_config.json`, the pixel tensor written as the gateway writes it on the wire, in
+//! bf16 and in f32, and the digests of all four, so that a recorded line and SMG's line for an
+//! image compare field by field. Comparing a whole fixture set is a test's business; by hand,
+//! `diff` two dumps, or a dump and the recorded lines of the same images.
 //!
-//! The protocol is environment variables, which the suite's runner sets; each has a flag of
-//! the same meaning for a run by hand (a flag wins over its variable):
+//! Settings come from flags, or from environment variables of the same meaning, so a runner can
+//! set them without a command line (a flag wins over its variable):
 //!
-//! | variable | flag | meaning |
+//! | flag | variable | meaning |
 //! |---|---|---|
-//! | `SMG_DUMP_LIST` | `--list <file>` | the image files, one path per line |
-//! | `SMG_DUMP_OUT` | `--out <path>` | in `hash` mode the JSON Lines file written; in `raw` mode the directory the artifacts go to |
-//! | `SMG_DUMP_PROCESSOR` | `--processor <name>` | `qwen2_vl`, `qwen3_vl` or `minimax_m3`: the family's `smg_processor` |
-//! | `SMG_DUMP_CONFIG` | `--config <file>` | the family's `preprocessor_config.json` |
-//! | `SMG_DUMP_MODE` | `--mode <hash\|raw>` | `hash` unless given |
+//! | `--list <file>` | `SMG_DUMP_LIST` | the image files, one path per line |
+//! | `--out <path>` | `SMG_DUMP_OUT` | in `hash` mode the JSON Lines file written; in `raw` mode the directory the artifacts go to |
+//! | `--processor <name>` | `SMG_DUMP_PROCESSOR` | `qwen2_vl`, `qwen3_vl` or `minimax_m3`: the processor family |
+//! | `--config <file>` | `SMG_DUMP_CONFIG` | the family's `preprocessor_config.json` |
+//! | `--mode <hash\|raw>` | `SMG_DUMP_MODE` | `hash` unless given |
 //!
-//! `hash` writes one JSON object per image: `name` (the file name, the key every reference
-//! and dump share), `path` (as listed), `w` and `h` (the decoded size), `alpha` (whether the
+//! `hash` writes one JSON object per image: `name` (the file name, the key a recorded line and a
+//! dump line share), `path` (as listed), `w` and `h` (the decoded size), `alpha` (whether the
 //! file carried transparency), `grid` (the image grid the processor reports, as `t, h, w`,
 //! empty where it reports none), `shape` (the pixel tensor's shape), `rgb_sha256` (the
 //! decoded RGB bytes), `u8_sha256` (the un-normalized u8 patches; `null` when the processor
@@ -30,17 +31,18 @@
 //! be decoded or processed gets `name`, `path` and `error` instead, and the run goes on.
 //! `raw` writes the artifacts themselves under the image's name, `<name>.rgb.raw`,
 //! `<name>.u8.raw` (when there are u8 patches), `<name>.bf16.raw` and `<name>.f32.raw`; where
-//! several listed files share a name, each of them is written under
-//! `<position in the list>-<name>` instead, so no file writes over another's. `meta.json` carries
-//! the processor's name and the per-image lines without the digests, each with the stem its files
-//! were written under as `artifact`, for the first differing element.
+//! any two listed files share a name, every file is written under
+//! `<position in the list>-<name>` instead, which keeps the files of one list apart whatever
+//! the names. `meta.json` carries the processor's name and the per-image lines without the
+//! digests, each with the stem its files were written under as `artifact`, for the first
+//! differing element.
 //!
 //! The exit status is 0 once every listed image has its line, errors included, and the last
 //! line on standard error is then `DUMP_DONE mode=<mode> processor=<name> ok=<n> err=<n>`. A
 //! fault in the setup (an unreadable list or config, an unknown processor, an output that
-//! cannot be written) ends the run with status 1 and the fault, as written, on standard error. The
-//! crate's preprocessing pool is sized by `SMG_MM_THREADS` as everywhere else; the suite's
-//! runner sets it to 1 and shards the list across processes itself.
+//! cannot be written) ends the run with status 1 and the fault, as written, on standard error.
+//! The crate's preprocessing pool is sized by `SMG_MM_THREADS` as everywhere else; a runner
+//! that shards a list across processes sets it to 1.
 //!
 //! ```text
 //! cargo run --release -p llm-multimodal --example bellwether_dump -- \
@@ -48,7 +50,7 @@
 //! ```
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     env,
     error::Error,
     fmt::Write as _,
@@ -182,7 +184,7 @@ fn build_processor(
     })
 }
 
-/// SHA-256 of `bytes` as lowercase hex, the digest the suite's references carry.
+/// SHA-256 of `bytes` as lowercase hex, the digest the recorded fixtures carry.
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -349,24 +351,19 @@ fn listed(list: &Path) -> Result<Vec<(String, PathBuf)>, Fault> {
         .collect())
 }
 
-/// The stem each listed file's artifacts are written under in `raw` mode: its name, or, where
-/// several listed files share a name, the name behind the file's position in the list, so that
-/// two files of one name never write over each other.
+/// The stem each listed file's artifacts are written under in `raw` mode: its name, or, where any
+/// two listed files share a name, its position in the list and its name, for every file. The
+/// positions are distinct, so the stems are too, whatever the names (a file named like a prefixed
+/// stem included).
 fn artifact_stems(names: &[String]) -> Vec<String> {
-    let mut shared: HashMap<&str, usize> = HashMap::new();
-    for name in names {
-        *shared.entry(name.as_str()).or_insert(0) += 1;
+    let distinct: HashSet<&str> = names.iter().map(String::as_str).collect();
+    if distinct.len() == names.len() {
+        return names.to_vec();
     }
     names
         .iter()
         .enumerate()
-        .map(|(index, name)| {
-            if shared.get(name.as_str()).copied().unwrap_or(0) > 1 {
-                format!("{}-{name}", index + 1)
-            } else {
-                name.clone()
-            }
-        })
+        .map(|(index, name)| format!("{}-{name}", index + 1))
         .collect()
 }
 
@@ -464,6 +461,10 @@ fn run() -> Result<(), Fault> {
 mod tests {
     use super::*;
 
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
     fn artifacts(byte: u8) -> Artifacts {
         Artifacts {
             width: 1,
@@ -479,14 +480,23 @@ mod tests {
     }
 
     #[test]
-    fn a_name_shared_by_listed_files_gets_each_of_them_its_position() {
-        let names: Vec<String> = ["x.png", "y.png", "x.png"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        assert_eq!(artifact_stems(&names), ["1-x.png", "y.png", "3-x.png"]);
-        let unique: Vec<String> = ["x.png", "y.png"].iter().map(|s| (*s).to_owned()).collect();
-        assert_eq!(artifact_stems(&unique), ["x.png", "y.png"]);
+    fn distinct_names_are_the_stems() {
+        assert_eq!(
+            artifact_stems(&names(&["x.png", "y.png"])),
+            ["x.png", "y.png"]
+        );
+    }
+
+    #[test]
+    fn a_shared_name_gives_every_file_its_position() {
+        assert_eq!(
+            artifact_stems(&names(&["x.png", "y.png", "x.png"])),
+            ["1-x.png", "2-y.png", "3-x.png"]
+        );
+        // A file named like a prefixed stem cannot take another file's stem: positions are distinct.
+        let stems = artifact_stems(&names(&["x.png", "1-x.png", "x.png"]));
+        assert_eq!(stems, ["1-x.png", "2-1-x.png", "3-x.png"]);
+        assert_eq!(stems.iter().collect::<HashSet<_>>().len(), stems.len());
     }
 
     #[test]
