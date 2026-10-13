@@ -796,6 +796,7 @@ impl LoadRecords {
             dp_rank: self.last_rank,
             snapshot: None,
             load: Some(record),
+            ..Default::default()
         })
     }
 }

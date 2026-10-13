@@ -42,6 +42,40 @@ message KvEventBatch {
   // The engine's load as the servicer knows it when it sends this batch (see
   // EngineLoad); absent from servicers that predate the field.
   EngineLoad load = 8;
+  // Additive GPU-local group evidence, independent of the legacy prefix events.
+  // The same admission cursor covers both views.
+  bool group_events_enabled = 9;
+  repeated KvGroupEvent group_events = 10;
+}
+
+// Native keys retain their full bytes. Token ancestry describes a path, not
+// cache residency; only block_hashes with a positive copy count are resident.
+message KvGroupEvent {
+  enum Operation {
+    INVALID = 0;
+    STORE = 1;
+    REMOVE = 2;
+    CLEAR = 3;
+  }
+  Operation operation = 1;
+  uint32 group_id = 2;
+  repeated bytes block_hashes = 3;
+  bytes parent_block_hash = 4;
+  repeated uint32 token_ids = 5;
+  uint32 block_size = 6;
+  string kind = 7;
+  uint32 sliding_window = 8;
+  bool tokens_matchable = 9;
+  // When present, tokens from root, or from skipped_token_parent_hash's endpoint,
+  // to the resident run's start. Absent reports resolve their native parent.
+  repeated uint32 skipped_token_ids = 10;
+  bool ancestry_provided = 11;
+  // Parallel to hashes: authoritative resident physical copies after the event.
+  // Absent on older publishers; a REMOVE then conservatively withdraws the key.
+  repeated uint32 cache_copy_counts = 12;
+  // An earlier prefix identity for compact ancestry; never a residency claim.
+  // Nonempty only with ancestry_provided. Native parent_block_hash is unchanged.
+  bytes skipped_token_parent_hash = 13;
 }
 
 // The servicer's load record, attached to every KvEventBatch it streams so a
@@ -258,6 +292,7 @@ message KvBlock {
   optional int64 lora_id = 4;
   optional int32 cache_level = 5;
   repeated KvBlockExtraKey extra_keys = 6;
+  optional uint32 cache_copy_count = 7;
 }
 
 message KvBlocksRemoved {
@@ -268,6 +303,7 @@ message KvBlocksRemoved {
   optional uint32 group_idx = 5;
   optional KvCacheLocality locality = 6;
   optional string ownership = 7;
+  repeated uint32 cache_copy_counts = 8;
 }
 
 message KvCacheCleared {

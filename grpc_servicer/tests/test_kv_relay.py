@@ -96,6 +96,10 @@ def _vllm_structs(array_like):
         locality: str | None = None
         ownership: str | None = None
         session_id: str | None = None
+        skipped_token_ids: list[int] | None = None
+        cache_copy_counts: list[int] | None = None
+        token_ids_matchable: bool | None = None
+        skipped_token_parent_hash: int | bytes | None = None
 
     class BlockRemoved(KVCacheEvent):
         block_hashes: list
@@ -103,6 +107,7 @@ def _vllm_structs(array_like):
         group_idx: int | None = None
         locality: str | None = None
         ownership: str | None = None
+        cache_copy_counts: list[int] | None = None
 
     class AllBlocksCleared(KVCacheEvent):
         pass
@@ -784,6 +789,449 @@ def test_a_non_batch_payload_is_an_error():
 
 
 # ---------------------------------------------------------------------------
+# Additive group evidence (the legacy expectations above remain unchanged)
+# ---------------------------------------------------------------------------
+
+
+def _group_store(hashes, tokens, **extra):
+    return _store(
+        hashes, tokens, **{"group_idx": 0, "kv_cache_spec_kind": "full_attention", **extra}
+    )
+
+
+@pytest.mark.parametrize("array_like", [False, True], ids=["map", "array"])
+def test_group_wire_keeps_native_keys_and_copy_counts_before_legacy_filters(array_like):
+    Batch, Stored, Removed, _, _ = _vllm_structs(array_like)
+    key = bytes(range(32))
+    stores = [
+        Stored(
+            [key],
+            None,
+            [1, 2, 3, 4],
+            4,
+            None,
+            "GPU",
+            None,
+            group_idx=group,
+            kv_cache_spec_kind=kind,
+            kv_cache_spec_sliding_window=window,
+            skipped_token_ids=[],
+            cache_copy_counts=[2],
+            token_ids_matchable=True,
+        )
+        for group, kind, window in (
+            (0, "full_attention", None),
+            (1, "sliding_window", 8),
+            (2, "mamba", None),
+        )
+    ]
+    stores.append(Removed([key], "GPU", group_idx=1, cache_copy_counts=[1]))
+    batches, _ = _normalize([msgspec.msgpack.encode(Batch(1.5, stores, 0))])
+    batch = batches[0]
+    assert batch.group_events_enabled
+    assert [event.group_id for event in batch.group_events] == [0, 1, 2, 1]
+    assert [event.operation for event in batch.group_events] == [
+        common_pb2.KvGroupEvent.STORE,
+        common_pb2.KvGroupEvent.STORE,
+        common_pb2.KvGroupEvent.STORE,
+        common_pb2.KvGroupEvent.REMOVE,
+    ]
+    assert all(list(event.block_hashes) == [key] for event in batch.group_events)
+    assert list(batch.group_events[-1].cache_copy_counts) == [1]
+    assert all(event.ancestry_provided for event in batch.group_events[:3])
+    assert all(event.tokens_matchable for event in batch.group_events[:3])
+    assert len(batch.events) == 1, "legacy still filters SWA/Mamba"
+    block = batch.events[0].stored.blocks[0]
+    assert block.block_hash == kv_relay.fold_hash(key)
+    assert block.cache_copy_count == 2
+
+
+def test_full_native_hashes_do_not_alias_on_the_legacy_low_64_bits():
+    keys = [bytes(24) + b"same-key", bytes([255]) * 24 + b"same-key"]
+    batches, counts = _normalize([_batch([_group_store(keys, list(range(8)))])])
+    batch = batches[0]
+    assert list(batch.group_events[0].block_hashes) == keys
+    assert batch.group_events[0].operation == common_pb2.KvGroupEvent.STORE
+    assert not batch.events
+    assert counts.dropped == {"self_referencing_hashes": 1}, "legacy collision rule is preserved"
+
+
+def test_native_integer_keys_keep_their_64_bit_pattern():
+    batches, _ = _normalize([_batch([_group_store([-3], [1, 2, 3, 4])])])
+    assert batches[0].group_events[0].block_hashes[0] == (2**64 - 3).to_bytes(8, "big")
+    assert batches[0].events[0].stored.blocks[0].block_hash == -3
+
+
+def test_sparse_ancestry_is_forwarded_without_claiming_skipped_blocks_resident():
+    parent, key = _digest("unreported-parent"), _digest("sparse-resident")
+    batches, _ = _normalize(
+        [
+            _batch(
+                [
+                    _group_store(
+                        [key],
+                        [9, 10, 11, 12],
+                        parent_block_hash=parent,
+                        group_idx=1,
+                        kv_cache_spec_kind="sliding_window",
+                        kv_cache_spec_sliding_window=8,
+                        skipped_token_ids=list(range(1, 9)),
+                        cache_copy_counts=[1],
+                        token_ids_matchable=True,
+                    )
+                ]
+            )
+        ]
+    )
+    event = batches[0].group_events[0]
+    assert list(event.block_hashes) == [key]
+    assert event.parent_block_hash == parent
+    assert list(event.token_ids) == [9, 10, 11, 12]
+    assert event.ancestry_provided and list(event.skipped_token_ids) == list(range(1, 9))
+    assert event.tokens_matchable
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"lora_name": "adapter"},
+        {"cache_salt": "tenant"},
+        {"extra_keys": [[("mm", 0)]]},
+        {"token_ids": [[1, 2], [2, 3], [3, 4], [4, 5]]},
+        {"token_ids_matchable": False},
+        {"skipped_token_ids": [8, 9]},
+    ],
+)
+def test_non_plain_group_evidence_stays_present_but_cannot_match_tokens(extra):
+    batches, _ = _normalize([_batch([_group_store([1], [1, 2, 3, 4], **extra)])])
+    event = batches[0].group_events[0]
+    assert event.operation == common_pb2.KvGroupEvent.STORE
+    assert event.group_id == 0 and not event.tokens_matchable
+
+
+def test_plain_parent_evidence_is_rank_and_group_local():
+    normalizer = kv_relay.Normalizer()
+    root = _group_store([1], [1, 2, 3, 4])
+    child = _group_store([2], [5, 6, 7, 8], parent_block_hash=1, skipped_token_ids=[1, 2, 3, 4])
+    normalizer.normalize_batch(kv_relay.decode_batch(_batch([root])), 1)
+    known = normalizer.normalize_batch(kv_relay.decode_batch(_batch([child])), 2)
+    other_rank = normalizer.normalize_batch(kv_relay.decode_batch(_batch([child], rank=1)), 3)
+    other_group = normalizer.normalize_batch(
+        kv_relay.decode_batch(_batch([{**child, "group_idx": 1}])), 4
+    )
+    assert known.group_events[0].tokens_matchable
+    assert not other_rank.group_events[0].tokens_matchable
+    assert not other_group.group_events[0].tokens_matchable
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"token_ids": [1]},
+        {"parent_block_hash": "bad"},
+        {"group_idx": -1},
+        {"block_hashes": [b""]},
+        {"block_size": 0},
+        {"cache_copy_counts": []},
+        {"cache_copy_counts": [0]},
+        {"skipped_token_ids": [[1, 2]]},
+        {"token_ids_matchable": "true"},
+        {"extra_keys": []},
+        {"extra_keys": ["bad"]},
+        {"lora_name": 0},
+        {"skipped_token_parent_hash": "bad", "skipped_token_ids": []},
+        {"skipped_token_parent_hash": b""},
+        {"skipped_token_parent_hash": 8},
+        {"skipped_token_parent_hash": 1, "skipped_token_ids": []},
+        {"type": "UnknownGroupOperation"},
+    ],
+)
+def test_malformed_relevant_event_invalidates_group_evidence(extra):
+    event = {**_group_store([1], [1, 2, 3, 4]), **extra}
+    batches, _ = _normalize([_batch([event])])
+    assert batches[0].group_events_enabled
+    assert [event.operation for event in batches[0].group_events] == [
+        common_pb2.KvGroupEvent.INVALID
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra", [{"ownership": "kvcr"}, {"ownership": "unknown-owner"}, {"ownership": 7}]
+)
+def test_foreign_owned_group_events_are_not_worker_residency(extra):
+    batches, _ = _normalize([_batch([_group_store([1], [1, 2, 3, 4], **extra)])])
+    assert not batches[0].group_events_enabled
+    assert not batches[0].group_events
+
+
+def test_foreign_only_group_metadata_does_not_disable_following_legacy_affinity():
+    batches, _ = _normalize(
+        [
+            _batch([_group_store([1], [1, 2, 3, 4], ownership="kvcr")]),
+            _batch([_store([2], [5, 6, 7, 8])]),
+        ]
+    )
+    assert all(not batch.group_events_enabled and not batch.group_events for batch in batches)
+    assert batches[1].events[0].stored.blocks[0].block_hash == 2
+
+
+@pytest.mark.parametrize(
+    "extra", [{"medium": "CPU"}, {"medium": "unknown"}, {"locality": "REMOTE"}]
+)
+def test_non_gpu_group_metadata_is_retained_without_claiming_residency(extra):
+    normalizer = kv_relay.Normalizer()
+    gpu = _group_store([1], [1, 2, 3, 4], cache_copy_counts=[1])
+    elsewhere = _group_store(
+        [1],
+        [1, 2, 3, 4],
+        skipped_token_ids=[8, 9],
+        cache_copy_counts=[7],
+        token_ids_matchable=False,
+        **extra,
+    )
+    first = normalizer.normalize_batch(kv_relay.decode_batch(_batch([gpu, elsewhere])), 1)
+    declaration = first.group_events[1]
+    assert declaration.operation == common_pb2.KvGroupEvent.STORE
+    assert declaration.group_id == 0 and declaration.kind == "full_attention"
+    assert declaration.block_size == 4 and declaration.tokens_matchable
+    assert not declaration.block_hashes and not declaration.token_ids
+    assert not declaration.parent_block_hash and not declaration.cache_copy_counts
+    assert not declaration.ancestry_provided and not declaration.skipped_token_ids
+    child = _group_store([2], [5, 6, 7, 8], parent_block_hash=1, skipped_token_ids=[1, 2, 3, 4])
+    after = normalizer.normalize_batch(kv_relay.decode_batch(_batch([child])), 2)
+    assert after.group_events[0].tokens_matchable, (
+        "metadata-only events leave GPU parent evidence intact"
+    )
+
+
+@pytest.mark.parametrize("extra", [{"medium": "CPU"}, {"locality": "REMOTE"}])
+def test_non_gpu_removal_declares_group_without_removing_known_gpu_parent(extra):
+    normalizer = kv_relay.Normalizer()
+    normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch(
+                [
+                    _group_store([1], [1, 2, 3, 4]),
+                ]
+            )
+        ),
+        1,
+    )
+    removed = {
+        "type": "BlockRemoved",
+        "block_hashes": [1],
+        "group_idx": 0,
+        "cache_copy_counts": [0],
+        **extra,
+    }
+    batch = normalizer.normalize_batch(kv_relay.decode_batch(_batch([removed])), 2)
+    declaration = batch.group_events[0]
+    assert declaration.operation == common_pb2.KvGroupEvent.REMOVE
+    assert declaration.group_id == 0 and not declaration.block_hashes
+    assert not declaration.cache_copy_counts and not declaration.ancestry_provided
+    child = _group_store([2], [5, 6, 7, 8], parent_block_hash=1, skipped_token_ids=[1, 2, 3, 4])
+    after = normalizer.normalize_batch(kv_relay.decode_batch(_batch([child])), 3)
+    assert after.group_events[0].tokens_matchable
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"block_size": 0},
+        {"kv_cache_spec_kind": None},
+        {"token_ids": "bad"},
+        {"cache_copy_counts": []},
+        {"locality": 7},
+        {"extra_keys": []},
+    ],
+)
+def test_malformed_non_gpu_required_group_evidence_remains_invalid(extra):
+    batches, _ = _normalize([_batch([_group_store([1], [1, 2, 3, 4], medium="CPU", **extra)])])
+    assert batches[0].group_events_enabled
+    assert batches[0].group_events[0].operation == common_pb2.KvGroupEvent.INVALID
+
+
+@pytest.mark.parametrize("array_like", [False, True], ids=["map", "array"])
+def test_compact_ancestry_keeps_native_parent_separate_from_opaque_anchor(array_like):
+    Batch, Stored, _, _, _ = _vllm_structs(array_like)
+    key, parent, anchor = (_digest(name) for name in ("resident", "immediate-parent", "ancestor"))
+    raw = Stored(
+        [key],
+        parent,
+        [9, 10, 11, 12],
+        4,
+        None,
+        "GPU",
+        None,
+        group_idx=0,
+        kv_cache_spec_kind="full_attention",
+        skipped_token_ids=[5, 6, 7, 8],
+        cache_copy_counts=[1],
+        token_ids_matchable=True,
+        skipped_token_parent_hash=anchor,
+    )
+    batches, _ = _normalize([msgspec.msgpack.encode(Batch(1.5, [raw], 0))])
+    event = batches[0].group_events[0]
+    assert event.parent_block_hash == parent and event.skipped_token_parent_hash == anchor
+    assert event.ancestry_provided and list(event.skipped_token_ids) == [5, 6, 7, 8]
+    assert event.tokens_matchable
+    assert batches[0].events[0].stored.parent_block_hash == kv_relay.fold_hash(parent)
+
+
+@pytest.mark.parametrize("known", ["plain", "namespaced", "unknown"])
+@pytest.mark.parametrize("marker", [None, True, False])
+def test_compact_ancestry_namespace_proof_uses_the_actual_anchor(known, marker):
+    normalizer = kv_relay.Normalizer()
+    if known != "unknown":
+        normalizer.normalize_batch(
+            kv_relay.decode_batch(
+                _batch(
+                    [
+                        _group_store(
+                            [1],
+                            [1, 2, 3, 4],
+                            cache_salt="tenant" if known == "namespaced" else None,
+                        ),
+                    ]
+                )
+            ),
+            1,
+        )
+    child = _group_store(
+        [3],
+        [9, 10, 11, 12],
+        parent_block_hash=2,
+        skipped_token_ids=[5, 6, 7, 8],
+        skipped_token_parent_hash=1,
+        token_ids_matchable=marker,
+    )
+    batch = normalizer.normalize_batch(kv_relay.decode_batch(_batch([child])), 2)
+    assert batch.group_events[0].tokens_matchable is (
+        marker is not False and known != "namespaced" and (known == "plain" or marker is True)
+    )
+
+
+def test_empty_delta_with_unknown_anchor_needs_a_plain_request_marker():
+    batches, _ = _normalize(
+        [
+            _batch(
+                [
+                    _group_store(
+                        [1],
+                        [1, 2, 3, 4],
+                        parent_block_hash=2,
+                        skipped_token_ids=[],
+                        skipped_token_parent_hash=2,
+                    ),
+                ]
+            )
+        ]
+    )
+    assert not batches[0].group_events[0].tokens_matchable
+
+
+def test_an_empty_gpu_group_store_still_declares_a_required_group():
+    batches, _ = _normalize(
+        [_batch([_group_store([], [], group_idx=1, kv_cache_spec_kind="mamba")])]
+    )
+    event = batches[0].group_events[0]
+    assert event.operation == common_pb2.KvGroupEvent.STORE
+    assert event.group_id == 1 and event.kind == "mamba" and event.block_size == 4
+    assert event.tokens_matchable and not event.block_hashes
+    assert not batches[0].events
+
+
+def test_group_mode_survives_clear_and_is_not_inherited_by_another_rank():
+    batches, _ = _normalize(
+        [
+            _batch([_group_store([1], [1, 2, 3, 4])]),
+            _batch([{"type": "AllBlocksCleared"}]),
+            _batch([]),
+            _batch([], rank=1),
+        ]
+    )
+    assert [batch.group_events_enabled for batch in batches] == [True, True, True, False]
+    assert batches[1].group_events[0].operation == common_pb2.KvGroupEvent.CLEAR
+    assert batches[1].events[0].WhichOneof("data") == "cleared"
+
+
+def test_authoritative_copy_counts_do_not_turn_repeated_reports_into_copies():
+    normalizer = kv_relay.Normalizer()
+    root = _group_store([1], [1, 2, 3, 4], cache_salt="tenant", cache_copy_counts=[1])
+    removed = {"type": "BlockRemoved", "block_hashes": [1], "medium": "GPU", "group_idx": 0}
+    first = normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch(
+                [
+                    root,
+                    root,
+                    {**root, "cache_copy_counts": [2]},
+                    {**removed, "cache_copy_counts": [1]},
+                    _group_store([2], [5, 6, 7, 8], parent_block_hash=1),
+                ]
+            )
+        ),
+        1,
+    )
+    assert [event.stored.blocks[0].cache_copy_count for event in first.events[:3]] == [1, 1, 2]
+    assert list(first.events[3].removed.cache_copy_counts) == [1]
+    assert first.events[4].stored.cache_salt == "tenant"
+    assert not first.group_events[4].tokens_matchable, "the known parent remains namespaced"
+    second = normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch(
+                [
+                    {**removed, "cache_copy_counts": [0]},
+                    _group_store([3], [9, 10, 11, 12], parent_block_hash=1),
+                ]
+            )
+        ),
+        2,
+    )
+    assert not second.events[1].stored.HasField("cache_salt")
+    assert list(second.group_events[0].cache_copy_counts) == [0]
+
+
+def test_wire_copy_counts_stay_exact_while_legacy_namespace_memory_keeps_its_cap():
+    normalizer = kv_relay.Normalizer()
+    root = _group_store([1], [1, 2, 3, 4], cache_salt="tenant", cache_copy_counts=[20])
+    batch = normalizer.normalize_batch(kv_relay.decode_batch(_batch([root])), 1)
+    assert batch.events[0].stored.blocks[0].cache_copy_count == 20
+    assert list(batch.group_events[0].cache_copy_counts) == [20]
+    removed = {"type": "BlockRemoved", "block_hashes": [1], "group_idx": 0}
+    # Reports lacking counts retain the legacy cap rather than depending on
+    # how often a newer publisher repeated a snapshot of the same block.
+    normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch(
+                [
+                    {**root, "cache_copy_counts": None},
+                ]
+            )
+        ),
+        2,
+    )
+    normalizer.normalize_batch(
+        kv_relay.decode_batch(_batch([removed for _ in range(kv_relay.COPIES_CAP - 1)])), 3
+    )
+    child = _group_store([2], [5, 6, 7, 8], parent_block_hash=1)
+    before = normalizer.normalize_batch(kv_relay.decode_batch(_batch([child])), 4)
+    assert before.events[0].stored.cache_salt == "tenant"
+    after = normalizer.normalize_batch(
+        kv_relay.decode_batch(
+            _batch(
+                [
+                    removed,
+                    _group_store([3], [9, 10, 11, 12], parent_block_hash=1),
+                ]
+            )
+        ),
+        5,
+    )
+    assert not after.events[1].stored.HasField("cache_salt")
+
+
+# ---------------------------------------------------------------------------
 # Streaming: ranks, cursors, replay
 # ---------------------------------------------------------------------------
 
@@ -965,6 +1413,51 @@ async def test_a_gap_is_filled_from_that_ranks_replay_before_later_batches(bridg
     assert hashes[3] == (0, 1)
     await bridge.publish(1, 4)
     assert (await read(call)).events[0].stored.blocks[0].block_hash == 5
+    call.cancel()
+
+
+@pytest.mark.asyncio
+async def test_group_evidence_and_legacy_events_share_rank_gap_replay(bridge):
+    key = _digest("group-replay")
+    root = _group_store([key], [1, 2, 3, 4], token_ids_matchable=True, cache_copy_counts=[1])
+    swa = {
+        **root,
+        "group_idx": 1,
+        "kv_cache_spec_kind": "sliding_window",
+        "kv_cache_spec_sliding_window": 8,
+        "skipped_token_ids": [],
+        "skipped_token_parent_hash": _digest("replay-anchor"),
+    }
+    removed = {
+        "type": "BlockRemoved",
+        "block_hashes": [key],
+        "medium": "GPU",
+        "group_idx": 1,
+        "cache_copy_counts": [0],
+    }
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(0, 0, _batch([root], rank=99))
+    first = await read(call)
+    assert first.sequence_number == 1 and first.dp_rank == 0
+    assert first.group_events_enabled and len(first.events) == 1
+    await bridge.publish(0, 2, _batch([removed], rank=99))
+    identity, start = await bridge.replay_request(0)
+    assert start == 1
+    await bridge.replay_send(0, identity, 1, _batch([swa], rank=99))
+    await bridge.replay_send(0, identity, 2, _batch([removed], rank=99))
+    await bridge.replay_send(0, identity, -1)
+    replayed = [await read(call) for _ in range(2)]
+    assert [batch.sequence_number for batch in replayed] == [2, 3]
+    assert all(batch.dp_rank == 0 and batch.group_events_enabled for batch in replayed)
+    assert [batch.group_events[0].operation for batch in replayed] == [
+        common_pb2.KvGroupEvent.STORE,
+        common_pb2.KvGroupEvent.REMOVE,
+    ]
+    assert all(batch.group_events[0].block_hashes[0] == key for batch in replayed)
+    assert replayed[0].group_events[0].skipped_token_parent_hash == _digest("replay-anchor")
+    assert replayed[0].group_events[0].ancestry_provided
+    assert all(not batch.events for batch in replayed), "replay keeps legacy non-main filtering"
     call.cancel()
 
 

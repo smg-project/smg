@@ -3,7 +3,13 @@
 //! public API and matching/convergence contract as the flat core;
 //! the differential referee proves equality.
 
+use std::collections::BTreeMap;
+
 use rustc_hash::FxHashMap;
+
+#[path = "context.rs"]
+mod context;
+pub use context::{ContextError, PrefixContext};
 
 use crate::{
     lineage_root, lineage_step, BlockKey, Config, ContentHash, HolderId, Overlap, OverlapScratch,
@@ -31,6 +37,9 @@ struct ChainData {
     /// Child forks: (fork position ON THIS CHAIN, first child
     /// content, child chain), sorted.
     children: Vec<(u32, ContentHash, u32)>,
+    /// Historical endpoints: (lineage, retained by the caller).
+    contexts: BTreeMap<u32, (u64, bool)>,
+    context_pins: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +107,8 @@ pub struct RadixTree {
     /// Distinct covered (position, content, lineage) = chain
     /// positions with a non-empty holder set.
     distinct_entries: u64,
+    retained_contents: usize,
+    retired_contexts: Vec<PrefixContext>,
 }
 
 impl RadixTree {
@@ -113,6 +124,8 @@ impl RadixTree {
             interner: SetInterner::default(),
             holder_blocks_total: 0,
             distinct_entries: 0,
+            retained_contents: 0,
+            retired_contexts: Vec::new(),
         }
     }
 
@@ -244,6 +257,42 @@ impl RadixTree {
         lineage: u64,
         cursor: &mut Option<(u32, u32)>,
     ) -> Result<Placed, StoreError> {
+        let (chain, pos) = self.place_content(content, lineage, cursor);
+
+        // §4 semantics at the resolved position, PER HOLDER (chaos
+        // finding: chain-global key canonicity diverged from the
+        // model — aliasing is a per-holder concept, so the chain
+        // stores no keys at all; per-holder key maps carry them).
+        // Covered ⇒ this holder already holds the exact triple: a
+        // plain duplicate, an alias (their other key), or a refused
+        // move — all observably identical, all non-destructive.
+        if self.chains[chain as usize].covered(pos, holder) {
+            return Ok(Placed::Duplicate);
+        }
+        // Not covered: a move relocates the key first, then join.
+        // Key BEFORE membership: the invariant every key map entry is
+        // covered by a span (audit rule) must hold at every GC point,
+        // and the old key's coverage is what the removal below drops.
+        // The CURSOR chain is pinned against GC for the gap between
+        // this removal and the add just below: an in-batch move can
+        // otherwise free the chain the batch is standing on, and the
+        // next block would write into a freed slot (found by the
+        // chaos fuzz).
+        if let Some(old) = self.state_of(holder).keys.get(&key).copied() {
+            self.state_of_mut(holder).keys.remove(&key);
+            self.remove_membership_pinned(holder, old, Some(chain));
+        }
+        self.add_membership(holder, chain, pos);
+        self.state_of_mut(holder).keys.insert(key, (chain, pos));
+        Ok(Placed::Applied)
+    }
+
+    fn place_content(
+        &mut self,
+        content: ContentHash,
+        lineage: u64,
+        cursor: &mut Option<(u32, u32)>,
+    ) -> (u32, u32) {
         // Resolve the target (chain, pos) for this block canonically.
         let target: (u32, u32) = match *cursor {
             None => {
@@ -266,6 +315,8 @@ impl RadixTree {
                             end_lineage: lineage,
                             spans: Vec::new(),
                             children: Vec::new(),
+                            contexts: BTreeMap::new(),
+                            context_pins: 0,
                         });
                         self.roots.entry(lineage).or_default().push(c);
                         (c, 0)
@@ -313,6 +364,7 @@ impl RadixTree {
                             } else {
                                 let cd = &mut self.chains[chain as usize];
                                 cd.contents.push(content);
+                                self.retained_contents += 1;
                                 cd.end_lineage = lineage;
                                 (chain, pos)
                             }
@@ -321,35 +373,8 @@ impl RadixTree {
                 }
             }
         };
-        let (chain, pos) = target;
-        *cursor = Some((chain, pos + 1));
-
-        // §4 semantics at the resolved position, PER HOLDER (chaos
-        // finding: chain-global key canonicity diverged from the
-        // model — aliasing is a per-holder concept, so the chain
-        // stores no keys at all; per-holder key maps carry them).
-        // Covered ⇒ this holder already holds the exact triple: a
-        // plain duplicate, an alias (their other key), or a refused
-        // move — all observably identical, all non-destructive.
-        if self.chains[chain as usize].covered(pos, holder) {
-            return Ok(Placed::Duplicate);
-        }
-        // Not covered: a move relocates the key first, then join.
-        // Key BEFORE membership: the invariant every key map entry is
-        // covered by a span (audit rule) must hold at every GC point,
-        // and the old key's coverage is what the removal below drops.
-        // The CURSOR chain is pinned against GC for the gap between
-        // this removal and the add just below: an in-batch move can
-        // otherwise free the chain the batch is standing on, and the
-        // next block would write into a freed slot (found by the
-        // chaos fuzz).
-        if let Some(old) = self.state_of(holder).keys.get(&key).copied() {
-            self.state_of_mut(holder).keys.remove(&key);
-            self.remove_membership_pinned(holder, old, Some(chain));
-        }
-        self.add_membership(holder, chain, pos);
-        self.state_of_mut(holder).keys.insert(key, (chain, pos));
-        Ok(Placed::Applied)
+        *cursor = Some((target.0, target.1 + 1));
+        target
     }
 
     /// Read-only no-op predicate: true iff `store(id, parent, blocks)`
@@ -549,13 +574,8 @@ impl RadixTree {
 
     // ---- reads ----
 
-    pub fn overlap(
-        &self,
-        chain_query: &[ContentHash],
-        scratch: &mut OverlapScratch,
-        out: &mut Vec<Overlap>,
-    ) {
-        out.clear();
+    fn match_path(&self, chain_query: &[ContentHash], segments: &mut Vec<(u32, u32, u32)>) {
+        segments.clear();
         if chain_query.is_empty() {
             return;
         }
@@ -570,8 +590,6 @@ impl RadixTree {
         // Walk the trie along the query, collecting the matched path
         // as (chain, from, to) segments into the caller-owned scratch
         // (no per-query heap once warm — the alloc gate holds this).
-        let segments = &mut scratch.segments;
-        segments.clear();
         let mut chain = root;
         let mut pos = 0u32;
         let limit = chain_query.len().min(u32::MAX as usize) as u32;
@@ -615,6 +633,17 @@ impl RadixTree {
                 None => break,
             }
         }
+    }
+
+    pub fn overlap(
+        &self,
+        chain_query: &[ContentHash],
+        scratch: &mut OverlapScratch,
+        out: &mut Vec<Overlap>,
+    ) {
+        out.clear();
+        self.match_path(chain_query, &mut scratch.segments);
+        let segments = &scratch.segments;
         if segments.is_empty() {
             return;
         }
@@ -729,6 +758,7 @@ impl RadixTree {
                 16 * c.contents.len() as u64
                     + 24 * c.spans.len() as u64
                     + 16 * c.children.len() as u64
+                    + 32 * c.contexts.len() as u64
             })
             .sum();
         // Interned holder sets: the `Arc<[u32]>` data plus per-bucket
@@ -778,6 +808,7 @@ impl RadixTree {
     }
 
     fn alloc_chain(&mut self, data: ChainData) -> u32 {
+        self.retained_contents += data.contents.len();
         if let Some(c) = self.free_chains.pop() {
             self.chains[c as usize] = data;
             c
@@ -796,6 +827,8 @@ impl RadixTree {
             end_lineage: lineage,
             spans: Vec::new(),
             children: Vec::new(),
+            contexts: BTreeMap::new(),
+            context_pins: 0,
         });
         let pd = &mut self.chains[parent as usize];
         let at = pd
@@ -1010,7 +1043,7 @@ impl RadixTree {
             if cd.contents.is_empty() {
                 return;
             }
-            if !cd.spans.is_empty() || !cd.children.is_empty() {
+            if !cd.spans.is_empty() || !cd.children.is_empty() || cd.context_pins > 0 {
                 return;
             }
             // In-contract this chain has no key-map references either:
@@ -1029,6 +1062,17 @@ impl RadixTree {
             let parent = cd.parent;
             let start_lineage = cd.start_lineage;
             let first_content = cd.contents.first().copied();
+            self.retired_contexts
+                .extend(
+                    cd.contexts
+                        .iter()
+                        .map(|(&position, &(lineage, _))| PrefixContext {
+                            chain,
+                            position,
+                            lineage,
+                        }),
+                );
+            self.retained_contents -= cd.contents.len();
             self.chains[chain as usize] = ChainData::default();
             self.free_chains.push(chain);
             match parent {
@@ -1102,6 +1146,9 @@ impl RadixTree {
 
     pub fn audit(&self) -> Result<(), String> {
         use std::collections::HashSet;
+        if self.chains.iter().map(|c| c.contents.len()).sum::<usize>() != self.retained_contents {
+            return Err("retained content count mismatch".into());
+        }
         // Slot/name/free coherence (same rules as the flat core).
         let mut live = 0u64;
         for (idx, slot) in self.slots.iter().enumerate() {
@@ -1145,6 +1192,9 @@ impl RadixTree {
                 return Err(format!("live chain {ci} is empty"));
             }
             live_chains.insert(ci);
+            if cd.context_pins != cd.contexts.values().filter(|(_, pinned)| *pinned).count() {
+                return Err(format!("chain {ci} context pin count mismatch"));
+            }
             let mut prev_end = cd.base_pos;
             let mut prev_set: Option<&SetRef> = None;
             for s in &cd.spans {
@@ -1213,8 +1263,22 @@ impl RadixTree {
             }
             // start/end lineage coherence.
             let mut l = cd.start_lineage;
-            for i in 1..cd.contents.len() {
-                l = lineage_step(l, cd.contents[i]);
+            let mut contexts = cd.contexts.iter().peekable();
+            for (i, &content) in cd.contents.iter().enumerate() {
+                if i > 0 {
+                    l = lineage_step(l, content);
+                }
+                if let Some(&(&position, &(lineage, _))) = contexts.peek() {
+                    if position == cd.base_pos + i as u32 {
+                        if lineage != l {
+                            return Err(format!("chain {ci} context lineage mismatch"));
+                        }
+                        contexts.next();
+                    }
+                }
+            }
+            if contexts.next().is_some() {
+                return Err(format!("chain {ci} context outside contents"));
             }
             if l != cd.end_lineage {
                 return Err(format!("chain {ci} end_lineage stale"));
@@ -1307,7 +1371,7 @@ impl RadixTree {
             }
         }
         // GC coherence: a live chain must be referenced by spans,
-        // children, or at least one key map (otherwise the GC missed
+        // children, registered contexts, or a key map (otherwise the GC missed
         // it — the leak class the churn gate caught).
         let mut key_ref_chains: HashSet<u32> = HashSet::new();
         for slot in &self.slots {
@@ -1319,7 +1383,11 @@ impl RadixTree {
         }
         for &ci in &live_chains {
             let cd = &self.chains[ci as usize];
-            if cd.spans.is_empty() && cd.children.is_empty() && !key_ref_chains.contains(&ci) {
+            if cd.spans.is_empty()
+                && cd.children.is_empty()
+                && cd.context_pins == 0
+                && !key_ref_chains.contains(&ci)
+            {
                 return Err(format!("live chain {ci} is orphaned (GC leak)"));
             }
         }

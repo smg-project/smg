@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 use super::{
     admission::{BatchOutcome, WorkerStreamState},
     apply::{WorkerIndexCounters, WorkerIndexState},
+    groups::GroupViewHandle,
     KvBlockSize, KvEventMonitor,
 };
 use crate::{
@@ -131,6 +132,13 @@ impl KvEventMonitor {
             let Some(kv_cache_event::Data::Stored(stored)) = &event.data else {
                 continue;
             };
+            if stored
+                .kv_cache_spec_kind
+                .as_deref()
+                .is_some_and(|kind| !super::apply::MAIN_ATTENTION_KINDS.contains(&kind))
+            {
+                continue;
+            }
             let Some(block) = stored.blocks.first() else {
                 continue;
             };
@@ -211,6 +219,10 @@ impl KvEventMonitor {
     /// Owns the worker's index state and takes its blocks out of the index on
     /// exit. Exits when `shutdown_rx` fires or the backend returns
     /// `Unimplemented`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one worker subscription owns its index, group view, load sink and shutdown lifetimes"
+    )]
     pub(super) async fn subscription_loop(
         worker: Arc<dyn Worker>,
         worker_url: String,
@@ -219,6 +231,7 @@ impl KvEventMonitor {
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
         load_sink: Option<Weak<WorkerMonitor>>,
+        group_view: GroupViewHandle,
     ) {
         let worker_id = match indexer.intern_worker(&worker_url) {
             Ok(id) => id,
@@ -233,7 +246,10 @@ impl KvEventMonitor {
                 return;
             }
         };
-        let mut state = WorkerStreamState::default();
+        let mut state = WorkerStreamState {
+            groups: group_view,
+            ..Default::default()
+        };
         // A contact with the worker (a poll answered, a probe passed) ends the
         // reconnect backoff early: a worker that is back gets its stream back
         // at once instead of after the remaining delay.
@@ -463,6 +479,7 @@ impl KvEventMonitor {
                 reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
             }
             if state.abandon_snapshot() {
+                state.groups.write().clear_evidence();
                 warn!(
                     worker_url = %worker_url,
                     "KV event stream ended during a relay snapshot; the next subscription \

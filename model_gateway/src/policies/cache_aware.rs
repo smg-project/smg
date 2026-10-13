@@ -81,8 +81,8 @@ use std::{
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use kv_index::{
-    compute_request_content_hashes, request_prefix_hashes, salt::request_content_hashes_with_seed,
-    ContentHash, OverlapScores, TenantId, TokenTree, Tree,
+    compute_request_content_hashes, group_cache::GroupRequest, request_prefix_hashes,
+    salt::request_content_hashes_with_seed, ContentHash, OverlapScores, TenantId, TokenTree, Tree,
 };
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
@@ -105,7 +105,7 @@ use crate::{
     config::CacheIndexKind,
     mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
     observability::{cache_trace, metrics::Metrics},
-    worker::{liveness, KvEventMonitor, KvIndex, Worker},
+    worker::{kv_event_monitor::ModelGroups, liveness, KvEventMonitor, KvIndex, Worker},
 };
 
 /// An overlap of at most this many blocks counts as a miss for the warm-up
@@ -1467,6 +1467,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 /// The event-driven index resolved once per request for the selection.
 struct EventIndex<'a> {
     indexer: Arc<KvIndex>,
+    groups: Option<Arc<ModelGroups>>,
     block_size: usize,
     model_id: &'a str,
 }
@@ -1721,7 +1722,8 @@ impl CacheAwarePolicy {
         let guard = self.kv_monitor.read();
         let monitor = guard.as_ref()?;
         let indexer = monitor.get_indexer(model_id)?;
-        if indexer.is_empty() {
+        let groups = monitor.group_views(model_id);
+        if indexer.is_empty() && !groups.as_ref().is_some_and(|groups| groups.enabled()) {
             return None;
         }
         // Per-model block_size: learned from events > config default
@@ -1730,6 +1732,7 @@ impl CacheAwarePolicy {
             .unwrap_or(self.config.block_size);
         Some(EventIndex {
             indexer,
+            groups,
             block_size,
             model_id,
         })
@@ -2359,6 +2362,7 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         let EventIndex {
             indexer,
+            groups,
             block_size,
             model_id,
         } = index;
@@ -2395,15 +2399,35 @@ impl CacheAwarePolicy {
                 cap: cap.filter(|_| wants_all),
             }
         };
-        let candidates = Self::overlap_candidates_for_hashes(
-            workers,
-            &content_hashes,
-            &table,
-            indexer,
-            block_size,
-            &tuning,
-            gather,
-        );
+        let enabled_groups = groups.as_deref().filter(|groups| groups.enabled());
+        let group_mode = enabled_groups.is_some();
+        let (candidates, group_evidence) = if let Some(groups) = enabled_groups {
+            Self::group_overlap_candidates(
+                workers,
+                tokens,
+                &content_hashes,
+                &table,
+                indexer,
+                groups,
+                block_size,
+                &tuning,
+                gather,
+                info.cache_namespace.is_some(),
+            )
+        } else {
+            (
+                Self::overlap_candidates_for_hashes(
+                    workers,
+                    &content_hashes,
+                    &table,
+                    indexer,
+                    block_size,
+                    &tuning,
+                    gather,
+                ),
+                Vec::new(),
+            )
+        };
         // Chain hashes are computed only for policies (or accounting) keyed
         // on prefixes; the default decision never pays for them.
         let prefix_hashes: Vec<u64> =
@@ -2437,6 +2461,13 @@ impl CacheAwarePolicy {
             || (best_overlap <= WARMUP_MISS_BLOCKS && best_overlap * 2.0 < request_blocks);
         if thin_overlap {
             if let Some(idx) = self.warmup_slice(workers, &table, indexer, info, avg_load) {
+                Self::trace_group_prediction(
+                    workers[idx].url(),
+                    &group_evidence,
+                    "warmup_slice",
+                    block_size,
+                    tokens.len(),
+                );
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
                 debug!(
                     worker = workers[idx].url(),
@@ -2454,6 +2485,13 @@ impl CacheAwarePolicy {
             &candidates,
             best_overlap / request_blocks,
         ) {
+            Self::trace_group_prediction(
+                workers[idx].url(),
+                &group_evidence,
+                "warmup_divert",
+                block_size,
+                tokens.len(),
+            );
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
             debug!(
                 worker = workers[idx].url(),
@@ -2476,13 +2514,14 @@ impl CacheAwarePolicy {
         // `overlap_blocks` is the chosen worker's undecayed overlap, so a
         // per-decision join against the engine's `cached_tokens` compares
         // blocks and not only the branch.
-        let overlap_blocks = candidates
+        let raw_overlap = candidates
             .iter()
             .find(|candidate| candidate.idx == idx)
-            .map_or(0, |candidate| candidate.raw_score as u64);
+            .map_or(0.0, |candidate| candidate.raw_score);
+        let overlap_blocks = raw_overlap as u64;
         let branch = if !had_overlap {
             "event_miss"
-        } else if overlap_blocks > 0 {
+        } else if raw_overlap > 0.0 {
             "event_hit"
         } else {
             "event_spill"
@@ -2498,12 +2537,147 @@ impl CacheAwarePolicy {
             "Event-driven routing"
         );
         if cache_trace::enabled() {
-            cache_trace::prediction(serde_json::json!({
-                "source": "event_index_overlap", "branch": branch,
-                "overlap_blocks": overlap_blocks, "request_blocks": content_hashes.len(), "block_size": block_size,
-            }));
+            if group_mode {
+                Self::trace_group_prediction(
+                    workers[idx].url(),
+                    &group_evidence,
+                    branch,
+                    block_size,
+                    tokens.len(),
+                );
+            } else {
+                cache_trace::prediction(serde_json::json!({
+                    "source": "event_index_overlap", "branch": branch,
+                    "overlap_blocks": overlap_blocks, "request_blocks": content_hashes.len(), "block_size": block_size,
+                }));
+            }
         }
         Some(idx)
+    }
+
+    // Read each group's joint position before discarding shallow FA holders.
+    // A worker with unknown group evidence receives no cache-affinity credit.
+    #[expect(clippy::too_many_arguments, reason = "shared event routing inputs")]
+    fn group_overlap_candidates(
+        workers: &[Arc<dyn Worker>],
+        tokens: &[u32],
+        content_hashes: &[ContentHash],
+        table: &PoolTable,
+        indexer: &KvIndex,
+        groups: &ModelGroups,
+        block_size: usize,
+        tuning: &OverlapTuning<'_>,
+        gather: Gather,
+        namespaced: bool,
+    ) -> (Vec<OverlapCandidate>, Vec<serde_json::Value>) {
+        let request = GroupRequest::new(tokens);
+        let mut legacy_scores: Option<HashMap<usize, f64>> = None;
+        let mut candidates = Vec::new();
+        let mut evidence = Vec::new();
+        for (idx, worker) in workers.iter().enumerate() {
+            if !worker.routing_state().eligible() {
+                continue;
+            }
+            let joint = groups.reusable_tokens(worker.url(), &request);
+            let (raw, source, status, reusable_tokens) = match joint {
+                Some(Some(reusable)) if !namespaced => (
+                    reusable as f64 / block_size as f64,
+                    "group_common_resume",
+                    "known",
+                    Some(reusable),
+                ),
+                Some(_) => (
+                    0.0,
+                    "group_common_resume",
+                    if namespaced {
+                        "unsupported_namespace"
+                    } else {
+                        "unknown"
+                    },
+                    None,
+                ),
+                None => {
+                    let scores = legacy_scores.get_or_insert_with(|| {
+                        let overlap = indexer.find_matches(content_hashes, false);
+                        overlap
+                            .scores
+                            .iter()
+                            .filter_map(|(&id, &score)| {
+                                table
+                                    .position(id, workers)
+                                    .map(|idx| (idx, f64::from(score)))
+                            })
+                            .collect()
+                    });
+                    let raw = scores.get(&idx).copied().unwrap_or(0.0);
+                    (raw, "event_index_overlap", "legacy", None)
+                }
+            };
+            if cache_trace::enabled() && evidence.len() < 2 * FLEET_SAMPLE {
+                evidence.push(serde_json::json!({
+                    "worker": worker.url(), "source": source, "status": status,
+                    "reusable_tokens": reusable_tokens, "overlap_blocks": raw,
+                }));
+            }
+            if raw > 0.0 {
+                candidates.push(OverlapCandidate {
+                    idx,
+                    raw_score: raw,
+                    effective_score: raw,
+                });
+            }
+        }
+        match gather {
+            Gather::TopGroup { cap } => {
+                let best = candidates
+                    .iter()
+                    .map(|candidate| candidate.raw_score)
+                    .fold(0.0_f64, f64::max);
+                candidates.retain(|candidate| candidate.raw_score == best);
+                Self::draw(&mut candidates, cap);
+            }
+            Gather::All { cap: Some(cap) } if candidates.len() > cap => {
+                candidates
+                    .select_nth_unstable_by(cap - 1, |a, b| b.raw_score.total_cmp(&a.raw_score));
+                candidates.truncate(cap);
+            }
+            Gather::All { .. } => {}
+        }
+        candidates.sort_unstable_by_key(|candidate| candidate.idx);
+        if !candidates.is_empty() {
+            Self::apply_overlap_decay(
+                workers,
+                &mut candidates,
+                content_hashes.len().max(1),
+                block_size,
+                tuning,
+            );
+        }
+        (candidates, evidence)
+    }
+
+    fn trace_group_prediction(
+        url: &str,
+        evidence: &[serde_json::Value],
+        branch: &str,
+        block_size: usize,
+        request_tokens: usize,
+    ) {
+        if !cache_trace::enabled() || evidence.is_empty() {
+            return;
+        }
+        let selected = evidence
+            .iter()
+            .find(|entry| entry["worker"].as_str() == Some(url));
+        cache_trace::prediction(serde_json::json!({
+            "source": selected.map(|entry| &entry["source"]), "status": selected.map(|entry| &entry["status"]),
+            "branch": branch, "common_reusable_tokens": selected.and_then(|entry| entry["reusable_tokens"].as_u64()),
+            "overlap_blocks": selected.map(|entry| &entry["overlap_blocks"]),
+            "block_size": block_size, "request_tokens": request_tokens,
+            "group_evidence": evidence,
+            "group_evidence_at_capacity": evidence.len() == 2 * FLEET_SAMPLE,
+            "selected_evidence_captured": selected.is_some(),
+        }));
     }
 
     /// Build positive-overlap candidates for event-driven routing.
@@ -5274,6 +5448,138 @@ mod tests {
     }
 
     // -- overlap affinity-group unit tests --
+
+    #[test]
+    fn group_scores_precede_full_attention_top_group_and_preserve_namespace_fallback() {
+        use smg_grpc_client::common_proto::{
+            kv_group_event::Operation, KvEventBatch, KvGroupEvent,
+        };
+
+        use crate::worker::kv_index_backend::KvIndexKind;
+
+        for kind in [KvIndexKind::Positional, KvIndexKind::Chain] {
+            let workers: Vec<Arc<dyn Worker>> = ["http://w1:8000", "http://w2:8000"]
+                .iter()
+                .map(|url| {
+                    Arc::new(
+                        BasicWorkerBuilder::new(*url)
+                            .worker_type(WorkerType::Regular)
+                            .health_config(no_health_check())
+                            .build(),
+                    ) as Arc<dyn Worker>
+                })
+                .collect();
+            let indexer = Arc::new(KvIndex::new(kind, 4));
+            let monitor = KvEventMonitor::new(None);
+            monitor.set_index("m", Arc::clone(&indexer));
+            for (idx, depth) in [8_usize, 6].into_iter().enumerate() {
+                let id = indexer.intern_worker(workers[idx].url()).unwrap();
+                let blocks: Vec<_> = (1..=depth)
+                    .map(|i| StoredBlock {
+                        seq_hash: SequenceHash(i as u64),
+                        content_hash: compute_content_hash(&[i as u32]),
+                    })
+                    .collect();
+                indexer
+                    .apply_stored(id, &blocks, None, &mut WorkerBlocks::default())
+                    .unwrap();
+                let native_keys: Vec<_> = (1..=depth)
+                    .map(|i| (i as u64).to_be_bytes().to_vec())
+                    .collect();
+                monitor.set_group_events(
+                    "m",
+                    workers[idx].url(),
+                    &KvEventBatch {
+                        group_events_enabled: true,
+                        group_events: vec![
+                            KvGroupEvent {
+                                operation: Operation::Store as i32,
+                                group_id: 0,
+                                kind: "full_attention".into(),
+                                block_hashes: native_keys.clone(),
+                                token_ids: (1..=depth as u32).collect(),
+                                block_size: 1,
+                                tokens_matchable: true,
+                                cache_copy_counts: vec![1; depth],
+                                ..Default::default()
+                            },
+                            KvGroupEvent {
+                                operation: Operation::Store as i32,
+                                group_id: 7,
+                                kind: "mamba".into(),
+                                block_hashes: if idx == 0 {
+                                    vec![]
+                                } else {
+                                    vec![native_keys.last().unwrap().clone()]
+                                },
+                                token_ids: if idx == 0 {
+                                    vec![]
+                                } else {
+                                    (1..=depth as u32).collect()
+                                },
+                                block_size: depth as u32,
+                                tokens_matchable: true,
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                );
+            }
+            let tokens: Vec<_> = (1..=9).collect();
+            let hashes = compute_request_content_hashes(&tokens, 1);
+            let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
+            let legacy = CacheAwarePolicy::overlap_candidates_for_hashes(
+                &workers,
+                &hashes,
+                &table,
+                &indexer,
+                1,
+                &default_tuning(),
+                Gather::TopGroup { cap: None },
+            );
+            assert_eq!(
+                legacy
+                    .iter()
+                    .map(|candidate| candidate.idx)
+                    .collect::<Vec<_>>(),
+                vec![0]
+            );
+            let groups = monitor.group_views("m").unwrap();
+            let (joint, _) = CacheAwarePolicy::group_overlap_candidates(
+                &workers,
+                &tokens,
+                &hashes,
+                &table,
+                &indexer,
+                &groups,
+                1,
+                &default_tuning(),
+                Gather::TopGroup { cap: None },
+                false,
+            );
+            assert_eq!(
+                joint
+                    .iter()
+                    .map(|candidate| (candidate.idx, candidate.raw_score))
+                    .collect::<Vec<_>>(),
+                vec![(1, 6.0)]
+            );
+            let (namespaced, _) = CacheAwarePolicy::group_overlap_candidates(
+                &workers,
+                &tokens,
+                &hashes,
+                &table,
+                &indexer,
+                &groups,
+                1,
+                &default_tuning(),
+                Gather::TopGroup { cap: None },
+                true,
+            );
+            assert!(namespaced.is_empty());
+        }
+    }
 
     #[test]
     fn test_overlap_affinity_group_selects_best_match() {

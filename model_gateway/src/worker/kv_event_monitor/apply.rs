@@ -20,8 +20,19 @@ use crate::worker::kv_index_backend::{KvIndex, WorkerBlocks};
 
 impl KvEventMonitor {
     /// Apply a single KV cache event to the indexer.
+    #[cfg(test)]
     pub(crate) fn apply_event(
         event: &KvCacheEvent,
+        worker_id: u32,
+        indexer: &KvIndex,
+        worker_blocks: &mut WorkerIndexState,
+    ) {
+        Self::apply_rank_event(event, 0, worker_id, indexer, worker_blocks);
+    }
+
+    pub(super) fn apply_rank_event(
+        event: &KvCacheEvent,
+        rank: i32,
         worker_id: u32,
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
@@ -32,10 +43,10 @@ impl KvEventMonitor {
 
         match data {
             kv_cache_event::Data::Stored(stored) => {
-                Self::apply_stored(stored, worker_id, indexer, worker_blocks);
+                Self::apply_rank_stored(stored, rank, worker_id, indexer, worker_blocks);
             }
             kv_cache_event::Data::Removed(removed) => {
-                Self::apply_removed(removed, worker_id, indexer, worker_blocks);
+                Self::apply_rank_removed(removed, rank, worker_id, indexer, worker_blocks);
             }
             kv_cache_event::Data::Cleared(cleared) => {
                 if worker_blocks.admits(None, None, None, cleared.ownership.as_deref()) {
@@ -52,8 +63,19 @@ impl KvEventMonitor {
     /// counted and skipped. Content hashes are computed under the event's
     /// LoRA name and cache salt, so a salted block matches only a request
     /// hashed under the same namespace.
+    #[cfg(test)]
     fn apply_stored(
         stored: &KvBlocksStored,
+        worker_id: u32,
+        indexer: &KvIndex,
+        worker_blocks: &mut WorkerIndexState,
+    ) {
+        Self::apply_rank_stored(stored, 0, worker_id, indexer, worker_blocks);
+    }
+
+    fn apply_rank_stored(
+        stored: &KvBlocksStored,
+        rank: i32,
         worker_id: u32,
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
@@ -78,7 +100,12 @@ impl KvEventMonitor {
             .iter()
             .map(|block| convert_kv_block(block, seed))
             .collect();
-        worker_blocks.note_stored(&blocks, tier);
+        for (block, proto) in blocks.iter().zip(&stored.blocks) {
+            if proto.cache_copy_count.is_none() {
+                worker_blocks.note_stored(std::slice::from_ref(block), tier);
+            }
+            worker_blocks.note_rank_store(block.seq_hash, rank, tier, proto.cache_copy_count);
+        }
 
         let parent_seq_hash = stored.parent_block_hash.map(SequenceHash::from);
 
@@ -110,8 +137,19 @@ impl KvEventMonitor {
     ///
     /// A removal names one tier; a block leaves the index only when no
     /// indexed copy remains on another tier.
+    #[cfg(test)]
     fn apply_removed(
         removed: &KvBlocksRemoved,
+        worker_id: u32,
+        indexer: &KvIndex,
+        worker_blocks: &mut WorkerIndexState,
+    ) {
+        Self::apply_rank_removed(removed, 0, worker_id, indexer, worker_blocks);
+    }
+
+    fn apply_rank_removed(
+        removed: &KvBlocksRemoved,
+        rank: i32,
         worker_id: u32,
         indexer: &KvIndex,
         worker_blocks: &mut WorkerIndexState,
@@ -129,15 +167,18 @@ impl KvEventMonitor {
             return;
         };
 
-        let hashes = removed.block_hashes.iter().map(|&h| SequenceHash::from(h));
-        let seq_hashes: Vec<SequenceHash> =
-            if tier == IndexedTier::Device && worker_blocks.copies.is_empty() {
-                hashes.collect()
-            } else {
-                hashes
-                    .filter(|&seq_hash| worker_blocks.release(seq_hash, tier))
-                    .collect()
-            };
+        let authoritative = removed.cache_copy_counts.len() == removed.block_hashes.len();
+        let seq_hashes: Vec<SequenceHash> = removed
+            .block_hashes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &hash)| {
+                let hash = SequenceHash::from(hash);
+                let remaining = authoritative.then(|| removed.cache_copy_counts[i]);
+                let remove = worker_blocks.note_rank_remove(hash, rank, tier, remaining);
+                remove.then_some(hash)
+            })
+            .collect();
 
         indexer.apply_removed(worker_id, &seq_hashes, &mut worker_blocks.blocks);
     }
@@ -150,6 +191,7 @@ impl KvEventMonitor {
     ) {
         indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
         worker_blocks.copies.clear();
+        worker_blocks.rank_copies.clear();
     }
 }
 
@@ -165,7 +207,7 @@ pub(super) fn convert_kv_block(block: &KvBlock, seed: u64) -> StoredBlock {
 /// The residency tiers the index tracks: the device, and the host cache the
 /// engine restores from without recompute. Disk and external copies are not
 /// indexed; a hit there costs an engine-side fetch the router cannot price.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum IndexedTier {
     Device,
     Host,
@@ -193,7 +235,8 @@ fn indexed_tier(tier: Option<i32>, cache_level: Option<i32>) -> Option<IndexedTi
 
 /// Cache-group kinds whose blocks hold the main attention KV, the ones
 /// prefix matching is about. Sliding-window and Mamba groups are skipped.
-const MAIN_ATTENTION_KINDS: [&str; 3] = ["full_attention", "mla_attention", "sink_full_attention"];
+pub(super) const MAIN_ATTENTION_KINDS: [&str; 3] =
+    ["full_attention", "mla_attention", "sink_full_attention"];
 
 /// The most physical copies of one block counted per tier. vLLM's opt-in
 /// `kv_cache_report_mode: full` re-announces whole hit chains without
@@ -272,19 +315,105 @@ impl Copies {
 /// Counting is sparse. A block gets an entry in `copies` only on a host
 /// store or on a second store of an indexed hash; an indexed block without
 /// an entry is a single device copy. A worker that never duplicates and
-/// never offloads pays one lookup per stored block and no memory.
+/// never offloads keeps the aggregate count implicit. Rank-local counts are
+/// retained separately so authoritative updates cannot erase another rank.
 #[derive(Default)]
 pub(crate) struct WorkerIndexState {
     /// The indexer's caller-owned reverse map for this worker.
     pub(crate) blocks: WorkerBlocks,
     /// Copies per tier of blocks with a host copy or more than one copy.
     copies: HashMap<SequenceHash, Copies>,
+    // Authoritative publisher counts are rank-local; the legacy index pools
+    // all ranks, so a count from one rank cannot overwrite another's copies.
+    rank_copies: HashMap<(SequenceHash, IndexedTier), HashMap<i32, u32>>,
     /// Cache groups whose kind is not main attention.
     non_main_groups: Vec<u32>,
     pub(crate) counters: WorkerIndexCounters,
 }
 
 impl WorkerIndexState {
+    fn set_rank_count(
+        &mut self,
+        hash: SequenceHash,
+        rank: i32,
+        tier: IndexedTier,
+        count: u32,
+    ) -> bool {
+        let ranks = self.rank_copies.entry((hash, tier)).or_default();
+        if count == 0 {
+            ranks.remove(&rank);
+        } else {
+            ranks.insert(rank, count);
+        }
+        let total = ranks
+            .values()
+            .fold(0_u32, |total, count| total.saturating_add(*count));
+        if ranks.is_empty() {
+            self.rank_copies.remove(&(hash, tier));
+        }
+        let entry = self
+            .copies
+            .entry(hash)
+            .or_insert(Copies { device: 0, host: 0 });
+        *entry.on(tier) = total.min(u32::from(COPIES_CAP)) as u8;
+        if entry.none() {
+            self.copies.remove(&hash);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn note_rank_store(
+        &mut self,
+        hash: SequenceHash,
+        rank: i32,
+        tier: IndexedTier,
+        count: Option<u32>,
+    ) {
+        if let Some(count) = count {
+            self.set_rank_count(hash, rank, tier, count);
+        } else {
+            let count = self
+                .rank_copies
+                .entry((hash, tier))
+                .or_default()
+                .entry(rank)
+                .or_default();
+            *count = count.saturating_add(1).min(u32::from(COPIES_CAP));
+        }
+    }
+
+    fn note_rank_remove(
+        &mut self,
+        hash: SequenceHash,
+        rank: i32,
+        tier: IndexedTier,
+        count: Option<u32>,
+    ) -> bool {
+        if let Some(count) = count {
+            self.set_rank_count(hash, rank, tier, count)
+        } else {
+            if let Some(ranks) = self.rank_copies.get_mut(&(hash, tier)) {
+                if let Some(count) = ranks.get_mut(&rank) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        ranks.remove(&rank);
+                    }
+                }
+                if ranks.is_empty() {
+                    self.rank_copies.remove(&(hash, tier));
+                }
+            }
+            let remove = self.release(hash, tier);
+            if remove {
+                self.rank_copies.remove(&(hash, IndexedTier::Device));
+                self.rank_copies.remove(&(hash, IndexedTier::Host));
+            }
+            remove
+        }
+    }
+
     /// Whether an event with these attributes belongs in the index. A store
     /// names its group's kind; later events for that group may omit it, so
     /// non-main groups are remembered.
@@ -721,6 +850,74 @@ mod tests {
             block_hashes: vec![hash],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn authoritative_copy_reports_are_idempotent_and_pool_ranks() {
+        use crate::worker::kv_index_backend::KvIndexKind;
+
+        for kind in [KvIndexKind::Positional, KvIndexKind::Chain] {
+            let indexer = KvIndex::new(kind, 64);
+            let worker = indexer.intern_worker("http://copies:8000").unwrap();
+            let mut state = WorkerIndexState::default();
+            let mut stored = stored_event(1, &TOKENS);
+            stored.blocks[0].cache_copy_count = Some(2);
+            for _ in 0..20 {
+                KvEventMonitor::apply_rank_stored(&stored, 0, worker, &indexer, &mut state);
+            }
+            stored.blocks[0].cache_copy_count = Some(1);
+            KvEventMonitor::apply_rank_stored(&stored, 1, worker, &indexer, &mut state);
+            let mut removed = removed_event(1);
+            removed.cache_copy_counts = vec![1];
+            KvEventMonitor::apply_rank_removed(&removed, 0, worker, &indexer, &mut state);
+            assert_eq!(
+                indexer.worker_block_count(worker),
+                1,
+                "{kind:?}: another copy"
+            );
+            removed.cache_copy_counts = vec![0];
+            KvEventMonitor::apply_rank_removed(&removed, 0, worker, &indexer, &mut state);
+            assert_eq!(
+                indexer.worker_block_count(worker),
+                1,
+                "{kind:?}: another rank"
+            );
+            KvEventMonitor::apply_rank_removed(&removed, 1, worker, &indexer, &mut state);
+            assert_eq!(indexer.worker_block_count(worker), 0, "{kind:?}: last copy");
+            assert!(state.copies.is_empty());
+            assert!(state.rank_copies.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_full_reports_release_the_bounded_rank_registry() {
+        let indexer = KvIndex::positional(64);
+        let worker = indexer.intern_worker("http://legacy:8000").unwrap();
+        let mut state = WorkerIndexState::default();
+        for _ in 0..20 {
+            KvEventMonitor::apply_stored(&stored_event(1, &TOKENS), worker, &indexer, &mut state);
+        }
+        let hash = SequenceHash::from(1i64);
+        assert_eq!(
+            state.rank_copies[&(hash, IndexedTier::Device)][&0],
+            u32::from(COPIES_CAP)
+        );
+        for _ in 0..COPIES_CAP {
+            KvEventMonitor::apply_removed(&removed_event(1), worker, &indexer, &mut state);
+        }
+        assert_eq!(indexer.worker_block_count(worker), 0);
+        assert!(state.rank_copies.is_empty());
+        let mut authoritative = stored_event(1, &TOKENS);
+        authoritative.blocks[0].cache_copy_count = Some(1);
+        KvEventMonitor::apply_stored(&authoritative, worker, &indexer, &mut state);
+        let mut last = removed_event(1);
+        last.cache_copy_counts = vec![0];
+        KvEventMonitor::apply_removed(&last, worker, &indexer, &mut state);
+        assert_eq!(
+            indexer.worker_block_count(worker),
+            0,
+            "no stale full-report copies"
+        );
     }
 
     fn routable(indexer: &KvIndex, worker: u32, hashes: &[ContentHash]) -> bool {

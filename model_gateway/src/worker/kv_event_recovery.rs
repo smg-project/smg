@@ -334,6 +334,7 @@ mod tests {
             dp_rank: None,
             snapshot: None,
             load: None,
+            ..Default::default()
         }
     }
 

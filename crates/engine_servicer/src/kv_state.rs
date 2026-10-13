@@ -10,11 +10,14 @@
 //! `AllBlocksCleared` empties the rank. Copies are capped per block the way
 //! the gateway caps them ([`COPIES_CAP`]), so a snapshot rebuilds the copy
 //! counts the gateway would hold after the same stream. Memory is one entry
-//! per live `(rank, tier, hash)`, about 230 bytes at block size 16; nothing
-//! is kept per relayed batch.
+//! per live `(rank, tier, hash)`, about 230 bytes at block size 16. Optional
+//! authoritative counts set the current copies rather than adding a report.
+//! The native group companion keeps required group metadata and the token
+//! ancestry of live descendants, separately from legacy physical-copy state.
 //!
-//! A snapshot ([`LiveState::snapshot`]) is one pass over the entries that
-//! clones the per-block `Arc`s. The relay takes it under its lock together
+//! A snapshot ([`LiveState::snapshot`]) shares legacy entries through `Arc`s
+//! and copies bounded parent-linked native group descriptions. The relay
+//! takes it under its lock together
 //! with the sequence the state is current through, so the cut is atomic:
 //! every batch up to that sequence is in it and every later one reaches the
 //! subscriber through the live channel afterwards. Everything else, the
@@ -46,6 +49,7 @@ use std::{
     sync::Arc,
 };
 
+use kv_index::group_cache::{GroupCache, GroupEvent};
 use prost::Message;
 use smg_grpc_client::common_proto::{self as common, kv_cache_event, KvCacheTier};
 
@@ -234,6 +238,7 @@ pub(crate) struct StateCounts {
 #[derive(Default)]
 pub struct LiveState {
     ranks: BTreeMap<Option<i32>, RankBlocks>,
+    groups: BTreeMap<Option<i32>, GroupCache>,
     /// The last store's tail, shared with the next store that repeats it.
     last_tail: Option<Arc<StoredTail>>,
     order: u64,
@@ -263,6 +268,33 @@ impl LiveState {
 
     /// Fold one normalized batch into the state.
     pub fn apply(&mut self, batch: &common::KvEventBatch) {
+        if batch
+            .snapshot
+            .as_ref()
+            .is_some_and(|chunk| chunk.index == 0)
+        {
+            self.groups.clear();
+        }
+        if batch.group_events_enabled {
+            let groups = self.groups.entry(batch.dp_rank).or_default();
+            if batch.snapshot.is_some() {
+                groups.begin_snapshot();
+            }
+            let events: Vec<_> = batch.group_events.iter().map(group_from_proto).collect();
+            // Invalid evidence withdraws affinity; it cannot create a hit.
+            if let Err(reason) = groups.apply_events(&events) {
+                tracing::debug!(dp_rank = ?batch.dp_rank, reason, "group snapshot affinity withdrawn");
+            }
+        }
+        if batch
+            .snapshot
+            .as_ref()
+            .is_some_and(|chunk| chunk.index.saturating_add(1) == chunk.count)
+        {
+            for groups in self.groups.values_mut() {
+                groups.finish_snapshot();
+            }
+        }
         for event in &batch.events {
             match &event.data {
                 Some(kv_cache_event::Data::Stored(stored)) => self.store(batch.dp_rank, stored),
@@ -299,13 +331,22 @@ impl LiveState {
         let mut parent = stored.parent_block_hash;
         for block in &stored.blocks {
             let key = (tier, block.block_hash);
+            let wanted = block.cache_copy_count.map(|count| count.min(COPIES_CAP));
+            if wanted == Some(0) {
+                if let Some(entry) = blocks.remove(key) {
+                    self.blocks -= u64::from(entry.copies);
+                }
+                parent = Some(block.block_hash);
+                continue;
+            }
             if let Some(entry) = blocks.get_mut(key) {
-                if entry.copies < COPIES_CAP {
-                    entry.copies += 1;
-                    self.blocks += 1;
-                } else {
+                let copies =
+                    wanted.unwrap_or_else(|| entry.copies.saturating_add(1).min(COPIES_CAP));
+                if wanted.is_none() && copies == entry.copies {
                     self.counts.capped += 1;
                 }
+                self.blocks = self.blocks - u64::from(entry.copies) + u64::from(copies);
+                entry.copies = copies;
             } else {
                 self.order += 1;
                 blocks.insert(
@@ -324,10 +365,10 @@ impl LiveState {
                             order: self.order,
                             wire_len: u32::try_from(block.encoded_len()).unwrap_or(u32::MAX),
                         }),
-                        copies: 1,
+                        copies: wanted.unwrap_or(1),
                     },
                 );
-                self.blocks += 1;
+                self.blocks += u64::from(wanted.unwrap_or(1));
             }
             self.counts.stored += 1;
             parent = Some(block.block_hash);
@@ -340,15 +381,25 @@ impl LiveState {
             self.counts.removed_unknown += removed.block_hashes.len() as u64;
             return;
         };
-        for &hash in &removed.block_hashes {
+        if !removed.cache_copy_counts.is_empty()
+            && removed.cache_copy_counts.len() != removed.block_hashes.len()
+        {
+            tracing::warn!(rank = ?rank, "KV removal copy counts do not match hashes");
+            return;
+        }
+        for (index, &hash) in removed.block_hashes.iter().enumerate() {
             let key = (tier, hash);
             let Some(entry) = blocks.get_mut(key) else {
                 self.counts.removed_unknown += 1;
                 continue;
             };
-            entry.copies -= 1;
-            self.blocks -= 1;
-            self.counts.removed += 1;
+            let copies = removed.cache_copy_counts.get(index).map_or_else(
+                || entry.copies.saturating_sub(1),
+                |count| (*count).min(COPIES_CAP),
+            );
+            self.blocks = self.blocks - u64::from(entry.copies) + u64::from(copies);
+            self.counts.removed += u64::from(entry.copies.saturating_sub(copies));
+            entry.copies = copies;
             if entry.copies == 0 {
                 blocks.remove(key);
             }
@@ -366,6 +417,7 @@ impl LiveState {
     /// Forget everything: the publisher started over.
     pub fn clear(&mut self) {
         self.ranks.clear();
+        self.groups.clear();
         self.last_tail = None;
         self.blocks = 0;
     }
@@ -397,8 +449,8 @@ impl LiveState {
             .map_or(0, |entry| entry.copies)
     }
 
-    /// The live set as it stands: the per-block records shared, nothing
-    /// copied. One pass over the entries; the caller orders and encodes it
+    /// The live set as it stands: legacy records shared and native group
+    /// ancestry copied once. The caller orders and encodes it
     /// outside the lock with [`SnapshotChunks::new`].
     pub fn snapshot(&self) -> Snapshot {
         let ranks = self
@@ -414,8 +466,22 @@ impl LiveState {
                 (*rank, entries)
             })
             .collect();
+        let groups = self
+            .groups
+            .iter()
+            .map(|(rank, cache)| {
+                let events = cache
+                    .snapshot_events()
+                    .into_iter()
+                    .map(group_to_proto)
+                    .map(Arc::new)
+                    .collect();
+                (*rank, events)
+            })
+            .collect();
         Snapshot {
             ranks,
+            groups,
             blocks: self.blocks,
         }
     }
@@ -431,6 +497,7 @@ pub(crate) struct SnapshotEntry {
 pub struct Snapshot {
     /// Per rank, in rank order; ranks without blocks are left out.
     pub(crate) ranks: Vec<(Option<i32>, Vec<SnapshotEntry>)>,
+    groups: Vec<(Option<i32>, Vec<Arc<common::KvGroupEvent>>)>,
     /// Physical copies over all ranks.
     pub(crate) blocks: u64,
 }
@@ -441,12 +508,111 @@ impl Snapshot {
     }
 }
 
+enum SnapshotUnit {
+    Legacy(Arc<LiveBlock>),
+    Group(Arc<common::KvGroupEvent>),
+}
+
+impl SnapshotUnit {
+    fn entry_len(&self) -> usize {
+        match self {
+            Self::Legacy(block) => block.entry_len(),
+            Self::Group(event) => {
+                let len = event.encoded_len();
+                1 + varint_len(len as u64) + len
+            }
+        }
+    }
+}
+
+fn group_from_proto(event: &common::KvGroupEvent) -> GroupEvent {
+    use common::kv_group_event::Operation;
+    match Operation::try_from(event.operation) {
+        Ok(Operation::Store) => GroupEvent::Store {
+            group_id: event.group_id,
+            kind: event.kind.clone(),
+            window: event.sliding_window as usize,
+            keys: event.block_hashes.clone(),
+            parent: (!event.parent_block_hash.is_empty()).then(|| event.parent_block_hash.clone()),
+            tokens: event.token_ids.clone(),
+            block_size: event.block_size as usize,
+            tokens_matchable: event.tokens_matchable,
+            skipped_tokens: event
+                .ancestry_provided
+                .then(|| event.skipped_token_ids.clone()),
+            skipped_token_parent_hash: (!event.skipped_token_parent_hash.is_empty())
+                .then(|| event.skipped_token_parent_hash.clone()),
+            copy_counts: event.cache_copy_counts.clone(),
+        },
+        Ok(Operation::Remove) => GroupEvent::Remove {
+            group_id: event.group_id,
+            keys: event.block_hashes.clone(),
+            copy_counts: event.cache_copy_counts.clone(),
+        },
+        Ok(Operation::Clear) => GroupEvent::Clear,
+        _ => GroupEvent::Invalid,
+    }
+}
+
+fn group_to_proto(event: GroupEvent) -> common::KvGroupEvent {
+    use common::kv_group_event::Operation;
+    match event {
+        GroupEvent::Store {
+            group_id,
+            kind,
+            window,
+            keys,
+            parent,
+            tokens,
+            block_size,
+            tokens_matchable,
+            skipped_tokens,
+            skipped_token_parent_hash,
+            copy_counts,
+        } => common::KvGroupEvent {
+            operation: Operation::Store as i32,
+            group_id,
+            kind,
+            sliding_window: window as u32,
+            block_hashes: keys,
+            parent_block_hash: parent.unwrap_or_default(),
+            token_ids: tokens,
+            block_size: block_size as u32,
+            tokens_matchable,
+            ancestry_provided: skipped_tokens.is_some(),
+            skipped_token_ids: skipped_tokens.unwrap_or_default(),
+            skipped_token_parent_hash: skipped_token_parent_hash.unwrap_or_default(),
+            cache_copy_counts: copy_counts,
+        },
+        GroupEvent::Remove {
+            group_id,
+            keys,
+            copy_counts,
+        } => common::KvGroupEvent {
+            operation: Operation::Remove as i32,
+            group_id,
+            block_hashes: keys,
+            cache_copy_counts: copy_counts,
+            ..Default::default()
+        },
+        GroupEvent::Clear => common::KvGroupEvent {
+            operation: Operation::Clear as i32,
+            ..Default::default()
+        },
+        GroupEvent::Invalid => common::KvGroupEvent {
+            operation: Operation::Invalid as i32,
+            ..Default::default()
+        },
+    }
+}
+
 /// A snapshot ordered and cut into the batches a subscriber receives, built
 /// lazily chunk by chunk.
 pub struct SnapshotChunks {
-    /// Per rank, one unit per physical copy in emission order: parents
-    /// before children, store order otherwise, copies adjacent.
-    ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)>,
+    /// Per rank: legacy physical copies in parent-first order followed by
+    /// parent-linked group context and logical membership descriptions.
+    ranks: Vec<(Option<i32>, Vec<SnapshotUnit>)>,
+    group_ranks: Vec<Option<i32>>,
     /// The units of each chunk, `(rank index, start, end)`, in order; empty
     /// for an empty state, whose one chunk is the clear.
     cuts: Vec<(usize, usize, usize)>,
@@ -466,11 +632,31 @@ impl SnapshotChunks {
     /// record the snapshot cannot cover (0 for a record from the start).
     pub fn new(snapshot: Snapshot, through: u64, timestamp: f64, unknown_before: u64) -> Self {
         let blocks = snapshot.blocks;
-        let ranks: Vec<(Option<i32>, Vec<Arc<LiveBlock>>)> = snapshot
+        let mut by_rank: BTreeMap<Option<i32>, Vec<SnapshotUnit>> = snapshot
             .ranks
             .into_iter()
-            .map(|(rank, entries)| (rank, order_rank(entries)))
+            .map(|(rank, entries)| {
+                (
+                    rank,
+                    order_rank(entries)
+                        .into_iter()
+                        .map(SnapshotUnit::Legacy)
+                        .collect(),
+                )
+            })
             .collect();
+        let group_ranks = snapshot.groups.iter().map(|(rank, _)| *rank).collect();
+        for (rank, events) in snapshot.groups {
+            let units = by_rank.entry(rank).or_default();
+            units.extend(events.into_iter().map(SnapshotUnit::Group));
+            if units.is_empty() {
+                units.push(SnapshotUnit::Group(Arc::new(common::KvGroupEvent {
+                    operation: common::kv_group_event::Operation::Invalid as i32,
+                    ..Default::default()
+                })));
+            }
+        }
+        let ranks: Vec<_> = by_rank.into_iter().collect();
         let largest_units = ranks
             .iter()
             .map(|(_, units)| units.len())
@@ -497,6 +683,7 @@ impl SnapshotChunks {
         let count = u32::try_from(cuts.len().max(1)).unwrap_or(u32::MAX);
         Self {
             ranks,
+            group_ranks,
             cuts,
             count,
             next: 0,
@@ -542,11 +729,25 @@ impl SnapshotChunks {
                 )),
             });
         }
+        let mut group_events = Vec::new();
         let mut dp_rank = None;
         if let Some(&(rank_index, start, end)) = self.cuts.get(index as usize) {
             let (rank, units) = &self.ranks[rank_index];
             dp_rank = *rank;
-            stored_events(&units[start..end], &mut events);
+            if start == 0 && self.group_ranks.contains(rank) {
+                group_events.push(common::KvGroupEvent {
+                    operation: common::kv_group_event::Operation::Clear as i32,
+                    ..Default::default()
+                });
+            }
+            let mut legacy = Vec::new();
+            for unit in &units[start..end] {
+                match unit {
+                    SnapshotUnit::Legacy(block) => legacy.push(Arc::clone(block)),
+                    SnapshotUnit::Group(event) => group_events.push((**event).clone()),
+                }
+            }
+            stored_events(&legacy, &mut events);
         }
         Some(common::KvEventBatch {
             sequence_number,
@@ -560,6 +761,8 @@ impl SnapshotChunks {
                 unknown_before: self.unknown_before,
             }),
             load: None,
+            group_events_enabled: self.group_ranks.contains(&dp_rank),
+            group_events,
         })
     }
 }
@@ -577,7 +780,7 @@ impl Iterator for SnapshotChunks {
 /// (a unit larger than the byte bound is a chunk of its own), and at the end
 /// of its rank.
 fn cut_chunks(
-    ranks: &[(Option<i32>, Vec<Arc<LiveBlock>>)],
+    ranks: &[(Option<i32>, Vec<SnapshotUnit>)],
     chunk_blocks: usize,
     chunk_bytes: usize,
 ) -> Vec<(usize, usize, usize)> {
@@ -702,6 +905,8 @@ fn stored_event(run: &[Arc<LiveBlock>]) -> common::KvCacheEvent {
                     lora_id: block.lora_id,
                     cache_level: block.cache_level,
                     extra_keys: block.extra_keys.to_vec(),
+                    // Each legacy snapshot unit represents one physical copy.
+                    cache_copy_count: None,
                 })
                 .collect(),
             parent_block_hash: run[0].parent,
@@ -723,9 +928,11 @@ fn stored_event(run: &[Arc<LiveBlock>]) -> common::KvCacheEvent {
 mod tests {
     use std::time::Instant;
 
+    use kv_index::group_cache::GroupRequest;
     use smg_grpc_client::common_proto::{KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent};
 
     use super::*;
+    use crate::kv_wire::Normalizer;
 
     fn block(hash: i64) -> KvBlock {
         KvBlock {
@@ -781,6 +988,7 @@ mod tests {
             dp_rank: rank,
             snapshot: None,
             load: None,
+            ..Default::default()
         }
     }
 
@@ -809,6 +1017,230 @@ mod tests {
 
     fn chunks_of(state: &LiveState, through: u64) -> Vec<common::KvEventBatch> {
         SnapshotChunks::new(state.snapshot(), through, 2.0, 0).collect()
+    }
+
+    fn group_store(
+        group_id: u32,
+        kind: &str,
+        keys: &[u8],
+        tokens: &[u32],
+        span: usize,
+        counts: &[u32],
+    ) -> common::KvGroupEvent {
+        group_to_proto(GroupEvent::Store {
+            group_id,
+            kind: kind.into(),
+            window: 0,
+            keys: keys.iter().map(|&key| vec![key]).collect(),
+            parent: None,
+            tokens: tokens.to_vec(),
+            block_size: span,
+            tokens_matchable: true,
+            skipped_tokens: Some(Vec::new()),
+            skipped_token_parent_hash: None,
+            copy_counts: counts.to_vec(),
+        })
+    }
+
+    fn group_batch(rank: i32, events: Vec<common::KvGroupEvent>) -> common::KvEventBatch {
+        common::KvEventBatch {
+            dp_rank: Some(rank),
+            group_events_enabled: true,
+            group_events: events,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn snapshots_preserve_joint_position_empty_groups_and_remaining_copies() {
+        use kv_index::group_cache::GroupRequest;
+        let tokens: Vec<_> = (1..=41).collect();
+        let request = GroupRequest::new(&tokens);
+        let mut state = LiveState::new();
+        state.apply(&group_batch(
+            0,
+            vec![
+                group_store(0, "full_attention", &[1, 2], &tokens[..32], 16, &[1, 1]),
+                group_store(1, "mamba", &[3], &tokens[..24], 24, &[2]),
+            ],
+        ));
+        assert_eq!(state.groups[&Some(0)].reusable_tokens(&request), Some(24));
+        let remaining = group_to_proto(GroupEvent::Remove {
+            group_id: 1,
+            keys: vec![vec![3]],
+            copy_counts: vec![1],
+        });
+        state.apply(&group_batch(0, vec![remaining]));
+        let chunks = chunks_of(&state, 20);
+        let mut restored = LiveState::new();
+        for chunk in &chunks {
+            restored.apply(chunk);
+        }
+        assert_eq!(
+            restored.groups[&Some(0)].reusable_tokens(&request),
+            Some(24)
+        );
+        // Repeating the snapshot's logical reports does not create phantom copies.
+        for chunk in &chunks {
+            restored.apply(chunk);
+        }
+        let removed = group_to_proto(GroupEvent::Remove {
+            group_id: 1,
+            keys: vec![vec![3]],
+            copy_counts: vec![0],
+        });
+        restored.apply(&group_batch(0, vec![removed]));
+        assert_eq!(restored.groups[&Some(0)].reusable_tokens(&request), Some(0));
+        let empty = chunks_of(&restored, 30);
+        let mut again = LiveState::new();
+        for chunk in &empty {
+            again.apply(chunk);
+        }
+        assert_eq!(
+            again.groups[&Some(0)].reusable_tokens(&request),
+            Some(0),
+            "empty Mamba remains required"
+        );
+        assert!(empty
+            .iter()
+            .flat_map(|batch| &batch.group_events)
+            .any(|event| event.group_id == 1 && event.block_hashes.is_empty()));
+    }
+
+    #[test]
+    fn anchored_sparse_wire_state_replays_without_reviving_its_evicted_ancestor() {
+        use kv_index::group_cache::GroupRequest;
+        use serde_json::json;
+        let tokens: Vec<u32> = (1..=13).collect();
+        let wire = json!([1.0, [
+            {"type": "BlockStored", "block_hashes": [1], "parent_block_hash": null,
+                "token_ids": [1, 2, 3, 4], "block_size": 4, "group_idx": 0,
+                "kv_cache_spec_kind": "sliding_window", "kv_cache_spec_sliding_window": 4},
+            {"type": "BlockStored", "block_hashes": [3], "parent_block_hash": 2,
+                "token_ids": [9, 10, 11, 12], "block_size": 4, "group_idx": 0,
+                "kv_cache_spec_kind": "sliding_window", "kv_cache_spec_sliding_window": 4,
+                "skipped_token_ids": [5, 6, 7, 8], "skipped_token_parent_hash": 1,
+                "cache_copy_counts": [1]},
+            {"type": "BlockRemoved", "block_hashes": [1], "group_idx": 0,
+                "cache_copy_counts": [0]},
+        ], 0]);
+        let bytes = rmp_serde::to_vec_named(&wire).unwrap();
+        let wire: crate::kv_wire::WireBatch = rmp_serde::from_slice(&bytes).unwrap();
+        let mut event_id = 0;
+        let batch = Normalizer::new().normalize_batch(wire, 1, &mut event_id);
+        assert_eq!(
+            batch.group_events[1].skipped_token_parent_hash,
+            1i64.to_be_bytes()
+        );
+        let mut state = LiveState::new();
+        state.apply(&batch);
+        let request = GroupRequest::new(&tokens);
+        assert_eq!(state.groups[&Some(0)].reusable_tokens(&request), Some(12));
+        let chunks = chunks_of(&state, 20);
+        let mut restored = LiveState::new();
+        for chunk in &chunks {
+            restored.apply(chunk);
+        }
+        assert_eq!(
+            restored.groups[&Some(0)].reusable_tokens(&request),
+            Some(12)
+        );
+        assert!(chunks
+            .iter()
+            .flat_map(|chunk| &chunk.group_events)
+            .all(|event| event
+                .block_hashes
+                .iter()
+                .zip(&event.cache_copy_counts)
+                .all(|(key, count)| *count == 0 || *key != 1i64.to_be_bytes())));
+    }
+
+    #[test]
+    fn group_snapshots_keep_native_keys_ranks_and_bounded_chunks() {
+        let mut state = LiveState::new();
+        let tokens: Vec<_> = (0..CHUNK_BLOCKS as u32 + 20).collect();
+        let mut query_tokens = tokens.clone();
+        query_tokens.push(u32::MAX);
+        let request = GroupRequest::new(&query_tokens);
+        let keys: Vec<_> = (0..tokens.len())
+            .map(|key| (key as u64).to_be_bytes().to_vec())
+            .collect();
+        let event = group_to_proto(GroupEvent::Store {
+            group_id: 0,
+            kind: "full_attention".into(),
+            window: 0,
+            keys: keys.clone(),
+            parent: None,
+            tokens,
+            block_size: 1,
+            tokens_matchable: true,
+            skipped_tokens: Some(Vec::new()),
+            skipped_token_parent_hash: None,
+            copy_counts: vec![1; keys.len()],
+        });
+        state.apply(&group_batch(0, vec![event]));
+        state.apply(&group_batch(
+            1,
+            vec![group_store(5, "mamba", &[8], &[1, 2, 3, 4], 4, &[1])],
+        ));
+        let chunks = chunks_of(&state, 100);
+        assert!(chunks.len() >= 3);
+        assert!(chunks
+            .iter()
+            .all(|batch| batch.encoded_len() <= CHUNK_BYTES + 64 * 1024));
+        assert!(chunks.iter().any(|batch| batch.dp_rank == Some(1)
+            && batch.group_events.iter().any(|event| event.group_id == 5)));
+        for (index, chunk) in chunks.iter().enumerate() {
+            assert_eq!(
+                chunk.sequence_number,
+                101 - chunks.len() as u64 + index as u64
+            );
+        }
+        let mut restored = LiveState::new();
+        for chunk in &chunks {
+            restored.apply(chunk);
+        }
+        assert_eq!(
+            restored.groups[&Some(0)].reusable_tokens(&request),
+            Some(keys.len()),
+            "ancestry must survive the context-only chunk boundary"
+        );
+        assert_eq!(
+            restored.groups[&Some(0)]
+                .snapshot_events()
+                .iter()
+                .filter_map(|event| match event {
+                    GroupEvent::Store { copy_counts, .. } =>
+                        Some(copy_counts.iter().filter(|&&count| count > 0).count()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            keys.len()
+        );
+    }
+
+    #[test]
+    fn authoritative_legacy_counts_restore_as_physical_copy_units() {
+        let mut state = LiveState::new();
+        let mut event = stored(None, &[7], KvCacheTier::Device);
+        if let Some(kv_cache_event::Data::Stored(stored)) = &mut event.data {
+            stored.blocks[0].cache_copy_count = Some(2);
+        }
+        state.apply(&batch(1, Some(0), vec![event.clone(), event]));
+        assert_eq!(state.copies(Some(0), KvCacheTier::Device, 7), 2);
+        let chunks = chunks_of(&state, 10);
+        assert_eq!(emitted(&chunks).len(), 2);
+        let mut restored = LiveState::new();
+        for chunk in &chunks {
+            restored.apply(chunk);
+        }
+        assert_eq!(restored.copies(Some(0), KvCacheTier::Device, 7), 2);
+        let mut event = removed(&[7], KvCacheTier::Device);
+        if let Some(kv_cache_event::Data::Removed(removed)) = &mut event.data {
+            removed.cache_copy_counts = vec![1];
+        }
+        restored.apply(&batch(11, Some(0), vec![event]));
+        assert_eq!(restored.copies(Some(0), KvCacheTier::Device, 7), 1);
     }
 
     #[test]

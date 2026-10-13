@@ -55,6 +55,7 @@ fn snapshot_chunk() -> common::KvEventBatch {
             unknown_before: 0,
         }),
         load: None,
+        ..Default::default()
     }
 }
 

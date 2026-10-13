@@ -20,7 +20,7 @@ mod chain;
 /// flat core remains as [`FlatTree`] — a second, independently
 /// verified implementation the dual-core harness keeps asserting
 /// against the model.
-pub use chain::RadixTree;
+pub use chain::{ContextError, PrefixContext, RadixTree};
 use rustc_hash::FxHashMap;
 
 /// Position-independent content identity (the matching currency).

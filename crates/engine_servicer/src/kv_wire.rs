@@ -29,12 +29,12 @@
 //! - the cache namespace (LoRA name, cache salt) carried on every store and
 //!   inherited down the parent chain when a child store omits it.
 //!
-//! Stores and removals are forwarded one for one. vLLM keeps up to two
-//! physical copies of one hash and removes them one at a time, so a removal
-//! can arrive while another copy is still cached: every copy's store and
-//! every removal go through, and the gateway counts copies per worker, tier
-//! and hash (capped), as the relay's own live-block record and the hash
-//! check's parent memory do.
+//! Stores and removals are forwarded one for one. Optional authoritative
+//! copy counts distinguish a repeated residency report from a new physical
+//! copy. Without them, the legacy capped store/remove counting is unchanged.
+//! A separate group view retains full native keys and GPU-local group
+//! membership before these legacy filters; unsupported or malformed evidence
+//! cannot claim a plain-token cache hit.
 //!
 //! Hash identity: an integer hash is used as is (vLLM sends the low 64 bits
 //! of the digest as an unsigned integer, SGLang the high 64 bits as a signed
@@ -148,6 +148,19 @@ pub enum ExtraKey {
     Opaque,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GroupEvidence {
+    pub block_hashes: Vec<Vec<u8>>,
+    pub parent_block_hash: Option<Vec<u8>>,
+    pub skipped_token_ids: Option<Vec<u32>>,
+    pub skipped_token_parent_hash: Option<Vec<u8>>,
+    pub cache_copy_counts: Option<Vec<u32>>,
+    pub token_ids_matchable: Option<bool>,
+    pub has_group_metadata: bool,
+    pub ownership_provided: bool,
+    pub malformed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WireStored {
     pub block_hashes: Vec<BlockHash>,
@@ -159,12 +172,14 @@ pub struct WireStored {
     pub cache_salt: Option<String>,
     /// One entry per block, `None` for a block without extra keys.
     pub extra_keys: Option<Vec<Option<Vec<ExtraKey>>>>,
+    pub group: GroupEvidence,
     pub tail: EventTail,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WireRemoved {
     pub block_hashes: Vec<BlockHash>,
+    pub group: GroupEvidence,
     pub tail: EventTail,
 }
 
@@ -174,14 +189,17 @@ pub enum WireEvent {
     BlockRemoved(WireRemoved),
     AllBlocksCleared {
         ownership: Option<String>,
+        ownership_provided: bool,
     },
     /// An event type this relay does not convert (one a newer engine added):
     /// skipped on its own so the batch's other events still go through.
     Unknown,
+    UnknownGroup(EventTail, bool),
     /// A known event whose named field is missing or of a shape this relay
     /// cannot read: skipped on its own, the rest of the batch still goes
     /// through.
     Malformed(&'static str),
+    MalformedGroup(&'static str, EventTail, bool),
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +211,7 @@ pub enum WireEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Loose {
     Nil,
+    Bool(bool),
     Unsigned(u64),
     Signed(i64),
     Text(String),
@@ -228,7 +247,7 @@ impl<'de> Deserialize<'de> for Loose {
             }
 
             fn visit_bool<E: de::Error>(self, value: bool) -> Result<Loose, E> {
-                Ok(Loose::Unsigned(u64::from(value)))
+                Ok(Loose::Bool(value))
             }
 
             fn visit_u64<E: de::Error>(self, value: u64) -> Result<Loose, E> {
@@ -313,6 +332,29 @@ impl Loose {
         }
     }
 
+    fn native_hash(&self) -> Option<Vec<u8>> {
+        match self {
+            Loose::Unsigned(value) => Some(value.to_be_bytes().to_vec()),
+            Loose::Signed(value) => Some(value.to_be_bytes().to_vec()),
+            Loose::Bytes(bytes) if !bytes.is_empty() => Some(bytes.clone()),
+            _ => None,
+        }
+    }
+
+    fn native_hashes(&self) -> Option<Vec<Vec<u8>>> {
+        match self {
+            Loose::Seq(items) => items.iter().map(Loose::native_hash).collect(),
+            _ => None,
+        }
+    }
+
+    fn unsigned_ids(self) -> Option<Vec<u32>> {
+        match self {
+            Loose::Seq(items) => items.into_iter().map(Loose::unsigned32).collect(),
+            _ => None,
+        }
+    }
+
     fn block_hashes(self) -> Option<Vec<BlockHash>> {
         match self {
             Loose::Seq(items) => items.iter().map(Loose::block_hash).collect(),
@@ -366,7 +408,7 @@ impl Loose {
                 },
                 _ => ExtraKey::Opaque,
             },
-            Loose::Nil | Loose::Other => ExtraKey::Opaque,
+            Loose::Nil | Loose::Bool(_) | Loose::Other => ExtraKey::Opaque,
         }
     }
 
@@ -387,14 +429,6 @@ impl Loose {
             _ => None,
         }
     }
-
-    /// The array layout's seventh store slot: vLLM's `lora_name`.
-    fn namespace_slot(self) -> (Option<String>, Option<String>) {
-        match self {
-            Loose::Text(name) => (Some(name), None),
-            _ => (None, None),
-        }
-    }
 }
 
 /// Everything a map-layout event may carry, collected before dispatch on
@@ -410,6 +444,10 @@ struct Fields {
     lora_name: Option<Loose>,
     cache_salt: Option<Loose>,
     extra_keys: Option<Loose>,
+    skipped_token_ids: Option<Loose>,
+    skipped_token_parent_hash: Option<Loose>,
+    cache_copy_counts: Option<Loose>,
+    token_ids_matchable: Option<Loose>,
     tail: [Option<Loose>; 7],
 }
 
@@ -438,19 +476,118 @@ fn tail_from(slots: [Option<Loose>; 7]) -> EventTail {
 
 impl Fields {
     fn into_event(self) -> WireEvent {
+        let has_group_metadata = self.tail[1..4].iter().any(|slot| {
+            slot.as_ref()
+                .is_some_and(|value| !matches!(value, Loose::Nil))
+        });
+        let tail_bad = self.tail.iter().enumerate().any(|(index, slot)| {
+            slot.as_ref().is_some_and(|value| match value {
+                Loose::Nil => false,
+                Loose::Unsigned(value) if index == 1 || index == 3 => {
+                    u32::try_from(*value).is_err()
+                }
+                Loose::Text(_) if index != 1 && index != 3 => false,
+                _ => true,
+            })
+        });
+        let ownership_provided = self.tail[5]
+            .as_ref()
+            .is_some_and(|value| !matches!(value, Loose::Nil));
+        let tail = tail_from(self.tail);
+        let malformed = |field| {
+            if has_group_metadata || ownership_provided {
+                WireEvent::MalformedGroup(field, tail.clone(), ownership_provided)
+            } else {
+                WireEvent::Malformed(field)
+            }
+        };
         let Some(event_type) = self.event_type else {
-            return WireEvent::Malformed("type");
+            return malformed("type");
+        };
+        let optional_ids = |value: Option<Loose>| -> (Option<Vec<u32>>, bool) {
+            match value {
+                None | Some(Loose::Nil) => (None, false),
+                Some(value) => match value.unsigned_ids() {
+                    Some(ids) => (Some(ids), false),
+                    None => (None, true),
+                },
+            }
+        };
+        let namespace_bad =
+            self.lora_id.as_ref().is_some_and(|value| {
+                !matches!(value, Loose::Nil) && value.clone().signed().is_none()
+            }) || self
+                .lora_name
+                .as_ref()
+                .is_some_and(|value| !matches!(value, Loose::Nil | Loose::Text(_)))
+                || self
+                    .cache_salt
+                    .as_ref()
+                    .is_some_and(|value| !matches!(value, Loose::Nil | Loose::Text(_)));
+        let native_hashes = self.block_hashes.as_ref().and_then(Loose::native_hashes);
+        let hashes_bad = native_hashes.is_none();
+        let extra_bad = self.extra_keys.as_ref().is_some_and(|value| match value {
+            Loose::Nil => false,
+            Loose::Seq(blocks) => {
+                blocks
+                    .iter()
+                    .any(|keys| !matches!(keys, Loose::Nil | Loose::Seq(_)))
+                    || native_hashes
+                        .as_ref()
+                        .is_some_and(|hashes| blocks.len() != hashes.len())
+            }
+            _ => true,
+        });
+        let (skipped_token_ids, ancestry_bad) = optional_ids(self.skipped_token_ids);
+        let anchor = self
+            .skipped_token_parent_hash
+            .as_ref()
+            .and_then(Loose::native_hash);
+        let anchor_bad = self
+            .skipped_token_parent_hash
+            .as_ref()
+            .is_some_and(|value| !matches!(value, Loose::Nil) && anchor.is_none())
+            || anchor.is_some() && skipped_token_ids.is_none();
+        let (cache_copy_counts, copies_bad) = optional_ids(self.cache_copy_counts);
+        let parent = self.parent_block_hash.as_ref().and_then(Loose::native_hash);
+        let parent_bad = self
+            .parent_block_hash
+            .as_ref()
+            .is_some_and(|value| !matches!(value, Loose::Nil) && parent.is_none());
+        let (token_ids_matchable, marker_bad) = match self.token_ids_matchable {
+            None | Some(Loose::Nil) => (None, false),
+            Some(Loose::Bool(value)) => (Some(value), false),
+            Some(_) => (None, true),
+        };
+        let group = GroupEvidence {
+            block_hashes: native_hashes.unwrap_or_default(),
+            parent_block_hash: parent,
+            skipped_token_ids,
+            skipped_token_parent_hash: anchor,
+            cache_copy_counts,
+            token_ids_matchable,
+            has_group_metadata,
+            ownership_provided,
+            malformed: tail_bad
+                || namespace_bad
+                || extra_bad
+                || ancestry_bad
+                || anchor_bad
+                || copies_bad
+                || marker_bad
+                || parent_bad
+                || hashes_bad,
         };
         match event_type.as_str() {
             "BlockStored" => {
                 let Some(block_hashes) = self.block_hashes.and_then(Loose::block_hashes) else {
-                    return WireEvent::Malformed("block_hashes");
+                    return malformed("block_hashes");
                 };
                 let Some(token_ids) = self.token_ids.and_then(Loose::tokens) else {
-                    return WireEvent::Malformed("token_ids");
+                    return malformed("token_ids");
                 };
                 let Some(block_size) = self.block_size.and_then(Loose::signed) else {
-                    return WireEvent::Malformed("block_size");
+                    return malformed("block_size");
                 };
                 WireEvent::BlockStored(WireStored {
                     block_hashes,
@@ -461,21 +598,24 @@ impl Fields {
                     lora_name: self.lora_name.and_then(Loose::text),
                     cache_salt: self.cache_salt.and_then(Loose::text),
                     extra_keys: self.extra_keys.and_then(Loose::extra_keys),
-                    tail: tail_from(self.tail),
+                    group,
+                    tail,
                 })
             }
             "BlockRemoved" => match self.block_hashes.and_then(Loose::block_hashes) {
                 Some(block_hashes) => WireEvent::BlockRemoved(WireRemoved {
                     block_hashes,
-                    tail: tail_from(self.tail),
+                    group,
+                    tail,
                 }),
-                None => WireEvent::Malformed("block_hashes"),
+                None => malformed("block_hashes"),
             },
-            "AllBlocksCleared" => {
-                let [_, _, _, _, _, ownership, _] = self.tail;
-                WireEvent::AllBlocksCleared {
-                    ownership: ownership.and_then(Loose::text),
-                }
+            "AllBlocksCleared" => WireEvent::AllBlocksCleared {
+                ownership: tail.ownership,
+                ownership_provided,
+            },
+            _ if has_group_metadata || ownership_provided => {
+                WireEvent::UnknownGroup(tail, ownership_provided)
             }
             _ => WireEvent::Unknown,
         }
@@ -506,6 +646,14 @@ impl<'de> Deserialize<'de> for WireEvent {
                         "lora_name" => fields.lora_name = Some(map.next_value()?),
                         "cache_salt" => fields.cache_salt = Some(map.next_value()?),
                         "extra_keys" => fields.extra_keys = Some(map.next_value()?),
+                        "skipped_token_ids" => fields.skipped_token_ids = Some(map.next_value()?),
+                        "skipped_token_parent_hash" => {
+                            fields.skipped_token_parent_hash = Some(map.next_value()?);
+                        }
+                        "cache_copy_counts" => fields.cache_copy_counts = Some(map.next_value()?),
+                        "token_ids_matchable" => {
+                            fields.token_ids_matchable = Some(map.next_value()?);
+                        }
                         other => match TAIL_KEYS.iter().position(|name| *name == other) {
                             Some(slot) => fields.tail[slot] = Some(map.next_value()?),
                             None => {
@@ -521,7 +669,8 @@ impl<'de> Deserialize<'de> for WireEvent {
             /// structs declare their fields: a store is `[tag, block_hashes,
             /// parent, token_ids, block_size, lora_id, medium, lora_name,
             /// extra_keys, group_idx, kind, sliding_window, locality,
-            /// ownership, session_id]`, a removal `[tag, block_hashes,
+            /// ownership, session_id, skipped_token_ids, cache_copy_counts,
+            /// token_ids_matchable, skipped_token_parent_hash]`, a removal `[tag, block_hashes,
             /// medium, group_idx, locality, ownership]`, a clear `[tag]`;
             /// trailing defaults are omitted. SGLang's legacy arrays put
             /// `cache_salt` where vLLM has `lora_name`; the two are not
@@ -549,19 +698,22 @@ impl<'de> Deserialize<'de> for WireEvent {
                         fields.block_size = Some(next());
                         fields.lora_id = Some(next());
                         fields.tail[0] = Some(next());
-                        let (lora_name, cache_salt) = next().namespace_slot();
-                        fields.lora_name = lora_name.map(Loose::Text);
-                        fields.cache_salt = cache_salt.map(Loose::Text);
+                        fields.lora_name = Some(next());
                         fields.extra_keys = Some(next());
                         for slot in 1..=6 {
                             fields.tail[slot] = Some(next());
                         }
+                        fields.skipped_token_ids = Some(next());
+                        fields.cache_copy_counts = Some(next());
+                        fields.token_ids_matchable = Some(next());
+                        fields.skipped_token_parent_hash = Some(next());
                     }
                     "BlockRemoved" => {
                         fields.block_hashes = Some(next());
                         for slot in [0, 1, 4, 5] {
                             fields.tail[slot] = Some(next());
                         }
+                        fields.cache_copy_counts = Some(next());
                     }
                     "AllBlocksCleared" => {
                         fields.tail[5] = Some(next());
@@ -688,6 +840,7 @@ struct RankState {
     /// Hashes forwarded from a sliding-window group while the rank had no
     /// main-attention group, so their removals still go through once it has.
     window_forwarded: HashSet<i64>,
+    group_plain: HashMap<(u32, Vec<u8>), bool>,
 }
 
 impl RankState {
@@ -725,6 +878,7 @@ struct Admitted {
 pub struct Normalizer {
     ranks: HashMap<i32, RankState>,
     counts: Counts,
+    group_ranks: HashSet<i32>,
     /// The engine hash to recompute per store, when verification is on.
     hash_check: Option<EngineHash>,
 }
@@ -876,8 +1030,18 @@ impl Normalizer {
                 }
             }
         }
+        let mut group_events = Vec::new();
         let mut events = Vec::with_capacity(batch.events.len());
         for event in batch.events {
+            if let Some(group_event) = self.group_event(&event, rank) {
+                if group_event.operation == common::kv_group_event::Operation::Invalid as i32 {
+                    if let Some(state) = self.ranks.get_mut(&rank) {
+                        state.group_plain.clear();
+                    }
+                }
+                self.group_ranks.insert(rank);
+                group_events.push(group_event);
+            }
             *event_id += 1;
             if let Ok(converted) = self.normalize(event, batch.dp_rank, *event_id) {
                 events.push(converted);
@@ -890,6 +1054,226 @@ impl Normalizer {
             dp_rank: batch.dp_rank,
             snapshot: None,
             load: None,
+            group_events_enabled: self.group_ranks.contains(&rank),
+            group_events,
+        }
+    }
+
+    /// Independent native-key evidence, taken before the legacy group filter.
+    fn group_event(&mut self, event: &WireEvent, rank: i32) -> Option<common::KvGroupEvent> {
+        use common::kv_group_event::Operation;
+        let invalid = |group_id| common::KvGroupEvent {
+            operation: Operation::Invalid as i32,
+            group_id,
+            ..Default::default()
+        };
+        let local_device = |tail: &EventTail| {
+            tail.ownership.is_none()
+                && locality_of(tail.locality.as_deref()).is_ok()
+                && tier_of(tail.medium.as_deref()) == Some(KvCacheTier::Device)
+        };
+        match event {
+            WireEvent::AllBlocksCleared {
+                ownership,
+                ownership_provided,
+            } => (!ownership_provided && ownership.is_none() && self.group_ranks.contains(&rank))
+                .then(|| common::KvGroupEvent {
+                    operation: Operation::Clear as i32,
+                    ..Default::default()
+                }),
+            WireEvent::UnknownGroup(tail, ownership_provided)
+            | WireEvent::MalformedGroup(_, tail, ownership_provided)
+                if !ownership_provided && tail.ownership.is_none() =>
+            {
+                Some(invalid(tail.group_idx.unwrap_or(0)))
+            }
+            WireEvent::Unknown | WireEvent::Malformed(_) if self.group_ranks.contains(&rank) => {
+                Some(invalid(0))
+            }
+            WireEvent::BlockStored(stored)
+                if !stored.group.ownership_provided && stored.tail.ownership.is_none() =>
+            {
+                let group_id = match stored.tail.group_idx {
+                    Some(id) => id,
+                    None if stored.group.has_group_metadata || self.group_ranks.contains(&rank) => {
+                        return Some(invalid(0))
+                    }
+                    None => return None,
+                };
+                let Some(kind) = stored
+                    .tail
+                    .kv_cache_spec_kind
+                    .as_ref()
+                    .filter(|kind| !kind.is_empty())
+                else {
+                    return Some(invalid(group_id));
+                };
+                let hashes = native_hashes(&stored.group, &stored.block_hashes);
+                let parent = native_parent(&stored.group, stored.parent_block_hash);
+                let width = u32::try_from(stored.block_size)
+                    .ok()
+                    .filter(|&width| width > 0);
+                let tokens = match &stored.token_ids {
+                    WireTokens::Ids(ids) => ids.clone(),
+                    WireTokens::Bigrams(pairs) => pairs.iter().map(|&(first, _)| first).collect(),
+                };
+                let mut distinct = HashSet::with_capacity(hashes.len() + 1);
+                if let Some(parent) = &parent {
+                    distinct.insert(parent.clone());
+                }
+                let copies = stored
+                    .group
+                    .cache_copy_counts
+                    .as_deref()
+                    .unwrap_or_default();
+                if stored.group.malformed
+                    || width.is_none()
+                    || stored
+                        .group
+                        .cache_copy_counts
+                        .as_ref()
+                        .is_some_and(|counts| counts.len() != hashes.len())
+                    || copies.contains(&0)
+                    || stored
+                        .group
+                        .skipped_token_parent_hash
+                        .as_ref()
+                        .is_some_and(|anchor| hashes.contains(anchor))
+                    || hashes.iter().any(|key| !distinct.insert(key.clone()))
+                    || hashes.len().checked_mul(width.unwrap_or(0) as usize) != Some(tokens.len())
+                {
+                    return Some(invalid(group_id));
+                }
+                if !local_device(&stored.tail) {
+                    return Some(common::KvGroupEvent {
+                        operation: Operation::Store as i32,
+                        group_id,
+                        kind: kind.clone(),
+                        sliding_window: stored.tail.kv_cache_spec_sliding_window.unwrap_or(0),
+                        block_size: width.unwrap_or(0),
+                        tokens_matchable: true,
+                        ..Default::default()
+                    });
+                }
+                let parent_plain = parent.as_ref().and_then(|key| {
+                    self.ranks
+                        .get(&rank)
+                        .and_then(|state| state.group_plain.get(&(group_id, key.clone())).copied())
+                });
+                let anchor_plain =
+                    stored
+                        .group
+                        .skipped_token_parent_hash
+                        .as_ref()
+                        .and_then(|key| {
+                            self.ranks.get(&rank).and_then(|state| {
+                                state.group_plain.get(&(group_id, key.clone())).copied()
+                            })
+                        });
+                let plain_fields = matches!(stored.token_ids, WireTokens::Ids(_))
+                    && stored.lora_id.is_none()
+                    && stored.lora_name.as_ref().is_none_or(String::is_empty)
+                    && stored.cache_salt.as_ref().is_none_or(String::is_empty)
+                    && stored.extra_keys.as_ref().is_none_or(|blocks| {
+                        blocks
+                            .iter()
+                            .all(|keys| keys.as_ref().is_none_or(Vec::is_empty))
+                    });
+                let ancestry_plain = if stored.group.skipped_token_parent_hash.is_some() {
+                    stored.group.token_ids_matchable == Some(true) || anchor_plain == Some(true)
+                } else {
+                    stored
+                        .group
+                        .skipped_token_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.is_empty())
+                        || stored.group.token_ids_matchable == Some(true)
+                        || parent_plain == Some(true)
+                };
+                let tokens_matchable = plain_fields
+                    && parent_plain != Some(false)
+                    && anchor_plain != Some(false)
+                    && ancestry_plain
+                    && stored.group.token_ids_matchable != Some(false);
+                let state = self.ranks.entry(rank).or_default();
+                for (index, key) in hashes.iter().enumerate() {
+                    let identity = (group_id, key.clone());
+                    if copies.get(index).copied().unwrap_or(1) > 0 {
+                        state.group_plain.insert(identity, tokens_matchable);
+                    } else {
+                        state.group_plain.remove(&identity);
+                    }
+                }
+                Some(common::KvGroupEvent {
+                    operation: Operation::Store as i32,
+                    group_id,
+                    block_hashes: hashes,
+                    parent_block_hash: parent.unwrap_or_default(),
+                    token_ids: tokens,
+                    block_size: width.unwrap_or(0),
+                    kind: kind.clone(),
+                    sliding_window: stored.tail.kv_cache_spec_sliding_window.unwrap_or(0),
+                    tokens_matchable,
+                    skipped_token_ids: stored.group.skipped_token_ids.clone().unwrap_or_default(),
+                    ancestry_provided: stored.group.skipped_token_ids.is_some(),
+                    skipped_token_parent_hash: stored
+                        .group
+                        .skipped_token_parent_hash
+                        .clone()
+                        .unwrap_or_default(),
+                    cache_copy_counts: copies.to_vec(),
+                })
+            }
+            WireEvent::BlockRemoved(removed)
+                if !removed.group.ownership_provided && removed.tail.ownership.is_none() =>
+            {
+                let group_id = match removed.tail.group_idx {
+                    Some(id) => id,
+                    None if removed.group.has_group_metadata
+                        || self.group_ranks.contains(&rank) =>
+                    {
+                        return Some(invalid(0))
+                    }
+                    None => return None,
+                };
+                if !local_device(&removed.tail) {
+                    return Some(common::KvGroupEvent {
+                        operation: Operation::Remove as i32,
+                        group_id,
+                        ..Default::default()
+                    });
+                }
+                let hashes = native_hashes(&removed.group, &removed.block_hashes);
+                let copies = removed
+                    .group
+                    .cache_copy_counts
+                    .as_deref()
+                    .unwrap_or_default();
+                if removed.group.malformed
+                    || removed
+                        .group
+                        .cache_copy_counts
+                        .as_ref()
+                        .is_some_and(|counts| counts.len() != hashes.len())
+                {
+                    return Some(invalid(group_id));
+                }
+                if let Some(state) = self.ranks.get_mut(&rank) {
+                    for (index, key) in hashes.iter().enumerate() {
+                        if copies.get(index).copied().unwrap_or(0) == 0 {
+                            state.group_plain.remove(&(group_id, key.clone()));
+                        }
+                    }
+                }
+                Some(common::KvGroupEvent {
+                    operation: Operation::Remove as i32,
+                    group_id,
+                    block_hashes: hashes,
+                    cache_copy_counts: copies.to_vec(),
+                    ..Default::default()
+                })
+            }
+            _ => None,
         }
     }
 
@@ -902,12 +1286,14 @@ impl Normalizer {
     ) -> Result<common::KvCacheEvent, DropReason> {
         let rank = dp_rank.unwrap_or(-1);
         let data = match event {
-            WireEvent::Unknown => return Err(self.drop(DropReason::UnknownType, event_id)),
-            WireEvent::Malformed(field) => {
+            WireEvent::Unknown | WireEvent::UnknownGroup(_, _) => {
+                return Err(self.drop(DropReason::UnknownType, event_id))
+            }
+            WireEvent::Malformed(field) | WireEvent::MalformedGroup(field, _, _) => {
                 debug!(event_id, field, "KV event field unreadable");
                 return Err(self.drop(DropReason::Malformed, event_id));
             }
-            WireEvent::AllBlocksCleared { ownership } => {
+            WireEvent::AllBlocksCleared { ownership, .. } => {
                 if is_residency_agent(ownership.as_deref()) {
                     return Err(self.drop(DropReason::UnsupportedOwnership, event_id));
                 }
@@ -987,6 +1373,14 @@ impl Normalizer {
             locality,
             window_only,
         } = self.admit(&stored.tail, rank, event_id, true, &stored.block_hashes)?;
+        if stored
+            .group
+            .cache_copy_counts
+            .as_ref()
+            .is_some_and(|counts| counts.len() != stored.block_hashes.len())
+        {
+            return Err(self.drop(DropReason::Malformed, event_id));
+        }
         // A bigram page lists (token, next token) per position; its tokens
         // are the first elements and the page grid is unchanged. The pairs
         // stay around for the engine-hash check, which hashes both words.
@@ -1075,12 +1469,22 @@ impl Normalizer {
         }
         let stored_namespace = (!namespace.is_empty()).then(|| namespace.clone());
         let mut all_seen = true;
-        for hash in &stored.block_hashes {
+        for (index, hash) in stored.block_hashes.iter().enumerate() {
+            let copies = stored
+                .group
+                .cache_copy_counts
+                .as_ref()
+                .map(|counts| counts[index].min(COPIES_CAP));
+            if copies == Some(0) {
+                blocks_state.remove(&hash.0);
+                continue;
+            }
             match blocks_state.get_mut(&hash.0) {
                 // A second physical copy: the record stays, its digest with
                 // it, with one more copy counted.
                 Some(record) => {
-                    record.copies = record.copies.saturating_add(1).min(COPIES_CAP);
+                    record.copies =
+                        copies.unwrap_or_else(|| record.copies.saturating_add(1).min(COPIES_CAP));
                     record.namespace.clone_from(&stored_namespace);
                 }
                 None => {
@@ -1089,7 +1493,7 @@ impl Normalizer {
                         hash.0,
                         BlockRecord {
                             namespace: stored_namespace.clone(),
-                            copies: 1,
+                            copies: copies.unwrap_or(1),
                             digest: None,
                         },
                     );
@@ -1138,12 +1542,18 @@ impl Normalizer {
             .block_hashes
             .iter()
             .zip(token_ids.chunks_exact(width))
-            .map(|(hash, tokens)| common::KvBlock {
+            .enumerate()
+            .map(|(index, (hash, tokens))| common::KvBlock {
                 block_hash: hash.0,
                 token_ids: tokens.to_vec(),
                 block_size: i32::try_from(width).unwrap_or(i32::MAX),
                 lora_id: stored.lora_id,
                 cache_level,
+                cache_copy_count: stored
+                    .group
+                    .cache_copy_counts
+                    .as_ref()
+                    .map(|counts| counts[index]),
                 extra_keys: extra_keys
                     .next()
                     .flatten()
@@ -1188,23 +1598,49 @@ impl Normalizer {
             locality,
             window_only,
         } = self.admit(&removed.tail, rank, event_id, false, &removed.block_hashes)?;
-        let mut block_hashes: Vec<i64> = removed.block_hashes.iter().map(|hash| hash.0).collect();
+        if removed
+            .group
+            .cache_copy_counts
+            .as_ref()
+            .is_some_and(|counts| counts.len() != removed.block_hashes.len())
+        {
+            return Err(self.drop(DropReason::Malformed, event_id));
+        }
+        let mut hashes: Vec<(i64, Option<u32>)> = removed
+            .block_hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| {
+                (
+                    hash.0,
+                    removed
+                        .group
+                        .cache_copy_counts
+                        .as_ref()
+                        .map(|counts| counts[index]),
+                )
+            })
+            .collect();
         if let Some(state) = self.ranks.get_mut(&rank) {
             if window_only {
-                // Once the rank has a main group, a window group's removal
-                // reaches only the blocks forwarded while it had none.
+                // Keep count/hash alignment when the window compatibility
+                // path forwards only the keys it previously admitted.
                 if state.main_seen() {
-                    block_hashes.retain(|hash| state.window_forwarded.contains(hash));
+                    hashes.retain(|(hash, _)| state.window_forwarded.contains(hash));
                 }
-                for hash in &block_hashes {
-                    state.window_forwarded.remove(hash);
+                for (hash, copies) in &hashes {
+                    if copies.unwrap_or(0) == 0 {
+                        state.window_forwarded.remove(hash);
+                    }
                 }
             }
             if let Some(blocks_state) = state.tiers.get_mut(&(tier as i32)) {
-                // One physical copy goes; the record goes with the last.
-                for hash in &block_hashes {
+                for (hash, copies) in &hashes {
                     if let Some(record) = blocks_state.get_mut(hash) {
-                        record.copies = record.copies.saturating_sub(1);
+                        record.copies = copies.map_or_else(
+                            || record.copies.saturating_sub(1),
+                            |copies| copies.min(COPIES_CAP),
+                        );
                         if record.copies == 0 {
                             blocks_state.remove(hash);
                         }
@@ -1212,6 +1648,15 @@ impl Normalizer {
                 }
             }
         }
+        let block_hashes = hashes.iter().map(|(hash, _)| *hash).collect();
+        let cache_copy_counts = if removed.group.cache_copy_counts.is_some() {
+            hashes
+                .iter()
+                .map(|(_, copies)| copies.unwrap_or(0))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.counts.forwarded_removed += 1;
         let EventTail {
             medium,
@@ -1221,6 +1666,7 @@ impl Normalizer {
         } = removed.tail;
         Ok(kv_cache_event::Data::Removed(common::KvBlocksRemoved {
             block_hashes,
+            cache_copy_counts,
             cache_level: cache_level_of(tier),
             tier: Some(tier as i32),
             medium,
@@ -1229,6 +1675,24 @@ impl Normalizer {
             ownership,
         }))
     }
+}
+
+fn native_hashes(group: &GroupEvidence, hashes: &[BlockHash]) -> Vec<Vec<u8>> {
+    if group.block_hashes.is_empty() {
+        hashes
+            .iter()
+            .map(|hash| hash.0.to_be_bytes().to_vec())
+            .collect()
+    } else {
+        group.block_hashes.clone()
+    }
+}
+
+fn native_parent(group: &GroupEvidence, parent: Option<BlockHash>) -> Option<Vec<u8>> {
+    group
+        .parent_block_hash
+        .clone()
+        .or_else(|| parent.map(|hash| hash.0.to_be_bytes().to_vec()))
 }
 
 /// The engine-hash check's view of one admitted store.
@@ -1410,6 +1874,419 @@ mod tests {
             Some(kv_cache_event::Data::Removed(ref removed)) => removed,
             ref other => panic!("not a removal: {other:?}"),
         }
+    }
+
+    #[test]
+    fn raw_groups_survive_legacy_filtering_and_decode_sparse_ancestry() {
+        let swa = with(
+            with(
+                with(
+                    with(
+                        store(&[3], Some(2), &[9, 10, 11, 12]),
+                        "group_idx",
+                        json!(1),
+                    ),
+                    "kv_cache_spec_kind",
+                    json!("sliding_window_attention"),
+                ),
+                "kv_cache_spec_sliding_window",
+                json!(4),
+            ),
+            "skipped_token_ids",
+            json!([1, 2, 3, 4, 5, 6, 7, 8]),
+        );
+        let swa = with(
+            with(swa, "cache_copy_counts", json!([1])),
+            "token_ids_matchable",
+            json!(true),
+        );
+        let (batches, _) = normalize_all(vec![one(vec![
+            swa,
+            store(&[1, 2, 3], None, &(1..=12).collect::<Vec<_>>()),
+        ])]);
+        let batch = &batches[0];
+        assert_eq!(
+            batch.events.len(),
+            1,
+            "legacy main-attention view stays unchanged"
+        );
+        assert!(batch.group_events_enabled);
+        assert_eq!(batch.group_events.len(), 2);
+        let event = &batch.group_events[0];
+        assert_eq!(event.group_id, 1);
+        assert_eq!(event.parent_block_hash, 2i64.to_be_bytes());
+        assert_eq!(event.skipped_token_ids, (1..=8).collect::<Vec<_>>());
+        assert!(event.ancestry_provided && event.tokens_matchable);
+        assert_eq!(event.cache_copy_counts, vec![1]);
+    }
+
+    #[test]
+    fn native_digest_identity_is_not_the_legacy_low64_identity() {
+        use rmpv::Value as M;
+        let first = vec![1u8; 32];
+        let mut second = first.clone();
+        second[0] = 2;
+        let event = M::Map(vec![
+            (M::from("type"), M::from("BlockStored")),
+            (
+                M::from("block_hashes"),
+                M::Array(vec![M::Binary(first.clone()), M::Binary(second.clone())]),
+            ),
+            (M::from("parent_block_hash"), M::Nil),
+            (
+                M::from("token_ids"),
+                M::Array((1..=8).map(M::from).collect()),
+            ),
+            (M::from("block_size"), M::from(4)),
+            (M::from("group_idx"), M::from(0)),
+            (M::from("kv_cache_spec_kind"), M::from("full_attention")),
+        ]);
+        let wire = M::Array(vec![M::F64(1.0), M::Array(vec![event]), M::from(0)]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &wire).unwrap();
+        let wire: WireBatch = rmp_serde::from_slice(&bytes).unwrap();
+        let mut id = 0;
+        let batch = Normalizer::new().normalize_batch(wire, 1, &mut id);
+        assert!(
+            batch.events.is_empty(),
+            "legacy folded self-collision remains rejected"
+        );
+        assert_eq!(batch.group_events[0].block_hashes, vec![first, second]);
+        assert!(batch.group_events[0].tokens_matchable);
+    }
+
+    #[test]
+    fn positional_extensions_and_invalid_evidence_are_explicit() {
+        let array = json!([
+            "BlockStored",
+            [7],
+            null,
+            [5, 6, 7, 8],
+            4,
+            null,
+            "GPU",
+            null,
+            null,
+            2,
+            "mamba",
+            null,
+            "LOCAL",
+            null,
+            null,
+            [1, 2, 3, 4],
+            [2],
+            true
+        ]);
+        let bad = with(
+            store(&[1], None, &[1, 2, 3, 4]),
+            "cache_copy_counts",
+            json!([1, 2]),
+        );
+        let (batches, normalizer) = normalize_all(vec![one(vec![array, bad])]);
+        let groups = &batches[0].group_events;
+        assert_eq!(groups[0].cache_copy_counts, vec![2]);
+        assert!(groups[0].tokens_matchable && groups[0].ancestry_provided);
+        assert_eq!(
+            groups[1].operation,
+            common::kv_group_event::Operation::Invalid as i32
+        );
+        assert_eq!(normalizer.counts().dropped(DropReason::Malformed), 1);
+    }
+
+    #[test]
+    fn nonempty_ancestry_needs_plain_request_evidence_and_clear_keeps_enablement() {
+        let sparse = with(
+            store(&[2], Some(1), &[5, 6, 7, 8]),
+            "skipped_token_ids",
+            json!([1, 2, 3, 4]),
+        );
+        let marked = with(sparse.clone(), "token_ids_matchable", json!(true));
+        let salted = with(marked.clone(), "cache_salt", json!("tenant"));
+        let (batches, _) = normalize_all(vec![
+            one(vec![sparse, marked, salted]),
+            one(vec![json!({"type":"AllBlocksCleared"})]),
+            one(vec![]),
+        ]);
+        assert!(!batches[0].group_events[0].tokens_matchable);
+        assert!(batches[0].group_events[1].tokens_matchable);
+        assert!(!batches[0].group_events[2].tokens_matchable);
+        assert!(batches[1].group_events_enabled && batches[2].group_events_enabled);
+        assert_eq!(
+            batches[1].group_events[0].operation,
+            common::kv_group_event::Operation::Clear as i32
+        );
+    }
+
+    #[test]
+    fn anchored_delta_and_root_ancestry_decode_without_changing_native_parent() {
+        let root = store(&[1], None, &[1, 2, 3, 4]);
+        let delta = with(
+            with(
+                store(&[3], Some(2), &[9, 10, 11, 12]),
+                "skipped_token_ids",
+                json!([5, 6, 7, 8]),
+            ),
+            "skipped_token_parent_hash",
+            json!(1),
+        );
+        let old = with(
+            with(
+                store(&[3], Some(2), &[9, 10, 11, 12]),
+                "skipped_token_ids",
+                json!([1, 2, 3, 4, 5, 6, 7, 8]),
+            ),
+            "token_ids_matchable",
+            json!(true),
+        );
+        let array = json!(["BlockStored", [3], 2, [9, 10, 11, 12], 4, null, "GPU", null, null,
+            0, "full_attention", null, "LOCAL", null, null, [5, 6, 7, 8], [1], true, 1, {"future": true}]);
+        let (batches, _) = normalize_all(vec![one(vec![
+            root,
+            delta,
+            with(old, "future_map_extension", json!({"ignored": [true]})),
+            array,
+        ])]);
+        let events = &batches[0].group_events;
+        assert_eq!(events[1].parent_block_hash, 2i64.to_be_bytes());
+        assert_eq!(events[1].skipped_token_parent_hash, 1i64.to_be_bytes());
+        assert_eq!(events[1].skipped_token_ids, vec![5, 6, 7, 8]);
+        assert!(events[1].ancestry_provided && events[1].tokens_matchable);
+        assert!(events[2].skipped_token_parent_hash.is_empty());
+        assert_eq!(events[2].skipped_token_ids, (1..=8).collect::<Vec<_>>());
+        assert_eq!(
+            events[3].skipped_token_parent_hash,
+            events[1].skipped_token_parent_hash
+        );
+        assert_eq!(events[3].skipped_token_ids, events[1].skipped_token_ids);
+    }
+
+    #[test]
+    fn native_ancestry_anchor_retains_opaque_bytes_before_legacy_folding() {
+        use rmpv::Value as M;
+        let key = vec![3u8; 32];
+        let mut parent = key.clone();
+        parent[0] = 2;
+        let mut anchor = key.clone();
+        anchor[0] = 1;
+        let event = M::Map(vec![
+            (M::from("type"), M::from("BlockStored")),
+            (
+                M::from("block_hashes"),
+                M::Array(vec![M::Binary(key.clone())]),
+            ),
+            (M::from("parent_block_hash"), M::Binary(parent.clone())),
+            (
+                M::from("token_ids"),
+                M::Array((9..=12).map(M::from).collect()),
+            ),
+            (M::from("block_size"), M::from(4)),
+            (M::from("group_idx"), M::from(0)),
+            (M::from("kv_cache_spec_kind"), M::from("full_attention")),
+            (
+                M::from("skipped_token_ids"),
+                M::Array((5..=8).map(M::from).collect()),
+            ),
+            (M::from("token_ids_matchable"), M::Boolean(true)),
+            (
+                M::from("skipped_token_parent_hash"),
+                M::Binary(anchor.clone()),
+            ),
+        ]);
+        let wire = M::Array(vec![M::F64(1.0), M::Array(vec![event]), M::from(0)]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &wire).unwrap();
+        let wire: WireBatch = rmp_serde::from_slice(&bytes).unwrap();
+        let mut id = 0;
+        let batch = Normalizer::new().normalize_batch(wire, 1, &mut id);
+        assert!(
+            batch.events.is_empty(),
+            "legacy self-reference after low64 folding still rejected"
+        );
+        let event = &batch.group_events[0];
+        assert_eq!(event.block_hashes, vec![key]);
+        assert_eq!(event.parent_block_hash, parent);
+        assert_eq!(event.skipped_token_parent_hash, anchor);
+        assert!(event.tokens_matchable && event.ancestry_provided);
+    }
+
+    #[test]
+    fn anchors_require_ancestry_and_plain_request_or_known_plain_anchor() {
+        let anchored = with(
+            store(&[3], Some(2), &[9, 10, 11, 12]),
+            "skipped_token_parent_hash",
+            json!(1),
+        );
+        let missing = anchored.clone();
+        let unknown = with(anchored.clone(), "skipped_token_ids", json!([]));
+        let marked = with(unknown.clone(), "token_ids_matchable", json!(true));
+        let (batches, _) = normalize_all(vec![one(vec![missing, unknown, marked])]);
+        assert_eq!(
+            batches[0].group_events[0].operation,
+            common::kv_group_event::Operation::Invalid as i32
+        );
+        assert!(!batches[0].group_events[1].tokens_matchable);
+        assert!(batches[0].group_events[2].tokens_matchable);
+        let salted_root = with(
+            store(&[1], None, &[1, 2, 3, 4]),
+            "cache_salt",
+            json!("tenant"),
+        );
+        let child = with(
+            with(anchored, "skipped_token_ids", json!([5, 6, 7, 8])),
+            "token_ids_matchable",
+            json!(true),
+        );
+        let (batches, _) = normalize_all(vec![one(vec![salted_root, child])]);
+        assert!(
+            !batches[0].group_events[1].tokens_matchable,
+            "known false ancestor cannot be overridden"
+        );
+    }
+
+    #[test]
+    fn boolean_extra_keys_remain_opaque_and_cannot_claim_plain_tokens() {
+        let wire = batch_from(one(vec![with(
+            store(&[1], None, &[1, 2, 3, 4]),
+            "extra_keys",
+            json!([[true]]),
+        )]));
+        let WireEvent::BlockStored(event) = &wire.events[0] else {
+            panic!("a readable store");
+        };
+        assert_eq!(event.extra_keys, Some(vec![Some(vec![ExtraKey::Opaque])]));
+        let mut event_id = 0;
+        let batch = Normalizer::new().normalize_batch(wire, 1, &mut event_id);
+        assert!(!batch.group_events[0].tokens_matchable);
+        assert!(stored(&batch.events[0]).blocks[0].extra_keys.is_empty());
+    }
+
+    #[test]
+    fn malformed_inputs_cannot_claim_plain_residency_and_foreign_owners_are_filtered() {
+        for (field, value) in [
+            ("lora_id", json!(1.5)),
+            ("lora_name", json!(false)),
+            ("cache_salt", json!([])),
+            ("extra_keys", json!([[], []])),
+            ("extra_keys", json!([7])),
+            ("group_idx", json!(-1)),
+            ("group_idx", json!(false)),
+            ("kv_cache_spec_kind", json!(7)),
+            ("locality", json!(7)),
+            ("cache_copy_counts", json!([0])),
+            ("token_ids_matchable", json!(1)),
+        ] {
+            let (batches, _) = normalize_all(vec![one(vec![with(
+                store(&[1], None, &[1, 2, 3, 4]),
+                field,
+                value,
+            )])]);
+            assert_eq!(
+                batches[0].group_events[0].operation,
+                common::kv_group_event::Operation::Invalid as i32,
+                "{field}"
+            );
+        }
+        for owner in [json!("another-agent"), json!(7), json!("")] {
+            let (batches, _) = normalize_all(vec![one(vec![with(
+                store(&[1], None, &[1, 2, 3, 4]),
+                "ownership",
+                owner,
+            )])]);
+            assert!(batches[0].group_events.is_empty());
+        }
+    }
+
+    #[test]
+    fn dense_children_inherit_unmatchable_parent_and_other_tiers_only_declare_groups() {
+        let salted = with(
+            store(&[1], None, &[1, 2, 3, 4]),
+            "cache_salt",
+            json!("tenant"),
+        );
+        let child = store(&[2], Some(1), &[5, 6, 7, 8]);
+        let (batches, _) = normalize_all(vec![one(vec![salted, child])]);
+        assert!(!batches[0].group_events[1].tokens_matchable);
+        let root = store(&[1], None, &[1, 2, 3, 4]);
+        let host = with(
+            with(root.clone(), "medium", json!("CPU")),
+            "cache_salt",
+            json!("tenant"),
+        );
+        let child = with(
+            store(&[2], Some(1), &[5, 6, 7, 8]),
+            "skipped_token_ids",
+            json!([1, 2, 3, 4]),
+        );
+        let (batches, _) = normalize_all(vec![one(vec![root, host, child])]);
+        assert!(batches[0].group_events[1].block_hashes.is_empty());
+        assert_eq!(batches[0].group_events[1].block_size, 4);
+        assert!(batches[0].group_events[1].token_ids.is_empty());
+        assert!(batches[0].group_events[2].tokens_matchable);
+    }
+
+    #[test]
+    fn other_tier_metadata_stores_still_validate_native_evidence() {
+        let invalid = vec![
+            with(
+                store(&[1], None, &[1, 2, 3, 4]),
+                "cache_copy_counts",
+                json!([0]),
+            ),
+            with(
+                store(&[1], None, &[1, 2, 3, 4]),
+                "cache_copy_counts",
+                json!([1, 2]),
+            ),
+            store(&[1, 1], None, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            store(&[1], Some(1), &[1, 2, 3, 4]),
+            with(
+                with(
+                    store(&[1], None, &[1, 2, 3, 4]),
+                    "skipped_token_ids",
+                    json!([]),
+                ),
+                "skipped_token_parent_hash",
+                json!(1),
+            ),
+            store(&[1], None, &[1, 2, 3]),
+        ];
+        for (field, value) in [("medium", json!("CPU")), ("locality", json!("REMOTE"))] {
+            for event in &invalid {
+                let (batches, normalizer) = normalize_all(vec![one(vec![
+                    store(&[9], None, &[1, 2, 3, 4]),
+                    with(event.clone(), field, value.clone()),
+                ])]);
+                assert_eq!(
+                    batches[0].group_events[1].operation,
+                    common::kv_group_event::Operation::Invalid as i32,
+                    "{field}: {event}",
+                );
+                assert!(normalizer.ranks[&0].group_plain.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_counts_do_not_accumulate_repeated_reports() {
+        let report = with(
+            store(&[1], None, &[1, 2, 3, 4]),
+            "cache_copy_counts",
+            json!([2]),
+        );
+        let remaining = with(remove(&[1]), "cache_copy_counts", json!([1]));
+        let (batches, normalizer) = normalize_all(vec![
+            one(vec![report.clone(), report]),
+            one(vec![remaining]),
+        ]);
+        assert_eq!(
+            stored(&batches[0].events[0]).blocks[0].cache_copy_count,
+            Some(2)
+        );
+        assert_eq!(removed(&batches[1].events[0]).cache_copy_counts, vec![1]);
+        assert_eq!(
+            normalizer.ranks[&0].tiers[&(KvCacheTier::Device as i32)][&1].copies,
+            1
+        );
     }
 
     #[test]
@@ -1841,6 +2718,54 @@ mod tests {
     }
 
     #[test]
+    fn positional_lora_name_validation_matches_maps_without_changing_legacy() {
+        for name in [
+            Value::Null,
+            json!(""),
+            json!("adapter"),
+            json!(false),
+            json!(7),
+            json!([]),
+        ] {
+            let map = with(store(&[1], None, &[1, 2, 3, 4]), "lora_name", name.clone());
+            let array = json!([
+                "BlockStored",
+                [1],
+                null,
+                [1, 2, 3, 4],
+                4,
+                null,
+                "GPU",
+                name,
+                null,
+                0,
+                "full_attention"
+            ]);
+            let (from_map, _) = normalize_all(vec![one(vec![map])]);
+            let (from_array, _) = normalize_all(vec![one(vec![array])]);
+            assert_eq!(from_map, from_array, "lora_name={name}");
+            let batch = &from_array[0];
+            assert_eq!(
+                stored(&batch.events[0]).lora_name.as_deref(),
+                name.as_str().filter(|name| !name.is_empty())
+            );
+            let group = &batch.group_events[0];
+            if name.is_null() || name.is_string() {
+                assert_eq!(
+                    group.operation,
+                    common::kv_group_event::Operation::Store as i32
+                );
+                assert_eq!(group.tokens_matchable, name.is_null() || name == json!(""));
+            } else {
+                assert_eq!(
+                    group.operation,
+                    common::kv_group_event::Operation::Invalid as i32
+                );
+            }
+        }
+    }
+
+    #[test]
     fn legacy_arrays_keep_their_trailing_slots_in_order() {
         // ownership is the removal's sixth slot and must gate the event even
         // when locality (the fifth) is set.
@@ -1999,6 +2924,7 @@ mod tests {
                 lora_name: None,
                 cache_salt: None,
                 extra_keys: keys,
+                group: GroupEvidence::default(),
                 tail: EventTail {
                     medium: Some("GPU".into()),
                     group_idx: Some(0),

@@ -1955,6 +1955,7 @@ impl SchedulerState {
                 dp_rank: Some(0),
                 snapshot: None,
                 load: None,
+                ..Default::default()
             })
         };
 

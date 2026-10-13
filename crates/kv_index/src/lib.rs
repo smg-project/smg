@@ -17,6 +17,7 @@ pub mod chain_index;
 pub mod churn;
 mod common;
 mod event_tree;
+pub mod group_cache;
 mod lane_map;
 pub mod lane_pool;
 mod path_hash;

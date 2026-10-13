@@ -12,6 +12,7 @@ engine-zmq-client.workspace = true
 smg-grpc-client.workspace = true
 llm-tokenizer.workspace = true
 openai-protocol.workspace = true
+kv-index.workspace = true
 
 bytes.workspace = true
 chrono.workspace = true
@@ -37,8 +38,6 @@ zeromq.workspace = true
 [dev-dependencies]
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 criterion = { version = "0.8", features = ["html_reports"] }
-# The normalized KV-event streams' round trip into the gateway's reference index.
-kv-index.workspace = true
 # The engines' KV-event wire shapes, built in code for the normalizer tests.
 rmpv.workspace = true
 portpicker = "0.1"

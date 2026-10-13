@@ -193,12 +193,14 @@ impl Generator {
             lora_name: None,
             cache_salt: None,
             extra_keys: None,
+            group: Default::default(),
             tail: self.tail(host),
         })
     }
 
     fn removed(&self, hashes: Vec<i64>, host: bool) -> WireEvent {
         WireEvent::BlockRemoved(WireRemoved {
+            group: Default::default(),
             block_hashes: hashes.into_iter().map(BlockHash).collect(),
             tail: self.tail(host),
         })
@@ -347,7 +349,10 @@ impl Generator {
         let rank = self.rng.below(RANKS);
         let mut events = Vec::new();
         if index == self.clear_at {
-            events.push(WireEvent::AllBlocksCleared { ownership: None });
+            events.push(WireEvent::AllBlocksCleared {
+                ownership: None,
+                ownership_provided: false,
+            });
             self.ranks[0] = RankModel::default();
         }
         let rank = if index == self.clear_at { 0 } else { rank };
@@ -459,6 +464,7 @@ fn emitted(chunks: &[KvEventBatch]) -> LiveSet {
 fn wire_stored(stored: &KvBlocksStored) -> WireEvent {
     let first = &stored.blocks[0];
     WireEvent::BlockStored(WireStored {
+        group: Default::default(),
         block_hashes: stored
             .blocks
             .iter()

@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     apply::{WorkerIndexCounters, WorkerIndexState},
+    groups::GroupViewHandle,
     KvEventMonitor,
 };
 use crate::{
@@ -29,6 +30,8 @@ use crate::{
 pub(super) struct WorkerStreamState {
     pub(super) ranks: HashMap<i32, RankState>,
     pub(super) index: WorkerIndexState,
+    pub(super) groups: GroupViewHandle,
+    pub(super) group_replay_through: Option<u64>,
     /// A relay snapshot whose chunks are still arriving on the stream.
     pub(super) snapshot: Option<SnapshotProgress>,
 }
@@ -39,6 +42,7 @@ pub(super) struct SnapshotProgress {
     count: u32,
     applied: u32,
     blocks: u64,
+    groups_unknown: bool,
 }
 
 impl WorkerStreamState {
@@ -129,6 +133,10 @@ impl KvEventMonitor {
                     "KV event publisher restarted; clearing the worker's index state"
                 );
                 Self::clear_worker(worker_id, indexer, state, rank);
+                if rank == 0 {
+                    state.groups.write().restart();
+                }
+                state.group_replay_through = None;
                 Metrics::record_kv_event_resync(
                     worker_url,
                     ResyncReason::PublisherRestart.as_str(),
@@ -136,6 +144,10 @@ impl KvEventMonitor {
                 degraded_changed = true;
             }
             Admission::Replay { expected } => {
+                if rank == 0 {
+                    state.groups.write().valid = false;
+                    state.group_replay_through = Some(seq);
+                }
                 Metrics::record_kv_event_gap(worker_url, "replay_requested", seq - expected);
                 return BatchOutcome::Gap {
                     expected,
@@ -143,6 +155,10 @@ impl KvEventMonitor {
                 };
             }
             Admission::Unrecovered { missed, cleared } => {
+                if rank == 0 {
+                    state.groups.write().clear_evidence();
+                    state.group_replay_through = None;
+                }
                 warn!(
                     worker_url = %worker_url,
                     rank,
@@ -188,7 +204,17 @@ impl KvEventMonitor {
                 }
                 _ => {}
             }
-            Self::apply_event(event, worker_id, indexer, &mut state.index);
+            Self::apply_rank_event(event, rank, worker_id, indexer, &mut state.index);
+        }
+        if rank == 0 {
+            let mut groups = state.groups.write();
+            groups.apply(batch);
+            if let Some(through) = state.group_replay_through {
+                groups.valid = seq >= through && !groups.malformed;
+                if seq >= through {
+                    state.group_replay_through = None;
+                }
+            }
         }
         Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
         Self::record_parentless(worker_url, &state.index.counters, &counters_before);
@@ -254,6 +280,13 @@ impl KvEventMonitor {
                 );
             }
             Self::apply_cleared(worker_id, indexer, &mut state.index);
+            {
+                let mut groups = state.groups.write();
+                groups.restart();
+                groups.valid = false;
+                groups.cache.begin_snapshot();
+            }
+            state.group_replay_through = None;
             for cursor in state.ranks.values_mut() {
                 cursor.reset();
             }
@@ -262,6 +295,7 @@ impl KvEventMonitor {
                 count: chunk.count.max(1),
                 applied: 0,
                 blocks: chunk.blocks,
+                groups_unknown: chunk.index != 0,
             });
         }
         let cursor = state.ranks.entry(rank).or_default();
@@ -276,7 +310,12 @@ impl KvEventMonitor {
             if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
                 snapshot_blocks += stored.blocks.len();
             }
-            Self::apply_event(event, worker_id, indexer, &mut state.index);
+            Self::apply_rank_event(event, rank, worker_id, indexer, &mut state.index);
+        }
+        {
+            let mut groups = state.groups.write();
+            groups.apply(batch);
+            groups.valid = false;
         }
         Self::record_parentless(worker_url, &state.index.counters, &counters_before);
         if snapshot_blocks > 0 {
@@ -286,6 +325,9 @@ impl KvEventMonitor {
         Metrics::record_kv_event_batch(worker_url, "snapshot");
         Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
         if let Some(progress) = &mut state.snapshot {
+            progress.groups_unknown |= chunk.unknown_before > 0
+                || chunk.index != progress.applied
+                || chunk.count != progress.count;
             progress.applied += 1;
             if progress.applied >= progress.count {
                 info!(
@@ -295,7 +337,11 @@ impl KvEventMonitor {
                     through = batch.sequence_number,
                     "KV event relay snapshot applied; continuing with live events"
                 );
+                let groups_unknown = progress.groups_unknown;
                 state.snapshot = None;
+                let mut groups = state.groups.write();
+                groups.cache.finish_snapshot();
+                groups.valid = !groups_unknown && !groups.malformed;
                 Metrics::set_kv_event_degraded_ranks(worker_url, state.degraded_ranks());
             }
         }
@@ -308,6 +354,7 @@ impl KvEventMonitor {
     /// as a first one instead of clearing the index a second time.
     fn clear_worker(worker_id: u32, indexer: &KvIndex, state: &mut WorkerStreamState, rank: i32) {
         Self::apply_cleared(worker_id, indexer, &mut state.index);
+        state.groups.write().clear_evidence();
         for (other, cursor) in &mut state.ranks {
             if *other != rank {
                 cursor.reset();
@@ -337,6 +384,8 @@ impl KvEventMonitor {
         reason: ResyncReason,
     ) {
         Self::apply_cleared(worker_id, indexer, &mut state.index);
+        state.groups.write().clear_evidence();
+        state.group_replay_through = None;
         for cursor in state.ranks.values_mut() {
             cursor.reset();
         }
@@ -430,6 +479,108 @@ mod tests {
             dp_rank: rank,
             snapshot: None,
             load: None,
+            ..Default::default()
+        }
+    }
+
+    fn group_store(group_id: u32, kind: &str) -> smg_grpc_client::common_proto::KvGroupEvent {
+        use smg_grpc_client::common_proto::{kv_group_event::Operation, KvGroupEvent};
+        KvGroupEvent {
+            operation: Operation::Store as i32,
+            group_id,
+            kind: kind.to_string(),
+            block_hashes: vec![vec![group_id as u8 + 1]],
+            token_ids: vec![1, 2, 3, 4],
+            block_size: 4,
+            tokens_matchable: true,
+            ancestry_provided: true,
+            cache_copy_counts: vec![1],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_replayed_clear_does_not_enable_groups_before_the_missing_tail() {
+        use kv_index::group_cache::GroupRequest;
+        use smg_grpc_client::common_proto::{kv_group_event::Operation, KvGroupEvent};
+
+        let mut sim = Sim::new();
+        let mut first = batch(1, None, vec![]);
+        first.group_events_enabled = true;
+        first.group_events = vec![group_store(0, "full_attention")];
+        assert_eq!(sim.feed(&first), BatchOutcome::Applied);
+        let through = batch(3, None, vec![]);
+        assert!(matches!(sim.feed(&through), BatchOutcome::Gap { .. }));
+        let mut replay = batch(2, None, vec![cleared()]);
+        replay.group_events_enabled = true;
+        replay.group_events = vec![
+            KvGroupEvent {
+                operation: Operation::Clear as i32,
+                ..Default::default()
+            },
+            group_store(0, "full_attention"),
+        ];
+        assert_eq!(sim.feed(&replay), BatchOutcome::Applied);
+        assert!(
+            !sim.state.groups.read().valid,
+            "the missing tail can still remove these blocks"
+        );
+        assert_eq!(sim.feed(&through), BatchOutcome::Applied);
+        let groups = sim.state.groups.read();
+        assert!(groups.valid);
+        assert_eq!(
+            groups
+                .cache
+                .reusable_tokens(&GroupRequest::new(&[1, 2, 3, 4, 5])),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn another_rank_restart_preserves_required_rank_zero_groups() {
+        let mut sim = Sim::new();
+        let mut first = batch(1, Some(0), vec![]);
+        first.group_events_enabled = true;
+        first.group_events = vec![group_store(0, "full_attention"), group_store(1, "mamba")];
+        sim.feed(&first);
+        sim.feed(&batch(5, Some(1), vec![]));
+        sim.state.ranks.get_mut(&1).unwrap().reconnected();
+        assert_eq!(sim.feed(&batch(1, Some(1), vec![])), BatchOutcome::Applied);
+        let mut after = batch(2, Some(0), vec![]);
+        after.group_events_enabled = true;
+        after.group_events = vec![group_store(0, "full_attention")];
+        sim.feed(&after);
+        let groups = sim.state.groups.read();
+        assert!(groups.enabled);
+        assert!(
+            !groups.valid,
+            "rank zero evidence was invalidated with the pooled index"
+        );
+        let snapshot = groups.cache.snapshot_events();
+        assert!(
+            snapshot.iter().any(|event| matches!(
+                event,
+                kv_index::group_cache::GroupEvent::Store { group_id: 1, .. }
+            )),
+            "the missing Mamba group must remain required"
+        );
+    }
+
+    #[test]
+    fn incomplete_or_late_group_snapshots_remain_unknown() {
+        for late in [false, true] {
+            let mut sim = Sim::new();
+            let mut chunks = snapshot_chunks(10, None, &[vec![cleared()], vec![]], 0);
+            for chunk in &mut chunks {
+                chunk.group_events_enabled = true;
+                chunk.group_events = vec![group_store(0, "full_attention")];
+                chunk.snapshot.as_mut().unwrap().unknown_before = u64::from(late);
+            }
+            sim.feed(&chunks[0]);
+            assert!(!sim.state.groups.read().valid);
+            chunks[1].snapshot.as_mut().unwrap().unknown_before = 0;
+            sim.feed(&chunks[1]);
+            assert_eq!(sim.state.groups.read().valid, !late);
         }
     }
 
@@ -1007,6 +1158,7 @@ mod tests {
                         unknown_before: 0,
                     }),
                     load: None,
+                    ..Default::default()
                 }
             })
             .collect()
@@ -1200,7 +1352,8 @@ mod tests {
             Some(SnapshotProgress {
                 count: 2,
                 applied: 1,
-                blocks: 2
+                blocks: 2,
+                groups_unknown: false,
             })
         );
         assert_eq!(sim.state.resume_sequence(), 9);

@@ -48,10 +48,12 @@ use crate::{
 
 mod admission;
 mod apply;
+mod groups;
 mod subscription;
 
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
+pub(crate) use groups::ModelGroups;
 
 /// Default jump size for new positional indexers.
 const DEFAULT_JUMP_SIZE: usize = 64;
@@ -93,6 +95,7 @@ pub struct KvEventMonitor {
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
     block_sizes: Arc<DashMap<String, KvBlockSize>>,
+    group_views: Arc<DashMap<String, Arc<ModelGroups>>>,
     /// Per-worker subscription slots: worker_url → the live subscription, or
     /// the reservation a removal leaves until the old task has cleaned up.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove; Arc so a
@@ -173,6 +176,7 @@ impl KvEventMonitor {
         Self {
             indexers: Arc::new(DashMap::new()),
             block_sizes: Arc::new(DashMap::new()),
+            group_views: Arc::new(DashMap::new()),
             worker_handles: Arc::new(Mutex::new(HashMap::new())),
             kind,
             jump_size,
@@ -378,6 +382,19 @@ impl KvEventMonitor {
         let worker = Arc::clone(worker);
         let worker_url = url.clone();
         let block_sizes = Arc::clone(&self.block_sizes);
+        let model_groups = Arc::clone(
+            self.group_views
+                .entry(model_id.clone())
+                .or_default()
+                .value(),
+        );
+        let group_view = Arc::new(parking_lot::RwLock::new(groups::GroupView {
+            model_enabled: Some(Arc::clone(&model_groups.enabled)),
+            ..Default::default()
+        }));
+        model_groups
+            .workers
+            .insert(url.clone(), Arc::clone(&group_view));
 
         info!(
             worker_url = %url,
@@ -414,6 +431,7 @@ impl KvEventMonitor {
                 loop_model_id,
                 shutdown_rx,
                 load_sink,
+                group_view,
             ))
             .catch_unwind()
             .await;
@@ -432,6 +450,7 @@ impl KvEventMonitor {
                 );
                 Metrics::record_kv_event_subscription_failure(&task_url, "panic");
             }
+            model_groups.remove(&task_url);
             Self::complete_removal(
                 &slots,
                 &indexers,
@@ -603,11 +622,18 @@ impl KvEventMonitor {
 
         self.indexers.clear();
         self.block_sizes.clear();
+        self.group_views.clear();
     }
 
     /// Get the indexer for a model (used by `CacheAwarePolicy` for queries).
     pub fn get_indexer(&self, model_id: &str) -> Option<Arc<KvIndex>> {
         self.indexers.get(model_id).map(|r| Arc::clone(&r))
+    }
+
+    pub(crate) fn group_views(&self, model_id: &str) -> Option<Arc<ModelGroups>> {
+        self.group_views
+            .get(model_id)
+            .map(|views| Arc::clone(&views))
     }
 
     /// Get the block size for a model (learned from events or set via `set_block_size`).
@@ -655,6 +681,25 @@ pub mod bench_support {
         pub fn set_index(&self, model_id: &str, index: Arc<KvIndex>) {
             self.indexers.insert(model_id.to_string(), index);
         }
+
+        pub fn set_group_events(&self, model_id: &str, worker_url: &str, batch: &KvEventBatch) {
+            let model = Arc::clone(
+                self.group_views
+                    .entry(model_id.to_string())
+                    .or_default()
+                    .value(),
+            );
+            let view = model
+                .workers
+                .entry(worker_url.to_string())
+                .or_insert_with(|| {
+                    Arc::new(parking_lot::RwLock::new(super::groups::GroupView {
+                        model_enabled: Some(Arc::clone(&model.enabled)),
+                        ..Default::default()
+                    }))
+                });
+            view.write().apply(batch);
+        }
     }
 
     /// One worker's feed into an index.
@@ -679,7 +724,13 @@ pub mod bench_support {
         /// Apply every event of `batch`, as an admitted batch is applied.
         pub fn apply(&mut self, index: &KvIndex, batch: &KvEventBatch) {
             for event in &batch.events {
-                KvEventMonitor::apply_event(event, self.worker, index, &mut self.state);
+                KvEventMonitor::apply_rank_event(
+                    event,
+                    batch.dp_rank.unwrap_or(0),
+                    self.worker,
+                    index,
+                    &mut self.state,
+                );
             }
         }
 

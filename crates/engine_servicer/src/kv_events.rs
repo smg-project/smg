@@ -894,6 +894,7 @@ impl Subscriber {
             dp_rank: rank,
             snapshot: None,
             load: Some(record),
+            ..Default::default()
         })
     }
 
@@ -2198,6 +2199,40 @@ mod tests {
             .expect("a batch")
     }
 
+    async fn read_snapshot(
+        stream: &mut BoxStream<common::KvEventBatch>,
+        through: u64,
+        blocks: u64,
+    ) -> Vec<common::KvEventBatch> {
+        let first = read(stream).await;
+        let count = first.snapshot.as_ref().expect("snapshot marker").count;
+        assert!(count > 0);
+        let mut chunks = vec![first];
+        for _ in 1..count {
+            chunks.push(read(stream).await);
+        }
+        for (index, chunk) in chunks.iter().enumerate() {
+            let marker = chunk.snapshot.as_ref().expect("snapshot marker");
+            assert_eq!(marker.index, u32::try_from(index).expect("chunk index"));
+            assert_eq!(marker.count, count);
+            assert_eq!(marker.blocks, blocks);
+            assert_eq!(marker.unknown_before, 0);
+            assert_eq!(
+                chunk.sequence_number,
+                through.saturating_sub(u64::from(count - 1))
+                    + u64::try_from(index).expect("chunk index")
+            );
+        }
+        assert_eq!(chunks.last().expect("snapshot").sequence_number, through);
+        assert!(is_cleared(&chunks[0].events[0]));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.dp_rank.is_none()
+                && !chunk.group_events.is_empty()
+                && stored_hashes(chunk).is_empty()
+        }));
+        chunks
+    }
+
     async fn read_error(stream: &mut BoxStream<common::KvEventBatch>) -> Status {
         timeout(Duration::from_secs(5), stream.next())
             .await
@@ -2398,11 +2433,9 @@ mod tests {
         // subscriber without a cursor gets the snapshot (both copies of block
         // 42, from sequences 1 and 4) cut at 4, then live.
         let mut no_cursor = lab.subscribe(0).expect("a snapshot");
-        let chunk = read(&mut no_cursor).await;
-        assert_eq!(chunk.sequence_number, 4);
-        assert_eq!(chunk.snapshot.as_ref().map(|chunk| chunk.blocks), Some(2));
+        let chunks = read_snapshot(&mut no_cursor, 4, 2).await;
         assert_eq!(
-            stored_hashes(&chunk),
+            chunks.iter().flat_map(stored_hashes).collect::<Vec<_>>(),
             vec![(Some(41), vec![42]), (Some(41), vec![42])]
         );
         lab.publish(5, &batch2).await;
@@ -2982,21 +3015,13 @@ mod tests {
         // Published before the first poll: must follow the snapshot.
         lab.publish(6, &store_payload(6.0, &[30], Some(22))).await;
         lab.wait_relayed(7).await;
-        let chunk = read(&mut stream).await;
-        assert_eq!(chunk.sequence_number, 5, "stamped at the cut");
+        let chunks = read_snapshot(&mut stream, 5, 5).await;
+        assert!(chunks
+            .iter()
+            .filter(|chunk| !stored_hashes(chunk).is_empty())
+            .all(|chunk| chunk.dp_rank == Some(0)));
         assert_eq!(
-            chunk.snapshot,
-            Some(common::KvSnapshotChunk {
-                index: 0,
-                count: 1,
-                blocks: 5,
-                unknown_before: 0,
-            })
-        );
-        assert_eq!(chunk.dp_rank, Some(0));
-        assert!(is_cleared(&chunk.events[0]));
-        assert_eq!(
-            stored_hashes(&chunk),
+            chunks.iter().flat_map(stored_hashes).collect::<Vec<_>>(),
             vec![(None, vec![10, 11, 12]), (None, vec![21, 22])],
             "the live set as the engine stored it, chains merged"
         );
@@ -3034,11 +3059,9 @@ mod tests {
             status.message()
         );
         let mut stream = lab.subscribe(0).expect("a snapshot");
-        let chunk = read(&mut stream).await;
-        assert_eq!(chunk.sequence_number, 4);
-        assert_eq!(chunk.snapshot.as_ref().map(|chunk| chunk.blocks), Some(4));
+        let chunks = read_snapshot(&mut stream, 4, 4).await;
         assert_eq!(
-            stored_hashes(&chunk),
+            chunks.iter().flat_map(stored_hashes).collect::<Vec<_>>(),
             vec![
                 (None, vec![10]),
                 (None, vec![20]),
@@ -3078,6 +3101,7 @@ mod tests {
             dp_rank: Some(0),
             snapshot: None,
             load: None,
+            ..Default::default()
         }
     }
 

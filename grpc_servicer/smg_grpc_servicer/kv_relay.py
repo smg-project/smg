@@ -39,10 +39,15 @@ every removal go through, and the gateway counts copies per worker and tier.
 The relay's own record of a hash (the namespace a child inherits, the digest
 the hash check chains on) counts the copies too, capped as the gateway caps
 them, and goes with the last removal. Of a hybrid model's KV-cache
-groups only the main-attention ones are forwarded; this relay drops every
-sliding-window and state-space group's events (the Rust relay additionally
+groups only the main-attention ones feed the legacy view; this relay drops every
+sliding-window and state-space group's legacy event (the Rust relay additionally
 forwards a rank that publishes sliding-window groups only, with the hashes
 aligned to the tail of the tokens).
+
+An additive group view retains native hash bytes and GPU-local evidence for
+every reported group before legacy normalization. Its token ancestry is not
+cache residency. Authoritative copy counts, when supplied, make a repeated
+report distinct from an additional physical copy in both views.
 
 ``SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor`` (or ``relay(...,
 hash_check=...)``) turns on engine-hash verification: every store whose
@@ -193,6 +198,30 @@ def _hashes(value: object) -> list[int] | None:
     return None if any(item is None for item in folded) else folded  # type: ignore[return-value]
 
 
+def _native_hash(value: object) -> bytes | None:
+    if isinstance(value, int) and not isinstance(value, bool) and -(2**63) <= value < 2**64:
+        return (value & _U64_MASK).to_bytes(8, "big")
+    if isinstance(value, (bytes, bytearray)) and value:
+        return bytes(value)
+    return None
+
+
+def _native_hashes(value: object) -> list[bytes] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    hashes = [_native_hash(item) for item in value]
+    return None if any(item is None for item in hashes) else hashes  # type: ignore[return-value]
+
+
+def _copy_counts(value: object, size: int, *, stored: bool) -> list[int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != size:
+        return None
+    counts = [_unsigned32(item) for item in value]
+    if any(item is None or (stored and item == 0) for item in counts):
+        return None
+    return counts  # type: ignore[return-value]
+
+
 def _tokens(value: object) -> tuple[list[int], list[int] | None] | None:
     """Token ids as plain ints, or bigram ``[token, next]`` cells folded to their
     tokens; the second item is both words of every bigram (for the engine-hash
@@ -284,8 +313,19 @@ _STORED_SLOTS = (
     "locality",
     "ownership",
     "session_id",
+    "skipped_token_ids",
+    "cache_copy_counts",
+    "token_ids_matchable",
+    "skipped_token_parent_hash",
 )
-_REMOVED_SLOTS = ("block_hashes", "medium", "group_idx", "locality", "ownership")
+_REMOVED_SLOTS = (
+    "block_hashes",
+    "medium",
+    "group_idx",
+    "locality",
+    "ownership",
+    "cache_copy_counts",
+)
 
 
 @dataclass
@@ -313,6 +353,16 @@ class WireEvent:
     locality: str | None = None
     ownership: str | None = None
     session_id: str | None = None
+    native_block_hashes: list[bytes] | None = None
+    native_parent_block_hash: bytes | None = None
+    skipped_token_ids: list[int] | None = None
+    cache_copy_counts: list[int] | None = None
+    group_invalid: bool = False
+    group_present: bool = False
+    ownership_provided: bool = False
+    namespace_inputs: bool = False
+    token_ids_matchable: bool | None = None
+    skipped_token_parent_hash: bytes | None = None
 
 
 @dataclass
@@ -333,16 +383,67 @@ def _event_from_fields(kind: str, raw: dict[str, Any]) -> WireEvent:
         "ownership": _text(tail["ownership"]),
         "session_id": _text(tail["session_id"]),
     }
+    # Keep malformed group metadata distinguishable from a legacy publisher
+    # that has no group field at all. The legacy decoder stays lenient.
+    group_invalid = any(tail[key] is not None and tail_parsed[key] is None for key in _TAIL_KEYS)
+    native_hashes = _native_hashes(raw.get("block_hashes"))
+    counts_raw = raw.get("cache_copy_counts")
+    counts = (
+        _copy_counts(counts_raw, len(native_hashes or []), stored=kind == "BlockStored")
+        if counts_raw is not None
+        else None
+    )
+    group_invalid |= counts_raw is not None and counts is None
+    group_fields = {
+        "native_block_hashes": native_hashes,
+        "cache_copy_counts": counts,
+        "group_invalid": group_invalid,
+        "ownership_provided": raw.get("ownership") is not None,
+        "group_present": any(
+            raw.get(key) is not None
+            for key in ("group_idx", "kv_cache_spec_kind", "kv_cache_spec_sliding_window")
+        ),
+    }
+
+    def malformed(field: str) -> WireEvent:
+        return WireEvent("malformed", field, **tail_parsed, **group_fields)
+
     if kind == "BlockStored":
         hashes = _hashes(raw.get("block_hashes"))
         if hashes is None:
-            return WireEvent("malformed", "block_hashes")
+            return malformed("block_hashes")
         tokens = _tokens(raw.get("token_ids"))
         if tokens is None:
-            return WireEvent("malformed", "token_ids")
+            return malformed("token_ids")
         block_size = _signed(raw.get("block_size"))
         if block_size is None:
-            return WireEvent("malformed", "block_size")
+            return malformed("block_size")
+        parent_raw = raw.get("parent_block_hash")
+        parent = _native_hash(parent_raw)
+        skipped_raw = raw.get("skipped_token_ids")
+        skipped = _tokens(skipped_raw) if skipped_raw is not None else None
+        anchor_raw = raw.get("skipped_token_parent_hash")
+        anchor = _native_hash(anchor_raw)
+        group_fields["group_invalid"] |= (
+            (parent_raw is not None and parent is None)
+            or (skipped_raw is not None and (skipped is None or skipped[1] is not None))
+            or (anchor_raw is not None and (anchor is None or skipped_raw is None))
+        )
+        extras_raw = raw.get("extra_keys")
+        matchable = raw.get("token_ids_matchable")
+        group_fields["group_invalid"] |= matchable is not None and type(matchable) is not bool
+        group_fields["group_invalid"] |= any(
+            raw.get(key) is not None and _text(raw[key]) is None
+            for key in ("lora_name", "cache_salt")
+        ) or (raw.get("lora_id") is not None and _signed(raw["lora_id"]) is None)
+        if extras_raw is not None:
+            group_fields["group_invalid"] |= (
+                not isinstance(extras_raw, (list, tuple))
+                or len(extras_raw) != len(hashes)
+                or any(
+                    keys is not None and not isinstance(keys, (list, tuple)) for keys in extras_raw
+                )
+            )
         return WireEvent(
             kind,
             block_hashes=hashes,
@@ -355,16 +456,30 @@ def _event_from_fields(kind: str, raw: dict[str, Any]) -> WireEvent:
             lora_name=_text(raw.get("lora_name")),
             cache_salt=_text(raw.get("cache_salt")),
             extra_keys=_extra_keys(raw.get("extra_keys")),
+            native_parent_block_hash=parent,
+            skipped_token_ids=None if skipped is None else skipped[0],
+            skipped_token_parent_hash=anchor,
+            token_ids_matchable=matchable if type(matchable) is bool else None,
+            namespace_inputs=(
+                raw.get("lora_id") is not None
+                or bool(raw.get("lora_name"))
+                or bool(raw.get("cache_salt"))
+                or (
+                    extras_raw is not None
+                    and (not isinstance(extras_raw, (list, tuple)) or any(extras_raw))
+                )
+            ),
             **tail_parsed,
+            **group_fields,
         )
     if kind == "BlockRemoved":
         hashes = _hashes(raw.get("block_hashes"))
         if hashes is None:
-            return WireEvent("malformed", "block_hashes")
-        return WireEvent(kind, block_hashes=hashes, **tail_parsed)
+            return malformed("block_hashes")
+        return WireEvent(kind, block_hashes=hashes, **tail_parsed, **group_fields)
     if kind == "AllBlocksCleared":
-        return WireEvent(kind, ownership=tail_parsed["ownership"])
-    return WireEvent("unknown")
+        return WireEvent(kind, ownership=tail_parsed["ownership"], **group_fields)
+    return WireEvent("unknown", **tail_parsed, **group_fields)
 
 
 def parse_event(raw: object) -> WireEvent:
@@ -372,7 +487,9 @@ def parse_event(raw: object) -> WireEvent:
     if isinstance(raw, dict):
         kind = raw.get("type")
         if not isinstance(kind, str):
-            return WireEvent("malformed", "type")
+            event = _event_from_fields("unknown", raw)
+            event.kind, event.missing = "malformed", "type"
+            return event
         return _event_from_fields(kind, raw)
     if isinstance(raw, (list, tuple)):
         if not raw or not isinstance(raw[0], str):
@@ -489,6 +606,10 @@ class Normalizer:
 
     def __init__(self, hash_check: str | None = None) -> None:
         self.ranks: dict[int, _RankState] = {}
+        # A clear withdraws residency, not the fact this is a hybrid publisher.
+        # Both records remain rank-local, as the legacy namespace records do.
+        self._group_ranks: set[int] = set()
+        self._group_paths: dict[int, dict[tuple[int, bytes], bool]] = {}
         self.counts = Counts()
         self._event_id = 0
         self.hash_check = _hash_check_name(hash_check)
@@ -510,10 +631,117 @@ class Normalizer:
             proto.dp_rank = rank
         for event in batch.events:
             self._event_id += 1
+            group_event = self._group_event(event, rank)
+            if group_event is not None:
+                proto.group_events.append(group_event)
             converted = self.normalize(event, rank, self._event_id)
             if converted is not None:
                 proto.events.append(converted)
+        proto.group_events_enabled = (-1 if rank is None else rank) in self._group_ranks
         return proto
+
+    def _group_event(self, event: WireEvent, dp_rank: int | None):
+        """Extract GPU-local group evidence without the legacy hash folding or filters."""
+        rank = -1 if dp_rank is None else dp_rank
+        if event.ownership_provided:
+            return None
+        if event.group_present:
+            self._group_ranks.add(rank)
+        if rank not in self._group_ranks:
+            return None
+        if event.kind == "AllBlocksCleared":
+            if event.group_invalid:
+                self._group_paths.pop(rank, None)
+                return common_pb2.KvGroupEvent(operation=common_pb2.KvGroupEvent.INVALID)
+            self._group_paths.pop(rank, None)
+            return common_pb2.KvGroupEvent(operation=common_pb2.KvGroupEvent.CLEAR)
+        invalid = common_pb2.KvGroupEvent(operation=common_pb2.KvGroupEvent.INVALID)
+        if (
+            event.kind not in ("BlockStored", "BlockRemoved")
+            or event.group_invalid
+            or event.group_idx is None
+            or event.native_block_hashes is None
+        ):
+            self._group_paths.pop(rank, None)
+            return invalid
+        hashes = event.native_block_hashes
+        if event.kind == "BlockStored" and (
+            not event.kv_cache_spec_kind
+            or not 0 < event.block_size < 2**32
+            or len(event.token_ids) != len(hashes) * event.block_size
+            or len(set(hashes)) != len(hashes)
+            or event.native_parent_block_hash in hashes
+            or event.skipped_token_parent_hash in hashes
+        ):
+            self._group_paths.pop(rank, None)
+            return invalid
+        if (
+            _locality_of(event.locality) is None
+            or tier_of(event.medium) != common_pb2.KV_CACHE_TIER_DEVICE
+        ):
+            # The group still constrains joint reuse when its reported blocks
+            # are elsewhere. Declare it without altering GPU keys or paths.
+            return common_pb2.KvGroupEvent(
+                operation=(
+                    common_pb2.KvGroupEvent.STORE
+                    if event.kind == "BlockStored"
+                    else common_pb2.KvGroupEvent.REMOVE
+                ),
+                group_id=event.group_idx,
+                kind=event.kv_cache_spec_kind or "",
+                sliding_window=event.kv_cache_spec_sliding_window or 0,
+                block_size=event.block_size,
+                tokens_matchable=event.kind == "BlockStored",
+            )
+        paths = self._group_paths.setdefault(rank, {})
+        converted = common_pb2.KvGroupEvent(
+            operation=(
+                common_pb2.KvGroupEvent.STORE
+                if event.kind == "BlockStored"
+                else common_pb2.KvGroupEvent.REMOVE
+            ),
+            group_id=event.group_idx,
+            block_hashes=hashes,
+        )
+        if event.cache_copy_counts is not None:
+            converted.cache_copy_counts.extend(event.cache_copy_counts)
+        if event.kind == "BlockRemoved":
+            for index, key in enumerate(hashes):
+                if event.cache_copy_counts is None or event.cache_copy_counts[index] == 0:
+                    paths.pop((event.group_idx, key), None)
+            return converted
+        parent_plain = paths.get((event.group_idx, event.native_parent_block_hash))
+        anchor_plain = paths.get((event.group_idx, event.skipped_token_parent_hash))
+        ancestry_plain = (
+            anchor_plain if event.skipped_token_parent_hash is not None else parent_plain
+        )
+        plain = not event.namespace_inputs and not event.bigrams
+        if event.token_ids_matchable is False or parent_plain is False or anchor_plain is False:
+            plain = False
+        # Ancestry does not itself identify the hash namespace. The actual
+        # anchor (or native parent for root ancestry) must be known plain,
+        # unless the whole-request marker proves it. Empty root ancestry is plain.
+        if (
+            (event.skipped_token_ids or event.skipped_token_parent_hash is not None)
+            and event.token_ids_matchable is not True
+            and ancestry_plain is not True
+        ):
+            plain = False
+        converted.kind = event.kv_cache_spec_kind
+        converted.sliding_window = event.kv_cache_spec_sliding_window or 0
+        converted.block_size = event.block_size
+        converted.token_ids.extend(event.token_ids)
+        converted.tokens_matchable = plain
+        if event.native_parent_block_hash is not None:
+            converted.parent_block_hash = event.native_parent_block_hash
+        if event.skipped_token_ids is not None:
+            converted.ancestry_provided = True
+            converted.skipped_token_ids.extend(event.skipped_token_ids)
+        if event.skipped_token_parent_hash is not None:
+            converted.skipped_token_parent_hash = event.skipped_token_parent_hash
+        for key in hashes:
+            paths[(event.group_idx, key)] = plain
+        return converted
 
     def normalize(
         self, event: WireEvent, dp_rank: int | None, event_id: int
@@ -608,14 +836,18 @@ class Normalizer:
                 cache_salt = cache_salt if cache_salt is not None else parent[0][1]
         namespace = (lora_name, cache_salt)
         all_seen = True
-        for block_hash in event.block_hashes:
+        for index, block_hash in enumerate(event.block_hashes):
             record = blocks_state.get(block_hash)
+            copies = (
+                min(event.cache_copy_counts[index], COPIES_CAP)
+                if event.cache_copy_counts is not None
+                else min((record[2] if record is not None else 0) + 1, COPIES_CAP)
+            )
             if record is None:
                 all_seen = False
-                blocks_state[block_hash] = (namespace, None, 1)
+                blocks_state[block_hash] = (namespace, None, copies)
             else:
-                # A second physical copy: the digest stays, one more copy counted.
-                blocks_state[block_hash] = (namespace, record[1], min(record[2] + 1, COPIES_CAP))
+                blocks_state[block_hash] = (namespace, record[1], copies)
         if all_seen:
             self.counts.duplicate_stores += 1
         if event.bigrams:
@@ -634,6 +866,8 @@ class Normalizer:
             )
             if event.lora_id is not None:
                 block.lora_id = event.lora_id
+            if event.cache_copy_counts is not None:
+                block.cache_copy_count = event.cache_copy_counts[index]
             if cache_level is not None:
                 block.cache_level = cache_level
             keys = extra_keys[index] if index < len(extra_keys) else None
@@ -668,17 +902,24 @@ class Normalizer:
             blocks_state = state.tiers.get(tier)
             if blocks_state:
                 # One physical copy goes; the record goes with the last.
-                for block_hash in event.block_hashes:
+                for index, block_hash in enumerate(event.block_hashes):
                     record = blocks_state.get(block_hash)
                     if record is None:
                         continue
-                    if record[2] <= 1:
+                    copies = (
+                        min(event.cache_copy_counts[index], COPIES_CAP)
+                        if event.cache_copy_counts is not None
+                        else record[2] - 1
+                    )
+                    if copies <= 0:
                         del blocks_state[block_hash]
                     else:
-                        blocks_state[block_hash] = (record[0], record[1], record[2] - 1)
+                        blocks_state[block_hash] = (record[0], record[1], copies)
         removed = common_pb2.KvBlocksRemoved(
             block_hashes=event.block_hashes, tier=tier, locality=locality
         )
+        if event.cache_copy_counts is not None:
+            removed.cache_copy_counts.extend(event.cache_copy_counts)
         cache_level = _CACHE_LEVEL[tier]
         if cache_level is not None:
             removed.cache_level = cache_level
