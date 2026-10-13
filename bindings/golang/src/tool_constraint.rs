@@ -237,7 +237,8 @@ mod tests {
     /// The engine keeps its special tokens for the parser when tools are
     /// declared at either level and nothing forces plain JSON: a request whose
     /// only tool is message-declared keeps them; a JSON-schema constraint, a
-    /// `none` choice or no tools at all do not.
+    /// `none` choice, no tools at all or an empty `tools` list (what the Go
+    /// wrappers send when the caller sets none) do not.
     #[test]
     fn special_tokens_are_kept_for_message_declared_tools() {
         let only_message_tool = request_with_message_tool(Value::Null, json!("auto"));
@@ -254,6 +255,11 @@ mod tests {
         }))
         .unwrap();
         assert!(!tools_keep_special_tokens(&no_tools, None));
+        let empty_tools: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "kimi-k3", "messages": [{"role": "user", "content": "hi"}], "tools": []
+        }))
+        .unwrap();
+        assert!(!tools_keep_special_tokens(&empty_tools, None));
     }
 
     /// The response parser's tool list is the same set: the request-level
