@@ -1914,24 +1914,41 @@ async fn decode_video_with_ffmpeg_runners(
     let sampling = selection.map(FrameSelection::sampling_info);
     if let Some(mut metadata) = metadata {
         let sample_fps = effective_sample_fps(metadata.duration_seconds, cfg);
-        let started = Instant::now();
+        let mut started = Instant::now();
         let mut headed = decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
-        if let (Err(error), true) = (&headed, metadata.from_container) {
+        if metadata.from_container && headed.as_ref().is_err_and(is_frame_size_mismatch) {
             // The container's size is the muxer's; the probe's is the
-            // decoder's. A headed decode that failed on the container's
-            // metadata is retried on the probe's before anything frames raw
-            // output by a size the decoder may not produce.
-            log_video_decode_backend_timing(
-                "ffmpeg_ppm_file",
-                started,
-                input_bytes,
-                cfg,
-                Some(error),
-            );
-            metadata = probe_video_info(input_path)
+            // decoder's. A headed decode whose frames were neither the
+            // container's size nor its transpose is retried once on the
+            // probe's metadata before anything frames raw output by a size
+            // the decoder may not produce; a probe that cannot run leaves the
+            // mismatch standing, which the headed PNG runner below takes.
+            if let Err(error) = &headed {
+                log_video_decode_backend_timing(
+                    "ffmpeg_ppm_file",
+                    started,
+                    input_bytes,
+                    cfg,
+                    Some(error),
+                );
+            }
+            match probe_video_info(input_path)
                 .await
-                .and_then(|info| video_metadata_from(info, false))?;
-            headed = decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
+                .and_then(|info| video_metadata_from(info, false))
+            {
+                Ok(probed) => {
+                    metadata = probed;
+                    started = Instant::now();
+                    headed =
+                        decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await;
+                }
+                Err(error) => {
+                    info!(
+                        error = %error,
+                        "video probe after a frame size mismatch failed; the container's metadata stands"
+                    );
+                }
+            }
         }
         match headed {
             Ok(video) => {
@@ -2206,9 +2223,13 @@ async fn decode_video_with_ffmpeg_ppm(
 
     let mut video = parse_ppm_rgb_video(Bytes::from(output.stdout))?;
     if let Some(frame) = video.frames.first() {
-        if (frame.width, frame.height) != (metadata.width, metadata.height) {
+        // The frames carry their own size; the metadata states the coded one.
+        // This decode autorotates, so a clip stored with a 90 or 270 degree
+        // display rotation comes out transposed: both are the decoder's size.
+        let size = (frame.width, frame.height);
+        if size != (metadata.width, metadata.height) && size != (metadata.height, metadata.width) {
             return Err(MediaConnectorError::VideoDecode(format!(
-                "{FRAME_SIZE_MISMATCH} {}x{} differs from the stated {}x{}",
+                "{FRAME_SIZE_MISMATCH} {}x{} differs from the stated {}x{} and its transpose",
                 frame.width, frame.height, metadata.width, metadata.height
             )));
         }
@@ -4438,6 +4459,113 @@ mod video_sampling_tests {
                 "{label}: ffmpeg picked other frames than the selection"
             );
         }
+    }
+
+    /// Writes a 90-degree display rotation into the first track's header
+    /// matrix, the way a phone stores a portrait recording: the rotation lives
+    /// in the container, the coded size stays what it was. Written by hand
+    /// because not every ffmpeg build turns a `rotate` tag into the matrix.
+    fn rotate_first_track(path: &Path) {
+        use std::fs as std_fs;
+        fn child(bytes: &[u8], start: usize, end: usize, kind: [u8; 4]) -> (usize, usize, usize) {
+            let mut offset = start;
+            while offset + 8 <= end {
+                let stated = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                let (size, header) = match stated {
+                    1 => (
+                        u64::from_be_bytes(bytes[offset + 8..offset + 16].try_into().unwrap())
+                            as usize,
+                        16,
+                    ),
+                    0 => (end - offset, 8),
+                    stated => (stated as usize, 8),
+                };
+                if bytes[offset + 4..offset + 8] == kind {
+                    return (offset, header, size);
+                }
+                offset += size;
+            }
+            panic!("no {} box", String::from_utf8_lossy(&kind));
+        }
+        let mut bytes = std_fs::read(path).expect("clip bytes");
+        let (moov, moov_header, moov_size) = child(&bytes, 0, bytes.len(), *b"moov");
+        let (trak, trak_header, trak_size) =
+            child(&bytes, moov + moov_header, moov + moov_size, *b"trak");
+        let (tkhd, tkhd_header, _) = child(&bytes, trak + trak_header, trak + trak_size, *b"tkhd");
+        let payload = tkhd + tkhd_header;
+        let matrix = payload + if bytes[payload] == 1 { 52 } else { 40 };
+        let rotated: [i32; 9] = [0, 65536, 0, -65536, 0, 0, 0, 0, 1 << 30];
+        let (slots, _) = bytes[matrix..matrix + 36].as_chunks_mut::<4>();
+        for (slot, value) in slots.iter_mut().zip(rotated) {
+            *slot = value.to_be_bytes();
+        }
+        std_fs::write(path, bytes).expect("clip rewritten");
+    }
+
+    /// A clip stored with a 90-degree display rotation (the portrait phone
+    /// shape) through both runners, where the tools are installed: the headed
+    /// decode autorotates and hands back the transposed size, which the size
+    /// check accepts on the first decode; the raw runner, without
+    /// autorotation, frames the coded size.
+    #[tokio::test]
+    async fn a_rotated_clip_decodes_through_both_runners() {
+        use std::process::Command as Sync;
+        let have = |tool: &str| {
+            Sync::new(tool)
+                .arg("-version")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        };
+        if !have("ffmpeg") || !have("ffprobe") {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("rotated.mp4");
+        let encoded = Sync::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=24:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "mpeg4",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            encoded.status.success(),
+            "ffmpeg wrote the clip: {}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        rotate_first_track(&path);
+        let metadata = probe_video_metadata(&path).await.expect("metadata");
+        assert_eq!(
+            (metadata.width, metadata.height),
+            (64, 48),
+            "the coded size"
+        );
+        let config = up_to_cfg(4);
+        let selection = FrameSelection::from_metadata(metadata, config)
+            .expect("frame rate and count are known");
+        let headed = decode_video_with_ffmpeg_ppm(&path, config, metadata, Some(&selection))
+            .await
+            .expect("the headed decode accepts the transposed frames");
+        assert_eq!(headed.frames.len(), selection.frame_indices.len());
+        assert_eq!((headed.frames[0].width, headed.frames[0].height), (48, 64));
+        let raw = decode_video_with_ffmpeg_raw(&path, config, metadata, Some(&selection))
+            .await
+            .expect("the raw decode frames the coded size");
+        assert_eq!(raw.frames.len(), selection.frame_indices.len());
+        assert_eq!((raw.frames[0].width, raw.frames[0].height), (64, 48));
     }
 
     #[test]
