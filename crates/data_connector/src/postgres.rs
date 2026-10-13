@@ -77,11 +77,14 @@ impl PostgresStore {
     /// answers, is a verdict before the gateway serves.
     pub(crate) async fn contact(&self, bound: Duration) -> Result<(), StoreContactError> {
         let round_trip = async {
-            let client = self.pool.get().await.map_err(|e| e.to_string())?;
+            // The cause chain stays in the text (`error connecting to server:
+            // Connection refused`, `db error: FATAL: password authentication
+            // failed ...`): the driver's kind alone says nothing of why.
+            let client = self.pool.get().await.map_err(|e| describe_error(&e))?;
             client
                 .simple_query("SELECT 1")
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| describe_error(&e))?;
             Ok::<(), String>(())
         };
         match tokio::time::timeout(bound, round_trip).await {
@@ -1957,6 +1960,32 @@ mod tests {
     fn parse_metadata_non_object_is_error() {
         assert!(PostgresConversationStorage::parse_metadata(Some(json!("not an object"))).is_err());
     }
+
+    /// The start-up contact's failure carries its cause chain: the driver's
+    /// kind alone (`error connecting to server`) says nothing of why.
+    #[tokio::test]
+    async fn the_start_up_contact_keeps_the_cause_of_a_refused_connection() {
+        let store = PostgresStore::new(PostgresConfig {
+            db_url: "postgres://u:p@127.0.0.1:1/db".to_string(),
+            pool_max: 1,
+            op_timeout_secs: 2,
+            schema: None,
+        })
+        .expect("a store");
+        let err = store
+            .contact(Duration::from_secs(5))
+            .await
+            .expect_err("nothing listens on port 1");
+        match err {
+            StoreContactError::Failed(cause) => {
+                assert!(cause.contains("refused"), "{cause}");
+            }
+            StoreContactError::NoAnswer => {
+                panic!("a refused connection is a failure with its cause, not silence")
+            }
+        }
+    }
+
     /// The bootstrap creates every table `IF NOT EXISTS`, in the schema's
     /// names, and the index on its own so a legacy table can gain the column
     /// first.
