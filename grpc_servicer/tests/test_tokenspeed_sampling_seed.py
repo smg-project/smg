@@ -58,7 +58,10 @@ def servicer():
         ],
         type_ignores=[],
     )
+    from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
+
     namespace = {
+        "EngineConfigView": EngineConfigView,
         "json": json,
         "_engine_supports_dp_rank_pin": lambda: False,
         "_lazy_generate_req_input": lambda: SimpleNamespace,

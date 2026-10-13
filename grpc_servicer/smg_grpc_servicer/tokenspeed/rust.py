@@ -59,6 +59,7 @@ from smg_grpc_servicer.structured_outputs import (
     grammar_start_labels,
     tokenspeed_structured_outputs_start,
 )
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
@@ -153,36 +154,24 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
     from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
 
     model_config = model_config if model_config is not None else _model_config(server_args)
-    hf_config = getattr(model_config, "hf_config", None)
-    eos = getattr(hf_config, "eos_token_id", None) if hf_config is not None else None
-    if isinstance(eos, int):
-        eos_token_ids = [eos]
-    elif isinstance(eos, list):
-        eos_token_ids = [int(value) for value in eos]
-    else:
-        eos_token_ids = []
+    view = EngineConfigView(server_args, model_config)
+    args, model = view.server_args, view.model
     supported_modalities = TokenSpeedSchedulerServicer._static_supported_modalities(
-        model_config, hf_config
+        model_config, model.hf_config
     )
-    dtype = _dtype_name(getattr(model_config, "dtype", None))
-    model_path = getattr(server_args, "model", None) or getattr(server_args, "model_path", "")
-    tokenizer_path = getattr(server_args, "tokenizer", None) or getattr(
-        server_args, "tokenizer_path", ""
-    )
+    dtype = _dtype_name(model.dtype)
     return {
-        "model_path": str(model_path),
-        "tokenizer_path": str(tokenizer_path or model_path),
-        "served_model_name": str(getattr(server_args, "served_model_name", None) or model_path),
-        "model_type": str((getattr(hf_config, "model_type", "") or "") if hf_config else ""),
-        "architectures": list((getattr(hf_config, "architectures", []) or []) if hf_config else []),
-        "max_context_length": int(getattr(model_config, "context_len", 0) or 0),
-        "vocab_size": int(getattr(model_config, "vocab_size", 0) or 0),
-        "eos_token_ids": eos_token_ids,
-        "pad_token_id": int((getattr(hf_config, "pad_token_id", 0) or 0) if hf_config else 0),
-        "bos_token_id": int((getattr(hf_config, "bos_token_id", 0) or 0) if hf_config else 0),
-        "default_sampling_params_json": str(
-            getattr(server_args, "preferred_sampling_params", None) or ""
-        ),
+        "model_path": args.model,
+        "tokenizer_path": args.tokenizer or args.model,
+        "served_model_name": str(args.served_model_name or args.model),
+        "model_type": model.model_type,
+        "architectures": model.architectures,
+        "max_context_length": model.context_len,
+        "vocab_size": model.vocab_size,
+        "eos_token_ids": model.eos_token_ids,
+        "pad_token_id": model.pad_token_id,
+        "bos_token_id": model.bos_token_id,
+        "default_sampling_params_json": str(args.preferred_sampling_params or ""),
         "supports_vision": any(modality in (1, 3) for modality in supported_modalities),
         "supports_multimodal": bool(supported_modalities),
         "supported_modalities": [int(modality) for modality in supported_modalities],
@@ -202,8 +191,8 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         args_dict = dataclasses.asdict(server_args)
     else:
         args_dict = dict(getattr(server_args, "__dict__", {}))
-    dp_size = getattr(getattr(getattr(server_args, "mapping", None), "attn", None), "dp_size", None)
-    if isinstance(dp_size, int) and dp_size > 1:
+    dp_size = EngineConfigView(server_args).server_args.attention_dp_size
+    if dp_size is not None and dp_size > 1:
         args_dict["dp_size"] = dp_size
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
@@ -223,7 +212,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         "scheduler_info_json": json.dumps({"shm_namespace_id": _shm_namespace_id()}),
         "tokenspeed_version": str(tokenspeed_version),
         "max_running_requests": running_window(server_args),
-        "data_parallel_size": int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1,
+        "data_parallel_size": dp_size or 1,
         "kv_events_endpoint": kv_events.endpoint if kv_events else "",
         "kv_events_replay_endpoint": kv_events.replay_endpoint if kv_events else "",
         "kv_events_topic": kv_events.topic if kv_events else "",
@@ -248,7 +237,7 @@ def default_kv_events_config(
     one.
     """
     source = os.environ if environ is None else environ
-    if getattr(server_args, "kv_events_config", None):
+    if EngineConfigView(server_args).server_args.kv_events_config:
         return None
     if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
         return None
@@ -412,8 +401,8 @@ def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProce
 
 def tokenizer_dir_for(server_args: Any) -> str | None:
     """The local tokenizer directory for the served model, or ``None``."""
-    tokenizer = getattr(server_args, "tokenizer", None) or getattr(server_args, "model", "")
-    return resolve_tokenizer_dir(str(tokenizer), getattr(server_args, "revision", None))
+    args = EngineConfigView(server_args).server_args
+    return resolve_tokenizer_dir(args.tokenizer or args.model, args.revision)
 
 
 # ---------------------------------------------------------------------------

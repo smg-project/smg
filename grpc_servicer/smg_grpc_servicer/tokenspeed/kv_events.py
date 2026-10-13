@@ -15,6 +15,8 @@ import json
 import logging
 from dataclasses import dataclass
 
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
+
 logger = logging.getLogger(__name__)
 
 # Defaults mirror tokenspeed.runtime.pd.kv_events.KVEventsConfig.
@@ -40,7 +42,7 @@ def resolve_kv_events_config(server_args: object) -> ResolvedKvEventsConfig | No
     leaving ``SubscribeKvEvents`` to report UNIMPLEMENTED — when events are
     disabled, the publisher is not ``zmq``, or the config is absent/malformed.
     """
-    raw = getattr(server_args, "kv_events_config", None)
+    raw = EngineConfigView(server_args).server_args.kv_events_config
     if not raw:
         return None
 

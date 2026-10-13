@@ -14,6 +14,7 @@ from smg_grpc_proto import tokenspeed_scheduler_pb2
 from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.load_record import engine_load_from
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 
 
 def running_window(server_args: Any) -> int:
@@ -27,11 +28,7 @@ def running_window(server_args: Any) -> int:
     deadline is racing, and a frontend that cannot see it cannot pace its
     dispatch.
     """
-    return int(
-        getattr(server_args, "max_num_seqs", 0)
-        or getattr(server_args, "max_running_requests", 0)
-        or 0
-    )
+    return EngineConfigView(server_args).server_args.running_window
 
 
 def convert_load_to_protobuf(
