@@ -32,19 +32,24 @@ def _first_attr(obj: Any, names: tuple[str, ...], default: Any = 0) -> Any:
     return default
 
 
-def effective_running_window(snapshots: Iterable[Any]) -> int:
-    """The running window the schedulers enforce, read off their published
-    load snapshots: the smallest positive ``max_running_requests`` across the
-    ranks (one rank's bound is the bound a request meets), or 0 while no rank
-    has published one.
+def effective_running_window(snapshots: Iterable[Any], attention_dp_size: int = 1) -> int:
+    """The running window the schedulers enforce, in the units of the
+    ``--max-running-requests`` flag, read off their published load snapshots;
+    0 while no rank has published one.
 
     The server argument of the same name is ``None`` unless the operator set
-    ``--max-running-requests``; the scheduler then computes the bound itself
-    (from its memory pool, capped by its state cache) and the gateway, which
-    reads the window off the server arguments, saw none: its PD admission
-    gate stayed off for the worker and its fleet capacity fell back to an
-    estimate. The snapshot carries the computed figure, the one ``GetLoads``
-    already reports.
+    the flag; the scheduler then computes the bound itself (from its memory
+    pool, capped by its state cache) and the gateway, which reads the window
+    off the server arguments, saw none: its PD admission gate stayed off for
+    the worker and its fleet capacity fell back to an estimate. The snapshot
+    carries the computed figure, the one ``GetLoads`` already reports.
+
+    Each snapshot's figure is one attention-DP worker's bound: the engine
+    splits the flag across its attention-DP workers (``flag // attn_dp_size``)
+    and each scheduler publishes its own share, so the flag's units are the
+    smallest published share (one rank's bound is the bound a request meets)
+    times ``attention_dp_size`` (1 without attention DP, where every scheduler
+    runs the whole flag).
     """
     windows = []
     for snapshot in snapshots:
@@ -52,7 +57,7 @@ def effective_running_window(snapshots: Iterable[Any]) -> int:
         if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
             continue
         windows.append(window)
-    return min(windows, default=0)
+    return min(windows, default=0) * max(1, int(attention_dp_size))
 
 
 def convert_loads_to_protobuf(result: LoadSnapshot) -> sglang_scheduler_pb2.SchedulerLoad:

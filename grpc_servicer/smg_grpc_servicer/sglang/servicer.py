@@ -531,8 +531,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # here, which is None unless the operator set the flag: the scheduler
         # then computes the bound itself and publishes it with its load
         # snapshots. Report the bound the scheduler enforces under the
-        # argument's name, so a default start advertises the window a flag
-        # would; the operator's flag, when set, stays the figure reported.
+        # argument's name and in the flag's units (the whole worker's, across
+        # its attention-DP workers), so a default start advertises the window
+        # a flag would; the operator's flag, when set, stays the figure
+        # reported.
         if not serializable_args.get("max_running_requests"):
             window = self._running_window()
             if window > 0:
@@ -566,11 +568,21 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             max_total_num_tokens=self.scheduler_info.get("max_total_num_tokens", 0),
         )
 
+    def _attention_dp_size(self) -> int:
+        """How many attention-DP workers the flag is split across: ``dp_size``
+        under ``--enable-dp-attention``, else 1 (plain data parallelism runs the
+        whole flag on every scheduler)."""
+        if not getattr(self.server_args, "enable_dp_attention", False):
+            return 1
+        dp_size = getattr(self.server_args, "dp_size", 1)
+        return dp_size if isinstance(dp_size, int) and not isinstance(dp_size, bool) else 1
+
     def _running_window(self) -> int:
-        """The running window the schedulers enforce: the operator's
-        `--max-running-requests` when set, else the figure the schedulers
-        publish in their load snapshots (cached once seen), else 0 (no
-        snapshot published yet, or a request manager without the reader)."""
+        """The running window the schedulers enforce, in the flag's units: the
+        operator's `--max-running-requests` when set, else the figure the
+        schedulers publish in their load snapshots (one attention-DP worker's
+        share each, scaled back to the flag's units; cached once seen), else 0
+        (no snapshot published yet, or a request manager without the reader)."""
         configured = getattr(self.server_args, "max_running_requests", None)
         if isinstance(configured, int) and not isinstance(configured, bool) and configured > 0:
             return configured
@@ -584,7 +596,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         except Exception as e:  # noqa: BLE001 - the window is advisory; GetServerInfo must answer
             logger.debug("load snapshots unreadable while resolving the running window: %s", e)
             return 0
-        window = effective_running_window(snapshots)
+        window = effective_running_window(snapshots, self._attention_dp_size())
         if window > 0:
             self._computed_running_window = window
             logger.info(

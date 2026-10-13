@@ -95,6 +95,17 @@ class TestEffectiveRunningWindow:
         second.dp_rank = 1
         assert loads_mod.effective_running_window([first, second]) == 314
 
+    def test_the_flags_units_are_the_share_times_the_attention_dp_width(self, loads_mod):
+        # The engine splits --max-running-requests across its attention-DP
+        # workers and each publishes its share: 16384 over 8 publishes 2048 each.
+        ranks = [_snapshot(None) for _ in range(8)]
+        for rank, snapshot in enumerate(ranks):
+            snapshot.dp_rank, snapshot.max_running_requests = rank, 2048
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=8) == 16384
+        # Without attention DP every scheduler runs the whole flag.
+        assert loads_mod.effective_running_window(ranks, attention_dp_size=1) == 2048
+        assert loads_mod.effective_running_window([], attention_dp_size=8) == 0
+
     def test_no_snapshot_or_no_figure_means_no_window(self, loads_mod):
         unset = _snapshot(None)
         unset.max_running_requests = 0

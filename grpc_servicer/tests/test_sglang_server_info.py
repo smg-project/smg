@@ -93,6 +93,8 @@ class _WindowServerArgs(msgspec.Struct):
 
     model_path: str = "org/model"
     max_running_requests: int | None = None
+    dp_size: int = 1
+    enable_dp_attention: bool = False
 
 
 def _servicer(servicer_mod, server_args, **request_manager):
@@ -138,6 +140,34 @@ def test_server_info_reports_the_window_the_scheduler_computed_when_the_flag_is_
         servicer_mod, _WindowServerArgs(max_running_requests=8), load_snapshot_reader=reader
     )
     assert _info(explicit).server_args["max_running_requests"] == 8
+
+
+def test_server_info_reports_the_window_in_the_flags_units_under_attention_dp(
+    servicer_mod, monkeypatch
+):
+    """Under --enable-dp-attention the engine splits the flag across its
+    attention-DP workers and each publishes its share; the figure reported is
+    the whole worker's, as the flag would be. Plain data parallelism runs the
+    whole flag on every scheduler and reports the published figure as it is."""
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    reader = SimpleNamespace(read_all=lambda: _snapshots(*([2048] * 8)))
+    attention = _servicer(
+        servicer_mod,
+        _WindowServerArgs(dp_size=8, enable_dp_attention=True),
+        load_snapshot_reader=reader,
+    )
+    assert _info(attention).server_args["max_running_requests"] == 16384
+
+    replicas = _servicer(servicer_mod, _WindowServerArgs(dp_size=8), load_snapshot_reader=reader)
+    assert _info(replicas).server_args["max_running_requests"] == 2048
+
+    # The operator's flag is already in its own units.
+    explicit = _servicer(
+        servicer_mod,
+        _WindowServerArgs(max_running_requests=16384, dp_size=8, enable_dp_attention=True),
+        load_snapshot_reader=reader,
+    )
+    assert _info(explicit).server_args["max_running_requests"] == 16384
 
 
 def test_server_info_reports_the_window_once_a_snapshot_is_published(servicer_mod, monkeypatch):
