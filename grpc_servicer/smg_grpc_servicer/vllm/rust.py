@@ -62,6 +62,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
 )
+from smg_grpc_servicer.vllm.config_view import EngineConfigView
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     engine_reasoning_parser,
@@ -100,6 +101,7 @@ def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -
     an engine's wire reports every scheduler step, which the servicer's
     pushed load records say from the first record; ``None`` leaves the
     servicer to classify the wire by what it shows."""
+    view = EngineConfigView(vllm_config)
     model_config = vllm_config.model_config
     facts = {**model_facts(model_config), **server_facts(vllm_config)}
     # `server_facts` carries the multimodal encoder dtype for the Python
@@ -108,20 +110,7 @@ def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -
     facts.pop("multimodal_encoder_dtype", None)
     # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
     # publisher can be relayed; anything else leaves SubscribeKvEvents off.
-    kv_events = getattr(vllm_config, "kv_events_config", None)
-    kv_events_enabled = (
-        kv_events is not None
-        and bool(getattr(kv_events, "enable_kv_cache_events", False))
-        and getattr(kv_events, "publisher", None) == "zmq"
-    )
-    structured = getattr(vllm_config, "structured_outputs_config", None)
-    structured_backend = getattr(structured, "backend", None) if structured is not None else None
-    # The pooler config vLLM's frontend merges into a pooling request's unset
-    # fields (`PoolingParams._merge_default_parameters`); absent on most
-    # generation models.
-    pooler = getattr(model_config, "pooler_config", None)
-    pooler_use_activation = getattr(pooler, "use_activation", None)
-    pooler_dimensions = getattr(pooler, "dimensions", None)
+    events = view.kv_events
     return {
         **facts,
         # The Rust servicer stops on the full set vLLM's frontend assembles
@@ -133,18 +122,15 @@ def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -
         "attention_backend": str(facts.get("attention_backend", "")),
         "model_dtype": str(facts.get("model_dtype", "")),
         "block_size": int(facts.get("block_size", 0) or 0),
-        "structured_outputs_backend": str(structured_backend or "auto"),
-        "kv_events_endpoint": str(getattr(kv_events, "endpoint", "") or "")
-        if kv_events_enabled
-        else "",
-        "kv_events_replay_endpoint": (
-            str(getattr(kv_events, "replay_endpoint", "") or "") if kv_events_enabled else ""
-        ),
-        "kv_events_topic": str(getattr(kv_events, "topic", "") or "") if kv_events_enabled else "",
-        "pooler_use_activation": (
-            bool(pooler_use_activation) if pooler_use_activation is not None else None
-        ),
-        "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
+        "structured_outputs_backend": str(view.structured_outputs.backend or "auto"),
+        "kv_events_endpoint": events.endpoint if events.relayed else "",
+        "kv_events_replay_endpoint": events.replay_endpoint if events.relayed else "",
+        "kv_events_topic": events.topic if events.relayed else "",
+        # The pooler config vLLM's frontend merges into a pooling request's
+        # unset fields (`PoolingParams._merge_default_parameters`); absent on
+        # most generation models.
+        "pooler_use_activation": view.pooler.use_activation,
+        "pooler_dimensions": view.pooler.dimensions,
         "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
         "mm_item_limits": mm_item_limits(vllm_config),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
@@ -428,15 +414,14 @@ def launch_engine_cores(ns: argparse.Namespace) -> EngineProcessGroup | EnginePr
     vllm_config = engine_args.create_engine_config(
         usage_context=UsageContext.OPENAI_API_SERVER, headless=True
     )
-    parallel_config = vllm_config.parallel_config
-    node_rank = getattr(parallel_config, "node_rank_within_dp", 0)
-    backend = getattr(parallel_config, "data_parallel_backend", "mp")
-    if node_rank > 0 or backend == "ray":
+    view = EngineConfigView(vllm_config)
+    parallel = view.parallel
+    if parallel.node_rank_within_dp > 0 or parallel.data_parallel_backend == "ray":
         logger.info(
             "Engine launch left to vLLM's headless launcher in a spawned process "
             "(node rank %d within the data-parallel group, backend %s)",
-            node_rank,
-            backend,
+            parallel.node_rank_within_dp,
+            parallel.data_parallel_backend,
         )
         return launch_headless_engine(ns)
 
@@ -451,21 +436,20 @@ def launch_engine_cores(ns: argparse.Namespace) -> EngineProcessGroup | EnginePr
             MULTIPROC_METHOD_ENV,
             os.environ[MULTIPROC_METHOD_ENV],
         )
+    launch = view.launch
     manager = CoreEngineProcManager(
-        local_engine_count=parallel_config.data_parallel_size_local,
-        start_index=parallel_config.data_parallel_rank,
+        local_engine_count=launch.local_engine_count,
+        start_index=launch.start_index,
         local_start_index=0,
         vllm_config=vllm_config,
         local_client=False,
-        handshake_address=get_tcp_uri(
-            parallel_config.data_parallel_master_ip, parallel_config.data_parallel_rpc_port
-        ),
+        handshake_address=get_tcp_uri(launch.master_ip, launch.rpc_port),
         executor_class=Executor.get_class(vllm_config),
         log_stats=not engine_args.disable_log_stats,
     )
     # The engine's own request-drain budget bounds the shutdown when one is
     # configured; otherwise the manager's best-effort grace applies.
-    engines = EngineProcessGroup(manager, shutdown_timeout=vllm_config.shutdown_timeout or None)
+    engines = EngineProcessGroup(manager, shutdown_timeout=launch.shutdown_timeout or None)
     logger.info(
         "Started %d engine core process(es) from the servicer process: pids %s",
         len(engines.pids),
@@ -524,12 +508,8 @@ class VllmLauncher(RustLauncher):
         )
 
     def tokenizer_dir(self, args: argparse.Namespace) -> str | None:
-        model_config = self.vllm_config.model_config
-        return resolve_tokenizer_dir(
-            str(getattr(model_config, "tokenizer", None) or model_config.model),
-            getattr(model_config, "tokenizer_revision", None)
-            or getattr(model_config, "revision", None),
-        )
+        model = EngineConfigView(self.vllm_config).model
+        return resolve_tokenizer_dir(model.tokenizer, model.tokenizer_revision)
 
     def server_extras(self, args: argparse.Namespace, tokenizer_dir: str | None) -> dict[str, Any]:
         """Worker-side media processing, from the same ``--mm-*`` settings

@@ -24,6 +24,8 @@ def _model_config(**overrides):
         ),
         architectures=["Qwen3ForCausalLM"],
         dtype="torch.bfloat16",
+        revision="model-rev",
+        tokenizer_revision="tok-rev",
     )
     for key, value in overrides.items():
         setattr(config, key, value)
@@ -38,16 +40,30 @@ def _full_config():
                 mm_device_do_normalize=True, get_limit_per_prompt={"image": 8}.__getitem__
             ),
             uses_mrope=True,
+            pooler_config=SimpleNamespace(use_activation=0, dimensions=512),
         ),
-        parallel_config=SimpleNamespace(data_parallel_size=2, data_parallel_rank=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=2,
+            data_parallel_rank=1,
+            data_parallel_size_local=2,
+            data_parallel_master_ip="127.0.0.1",
+            data_parallel_rpc_port=24321,
+            node_rank_within_dp=0,
+            data_parallel_backend="mp",
+        ),
+        shutdown_timeout=30,
         scheduler_config=SimpleNamespace(max_num_seqs=64),
         cache_config=SimpleNamespace(cache_dtype="auto", block_size=16, num_gpu_blocks=1000),
         attention_config=SimpleNamespace(backend=SimpleNamespace(name="FLASH_ATTN")),
         structured_outputs_config=SimpleNamespace(
-            reasoning_parser="glm45", enable_in_reasoning=False
+            backend="xgrammar", reasoning_parser="glm45", enable_in_reasoning=False
         ),
         kv_events_config=SimpleNamespace(
-            enable_kv_cache_events=True, publisher="zmq", endpoint="tcp://*:5557"
+            enable_kv_cache_events=True,
+            publisher="zmq",
+            endpoint="tcp://*:5557",
+            replay_endpoint="tcp://*:5558",
+            topic="kv",
         ),
         kv_transfer_config=SimpleNamespace(
             kv_connector="NixlConnector", kv_role="kv_producer", engine_id="eng-a"
@@ -69,12 +85,17 @@ def test_every_section_reads_the_config_it_was_given():
         hf_eos_token_ids=[151645, 151643],
         pad_token_id=0,
         bos_token_id=1,
+        tokenizer_revision="tok-rev",
     )
     assert view.multimodal.is_multimodal and view.multimodal.device_do_normalize
     assert view.multimodal.limit_per_prompt("image") == 8
     assert view.model_dtype == "torch.bfloat16"
     assert view.parallel.data_parallel_size == 2 and view.parallel.data_parallel_rank == 1
+    assert (view.parallel.node_rank_within_dp, view.parallel.data_parallel_backend) == (0, "mp")
     assert view.data_parallel_size == 2
+    launch = view.launch
+    assert (launch.local_engine_count, launch.start_index) == (2, 1)
+    assert (launch.master_ip, launch.rpc_port, launch.shutdown_timeout) == ("127.0.0.1", 24321, 30)
     assert view.max_num_seqs == 64
     assert (view.cache.cache_dtype, view.cache.block_size, view.cache.num_gpu_blocks) == (
         "auto",
@@ -83,11 +104,13 @@ def test_every_section_reads_the_config_it_was_given():
     )
     assert view.attention_backend == "FLASH_ATTN"
     structured = view.structured_outputs
-    assert (structured.reasoning_parser, structured.reasoning_parser_known) == ("glm45", True)
-    assert structured.enable_in_reasoning is False
+    assert (structured.backend, structured.reasoning_parser) == ("xgrammar", "glm45")
+    assert structured.reasoning_parser_known and structured.enable_in_reasoning is False
     events = view.kv_events
-    assert events.config is not None and events.enable_kv_cache_events
+    assert events.config is not None and events.enable_kv_cache_events and events.relayed
     assert (events.publisher, events.endpoint) == ("zmq", "tcp://*:5557")
+    assert (events.replay_endpoint, events.topic) == ("tcp://*:5558", "kv")
+    assert (view.pooler.use_activation, view.pooler.dimensions) == (False, 512)
     assert view.kv_transfer.role == "kv_producer"
     assert view.kv_transfer.config.kv_connector == "NixlConnector"
     assert config_view.uses_mrope(view._config.model_config) is True
@@ -103,6 +126,7 @@ def test_a_config_without_a_section_reads_as_the_defaults(config):
     assert (multimodal.is_multimodal, multimodal.device_do_normalize) == (False, False)
     assert multimodal.limit_per_prompt is None
     assert view.parallel.data_parallel_size is None and view.parallel.data_parallel_rank == 0
+    assert (view.parallel.node_rank_within_dp, view.parallel.data_parallel_backend) == (0, "mp")
     assert view.max_num_seqs == 0
     assert (view.cache.cache_dtype, view.cache.block_size, view.cache.num_gpu_blocks) == (
         None,
@@ -111,10 +135,17 @@ def test_a_config_without_a_section_reads_as_the_defaults(config):
     )
     assert view.attention_backend is None
     structured = view.structured_outputs
-    assert (structured.reasoning_parser, structured.reasoning_parser_known) == ("", False)
+    assert (structured.backend, structured.reasoning_parser) == (None, "")
+    assert structured.reasoning_parser_known is False
     events = view.kv_events
-    assert events.config is None and not events.enable_kv_cache_events
-    assert (events.publisher, events.endpoint) == (None, "")
+    assert events.config is None and not events.enable_kv_cache_events and not events.relayed
+    assert (events.publisher, events.endpoint, events.replay_endpoint, events.topic) == (
+        None,
+        "",
+        "",
+        "",
+    )
+    assert (view.pooler.use_activation, view.pooler.dimensions) == (None, None)
     assert view.kv_transfer.config is None and view.kv_transfer.role == ""
     assert config_view.uses_mrope(None) is False
 
@@ -136,6 +167,10 @@ def test_the_model_section_requires_the_facts_a_model_must_have():
         EngineConfigView(SimpleNamespace(parallel_config=SimpleNamespace())).data_parallel_size  # noqa: B018
     two = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=2))
     assert EngineConfigView(two).data_parallel_size == 2
+    # So are the process manager's inputs: a config an engine cannot be
+    # started from this way fails by name.
+    with pytest.raises(AttributeError, match="data_parallel_size_local"):
+        EngineConfigView(two).launch  # noqa: B018
 
 
 def test_the_model_section_degrades_the_rest_to_the_proto_defaults():
@@ -155,6 +190,13 @@ def test_the_model_section_degrades_the_rest_to_the_proto_defaults():
         "org/m",
         "pooling",
     )
+    # The tokenizer's own revision first, else the model's, else none.
+    assert model.tokenizer_revision == "tok-rev"
+    assert (
+        ModelSection.read(_model_config(tokenizer_revision=None)).tokenizer_revision == "model-rev"
+    )
+    bare_revisions = _model_config(tokenizer_revision=None, revision=None)
+    assert ModelSection.read(bare_revisions).tokenizer_revision is None
     assert (model.model_type, model.architectures, model.hf_eos_token_ids) == ("", [], [2])
     assert (model.pad_token_id, model.bos_token_id) == (3, 0)
     # An empty served-name list and a config without an HF config.
@@ -247,14 +289,22 @@ def test_the_structured_outputs_section_tells_an_absent_parser_from_none():
         assert structured.enable_in_reasoning is True
 
 
-def test_the_kv_events_section_reads_the_publisher_as_configured():
+def test_the_kv_events_section_relays_a_zmq_publisher_only():
     def config(**fields):
         return SimpleNamespace(kv_events_config=SimpleNamespace(**fields))
 
     events = EngineConfigView(config(enable_kv_cache_events=False, publisher="zmq")).kv_events
     assert (events.enable_kv_cache_events, events.publisher, events.endpoint) == (False, "zmq", "")
+    assert not events.relayed
     events = EngineConfigView(config(enable_kv_cache_events=True, publisher="null")).kv_events
     assert (events.enable_kv_cache_events, events.publisher) == (True, "null")
+    assert not events.relayed
+    events = EngineConfigView(config(enable_kv_cache_events=True, publisher="zmq")).kv_events
+    assert events.relayed and (events.endpoint, events.replay_endpoint, events.topic) == (
+        "",
+        "",
+        "",
+    )
 
 
 def test_a_section_is_read_once_per_view():
