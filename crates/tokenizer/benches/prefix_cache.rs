@@ -348,6 +348,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(40);
+    assert!(variants >= 3, "PREFIX_BENCH_VARIANTS must be at least 3");
     let budget = Duration::from_millis(300);
     let mut table: Vec<(String, String, usize, String, f64)> = Vec::new();
 
@@ -574,8 +575,8 @@ fn delta(before: [u64; 4], after: [u64; 4]) -> [u64; 4] {
     ]
 }
 
-/// The boundary scan as the cache does it: every special string searched
-/// over the whole text on its own.
+/// The boundary scan the cache did before the one-pass matcher: every special
+/// string searched over the whole text on its own.
 fn boundaries_per_string(text: &str, specials: &[String]) -> Vec<usize> {
     let mut boundaries = Vec::new();
     for token in specials {
