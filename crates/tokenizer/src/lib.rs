@@ -6,6 +6,7 @@ mod byte_fallback;
 mod byte_level;
 pub mod cache;
 pub mod decode_activity;
+pub mod encode_path;
 pub mod encoders;
 pub mod eos;
 pub mod factory;
@@ -33,6 +34,9 @@ mod tests;
 pub use cache::{CacheConfig, CacheStats, CachedTokenizer, L0Cache, L1Cache, TokenizerFingerprint};
 pub use chat_template::ChatTemplateState;
 pub use decode_activity::{decode_activity_stats, DecodeActivityStats};
+pub use encode_path::{
+    encode_fallbacks, encode_path_loads, EncodeFallbacks, EncodePath, EncodePathLoads,
+};
 pub use factory::{
     create_tokenizer, create_tokenizer_from_file, create_tokenizer_with_chat_template,
     TokenizerType,

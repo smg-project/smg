@@ -13,7 +13,10 @@ use tokenizers_v1::{
     SplitDelimiterBehavior,
 };
 
-use crate::traits::{Encoder, Encoding};
+use crate::{
+    encode_path::Declined,
+    traits::{Encoder, Encoding},
+};
 
 pub(crate) struct V1Encoder {
     pipeline: PipelineTokenizer,
@@ -59,17 +62,25 @@ fn clone_normalizer(n: &PipelineNormalizer) -> PipelineNormalizer {
 }
 
 impl V1Encoder {
-    pub(crate) fn from_tokenizer(tokenizer: &Tokenizer, cache_capacity: usize) -> Option<Self> {
+    /// The pipeline for `tokenizer`, or why it declines: a configuration
+    /// outside what the RC is trusted with here.
+    pub(crate) fn from_tokenizer(
+        tokenizer: &Tokenizer,
+        cache_capacity: usize,
+    ) -> Result<Self, Declined> {
         // Limit the RC to deterministic, unpadded/untruncated BPE. Other models
         // keep the established implementation, including its rich Encoding metadata.
         let ModelWrapper::BPE(bpe) = tokenizer.get_model() else {
-            return None;
+            return Err(Declined::from("the model is not BPE"));
         };
-        if bpe.dropout.is_some_and(|p| p > 0.0)
-            || tokenizer.get_padding().is_some()
-            || tokenizer.get_truncation().is_some()
-        {
-            return None;
+        if bpe.dropout.is_some_and(|p| p > 0.0) {
+            return Err(Declined::from("BPE dropout is set"));
+        }
+        if tokenizer.get_padding().is_some() {
+            return Err(Declined::from("padding is configured"));
+        }
+        if tokenizer.get_truncation().is_some() {
+            return Err(Declined::from("truncation is configured"));
         }
         // Serialize AFTER config.json/tokenizer_config.json overrides, including
         // BOS/EOS processing. Loading the original file here would lose them.
@@ -112,14 +123,11 @@ impl V1Encoder {
             ))
         };
         match build() {
-            Ok(pipeline) => Some(Self {
+            Ok(pipeline) => Ok(Self {
                 pipeline,
                 encode_special_tokens: tokenizer.get_encode_special_tokens(),
             }),
-            Err(error) => {
-                tracing::warn!(%error, "tokenizers v1 configuration unsupported; using existing encoder");
-                None
-            }
+            Err(error) => Err(Declined::from(error.to_string())),
         }
     }
 

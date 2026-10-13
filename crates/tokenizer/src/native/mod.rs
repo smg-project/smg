@@ -37,6 +37,7 @@ use std::{
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use rustc_hash::FxHashMap;
+use serde::Serialize;
 use serde_json::Value;
 use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model, Tokenizer as HfTokenizer};
@@ -46,6 +47,8 @@ mod pattern;
 mod unicode;
 
 use pattern::Pattern;
+
+use crate::encode_path::{Declined, Fallback};
 
 /// The split the `ByteLevel` pre-tokenizer applies itself when `use_regex`
 /// is on (GPT-2 and its descendants).
@@ -167,6 +170,9 @@ struct Stage {
     keep_gaps: bool,
 }
 
+/// Added tokens by content and id, the list a matcher is built from.
+type AddedTokenList = Vec<(String, u32)>;
+
 /// One set of added tokens, matched leftmost-longest as `AddedVocabulary`
 /// matches them.
 struct AddedTokens {
@@ -175,15 +181,16 @@ struct AddedTokens {
 }
 
 impl AddedTokens {
-    fn build(tokens: &[(String, u32)]) -> Option<Option<Self>> {
+    /// The matcher over `tokens`, none for no tokens.
+    fn build(tokens: &[(String, u32)]) -> Result<Option<Self>, Declined> {
         if tokens.is_empty() {
-            return Some(None);
+            return Ok(None);
         }
         let automaton = AhoCorasickBuilder::new()
             .match_kind(MatchKind::LeftmostLongest)
             .build(tokens.iter().map(|(content, _)| content.as_bytes()))
-            .ok()?;
-        Some(Some(Self {
+            .map_err(|e| Declined::from(format!("the added tokens form no automaton: {e}")))?;
+        Ok(Some(Self {
             automaton,
             ids: tokens.iter().map(|(_, id)| *id).collect(),
         }))
@@ -237,46 +244,108 @@ impl std::fmt::Debug for NativeEncoder {
     }
 }
 
+/// A component of the tokenizer in its serialized form (`Null` when there
+/// is none), the shape the checks below read.
+fn serialized<T: Serialize>(component: T) -> Result<Value, Declined> {
+    serde_json::to_value(component)
+        .map_err(|e| Declined::from(format!("a component does not serialize: {e}")))
+}
+
+/// The `type` a serialized component names.
+fn type_of(component: &Value) -> Result<&str, Declined> {
+    component
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Declined::from("a component without a type"))
+}
+
 impl NativeEncoder {
-    /// `None` unless the tokenizer has the shape this path reproduces.
-    pub(crate) fn from_tokenizer(tokenizer: &HfTokenizer) -> Option<Self> {
-        if tokenizer.get_truncation().is_some() || tokenizer.get_padding().is_some() {
-            return None;
+    /// This path's encoder for `tokenizer`, or why it declines: a shape
+    /// outside what the module documentation lists.
+    pub(crate) fn from_tokenizer(tokenizer: &HfTokenizer) -> Result<Self, Declined> {
+        if tokenizer.get_truncation().is_some() {
+            return Err(Declined::from("truncation is configured"));
+        }
+        if tokenizer.get_padding().is_some() {
+            return Err(Declined::from("padding is configured"));
         }
         if !matches!(tokenizer.get_model(), ModelWrapper::BPE(_)) {
-            return None;
+            return Err(Declined::from("the model is not BPE"));
         }
-        let normalizer = match serde_json::to_value(tokenizer.get_normalizer()).ok()? {
-            Value::Null => Normalizer::None,
-            value => match value.get("type").and_then(Value::as_str)? {
-                "NFC" => Normalizer::Nfc,
-                "Sequence" => {
-                    let inner = value.get("normalizers").and_then(Value::as_array)?;
-                    if !inner.is_empty() {
-                        return None;
-                    }
-                    Normalizer::None
-                }
-                _ => return None,
-            },
-        };
-        let stages = Self::stages(&serde_json::to_value(tokenizer.get_pre_tokenizer()).ok()?)?;
-        match serde_json::to_value(tokenizer.get_post_processor()).ok()? {
-            Value::Null => {}
-            // Only reshapes offsets; the ids are untouched.
-            value if value.get("type").and_then(Value::as_str) == Some("ByteLevel") => {}
-            _ => return None,
-        }
+        let normalizer = Self::normalizer_from(&serialized(tokenizer.get_normalizer())?)?;
+        let stages = Self::stages_from(&serialized(tokenizer.get_pre_tokenizer())?)?;
+        Self::post_processor_check(&serialized(tokenizer.get_post_processor())?)?;
+        let (raw, normalized) = Self::added_tokens_of(tokenizer, normalizer)?;
+        Ok(Self {
+            normalizer,
+            raw_added: AddedTokens::build(&raw)?,
+            normalized_added: AddedTokens::build(&normalized)?,
+            stages,
+            alphabet: bytes_char(),
+            piece_cache: ThreadLocal::new(),
+            threads: AtomicUsize::new(0),
+        })
+    }
 
+    /// The normalizer this path applies: none, or NFC alone.
+    fn normalizer_from(normalizer: &Value) -> Result<Normalizer, Declined> {
+        if normalizer.is_null() {
+            return Ok(Normalizer::None);
+        }
+        match type_of(normalizer)? {
+            "NFC" => Ok(Normalizer::Nfc),
+            "Sequence" => {
+                let steps = normalizer
+                    .get("normalizers")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| Declined::from("a normalizer sequence without a list"))?;
+                if steps.is_empty() {
+                    Ok(Normalizer::None)
+                } else {
+                    Err(Declined::from(
+                        "a normalizer sequence with steps (only NFC alone or none)",
+                    ))
+                }
+            }
+            other => Err(Declined::from(format!(
+                "normalizer {other} (only NFC or none)"
+            ))),
+        }
+    }
+
+    /// Only a post-processor that leaves the ids alone passes: none, or
+    /// `ByteLevel`, which reshapes offsets.
+    fn post_processor_check(post_processor: &Value) -> Result<(), Declined> {
+        if post_processor.is_null() {
+            return Ok(());
+        }
+        match type_of(post_processor)? {
+            "ByteLevel" => Ok(()),
+            other => Err(Declined::from(format!(
+                "post-processor {other} (only ByteLevel or none)"
+            ))),
+        }
+    }
+
+    /// The added tokens the path cuts out itself, those matched on the raw
+    /// text and those matched after normalization (normalized here, once),
+    /// each in a stable order so leftmost-longest ties stay deterministic.
+    fn added_tokens_of(
+        tokenizer: &HfTokenizer,
+        normalizer: Normalizer,
+    ) -> Result<(AddedTokenList, AddedTokenList), Declined> {
         let added = tokenizer.get_added_vocabulary();
         if added.get_encode_special_tokens() {
-            return None;
+            return Err(Declined::from("encode_special_tokens is set"));
         }
         let mut raw = Vec::new();
         let mut normalized = Vec::new();
         for (&id, token) in added.get_added_tokens_decoder() {
             if token.single_word || token.lstrip || token.rstrip || token.content.is_empty() {
-                return None;
+                return Err(Declined::from(format!(
+                    "added token {:?} with single_word, lstrip or rstrip, or without content",
+                    token.content
+                )));
             }
             if token.normalized {
                 let content = match normalizer {
@@ -288,86 +357,111 @@ impl NativeEncoder {
                 raw.push((token.content.clone(), id));
             }
         }
-        // A stable order keeps leftmost-longest ties deterministic.
         raw.sort();
         normalized.sort();
-        Some(Self {
-            normalizer,
-            raw_added: AddedTokens::build(&raw)?,
-            normalized_added: AddedTokens::build(&normalized)?,
-            stages,
-            alphabet: bytes_char(),
-            piece_cache: ThreadLocal::new(),
-            threads: AtomicUsize::new(0),
-        })
+        Ok((raw, normalized))
     }
 
     /// The `Split` stages of a pre-tokenizer that is zero or more `Split`s
     /// followed by one `ByteLevel` without prefix space.
-    fn stages(pre_tokenizer: &Value) -> Option<Vec<Stage>> {
-        let items: Vec<&Value> = match pre_tokenizer.get("type").and_then(Value::as_str)? {
+    fn stages_from(pre_tokenizer: &Value) -> Result<Vec<Stage>, Declined> {
+        let items: Vec<&Value> = match type_of(pre_tokenizer)? {
             "Sequence" => pre_tokenizer
                 .get("pretokenizers")
-                .and_then(Value::as_array)?
+                .and_then(Value::as_array)
+                .ok_or_else(|| Declined::from("a pre-tokenizer sequence without a list"))?
                 .iter()
                 .collect(),
             _ => vec![pre_tokenizer],
         };
-        let (byte_level, splits) = items.split_last()?;
+        let (byte_level, splits) = items
+            .split_last()
+            .ok_or_else(|| Declined::from("an empty pre-tokenizer sequence"))?;
         if byte_level.get("type").and_then(Value::as_str) != Some("ByteLevel")
             || byte_level.get("add_prefix_space").and_then(Value::as_bool) != Some(false)
         {
-            return None;
+            return Err(Declined::from(
+                "the pre-tokenizer does not end in ByteLevel without a prefix space",
+            ));
         }
         let mut stages = Vec::with_capacity(splits.len() + 1);
         for split in splits {
-            if split.get("type").and_then(Value::as_str) != Some("Split") {
-                return None;
-            }
-            let pattern = split.get("pattern")?;
-            let regex = match (pattern.get("Regex"), pattern.get("String")) {
-                (Some(regex), None) => regex.as_str()?.to_owned(),
-                (None, Some(literal)) => escape_literal(literal.as_str()?),
-                _ => return None,
-            };
-            let keep_gaps = match (
-                split.get("behavior").and_then(Value::as_str)?,
-                split.get("invert").and_then(Value::as_bool)?,
-            ) {
-                ("Isolated", false) => true,
-                ("Removed", true) => false,
-                _ => return None,
-            };
-            stages.push(Stage {
-                pattern: Pattern::parse(&regex)?,
-                keep_gaps,
-            });
+            stages.push(Self::split_stage(split)?);
         }
         if byte_level.get("use_regex").and_then(Value::as_bool) == Some(true) {
             stages.push(Stage {
-                pattern: Pattern::parse(BYTE_LEVEL_PATTERN)?,
+                pattern: Pattern::parse(BYTE_LEVEL_PATTERN)
+                    .ok_or_else(|| Declined::from("the ByteLevel split pattern"))?,
                 keep_gaps: true,
             });
         }
-        Some(stages)
+        Ok(stages)
+    }
+
+    /// One `Split` before the `ByteLevel` as a stage: a regex or a literal
+    /// the pattern engine takes, `Isolated`, or `Removed` inverted.
+    fn split_stage(split: &Value) -> Result<Stage, Declined> {
+        match type_of(split)? {
+            "Split" => {}
+            other => {
+                return Err(Declined::from(format!(
+                    "pre-tokenizer {other} before the ByteLevel (only Split)"
+                )))
+            }
+        }
+        let pattern = split
+            .get("pattern")
+            .ok_or_else(|| Declined::from("a Split without a pattern"))?;
+        let regex = match (pattern.get("Regex"), pattern.get("String")) {
+            (Some(regex), None) => regex
+                .as_str()
+                .ok_or_else(|| Declined::from("a Split whose Regex is not a string"))?
+                .to_owned(),
+            (None, Some(literal)) => escape_literal(
+                literal
+                    .as_str()
+                    .ok_or_else(|| Declined::from("a Split whose String is not a string"))?,
+            ),
+            _ => return Err(Declined::from("a Split pattern neither Regex nor String")),
+        };
+        let keep_gaps = match (
+            split.get("behavior").and_then(Value::as_str),
+            split.get("invert").and_then(Value::as_bool),
+        ) {
+            (Some("Isolated"), Some(false)) => true,
+            (Some("Removed"), Some(true)) => false,
+            (behavior, invert) => {
+                return Err(Declined::from(format!(
+                    "Split behavior {behavior:?} with invert {invert:?} (only Isolated, or \
+                     Removed inverted)"
+                )))
+            }
+        };
+        let pattern = Pattern::parse(&regex).ok_or_else(|| {
+            Declined::from(format!(
+                "a split pattern outside the supported regex subset: {regex}"
+            ))
+        })?;
+        Ok(Stage { pattern, keep_gaps })
     }
 
     /// The ids of `text` (the same whether special tokens were requested or
-    /// not: no post-processor the path accepts adds any), or `None` when this
-    /// text must take the `tokenizers` path: not in NFC under an NFC
-    /// normalizer, or a piece the model would not tokenize (so that the
-    /// error surfaces from there).
-    pub(crate) fn encode(&self, model: &ModelWrapper, text: &str) -> Option<Vec<u32>> {
+    /// not: no post-processor the path accepts adds any), or why this text
+    /// goes through `tokenizers` instead, for the caller to count: not in
+    /// NFC under an NFC normalizer, found before any work, or a piece the
+    /// model declines, found after the pieces before it were tokenized, so
+    /// that the error surfaces from the `tokenizers` encode.
+    pub(crate) fn encode(&self, model: &ModelWrapper, text: &str) -> Result<Vec<u32>, Fallback> {
         if self.normalizer == Normalizer::Nfc && !is_nfc(text) {
-            return None;
+            return Err(Fallback::NotNfc);
         }
         let mut ids = Vec::with_capacity(text.len() / 3 + 8);
         let mut mapped = String::new();
-        let mut failed = false;
+        let mut fallback = None;
         let mut tokenize = |segment: &str, ids: &mut Vec<u32>| {
             self.pieces(0, segment, &mut |piece| {
-                if !self.tokenize_piece(model, piece, &mut mapped, ids) {
-                    failed = true;
+                if let Err(declined) = self.tokenize_piece(model, piece, &mut mapped, ids) {
+                    fallback = Some(declined);
                 }
             });
         };
@@ -385,7 +479,7 @@ impl NativeEncoder {
             Some(added) => added.split(text, |segment| after_raw(segment, &mut ids)),
             None => after_raw(Segment::Text(text), &mut ids),
         }
-        (!failed).then_some(ids)
+        fallback.map_or(Ok(ids), Err)
     }
 
     /// Applies the stages from `depth` on to `text`, calling `f` with each
@@ -412,15 +506,15 @@ impl NativeEncoder {
     }
 
     /// Appends the ids of one piece, from the thread's cache or from the
-    /// model over the piece's byte-level alphabet form; `false` when the
-    /// model declines the piece.
+    /// model over the piece's byte-level alphabet form;
+    /// [`Fallback::PieceDeclined`] when the model declines the piece.
     fn tokenize_piece(
         &self,
         model: &ModelWrapper,
         piece: &str,
         mapped: &mut String,
         ids: &mut Vec<u32>,
-    ) -> bool {
+    ) -> Result<(), Fallback> {
         let bytes = piece.as_bytes();
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
         let cache = self.piece_cache.get_or(|| {
@@ -430,7 +524,7 @@ impl NativeEncoder {
         if cacheable {
             if let Some(found) = cache.borrow().get(bytes) {
                 ids.extend_from_slice(found);
-                return true;
+                return Ok(());
             }
         }
         mapped.clear();
@@ -438,7 +532,7 @@ impl NativeEncoder {
         let start = ids.len();
         match model.tokenize(mapped) {
             Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
-            Err(_) => return false,
+            Err(_) => return Err(Fallback::PieceDeclined),
         }
         if bytes.len() <= CACHED_PIECE_MAX_BYTES {
             let mut pieces = cache.borrow_mut();
@@ -459,7 +553,7 @@ impl NativeEncoder {
                 pieces.long.insert(bytes.into(), ids[start..].into());
             }
         }
-        true
+        Ok(())
     }
 
     /// Entries one thread's piece cache may hold: the total shared among the
@@ -483,7 +577,10 @@ impl NativeEncoder {
 mod tests {
     use tokenizers::{
         decoders::byte_level::ByteLevel as ByteLevelDecoder,
-        models::bpe::{Merges, Vocab, BPE},
+        models::{
+            bpe::{Merges, Vocab, BPE},
+            wordlevel::WordLevel,
+        },
         normalizers::{
             unicode::{NFC, NFKC},
             NormalizerWrapper,
@@ -494,11 +591,15 @@ mod tests {
             split::{Split, SplitPattern},
             PreTokenizerWrapper,
         },
-        processors::byte_level::ByteLevel as ByteLevelProcessor,
+        processors::{byte_level::ByteLevel as ByteLevelProcessor, template::TemplateProcessing},
         AddedToken, SplitDelimiterBehavior,
     };
 
     use super::*;
+    use crate::{
+        encode_path::{encode_fallbacks, EncodeFallbacks},
+        huggingface::HuggingFaceTokenizer,
+    };
 
     const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const CL100K: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -820,7 +921,12 @@ mod tests {
         for shape in shapes() {
             let tokenizer = tokenizer_of(&shape, &mut state);
             let native = NativeEncoder::from_tokenizer(&tokenizer);
-            assert!(native.is_some(), "{}", shape.name);
+            assert!(
+                native.is_ok(),
+                "{}: {:?}",
+                shape.name,
+                native.as_ref().err()
+            );
             let expected_stages = shape
                 .pre_tokenizers
                 .iter()
@@ -840,39 +946,73 @@ mod tests {
     fn shapes_outside_the_path_are_declined() {
         let mut state = 0x1234_5678_9ABC_DEF1u64;
         let base = &shapes()[0];
+        let declined = |tokenizer: &HfTokenizer| {
+            NativeEncoder::from_tokenizer(tokenizer)
+                .expect_err("declined")
+                .to_string()
+        };
         // Prefix space.
         let mut tokenizer = tokenizer_of(base, &mut state);
         tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
             split(QWEN35, SplitDelimiterBehavior::Isolated, false),
             PreTokenizerWrapper::ByteLevel(ByteLevelPreTokenizer::default().add_prefix_space(true)),
         ]))));
-        assert!(NativeEncoder::from_tokenizer(&tokenizer).is_none());
+        assert_eq!(
+            declined(&tokenizer),
+            "the pre-tokenizer does not end in ByteLevel without a prefix space"
+        );
         // A normalizer other than NFC.
         let mut tokenizer = tokenizer_of(base, &mut state);
         tokenizer
             .with_normalizer(Some(NormalizerWrapper::NFKC(NFKC)))
             .expect("normalizer");
-        assert!(NativeEncoder::from_tokenizer(&tokenizer).is_none());
+        assert_eq!(declined(&tokenizer), "normalizer NFKC (only NFC or none)");
         // A split behaviour the path does not reproduce.
         let mut tokenizer = tokenizer_of(base, &mut state);
         tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
             split(QWEN35, SplitDelimiterBehavior::MergedWithNext, false),
             byte_level(false),
         ]))));
-        assert!(NativeEncoder::from_tokenizer(&tokenizer).is_none());
+        assert_eq!(
+            declined(&tokenizer),
+            "Split behavior Some(\"MergedWithNext\") with invert Some(false) (only Isolated, or \
+             Removed inverted)"
+        );
         // An added token with lstrip.
         let mut tokenizer = tokenizer_of(base, &mut state);
         tokenizer
             .add_special_tokens([AddedToken::from("<pad>", true).lstrip(true)])
             .expect("special token");
-        assert!(NativeEncoder::from_tokenizer(&tokenizer).is_none());
+        assert_eq!(
+            declined(&tokenizer),
+            "added token \"<pad>\" with single_word, lstrip or rstrip, or without content"
+        );
         // A regex outside the subset.
         let mut tokenizer = tokenizer_of(base, &mut state);
         tokenizer.with_pre_tokenizer(Some(PreTokenizerWrapper::Sequence(Sequence::new(vec![
             split(r"\w+|\s+", SplitDelimiterBehavior::Isolated, false),
             byte_level(false),
         ]))));
-        assert!(NativeEncoder::from_tokenizer(&tokenizer).is_none());
+        assert_eq!(
+            declined(&tokenizer),
+            r"a split pattern outside the supported regex subset: \w+|\s+"
+        );
+        // A post-processor that adds tokens, and a model that is not BPE.
+        let mut tokenizer = tokenizer_of(base, &mut state);
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("<|im_start|> $A")
+                .expect("template")
+                .special_tokens(vec![("<|im_start|>", 0)])
+                .build()
+                .expect("post-processor"),
+        ));
+        assert_eq!(
+            declined(&tokenizer),
+            "post-processor TemplateProcessing (only ByteLevel or none)"
+        );
+        let tokenizer = HfTokenizer::new(WordLevel::default());
+        assert_eq!(declined(&tokenizer), "the model is not BPE");
     }
 
     #[test]
@@ -880,9 +1020,7 @@ mod tests {
         use crate::traits::{Encoder, Encoding};
         let mut state = 0x5A5A_1234_5678_9ABCu64;
         for shape in shapes() {
-            let tokenizer = crate::huggingface::HuggingFaceTokenizer::from_tokenizer(tokenizer_of(
-                &shape, &mut state,
-            ));
+            let tokenizer = HuggingFaceTokenizer::from_tokenizer(tokenizer_of(&shape, &mut state));
             let added: Vec<&str> = shape.special.to_vec();
             let mut texts: Vec<String> = (0..8)
                 .map(|round| random_text(&mut state, 1 + round * 5, &added))
@@ -944,13 +1082,13 @@ mod tests {
                     .get_ids()
                     .to_vec();
                 match native.encode(tokenizer.get_model(), &text) {
-                    Some(ids) => {
+                    Ok(ids) => {
                         compared += 1;
                         assert_eq!(ids, reference, "{}: {text:?}", shape.name);
                     }
-                    None => assert!(
-                        shape.nfc && text.nfc().ne(text.chars()),
-                        "{}: declined {text:?} for no reason",
+                    Err(fallback) => assert!(
+                        fallback == Fallback::NotNfc && shape.nfc && text.nfc().ne(text.chars()),
+                        "{}: declined {text:?} as {fallback:?}",
                         shape.name
                     ),
                 }
@@ -996,7 +1134,7 @@ mod tests {
                     .expect("encode")
                     .get_ids()
                     .to_vec();
-                if let Some(ids) = native.encode(tokenizer.get_model(), text) {
+                if let Ok(ids) = native.encode(tokenizer.get_model(), text) {
                     assert_eq!(ids, reference, "{}: {text:?}", shape.name);
                 }
             }
@@ -1010,10 +1148,66 @@ mod tests {
         let tokenizer = tokenizer_of(shape, &mut state);
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
         // "e" + combining acute composes under NFC: not our business.
-        assert!(native
-            .encode(tokenizer.get_model(), "Cafe\u{301}")
-            .is_none());
-        assert!(native.encode(tokenizer.get_model(), "Caf\u{E9}").is_some());
+        assert_eq!(
+            native.encode(tokenizer.get_model(), "Cafe\u{301}"),
+            Err(Fallback::NotNfc)
+        );
+        assert!(native.encode(tokenizer.get_model(), "Caf\u{E9}").is_ok());
+    }
+
+    #[test]
+    fn a_piece_the_model_declines_is_reported_after_the_work() {
+        // A vocabulary without the character for byte 0x7F whose `unk_token`
+        // is not in it either: `tokenizers` fails such a piece, and so does
+        // this path, once the pieces before it have been tokenized.
+        let mut state = 0x4444_3333_2222_1111u64;
+        let shape = &shapes()[0];
+        let mut tokenizer = tokenizer_of(shape, &mut state);
+        let table = bytes_char();
+        let mut vocab = Vocab::default();
+        for ch in table.iter().filter(|&&ch| ch != table[0x7F]) {
+            let id = vocab.len() as u32;
+            vocab.insert(ch.to_string(), id);
+        }
+        let mut bpe = BPE::builder()
+            .vocab_and_merges(vocab, Merges::new())
+            .build()
+            .expect("bpe");
+        bpe.unk_token = Some("<unk>".to_owned());
+        tokenizer.with_model(bpe);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        assert!(native.encode(tokenizer.get_model(), "plain text").is_ok());
+        assert_eq!(
+            native.encode(tokenizer.get_model(), "plain text\u{7F}"),
+            Err(Fallback::PieceDeclined)
+        );
+        assert!(tokenizer.encode("plain text\u{7F}", false).is_err());
+    }
+
+    #[test]
+    fn an_input_the_direct_encoder_gives_up_is_counted_and_encoded_by_tokenizers() {
+        use crate::traits::Encoder;
+        let mut state = 0x8888_9999_AAAA_BBBBu64;
+        let shape = &shapes()[0];
+        let reference = tokenizer_of(shape, &mut state);
+        let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+        let not_nfc = |stats: &[EncodeFallbacks; 2]| {
+            stats
+                .iter()
+                .find(|s| s.reason == "not_nfc")
+                .map_or(0, |s| s.encodes)
+        };
+        let before = not_nfc(&encode_fallbacks());
+        for text in ["Cafe\u{301}", "a\u{323}\u{301}", "\u{1100}\u{1161}"] {
+            let ids = ours.encode(text, false).expect("encode");
+            assert_eq!(
+                ids.token_ids(),
+                reference.encode(text, false).expect("encode").get_ids(),
+                "{text:?}"
+            );
+        }
+        // Three inputs left the direct path here; other tests may add theirs.
+        assert!(not_nfc(&encode_fallbacks()) >= before + 3);
     }
 
     #[test]
@@ -1042,17 +1236,17 @@ mod tests {
             split(r"\p{N}*|\s+", SplitDelimiterBehavior::Isolated, false),
             byte_level(false),
         ]))));
-        if let Some(native) = NativeEncoder::from_tokenizer(&tokenizer) {
+        if let Ok(native) = NativeEncoder::from_tokenizer(&tokenizer) {
             for text in ["ab1", "the same words 12"] {
                 let reference = tokenizer.encode(text, false).expect("encode");
                 assert_eq!(
                     native.encode(tokenizer.get_model(), text),
-                    Some(reference.get_ids().to_vec()),
+                    Ok(reference.get_ids().to_vec()),
                     "{text:?}"
                 );
             }
         }
-        assert!(NativeEncoder::from_tokenizer(&tokenizer).is_none());
+        assert!(NativeEncoder::from_tokenizer(&tokenizer).is_err());
     }
 
     #[test]
@@ -1267,7 +1461,9 @@ mod tests {
             );
             let ids = native
                 .encode(tokenizer.get_model(), text)
-                .unwrap_or_else(|| panic!("{text:?} is in NFC and must take the native path"));
+                .unwrap_or_else(|fallback| {
+                    panic!("{text:?} is in NFC and must take the native path, not {fallback:?}")
+                });
             assert_eq!(
                 ids,
                 tokenizer.encode(text, false).expect("encode").get_ids(),
@@ -1283,8 +1479,9 @@ mod tests {
             "\u{AC00}\u{11A8}",
             "ก\u{E48}\u{E38}",
         ] {
-            assert!(
-                native.encode(tokenizer.get_model(), text).is_none(),
+            assert_eq!(
+                native.encode(tokenizer.get_model(), text),
+                Err(Fallback::NotNfc),
                 "{text:?}"
             );
         }

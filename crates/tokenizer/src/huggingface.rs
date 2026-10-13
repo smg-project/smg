@@ -25,6 +25,7 @@ use crate::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
+    encode_path::{self, EncodePath},
     encoders::{deepseek_v32, deepseek_v4, deepseek_v41, RendererProfile},
     native::NativeEncoder,
     traits::{
@@ -75,8 +76,11 @@ pub struct HuggingFaceTokenizer {
     /// decodes read it instead of running the `tokenizers` decode.
     pieces: Option<Arc<PieceTable>>,
     /// The direct encode path for byte-level BPE tokenizers of the common
-    /// shape (see `native`); `None` keeps every encode in `tokenizers`.
+    /// shape (see `native`), when [`DirectEncoders::choose`] took it;
+    /// `None` keeps every encode in `tokenizers`.
     native: Option<NativeEncoder>,
+    /// The opt-in v1 pipeline, when the choice took it (then `native` is
+    /// `None`).
     #[cfg(feature = "tokenizers-v1")]
     v1: Option<crate::v1::V1Encoder>,
     has_byte_fallback: bool,
@@ -138,25 +142,101 @@ struct AddedTokenConfig {
     special: bool,
 }
 
+/// The encoders a tokenizer may serve an encode with before `tokenizers`
+/// itself, chosen once per load by [`DirectEncoders::choose`].
+struct DirectEncoders {
+    #[cfg(feature = "tokenizers-v1")]
+    v1: Option<crate::v1::V1Encoder>,
+    native: Option<NativeEncoder>,
+}
+
+impl DirectEncoders {
+    /// The first path, in order of preference, that takes `tokenizer`: the
+    /// opt-in v1 pipeline (behind its feature), the direct byte-level
+    /// encoder, else none and `tokenizers` encodes. The choice is logged
+    /// once, with the reasons the paths before it declined, and counted per
+    /// path ([`encode_path::encode_path_loads`]).
+    fn choose(tokenizer: &HfTokenizer) -> Self {
+        #[cfg(feature = "tokenizers-v1")]
+        let v1_declined = match crate::v1::V1Encoder::from_tokenizer(
+            tokenizer,
+            HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD,
+        ) {
+            Ok(v1) => {
+                encode_path::note_load(EncodePath::V1);
+                tracing::info!(path = %EncodePath::V1, "tokenizer encode path");
+                return Self {
+                    v1: Some(v1),
+                    native: None,
+                };
+            }
+            Err(declined) => declined,
+        };
+        let (native, path, native_declined) = match NativeEncoder::from_tokenizer(tokenizer) {
+            Ok(native) => (Some(native), EncodePath::Native, None),
+            Err(declined) => (None, EncodePath::Tokenizers, Some(declined.to_string())),
+        };
+        encode_path::note_load(path);
+        #[cfg(feature = "tokenizers-v1")]
+        tracing::warn!(
+            path = %path,
+            v1_declined = %v1_declined,
+            native_declined = native_declined.as_deref(),
+            "the opt-in tokenizers v1 pipeline declined this tokenizer; its encodes take the next path"
+        );
+        #[cfg(not(feature = "tokenizers-v1"))]
+        tracing::info!(
+            path = %path,
+            native_declined = native_declined.as_deref(),
+            "tokenizer encode path"
+        );
+        Self {
+            #[cfg(feature = "tokenizers-v1")]
+            v1: None,
+            native,
+        }
+    }
+
+    /// Words the `tokenizers` model may cache per thread: none behind the
+    /// direct encode path (`native`), whose own piece cache, owned by the
+    /// encoder and freed with it, answers in front of the model for every
+    /// piece of up to 256 bytes (the short ones by count, the long ones, a
+    /// clause in a script without word spaces say, within a byte budget; a
+    /// longer piece is rare and merged on every encode), else
+    /// [`HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD`]. The model's
+    /// cache outlives the model: it is a thread-local the crate never
+    /// clears, so every thread that encoded with a tokenizer the gateway
+    /// dropped (an unload, a re-registration, a reload) kept the words it
+    /// had cached for it, half a MB per thread per dropped tokenizer. The
+    /// piece cache is owned by the encoder and freed with it.
+    fn bpe_words_cached(&self) -> usize {
+        if self.native.is_some() {
+            0
+        } else {
+            HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD
+        }
+    }
+}
+
 impl HuggingFaceTokenizer {
+    /// The path this tokenizer's encodes take, chosen at load (see
+    /// [`EncodePath`]).
+    pub fn encode_path(&self) -> EncodePath {
+        #[cfg(feature = "tokenizers-v1")]
+        if self.v1.is_some() {
+            return EncodePath::V1;
+        }
+        if self.native.is_some() {
+            EncodePath::Native
+        } else {
+            EncodePath::Tokenizers
+        }
+    }
+
     /// Whether this tokenizer uses the opt-in tokenizers v1 encode pipeline.
     /// Unsupported configurations retain the existing encode path.
-    #[cfg_attr(
-        not(feature = "tokenizers-v1"),
-        expect(
-            clippy::unused_self,
-            reason = "keep the instance API identical across features"
-        )
-    )]
     pub fn uses_v1_encoder(&self) -> bool {
-        #[cfg(feature = "tokenizers-v1")]
-        {
-            self.v1.is_some()
-        }
-        #[cfg(not(feature = "tokenizers-v1"))]
-        {
-            false
-        }
+        self.encode_path() == EncodePath::V1
     }
 
     /// Create a tokenizer from a HuggingFace tokenizer JSON file
@@ -376,26 +456,16 @@ impl HuggingFaceTokenizer {
             .map(detect_renderer_from_config)
             .unwrap_or(Renderer::Jinja);
 
-        #[cfg(feature = "tokenizers-v1")]
-        let v1 =
-            crate::v1::V1Encoder::from_tokenizer(&tokenizer, Self::BPE_WORDS_CACHED_PER_THREAD);
-        #[cfg(feature = "tokenizers-v1")]
-        let native = if v1.is_none() {
-            NativeEncoder::from_tokenizer(&tokenizer)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "tokenizers-v1"))]
-        let native = NativeEncoder::from_tokenizer(&tokenizer);
-        Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
+        let encoders = DirectEncoders::choose(&tokenizer);
+        Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             pieces: PieceTable::build(&tokenizer),
-            native,
+            native: encoders.native,
             #[cfg(feature = "tokenizers-v1")]
-            v1,
+            v1: encoders.v1,
             tokenizer,
             special_tokens,
             vocab,
@@ -512,28 +582,8 @@ impl HuggingFaceTokenizer {
     /// frequent ones.
     const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
 
-    /// Words the model may cache per thread: none behind the direct encode
-    /// path (`native`), whose own piece cache, owned by the encoder and freed
-    /// with it, answers in front of the model for every piece of up to 256
-    /// bytes (the short ones by count, the long ones, a clause in a script
-    /// without word spaces say, within a byte budget; a longer piece is rare
-    /// and merged on every encode), else
-    /// [`Self::BPE_WORDS_CACHED_PER_THREAD`]. The
-    /// model's cache outlives the model: it is a thread-local the crate
-    /// never clears, so every thread that encoded with a tokenizer the
-    /// gateway dropped (an unload, a re-registration, a reload) kept the
-    /// words it had cached for it, half a MB per thread per dropped
-    /// tokenizer. The piece cache is owned by the encoder and freed with it.
-    fn bpe_words_cached(native: Option<&NativeEncoder>) -> usize {
-        if native.is_some() {
-            0
-        } else {
-            Self::BPE_WORDS_CACHED_PER_THREAD
-        }
-    }
-
     /// Sizes the per-thread word cache of a BPE model to `words`
-    /// ([`Self::bpe_words_cached`]); other model kinds have none.
+    /// ([`DirectEncoders::bpe_words_cached`]); other model kinds have none.
     fn bound_bpe_cache(tokenizer: &mut HfTokenizer, words: usize) {
         let bounded = match tokenizer.get_model() {
             ModelWrapper::BPE(bpe) => {
@@ -550,18 +600,8 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
-        #[cfg(feature = "tokenizers-v1")]
-        let v1 =
-            crate::v1::V1Encoder::from_tokenizer(&tokenizer, Self::BPE_WORDS_CACHED_PER_THREAD);
-        #[cfg(feature = "tokenizers-v1")]
-        let native = if v1.is_none() {
-            NativeEncoder::from_tokenizer(&tokenizer)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "tokenizers-v1"))]
-        let native = NativeEncoder::from_tokenizer(&tokenizer);
-        Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
+        let encoders = DirectEncoders::choose(&tokenizer);
+        Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
@@ -574,9 +614,9 @@ impl HuggingFaceTokenizer {
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             pieces: PieceTable::build(&tokenizer),
-            native,
+            native: encoders.native,
             #[cfg(feature = "tokenizers-v1")]
-            v1,
+            v1: encoders.v1,
             tokenizer,
             special_tokens,
             vocab,
@@ -719,13 +759,13 @@ impl Encoder for HuggingFaceTokenizer {
             return v1.encode(input, add_special_tokens);
         }
         // The direct path accepts no post-processor that adds tokens, so a
-        // request for special tokens gets the same ids and is served too.
-        if let Some(ids) = self
-            .native
-            .as_ref()
-            .and_then(|native| native.encode(self.tokenizer.get_model(), input))
-        {
-            return Ok(Encoding::Plain(ids));
+        // request for special tokens gets the same ids and is served too. An
+        // input it gives up is counted and encoded by `tokenizers`.
+        if let Some(native) = &self.native {
+            match native.encode(self.tokenizer.get_model(), input) {
+                Ok(ids) => return Ok(Encoding::Plain(ids)),
+                Err(fallback) => encode_path::note_fallback(fallback),
+            }
         }
         self.tokenizer
             .encode(input, add_special_tokens)
