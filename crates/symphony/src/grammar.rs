@@ -60,7 +60,7 @@ use serde_json::{json, Value};
 use crate::{
     format::{CallSyntax, Emits, Format},
     gemma::STRING as GEMMA_STRING,
-    tagged::{assembler::TAGS as TAGGED_TAGS, dsml, keyed::Tags as KeyedTags},
+    tagged::{assembler::TAGS as TAGGED_TAGS, keyed::Tags as KeyedTags},
 };
 
 mod attributed;
@@ -332,8 +332,9 @@ impl Format {
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
                 Self::keyed_calls(markers?, &named, at_least_one)
             }
-            CallSyntax::Dsml => Self::dsml_calls(markers?, &named, at_least_one)?,
-            CallSyntax::Attributed(tags) => attributed::calls(markers?, tags, &named, at_least_one),
+            CallSyntax::Attributed(tags) => {
+                attributed::calls(markers?, tags, &named, at_least_one)?
+            }
             CallSyntax::Keyed(tags) => {
                 let markers = markers?;
                 let ways_in = self.ways_into_block(markers);
@@ -382,7 +383,6 @@ impl Format {
                 tags.value_open,
                 tags.value_close,
             ],
-            Some(CallSyntax::Dsml) => &[dsml::PARAMETER_OPEN, dsml::PARAMETER_CLOSE],
             Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
             Some(CallSyntax::Gemma) => &[GEMMA_STRING],
@@ -538,66 +538,6 @@ impl Format {
             tags,
             at_least_one,
         }
-    }
-
-    /// DSML: the calls block, inside it one invoke per call, inside an invoke any number of
-    /// parameter tags whose `string` attribute types the value (`true`: any text up to a closing
-    /// tag; `false`: any JSON value), with the template's newlines; the shape the gateway writes
-    /// for DeepSeek V4.1 today. The block follows the template's two newlines.
-    fn dsml_calls(
-        markers: &CallMarkers<'_>,
-        tools: &[&Tool],
-        at_least_one: bool,
-    ) -> Option<Grammar> {
-        let block = markers.block.as_ref()?;
-        let (block_open, block_close) = (block.open, block.close);
-        let parameter_close = dsml::PARAMETER_CLOSE;
-        let parameter = Grammar::Tag(Tag::new(
-            dsml::PARAMETER_OPEN,
-            Grammar::Sequence(vec![
-                Grammar::Regex("[^\"]+".to_string()),
-                Grammar::ConstString("\" string=\"".to_string()),
-                Grammar::Or(vec![
-                    Grammar::Sequence(vec![
-                        Grammar::ConstString("true\">".to_string()),
-                        Grammar::AnyText {
-                            excludes: vec![
-                                parameter_close.to_string(),
-                                markers.call_close.to_string(),
-                                block_close.to_string(),
-                            ],
-                        },
-                    ]),
-                    Grammar::Sequence(vec![
-                        Grammar::ConstString("false\">".to_string()),
-                        Grammar::JsonSchema {
-                            schema: Value::Bool(true),
-                            style: None,
-                        },
-                    ]),
-                ]),
-            ]),
-            format!("{parameter_close}\n"),
-        ));
-        let invokes = tools
-            .iter()
-            .map(|tool| {
-                Tag::new(
-                    format!("{}{}\">\n", markers.call_open, tool.function.name),
-                    Grammar::Star(Box::new(parameter.clone())),
-                    format!("{}\n", markers.call_close),
-                )
-            })
-            .collect();
-        Some(Grammar::Sequence(vec![
-            Grammar::ConstString(format!("\n\n{block_open}\n")),
-            Grammar::TagsWithSeparator {
-                tags: invokes,
-                separator: String::new(),
-                at_least_one,
-            },
-            Grammar::ConstString(block_close.to_string()),
-        ]))
     }
 
     /// The text the table drops wherever it stands, which the template writes before every tag
@@ -758,7 +698,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::formats;
+    use crate::{formats, tagged::attributed::Tags as AttributedTags};
 
     fn tool(name: &str, strict: Option<bool>, parameters: Value) -> Tool {
         Tool {
@@ -1057,7 +997,7 @@ mod tests {
                 .calls(syntax)
         };
         let tools = weather_tools();
-        let as_dsml = two_doors(CallSyntax::Dsml)
+        let as_dsml = two_doors(CallSyntax::Attributed(AttributedTags::DSML))
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
@@ -1135,7 +1075,7 @@ mod tests {
             .terminal("calls_open", "<｜DSML｜ calls>")
             .terminal("calls_close", "</｜DSML｜ calls>")
             .terminal("invoke_open", "<｜DSML｜ invoke name=\"")
-            .terminal("invoke_close", dsml::INVOKE_CLOSE)
+            .terminal("invoke_close", AttributedTags::DSML.invoke_close)
             .state("content", Emits::Content)
             .state("reasoning", Emits::Reasoning)
             .state("calls", Emits::Wrapper)
@@ -1149,7 +1089,7 @@ mod tests {
             .transition("invoke", "invoke_close", "calls")
             .transition("invoke", "invoke_open", "invoke")
             .transition("calls", "calls_close", "content")
-            .calls(CallSyntax::Dsml);
+            .calls(CallSyntax::Attributed(AttributedTags::DSML));
         let tools = weather_tools();
         assert_eq!(
             swapped.grammar(&tools, true, true),

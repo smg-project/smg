@@ -73,8 +73,9 @@ and a client that wants the raw text back can have it.
   request's tools declare.
 - `pythonic`: calls written as Python, `name(key=value)`.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
-  `tagged`, `pythonic`, and `xml` for MiniMax's; the JSON, compact keyed, DSML and xLAM list
-  spellings in the module itself), with the argument shapes a JSON schema pins (`schema`).
+  `tagged`, `pythonic`, `attributed` for MiniMax M2's, dots3's, MiniCPM5's and DSML's, and `xml`
+  for MiniMax M3's; the JSON, compact keyed and xLAM list spellings in the module itself), with
+  the argument shapes a JSON schema pins (`schema`).
 - `adapt`: the three API adapters, every response policy in one place.
 - `event`, `input`, `parser`: the contract above.
 

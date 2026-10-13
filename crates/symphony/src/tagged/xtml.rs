@@ -43,14 +43,15 @@
 //!   the call with no bytes of their own: after the last argument it closes the object and pushes
 //!   `ToolCallEnd`; inside a value it reports what was held, closes an open string and the
 //!   object. [`Assembler::finish`] is a stream that was cut: nothing is closed.
-//! - **Every byte of the call lands in exactly one event**, with the DSML assembler's accounting:
+//! - **Every byte of the call lands in exactly one event**, with the attributed assembler's
+//!   accounting:
 //!   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
 //!   produce, text where the syntax has tags as `Malformed` run by run with the whitespace before
 //!   it as `Dropped { Wrapper }`.
 //!
-//! This is the DSML assembler ([`dsml`](super::dsml)) with Kimi's tags and six types in place of
-//! DeepSeek's two; the two keep their shape side by side until a shared core shows where the
-//! seams are.
+//! This is the attributed assembler ([`attributed`](super::attributed)) with Kimi's tags and six
+//! types in place of DSML's two; the two keep their shape side by side until a shared core shows
+//! where the seams are.
 //!
 //! [`formats::kimi_k3`]: crate::formats::kimi_k3()
 

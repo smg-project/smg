@@ -1,5 +1,6 @@
 //! Parameters named by an attribute: the events of one `<invoke name="NAME">` block whose
-//! arguments are `<parameter name="KEY">VALUE</parameter>` tags, typed by the request's tools.
+//! arguments are `<parameter name="KEY">VALUE</parameter>` tags, typed by the request's tools or,
+//! in DeepSeek's DSML, by a `string` attribute on the tag.
 //!
 //! MiniMax M2 writes a call as
 //!
@@ -18,21 +19,36 @@
 //! ```
 //!
 //! one call after another on lines of their own; dots3 writes M2's tags with a block per call and
-//! every value on a line of its own. The engine's table owns the block's and the invoke's markers
-//! ([`formats::minimax_m2`], [`formats::minicpm5`], [`formats::dots3`]): it enters this
-//! assembler at `<invoke name="` (`<function name="`) and leaves it at the invoke's closing
-//! tag, so the assembler starts inside the function's name and never sees that tag; the engine
-//! hands it the tag's bytes as the call's end. Between those two the assembler reads the
-//! parameter tags itself, in the family's spelling ([`Tags`]).
+//! every value on a line of its own; DeepSeek V4 and V4.1 write M2's shape in DSML's spelling,
+//!
+//! ```text
+//! <｜DSML｜ invoke name="get_weather">
+//! <｜DSML｜ parameter name="city" string="true">Paris</｜DSML｜ parameter>
+//! <｜DSML｜ parameter name="days" string="false">3</｜DSML｜ parameter>
+//! </｜DSML｜ invoke>
+//! ```
+//!
+//! inside a `<｜DSML｜ calls>` block. The engine's table owns the block's and the invoke's markers
+//! ([`formats::minimax_m2`], [`formats::minicpm5`], [`formats::dots3`],
+//! [`formats::deepseek_v4_1`]): it enters this assembler at `<invoke name="` (`<function
+//! name="`) and leaves it at the invoke's closing tag, so the assembler starts inside the
+//! function's name and never sees that tag; the engine hands it the tag's bytes as the call's end.
+//! Between those two the assembler reads the parameter tags itself, in the family's spelling
+//! ([`Tags`]).
 //!
 //! What the syntax says, and what the assembler does with it:
 //!
-//! - **The request's tools type the value**, as in the keyed assembler: a declared string is its
-//!   text, every byte of it, streamed as it arrives; every other value is written whole at
-//!   `</parameter>` through [`json`], which reads the JSON the template writes for a number, a
-//!   boolean, a list, an object or null (`tojson`), and infers the rest. A parameter tag with
-//!   anything between the name's closing quote and `>` is no parameter tag the syntax has: the
-//!   whole tag comes back as `Malformed`, and no parameter opens.
+//! - **The request's tools type the value** ([`Typing::Declared`]), as in the keyed assembler: a
+//!   declared string is its text, every byte of it, streamed as it arrives; every other value is
+//!   written whole at `</parameter>` through [`json`], which reads the JSON the template writes
+//!   for a number, a boolean, a list, an object or null (`tojson`), and infers the rest. A
+//!   parameter tag with anything between the name's closing quote and `>` is no parameter tag the
+//!   syntax has: the whole tag comes back as `Malformed`, and no parameter opens.
+//! - **Or the tag's `string` attribute types the value** ([`Typing::StringAttribute`], DSML):
+//!   `string="true"` is the text, streamed like a declared string; `string="false"` is JSON the
+//!   model wrote, written whole at the close through [`json`]'s inference. The request's tools are
+//!   not consulted: the model says the type. A parameter tag with another attribute, or none, is
+//!   no parameter tag.
 //! - **Inside a value only `</parameter>` is a tag**; `<parameter name="` there is the value's
 //!   text.
 //! - **A value may be a CDATA section** where the family's template writes one ([`Tags::cdata`]):
@@ -55,6 +71,7 @@
 //! [`formats::minimax_m2`]: crate::formats::minimax_m2()
 //! [`formats::minicpm5`]: crate::formats::minicpm5()
 //! [`formats::dots3`]: crate::formats::dots3()
+//! [`formats::deepseek_v4_1`]: crate::formats::deepseek_v4_1()
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -77,10 +94,24 @@ const TAG_CUT_SHORT: &str = "a tag that another tag cut short";
 const EMPTY_NAME: &str = "a tag without a name";
 const TAG_TAIL: &str = "text after a tag's name";
 const CLOSED_EARLY: &str = "an invoke that closed before its function name closed";
+/// The two tails a DSML parameter tag has after the name's quote: the attribute that types it.
+const STRING_TRUE: &str = " string=\"true\"";
+const STRING_FALSE: &str = " string=\"false\"";
+
+/// Where a value's type comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Typing {
+    /// The request's tools: a declared string streams, every other value is written whole at the
+    /// close in the type the tool declares.
+    Declared,
+    /// A `string="true"` or `string="false"` attribute after the parameter's name: the model says
+    /// whether the value is its text or JSON.
+    StringAttribute,
+}
 
 /// How a family spells the syntax: the parameter tag's opening up to the name's quote and its
-/// closing tag, the invoke's closing tag, and whether a value may be a CDATA section. The invoke's
-/// opening is the table's terminal.
+/// closing tag, the invoke's closing tag, where a value's type comes from, and how the template
+/// frames the tags. The invoke's opening is the table's terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tags {
     pub parameter_open: &'static str,
@@ -101,6 +132,11 @@ pub struct Tags {
     /// Whether the template opens a block around each call rather than around all of a turn's
     /// calls. The grammar writes the block the table has that way; the assembler reads neither.
     pub block_per_call: bool,
+    /// Where a value's type comes from.
+    pub typing: Typing,
+    /// What the template writes before the opener of a block around a turn's calls: a newline, or
+    /// DSML's two. The grammar writes it; the assembler never sees it.
+    pub before_block: &'static str,
 }
 
 impl Tags {
@@ -113,6 +149,8 @@ impl Tags {
         value_on_its_own_line: false,
         tags_on_their_own_lines: true,
         block_per_call: false,
+        typing: Typing::Declared,
+        before_block: "\n",
     };
     /// dots3's: MiniMax M2's tags, a block around each call, every value on a line of its own.
     pub const DOTS3: Self = Self {
@@ -123,6 +161,8 @@ impl Tags {
         value_on_its_own_line: true,
         tags_on_their_own_lines: true,
         block_per_call: true,
+        typing: Typing::Declared,
+        before_block: "\n",
     };
     /// MiniCPM5's: `<param name="…">`, `</param>` and `</function>`, a value a CDATA section when
     /// it holds `<`, `&` or a newline.
@@ -134,6 +174,22 @@ impl Tags {
         value_on_its_own_line: false,
         tags_on_their_own_lines: false,
         block_per_call: false,
+        typing: Typing::Declared,
+        before_block: "\n",
+    };
+    /// DeepSeek's DSML: `<｜DSML｜ parameter name="…" string="…">`, `</｜DSML｜ parameter>`
+    /// and `</｜DSML｜ invoke>`, each tag on a line of its own, the value typed by its `string`
+    /// attribute, the calls block opened after the template's two newlines.
+    pub const DSML: Self = Self {
+        parameter_open: "<｜DSML｜ parameter name=\"",
+        parameter_close: "</｜DSML｜ parameter>",
+        invoke_close: "</｜DSML｜ invoke>",
+        cdata: false,
+        value_on_its_own_line: false,
+        tags_on_their_own_lines: true,
+        block_per_call: false,
+        typing: Typing::StringAttribute,
+        before_block: "\n\n",
     };
 
     fn text(&self, tag: usize) -> &'static str {
@@ -496,21 +552,29 @@ impl Assembler {
         self.stage = Stage::Between;
     }
 
-    /// The parameter tag is whole: the value begins, typed by what the tool declares for the key.
-    /// A tag with a tail after the name's quote (`<parameter name="x" type="int">`) is not one the
-    /// syntax has: the whole tag comes back as `Malformed`, and no parameter opens.
+    /// The parameter tag is whole: the value begins, typed by what the tool declares for the key,
+    /// or by the tag's `string` attribute. A tag with any other tail after the name's quote
+    /// (`<parameter name="x" type="int">`) is not one the syntax has: the whole tag comes back as
+    /// `Malformed`, and no parameter opens.
     fn open_value(&mut self, key: String, tail: &str, declared: &Declared, out: &mut Events) {
-        if !tail.is_empty() {
-            self.report(TAG_TAIL, out);
-            self.stage = Stage::Between;
-            return;
-        }
-        let function = self.function.as_deref().unwrap_or_default();
-        let kind = declared.kind(function, &key);
-        let mode = match kind {
-            Some(Kind::String) => Mode::Streaming { opened: false },
-            Some(Kind::NullableString) => Mode::Undecided,
-            Some(Kind::Integer | Kind::Array | Kind::Object) | None => Mode::Whole,
+        let (kind, mode) = match (self.tags.typing, tail) {
+            (Typing::Declared, "") => {
+                let function = self.function.as_deref().unwrap_or_default();
+                let kind = declared.kind(function, &key);
+                let mode = match kind {
+                    Some(Kind::String) => Mode::Streaming { opened: false },
+                    Some(Kind::NullableString) => Mode::Undecided,
+                    Some(Kind::Integer | Kind::Array | Kind::Object) | None => Mode::Whole,
+                };
+                (kind, mode)
+            }
+            (Typing::StringAttribute, STRING_TRUE) => (None, Mode::Streaming { opened: false }),
+            (Typing::StringAttribute, STRING_FALSE) => (None, Mode::Whole),
+            _ => {
+                self.report(TAG_TAIL, out);
+                self.stage = Stage::Between;
+                return;
+            }
         };
         self.stage = Stage::Value(ValueState {
             key,
@@ -871,6 +935,55 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_dsml_invoke_types_its_values_by_the_string_attribute_not_by_the_tool() {
+        // `s` is declared a string and `n` an integer, but the attribute decides: `n` as text
+        // streams, `s` as JSON is written whole, and a false value that is not JSON is the string
+        // holding it.
+        let pieces = [
+            "f\">\n<｜DSML｜ parameter name=\"n\" string=\"true\">Par",
+            "is</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"s\" string=\"false\">3",
+            "</｜DSML｜ parameter>\n",
+            "<｜DSML｜ parameter name=\"o\" string=\"false\">abc</｜DSML｜ parameter>\n",
+        ];
+        let events = run_with(Tags::DSML, &pieces, false);
+        assert_eq!(bytes(&events), pieces.concat() + Tags::DSML.invoke_close);
+        assert_eq!(arguments(&events), r#"{"n": "Paris", "s": 3, "o": "abc"}"#);
+        // The streamed value came out in pieces: its opening fragment, `Par`, `is`.
+        let fragments: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(&fragments[..3], &[r#"{"n": ""#, "Par", "is"]);
+        assert!(malformed(&events).is_empty());
+    }
+
+    #[test]
+    fn a_dsml_parameter_tag_with_another_attribute_or_none_is_no_parameter() {
+        for tag in [
+            "<｜DSML｜ parameter name=\"n\" kind=\"int\">",
+            "<｜DSML｜ parameter name=\"n\">",
+        ] {
+            let text = format!("f\">\n{tag}1</｜DSML｜ parameter>\n");
+            let events = run_with(Tags::DSML, &[&text], false);
+            assert_eq!(
+                bytes(&events),
+                text.clone() + Tags::DSML.invoke_close,
+                "{tag}"
+            );
+            assert_eq!(arguments(&events), "{}", "{tag}");
+            let why: Vec<String> = malformed(&events).into_iter().map(|(_, why)| why).collect();
+            assert_eq!(
+                why,
+                [TAG_TAIL, TEXT_BETWEEN_TAGS, TAG_OUT_OF_PLACE],
+                "{tag}"
+            );
+        }
     }
 
     #[test]

@@ -6,9 +6,10 @@
 //! What this table says beyond the Qwen ones:
 //!
 //! - **Two states for the calls.** `calls` is the template's wrapping between invokes (a newline,
-//!   dropped; anything else malformed), and `invoke` is one call's arguments, read by the DSML
-//!   assembler ([`tagged::dsml`](crate::tagged::dsml)). A block with several invokes gives several
-//!   calls, each with its own index, through the same two rows.
+//!   dropped; anything else malformed), and `invoke` is one call's arguments, read by the
+//!   attributed assembler with DSML's tags ([`tagged::attributed`](crate::tagged::attributed),
+//!   `Tags::DSML`), the `string` attribute typing each value. A block with several invokes gives
+//!   several calls, each with its own index, through the same two rows.
 //! - **The invoke tag's opening is the terminal** that enters the arguments state, so the
 //!   assembler starts inside the function's name; the closing tag is the terminal that leaves it,
 //!   and the call's end carries its bytes. A second invoke before the first closed ends the first
@@ -24,7 +25,7 @@
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::dsml,
+    tagged::attributed::Tags,
 };
 
 /// The DeepSeek V4.1 table.
@@ -35,7 +36,7 @@ pub fn deepseek_v4_1() -> Format {
         .terminal("calls_open", "<｜DSML｜ calls>")
         .terminal("calls_close", "</｜DSML｜ calls>")
         .terminal("invoke_open", "<｜DSML｜ invoke name=\"")
-        .terminal("invoke_close", dsml::INVOKE_CLOSE)
+        .terminal("invoke_close", Tags::DSML.invoke_close)
         .state("content", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
@@ -49,7 +50,7 @@ pub fn deepseek_v4_1() -> Format {
         .transition("invoke", "invoke_open", "invoke")
         .transition("invoke", "calls_close", "content")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::Dsml)
+        .calls(CallSyntax::Attributed(Tags::DSML))
         .opens_turn("<｜Assistant｜>")
 }
 

@@ -1,16 +1,21 @@
 //! Parameters named by an attribute, written from the table's own tags in the family's spelling
-//! ([`Tags`]): MiniMax M2's, MiniCPM5's and dots3's. A call is the invoke's opener with the tool's
-//! name and `">`, then one parameter tag per property of the tool's schema, in the schema's order,
-//! each optional unless the schema requires it, the value as the templates write it (a string as
-//! it is, everything else as JSON, which [`shape`] pins), its closing tag, then the invoke's
-//! close; a schema without properties takes any pairs at all. Where the family writes each tag on
-//! a line of its own (M2, dots3) a newline follows the invoke's opener, each parameter's close and
-//! the invoke's close; where a value stands on its own line (dots3) a newline frames it on both
-//! sides. The calls sit in the block the table has: M2's one block around the turn's calls, opened
-//! after a newline and on a line of its own and closed right after the last invoke's newline;
-//! dots3's block around each call, the block's opener triggering the tag so the newline the
-//! template writes before it is free text. A table without a block (MiniCPM5) writes each call as
-//! a tag the invoke's opener triggers, the newlines between calls free text.
+//! ([`Tags`]): MiniMax M2's, MiniCPM5's, dots3's and DSML's. A call is the invoke's opener with the
+//! tool's name and `">`, then one parameter tag per property of the tool's schema, in the schema's
+//! order, each optional unless the schema requires it, the value as the templates write it (a
+//! string as it is, everything else as JSON, which [`shape`] pins), its closing tag, then the
+//! invoke's close; a schema without properties takes any pairs at all. Where the family writes each
+//! tag on a line of its own (M2, dots3) a newline follows the invoke's opener, each parameter's
+//! close and the invoke's close; where a value stands on its own line (dots3) a newline frames it
+//! on both sides. The calls sit in the block the table has: M2's one block around the turn's calls,
+//! opened after a newline and on a line of its own and closed right after the last invoke's
+//! newline; dots3's block around each call, the block's opener triggering the tag so the newline
+//! the template writes before it is free text. A table without a block (MiniCPM5) writes each call
+//! as a tag the invoke's opener triggers, the newlines between calls free text.
+//!
+//! Where the tag's `string` attribute types the value (DSML, [`Typing::StringAttribute`]) the
+//! schema is not consulted: any number of parameters with any name, each `string="true"` with
+//! any text or `string="false"` with any JSON value, the shape the gateway hand-wrote for
+//! DeepSeek V4.1; a schema-driven spelling is a change of its own.
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -19,16 +24,19 @@ use super::{
     schema::{self, shape, Definitions},
     CallMarkers, Grammar, Tag,
 };
-use crate::tagged::attributed::Tags;
+use crate::tagged::attributed::{Tags, Typing};
 
 /// The calls for `tools`, in the family's spelling: in the table's one block, in a block each, or
-/// with no block at all.
+/// with no block at all. `None` for a syntax that needs a block the table has not.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     tags: &Tags,
     tools: &[&Tool],
     at_least_one: bool,
-) -> Grammar {
+) -> Option<Grammar> {
+    if tags.typing == Typing::StringAttribute {
+        return string_attribute_calls(markers, tags, tools, at_least_one);
+    }
     let ends = Ends {
         parameter_close: tags.parameter_close,
         call_exits: &markers.call_exits,
@@ -50,34 +58,93 @@ pub(super) fn calls(
     };
     let Some(block) = markers.block.as_ref() else {
         // No block: each call is a tag its opener triggers, the text between calls free.
-        return Grammar::TriggeredTags {
+        return Some(Grammar::TriggeredTags {
             triggers: vec![markers.call_open.to_string()],
             tags: tools.iter().map(|tool| invoke(tool, "", "")).collect(),
             at_least_one,
-        };
+        });
     };
     if tags.block_per_call {
         // A block around each call: the block's opener triggers the tag, so the newline the
         // template writes before it is free text.
         let before = format!("{}\n", block.open);
-        return Grammar::TriggeredTags {
+        return Some(Grammar::TriggeredTags {
             triggers: vec![block.open.to_string()],
             tags: tools
                 .iter()
                 .map(|tool| invoke(tool, &before, block.close))
                 .collect(),
             at_least_one,
-        };
+        });
     }
-    Grammar::Sequence(vec![
-        Grammar::ConstString(format!("\n{}\n", block.open)),
+    Some(Grammar::Sequence(vec![
+        Grammar::ConstString(format!("{}{}\n", tags.before_block, block.open)),
         Grammar::TagsWithSeparator {
             tags: tools.iter().map(|tool| invoke(tool, "", "")).collect(),
             separator: String::new(),
             at_least_one,
         },
         Grammar::ConstString(block.close.to_string()),
-    ])
+    ]))
+}
+
+/// The calls where the tag's `string` attribute types the value: the block after what the
+/// template writes before it, inside it one invoke per tool, inside an invoke any number of
+/// parameter tags, each `string="true"` with any text up to a closing tag or `string="false"` with
+/// any JSON value, every tag closed with the template's newline.
+fn string_attribute_calls(
+    markers: &CallMarkers<'_>,
+    tags: &Tags,
+    tools: &[&Tool],
+    at_least_one: bool,
+) -> Option<Grammar> {
+    let block = markers.block.as_ref()?;
+    let parameter = Grammar::Tag(Tag::new(
+        tags.parameter_open,
+        Grammar::Sequence(vec![
+            Grammar::Regex("[^\"]+".to_string()),
+            Grammar::ConstString("\" string=\"".to_string()),
+            Grammar::Or(vec![
+                Grammar::Sequence(vec![
+                    Grammar::ConstString("true\">".to_string()),
+                    Grammar::AnyText {
+                        excludes: vec![
+                            tags.parameter_close.to_string(),
+                            markers.call_close.to_string(),
+                            block.close.to_string(),
+                        ],
+                    },
+                ]),
+                Grammar::Sequence(vec![
+                    Grammar::ConstString("false\">".to_string()),
+                    Grammar::JsonSchema {
+                        schema: Value::Bool(true),
+                        style: None,
+                    },
+                ]),
+            ]),
+        ]),
+        format!("{}\n", tags.parameter_close),
+    ));
+    let invokes = tools
+        .iter()
+        .map(|tool| {
+            Tag::new(
+                format!("{}{}\">\n", markers.call_open, tool.function.name),
+                Grammar::Star(Box::new(parameter.clone())),
+                format!("{}\n", markers.call_close),
+            )
+        })
+        .collect();
+    Some(Grammar::Sequence(vec![
+        Grammar::ConstString(format!("{}{}\n", tags.before_block, block.open)),
+        Grammar::TagsWithSeparator {
+            tags: invokes,
+            separator: String::new(),
+            at_least_one,
+        },
+        Grammar::ConstString(block.close.to_string()),
+    ]))
 }
 
 /// What ends a value: its own closing tag, and the terminals the table has a row for out of the

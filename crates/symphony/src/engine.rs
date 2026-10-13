@@ -104,7 +104,6 @@ pub struct Engine {
 enum Call {
     Json(json::Assembler),
     Tagged(tagged::Assembler),
-    Dsml(tagged::dsml::Assembler),
     Keyed(tagged::keyed::Assembler),
     Pythonic(pythonic::Assembler),
     JsonList(json::list::Assembler),
@@ -125,7 +124,6 @@ impl Call {
             Some(CallSyntax::Tagged(_, placement)) => {
                 Self::Tagged(tagged::Assembler::new(index, id, placement))
             }
-            Some(CallSyntax::Dsml) => Self::Dsml(tagged::dsml::Assembler::new(index, id)),
             Some(CallSyntax::Keyed(tags)) => {
                 Self::Keyed(tagged::keyed::Assembler::new(index, id, tags))
             }
@@ -147,10 +145,6 @@ impl Call {
         match self {
             Self::Json(assembler) => assembler.feed(text, out),
             Self::Tagged(assembler) => assembler.feed(text, declared, out),
-            Self::Dsml(assembler) => {
-                assembler.feed(text, out);
-                text.len()
-            }
             Self::Keyed(assembler) => {
                 assembler.feed(text, declared, out);
                 text.len()
@@ -207,18 +201,6 @@ impl Call {
             (Self::Json(assembler), _) => assembler.finish(out),
             (Self::Tagged(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::Tagged(assembler), Closed::ByEnd) => assembler.finish(out),
-            // Only the invoke's closing tag is the call's end; the next invoke's opening and the
-            // block's close end the call too, and the engine drops them as the region's. An
-            // invoke that named no call takes whichever terminal ended it, so that it is reported
-            // the same way however it ended.
-            (Self::Dsml(assembler), Closed::ByMarker)
-                if terminal == tagged::dsml::INVOKE_CLOSE || !assembler.started() =>
-            {
-                assembler.close(terminal, out);
-                return true;
-            }
-            (Self::Dsml(assembler), Closed::ByMarker) => assembler.close("", out),
-            (Self::Dsml(assembler), Closed::ByEnd) => assembler.finish(out),
             (Self::Keyed(assembler), Closed::ByMarker) => {
                 assembler.close(terminal, out);
                 return true;
@@ -229,8 +211,10 @@ impl Call {
             (Self::Pythonic(assembler), Closed::ByEnd) => assembler.finish(out),
             (Self::JsonList(assembler), Closed::ByMarker) => assembler.close(out),
             (Self::JsonList(assembler), Closed::ByEnd) => assembler.finish(out),
-            // As for DSML: only the invoke's closing tag is a started call's end, and an invoke
-            // that named no call takes whichever terminal ended it.
+            // Only the invoke's closing tag is a started call's end; the next invoke's opening and
+            // the block's close end the call too, and the engine drops them as the region's. An
+            // invoke that named no call takes whichever terminal ended it, so that it is reported
+            // the same way however it ended.
             (Self::Xml(assembler), Closed::ByMarker)
                 if terminal == tagged::xml::INVOKE_CLOSE || !assembler.started() =>
             {
@@ -239,7 +223,7 @@ impl Call {
             }
             (Self::Xml(assembler), Closed::ByMarker) => assembler.close("", out),
             (Self::Xml(assembler), Closed::ByEnd) => assembler.finish(out),
-            // And for Kimi K3: only the call's closing tag is a started call's end.
+            // As for XML: only the call's closing tag is a started call's end.
             (Self::Xtml(assembler), Closed::ByMarker)
                 if terminal == tagged::xtml::CALL_CLOSE || !assembler.started() =>
             {
@@ -248,8 +232,7 @@ impl Call {
             }
             (Self::Xtml(assembler), Closed::ByMarker) => assembler.close("", out),
             (Self::Xtml(assembler), Closed::ByEnd) => assembler.finish(out),
-            // As for DSML: only the invoke's closing tag is a started call's end, and an invoke
-            // that named no call takes whichever terminal ended it.
+            // As for XML: only the invoke's closing tag is a started call's end.
             (Self::Attributed(assembler), Closed::ByMarker)
                 if terminal == assembler.invoke_close() || !assembler.started() =>
             {
