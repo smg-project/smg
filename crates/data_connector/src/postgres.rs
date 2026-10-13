@@ -26,8 +26,8 @@ use crate::{
     schema::SchemaConfig,
     versioning::{
         postgres_create_versions_table, postgres_current_version, postgres_table_exists,
-        run_postgres_migrations, schema_ahead_check, stamp_postgres_versions,
-        POSTGRES_SCHEMA_LOCK_ID, VERSIONS_TABLE,
+        postgres_table_exists_sql, run_postgres_migrations, schema_ahead_check,
+        stamp_postgres_versions, POSTGRES_SCHEMA_LOCK_ID, VERSIONS_TABLE,
     },
 };
 
@@ -103,7 +103,9 @@ impl PostgresStore {
     /// (or refuses when `auto_migrate` is off), and creates the indexes
     /// last, once the columns they cover exist. Gateways starting together
     /// on an empty database all come up: the next one waits for the first's
-    /// commit and finds the schema in place.
+    /// commit and finds the schema in place. The index an earlier release
+    /// built for the sweep of unstored records goes after the commit,
+    /// concurrently (see [`Self::drop_legacy_unstored_index`]).
     pub(crate) async fn bootstrap(&self) -> Result<(), String> {
         let mut client = self.pool.get().await.map_err(|e| {
             format!(
@@ -223,21 +225,6 @@ impl PostgresStore {
             .await?;
         }
 
-        // The index an earlier release built over `::jsonb` refused every row
-        // whose object carries the escape `\u0000`: it goes on every start
-        // (a no-op once gone); an existing table gets the replacement from its
-        // operator, concurrently (see the release note).
-        tx.batch_execute(&PostgresResponseStorage::legacy_unstored_index_drop_ddl(
-            schema,
-        ))
-        .await
-        .map_err(|e| {
-            format!(
-                "failed to drop the earlier unstored response index: {}",
-                describe_error(&e)
-            )
-        })?;
-
         // The indexes last, so the share lock a `CREATE INDEX IF NOT EXISTS`
         // takes on its table is not held while the migrations wait for their
         // own locks: the links index on columns the table always has, then
@@ -283,7 +270,58 @@ impl PostgresStore {
                 "failed to commit the schema bootstrap: {}",
                 describe_error(&e)
             )
-        })
+        })?;
+
+        // The index an earlier release built over `::jsonb` (it refused every
+        // row whose object carries the escape `\u0000`) goes after the commit,
+        // outside any transaction and concurrently: a plain `DROP INDEX`
+        // takes an ACCESS EXCLUSIVE lock on the table, which on a database
+        // other replicas are serving queues behind every open transaction on
+        // the table and every later statement behind it, held to the commit.
+        // An existing table gets the replacement from its operator,
+        // concurrently too (see the release note).
+        self.drop_legacy_unstored_index(&client).await
+    }
+
+    /// Drops the index an earlier release built under
+    /// [`LEGACY_UNSTORED_INDEX`] when the database still has it: `DROP INDEX
+    /// CONCURRENTLY`, which blocks no read or write on the table and waits
+    /// for the transactions using it to end instead (it cannot run inside a
+    /// transaction block, so this runs on `client` after the bootstrap's
+    /// commit). Nothing is sent once the index is gone.
+    async fn drop_legacy_unstored_index(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> Result<(), String> {
+        let index = PostgresResponseStorage::legacy_unstored_index_name(&self.schema);
+        let present: bool = client
+            .query_one(postgres_table_exists_sql(), &[&index])
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to check for the earlier unstored response index: {}",
+                    describe_error(&e)
+                )
+            })?
+            .get(0);
+        if !present {
+            return Ok(());
+        }
+        tracing::info!(
+            index = %index,
+            "dropping the earlier unstored response index concurrently (the drop waits for the transactions using the table to end, and blocks none)"
+        );
+        client
+            .batch_execute(&PostgresResponseStorage::legacy_unstored_index_drop_ddl(
+                &self.schema,
+            ))
+            .await
+            .map_err(|e| {
+                format!(
+                    "failed to drop the earlier unstored response index: {}",
+                    describe_error(&e)
+                )
+            })
     }
 }
 
@@ -1272,14 +1310,25 @@ impl PostgresResponseStorage {
         ))
     }
 
+    /// The name of the index an earlier release built over `::jsonb`,
+    /// [`LEGACY_UNSTORED_INDEX`], under the schema's owner when it has one.
+    pub(crate) fn legacy_unstored_index_name(schema: &SchemaConfig) -> String {
+        match schema.owner.as_deref() {
+            Some(owner) => format!("{owner}.{LEGACY_UNSTORED_INDEX}"),
+            None => LEGACY_UNSTORED_INDEX.to_string(),
+        }
+    }
+
     /// The statement that drops the index an earlier release built over
     /// `::jsonb` under [`LEGACY_UNSTORED_INDEX`], valid or not: with it on
     /// the table no row whose object carries `\u0000` can be written.
+    /// Concurrently, so no read or write on the table waits on the drop;
+    /// the statement cannot run inside a transaction block.
     pub(crate) fn legacy_unstored_index_drop_ddl(schema: &SchemaConfig) -> String {
-        match schema.owner.as_deref() {
-            Some(owner) => format!("DROP INDEX IF EXISTS {owner}.{LEGACY_UNSTORED_INDEX};"),
-            None => format!("DROP INDEX IF EXISTS {LEGACY_UNSTORED_INDEX};"),
-        }
+        format!(
+            "DROP INDEX CONCURRENTLY IF EXISTS {};",
+            Self::legacy_unstored_index_name(schema)
+        )
     }
 
     pub fn build_response_from_row(
@@ -1922,6 +1971,26 @@ mod tests {
         assert!(
             lookup.contains(&format!("{}::jsonb @>", nul_safe_json_document(col_raw))),
             "{lookup}"
+        );
+    }
+
+    /// The earlier index is dropped concurrently (a plain drop holds an
+    /// ACCESS EXCLUSIVE lock on the live table to the end of its
+    /// transaction), under the schema's owner when it has one.
+    #[test]
+    fn the_earlier_index_is_dropped_concurrently() {
+        let schema = SchemaConfig::default();
+        assert_eq!(
+            PostgresResponseStorage::legacy_unstored_index_drop_ddl(&schema),
+            "DROP INDEX CONCURRENTLY IF EXISTS responses_unstored_idx;"
+        );
+        let owned = SchemaConfig {
+            owner: Some("history".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            PostgresResponseStorage::legacy_unstored_index_drop_ddl(&owned),
+            "DROP INDEX CONCURRENTLY IF EXISTS history.responses_unstored_idx;"
         );
     }
 

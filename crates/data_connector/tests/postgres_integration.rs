@@ -1931,3 +1931,148 @@ async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earli
         "the sweep plans on its index: {plan:?}"
     );
 }
+
+/// A start on a database that still has the index an earlier release built
+/// drops it without blocking the table: while a transaction another session
+/// holds open on `responses` makes the drop wait, a plain read from a third
+/// session answers (a plain `DROP INDEX` wants an ACCESS EXCLUSIVE lock on the
+/// table, and the read would queue behind it until the first session ends).
+/// On a database of its own.
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_start_drops_the_earlier_index_without_blocking_a_read_on_the_table() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "drop_lock")
+        .await
+        .expect("create a scratch database");
+    let outcome = async {
+        postgres_bundle(&scratch.url)
+            .await
+            .map(drop)
+            .map_err(|e| format!("the first start: {e}"))?;
+        scratch
+            .run(
+                "CREATE INDEX responses_unstored_idx ON responses ((raw_response::jsonb->>'status')) \
+                 WHERE (raw_response::jsonb->>'store') = 'false'",
+            )
+            .await
+            .map_err(|e| format!("the earlier release's index: {e}"))?;
+
+        // Session 1: a transaction that read the table and stays open.
+        let (holder, holder_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 1: {e}"))?;
+        let mut drivers = JoinSet::new();
+        drivers.spawn(async move {
+            let _ = holder_connection.await;
+        });
+        holder
+            .batch_execute("BEGIN; SELECT count(*) FROM responses")
+            .await
+            .map_err(|e| format!("session 1's read: {e}"))?;
+
+        // Session 2: a second start, whose drop of the earlier index has to
+        // wait for session 1.
+        let url = scratch.url.clone();
+        let mut start = JoinSet::new();
+        start.spawn(async move { postgres_bundle(&url).await.map(drop) });
+
+        // Seen from a fourth session: the start waits on a lock in its drop.
+        let (watch, watch_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 4: {e}"))?;
+        drivers.spawn(async move {
+            let _ = watch_connection.await;
+        });
+        let mut waiting_drop = None;
+        for _ in 0..200 {
+            let rows = watch
+                .query(
+                    "SELECT wait_event_type || '/' || coalesce(wait_event, '') FROM pg_stat_activity \
+                     WHERE datname = current_database() AND query ILIKE 'DROP INDEX%' \
+                     AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("session 4's read: {e}"))?;
+            if let Some(row) = rows.first() {
+                waiting_drop = Some(row.get::<_, String>(0));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Session 3: a plain read, bounded by the server at 2 s.
+        let (reader, reader_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 3: {e}"))?;
+        drivers.spawn(async move {
+            let _ = reader_connection.await;
+        });
+        reader
+            .batch_execute("SET statement_timeout = '2s'")
+            .await
+            .map_err(|e| format!("session 3's bound: {e}"))?;
+        let started = Instant::now();
+        let read = reader
+            .query_one("SELECT count(*) FROM responses", &[])
+            .await
+            .map(|row| row.get::<_, i64>(0))
+            .map_err(|e| match e.as_db_error() {
+                Some(db) => format!("{} ({})", db.message(), db.code().code()),
+                None => e.to_string(),
+            });
+        let read_took = started.elapsed();
+
+        // Session 1 ends: the drop goes through and the start completes.
+        holder
+            .batch_execute("COMMIT")
+            .await
+            .map_err(|e| format!("session 1's commit: {e}"))?;
+        let second_start = match tokio::time::timeout(Duration::from_secs(60), start.join_next()).await
+        {
+            Err(_) => Err("still waiting 60 s after session 1 ended".to_string()),
+            Ok(None) => Err("did not run".to_string()),
+            Ok(Some(Err(e))) => Err(format!("its task: {e}")),
+            Ok(Some(Ok(result))) => result,
+        };
+        let indexes = scratch.indexes().await?;
+        drop(holder);
+        drop(watch);
+        drop(reader);
+        drivers.join_all().await;
+        Ok::<_, String>((waiting_drop, read, read_took, second_start, indexes))
+    }
+    .await;
+    scratch.drop().await;
+
+    let (waiting_drop, read, read_took, second_start, indexes) = outcome.unwrap();
+    println!(
+        "the start's drop waited on {waiting_drop:?}; the read during it: {read:?} after {read_took:?}; \
+         the second start: {second_start:?}; indexes after it: {indexes:?}"
+    );
+    assert!(
+        waiting_drop.is_some(),
+        "the start's drop of the earlier index did not wait for the open transaction"
+    );
+    assert!(
+        read.is_ok(),
+        "a plain read on the table waited behind the start's drop (cancelled at its 2 s bound): {read:?}"
+    );
+    assert!(
+        second_start.is_ok(),
+        "the second start once session 1 ended: {second_start:?}"
+    );
+    assert!(
+        !indexes
+            .iter()
+            .any(|index| index == "responses_unstored_idx"),
+        "the earlier index is gone after the start: {indexes:?}"
+    );
+}
