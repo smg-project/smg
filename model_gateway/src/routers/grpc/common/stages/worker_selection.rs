@@ -1783,7 +1783,9 @@ mod tests {
             PD_PREFILL_QUEUE_FULL,
         },
         tenant::TenantKey,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation},
+        worker::{
+            BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillReservation, WorkerLoadGuard,
+        },
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -5068,6 +5070,43 @@ mod tests {
         );
         assert!(!holds_claim, "the prefill claim went back");
         assert_eq!(prefill.load(), 0, "no load left on the prefill worker");
+    }
+
+    /// An admission that lands right at the bound gives its claim back: the
+    /// step both disaggregated modes share refuses a request whose bound was
+    /// reached while its admission ran, and drops the guard. The admission
+    /// here is already settled, so the budget inside `admit_within_budget`
+    /// never fires and only the step after it can refuse.
+    #[tokio::test]
+    async fn an_admission_that_lands_past_the_bound_is_refused_and_gives_its_claim_back() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let prefill = worker("grpc://prefill-late:30000", WorkerType::Prefill);
+        registry.register(Arc::clone(&prefill)).unwrap();
+        let stage = pd_stage(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(5))),
+        )
+        .with_queue_timeout(Duration::from_millis(50));
+        let ctx = prepared_ctx(Arc::clone(&registry), None);
+        let accepted = Some(Instant::now() - Duration::from_millis(100));
+        let guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+        };
+        assert_eq!(prefill.load(), 1, "the admission holds its claim");
+
+        let Err(refused) = stage
+            .admit_selection_within_budget(&ctx, accepted, async { Ok(((), guard)) })
+            .await
+        else {
+            panic!("admitted past the bound, the request is refused");
+        };
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            SELECTION_QUEUE_TIMEOUT_ERROR_CODE
+        );
+        assert_eq!(prefill.load(), 0, "the claim went back with the refusal");
     }
 
     // ---- the refusal line of a drained pool -------------------------------------------------
