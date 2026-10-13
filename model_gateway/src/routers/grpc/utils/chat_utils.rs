@@ -98,7 +98,10 @@ pub(crate) async fn send_error_sse(tx: &SseSender, message: impl fmt::Display, e
             error_type,
         },
     };
-    // Serializing into memory fails only when the message's `Display` does.
+    // Unreachable in practice: a `Vec` writer never fails, and serde_json
+    // panics (as `to_string` did) on a `Display` that errors rather than
+    // returning the error; the fallback keeps the frame well-formed should
+    // either ever change.
     if serde_json::to_writer(&mut frame, &body).is_err() {
         frame.truncate(PREFIX.len());
         frame.extend_from_slice(
