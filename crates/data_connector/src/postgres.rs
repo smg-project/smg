@@ -298,14 +298,23 @@ impl Clone for PostgresStore {
 // prepared afresh; the connection is whole again for every later call.
 
 /// Whether `error` says the statement the server was handed is stale: its
-/// cached plan no longer fits the table (`0A000`) or it no longer exists on
-/// the server (`26000`).
+/// cached plan no longer fits the table (`0A000` raised by the server's
+/// cached-plan revalidation; the class holds unrelated answers too, which
+/// stay as they are) or it no longer exists on the server (`26000`).
 fn is_stale_statement(error: &tokio_postgres::Error) -> bool {
-    error.code().is_some_and(is_stale_statement_state)
+    error
+        .as_db_error()
+        .is_some_and(|db| is_stale_statement_state(db.code(), db.routine()))
 }
 
-fn is_stale_statement_state(code: &SqlState) -> bool {
-    *code == SqlState::FEATURE_NOT_SUPPORTED || *code == SqlState::INVALID_SQL_STATEMENT_NAME
+/// The server routine that raises `0A000` for a cached plan whose result no
+/// longer fits ("cached plan must not change result type"); the routine field
+/// is sent whatever the server's message locale, the message is not.
+const CACHED_PLAN_REVALIDATION: &str = "RevalidateCachedQuery";
+
+fn is_stale_statement_state(code: &SqlState, routine: Option<&str>) -> bool {
+    *code == SqlState::INVALID_SQL_STATEMENT_NAME
+        || (*code == SqlState::FEATURE_NOT_SUPPORTED && routine == Some(CACHED_PLAN_REVALIDATION))
 }
 
 /// The statement for `sql` prepared afresh after a stale answer: the entry
@@ -1953,19 +1962,39 @@ mod tests {
     }
 
     /// The two answers that mean the statement the server was handed is
-    /// stale (its cached plan no longer fits, it no longer exists), and no
-    /// other, make a helper prepare the statement afresh and call again.
+    /// stale (its cached plan no longer fits, raised by the server's
+    /// cached-plan revalidation; it no longer exists, whatever raised it),
+    /// and no other, make a helper prepare the statement afresh and call
+    /// again: `0A000` from any other routine is the broad class it is (a
+    /// feature the server does not support) and is answered as it came.
     #[test]
     fn a_stale_plan_and_a_missing_statement_are_the_stale_states() {
-        assert!(is_stale_statement_state(&SqlState::FEATURE_NOT_SUPPORTED));
         assert!(is_stale_statement_state(
-            &SqlState::INVALID_SQL_STATEMENT_NAME
+            &SqlState::FEATURE_NOT_SUPPORTED,
+            Some("RevalidateCachedQuery")
         ));
-        assert!(!is_stale_statement_state(&SqlState::UNIQUE_VIOLATION));
+        assert!(is_stale_statement_state(
+            &SqlState::INVALID_SQL_STATEMENT_NAME,
+            None
+        ));
+        assert!(is_stale_statement_state(
+            &SqlState::INVALID_SQL_STATEMENT_NAME,
+            Some("FetchPreparedStatement")
+        ));
         assert!(!is_stale_statement_state(
-            &SqlState::IN_FAILED_SQL_TRANSACTION
+            &SqlState::FEATURE_NOT_SUPPORTED,
+            None
         ));
-        assert!(!is_stale_statement_state(&SqlState::UNDEFINED_COLUMN));
-        assert!(!is_stale_statement_state(&SqlState::QUERY_CANCELED));
+        assert!(!is_stale_statement_state(
+            &SqlState::FEATURE_NOT_SUPPORTED,
+            Some("infer_arbiter_indexes")
+        ));
+        assert!(!is_stale_statement_state(&SqlState::UNIQUE_VIOLATION, None));
+        assert!(!is_stale_statement_state(
+            &SqlState::IN_FAILED_SQL_TRANSACTION,
+            None
+        ));
+        assert!(!is_stale_statement_state(&SqlState::UNDEFINED_COLUMN, None));
+        assert!(!is_stale_statement_state(&SqlState::QUERY_CANCELED, None));
     }
 }
