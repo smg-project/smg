@@ -166,8 +166,10 @@ pub trait VisionPreProcessor: Send + Sync {
     ///
     /// This is used to determine how many placeholder tokens to insert
     /// in the text input before the image has been fully processed. A
-    /// config or a size that [`Self::preprocess`] would refuse is the same
-    /// error here, never a count of zero or one taken from other settings.
+    /// config the implementation cannot read, or a size its resize rule
+    /// refuses, is the error the preprocessing reports for it, never a count
+    /// of zero or one taken from other settings; the arithmetic itself
+    /// cannot fail.
     ///
     /// # Arguments
     /// * `width` - Image width after preprocessing

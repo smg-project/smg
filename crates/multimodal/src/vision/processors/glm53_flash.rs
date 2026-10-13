@@ -637,8 +637,6 @@ mod tests {
         }
     }
 
-    /// The video processor config this family's checkpoint ships, the keys
-    /// the engine's own processor reads.
     #[test]
     fn token_count_reports_an_unusable_expand_factor() {
         // A present but unusable `patch_expand_factor` is the configuration
@@ -661,6 +659,8 @@ mod tests {
         );
     }
 
+    /// The video processor config this family's checkpoint ships, the keys
+    /// the engine's own processor reads.
     fn video_config() -> PreProcessorConfig {
         PreProcessorConfig::from_json(
             r#"{"do_rescale":true,"video_processor_type":"Glm5NextVideoProcessor",
