@@ -4,7 +4,7 @@
 
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{Tool, ToolChoice},
+    common::{Tool, ToolChoice, ToolChoiceValue},
 };
 use tool_parser::ToolConstraint;
 
@@ -27,6 +27,23 @@ pub(crate) fn effective_tools_json(request: &ChatCompletionRequest) -> Option<St
         return None;
     }
     serde_json::to_string(&tools).ok()
+}
+
+/// Whether the engine must keep its special tokens for the response parser:
+/// tools at either level (request-level or message-declared), a tool choice
+/// that allows calls, and no JSON-schema constraint (whose output is plain
+/// JSON from the first token, with no markers to keep). The request paths
+/// derive `skip_special_tokens = false` from it.
+pub(crate) fn tools_keep_special_tokens(
+    request: &ChatCompletionRequest,
+    constraint: Option<&(String, String)>,
+) -> bool {
+    constraint.is_none_or(|(kind, _)| kind != "json_schema")
+        && !effective_tools(request).is_empty()
+        && !matches!(
+            request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        )
 }
 
 /// The constraint the engine is held to for the request's tool choice, built
@@ -215,6 +232,28 @@ mod tests {
         let schema =
             schema_of(&request_with_message_tool(Value::Null, json!("required"))).to_string();
         assert!(schema.contains("get_weather"), "{schema}");
+    }
+
+    /// The engine keeps its special tokens for the parser when tools are
+    /// declared at either level and nothing forces plain JSON: a request whose
+    /// only tool is message-declared keeps them; a JSON-schema constraint, a
+    /// `none` choice or no tools at all do not.
+    #[test]
+    fn special_tokens_are_kept_for_message_declared_tools() {
+        let only_message_tool = request_with_message_tool(Value::Null, json!("auto"));
+        assert!(tools_keep_special_tokens(&only_message_tool, None));
+        let json_schema = ("json_schema".to_string(), "{}".to_string());
+        assert!(!tools_keep_special_tokens(
+            &only_message_tool,
+            Some(&json_schema)
+        ));
+        let none_choice = request_with_message_tool(Value::Null, json!("none"));
+        assert!(!tools_keep_special_tokens(&none_choice, None));
+        let no_tools: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "kimi-k3", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(!tools_keep_special_tokens(&no_tools, None));
     }
 
     /// The response parser's tool list is the same set: the request-level

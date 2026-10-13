@@ -8,10 +8,7 @@ use std::{
 };
 
 use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
-use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ToolChoice, ToolChoiceValue},
-};
+use openai_protocol::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::process_chat_messages;
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
 use uuid::Uuid;
@@ -22,7 +19,7 @@ use super::{
     runtime::RUNTIME,
     stream::SglangStreamHandle,
     tokenizer::TokenizerHandle,
-    tool_constraint::{effective_tools_json, tool_constraint_for},
+    tool_constraint::{effective_tools_json, tool_constraint_for, tools_keep_special_tokens},
     utils::chat_requires_reasoning,
 };
 
@@ -190,16 +187,9 @@ pub unsafe extern "C" fn sgl_client_chat_completion_stream(
         }
     };
 
-    // Derive skip_special_tokens from constraint type (option B)
-    if tool_constraint
-        .as_ref()
-        .is_none_or(|c| c.0 != "json_schema")
-        && chat_request.tools.is_some()
-        && !matches!(
-            chat_request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        )
-    {
+    // The engine keeps its special tokens when a parser will read them:
+    // tools at either level, a choice that allows calls, no JSON schema.
+    if tools_keep_special_tokens(&chat_request, tool_constraint.as_ref()) {
         chat_request.skip_special_tokens = false;
     }
 
