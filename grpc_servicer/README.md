@@ -82,7 +82,10 @@ by default) overrides the model's per-modality reference limits;
 meaning vLLM's own `--media-io-kwargs` decide) caps the frames a video is
 sampled to, so long clips stay bounded. All eight flag-backed settings are
 validated when the servicer starts, whatever the processor mode, so a stale
-unreadable value fails loudly.
+unreadable value fails loudly. The inline cap is the worker's alone: the router
+has no per-item cap, and the 400 it relays for an oversized item quotes this
+flag; what the router bounds is the whole request body, with
+`--max-buffered-request-bytes`, which a large inline item needs raised as well.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 the model's spec opts in and every registered worker of the model advertises
