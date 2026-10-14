@@ -82,6 +82,11 @@ PROFILE_TIMEOUT = 600.0
 # long, before it reports the refusal.
 FLUSH_RETRY_INTERVAL_S = 0.05
 FLUSH_RETIRE_GRACE_S = 2.0
+# The bound of the whole FlushCache RPC, attempts included: the scheduler's
+# round-trip floor, or the request's own wait plus a margin; the gateway's
+# client deadline is sized on it.
+FLUSH_SCHEDULER_TIMEOUT_S = 30.0
+FLUSH_SCHEDULER_MARGIN_S = 10.0
 LOG_MM_TENSOR_DATA = os.getenv("TOKENSPEED_LOG_MM_TENSOR_DATA", "").lower() in (
     "1",
     "true",
@@ -936,19 +941,28 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         ``FLUSH_RETRY_INTERVAL_S`` until the engine accepts it, for the
         request's ``timeout_s`` and never less than ``FLUSH_RETIRE_GRACE_S``;
         a request that is really in flight still fails the flush, at the end
-        of that wait instead of at once.
+        of that wait instead of at once. The attempts share one deadline,
+        ``comm_timeout``, so the RPC as a whole stays bounded as before.
         """
         logger.debug("Receive flush cache request (timeout_s=%.1f)", request.timeout_s)
-        comm_timeout = max(30.0, request.timeout_s + 10.0)
-        wait_s = request.timeout_s if math.isfinite(request.timeout_s) else 0.0
+        timeout_s = request.timeout_s
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "timeout_s must be finite and non-negative"
+            )
+            return
+        comm_timeout = max(FLUSH_SCHEDULER_TIMEOUT_S, timeout_s + FLUSH_SCHEDULER_MARGIN_S)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(wait_s, FLUSH_RETIRE_GRACE_S)
+        rpc_deadline = loop.time() + comm_timeout
+        retry_deadline = loop.time() + max(timeout_s, FLUSH_RETIRE_GRACE_S)
         attempts = 0
         try:
             while True:
                 attempts += 1
-                result = await asyncio.wait_for(self.async_llm.flush_cache(), timeout=comm_timeout)
-                if result.success or loop.time() >= deadline:
+                result = await asyncio.wait_for(
+                    self.async_llm.flush_cache(), timeout=max(0.0, rpc_deadline - loop.time())
+                )
+                if result.success or loop.time() >= retry_deadline:
                     break
                 await asyncio.sleep(FLUSH_RETRY_INTERVAL_S)
         # asyncio.TimeoutError is a separate exception on Python 3.10.

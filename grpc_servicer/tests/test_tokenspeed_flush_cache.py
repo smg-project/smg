@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sys
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import grpc
 import pytest
 
 pytest.importorskip("msgspec")
@@ -148,3 +150,58 @@ def test_the_engines_own_message_is_reported(servicer_mod, monkeypatch):
     servicer.async_llm = SimpleNamespace(flush_cache=flush_cache)
 
     assert _flush(servicer).message == "cleared 12 pages"
+
+
+class _Abort(Exception):
+    pass
+
+
+class _RecordingContext:
+    """A servicer context that records ``abort`` and ends the handler the way
+    grpc's does (``abort`` never returns)."""
+
+    def __init__(self):
+        self.aborts = []
+
+    async def abort(self, code, details):
+        self.aborts.append((code, details))
+        raise _Abort()
+
+
+@pytest.mark.parametrize("timeout_s", [-1.0, float("inf"), float("nan")])
+def test_a_non_finite_or_negative_timeout_is_refused_before_any_attempt(
+    servicer_mod, monkeypatch, timeout_s
+):
+    """``timeout_s`` sizes the wait and the RPC bound; a value that cannot is
+    an INVALID_ARGUMENT, as the vLLM servicer answers it."""
+    _fast(servicer_mod, monkeypatch, grace_s=0.0)
+    servicer, attempts = _servicer(servicer_mod, [True])
+    context = _RecordingContext()
+
+    with pytest.raises(_Abort):
+        asyncio.run(servicer.FlushCache(common_pb2.FlushCacheRequest(timeout_s=timeout_s), context))
+
+    assert [code for code, _ in context.aborts] == [grpc.StatusCode.INVALID_ARGUMENT]
+    assert attempts == []
+
+
+def test_the_whole_rpc_stays_within_the_scheduler_bound(servicer_mod, monkeypatch):
+    """The retry window never outlives the scheduler round-trip bound: an
+    attempt that hangs is cut at what is left of it, however long the grace."""
+    _fast(servicer_mod, monkeypatch, grace_s=60.0)
+    monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_MARGIN_S", 0.05, raising=False)
+    servicer, _ = _servicer(servicer_mod, [False])
+
+    async def flush_cache():
+        await asyncio.Event().wait()
+
+    servicer.async_llm = SimpleNamespace(flush_cache=flush_cache)
+    context = _RecordingContext()
+
+    started = time.monotonic()
+    with pytest.raises(_Abort):
+        asyncio.run(servicer.FlushCache(common_pb2.FlushCacheRequest(), context))
+
+    assert time.monotonic() - started < 5.0
+    assert [code for code, _ in context.aborts] == [grpc.StatusCode.DEADLINE_EXCEEDED]
