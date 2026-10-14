@@ -462,9 +462,9 @@ impl AppContextBuilder {
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
-                "The configured parser names are the legacy parsers', so every model is read by \
-                 the legacy parsers under --parser symphony; a Symphony table's name in both \
-                 flags reads with that table"
+                "The configured parser names select no Symphony table, so every model is read by \
+                 the legacy parsers under --parser symphony; a table's name, or a legacy name \
+                 that reads a table's format (qwen, qwen_xml, ...), reads with that table"
             );
         }
 
