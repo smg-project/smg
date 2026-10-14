@@ -90,8 +90,8 @@ refuses a `data:` item above its own per-kind input bound
 above `--mm-max-item-bytes` with a message that names the worker as the flag's
 owner, which the router relays as a 400 `start_generation_failed`. With the
 defaults a 50 MB item clears the router and stops at the worker's 32 MiB, so
-that flag is the one to raise; the router's `--max-buffered-request-bytes` must
-also hold the whole request body.
+that flag is the one to raise; the router's `--max-payload-size` (default
+512 MiB) must also hold the whole request body.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 the model's spec opts in and every registered worker of the model advertises
