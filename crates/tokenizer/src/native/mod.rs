@@ -104,6 +104,10 @@ const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
 /// Text on each side of a candidate cut that every stage's pattern is run
 /// over to confirm a piece starts there (widened to the spaces around it).
 const CUT_CHECK_WINDOW: usize = 512;
+/// Candidates one cut search may reject before it gives up: the byte scan for
+/// a candidate is cheap, the window check on each one is not, so a text whose
+/// candidates keep failing the check costs at most this many checks per cut.
+const MAX_REJECTED_CUT_CANDIDATES: usize = 64;
 
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
@@ -567,29 +571,39 @@ impl NativeEncoder {
     /// point (letters, digits and punctuation stop at the space, a whitespace
     /// run cannot start before it) and the patterns have no lookbehind, so
     /// the pieces of the two halves are the pieces of the whole. `None` when
-    /// the text has no such point within `PARALLEL_CHUNK_BYTES` past `from`
-    /// (the search is bounded: a text whose candidates all fail stays one
-    /// unit instead of paying a window check per candidate to its end).
+    /// the text has no such point past `from`, or when
+    /// [`MAX_REJECTED_CUT_CANDIDATES`] candidates past `from` failed the
+    /// check: a stretch without candidates (a blob, a table of numbers) costs
+    /// only the byte scan and the search goes on past it, a text whose
+    /// candidates keep failing stays one unit after that many checks.
     fn stable_cut(&self, text: &str, from: usize) -> Option<usize> {
         if self.stages.is_empty() {
             return None;
         }
         let bytes = text.as_bytes();
-        let limit = from.saturating_add(PARALLEL_CHUNK_BYTES).min(text.len());
+        let mut rejected = 0;
         let mut p = from;
-        while p + 1 < limit {
-            if bytes[p] == b' '
-                && text[p + 1..]
-                    .chars()
-                    .next()
-                    .is_some_and(char::is_alphabetic)
+        while p + 1 < text.len() {
+            if bytes[p] != b' ' {
+                p += 1;
+                continue;
+            }
+            if text[p + 1..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphabetic)
                 && text[..p]
                     .chars()
                     .next_back()
                     .is_some_and(|c| !c.is_whitespace())
-                && self.piece_starts_at(text, p)
             {
-                return Some(p);
+                if self.piece_starts_at(text, p) {
+                    return Some(p);
+                }
+                rejected += 1;
+                if rejected >= MAX_REJECTED_CUT_CANDIDATES {
+                    return None;
+                }
             }
             p += 1;
         }
@@ -630,9 +644,10 @@ impl NativeEncoder {
     }
 
     /// Appends the ids of one unit: an added token's id, or a text's pieces
-    /// through the added tokens matched after normalization, the stages and
-    /// the model; the reason when the model declines a piece (the pieces
-    /// after it are tokenized all the same, as in the whole-text encode).
+    /// through the stages and the model (the text has no added token left in
+    /// it, see [`Self::units`]); the reason when the model declines a piece
+    /// (the pieces after it are tokenized all the same, as in the whole-text
+    /// encode).
     fn encode_unit(
         &self,
         model: &ModelWrapper,
@@ -650,13 +665,7 @@ impl NativeEncoder {
         };
         match *unit {
             Segment::Added(id) => ids.push(id),
-            Segment::Text(text) => match &self.normalized_added {
-                Some(added) => added.split(text, |inner| match inner {
-                    Segment::Added(id) => ids.push(id),
-                    Segment::Text(text) => tokenize(text, ids),
-                }),
-                None => tokenize(text, ids),
-            },
+            Segment::Text(text) => tokenize(text, ids),
         }
         fallback.map_or(Ok(()), Err)
     }
@@ -1377,6 +1386,42 @@ mod tests {
         assert_eq!(pooled, serial, "the pool changed the ids");
         assert_eq!(pooled, reference, "against the reference");
         assert!(pooled.contains(&foo_bar), "the token's id is in the ids");
+    }
+
+    /// A stretch without a cut candidate (a table of numbers: spaces before
+    /// digits, never before a letter) longer than two chunks, then prose: the
+    /// search goes on past the stretch and the prose is chunked.
+    #[test]
+    fn chunking_goes_on_past_a_stretch_without_candidates() {
+        let mut state = 0x7E57_C0DE_0BAD_F00Du64;
+        let shape = shapes()
+            .into_iter()
+            .find(|shape| shape.name == "cl100k-ignore-merges")
+            .expect("the shape");
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let mut text = "0.125, -3.5, 42, ".repeat(PARALLEL_CHUNK_BYTES / 8);
+        assert!(text.len() > 2 * PARALLEL_CHUNK_BYTES);
+        text.push_str(&long_text(&mut state, &[], 4 * PARALLEL_CHUNK_BYTES));
+        let units = native.units(&text, true);
+        assert!(
+            units.len() > 2,
+            "{} units: the prose after the table is chunked",
+            units.len()
+        );
+        let pooled = native
+            .encode_with(tokenizer.get_model(), &text, true)
+            .expect("pooled");
+        let serial = native
+            .encode_with(tokenizer.get_model(), &text, false)
+            .expect("serial");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, serial, "the pool changed the ids");
+        assert_eq!(pooled, reference, "against the reference");
     }
 
     #[test]
