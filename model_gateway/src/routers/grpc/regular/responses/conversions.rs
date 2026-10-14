@@ -13,6 +13,7 @@ use openai_protocol::{
         ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, ToolCall,
         ToolChoice, ToolChoiceValue, UsageInfo,
     },
+    profile::ProviderProfile,
     responses::{
         CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, IncompleteDetails,
         IncompleteReason, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
@@ -263,14 +264,28 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
 
     // 4. Build ChatCompletionRequest
     let is_streaming = req.stream.unwrap_or(false);
+    let model = if req.model.is_empty() {
+        UNKNOWN_MODEL_ID.to_string()
+    } else {
+        req.model.clone()
+    };
+
+    // The history the items make is held to the model's contract as a chat
+    // request's would be: a tool result under a call id no call of the
+    // previous assistant turn issued is a malformed history under the
+    // contracts that say so, answered as a bad request, not sent to the
+    // engine. The message names the item, as the chat endpoint's does.
+    ProviderProfile::for_model(&model)
+        .validate_tool_messages(&messages)
+        .map_err(|error| {
+            error
+                .message
+                .map_or_else(|| error.code.to_string(), |message| message.into_owned())
+        })?;
 
     Ok(ChatCompletionRequest {
         messages,
-        model: if req.model.is_empty() {
-            UNKNOWN_MODEL_ID.to_string()
-        } else {
-            req.model.clone()
-        },
+        model,
         temperature: req.temperature,
         max_completion_tokens: req.max_output_tokens,
         stream: is_streaming,
@@ -813,6 +828,31 @@ mod tests {
             body["usage"]["output_tokens_details"],
             serde_json::json!({"reasoning_tokens": 0})
         );
+    }
+
+    /// A tool result under a call id the previous turn did not issue is a
+    /// malformed history under the DeepSeek contract (as under OpenAI's): the
+    /// conversion refuses it, naming the id; the right id converts, and a
+    /// model under no such contract converts either way.
+    #[test]
+    fn a_tool_result_under_an_unknown_call_id_does_not_convert_under_the_deepseek_contract() {
+        let request = |model: &str, call_id: &str| -> ResponsesRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": model,
+                "input": [
+                    {"type": "message", "role": "user", "content": "Add 17 and 25."},
+                    {"type": "function_call", "call_id": "call_1", "name": "add_integers",
+                     "arguments": "{\"a\":17,\"b\":25}"},
+                    {"type": "function_call_output", "call_id": call_id, "output": "42"}
+                ]
+            }))
+            .expect("a responses request")
+        };
+        let refused = responses_to_chat(&request("deepseek-flash", "call_doesnotexist"))
+            .expect_err("an unknown call id is a malformed history");
+        assert!(refused.contains("call_doesnotexist"), "{refused}");
+        assert!(responses_to_chat(&request("deepseek-flash", "call_1")).is_ok());
+        assert!(responses_to_chat(&request("local-model", "call_doesnotexist")).is_ok());
     }
 
     #[test]

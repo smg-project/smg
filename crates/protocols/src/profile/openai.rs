@@ -53,7 +53,7 @@ fn validate_single_token_limit(
 /// them, naming the message. Historical `arguments` are not inspected (the
 /// public API takes any string there). Linear in the number of messages
 /// and calls.
-fn validate_tool_message_pairing(
+pub(super) fn validate_tool_message_pairing(
     messages: &[ChatMessage],
 ) -> Result<(), validator::ValidationError> {
     // The call ids of the last assistant `tool_calls` turn still unanswered

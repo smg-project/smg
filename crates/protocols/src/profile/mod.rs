@@ -269,6 +269,27 @@ impl ProviderProfile {
         }
     }
 
+    /// The tool-message pairing rule of this profile's contract, for a chat
+    /// history assembled outside core validation (the Responses conversions
+    /// build one from input items): the OpenAI and DeepSeek contracts reject
+    /// a tool result under a call id the previous assistant turn did not
+    /// issue, or with no call to answer, the way the public API does; the
+    /// other profiles pass the history through to the engine.
+    pub fn validate_tool_messages(
+        self,
+        messages: &[ChatMessage],
+    ) -> Result<(), validator::ValidationError> {
+        match self {
+            ProviderProfile::OpenAi | ProviderProfile::DeepSeek => {
+                openai::validate_tool_message_pairing(messages)
+            }
+            ProviderProfile::Generic
+            | ProviderProfile::Kimi
+            | ProviderProfile::Zai
+            | ProviderProfile::Minimax => Ok(()),
+        }
+    }
+
     /// Contract rules applied on top of core validation.
     pub fn validate_chat(
         self,
@@ -286,6 +307,7 @@ impl ProviderProfile {
             }
             ProviderProfile::DeepSeek => {
                 reject_root(req)?;
+                openai::validate_tool_message_pairing(&req.messages)?;
                 deepseek::validate_chat(req)
             }
             ProviderProfile::OpenAi => {
@@ -576,5 +598,49 @@ mod tests {
                 "{model}"
             );
         }
+    }
+
+    /// A tool result under a call id the previous assistant turn did not
+    /// issue is a malformed history under the DeepSeek contract, as under
+    /// OpenAI's; the generic profile leaves it to the engine.
+    #[test]
+    fn a_tool_result_under_an_unknown_call_id_is_refused_under_the_deepseek_contract() {
+        let request = |model: &str, tool_call_id: &str| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": "Add 17 and 25."},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "add_integers", "arguments": "{\"a\":17,\"b\":25}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": tool_call_id, "content": "42"}
+                ]
+            }))
+            .expect("a chat request")
+        };
+        let code = |request: &ChatCompletionRequest| {
+            ProviderProfile::for_model(&request.model)
+                .validate_chat(request)
+                .err()
+                .map(|error| error.code.to_string())
+        };
+        assert_eq!(
+            code(&request("deepseek-flash", "call_doesnotexist")).as_deref(),
+            Some("tool_call_id_not_found")
+        );
+        assert_eq!(code(&request("deepseek-flash", "call_1")), None);
+        assert_eq!(code(&request("local-model", "call_doesnotexist")), None);
+        assert_eq!(
+            ProviderProfile::DeepSeek
+                .validate_tool_messages(&request("deepseek-flash", "call_doesnotexist").messages)
+                .err()
+                .map(|error| error.code.to_string())
+                .as_deref(),
+            Some("tool_call_id_not_found")
+        );
+        assert!(ProviderProfile::Generic
+            .validate_tool_messages(&request("local-model", "call_doesnotexist").messages)
+            .is_ok());
     }
 }
