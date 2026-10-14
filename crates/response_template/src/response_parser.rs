@@ -10,9 +10,9 @@ use serde_json::{Map, Value};
 
 use crate::{
     content_parsers::process_field,
-    error::{ParseError, PyError, PyErrorKind, PyResult, Taint},
+    error::{LoadError, ParseError, PyError, PyErrorKind, PyResult, Taint},
     py::{self, JsonError},
-    pyre::{Found, Match, Memo},
+    pyre::{Found, Match, Memo, Pattern},
     response_templates::{Delimiter, ResponseTemplate, ResponseTemplateField},
 };
 
@@ -133,12 +133,36 @@ pub(crate) fn coerce(raw: &str, types: &[String], taint: &mut Taint) -> PyResult
     Ok(Value::String(raw.to_owned()))
 }
 
+/// transformers: the cast of one argument in `_coerce_tool_calls`, by the
+/// non-empty `types` of its schema: a string with `_coerce`, and each string
+/// of a list when the types hold no array.
+pub(crate) fn coerce_argument(
+    argument: &mut Value,
+    types: &[String],
+    taint: &mut Taint,
+) -> PyResult<()> {
+    match argument {
+        Value::String(s) => *argument = coerce(s, types, taint)?,
+        // Duplicate keys collected by `merge_duplicates`; a list for a
+        // parameter that can be an array is already its value.
+        Value::Array(items) if !types.iter().any(|t| t == "array") => {
+            for item in items {
+                if let Value::String(s) = item {
+                    *item = coerce(s, types, taint)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// transformers: `ResponseParser`, a streaming parser with a response template.
 ///
 /// Feed model output with [`feed`](Self::feed) and finish with
 /// [`finalize`](Self::finalize); each returns the region events it produced.
 /// Events from the prompt prefix are in [`initial_events`](Self::initial_events).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResponseParser {
     spec: ResponseTemplate,
     /// Tool name to the `properties` of its parameters schema.
@@ -153,6 +177,9 @@ pub struct ResponseParser {
     body: String,
     opened: bool,
     initial_events: Vec<Event>,
+    /// Where the current region starts in `buffer`: at its opener, or for the
+    /// implicit field where the delimiter before it ended.
+    region_start: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,11 +191,35 @@ enum Kind {
 impl ResponseParser {
     /// transformers: `ResponseParser(template, prefix=prefix, tools=tools)`.
     /// `prefix` is the chat prompt sent before generation; pass `""` to opt out.
+    /// A template this crate's parser does not run
+    /// ([`ResponseTemplate::unsupported`]) is `ParseError::Unsupported`.
     pub fn new(
         template: &ResponseTemplate,
         prefix: &str,
         tools: &[Value],
     ) -> Result<Self, ParseError> {
+        Self::from_truncated(template, template.truncate_past_last_anchor(prefix), tools)
+    }
+
+    /// [`new`](Self::new) with the prefix already truncated past its last
+    /// start anchor; truncating it again could cut more.
+    pub(crate) fn from_truncated(
+        template: &ResponseTemplate,
+        truncated: &str,
+        tools: &[Value],
+    ) -> Result<Self, ParseError> {
+        if let Some(LoadError::Unsupported { scope, feature }) = template.unsupported() {
+            return Err(ParseError::Unsupported {
+                scope: scope.clone(),
+                feature: feature.clone(),
+            });
+        }
+        let mut parser = Self::unprimed(template, tools);
+        parser.prime(truncated)?;
+        Ok(parser)
+    }
+
+    fn unprimed(template: &ResponseTemplate, tools: &[Value]) -> Self {
         let mut tool_params = HashMap::new();
         for tool in tools {
             let function = match tool {
@@ -184,7 +235,7 @@ impl ResponseParser {
                 .and_then(Value::as_object);
             tool_params.insert(name.clone(), properties.cloned().unwrap_or_default());
         }
-        let mut parser = Self {
+        Self {
             spec: template.clone(),
             tool_params,
             buffer: String::new(),
@@ -196,13 +247,18 @@ impl ResponseParser {
             body: String::new(),
             opened: false,
             initial_events: Vec::new(),
-        };
-        if !prefix.is_empty() {
-            let mut events = Vec::new();
-            parser.consume_prefix(prefix, &mut events)?;
-            parser.initial_events = events;
+            region_start: 0,
         }
-        Ok(parser)
+    }
+
+    /// Consume the truncated prefix, keeping its events.
+    fn prime(&mut self, truncated: &str) -> Result<(), ParseError> {
+        if !truncated.is_empty() {
+            let mut events = Vec::new();
+            self.consume_prefix(truncated, &mut events)?;
+            self.initial_events = events;
+        }
+        Ok(())
     }
 
     /// Events produced while consuming the prefix, to replay before the output.
@@ -210,15 +266,15 @@ impl ResponseParser {
         &self.initial_events
     }
 
-    /// transformers: `_consume_prefix`.
-    fn consume_prefix(&mut self, prefix: &str, events: &mut Vec<Event>) -> Result<(), ParseError> {
-        let truncated = self.spec.truncate_past_last_anchor(prefix);
-        if truncated.is_empty() {
-            return Ok(());
-        }
+    /// transformers: `_consume_prefix`, from the truncation on.
+    fn consume_prefix(
+        &mut self,
+        truncated: &str,
+        events: &mut Vec<Event>,
+    ) -> Result<(), ParseError> {
         truncated.clone_into(&mut self.buffer);
         let mut taint = None;
-        self.process(events, false, &mut taint)?;
+        self.process(events, false, &mut taint, 0)?;
         taint.map_or(Ok(()), |t| Err(ParseError::Unrepresentable(t)))
     }
 
@@ -227,7 +283,7 @@ impl ResponseParser {
         self.buffer.push_str(text);
         let mut events = Vec::new();
         let mut taint = None;
-        self.process(&mut events, false, &mut taint)?;
+        self.process(&mut events, false, &mut taint, 0)?;
         taint.map_or(Ok(events), |t| Err(ParseError::Unrepresentable(t)))
     }
 
@@ -236,7 +292,7 @@ impl ResponseParser {
     pub fn finalize(mut self) -> Result<(Message, Vec<Event>), ParseError> {
         let mut events = Vec::new();
         let mut taint = None;
-        self.process(&mut events, true, &mut taint)?;
+        self.process(&mut events, true, &mut taint, 0)?;
         let missing: Vec<String> = self
             .spec
             .0
@@ -263,18 +319,20 @@ impl ResponseParser {
         Ok((self.output, events))
     }
 
-    /// transformers: `_process`.
+    /// transformers: `_process`. No match that starts before `floor` is
+    /// waited for (see [`feed_into`](Self::feed_into)); transformers' is 0.
     fn process(
         &mut self,
         events: &mut Vec<Event>,
         eos: bool,
         taint: &mut Taint,
+        floor: usize,
     ) -> Result<(), ParseError> {
         // The buffer does not change here, so searches of it are remembered.
         let mut memos = vec![[Memo::default(), Memo::default()]; self.spec.0.fields.len()];
         loop {
             let watch = self.watchlist();
-            let (best, hold_start) = self.scan(&watch, eos, &mut memos);
+            let (best, hold_start) = self.scan(&watch, eos, &mut memos, floor);
             if let Some((kind, field, m)) = best {
                 if m.start > self.pos {
                     let text = self.buffer[self.pos..m.start].to_owned();
@@ -332,12 +390,14 @@ impl ResponseParser {
         watch
     }
 
-    fn delimiter(&self, kind: Kind, field: usize) -> Option<&Delimiter> {
+    /// The delimiter and its pattern as the matcher runs it.
+    fn delimiter(&self, kind: Kind, field: usize) -> Option<(&Delimiter, &Pattern)> {
         let field = &self.spec.0.fields[field];
-        match kind {
+        let delimiter = match kind {
             Kind::Open => field.open.as_ref(),
             Kind::Close => field.close.as_ref(),
-        }
+        }?;
+        Some((delimiter, delimiter.pattern.as_ref()?))
     }
 
     /// transformers: `_scan`. The earliest delimiter that can be committed now
@@ -348,23 +408,26 @@ impl ResponseParser {
         watch: &[(Kind, usize)],
         eos: bool,
         memos: &mut [[Memo; 2]],
+        floor: usize,
     ) -> (Option<(Kind, usize, Match)>, usize) {
         let mut best: Option<(Kind, usize, Match)> = None;
         let mut hold_start = self.buffer.len();
         for &(kind, field) in watch {
-            let Some(delimiter) = self.delimiter(kind, field) else {
+            let Some((delimiter, pattern)) = self.delimiter(kind, field) else {
                 continue;
             };
             let memo = &mut memos[field][usize::from(kind == Kind::Close)];
             let found = if eos {
-                delimiter
-                    .pattern
+                pattern
                     .search(&self.buffer, self.pos, memo)
                     .map(Found::Complete)
             } else {
-                delimiter
-                    .pattern
-                    .search_partial(&self.buffer, self.pos, memo)
+                match pattern.search_partial(&self.buffer, self.pos, memo) {
+                    Some(Found::Partial(start)) if start < floor => {
+                        pattern.search_partial(&self.buffer, floor, memo)
+                    }
+                    found => found,
+                }
             };
             let m = match found {
                 None => continue,
@@ -372,7 +435,9 @@ impl ResponseParser {
                     hold_start = hold_start.min(start);
                     continue;
                 }
-                Some(Found::Complete(m)) if !eos && self.can_grow(delimiter, &m) => {
+                Some(Found::Complete(m))
+                    if !eos && m.start >= floor && self.can_grow(delimiter, &m) =>
+                {
                     hold_start = hold_start.min(m.start);
                     continue;
                 }
@@ -409,7 +474,8 @@ impl ResponseParser {
     }
 
     /// transformers: `_accumulate`. Route text into the current region; the
-    /// null sink (no implicit field, no open region) drops it.
+    /// null sink (no implicit field, no open region) drops it. `text` starts
+    /// at `pos`.
     fn accumulate(&mut self, events: &mut Vec<Event>, text: String) {
         let Some(current) = self.current.filter(|_| !text.is_empty()) else {
             return;
@@ -422,11 +488,13 @@ impl ResponseParser {
             self.opened = true;
         }
         self.body.push_str(&text);
-        events.push(Event::RegionChunk {
-            field: field.name.clone(),
-            text,
-            dirty: !field.content.parser.streamable(),
-        });
+        if !text.is_empty() {
+            events.push(Event::RegionChunk {
+                field: field.name.clone(),
+                text,
+                dirty: !field.content.parser.streamable(),
+            });
+        }
     }
 
     /// transformers: `_open_explicit`.
@@ -434,9 +502,8 @@ impl ResponseParser {
         let spec = self.spec.clone();
         let f = &spec.0.fields[field];
         self.current = Some(field);
-        self.captures = match &f.open {
-            Some(open) => open
-                .pattern
+        self.captures = match f.open.as_ref().and_then(|open| open.pattern.as_ref()) {
+            Some(pattern) => pattern
                 .groupdict(&self.buffer, m)
                 .into_iter()
                 .filter_map(|(name, value)| Some((name.to_owned(), value?.to_owned())))
@@ -445,6 +512,7 @@ impl ResponseParser {
         };
         self.body.clear();
         self.opened = true;
+        self.region_start = m.start;
         events.push(Event::RegionOpen {
             field: f.name.clone(),
         });
@@ -560,19 +628,7 @@ impl ResponseParser {
             if types.is_empty() {
                 continue;
             }
-            match argument {
-                Value::String(s) => *argument = coerce(s, &types, taint)?,
-                // Duplicate keys collected by `merge_duplicates`; a list for a
-                // parameter that can be an array is already its value.
-                Value::Array(items) if !types.iter().any(|t| t == "array") => {
-                    for item in items {
-                        if let Value::String(s) = item {
-                            *item = coerce(s, &types, taint)?;
-                        }
-                    }
-                }
-                _ => {}
-            }
+            coerce_argument(argument, &types, taint)?;
         }
         Ok(())
     }
@@ -583,6 +639,7 @@ impl ResponseParser {
         self.captures.clear();
         self.body.clear();
         self.opened = false;
+        self.region_start = self.pos;
     }
 }
 

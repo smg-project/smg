@@ -11,7 +11,7 @@
   "src/transformers/utils/chat_parsing/content_parsers.py": "txykwyvwvyssgxvy",
   "tests/utils/test_chat_parsing.py": "hmqypkhjnjkrkkjy"
  },
- "generator": "jswwjtrrrxskqzsz",
+ "generator": "wrkrxrzzsytphygw",
  "hf_test_run": {
   "tests_run": 69,
   "tests_excluded": [
@@ -34,11 +34,11 @@
  },
  "counts": {
   "templates": 401,
-  "sessions": 725,
+  "sessions": 705,
   "random_sessions": 1000,
-  "regex_rows": 1684,
-  "units": 254
+  "regex_rows": 1859,
+  "units": 255
  },
  "digest": "sha256 of the canonical JSON, first 8 bytes, nibbles as ghjkmnpqrstvwxyz",
- "license": "Recorded from transformers (Apache-2.0); templates and inputs under hf-tests/ come from its tests/utils/test_chat_parsing.py, templates under serve/ from src/transformers/cli/serving/utils.py."
+ "license": "Recorded from transformers (Apache-2.0); templates and inputs under hf-tests/ come from its tests/utils/test_chat_parsing.py, templates under serve/ from src/transformers/cli/serving/utils.py, templates under trl/ from huggingface/trl (Apache-2.0) trl/chat_template_utils.py."
 }

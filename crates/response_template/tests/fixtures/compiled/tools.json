@@ -1,0 +1,193 @@
+{
+ "tools-0": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "description": "Current weather for a city.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "celsius",
+        "fahrenheit"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_time",
+    "description": "Current time in a time zone.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "zone": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "zone"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "set_values",
+    "description": "Store one value of each kind.",
+    "parameters": {
+     "$dict": [
+      [
+       "type",
+       "object"
+      ],
+      [
+       "$defs",
+       {
+        "count": {
+         "type": "integer"
+        }
+       }
+      ],
+      [
+       "properties",
+       {
+        "s": {
+         "type": "string"
+        },
+        "i": {
+         "type": "integer"
+        },
+        "n": {
+         "type": "number"
+        },
+        "b": {
+         "type": "boolean"
+        },
+        "a": {
+         "type": "array",
+         "items": {
+          "type": "integer"
+         }
+        },
+        "o": {
+         "type": "object"
+        },
+        "z": {
+         "type": "null"
+        },
+        "tl": {
+         "type": [
+          "integer",
+          "null"
+         ]
+        },
+        "any": {
+         "anyOf": [
+          {
+           "type": "integer"
+          },
+          {
+           "type": "boolean"
+          }
+         ]
+        },
+        "one": {
+         "oneOf": [
+          {
+           "type": "number"
+          },
+          {
+           "type": "string"
+          }
+         ]
+        },
+        "nb": {
+         "type": "integer",
+         "nullable": true
+        },
+        "ref": {
+         "$dict": [
+          [
+           "$ref",
+           "#/$defs/count"
+          ]
+         ]
+        },
+        "all": {
+         "allOf": [
+          {
+           "type": "integer"
+          },
+          {
+           "minimum": 0
+          }
+         ]
+        },
+        "en": {
+         "enum": [
+          1,
+          2,
+          3
+         ]
+        }
+       }
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "café_menu",
+    "description": "Today's menu of a cafe.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "crème": {
+       "type": "boolean"
+      },
+      "day": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "weather.forecast",
+    "description": "Forecast, in a tool namespace.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      }
+     }
+    }
+   }
+  }
+ ]
+}

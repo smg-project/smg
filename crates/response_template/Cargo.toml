@@ -8,15 +8,36 @@ repository = "https://github.com/smg-project/smg"
 readme = "README.md"
 keywords = ["llm", "parser", "response-template"]
 categories = ["parsing", "text-processing"]
+# Not published while smg-symphony, which the `symphony` feature depends on, is not.
+publish = false
 
 [dependencies]
+openai-protocol = { workspace = true, optional = true }
 regex-syntax = "0.8"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+smg-symphony = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
+openai-protocol.workspace = true
 sha2 = "0.11"
+
+[features]
+# The compile of a template into a symphony table (`to_symphony` module).
+symphony = ["dep:smg-symphony", "dep:openai-protocol"]
+
+[[test]]
+name = "to_symphony"
+required-features = ["symphony"]
+
+[[test]]
+name = "to_symphony_parity"
+required-features = ["symphony"]
+
+[[test]]
+name = "layout"
+required-features = ["symphony"]
 
 [lints]
 workspace = true

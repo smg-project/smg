@@ -1,0 +1,584 @@
+{
+ "recorded": "transformers' whole-text reading of each session: parse_response(output + stop, template, prefix=prompt, tools=tools). `streamed` adds transformers' streaming reading when `output` is fed in chunks that end at the listed offsets (or one character per chunk), with the stop joined to the last chunk.",
+ "transformers": "5.18.0",
+ "transformers_tag": "v5.18.0",
+ "regex": "2026.9.10",
+ "python": "3.12",
+ "unicodedata": "15.0.0",
+ "inputs": {
+  "src/transformers/utils/chat_parsing/__init__.py": "ktnhyhvmmzttjtyz",
+  "src/transformers/utils/chat_parsing/response_parser.py": "rwsphpgthgssqrtq",
+  "src/transformers/utils/chat_parsing/response_templates.py": "wxvnrrrmzswpqmkt",
+  "src/transformers/utils/chat_parsing/content_parsers.py": "txykwyvwvyssgxvy",
+  "tests/utils/test_chat_parsing.py": "hmqypkhjnjkrkkjy",
+  "src/transformers/cli/serving/utils.py": "kmqvxsrpvstsgrvh",
+  "tests/pipelines/test_pipelines_any_to_any.py": "mrknkspksqysnwrm",
+  "tests/pipelines/test_pipelines_text_generation.py": "zqwyxpjystwqwvrm",
+  "meta-models/Muse-Glimmer-30B@a4e59da52a7bc87ae7251dd5545c0dd437c44b68/tokenizer_config.json": "qrhypwqmznqhpmjw",
+  "CohereLabs/North-Micro-Vision-Instruct@fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40/tokenizer_config.json": "kjzqzqwjvhpyxxhq",
+  "huggingface/trl@d9b9f39b54324b272df051de7852e18761040edd/trl/chat_template_utils.py": "nystwqjpkjvsmjvg"
+ },
+ "generator": "wrkrxrzzsytphygw",
+ "counts": {
+  "templates": 8,
+  "sessions": 239,
+  "streamed": 2,
+  "tool_sets": 1,
+  "values": {
+   "coerce": 810,
+   "coerce_tool_calls": 9,
+   "sub_parse": 588
+  }
+ },
+ "value_schemas": {
+  "int": {
+   "type": "integer"
+  },
+  "num": {
+   "type": "number"
+  },
+  "bool": {
+   "type": "boolean"
+  },
+  "obj": {
+   "type": "object"
+  },
+  "arr": {
+   "type": "array"
+  },
+  "nstr": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "nint": {
+   "type": [
+    "integer",
+    "null"
+   ]
+  },
+  "union": {
+   "type": [
+    "string",
+    "number",
+    "null"
+   ]
+  },
+  "sib": {
+   "type": [
+    "string",
+    "integer",
+    "boolean"
+   ]
+  },
+  "anyof": {
+   "anyOf": [
+    {
+     "type": "array"
+    },
+    {
+     "type": "object"
+    },
+    {
+     "type": "integer"
+    }
+   ]
+  },
+  "opt": {
+   "type": "string",
+   "nullable": true
+  },
+  "str": {
+   "type": "string"
+  },
+  "oneof": {
+   "oneOf": [
+    {
+     "type": "number"
+    },
+    {
+     "type": "boolean"
+    }
+   ]
+  },
+  "oneof-null": {
+   "oneOf": [
+    {
+     "type": "null"
+    },
+    {
+     "type": "integer"
+    }
+   ]
+  },
+  "ref": {
+   "$ref": "#/$defs/count"
+  },
+  "allof": {
+   "allOf": [
+    {
+     "type": "integer"
+    },
+    {
+     "minimum": 0
+    }
+   ]
+  },
+  "enum": {
+   "enum": [
+    1,
+    2,
+    3
+   ]
+  },
+  "const": {
+   "const": 5
+  }
+ },
+ "value_tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "f",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "int": {
+       "type": "integer"
+      },
+      "num": {
+       "type": "number"
+      },
+      "bool": {
+       "type": "boolean"
+      },
+      "obj": {
+       "type": "object"
+      },
+      "arr": {
+       "type": "array"
+      },
+      "nstr": {
+       "type": [
+        "string",
+        "null"
+       ]
+      },
+      "nint": {
+       "type": [
+        "integer",
+        "null"
+       ]
+      },
+      "union": {
+       "type": [
+        "string",
+        "number",
+        "null"
+       ]
+      },
+      "sib": {
+       "type": [
+        "string",
+        "integer",
+        "boolean"
+       ]
+      },
+      "anyof": {
+       "anyOf": [
+        {
+         "type": "array"
+        },
+        {
+         "type": "object"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "opt": {
+       "type": "string",
+       "nullable": true
+      },
+      "str": {
+       "type": "string"
+      },
+      "oneof": {
+       "oneOf": [
+        {
+         "type": "number"
+        },
+        {
+         "type": "boolean"
+        }
+       ]
+      },
+      "oneof-null": {
+       "oneOf": [
+        {
+         "type": "null"
+        },
+        {
+         "type": "integer"
+        }
+       ]
+      },
+      "ref": {
+       "$ref": "#/$defs/count"
+      },
+      "allof": {
+       "allOf": [
+        {
+         "type": "integer"
+        },
+        {
+         "minimum": 0
+        }
+       ]
+      },
+      "enum": {
+       "enum": [
+        1,
+        2,
+        3
+       ]
+      },
+      "const": {
+       "const": 5
+      }
+     },
+     "$defs": {
+      "count": {
+       "type": "integer"
+      }
+     }
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "g",
+    "parameters": {
+     "type": "object"
+    }
+   }
+  }
+ ],
+ "templates": [
+  {
+   "id": "hub/muse-glimmer",
+   "source": [
+    {
+     "repository": "meta-models/Muse-Glimmer-30B",
+     "revision": "a4e59da52a7bc87ae7251dd5545c0dd437c44b68",
+     "file": "tokenizer_config.json",
+     "item": "response_template"
+    }
+   ],
+   "stops": [
+    "<|end_of_text|>",
+    "<|eot|>"
+   ],
+   "stops_from": "eos_token_id of meta-models/Muse-Glimmer-30B generation_config.json",
+   "sessions": 37,
+   "messages": 37,
+   "errors": {},
+   "streamed": 2,
+   "covers": {
+    "attributes": 1,
+    "call": 19,
+    "calls": 2,
+    "content": 14,
+    "cut": 4,
+    "duplicate-keys": 1,
+    "empty": 1,
+    "framing": 1,
+    "give-back": 1,
+    "header-near-miss": 2,
+    "json-values": 1,
+    "marker-prefix": 1,
+    "no-prompt": 1,
+    "no-tools": 1,
+    "prefill": 1,
+    "reasoning": 6,
+    "second-anchor": 1,
+    "stray-text": 1,
+    "stream-split": 1,
+    "types": 3,
+    "unicode": 2,
+    "whitespace": 1
+   }
+  },
+  {
+   "id": "serve/qwen3_5",
+   "source": [
+    {
+     "repository": "huggingface/transformers",
+     "revision": "v5.18.0",
+     "file": "src/transformers/cli/serving/utils.py",
+     "item": "_RESPONSE_TEMPLATE_FALLBACKS[qwen3_5]"
+    }
+   ],
+   "stops": [
+    "<|im_end|>",
+    "<|endoftext|>"
+   ],
+   "stops_from": "end-of-turn tokens of the Qwen chat models (eos_token_id of Qwen/Qwen3-8B generation_config.json)",
+   "sessions": 35,
+   "messages": 35,
+   "errors": {},
+   "streamed": 0,
+   "covers": {
+    "call": 18,
+    "calls": 1,
+    "close-without-trailer": 1,
+    "content": 13,
+    "cut": 4,
+    "duplicate-keys": 1,
+    "empty": 1,
+    "give-back": 2,
+    "header-near-miss": 1,
+    "json-values": 1,
+    "marker-prefix": 1,
+    "no-prompt": 1,
+    "no-tools": 1,
+    "prefill": 1,
+    "prompt-closes-thought": 1,
+    "reasoning": 6,
+    "second-anchor": 1,
+    "stray-text": 1,
+    "types": 4,
+    "unicode": 2,
+    "whitespace": 1
+   }
+  },
+  {
+   "id": "trl/qwen3_5",
+   "source": [
+    {
+     "repository": "huggingface/trl",
+     "revision": "d9b9f39b54324b272df051de7852e18761040edd",
+     "file": "trl/chat_template_utils.py",
+     "item": "qwen3_5_template"
+    }
+   ],
+   "stops": [
+    "<|im_end|>",
+    "<|endoftext|>"
+   ],
+   "stops_from": "end-of-turn tokens of the Qwen chat models (eos_token_id of Qwen/Qwen3-8B generation_config.json)",
+   "sessions": 35,
+   "messages": 35,
+   "errors": {},
+   "streamed": 0,
+   "covers": {
+    "call": 18,
+    "calls": 1,
+    "close-without-trailer": 1,
+    "content": 13,
+    "cut": 4,
+    "duplicate-keys": 1,
+    "empty": 1,
+    "give-back": 2,
+    "header-near-miss": 1,
+    "json-values": 1,
+    "marker-prefix": 1,
+    "no-prompt": 1,
+    "no-tools": 1,
+    "prefill": 1,
+    "prompt-closes-thought": 1,
+    "reasoning": 6,
+    "second-anchor": 1,
+    "stray-text": 1,
+    "types": 4,
+    "unicode": 2,
+    "whitespace": 1
+   }
+  },
+  {
+   "id": "hf-tests/qwen3_template",
+   "source": [
+    {
+     "repository": "huggingface/transformers",
+     "revision": "v5.18.0",
+     "file": "tests/utils/test_chat_parsing.py",
+     "item": "qwen3_template"
+    }
+   ],
+   "stops": [
+    "<|im_end|>",
+    "<|endoftext|>"
+   ],
+   "stops_from": "end-of-turn tokens of the Qwen chat models (eos_token_id of Qwen/Qwen3-8B generation_config.json)",
+   "sessions": 35,
+   "messages": 35,
+   "errors": {},
+   "streamed": 0,
+   "covers": {
+    "call": 18,
+    "calls": 1,
+    "close-without-trailer": 1,
+    "content": 13,
+    "cut": 4,
+    "duplicate-keys": 1,
+    "empty": 1,
+    "give-back": 2,
+    "header-near-miss": 1,
+    "json-values": 1,
+    "marker-prefix": 1,
+    "no-prompt": 1,
+    "no-tools": 1,
+    "prefill": 1,
+    "prompt-closes-thought": 1,
+    "reasoning": 5,
+    "second-anchor": 1,
+    "stray-text": 1,
+    "types": 4,
+    "unicode": 2,
+    "whitespace": 1
+   }
+  },
+  {
+   "id": "hf-tests/_XML_STRING_ARGS_TEMPLATE",
+   "source": [
+    {
+     "repository": "huggingface/transformers",
+     "revision": "v5.18.0",
+     "file": "tests/utils/test_chat_parsing.py",
+     "item": "_XML_STRING_ARGS_TEMPLATE"
+    }
+   ],
+   "stops": [
+    "<|im_end|>",
+    "<|endoftext|>"
+   ],
+   "stops_from": "end-of-turn tokens of the Qwen chat models (eos_token_id of Qwen/Qwen3-8B generation_config.json)",
+   "sessions": 28,
+   "messages": 28,
+   "errors": {},
+   "streamed": 0,
+   "covers": {
+    "call": 17,
+    "calls": 1,
+    "close-without-trailer": 1,
+    "content": 10,
+    "cut": 3,
+    "duplicate-keys": 1,
+    "empty": 1,
+    "give-back": 2,
+    "header-near-miss": 1,
+    "json-values": 1,
+    "marker-prefix": 1,
+    "no-prompt": 1,
+    "no-tools": 1,
+    "prefill": 1,
+    "second-anchor": 1,
+    "stray-text": 1,
+    "types": 3,
+    "unicode": 2,
+    "whitespace": 1
+   }
+  },
+  {
+   "id": "hub/cohere-north",
+   "source": [
+    {
+     "repository": "CohereLabs/North-Micro-Vision-Instruct",
+     "revision": "fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40",
+     "file": "tokenizer_config.json",
+     "item": "response_template"
+    }
+   ],
+   "stops": [
+    "<|END_OF_TURN_TOKEN|>"
+   ],
+   "stops_from": "eos_token_id of CohereLabs/North-Micro-Vision-Instruct generation_config.json",
+   "sessions": 23,
+   "messages": 23,
+   "errors": {},
+   "streamed": 0,
+   "covers": {
+    "content": 19,
+    "cut": 1,
+    "empty": 1,
+    "marker-prefix": 1,
+    "no-anchor": 1,
+    "no-prompt": 1,
+    "prefill": 1,
+    "second-anchor": 1,
+    "unicode": 1,
+    "whitespace": 9
+   }
+  },
+  {
+   "id": "hf-pipelines/any_to_any_gemma3_style",
+   "source": [
+    {
+     "repository": "huggingface/transformers",
+     "revision": "v5.18.0",
+     "file": "tests/pipelines/test_pipelines_any_to_any.py",
+     "item": "test_small_model_pt_chat_with_response_template_prefix"
+    }
+   ],
+   "stops": [
+    "<end_of_turn>",
+    "<eos>"
+   ],
+   "stops_from": "the end-of-turn token of the pipeline test's chat template, and <eos>",
+   "sessions": 23,
+   "messages": 23,
+   "errors": {},
+   "streamed": 0,
+   "covers": {
+    "content": 14,
+    "cut": 3,
+    "empty": 1,
+    "marker-prefix": 1,
+    "no-anchor": 1,
+    "no-prompt": 1,
+    "prefill": 1,
+    "prompt-opens-thought": 2,
+    "reasoning": 7,
+    "unicode": 1,
+    "whitespace": 3
+   }
+  },
+  {
+   "id": "hf-pipelines/text_generation_chatml",
+   "source": [
+    {
+     "repository": "huggingface/transformers",
+     "revision": "v5.18.0",
+     "file": "tests/pipelines/test_pipelines_text_generation.py",
+     "item": "test_small_chat_model_with_response_template_prefix"
+    }
+   ],
+   "stops": [
+    "<|im_end|>"
+   ],
+   "stops_from": "the end-of-turn token of the pipeline test's chat template",
+   "sessions": 23,
+   "messages": 23,
+   "errors": {},
+   "streamed": 0,
+   "covers": {
+    "content": 14,
+    "cut": 3,
+    "empty": 1,
+    "marker-prefix": 1,
+    "no-anchor": 1,
+    "no-prompt": 1,
+    "prefill": 1,
+    "prompt-opens-thought": 2,
+    "reasoning": 7,
+    "unicode": 1,
+    "whitespace": 3
+   }
+  }
+ ],
+ "digest": "sha256 of the canonical JSON, first 8 bytes, nibbles as ghjkmnpqrstvwxyz",
+ "license": "Recorded from transformers (Apache-2.0). Templates are read from the sources each row names: transformers and huggingface/trl (Apache-2.0), and the Hub repositories listed, whose model cards declare Apache-2.0."
+}

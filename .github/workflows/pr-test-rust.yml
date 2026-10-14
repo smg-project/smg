@@ -392,6 +392,7 @@ jobs:
           source "$HOME/.cargo/env"
           cargo test --no-run
           cargo test -p llm-tokenizer --features tokenizers-v1 --no-run
+          cargo test -p smg-response-template --features symphony --no-run
           cargo test -p data-connector --test postgres_integration --no-run
 
       - name: Run Rust tests
@@ -400,6 +401,7 @@ jobs:
           source "$HOME/.cargo/env"
           cargo test
           cargo test -p llm-tokenizer --features tokenizers-v1
+          cargo test -p smg-response-template --features symphony
           cargo test -p data-connector --test postgres_integration -- --ignored --test-threads=1
 
       - name: Fail if vision golden fixtures did not generate

@@ -1,6 +1,6 @@
-//! Rows recorded from Python in `tests/fixtures/hf/`: the regex subset
-//! against the `regex` module (`regex*.jsonl`), and the Python built-ins and
-//! character tables (`units.jsonl`).
+//! Rows recorded from Python in `tests/fixtures/hf/`: the regex reader and
+//! matcher against the `regex` module (`regex*.jsonl`), and the Python
+//! built-ins and character tables (`units.jsonl`).
 
 use serde_json::{json, Map, Value};
 
@@ -8,7 +8,11 @@ use crate::{
     content_parsers::{Content, ContentParser},
     error::{PyErrorKind, Taint, Unsupported},
     load_response_template, py,
-    pyre::{self, Found, Match, Memo, Pattern, Role},
+    pyre::{
+        self,
+        parse::{ReadError, Regex},
+        Found, Match, Memo, Pattern, Role,
+    },
     response_parser::{coerce, schema_types},
     test_fixtures::{
         byte_offset, canonical, char_index, digest_text, fixtures_dir, read_jsonl, tag, untag,
@@ -66,11 +70,15 @@ fn port_results(pattern: &Pattern, row: &Value) -> Value {
     Value::Array(results)
 }
 
+/// The reader reads every pattern the `regex` module compiles, except a
+/// construct it does not read (`NotRead`, listed in the README), and rejects
+/// every one the module rejects. The matcher returns what the module returns
+/// for every pattern it runs, and refuses the others.
 #[test]
 fn regex_rows_match_the_regex_module() {
     let rows = read_jsonl(&fixtures_dir(), "regex");
     assert!(!rows.is_empty(), "no regex rows");
-    let (mut compared, mut refused) = (0, 0);
+    let (mut compared, mut refused, mut not_read) = (0, 0, 0);
     let mut failures = Vec::new();
     for row in &rows {
         let source = row["pattern"].as_str().unwrap();
@@ -79,6 +87,18 @@ fn regex_rows_match_the_regex_module() {
         } else {
             Role::Delimiter
         };
+        match (row["python"] == "ok", Regex::parse(source)) {
+            (true, Err(ReadError::Syntax(why))) => {
+                failures.push(format!(
+                    "{source:?}: the regex module reads it, the reader rejects it: {why}"
+                ));
+            }
+            (true, Err(ReadError::NotRead(_))) => not_read += 1,
+            (false, Ok(_)) => failures.push(format!(
+                "{source:?}: the regex module rejects it, the reader reads it"
+            )),
+            _ => {}
+        }
         match (row["python"] == "ok", Pattern::new(source, role)) {
             (true, Ok(pattern)) => {
                 compared += 1;
@@ -106,7 +126,7 @@ fn regex_rows_match_the_regex_module() {
     }
     assert!(
         failures.is_empty(),
-        "{} of {} regex rows differ ({compared} compared, {refused} refused):\n{}",
+        "{} of {} regex rows differ ({compared} compared, {refused} refused, {not_read} not read):\n{}",
         failures.len(),
         rows.len(),
         failures.join("\n")
@@ -154,17 +174,19 @@ fn empty_groups_do_not_hide_merged_negated_classes() {
 /// 2026.9.10, `regex.compile(pattern, regex.DOTALL)`; spans in characters).
 /// Its `\s` is Unicode White_Space: U+001C, which Python's `re` counts as
 /// whitespace, is not one. Alternatives with such a negated class are not
-/// merged the way `[^a]|[^b]` is.
+/// merged the way `[^a]|[^b]` is. A class with a class escape and its
+/// complement matches every character, also when it is negated: the module
+/// makes it any character and drops the negation.
 #[test]
 fn class_escapes_match_the_regex_module() {
-    let hay = "a\u{1c}b\u{a0}c\u{2028}d\u{3000}e\u{85}f\tg<h é_1-";
+    let hay = "a\u{1c}b\u{a0}c\u{2028}d\u{3000}e\u{85}f\tg>h é_1-";
     let spaces: &[&str] = &["3:4", "5:6", "7:8", "9:10", "11:12", "15:16"];
     let every: Vec<String> = (0..20).map(|k| format!("{k}:{}", k + 1)).collect();
     let every: Vec<&str> = every.iter().map(String::as_str).collect();
     for (source, expected) in [
         (r"[\s]", spaces),
         (
-            r"[^\s<]+",
+            r"[^\s>]+",
             &[
                 "0:3", "4:5", "6:7", "8:9", "10:11", "12:13", "14:15", "16:20",
             ],
@@ -182,6 +204,8 @@ fn class_escapes_match_the_regex_module() {
         ),
         (r"[^\s]|[^a]", &every),
         (r"x?[^a\s]|[^b]", &every),
+        (r"[^\s\S]", &every),
+        (r"[^a\d\D]", &every),
     ] {
         for role in [Role::Delimiter, Role::Finditer] {
             let pattern = Pattern::new(source, role).unwrap();
@@ -196,29 +220,25 @@ fn class_escapes_match_the_regex_module() {
     // An opener that names a call: `search` (span and name) and
     // `search(..., partial=True)` from 0; a partial match ending in "+" can
     // still grow.
-    let opener = Pattern::new(r" to=(?P<name>[^\s<]+)<\|x\|>", Role::Delimiter).unwrap();
+    let opener = Pattern::new(r"<call:(?P<name>[^\s>]+)>", Role::Delimiter).unwrap();
     for (hay, full, partial) in [
         (
-            " to=get_weather<|x|>",
-            Some(("0:20", "get_weather")),
-            Some("0:20"),
-        ),
-        (
-            " to=ns.tool-x<|x|>",
-            Some(("0:18", "ns.tool-x")),
+            "<call:get_weather>",
+            Some(("0:18", "get_weather")),
             Some("0:18"),
         ),
         (
-            " to=a\u{1c}b<|x|>",
-            Some(("0:12", "a\u{1c}b")),
-            Some("0:12"),
+            "<call:ns.tool-x>",
+            Some(("0:16", "ns.tool-x")),
+            Some("0:16"),
         ),
-        (" to=a\u{a0}b<|x|>", None, None),
-        (" to=a\u{2028}b<|x|>", None, None),
-        (" to=a b<|x|>", None, None),
-        (" to=a<b<|x|>", None, None),
-        (" to=get_we", None, Some("0:10+")),
-        (" to=a<|x", None, Some("0:8+")),
+        ("<call:a\u{1c}b>", Some(("0:10", "a\u{1c}b")), Some("0:10")),
+        ("<call:a<b>", Some(("0:10", "a<b")), Some("0:10")),
+        ("<call:a\u{a0}b>", None, None),
+        ("<call:a\u{2028}b>", None, None),
+        ("<call:a b>", None, None),
+        ("<call:get_we", None, Some("0:12+")),
+        ("<call:a", None, Some("0:7+")),
     ] {
         let got = opener
             .search(hay, 0, &mut Memo::default())
@@ -235,7 +255,7 @@ fn class_escapes_match_the_regex_module() {
 }
 
 /// Lookahead in a pattern used only with `finditer`, such as a tag pattern
-/// whose value also ends where the next key starts, with what the `regex`
+/// whose closing tag may be left out, with what the `regex`
 /// module returns (`regex` 2026.9.10, spans in characters). Lookahead in an
 /// open or close pattern, and a group, backreference or repeat in or of one,
 /// stay refused.
@@ -243,7 +263,7 @@ fn class_escapes_match_the_regex_module() {
 fn lookahead_in_finditer_patterns() {
     type Spans<'a> = (String, Vec<(&'a str, Option<&'a str>)>);
     let rows = read_jsonl(&fixtures_dir(), "regex");
-    let tag = r#"<arg name="(?P<key>[^"]+)">\n(?P<value>.*?)\n(?:</arg>|(?=<arg name="))"#;
+    let tag = r"<parameter=(?P<key>[^>\n]+)>\s*(?P<value>.*?)\s*(?:</parameter>|(?=<parameter=|$))";
     for source in [tag, r"a(?=b(?=c))"] {
         assert!(
             rows.iter()
@@ -254,16 +274,16 @@ fn lookahead_in_finditer_patterns() {
     let pattern = Pattern::new(tag, Role::Finditer).unwrap();
     for (hay, expected) in [
         (
-            "<arg name=\"a\">\n1\n<arg name=\"b\">\n2\n</arg>",
-            &[("0:17", "a", "1"), ("17:40", "b", "2")][..],
+            "<parameter=a>\n1\n<parameter=b>\n2\n</parameter>",
+            &[("0:16", "a", "1"), ("16:44", "b", "2")][..],
         ),
         (
-            "<arg name=\"a\">\nx\n<arg name=\"b\n</arg>",
-            &[("0:17", "a", "x")][..],
+            "<parameter=a>\nx\n<parameter=b\n</parameter>",
+            &[("0:16", "a", "x")][..],
         ),
         (
-            "<arg name=\"a\">\n1\n</arg><arg name=\"b\">\n2\n",
-            &[("0:23", "a", "1")][..],
+            "<parameter=a>\n1\n</parameter><parameter=b>\n2\n",
+            &[("0:28", "a", "1"), ("28:44", "b", "2")][..],
         ),
     ] {
         let got: Vec<Spans<'_>> = pattern
@@ -314,31 +334,49 @@ fn lookahead_in_finditer_patterns() {
     }
 }
 
-/// Class escapes the port refuses, with the reason. `\d`, `\S`, `\W` and `\b`
-/// are not ported. The `regex` module reads a `-` next to `\w` or `\s` as a
-/// literal (`[\s-a]` finds "a", "-" and " "), where Python's `re` rejects the
-/// range. Two negated classes of one character stay refused next to one with
-/// `\s`.
+/// Class escapes in classes, with what the `regex` module returns (`regex`
+/// 2026.9.10, `regex.compile(pattern, regex.DOTALL)`; spans in characters).
+/// The module reads a `-` next to a class escape as a member (`[\s-a]` is
+/// `\s`, `-` and `a`), where Python's `re` rejects the range, and `\b` in a
+/// class as a backspace. Two negated classes of one character stay refused
+/// next to one with `\s`.
 #[test]
-fn class_escapes_the_port_refuses() {
-    for (source, reason) in [
-        (r"[\s-a]", r"'-' after \s in a character class"),
-        (r"[\w--\d]", r"'-' after \w in a character class"),
-        (r"[a-\s]", r"'-' before \s in a character class"),
-        (r"[\d\s]", r"escape \d"),
-        (r"[^\S]", r"escape \S"),
-        (r"[\W\s]", r"escape \W"),
-        (r"[\s\b]", r"escape \b"),
+fn class_escapes_in_classes() {
+    let hay = "a b-\u{8}c1\u{661}\u{e9}_>\t\u{3000}x";
+    for (source, expected) in [
+        (r"[\s-a]", &["0:1", "1:2", "3:4", "11:12", "12:13"][..]),
         (
-            r"[^\s]|[^a]|[^b]",
-            "alternatives that can end in a negated class of one character",
+            r"[\w--\d]",
+            &[
+                "0:1", "2:3", "3:4", "5:6", "6:7", "7:8", "8:9", "9:10", "13:14",
+            ],
         ),
+        (r"[a-\s]", &["0:1", "1:2", "3:4", "11:12", "12:13"]),
+        (r"[\d\s]", &["1:2", "6:7", "7:8", "11:12", "12:13"]),
+        (r"[^\S]", &["1:2", "11:12", "12:13"]),
+        (r"[\W\s]", &["1:2", "3:4", "4:5", "10:11", "11:12", "12:13"]),
+        (r"[\s\b]", &["1:2", "4:5", "11:12", "12:13"]),
+        (r"[^\d\W]+", &["0:1", "2:3", "5:6", "8:10", "13:14"]),
+        (r"\S+", &["0:1", "2:11", "13:14"]),
+        (r"\W+", &["1:2", "3:5", "10:13"]),
+        (r"\d+", &["6:8"]),
     ] {
         for role in [Role::Delimiter, Role::Finditer] {
-            match Pattern::new(source, role) {
-                Err(Unsupported::Regex(got)) => assert_eq!(got, reason, "{source:?}"),
-                other => panic!("{source:?} ({role:?}): {other:?}"),
-            }
+            let pattern = Pattern::new(source, role).unwrap();
+            let got: Vec<String> = pattern
+                .finditer(hay)
+                .map(|m| span(hay, m.start, m.end))
+                .collect();
+            assert_eq!(got, expected, "{source:?} ({role:?})");
+        }
+    }
+    for role in [Role::Delimiter, Role::Finditer] {
+        match Pattern::new(r"[^\s]|[^a]|[^b]", role) {
+            Err(Unsupported::Regex(got)) => assert_eq!(
+                got, "alternatives that can end in a negated class of one character",
+                "{role:?}"
+            ),
+            other => panic!("{role:?}: {other:?}"),
         }
     }
 }
@@ -397,26 +435,72 @@ fn parse_errors_do_not_quote_the_output() {
     assert_eq!(error.to_string(), expected);
 }
 
-/// Characters the port does not take where the README lists literal
-/// characters, each with its own reason.
+/// Characters the `regex` module reads as literals where they start nothing
+/// else (`{`, `}`, `]`, and `|` or `^` inside a class), counted repeats, and
+/// escapes of control characters and code points, with what it returns
+/// (`regex` 2026.9.10, spans in characters). A quantifier with nothing to
+/// repeat is rejected as the module rejects it.
 #[test]
-fn refused_characters_say_why() {
-    for (source, reason) in [
-        ("a{2}", "'{' (a counted repeat or a literal brace)"),
-        ("a{x}", "'{' (a counted repeat or a literal brace)"),
-        ("a}", "literal '}'"),
-        ("a]", "literal ']'"),
-        ("*a", "'*' without an atom"),
-        ("[]a]", "']' in a character class"),
-        ("[a|b]", "'|' in a character class"),
-        ("[a^b]", "'^' in a character class"),
-        (r"a\t", r"escape \t"),
+fn braces_brackets_and_escapes() {
+    let hay = "aa{2}a}a]x|^y\tz a{x} {} a\tq";
+    for (source, expected) in [
+        ("a{2}", &["0:2"][..]),
+        ("a{x}", &["16:20"]),
+        ("a}", &["5:7"]),
+        ("a]", &["7:9"]),
+        (
+            "[]a]",
+            &["0:1", "1:2", "5:6", "7:8", "8:9", "16:17", "24:25"],
+        ),
+        (
+            "[a|b]",
+            &["0:1", "1:2", "5:6", "7:8", "10:11", "16:17", "24:25"],
+        ),
+        (
+            "[a^b]",
+            &["0:1", "1:2", "5:6", "7:8", "11:12", "16:17", "24:25"],
+        ),
+        ("[|^]", &["10:11", "11:12"]),
+        (r"a\t", &["24:26"]),
+        (r"\141\u0009", &["24:26"]),
+        (r"\x61{1,2}", &["0:2", "5:6", "7:8", "16:17", "24:25"]),
+        (r"a{,1}\x7b", &["1:3", "16:18", "21:22"]),
+        (r"\{\}", &["21:23"]),
+        ("{}", &["21:23"]),
     ] {
-        match Pattern::new(source, Role::Delimiter) {
-            Err(Unsupported::Regex(got)) => assert_eq!(got, reason, "{source:?}"),
-            other => panic!("{source:?}: {other:?}"),
+        for role in [Role::Delimiter, Role::Finditer] {
+            let pattern = Pattern::new(source, role).unwrap();
+            let got: Vec<String> = pattern
+                .finditer(hay)
+                .map(|m| span(hay, m.start, m.end))
+                .collect();
+            assert_eq!(got, expected, "{source:?} ({role:?})");
         }
     }
+    for (source, reason) in [
+        ("*a", "nothing to repeat"),
+        ("a**", "multiple repeat"),
+        ("a{2,1}", "min repeat greater than max repeat"),
+        ("(?P<n>a)(?P=m)", "unknown group"),
+    ] {
+        assert_eq!(
+            Regex::parse(source).err(),
+            Some(ReadError::Syntax(reason.into())),
+            "{source:?}"
+        );
+    }
+}
+
+#[test]
+fn the_last_start_anchor_ends_where_the_tail_begins() {
+    let spec = json!({"start_anchor": "<a>", "fields": {"content": {}}});
+    let template = load_response_template(&spec).unwrap();
+    assert_eq!(template.last_anchor_end("x<a>y<a>z"), Some(8));
+    assert_eq!(template.truncate_past_last_anchor("x<a>y<a>z"), "z");
+    assert_eq!(template.last_anchor_end("x<a>"), Some(4));
+    // Without an anchor transformers keeps the whole text.
+    assert_eq!(template.last_anchor_end("xyz"), None);
+    assert_eq!(template.truncate_past_last_anchor("xyz"), "xyz");
 }
 
 fn class(kind: PyErrorKind) -> Value {
@@ -554,11 +638,12 @@ fn units_match_python() {
 fn character_tables_match_python() {
     let rows = read_jsonl(&fixtures_dir(), "units");
     let tables: Vec<&Value> = rows.iter().filter(|r| r["kind"] == "table").collect();
-    assert_eq!(tables.len(), 4, "missing table rows");
+    assert_eq!(tables.len(), 5, "missing table rows");
     for table in tables {
         let check: fn(char) -> bool = match table["name"].as_str().unwrap() {
             "regex_word" => pyre::is_word,
             "regex_space" => char::is_whitespace,
+            "regex_digit" => pyre::is_digit,
             "str_isspace" => py::is_space,
             "str_isdecimal" => |c| py::int(&c.to_string()).is_some(),
             other => panic!("unknown table {other}"),

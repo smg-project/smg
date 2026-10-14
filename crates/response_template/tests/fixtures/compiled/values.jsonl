@@ -1,0 +1,1407 @@
+{"kind":"coerce","schema":"int","text":"3","output":3}
+{"kind":"coerce","schema":"int","text":" 5 ","output":5}
+{"kind":"coerce","schema":"int","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"int","text":"007","output":7}
+{"kind":"coerce","schema":"int","text":"+5","output":5}
+{"kind":"coerce","schema":"int","text":"-0","output":0}
+{"kind":"coerce","schema":"int","text":"1_000","output":1000}
+{"kind":"coerce","schema":"int","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"int","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"int","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"int","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"int","text":".5","output":".5"}
+{"kind":"coerce","schema":"int","text":"5.","output":"5."}
+{"kind":"coerce","schema":"int","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"int","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"int","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"int","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"int","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"int","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"int","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"int","text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"coerce","schema":"int","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"int","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"int","text":"true","output":"true"}
+{"kind":"coerce","schema":"int","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"int","text":"1","output":1}
+{"kind":"coerce","schema":"int","text":"0","output":0}
+{"kind":"coerce","schema":"int","text":"False","output":"False"}
+{"kind":"coerce","schema":"int","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"int","text":"null","output":"null"}
+{"kind":"coerce","schema":"int","text":" null ","output":" null "}
+{"kind":"coerce","schema":"int","text":"None","output":"None"}
+{"kind":"coerce","schema":"int","text":"none","output":"none"}
+{"kind":"coerce","schema":"int","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"int","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"int","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"int","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"int","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"int","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"int","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"int","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"int","text":"","output":""}
+{"kind":"coerce","schema":"int","text":" ","output":" "}
+{"kind":"coerce","schema":"int","text":" 5 ","output":5}
+{"kind":"coerce","schema":"int","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"num","text":"3","output":3}
+{"kind":"coerce","schema":"num","text":" 5 ","output":5}
+{"kind":"coerce","schema":"num","text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"coerce","schema":"num","text":"007","output":7}
+{"kind":"coerce","schema":"num","text":"+5","output":5}
+{"kind":"coerce","schema":"num","text":"-0","output":0}
+{"kind":"coerce","schema":"num","text":"1_000","output":1000}
+{"kind":"coerce","schema":"num","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"num","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"num","text":"1e2","output":100}
+{"kind":"coerce","schema":"num","text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"coerce","schema":"num","text":".5","output":{"$float":"0x1.0000000000000p-1"}}
+{"kind":"coerce","schema":"num","text":"5.","output":{"$float":"0x1.4000000000000p+2"}}
+{"kind":"coerce","schema":"num","text":"-.5e1","output":{"$float":"-0x1.4000000000000p+2"}}
+{"kind":"coerce","schema":"num","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"num","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"num","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"num","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"num","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"num","text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"coerce","schema":"num","text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"coerce","schema":"num","text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"coerce","schema":"num","text":"1e22","error":"Unrepresentable"}
+{"kind":"coerce","schema":"num","text":"true","output":"true"}
+{"kind":"coerce","schema":"num","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"num","text":"1","output":1}
+{"kind":"coerce","schema":"num","text":"0","output":0}
+{"kind":"coerce","schema":"num","text":"False","output":"False"}
+{"kind":"coerce","schema":"num","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"num","text":"null","output":"null"}
+{"kind":"coerce","schema":"num","text":" null ","output":" null "}
+{"kind":"coerce","schema":"num","text":"None","output":"None"}
+{"kind":"coerce","schema":"num","text":"none","output":"none"}
+{"kind":"coerce","schema":"num","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"num","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"num","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"num","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"num","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"num","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"num","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"num","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"num","text":"","output":""}
+{"kind":"coerce","schema":"num","text":" ","output":" "}
+{"kind":"coerce","schema":"num","text":" 5 ","output":5}
+{"kind":"coerce","schema":"num","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"bool","text":"3","output":"3"}
+{"kind":"coerce","schema":"bool","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"bool","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"bool","text":"007","output":"007"}
+{"kind":"coerce","schema":"bool","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"bool","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"bool","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"bool","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"bool","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"bool","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"bool","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"bool","text":".5","output":".5"}
+{"kind":"coerce","schema":"bool","text":"5.","output":"5."}
+{"kind":"coerce","schema":"bool","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"bool","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"bool","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"bool","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"bool","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"bool","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"bool","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"bool","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"bool","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"bool","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"bool","text":"true","output":true}
+{"kind":"coerce","schema":"bool","text":" TRUE ","output":true}
+{"kind":"coerce","schema":"bool","text":"1","output":true}
+{"kind":"coerce","schema":"bool","text":"0","output":false}
+{"kind":"coerce","schema":"bool","text":"False","output":false}
+{"kind":"coerce","schema":"bool","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"bool","text":"null","output":"null"}
+{"kind":"coerce","schema":"bool","text":" null ","output":" null "}
+{"kind":"coerce","schema":"bool","text":"None","output":"None"}
+{"kind":"coerce","schema":"bool","text":"none","output":"none"}
+{"kind":"coerce","schema":"bool","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"bool","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"bool","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"bool","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"bool","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"bool","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"bool","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"bool","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"bool","text":"","output":""}
+{"kind":"coerce","schema":"bool","text":" ","output":" "}
+{"kind":"coerce","schema":"bool","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"bool","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"obj","text":"3","output":"3"}
+{"kind":"coerce","schema":"obj","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"obj","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"obj","text":"007","output":"007"}
+{"kind":"coerce","schema":"obj","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"obj","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"obj","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"obj","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"obj","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"obj","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"obj","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"obj","text":".5","output":".5"}
+{"kind":"coerce","schema":"obj","text":"5.","output":"5."}
+{"kind":"coerce","schema":"obj","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"obj","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"obj","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"obj","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"obj","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"obj","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"obj","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"obj","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"obj","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"obj","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"obj","text":"true","output":"true"}
+{"kind":"coerce","schema":"obj","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"obj","text":"1","output":"1"}
+{"kind":"coerce","schema":"obj","text":"0","output":"0"}
+{"kind":"coerce","schema":"obj","text":"False","output":"False"}
+{"kind":"coerce","schema":"obj","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"obj","text":"null","output":"null"}
+{"kind":"coerce","schema":"obj","text":" null ","output":" null "}
+{"kind":"coerce","schema":"obj","text":"None","output":"None"}
+{"kind":"coerce","schema":"obj","text":"none","output":"none"}
+{"kind":"coerce","schema":"obj","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"obj","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"obj","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"obj","text":"{}","output":{}}
+{"kind":"coerce","schema":"obj","text":"{\"a\": 1}","output":{"a":1}}
+{"kind":"coerce","schema":"obj","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"obj","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"obj","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"obj","text":"","output":""}
+{"kind":"coerce","schema":"obj","text":" ","output":" "}
+{"kind":"coerce","schema":"obj","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"obj","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"arr","text":"3","output":"3"}
+{"kind":"coerce","schema":"arr","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"arr","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"arr","text":"007","output":"007"}
+{"kind":"coerce","schema":"arr","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"arr","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"arr","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"arr","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"arr","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"arr","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"arr","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"arr","text":".5","output":".5"}
+{"kind":"coerce","schema":"arr","text":"5.","output":"5."}
+{"kind":"coerce","schema":"arr","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"arr","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"arr","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"arr","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"arr","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"arr","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"arr","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"arr","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"arr","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"arr","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"arr","text":"true","output":"true"}
+{"kind":"coerce","schema":"arr","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"arr","text":"1","output":"1"}
+{"kind":"coerce","schema":"arr","text":"0","output":"0"}
+{"kind":"coerce","schema":"arr","text":"False","output":"False"}
+{"kind":"coerce","schema":"arr","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"arr","text":"null","output":"null"}
+{"kind":"coerce","schema":"arr","text":" null ","output":" null "}
+{"kind":"coerce","schema":"arr","text":"None","output":"None"}
+{"kind":"coerce","schema":"arr","text":"none","output":"none"}
+{"kind":"coerce","schema":"arr","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"arr","text":"[1]","output":[1]}
+{"kind":"coerce","schema":"arr","text":" [1, 2] ","output":[1,2]}
+{"kind":"coerce","schema":"arr","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"arr","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"arr","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"arr","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"arr","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"arr","text":"","output":""}
+{"kind":"coerce","schema":"arr","text":" ","output":" "}
+{"kind":"coerce","schema":"arr","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"arr","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"nstr","text":"3","output":"3"}
+{"kind":"coerce","schema":"nstr","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"nstr","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"nstr","text":"007","output":"007"}
+{"kind":"coerce","schema":"nstr","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"nstr","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"nstr","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"nstr","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"nstr","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"nstr","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"nstr","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"nstr","text":".5","output":".5"}
+{"kind":"coerce","schema":"nstr","text":"5.","output":"5."}
+{"kind":"coerce","schema":"nstr","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"nstr","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"nstr","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"nstr","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"nstr","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"nstr","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"nstr","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"nstr","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"nstr","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"nstr","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"nstr","text":"true","output":"true"}
+{"kind":"coerce","schema":"nstr","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"nstr","text":"1","output":"1"}
+{"kind":"coerce","schema":"nstr","text":"0","output":"0"}
+{"kind":"coerce","schema":"nstr","text":"False","output":"False"}
+{"kind":"coerce","schema":"nstr","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"nstr","text":"null","output":null}
+{"kind":"coerce","schema":"nstr","text":" null ","output":null}
+{"kind":"coerce","schema":"nstr","text":"None","output":null}
+{"kind":"coerce","schema":"nstr","text":"none","output":"none"}
+{"kind":"coerce","schema":"nstr","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"nstr","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"nstr","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"nstr","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"nstr","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"nstr","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"nstr","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"nstr","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"nstr","text":"","output":""}
+{"kind":"coerce","schema":"nstr","text":" ","output":" "}
+{"kind":"coerce","schema":"nstr","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"nstr","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"nint","text":"3","output":3}
+{"kind":"coerce","schema":"nint","text":" 5 ","output":5}
+{"kind":"coerce","schema":"nint","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"nint","text":"007","output":7}
+{"kind":"coerce","schema":"nint","text":"+5","output":5}
+{"kind":"coerce","schema":"nint","text":"-0","output":0}
+{"kind":"coerce","schema":"nint","text":"1_000","output":1000}
+{"kind":"coerce","schema":"nint","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"nint","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"nint","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"nint","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"nint","text":".5","output":".5"}
+{"kind":"coerce","schema":"nint","text":"5.","output":"5."}
+{"kind":"coerce","schema":"nint","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"nint","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"nint","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"nint","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"nint","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"nint","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"nint","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"nint","text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"coerce","schema":"nint","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"nint","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"nint","text":"true","output":"true"}
+{"kind":"coerce","schema":"nint","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"nint","text":"1","output":1}
+{"kind":"coerce","schema":"nint","text":"0","output":0}
+{"kind":"coerce","schema":"nint","text":"False","output":"False"}
+{"kind":"coerce","schema":"nint","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"nint","text":"null","output":null}
+{"kind":"coerce","schema":"nint","text":" null ","output":null}
+{"kind":"coerce","schema":"nint","text":"None","output":null}
+{"kind":"coerce","schema":"nint","text":"none","output":"none"}
+{"kind":"coerce","schema":"nint","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"nint","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"nint","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"nint","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"nint","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"nint","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"nint","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"nint","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"nint","text":"","output":""}
+{"kind":"coerce","schema":"nint","text":" ","output":" "}
+{"kind":"coerce","schema":"nint","text":" 5 ","output":5}
+{"kind":"coerce","schema":"nint","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"union","text":"3","output":3}
+{"kind":"coerce","schema":"union","text":" 5 ","output":5}
+{"kind":"coerce","schema":"union","text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"coerce","schema":"union","text":"007","output":7}
+{"kind":"coerce","schema":"union","text":"+5","output":5}
+{"kind":"coerce","schema":"union","text":"-0","output":0}
+{"kind":"coerce","schema":"union","text":"1_000","output":1000}
+{"kind":"coerce","schema":"union","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"union","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"union","text":"1e2","output":100}
+{"kind":"coerce","schema":"union","text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"coerce","schema":"union","text":".5","output":{"$float":"0x1.0000000000000p-1"}}
+{"kind":"coerce","schema":"union","text":"5.","output":{"$float":"0x1.4000000000000p+2"}}
+{"kind":"coerce","schema":"union","text":"-.5e1","output":{"$float":"-0x1.4000000000000p+2"}}
+{"kind":"coerce","schema":"union","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"union","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"union","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"union","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"union","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"union","text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"coerce","schema":"union","text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"coerce","schema":"union","text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"coerce","schema":"union","text":"1e22","error":"Unrepresentable"}
+{"kind":"coerce","schema":"union","text":"true","output":"true"}
+{"kind":"coerce","schema":"union","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"union","text":"1","output":1}
+{"kind":"coerce","schema":"union","text":"0","output":0}
+{"kind":"coerce","schema":"union","text":"False","output":"False"}
+{"kind":"coerce","schema":"union","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"union","text":"null","output":null}
+{"kind":"coerce","schema":"union","text":" null ","output":null}
+{"kind":"coerce","schema":"union","text":"None","output":null}
+{"kind":"coerce","schema":"union","text":"none","output":"none"}
+{"kind":"coerce","schema":"union","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"union","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"union","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"union","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"union","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"union","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"union","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"union","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"union","text":"","output":""}
+{"kind":"coerce","schema":"union","text":" ","output":" "}
+{"kind":"coerce","schema":"union","text":" 5 ","output":5}
+{"kind":"coerce","schema":"union","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"sib","text":"3","output":3}
+{"kind":"coerce","schema":"sib","text":" 5 ","output":5}
+{"kind":"coerce","schema":"sib","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"sib","text":"007","output":7}
+{"kind":"coerce","schema":"sib","text":"+5","output":5}
+{"kind":"coerce","schema":"sib","text":"-0","output":0}
+{"kind":"coerce","schema":"sib","text":"1_000","output":1000}
+{"kind":"coerce","schema":"sib","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"sib","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"sib","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"sib","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"sib","text":".5","output":".5"}
+{"kind":"coerce","schema":"sib","text":"5.","output":"5."}
+{"kind":"coerce","schema":"sib","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"sib","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"sib","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"sib","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"sib","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"sib","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"sib","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"sib","text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"coerce","schema":"sib","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"sib","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"sib","text":"true","output":true}
+{"kind":"coerce","schema":"sib","text":" TRUE ","output":true}
+{"kind":"coerce","schema":"sib","text":"1","output":1}
+{"kind":"coerce","schema":"sib","text":"0","output":0}
+{"kind":"coerce","schema":"sib","text":"False","output":false}
+{"kind":"coerce","schema":"sib","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"sib","text":"null","output":"null"}
+{"kind":"coerce","schema":"sib","text":" null ","output":" null "}
+{"kind":"coerce","schema":"sib","text":"None","output":"None"}
+{"kind":"coerce","schema":"sib","text":"none","output":"none"}
+{"kind":"coerce","schema":"sib","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"sib","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"sib","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"sib","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"sib","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"sib","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"sib","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"sib","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"sib","text":"","output":""}
+{"kind":"coerce","schema":"sib","text":" ","output":" "}
+{"kind":"coerce","schema":"sib","text":" 5 ","output":5}
+{"kind":"coerce","schema":"sib","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"anyof","text":"3","output":3}
+{"kind":"coerce","schema":"anyof","text":" 5 ","output":5}
+{"kind":"coerce","schema":"anyof","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"anyof","text":"007","output":7}
+{"kind":"coerce","schema":"anyof","text":"+5","output":5}
+{"kind":"coerce","schema":"anyof","text":"-0","output":0}
+{"kind":"coerce","schema":"anyof","text":"1_000","output":1000}
+{"kind":"coerce","schema":"anyof","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"anyof","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"anyof","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"anyof","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"anyof","text":".5","output":".5"}
+{"kind":"coerce","schema":"anyof","text":"5.","output":"5."}
+{"kind":"coerce","schema":"anyof","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"anyof","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"anyof","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"anyof","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"anyof","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"anyof","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"anyof","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"anyof","text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"coerce","schema":"anyof","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"anyof","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"anyof","text":"true","output":"true"}
+{"kind":"coerce","schema":"anyof","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"anyof","text":"1","output":1}
+{"kind":"coerce","schema":"anyof","text":"0","output":0}
+{"kind":"coerce","schema":"anyof","text":"False","output":"False"}
+{"kind":"coerce","schema":"anyof","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"anyof","text":"null","output":"null"}
+{"kind":"coerce","schema":"anyof","text":" null ","output":" null "}
+{"kind":"coerce","schema":"anyof","text":"None","output":"None"}
+{"kind":"coerce","schema":"anyof","text":"none","output":"none"}
+{"kind":"coerce","schema":"anyof","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"anyof","text":"[1]","output":[1]}
+{"kind":"coerce","schema":"anyof","text":" [1, 2] ","output":[1,2]}
+{"kind":"coerce","schema":"anyof","text":"{}","output":{}}
+{"kind":"coerce","schema":"anyof","text":"{\"a\": 1}","output":{"a":1}}
+{"kind":"coerce","schema":"anyof","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"anyof","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"anyof","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"anyof","text":"","output":""}
+{"kind":"coerce","schema":"anyof","text":" ","output":" "}
+{"kind":"coerce","schema":"anyof","text":" 5 ","output":5}
+{"kind":"coerce","schema":"anyof","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"opt","text":"3","output":"3"}
+{"kind":"coerce","schema":"opt","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"opt","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"opt","text":"007","output":"007"}
+{"kind":"coerce","schema":"opt","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"opt","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"opt","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"opt","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"opt","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"opt","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"opt","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"opt","text":".5","output":".5"}
+{"kind":"coerce","schema":"opt","text":"5.","output":"5."}
+{"kind":"coerce","schema":"opt","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"opt","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"opt","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"opt","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"opt","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"opt","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"opt","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"opt","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"opt","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"opt","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"opt","text":"true","output":"true"}
+{"kind":"coerce","schema":"opt","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"opt","text":"1","output":"1"}
+{"kind":"coerce","schema":"opt","text":"0","output":"0"}
+{"kind":"coerce","schema":"opt","text":"False","output":"False"}
+{"kind":"coerce","schema":"opt","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"opt","text":"null","output":null}
+{"kind":"coerce","schema":"opt","text":" null ","output":null}
+{"kind":"coerce","schema":"opt","text":"None","output":null}
+{"kind":"coerce","schema":"opt","text":"none","output":"none"}
+{"kind":"coerce","schema":"opt","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"opt","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"opt","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"opt","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"opt","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"opt","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"opt","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"opt","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"opt","text":"","output":""}
+{"kind":"coerce","schema":"opt","text":" ","output":" "}
+{"kind":"coerce","schema":"opt","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"opt","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"str","text":"3","output":"3"}
+{"kind":"coerce","schema":"str","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"str","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"str","text":"007","output":"007"}
+{"kind":"coerce","schema":"str","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"str","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"str","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"str","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"str","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"str","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"str","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"str","text":".5","output":".5"}
+{"kind":"coerce","schema":"str","text":"5.","output":"5."}
+{"kind":"coerce","schema":"str","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"str","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"str","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"str","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"str","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"str","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"str","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"str","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"str","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"str","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"str","text":"true","output":"true"}
+{"kind":"coerce","schema":"str","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"str","text":"1","output":"1"}
+{"kind":"coerce","schema":"str","text":"0","output":"0"}
+{"kind":"coerce","schema":"str","text":"False","output":"False"}
+{"kind":"coerce","schema":"str","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"str","text":"null","output":"null"}
+{"kind":"coerce","schema":"str","text":" null ","output":" null "}
+{"kind":"coerce","schema":"str","text":"None","output":"None"}
+{"kind":"coerce","schema":"str","text":"none","output":"none"}
+{"kind":"coerce","schema":"str","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"str","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"str","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"str","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"str","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"str","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"str","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"str","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"str","text":"","output":""}
+{"kind":"coerce","schema":"str","text":" ","output":" "}
+{"kind":"coerce","schema":"str","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"str","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"oneof","text":"3","output":3}
+{"kind":"coerce","schema":"oneof","text":" 5 ","output":5}
+{"kind":"coerce","schema":"oneof","text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"coerce","schema":"oneof","text":"007","output":7}
+{"kind":"coerce","schema":"oneof","text":"+5","output":5}
+{"kind":"coerce","schema":"oneof","text":"-0","output":0}
+{"kind":"coerce","schema":"oneof","text":"1_000","output":1000}
+{"kind":"coerce","schema":"oneof","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"oneof","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"oneof","text":"1e2","output":100}
+{"kind":"coerce","schema":"oneof","text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"coerce","schema":"oneof","text":".5","output":{"$float":"0x1.0000000000000p-1"}}
+{"kind":"coerce","schema":"oneof","text":"5.","output":{"$float":"0x1.4000000000000p+2"}}
+{"kind":"coerce","schema":"oneof","text":"-.5e1","output":{"$float":"-0x1.4000000000000p+2"}}
+{"kind":"coerce","schema":"oneof","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"oneof","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"oneof","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"oneof","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"oneof","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"oneof","text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"coerce","schema":"oneof","text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"coerce","schema":"oneof","text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"coerce","schema":"oneof","text":"1e22","error":"Unrepresentable"}
+{"kind":"coerce","schema":"oneof","text":"true","output":true}
+{"kind":"coerce","schema":"oneof","text":" TRUE ","output":true}
+{"kind":"coerce","schema":"oneof","text":"1","output":1}
+{"kind":"coerce","schema":"oneof","text":"0","output":0}
+{"kind":"coerce","schema":"oneof","text":"False","output":false}
+{"kind":"coerce","schema":"oneof","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"oneof","text":"null","output":"null"}
+{"kind":"coerce","schema":"oneof","text":" null ","output":" null "}
+{"kind":"coerce","schema":"oneof","text":"None","output":"None"}
+{"kind":"coerce","schema":"oneof","text":"none","output":"none"}
+{"kind":"coerce","schema":"oneof","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"oneof","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"oneof","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"oneof","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"oneof","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"oneof","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"oneof","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"oneof","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"oneof","text":"","output":""}
+{"kind":"coerce","schema":"oneof","text":" ","output":" "}
+{"kind":"coerce","schema":"oneof","text":" 5 ","output":5}
+{"kind":"coerce","schema":"oneof","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"oneof-null","text":"3","output":3}
+{"kind":"coerce","schema":"oneof-null","text":" 5 ","output":5}
+{"kind":"coerce","schema":"oneof-null","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"oneof-null","text":"007","output":7}
+{"kind":"coerce","schema":"oneof-null","text":"+5","output":5}
+{"kind":"coerce","schema":"oneof-null","text":"-0","output":0}
+{"kind":"coerce","schema":"oneof-null","text":"1_000","output":1000}
+{"kind":"coerce","schema":"oneof-null","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"oneof-null","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"oneof-null","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"oneof-null","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"oneof-null","text":".5","output":".5"}
+{"kind":"coerce","schema":"oneof-null","text":"5.","output":"5."}
+{"kind":"coerce","schema":"oneof-null","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"oneof-null","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"oneof-null","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"oneof-null","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"oneof-null","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"oneof-null","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"oneof-null","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"oneof-null","text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"coerce","schema":"oneof-null","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"oneof-null","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"oneof-null","text":"true","output":"true"}
+{"kind":"coerce","schema":"oneof-null","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"oneof-null","text":"1","output":1}
+{"kind":"coerce","schema":"oneof-null","text":"0","output":0}
+{"kind":"coerce","schema":"oneof-null","text":"False","output":"False"}
+{"kind":"coerce","schema":"oneof-null","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"oneof-null","text":"null","output":null}
+{"kind":"coerce","schema":"oneof-null","text":" null ","output":null}
+{"kind":"coerce","schema":"oneof-null","text":"None","output":null}
+{"kind":"coerce","schema":"oneof-null","text":"none","output":"none"}
+{"kind":"coerce","schema":"oneof-null","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"oneof-null","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"oneof-null","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"oneof-null","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"oneof-null","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"oneof-null","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"oneof-null","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"oneof-null","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"oneof-null","text":"","output":""}
+{"kind":"coerce","schema":"oneof-null","text":" ","output":" "}
+{"kind":"coerce","schema":"oneof-null","text":" 5 ","output":5}
+{"kind":"coerce","schema":"oneof-null","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"ref","text":"3","output":"3"}
+{"kind":"coerce","schema":"ref","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"ref","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"ref","text":"007","output":"007"}
+{"kind":"coerce","schema":"ref","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"ref","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"ref","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"ref","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"ref","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"ref","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"ref","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"ref","text":".5","output":".5"}
+{"kind":"coerce","schema":"ref","text":"5.","output":"5."}
+{"kind":"coerce","schema":"ref","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"ref","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"ref","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"ref","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"ref","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"ref","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"ref","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"ref","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"ref","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"ref","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"ref","text":"true","output":"true"}
+{"kind":"coerce","schema":"ref","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"ref","text":"1","output":"1"}
+{"kind":"coerce","schema":"ref","text":"0","output":"0"}
+{"kind":"coerce","schema":"ref","text":"False","output":"False"}
+{"kind":"coerce","schema":"ref","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"ref","text":"null","output":"null"}
+{"kind":"coerce","schema":"ref","text":" null ","output":" null "}
+{"kind":"coerce","schema":"ref","text":"None","output":"None"}
+{"kind":"coerce","schema":"ref","text":"none","output":"none"}
+{"kind":"coerce","schema":"ref","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"ref","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"ref","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"ref","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"ref","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"ref","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"ref","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"ref","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"ref","text":"","output":""}
+{"kind":"coerce","schema":"ref","text":" ","output":" "}
+{"kind":"coerce","schema":"ref","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"ref","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"allof","text":"3","output":"3"}
+{"kind":"coerce","schema":"allof","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"allof","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"allof","text":"007","output":"007"}
+{"kind":"coerce","schema":"allof","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"allof","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"allof","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"allof","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"allof","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"allof","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"allof","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"allof","text":".5","output":".5"}
+{"kind":"coerce","schema":"allof","text":"5.","output":"5."}
+{"kind":"coerce","schema":"allof","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"allof","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"allof","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"allof","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"allof","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"allof","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"allof","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"allof","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"allof","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"allof","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"allof","text":"true","output":"true"}
+{"kind":"coerce","schema":"allof","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"allof","text":"1","output":"1"}
+{"kind":"coerce","schema":"allof","text":"0","output":"0"}
+{"kind":"coerce","schema":"allof","text":"False","output":"False"}
+{"kind":"coerce","schema":"allof","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"allof","text":"null","output":"null"}
+{"kind":"coerce","schema":"allof","text":" null ","output":" null "}
+{"kind":"coerce","schema":"allof","text":"None","output":"None"}
+{"kind":"coerce","schema":"allof","text":"none","output":"none"}
+{"kind":"coerce","schema":"allof","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"allof","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"allof","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"allof","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"allof","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"allof","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"allof","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"allof","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"allof","text":"","output":""}
+{"kind":"coerce","schema":"allof","text":" ","output":" "}
+{"kind":"coerce","schema":"allof","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"allof","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"enum","text":"3","output":"3"}
+{"kind":"coerce","schema":"enum","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"enum","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"enum","text":"007","output":"007"}
+{"kind":"coerce","schema":"enum","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"enum","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"enum","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"enum","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"enum","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"enum","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"enum","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"enum","text":".5","output":".5"}
+{"kind":"coerce","schema":"enum","text":"5.","output":"5."}
+{"kind":"coerce","schema":"enum","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"enum","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"enum","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"enum","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"enum","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"enum","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"enum","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"enum","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"enum","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"enum","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"enum","text":"true","output":"true"}
+{"kind":"coerce","schema":"enum","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"enum","text":"1","output":"1"}
+{"kind":"coerce","schema":"enum","text":"0","output":"0"}
+{"kind":"coerce","schema":"enum","text":"False","output":"False"}
+{"kind":"coerce","schema":"enum","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"enum","text":"null","output":"null"}
+{"kind":"coerce","schema":"enum","text":" null ","output":" null "}
+{"kind":"coerce","schema":"enum","text":"None","output":"None"}
+{"kind":"coerce","schema":"enum","text":"none","output":"none"}
+{"kind":"coerce","schema":"enum","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"enum","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"enum","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"enum","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"enum","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"enum","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"enum","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"enum","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"enum","text":"","output":""}
+{"kind":"coerce","schema":"enum","text":" ","output":" "}
+{"kind":"coerce","schema":"enum","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"enum","text":"\u001c5","output":"\u001c5"}
+{"kind":"coerce","schema":"const","text":"3","output":"3"}
+{"kind":"coerce","schema":"const","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"const","text":"3.0","output":"3.0"}
+{"kind":"coerce","schema":"const","text":"007","output":"007"}
+{"kind":"coerce","schema":"const","text":"+5","output":"+5"}
+{"kind":"coerce","schema":"const","text":"-0","output":"-0"}
+{"kind":"coerce","schema":"const","text":"1_000","output":"1_000"}
+{"kind":"coerce","schema":"const","text":"1__0","output":"1__0"}
+{"kind":"coerce","schema":"const","text":"_1","output":"_1"}
+{"kind":"coerce","schema":"const","text":"1e2","output":"1e2"}
+{"kind":"coerce","schema":"const","text":"1E-2","output":"1E-2"}
+{"kind":"coerce","schema":"const","text":".5","output":".5"}
+{"kind":"coerce","schema":"const","text":"5.","output":"5."}
+{"kind":"coerce","schema":"const","text":"-.5e1","output":"-.5e1"}
+{"kind":"coerce","schema":"const","text":"1e400","output":"1e400"}
+{"kind":"coerce","schema":"const","text":"inf","output":"inf"}
+{"kind":"coerce","schema":"const","text":"nan","output":"nan"}
+{"kind":"coerce","schema":"const","text":"-Infinity","output":"-Infinity"}
+{"kind":"coerce","schema":"const","text":"1e","output":"1e"}
+{"kind":"coerce","schema":"const","text":"1.5","output":"1.5"}
+{"kind":"coerce","schema":"const","text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"coerce","schema":"const","text":"0.1","output":"0.1"}
+{"kind":"coerce","schema":"const","text":"1e22","output":"1e22"}
+{"kind":"coerce","schema":"const","text":"true","output":"true"}
+{"kind":"coerce","schema":"const","text":" TRUE ","output":" TRUE "}
+{"kind":"coerce","schema":"const","text":"1","output":"1"}
+{"kind":"coerce","schema":"const","text":"0","output":"0"}
+{"kind":"coerce","schema":"const","text":"False","output":"False"}
+{"kind":"coerce","schema":"const","text":"yes","output":"yes"}
+{"kind":"coerce","schema":"const","text":"null","output":"null"}
+{"kind":"coerce","schema":"const","text":" null ","output":" null "}
+{"kind":"coerce","schema":"const","text":"None","output":"None"}
+{"kind":"coerce","schema":"const","text":"none","output":"none"}
+{"kind":"coerce","schema":"const","text":"NULL","output":"NULL"}
+{"kind":"coerce","schema":"const","text":"[1]","output":"[1]"}
+{"kind":"coerce","schema":"const","text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"coerce","schema":"const","text":"{}","output":"{}"}
+{"kind":"coerce","schema":"const","text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"coerce","schema":"const","text":"[1","output":"[1"}
+{"kind":"coerce","schema":"const","text":"\"x\"","output":"\"x\""}
+{"kind":"coerce","schema":"const","text":"abc","output":"abc"}
+{"kind":"coerce","schema":"const","text":"","output":""}
+{"kind":"coerce","schema":"const","text":" ","output":" "}
+{"kind":"coerce","schema":"const","text":" 5 ","output":" 5 "}
+{"kind":"coerce","schema":"const","text":"\u001c5","output":"\u001c5"}
+{"kind":"sub_parse","value_parser":null,"text":"3","output":"3"}
+{"kind":"sub_parse","value_parser":null,"text":" 5 ","output":" 5 "}
+{"kind":"sub_parse","value_parser":null,"text":"3.0","output":"3.0"}
+{"kind":"sub_parse","value_parser":null,"text":"007","output":"007"}
+{"kind":"sub_parse","value_parser":null,"text":"+5","output":"+5"}
+{"kind":"sub_parse","value_parser":null,"text":"-0","output":"-0"}
+{"kind":"sub_parse","value_parser":null,"text":"1_000","output":"1_000"}
+{"kind":"sub_parse","value_parser":null,"text":"1__0","output":"1__0"}
+{"kind":"sub_parse","value_parser":null,"text":"_1","output":"_1"}
+{"kind":"sub_parse","value_parser":null,"text":"1e2","output":"1e2"}
+{"kind":"sub_parse","value_parser":null,"text":"1E-2","output":"1E-2"}
+{"kind":"sub_parse","value_parser":null,"text":".5","output":".5"}
+{"kind":"sub_parse","value_parser":null,"text":"5.","output":"5."}
+{"kind":"sub_parse","value_parser":null,"text":"-.5e1","output":"-.5e1"}
+{"kind":"sub_parse","value_parser":null,"text":"1e400","output":"1e400"}
+{"kind":"sub_parse","value_parser":null,"text":"inf","output":"inf"}
+{"kind":"sub_parse","value_parser":null,"text":"nan","output":"nan"}
+{"kind":"sub_parse","value_parser":null,"text":"-Infinity","output":"-Infinity"}
+{"kind":"sub_parse","value_parser":null,"text":"1e","output":"1e"}
+{"kind":"sub_parse","value_parser":null,"text":"1.5","output":"1.5"}
+{"kind":"sub_parse","value_parser":null,"text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"sub_parse","value_parser":null,"text":"0.1","output":"0.1"}
+{"kind":"sub_parse","value_parser":null,"text":"1e22","output":"1e22"}
+{"kind":"sub_parse","value_parser":null,"text":"true","output":"true"}
+{"kind":"sub_parse","value_parser":null,"text":" TRUE ","output":" TRUE "}
+{"kind":"sub_parse","value_parser":null,"text":"1","output":"1"}
+{"kind":"sub_parse","value_parser":null,"text":"0","output":"0"}
+{"kind":"sub_parse","value_parser":null,"text":"False","output":"False"}
+{"kind":"sub_parse","value_parser":null,"text":"yes","output":"yes"}
+{"kind":"sub_parse","value_parser":null,"text":"null","output":"null"}
+{"kind":"sub_parse","value_parser":null,"text":" null ","output":" null "}
+{"kind":"sub_parse","value_parser":null,"text":"None","output":"None"}
+{"kind":"sub_parse","value_parser":null,"text":"none","output":"none"}
+{"kind":"sub_parse","value_parser":null,"text":"NULL","output":"NULL"}
+{"kind":"sub_parse","value_parser":null,"text":"[1]","output":"[1]"}
+{"kind":"sub_parse","value_parser":null,"text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"sub_parse","value_parser":null,"text":"{}","output":"{}"}
+{"kind":"sub_parse","value_parser":null,"text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"sub_parse","value_parser":null,"text":"[1","output":"[1"}
+{"kind":"sub_parse","value_parser":null,"text":"\"x\"","output":"\"x\""}
+{"kind":"sub_parse","value_parser":null,"text":"abc","output":"abc"}
+{"kind":"sub_parse","value_parser":null,"text":"","output":""}
+{"kind":"sub_parse","value_parser":null,"text":" ","output":" "}
+{"kind":"sub_parse","value_parser":null,"text":" 5 ","output":" 5 "}
+{"kind":"sub_parse","value_parser":null,"text":"\u001c5","output":"\u001c5"}
+{"kind":"sub_parse","value_parser":null,"text":"\n Paris \n","output":"\n Paris \n"}
+{"kind":"sub_parse","value_parser":null,"text":"{a: 1, b: [2]}","output":"{a: 1, b: [2]}"}
+{"kind":"sub_parse","value_parser":null,"text":"{a:<|\"|>x, y<|\"|>}","output":"{a:<|\"|>x, y<|\"|>}"}
+{"kind":"sub_parse","value_parser":null,"text":"{\"a\": \"<|\"|>x<|\"|>\"}","output":"{\"a\": \"<|\"|>x<|\"|>\"}"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"3","output":"3"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":" 5 ","output":"5"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"3.0","output":"3.0"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"007","output":"007"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"+5","output":"+5"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"-0","output":"-0"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1_000","output":"1_000"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1__0","output":"1__0"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"_1","output":"_1"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1e2","output":"1e2"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1E-2","output":"1E-2"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":".5","output":".5"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"5.","output":"5."}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"-.5e1","output":"-.5e1"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1e400","output":"1e400"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"inf","output":"inf"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"nan","output":"nan"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"-Infinity","output":"-Infinity"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1e","output":"1e"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1.5","output":"1.5"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"0.1","output":"0.1"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1e22","output":"1e22"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"true","output":"true"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":" TRUE ","output":"TRUE"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"1","output":"1"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"0","output":"0"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"False","output":"False"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"yes","output":"yes"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"null","output":"null"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":" null ","output":"null"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"None","output":"None"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"none","output":"none"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"NULL","output":"NULL"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"[1]","output":"[1]"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":" [1, 2] ","output":"[1, 2]"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"{}","output":"{}"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"[1","output":"[1"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"\"x\"","output":"\"x\""}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"abc","output":"abc"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"","output":""}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":" ","output":""}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":" 5 ","output":"5"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"\u001c5","output":"5"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"\n Paris \n","output":"Paris"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"{a: 1, b: [2]}","output":"{a: 1, b: [2]}"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"{a:<|\"|>x, y<|\"|>}","output":"{a:<|\"|>x, y<|\"|>}"}
+{"kind":"sub_parse","value_parser":{"name":"text"},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","output":"{\"a\": \"<|\"|>x<|\"|>\"}"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"3","output":"3"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":" 5 ","output":" 5 "}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"3.0","output":"3.0"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"007","output":"007"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"+5","output":"+5"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"-0","output":"-0"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1_000","output":"1_000"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1__0","output":"1__0"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"_1","output":"_1"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1e2","output":"1e2"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1E-2","output":"1E-2"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":".5","output":".5"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"5.","output":"5."}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"-.5e1","output":"-.5e1"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1e400","output":"1e400"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"inf","output":"inf"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"nan","output":"nan"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"-Infinity","output":"-Infinity"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1e","output":"1e"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1.5","output":"1.5"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"12345678901234567890123","output":"12345678901234567890123"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"0.1","output":"0.1"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1e22","output":"1e22"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"true","output":"true"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":" TRUE ","output":" TRUE "}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"1","output":"1"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"0","output":"0"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"False","output":"False"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"yes","output":"yes"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"null","output":"null"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":" null ","output":" null "}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"None","output":"None"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"none","output":"none"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"NULL","output":"NULL"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"[1]","output":"[1]"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":" [1, 2] ","output":" [1, 2] "}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"{}","output":"{}"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"{\"a\": 1}","output":"{\"a\": 1}"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"[1","output":"[1"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"\"x\"","output":"\"x\""}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"abc","output":"abc"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"","output":""}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":" ","output":" "}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":" 5 ","output":" 5 "}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"\u001c5","output":"\u001c5"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"\n Paris \n","output":"\n Paris \n"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"{a: 1, b: [2]}","output":"{a: 1, b: [2]}"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"{a:<|\"|>x, y<|\"|>}","output":"{a:<|\"|>x, y<|\"|>}"}
+{"kind":"sub_parse","value_parser":{"name":"text","args":{"strip":false}},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","output":"{\"a\": \"<|\"|>x<|\"|>\"}"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"3","output":3}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":" 5 ","output":5}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"007","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"+5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"-0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1_000","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1__0","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"_1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1e2","output":{"$float":"0x1.9000000000000p+6"}}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":".5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"5.","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"-.5e1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1e400","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"inf","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"nan","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"-Infinity","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1e","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1e22","output":{"$float":"0x1.0f0cf064dd592p+73"}}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"true","output":true}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":" TRUE ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"1","output":1}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"False","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"yes","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"null","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":" null ","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"None","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"none","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"NULL","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"[1]","output":[1]}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":" [1, 2] ","output":[1,2]}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"{}","output":{}}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"{\"a\": 1}","output":{"a":1}}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"[1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"\"x\"","output":"x"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"abc","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":" ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":" 5 ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"\u001c5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"\n Paris \n","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"{a: 1, b: [2]}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"{a:<|\"|>x, y<|\"|>}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json"},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"3","output":3}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":" 5 ","output":5}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"007","output":"007"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"+5","output":"+5"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"-0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1_000","output":"1_000"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1__0","output":"1__0"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"_1","output":"_1"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1e2","output":{"$float":"0x1.9000000000000p+6"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":".5","output":".5"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"5.","output":"5."}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"-.5e1","output":"-.5e1"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1e400","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"inf","output":"inf"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"nan","output":"nan"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"-Infinity","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1e","output":"1e"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1e22","output":{"$float":"0x1.0f0cf064dd592p+73"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"true","output":true}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":" TRUE ","output":"TRUE"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"1","output":1}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"False","output":"False"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"yes","output":"yes"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"null","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":" null ","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"None","output":"None"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"none","output":"none"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"NULL","output":"NULL"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"[1]","output":[1]}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":" [1, 2] ","output":[1,2]}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"{}","output":{}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"{\"a\": 1}","output":{"a":1}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"[1","output":"[1"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"\"x\"","output":"x"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"abc","output":"abc"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"","output":""}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":" ","output":""}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":" 5 ","output":"5"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"\u001c5","output":"5"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"\n Paris \n","output":"Paris"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"{a: 1, b: [2]}","output":"{a: 1, b: [2]}"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"{a:<|\"|>x, y<|\"|>}","output":"{a:<|\"|>x, y<|\"|>}"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true}},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","output":"{\"a\": \"<|\"|>x<|\"|>\"}"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"3","output":3}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":" 5 ","output":5}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"007","output":"007"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"+5","output":"+5"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"-0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1_000","output":"1_000"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1__0","output":"1__0"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"_1","output":"_1"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1e2","output":{"$float":"0x1.9000000000000p+6"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":".5","output":".5"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"5.","output":"5."}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"-.5e1","output":"-.5e1"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1e400","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"inf","output":"inf"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"nan","output":"nan"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"-Infinity","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1e","output":"1e"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1e22","output":{"$float":"0x1.0f0cf064dd592p+73"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"true","output":true}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":" TRUE ","output":" TRUE "}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"1","output":1}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"False","output":"False"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"yes","output":"yes"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"null","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":" null ","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"None","output":"None"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"none","output":"none"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"NULL","output":"NULL"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"[1]","output":[1]}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":" [1, 2] ","output":[1,2]}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"{}","output":{}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"{\"a\": 1}","output":{"a":1}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"[1","output":"[1"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"\"x\"","output":"x"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"abc","output":"abc"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"","output":""}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":" ","output":" "}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":" 5 ","output":" 5 "}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"\u001c5","output":"\u001c5"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"\n Paris \n","output":"\n Paris \n"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"{a: 1, b: [2]}","output":"{a: 1, b: [2]}"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"{a:<|\"|>x, y<|\"|>}","output":"{a:<|\"|>x, y<|\"|>}"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"allow_non_json":true,"strip":false}},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","output":"{\"a\": \"<|\"|>x<|\"|>\"}"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"3","output":3}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":" 5 ","output":5}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"007","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"+5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"-0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1_000","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1__0","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"_1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1e2","output":{"$float":"0x1.9000000000000p+6"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":".5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"5.","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"-.5e1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1e400","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"inf","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"nan","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"-Infinity","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1e","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1e22","output":{"$float":"0x1.0f0cf064dd592p+73"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"true","output":true}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":" TRUE ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"1","output":1}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"False","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"yes","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"null","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":" null ","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"None","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"none","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"NULL","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"[1]","output":[1]}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":" [1, 2] ","output":[1,2]}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"{}","output":{}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"{\"a\": 1}","output":{"a":1}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"[1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"\"x\"","output":"x"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"abc","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":" ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":" 5 ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"\u001c5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"\n Paris \n","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"{a: 1, b: [2]}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"{a:<|\"|>x, y<|\"|>}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"unquoted_keys":true}},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"3","output":3}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":" 5 ","output":5}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"007","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"+5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"-0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1_000","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1__0","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"_1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1e2","output":{"$float":"0x1.9000000000000p+6"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":".5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"5.","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"-.5e1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1e400","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"inf","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"nan","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"-Infinity","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1e","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1e22","output":{"$float":"0x1.0f0cf064dd592p+73"}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"true","output":true}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":" TRUE ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"1","output":1}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"False","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"yes","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"null","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":" null ","output":null}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"None","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"none","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"NULL","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"[1]","output":[1]}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":" [1, 2] ","output":[1,2]}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"{}","output":{}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"{\"a\": 1}","output":{"a":1}}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"[1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"\"x\"","output":"x"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"abc","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":" ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":" 5 ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"\u001c5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"\n Paris \n","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"{a: 1, b: [2]}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"{a:<|\"|>x, y<|\"|>}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"json","args":{"string_delims":[["<|\"|>","<|\"|>"]]}},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"3","output":3}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":" 5 ","output":5}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"3.0","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"007","output":7}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"+5","output":5}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"-0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1_000","output":1000}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1__0","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"_1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1e2","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1E-2","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":".5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"5.","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"-.5e1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1e400","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"inf","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"nan","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"-Infinity","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1e","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1.5","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"12345678901234567890123","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"0.1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1e22","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"true","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":" TRUE ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"1","output":1}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"0","output":0}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"False","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"yes","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"null","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":" null ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"None","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"none","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"NULL","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"[1]","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":" [1, 2] ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"{}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"{\"a\": 1}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"[1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"\"x\"","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"abc","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":" ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":" 5 ","output":5}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"\u001c5","output":5}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"\n Paris \n","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"{a: 1, b: [2]}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"{a:<|\"|>x, y<|\"|>}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"int"},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"3","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":" 5 ","output":{"$float":"0x1.4000000000000p+2"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"3.0","output":{"$float":"0x1.8000000000000p+1"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"007","output":{"$float":"0x1.c000000000000p+2"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"+5","output":{"$float":"0x1.4000000000000p+2"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"-0","output":{"$float":"-0x0.0p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1_000","output":{"$float":"0x1.f400000000000p+9"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1__0","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"_1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1e2","output":{"$float":"0x1.9000000000000p+6"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1E-2","output":{"$float":"0x1.47ae147ae147bp-7"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":".5","output":{"$float":"0x1.0000000000000p-1"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"5.","output":{"$float":"0x1.4000000000000p+2"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"-.5e1","output":{"$float":"-0x1.4000000000000p+2"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1e400","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"inf","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"nan","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"-Infinity","error":"Unrepresentable"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1e","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1.5","output":{"$float":"0x1.8000000000000p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"12345678901234567890123","output":{"$float":"0x1.4ea15b273b38ap+73"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"0.1","output":{"$float":"0x1.999999999999ap-4"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1e22","output":{"$float":"0x1.0f0cf064dd592p+73"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"true","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":" TRUE ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"1","output":{"$float":"0x1.0000000000000p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"0","output":{"$float":"0x0.0p+0"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"False","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"yes","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"null","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":" null ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"None","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"none","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"NULL","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"[1]","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":" [1, 2] ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"{}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"{\"a\": 1}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"[1","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"\"x\"","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"abc","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":" ","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":" 5 ","output":{"$float":"0x1.4000000000000p+2"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"\u001c5","output":{"$float":"0x1.4000000000000p+2"}}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"\n Paris \n","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"{a: 1, b: [2]}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"{a:<|\"|>x, y<|\"|>}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"float"},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","error":"ValueError"}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"3","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":" 5 ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"3.0","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"007","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"+5","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"-0","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1_000","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1__0","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"_1","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1e2","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1E-2","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":".5","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"5.","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"-.5e1","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1e400","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"inf","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"nan","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"-Infinity","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1e","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1.5","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"12345678901234567890123","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"0.1","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1e22","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"true","output":true}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":" TRUE ","output":true}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"1","output":true}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"0","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"False","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"yes","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"null","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":" null ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"None","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"none","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"NULL","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"[1]","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":" [1, 2] ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"{}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"{\"a\": 1}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"[1","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"\"x\"","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"abc","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":" ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":" 5 ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"\u001c5","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"\n Paris \n","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"{a: 1, b: [2]}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"{a:<|\"|>x, y<|\"|>}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool"},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"3","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":" 5 ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"3.0","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"007","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"+5","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"-0","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1_000","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1__0","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"_1","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1e2","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1E-2","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":".5","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"5.","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"-.5e1","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1e400","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"inf","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"nan","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"-Infinity","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1e","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1.5","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"12345678901234567890123","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"0.1","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1e22","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"true","output":true}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":" TRUE ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"1","output":true}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"0","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"False","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"yes","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"null","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":" null ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"None","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"none","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"NULL","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"[1]","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":" [1, 2] ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"{}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"{\"a\": 1}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"[1","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"\"x\"","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"abc","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":" ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":" 5 ","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"\u001c5","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"\n Paris \n","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"{a: 1, b: [2]}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"{a:<|\"|>x, y<|\"|>}","output":false}
+{"kind":"sub_parse","value_parser":{"name":"bool","args":{"strip":false}},"text":"{\"a\": \"<|\"|>x<|\"|>\"}","output":false}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"f","arguments":{"int":"5","num":"5","bool":"5","obj":"5","arr":"5","nstr":"5","nint":"5","union":"5","sib":"5","anyof":"5","opt":"5","str":"5","oneof":"5","oneof-null":"5","ref":"5","allof":"5","enum":"5","const":"5"}}},"output":{"function":{"name":"f","arguments":{"int":5,"num":5,"bool":"5","obj":"5","arr":"5","nstr":"5","nint":5,"union":5,"sib":5,"anyof":5,"opt":"5","str":"5","oneof":5,"oneof-null":5,"ref":"5","allof":"5","enum":"5","const":"5"}}}}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"f","arguments":{"int":" null ","num":" null ","bool":" null ","obj":" null ","arr":" null ","nstr":" null ","nint":" null ","union":" null ","sib":" null ","anyof":" null ","opt":" null ","str":" null ","oneof":" null ","oneof-null":" null ","ref":" null ","allof":" null ","enum":" null ","const":" null "}}},"output":{"function":{"name":"f","arguments":{"int":" null ","num":" null ","bool":" null ","obj":" null ","arr":" null ","nstr":null,"nint":null,"union":null,"sib":" null ","anyof":" null ","opt":null,"str":" null ","oneof":" null ","oneof-null":null,"ref":" null ","allof":" null ","enum":" null ","const":" null "}}}}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"f","arguments":{"int":"[1, 2]","num":"[1, 2]","bool":"[1, 2]","obj":"[1, 2]","arr":"[1, 2]","nstr":"[1, 2]","nint":"[1, 2]","union":"[1, 2]","sib":"[1, 2]","anyof":"[1, 2]","opt":"[1, 2]","str":"[1, 2]","oneof":"[1, 2]","oneof-null":"[1, 2]","ref":"[1, 2]","allof":"[1, 2]","enum":"[1, 2]","const":"[1, 2]"}}},"output":{"function":{"name":"f","arguments":{"int":"[1, 2]","num":"[1, 2]","bool":"[1, 2]","obj":"[1, 2]","arr":[1,2],"nstr":"[1, 2]","nint":"[1, 2]","union":"[1, 2]","sib":"[1, 2]","anyof":[1,2],"opt":"[1, 2]","str":"[1, 2]","oneof":"[1, 2]","oneof-null":"[1, 2]","ref":"[1, 2]","allof":"[1, 2]","enum":"[1, 2]","const":"[1, 2]"}}}}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"f","arguments":{"int":"TRUE","num":"TRUE","bool":"TRUE","obj":"TRUE","arr":"TRUE","nstr":"TRUE","nint":"TRUE","union":"TRUE","sib":"TRUE","anyof":"TRUE","opt":"TRUE","str":"TRUE","oneof":"TRUE","oneof-null":"TRUE","ref":"TRUE","allof":"TRUE","enum":"TRUE","const":"TRUE"}}},"output":{"function":{"name":"f","arguments":{"int":"TRUE","num":"TRUE","bool":true,"obj":"TRUE","arr":"TRUE","nstr":"TRUE","nint":"TRUE","union":"TRUE","sib":true,"anyof":"TRUE","opt":"TRUE","str":"TRUE","oneof":true,"oneof-null":"TRUE","ref":"TRUE","allof":"TRUE","enum":"TRUE","const":"TRUE"}}}}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"f","arguments":{"int":5,"num":[1],"str":{"a":"1"},"x":"1"}}},"output":{"function":{"name":"f","arguments":{"int":5,"num":[1],"str":{"a":"1"},"x":"1"}}}}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"f","arguments":{"int":["5"," null ","TRUE","[1, 2]",7,null],"num":["5"," null ","TRUE","[1, 2]",7,null],"bool":["5"," null ","TRUE","[1, 2]",7,null],"obj":["5"," null ","TRUE","[1, 2]",7,null],"arr":["5"," null ","TRUE","[1, 2]",7,null],"nstr":["5"," null ","TRUE","[1, 2]",7,null],"nint":["5"," null ","TRUE","[1, 2]",7,null],"union":["5"," null ","TRUE","[1, 2]",7,null],"sib":["5"," null ","TRUE","[1, 2]",7,null],"anyof":["5"," null ","TRUE","[1, 2]",7,null],"opt":["5"," null ","TRUE","[1, 2]",7,null],"str":["5"," null ","TRUE","[1, 2]",7,null],"oneof":["5"," null ","TRUE","[1, 2]",7,null],"oneof-null":["5"," null ","TRUE","[1, 2]",7,null],"ref":["5"," null ","TRUE","[1, 2]",7,null],"allof":["5"," null ","TRUE","[1, 2]",7,null],"enum":["5"," null ","TRUE","[1, 2]",7,null],"const":["5"," null ","TRUE","[1, 2]",7,null]}}},"output":{"function":{"name":"f","arguments":{"int":[5," null ","TRUE","[1, 2]",7,null],"num":[5," null ","TRUE","[1, 2]",7,null],"bool":["5"," null ",true,"[1, 2]",7,null],"obj":["5"," null ","TRUE","[1, 2]",7,null],"arr":["5"," null ","TRUE","[1, 2]",7,null],"nstr":["5",null,"TRUE","[1, 2]",7,null],"nint":[5,null,"TRUE","[1, 2]",7,null],"union":[5,null,"TRUE","[1, 2]",7,null],"sib":[5," null ",true,"[1, 2]",7,null],"anyof":["5"," null ","TRUE","[1, 2]",7,null],"opt":["5",null,"TRUE","[1, 2]",7,null],"str":["5"," null ","TRUE","[1, 2]",7,null],"oneof":[5," null ",true,"[1, 2]",7,null],"oneof-null":[5,null,"TRUE","[1, 2]",7,null],"ref":["5"," null ","TRUE","[1, 2]",7,null],"allof":["5"," null ","TRUE","[1, 2]",7,null],"enum":["5"," null ","TRUE","[1, 2]",7,null],"const":["5"," null ","TRUE","[1, 2]",7,null]}}}}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"f","arguments":{"int":[["5"],{"a":"5"},"1.5","x"],"num":[["5"],{"a":"5"},"1.5","x"],"bool":[["5"],{"a":"5"},"1.5","x"],"obj":[["5"],{"a":"5"},"1.5","x"],"arr":[["5"],{"a":"5"},"1.5","x"],"nstr":[["5"],{"a":"5"},"1.5","x"],"nint":[["5"],{"a":"5"},"1.5","x"],"union":[["5"],{"a":"5"},"1.5","x"],"sib":[["5"],{"a":"5"},"1.5","x"],"anyof":[["5"],{"a":"5"},"1.5","x"],"opt":[["5"],{"a":"5"},"1.5","x"],"str":[["5"],{"a":"5"},"1.5","x"],"oneof":[["5"],{"a":"5"},"1.5","x"],"oneof-null":[["5"],{"a":"5"},"1.5","x"],"ref":[["5"],{"a":"5"},"1.5","x"],"allof":[["5"],{"a":"5"},"1.5","x"],"enum":[["5"],{"a":"5"},"1.5","x"],"const":[["5"],{"a":"5"},"1.5","x"]}}},"output":{"function":{"name":"f","arguments":{"int":[["5"],{"a":"5"},"1.5","x"],"num":[["5"],{"a":"5"},{"$float":"0x1.8000000000000p+0"},"x"],"bool":[["5"],{"a":"5"},"1.5","x"],"obj":[["5"],{"a":"5"},"1.5","x"],"arr":[["5"],{"a":"5"},"1.5","x"],"nstr":[["5"],{"a":"5"},"1.5","x"],"nint":[["5"],{"a":"5"},"1.5","x"],"union":[["5"],{"a":"5"},{"$float":"0x1.8000000000000p+0"},"x"],"sib":[["5"],{"a":"5"},"1.5","x"],"anyof":[["5"],{"a":"5"},"1.5","x"],"opt":[["5"],{"a":"5"},"1.5","x"],"str":[["5"],{"a":"5"},"1.5","x"],"oneof":[["5"],{"a":"5"},{"$float":"0x1.8000000000000p+0"},"x"],"oneof-null":[["5"],{"a":"5"},"1.5","x"],"ref":[["5"],{"a":"5"},"1.5","x"],"allof":[["5"],{"a":"5"},"1.5","x"],"enum":[["5"],{"a":"5"},"1.5","x"],"const":[["5"],{"a":"5"},"1.5","x"]}}}}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"g","arguments":{"int":"5"}}},"output":{"function":{"name":"g","arguments":{"int":"5"}}}}
+{"kind":"coerce_tool_calls","value":{"function":{"name":"h","arguments":{"int":"5"}}},"output":{"function":{"name":"h","arguments":{"int":"5"}}}}

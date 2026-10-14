@@ -1,14 +1,16 @@
 //! The part of Python's `regex` module that response templates use.
 //! transformers compiles every pattern with `regex.DOTALL` and calls `search`,
-//! `search(..., partial=True)` and `finditer`. A pattern is parsed here into a
+//! `search(..., partial=True)` and `finditer`. A pattern is read (`parse`)
+//! into a tree of every construct the module reads, and compiled here into a
 //! small program for a backtracking matcher that returns what the `regex`
 //! module returns: the leftmost match in backtracking order, its named groups,
-//! and the start of a partial match. The syntax accepted is what the templates
-//! of transformers' tests and of `transformers serve` and the public
-//! checkpoint shapes the parity fixtures record use, plus positive classes,
-//! ranges in classes, `\w` and `\s` in classes, and lookahead in patterns
-//! only used with `finditer` (listed in the README); anything else is refused
-//! with the construct's name.
+//! and the start of a partial match. What the matcher runs is listed in the
+//! README; a tree with anything else is refused with the construct's name
+//! when it compiles.
+
+pub(crate) mod parse;
+
+pub(crate) use parse::Regex;
 
 use crate::error::Unsupported;
 
@@ -55,40 +57,159 @@ const WORD_ADDED: [(u32, u32); 27] = [
     (0x323b0, 0x33479),
 ];
 
-/// One character: a literal, `.`, `\w`, `\s`, or a class of literals,
-/// ranges of them, `\w` and `\s`.
+/// `\d` of the `regex` module: the decimal digits of Unicode 17; a unit test
+/// compares every code point.
+pub(crate) fn is_digit(c: char) -> bool {
+    let code = u32::from(c);
+    let i = DIGIT.partition_point(|&(lo, _)| lo <= code);
+    i > 0 && code <= DIGIT[i - 1].1
+}
+
+const DIGIT: [(u32, u32); 72] = [
+    (0x30, 0x39),
+    (0x660, 0x669),
+    (0x6f0, 0x6f9),
+    (0x7c0, 0x7c9),
+    (0x966, 0x96f),
+    (0x9e6, 0x9ef),
+    (0xa66, 0xa6f),
+    (0xae6, 0xaef),
+    (0xb66, 0xb6f),
+    (0xbe6, 0xbef),
+    (0xc66, 0xc6f),
+    (0xce6, 0xcef),
+    (0xd66, 0xd6f),
+    (0xde6, 0xdef),
+    (0xe50, 0xe59),
+    (0xed0, 0xed9),
+    (0xf20, 0xf29),
+    (0x1040, 0x1049),
+    (0x1090, 0x1099),
+    (0x17e0, 0x17e9),
+    (0x1810, 0x1819),
+    (0x1946, 0x194f),
+    (0x19d0, 0x19d9),
+    (0x1a80, 0x1a89),
+    (0x1a90, 0x1a99),
+    (0x1b50, 0x1b59),
+    (0x1bb0, 0x1bb9),
+    (0x1c40, 0x1c49),
+    (0x1c50, 0x1c59),
+    (0xa620, 0xa629),
+    (0xa8d0, 0xa8d9),
+    (0xa900, 0xa909),
+    (0xa9d0, 0xa9d9),
+    (0xa9f0, 0xa9f9),
+    (0xaa50, 0xaa59),
+    (0xabf0, 0xabf9),
+    (0xff10, 0xff19),
+    (0x104a0, 0x104a9),
+    (0x10d30, 0x10d39),
+    (0x10d40, 0x10d49),
+    (0x11066, 0x1106f),
+    (0x110f0, 0x110f9),
+    (0x11136, 0x1113f),
+    (0x111d0, 0x111d9),
+    (0x112f0, 0x112f9),
+    (0x11450, 0x11459),
+    (0x114d0, 0x114d9),
+    (0x11650, 0x11659),
+    (0x116c0, 0x116c9),
+    (0x116d0, 0x116e3),
+    (0x11730, 0x11739),
+    (0x118e0, 0x118e9),
+    (0x11950, 0x11959),
+    (0x11bf0, 0x11bf9),
+    (0x11c50, 0x11c59),
+    (0x11d50, 0x11d59),
+    (0x11da0, 0x11da9),
+    (0x11de0, 0x11de9),
+    (0x11f50, 0x11f59),
+    (0x16130, 0x16139),
+    (0x16a60, 0x16a69),
+    (0x16ac0, 0x16ac9),
+    (0x16b50, 0x16b59),
+    (0x16d70, 0x16d79),
+    (0x1ccf0, 0x1ccf9),
+    (0x1d7ce, 0x1d7ff),
+    (0x1e140, 0x1e149),
+    (0x1e2f0, 0x1e2f9),
+    (0x1e4f0, 0x1e4f9),
+    (0x1e5f1, 0x1e5fa),
+    (0x1e950, 0x1e959),
+    (0x1fbf0, 0x1fbf9),
+];
+
+/// A class escape: `\w`, `\W`, `\s`, `\S`, `\d`, `\D`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Escape {
+    Word,
+    NotWord,
+    Space,
+    NotSpace,
+    Digit,
+    NotDigit,
+}
+
+impl Escape {
+    /// With the `regex` module's tables: `\s` is Unicode White_Space.
+    fn matches(self, c: char) -> bool {
+        match self {
+            Self::Word => is_word(c),
+            Self::NotWord => !is_word(c),
+            Self::Space => c.is_whitespace(),
+            Self::NotSpace => !c.is_whitespace(),
+            Self::Digit => is_digit(c),
+            Self::NotDigit => !is_digit(c),
+        }
+    }
+}
+
+/// One character: a literal, `.`, a class escape, a property, or a class of
+/// characters, ranges of them, class escapes and properties.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Set {
+pub(crate) enum Set {
     Char(char),
     Any,
-    Word,
-    Space,
+    Escape(Escape),
+    /// A Unicode property or POSIX class as written (`\pL`, `[:alpha:]`,
+    /// `\h`): read, not run.
+    Property(Box<str>),
     Class {
         negated: bool,
         ranges: Box<[(char, char)]>,
-        word: bool,
-        space: bool,
+        escapes: Box<[Escape]>,
+        properties: Box<[Box<str>]>,
     },
 }
 
 impl Set {
+    /// Whether `c` is in the set; a set with a property is never run.
     fn matches(&self, c: char) -> bool {
         match self {
             Self::Char(x) => *x == c,
             Self::Any => true,
-            Self::Word => is_word(c),
-            Self::Space => c.is_whitespace(),
+            Self::Escape(e) => e.matches(c),
+            Self::Property(_) => false,
             Self::Class {
                 negated,
                 ranges,
-                word,
-                space,
+                escapes,
+                ..
             } => {
                 (ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
-                    || (*word && is_word(c))
-                    || (*space && c.is_whitespace()))
+                    || escapes.iter().any(|e| e.matches(c)))
                     != *negated
             }
+        }
+    }
+
+    /// The property this set holds, if any: the matcher does not run it.
+    fn property(&self) -> Option<&str> {
+        match self {
+            Self::Property(name) => Some(name),
+            Self::Class { properties, .. } => properties.first().map(|p| &**p),
+            _ => None,
         }
     }
 }
@@ -148,19 +269,19 @@ impl First {
 /// match of `node`; false when a backreference can come first.
 fn first_sets(node: &Node, chars: &mut Vec<char>, sets: &mut Vec<Set>) -> bool {
     match node {
-        Node::One(Set::Char(c)) | Node::Repeat(Set::Char(c), _) => {
+        Node::One(Set::Char(c)) => {
             chars.push(*c);
             true
         }
-        Node::One(set) | Node::Repeat(set, _) => {
+        Node::One(set) => {
             if !sets.contains(set) {
                 sets.push(set.clone());
             }
             true
         }
-        Node::Look(_) | Node::Ahead(_) => true,
-        Node::Backref(_) => false,
-        Node::Group(_, inner) | Node::Opt(inner) => first_sets(inner, chars, sets),
+        Node::Look(_) | Node::Around { .. } => true,
+        Node::Backref(_) | Node::Other(..) => false,
+        Node::Group(_, inner) | Node::Repeat { node: inner, .. } => first_sets(inner, chars, sets),
         Node::Alt(branches) => branches
             .iter()
             .all(|branch| first_sets(branch, chars, sets)),
@@ -178,13 +299,15 @@ fn first_sets(node: &Node, chars: &mut Vec<char>, sets: &mut Vec<Set>) -> bool {
     }
 }
 
-/// `^` (start of text), `$` (end, or before a final newline), `\Z`, `\b`.
+/// `^` and `\A` (start of text), `$` (end, or before a final newline), `\Z`
+/// and `\z` (end), `\b`, `\B`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Look {
+pub(crate) enum Look {
     Start,
     Dollar,
     End,
     WordBoundary,
+    NotWordBoundary,
 }
 
 impl Look {
@@ -198,47 +321,120 @@ impl Look {
                 hay[..at].chars().next_back().is_some_and(is_word)
                     != hay[at..].chars().next().is_some_and(is_word)
             }
+            Self::NotWordBoundary => !Self::WordBoundary.at(hay, at),
         }
     }
 }
 
+/// How a quantifier repeats: greedy, lazy (`*?`) or possessive (`*+`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rep {
-    Star,
-    Plus,
-    Opt,
-    LazyStar,
+pub(crate) enum Quantifier {
+    Greedy,
+    Lazy,
+    Possessive,
 }
 
-#[derive(Debug)]
-enum Node {
+/// Constructs the reader reads that the matcher does not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Other {
+    /// `(?>...)`.
+    Atomic,
+    /// `(?|...|...)`.
+    BranchReset,
+    /// `(?(1)yes|no)`, `(?(?=...)yes|no)`.
+    Conditional,
+    /// `a{e<=1}`.
+    Fuzzy,
+    /// `(?R)`, `(?1)`, `(?&name)`.
+    GroupCall,
+    /// `\K`.
+    Keep,
+    /// `\G`.
+    SearchAnchor,
+    /// `\X`.
+    Grapheme,
+    /// `\R`.
+    LineBreak,
+    /// `\m`.
+    WordStart,
+    /// `\M`.
+    WordEnd,
+    /// `(*FAIL)`, `(*F)`.
+    Fail,
+    /// `(*PRUNE)`.
+    Prune,
+    /// `(*SKIP)`.
+    Skip,
+}
+
+impl Other {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Atomic => "atomic group",
+            Self::BranchReset => "branch reset group",
+            Self::Conditional => "conditional",
+            Self::Fuzzy => "fuzzy matching",
+            Self::GroupCall => "group call",
+            Self::Keep => "escape \\K",
+            Self::SearchAnchor => "escape \\G",
+            Self::Grapheme => "escape \\X",
+            Self::LineBreak => "escape \\R",
+            Self::WordStart => "escape \\m",
+            Self::WordEnd => "escape \\M",
+            Self::Fail => "verb (*FAIL)",
+            Self::Prune => "verb (*PRUNE)",
+            Self::Skip => "verb (*SKIP)",
+        }
+    }
+}
+
+/// A pattern as the `regex` module reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Node {
     One(Set),
     Look(Look),
-    /// `(?=...)`, without groups or backreferences in it.
-    Ahead(Box<Node>),
+    /// `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`.
+    Around {
+        behind: bool,
+        negated: bool,
+        node: Box<Node>,
+    },
+    /// A capturing group (its number) or `(?:...)`.
     Group(Option<usize>, Box<Node>),
     Alt(Vec<Node>),
     Cat(Vec<Node>),
-    /// `?` after one character or a group.
-    Opt(Box<Node>),
-    /// `*`, `+` or `*?` after one character.
-    Repeat(Set, Rep),
+    /// `node` from `min` to `max` times (`None`: no limit): `*`, `+`, `?`,
+    /// `{m,n}`.
+    Repeat {
+        node: Box<Node>,
+        min: u32,
+        max: Option<u32>,
+        kind: Quantifier,
+    },
+    /// A backreference to a group number.
     Backref(usize),
+    /// Another construct, with what it holds.
+    Other(Other, Vec<Node>),
 }
 
 impl Node {
     /// Whether the `regex` module can reduce this alternative to a negated
     /// class of one character (after moving a common prefix out of the
     /// alternatives, merging nested ones and dropping empty groups). A class
-    /// with `\w` or `\s` is not such a class.
+    /// with a class escape is not such a class; one of a lone surrogate is.
     fn negated_char(&self) -> bool {
         match self {
             Self::One(Set::Class {
                 negated,
                 ranges,
-                word,
-                space,
-            }) => *negated && !*word && !*space && ranges.len() == 1 && ranges[0].0 == ranges[0].1,
+                escapes,
+                properties,
+            }) => {
+                *negated
+                    && escapes.is_empty()
+                    && properties.is_empty()
+                    && (ranges.is_empty() || (ranges.len() == 1 && ranges[0].0 == ranges[0].1))
+            }
             Self::Group(None, node) => node.negated_char(),
             Self::Cat(nodes) => nodes
                 .iter()
@@ -251,10 +447,10 @@ impl Node {
     }
 
     /// Whether this is a non-capturing group of nothing (such as `(?:)` or
-    /// `(?:(?:))?`), which the `regex` module drops when it parses.
+    /// `(?:(?:))`), which the `regex` module drops when it parses.
     fn empty_group(&self) -> bool {
         match self {
-            Self::Group(None, node) | Self::Opt(node) => node.empty_group(),
+            Self::Group(None, node) => node.empty_group(),
             Self::Cat(nodes) => nodes.iter().all(Self::empty_group),
             _ => false,
         }
@@ -263,23 +459,57 @@ impl Node {
     fn has_backref(&self) -> bool {
         match self {
             Self::Backref(_) => true,
-            Self::Group(_, node) | Self::Opt(node) => node.has_backref(),
-            Self::Alt(nodes) | Self::Cat(nodes) => nodes.iter().any(Self::has_backref),
-            _ => false,
+            Self::Group(_, node) | Self::Repeat { node, .. } | Self::Around { node, .. } => {
+                node.has_backref()
+            }
+            Self::Alt(nodes) | Self::Cat(nodes) | Self::Other(_, nodes) => {
+                nodes.iter().any(Self::has_backref)
+            }
+            Self::One(_) | Self::Look(_) => false,
         }
     }
 
     fn nullable(&self) -> bool {
         match self {
             Self::One(_) => false,
-            Self::Look(_) | Self::Ahead(_) | Self::Backref(_) => true,
+            Self::Look(_) | Self::Around { .. } | Self::Backref(_) | Self::Other(..) => true,
             Self::Group(_, node) => node.nullable(),
-            Self::Repeat(_, rep) => *rep != Rep::Plus,
-            Self::Opt(_) => true,
+            Self::Repeat { node, min, .. } => *min == 0 || node.nullable(),
             Self::Alt(nodes) => nodes.iter().any(Self::nullable),
             Self::Cat(nodes) => nodes.iter().all(Self::nullable),
         }
     }
+
+    /// The `regex` module's `is_empty`: whether the item reads as nothing,
+    /// so that a quantifier of it is dropped.
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Group(None, node) | Self::Repeat { node, .. } => node.is_empty(),
+            Self::Around { negated, node, .. } => !negated && node.is_empty(),
+            Self::Alt(nodes) | Self::Cat(nodes) => nodes.iter().all(Self::is_empty),
+            Self::Other(Other::Atomic | Other::Fuzzy | Other::BranchReset, nodes) => {
+                nodes.iter().all(Self::is_empty)
+            }
+            // A lookaround conditional reads as nothing when its test and its
+            // `yes` branch do.
+            Self::Other(Other::Conditional, nodes) => match nodes.as_slice() {
+                [Self::Around { node: test, .. }, yes, _] => test.is_empty() && yes.is_empty(),
+                nodes => nodes.iter().all(Self::is_empty),
+            },
+            _ => false,
+        }
+    }
+}
+
+/// What the tail of a lazy repeat starts with, as the `regex` module tests
+/// it before it lets the repeat take another character (the `test` node of
+/// its `LAZY_REPEAT_ONE`): one literal character, a literal string, or
+/// something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Test {
+    Char(char),
+    Str(Box<str>),
+    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +521,24 @@ enum Inst {
         set: Set,
         greedy: bool,
         memo: usize,
+    },
+    /// `x{min,max}` (greedy) of one character.
+    Count {
+        set: Set,
+        min: u32,
+        max: Option<u32>,
+        memo: usize,
+    },
+    /// A lazy repeat of one character, run as the `regex` module runs its
+    /// `LAZY_REPEAT_ONE`: `body` and `tail` number the positions it was
+    /// entered at and its tail was tried at.
+    Lazy {
+        set: Set,
+        min: u32,
+        max: Option<u32>,
+        test: Test,
+        body: usize,
+        tail: usize,
     },
     Look(Look),
     /// `(?=...)`: its body follows, ending in a `Match`; when the body
@@ -367,29 +615,50 @@ pub(crate) struct Memo {
     partial: Option<(usize, Option<usize>)>,
 }
 
+/// Why a lazy repeat in an open or close pattern is refused.
+const LAZY_POSITION: &str = "lazy repeat in this position of an open or close pattern";
+
 impl Pattern {
-    /// Compile a Python pattern, or name the construct that is not ported.
-    /// A `finditer` pattern must not match the empty string (see the README).
+    /// Read and compile a Python pattern, or name the construct that is not
+    /// ported. A `finditer` pattern must not match the empty string (see the
+    /// README).
     pub(crate) fn new(source: &str, role: Role) -> Result<Self, Unsupported> {
-        let mut parser = Parser {
-            chars: source.chars().collect(),
-            i: 0,
-            role,
-            groups: 0,
-            names: Vec::new(),
-            closed: vec![false],
-            optional: vec![false],
-            depth: 0,
-            ahead: 0,
-        };
-        let node = parser.alt().map_err(Unsupported::Regex)?;
-        if parser.i != parser.chars.len() {
-            return Err(Unsupported::Regex("unbalanced parenthesis".into()));
-        }
-        if role == Role::Finditer && node.nullable() {
+        let regex = Regex::parse(source).map_err(|e| Unsupported::Regex(e.to_string()))?;
+        Self::compile(&regex, role)
+    }
+
+    /// Compile a pattern the reader read, or name the construct the matcher
+    /// does not run.
+    pub(crate) fn compile(regex: &Regex, role: Role) -> Result<Self, Unsupported> {
+        check(regex, role).map_err(Unsupported::Regex)?;
+        if role == Role::Finditer && regex.node.nullable() {
             return Err(Unsupported::EmptyMatch);
         }
-        Ok(Self::build(&node, parser.names, parser.optional))
+        let mut pattern = Self::build(
+            &regex.node,
+            role,
+            regex.names.clone(),
+            regex.optional.clone(),
+        );
+        // A lazy repeat in an open or close pattern runs as the module's only
+        // before a literal tail, and not first: where a partial search starts
+        // depends on the module's own first sets there.
+        if role == Role::Delimiter && lazy_first(&pattern.prog) {
+            return Err(Unsupported::Regex(LAZY_POSITION.into()));
+        }
+        for pc in 0..pattern.prog.len() {
+            if !matches!(pattern.prog[pc], Inst::Lazy { .. }) {
+                continue;
+            }
+            let (test, branch_follows) = tail_test(&pattern.prog, pc + 1);
+            if role == Role::Delimiter && (test == Test::Other || branch_follows) {
+                return Err(Unsupported::Regex(LAZY_POSITION.into()));
+            }
+            if let Inst::Lazy { test: slot, .. } = &mut pattern.prog[pc] {
+                *slot = test;
+            }
+        }
+        Ok(pattern)
     }
 
     /// `"|".join(regex.escape(s) for s in literals)`.
@@ -403,13 +672,13 @@ impl Pattern {
         // A search enters no branch point of a list twice at one position.
         Self {
             memos: 0,
-            ..Self::build(&node, Vec::new(), vec![false])
+            ..Self::build(&node, Role::Delimiter, Vec::new(), vec![false])
         }
     }
 
-    fn build(node: &Node, names: Vec<(String, usize)>, optional: Vec<bool>) -> Self {
+    fn build(node: &Node, role: Role, names: Vec<(String, usize)>, optional: Vec<bool>) -> Self {
         let (mut prog, mut memos) = (Vec::new(), 0);
-        compile(node, &mut prog, &mut memos);
+        compile(node, role, None, &mut prog, &mut memos);
         prog.push(Inst::Match);
         let first = First::of(node);
         let (mut run, mut longest) = (String::new(), String::new());
@@ -422,7 +691,8 @@ impl Pattern {
             .map(|pc| match &prog[pc] {
                 Inst::Star {
                     set, greedy: true, ..
-                } => literal_firsts(&prog, pc + 1)
+                }
+                | Inst::Count { set, .. } => literal_firsts(&prog, pc + 1)
                     .is_none_or(|next| next.iter().any(|&c| set.matches(c))),
                 _ => false,
             })
@@ -445,6 +715,7 @@ impl Pattern {
     }
 
     /// The names of the named groups (`pattern.groupindex`).
+    #[cfg(test)]
     pub(crate) fn group_names(&self) -> impl Iterator<Item = &str> {
         self.names.iter().map(|(name, _)| name.as_str())
     }
@@ -548,7 +819,9 @@ impl Pattern {
     /// One backtracking run of the program from `pc` at `start`, up to the
     /// next `Match`. In a partial search, reading past the end of the
     /// haystack is a partial match, except when a lazy repeat would extend
-    /// there; entering a lazy repeat at the end is one too.
+    /// there; entering a lazy repeat at the end is one too. A lazy repeat
+    /// before a literal follows the `regex` module's own rules instead
+    /// ([`Pattern::lazy`]).
     fn run(&self, hay: &str, pc: usize, start: usize, partial: bool, run: &mut Run) -> Step {
         run.stack.push(Frame::Try(pc, start));
         while let Some(frame) = run.stack.pop() {
@@ -584,6 +857,20 @@ impl Pattern {
                     }
                     run.stack.push(Frame::Extend { pc, at: next });
                     (pc + 1, next)
+                }
+                // A lazy repeat run as the module's takes more characters.
+                Frame::Lazy { pc, pos, count } => {
+                    match self.lazy(hay, pc, pos, count, partial, run) {
+                        Lazy::Partial => {
+                            run.stack.clear();
+                            return Step::Partial;
+                        }
+                        Lazy::Fail => continue,
+                        Lazy::Match(pos, count) => {
+                            self.push_lazy(hay, pc, pos, count, run);
+                            (pc + 1, pos)
+                        }
+                    }
                 }
             };
             loop {
@@ -643,6 +930,75 @@ impl Pattern {
                         run.stack.push(Frame::Extend { pc, at });
                         pc += 1;
                     }
+                    // The module's `count_one` up to the maximum, then giving
+                    // back down to the minimum: reaching the end below the
+                    // maximum is a partial match.
+                    Inst::Count {
+                        set,
+                        min,
+                        max,
+                        memo,
+                    } => {
+                        if !run.visit(*memo, at) {
+                            break;
+                        }
+                        let (mut end, mut count, mut floor) = (at, 0, at);
+                        while max.is_none_or(|max| count < max) {
+                            let Some(c) = hay[end..].chars().next().filter(|&c| set.matches(c))
+                            else {
+                                break;
+                            };
+                            end += c.len_utf8();
+                            count += 1;
+                            if count == *min {
+                                floor = end;
+                            }
+                        }
+                        if partial && end == hay.len() && max.is_none_or(|max| count < max) {
+                            run.stack.clear();
+                            return Step::Partial;
+                        }
+                        if count < *min {
+                            break;
+                        }
+                        if end > floor && self.gives_back[pc] {
+                            let back = hay[..end].chars().next_back().map_or(0, char::len_utf8);
+                            run.stack.push(Frame::GiveBack {
+                                pc,
+                                floor,
+                                at: end - back,
+                            });
+                        }
+                        at = end;
+                        pc += 1;
+                    }
+                    // `count_one` up to the minimum (reaching the end below
+                    // it is a partial match); backtracking takes more
+                    // ([`Pattern::lazy`]).
+                    Inst::Lazy { set, min, body, .. } => {
+                        if !run.visit(*body, at) {
+                            break;
+                        }
+                        let (mut end, mut count) = (at, 0);
+                        while count < *min {
+                            let Some(c) = hay[end..].chars().next().filter(|&c| set.matches(c))
+                            else {
+                                break;
+                            };
+                            end += c.len_utf8();
+                            count += 1;
+                        }
+                        if count < *min {
+                            if partial && end == hay.len() {
+                                run.stack.clear();
+                                return Step::Partial;
+                            }
+                            break;
+                        }
+                        self.push_lazy(hay, pc, end, count, run);
+                        at = end;
+                        pc += 1;
+                    }
                     Inst::Look(look) if look.at(hay, at) => pc += 1,
                     Inst::Look(_) => break,
                     // The body runs with its own stack and memory: whether it
@@ -693,6 +1049,108 @@ impl Pattern {
         }
         Step::Fail
     }
+
+    /// Remember the lazy repeat at `pc`, now at `pos` with `count`
+    /// characters, so that backtracking can take more: while it is below its
+    /// maximum and characters are left.
+    fn push_lazy(&self, hay: &str, pc: usize, pos: usize, count: u32, run: &mut Run) {
+        if let Inst::Lazy { max, .. } = &self.prog[pc] {
+            if pos < hay.len() && max.is_none_or(|max| count < max) {
+                run.stack.push(Frame::Lazy { pc, pos, count });
+            }
+        }
+    }
+
+    /// Backtracking into the lazy repeat at `pc`, now at `pos` with `count`
+    /// characters: the next position from which its tail can match, found as
+    /// the `regex` module's `LAZY_REPEAT_ONE` finds it. Before a literal
+    /// character, a partial search is a partial match once at most one
+    /// character is left, whatever it is. Before a literal string, it is one
+    /// once no later copy of the string is left in the text (within the
+    /// maximum), whatever comes before.
+    fn lazy(
+        &self,
+        hay: &str,
+        pc: usize,
+        mut pos: usize,
+        mut count: u32,
+        partial: bool,
+        run: &mut Run,
+    ) -> Lazy {
+        let Inst::Lazy {
+            set,
+            max,
+            test,
+            tail,
+            ..
+        } = &self.prog[pc]
+        else {
+            return Lazy::Fail;
+        };
+        let below_max = |count: u32| max.is_none_or(|max| count < max);
+        match test {
+            Test::Char(ch) => loop {
+                let mut rest = hay[pos..].chars();
+                let next = rest.next();
+                let last = rest.next().is_none();
+                if partial && last {
+                    return Lazy::Partial;
+                }
+                if last || !below_max(count) {
+                    return Lazy::Fail;
+                }
+                let Some(c) = next.filter(|&c| set.matches(c)) else {
+                    return Lazy::Fail;
+                };
+                pos += c.len_utf8();
+                count += 1;
+                if hay[pos..].starts_with(*ch) && run.visit(*tail, pos) {
+                    return Lazy::Match(pos, count);
+                }
+            },
+            Test::Str(s) => loop {
+                if partial && pos >= hay.len() {
+                    return Lazy::Partial;
+                }
+                let from = pos + hay[pos..].chars().next().map_or(1, char::len_utf8);
+                let found = hay
+                    .get(from..)
+                    .and_then(|rest| rest.find(&**s))
+                    .map(|k| from + k)
+                    .filter(|&at| {
+                        max.is_none_or(|max| {
+                            u64::from(count) + hay[pos..at].chars().count() as u64 <= u64::from(max)
+                        })
+                    });
+                let Some(at) = found else {
+                    return if partial { Lazy::Partial } else { Lazy::Fail };
+                };
+                for c in hay[pos..at].chars() {
+                    if !set.matches(c) {
+                        return Lazy::Fail;
+                    }
+                    count += 1;
+                }
+                pos = at;
+                if run.visit(*tail, pos) {
+                    return Lazy::Match(pos, count);
+                }
+            },
+            Test::Other => loop {
+                if !below_max(count) {
+                    return Lazy::Fail;
+                }
+                let Some(c) = hay[pos..].chars().next().filter(|&c| set.matches(c)) else {
+                    return Lazy::Fail;
+                };
+                pos += c.len_utf8();
+                count += 1;
+                if run.visit(*tail, pos) {
+                    return Lazy::Match(pos, count);
+                }
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -702,11 +1160,21 @@ enum Step {
     Fail,
 }
 
+/// Backtracking into a lazy repeat: its tail can be tried at this position
+/// with this many characters, there is no such position, or the search is a
+/// partial match.
+enum Lazy {
+    Match(usize, u32),
+    Fail,
+    Partial,
+}
+
 enum Frame {
     Try(usize, usize),
     Restore(usize, Option<usize>),
     GiveBack { pc: usize, floor: usize, at: usize },
     Extend { pc: usize, at: usize },
+    Lazy { pc: usize, pos: usize, count: u32 },
 }
 
 /// State of one search: group slots, the backtracking stack, and the
@@ -804,6 +1272,50 @@ fn literal_firsts(prog: &[Inst], pc: usize) -> Option<Vec<char>> {
     Some(firsts)
 }
 
+/// Whether a run from the start can reach a lazy repeat run as the module's
+/// before it reads a character.
+fn lazy_first(prog: &[Inst]) -> bool {
+    let (mut seen, mut todo) = (vec![false; prog.len()], vec![0]);
+    while let Some(pc) = todo.pop() {
+        if std::mem::replace(&mut seen[pc], true) {
+            continue;
+        }
+        match &prog[pc] {
+            Inst::Lazy { .. } => return true,
+            Inst::Look(_) | Inst::Save(_) | Inst::Star { .. } => todo.push(pc + 1),
+            Inst::Count { min: 0, .. } => todo.push(pc + 1),
+            Inst::Ahead { end } => todo.extend([pc + 1, *end]),
+            Inst::Jmp(to) => todo.push(*to),
+            Inst::Split { second, .. } => todo.extend([pc + 1, *second]),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The test of the lazy repeat whose tail starts at `pc` (past the starts and
+/// ends of groups, as the module looks past them), and whether a branch
+/// point follows its literals (where the module could move a common prefix
+/// of alternatives into them).
+fn tail_test(prog: &[Inst], mut pc: usize) -> (Test, bool) {
+    while let Some(Inst::Save(_)) = prog.get(pc) {
+        pc += 1;
+    }
+    let mut literals = String::new();
+    while let Some(Inst::One(Set::Char(c))) = prog.get(pc) {
+        literals.push(*c);
+        pc += 1;
+    }
+    let branch_follows = matches!(prog.get(pc), Some(Inst::Split { .. } | Inst::Jmp(_)));
+    let mut chars = literals.chars();
+    let test = match (chars.next(), chars.next()) {
+        (None, _) => Test::Other,
+        (Some(c), None) => Test::Char(c),
+        _ => Test::Str(literals.into()),
+    };
+    (test, branch_follows)
+}
+
 /// The longest run of literal characters in `node` that every match contains.
 fn required_literal(node: &Node, run: &mut String, longest: &mut String) {
     match node {
@@ -843,15 +1355,36 @@ fn set_second(prog: &mut [Inst], split: usize) {
     }
 }
 
-/// Compile `node` into `prog`, numbering its repeats and branch points from `memos`.
-fn compile(node: &Node, prog: &mut Vec<Inst>, memos: &mut usize) {
+/// Whether the `*?` at `items[i]` keeps the matcher's own rule in an open or
+/// close pattern: `.*?` before a literal, or after another item and before
+/// `\b` and a literal (where partial searches match the `regex` module's).
+fn plain_lazy(items: &[Node], i: usize) -> bool {
+    let literal = |k: usize| matches!(items.get(k), Some(Node::One(Set::Char(_))));
+    let dot_literal = matches!(
+        &items[i],
+        Node::Repeat { node, .. } if **node == Node::One(Set::Any)
+    ) && literal(i + 1);
+    let boundary =
+        i > 0 && items.get(i + 1) == Some(&Node::Look(Look::WordBoundary)) && literal(i + 2);
+    dot_literal || boundary
+}
+
+/// Compile `node` into `prog`, numbering its repeats and branch points from
+/// `memos`; `items` is the sequence `node` is in, with its index.
+fn compile(
+    node: &Node,
+    role: Role,
+    items: Option<(&[Node], usize)>,
+    prog: &mut Vec<Inst>,
+    memos: &mut usize,
+) {
     match node {
         Node::One(set) => prog.push(Inst::One(set.clone())),
         Node::Look(look) => prog.push(Inst::Look(*look)),
-        Node::Ahead(body) => {
+        Node::Around { node: body, .. } => {
             let at = prog.len();
             prog.push(Inst::Ahead { end: 0 });
-            compile(body, prog, memos);
+            compile(body, role, None, prog, memos);
             prog.push(Inst::Match);
             prog[at] = Inst::Ahead { end: prog.len() };
         }
@@ -860,21 +1393,25 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, memos: &mut usize) {
             if let Some(g) = group {
                 prog.push(Inst::Save(2 * g));
             }
-            compile(inner, prog, memos);
+            compile(inner, role, None, prog, memos);
             if let Some(g) = group {
                 prog.push(Inst::Save(2 * g + 1));
             }
         }
-        Node::Cat(nodes) => nodes.iter().for_each(|n| compile(n, prog, memos)),
+        Node::Cat(nodes) => {
+            for (i, n) in nodes.iter().enumerate() {
+                compile(n, role, Some((nodes, i)), prog, memos);
+            }
+        }
         Node::Alt(branches) => {
             let mut jumps = Vec::new();
             for (k, branch) in branches.iter().enumerate() {
                 if k + 1 == branches.len() {
-                    compile(branch, prog, memos);
+                    compile(branch, role, None, prog, memos);
                     break;
                 }
                 let at = split(prog, memos);
-                compile(branch, prog, memos);
+                compile(branch, role, None, prog, memos);
                 jumps.push(prog.len());
                 prog.push(Inst::Jmp(0));
                 set_second(prog, at);
@@ -884,340 +1421,205 @@ fn compile(node: &Node, prog: &mut Vec<Inst>, memos: &mut usize) {
                 prog[j] = Inst::Jmp(end);
             }
         }
-        Node::Opt(body) => {
-            let at = split(prog, memos);
-            compile(body, prog, memos);
-            set_second(prog, at);
-        }
-        Node::Repeat(set, rep) => {
-            if *rep == Rep::Plus {
-                prog.push(Inst::One(set.clone()));
+        Node::Repeat {
+            node: body,
+            min,
+            max,
+            kind,
+        } => match (body.as_ref(), *min, *max, *kind) {
+            (Node::One(set), 0 | 1, None, Quantifier::Greedy) => {
+                if *min == 1 {
+                    prog.push(Inst::One(set.clone()));
+                }
+                let memo = next_memo(memos);
+                prog.push(Inst::Star {
+                    set: set.clone(),
+                    greedy: true,
+                    memo,
+                });
             }
-            let memo = next_memo(memos);
-            prog.push(Inst::Star {
-                set: set.clone(),
-                greedy: *rep != Rep::LazyStar,
-                memo,
-            });
-        }
+            (Node::One(set), 0, None, Quantifier::Lazy)
+                if role == Role::Finditer
+                    || items.is_some_and(|(items, i)| plain_lazy(items, i)) =>
+            {
+                let memo = next_memo(memos);
+                prog.push(Inst::Star {
+                    set: set.clone(),
+                    greedy: false,
+                    memo,
+                });
+            }
+            (body, 0, Some(1), Quantifier::Greedy) => {
+                let at = split(prog, memos);
+                compile(body, role, None, prog, memos);
+                set_second(prog, at);
+            }
+            (Node::One(set), min, max, Quantifier::Greedy) => {
+                let memo = next_memo(memos);
+                prog.push(Inst::Count {
+                    set: set.clone(),
+                    min,
+                    max,
+                    memo,
+                });
+            }
+            (Node::One(set), min, max, Quantifier::Lazy) => {
+                let body = next_memo(memos);
+                let tail = next_memo(memos);
+                prog.push(Inst::Lazy {
+                    set: set.clone(),
+                    min,
+                    max,
+                    test: Test::Other,
+                    body,
+                    tail,
+                });
+            }
+            // Refused by `check`.
+            _ => {}
+        },
+        // Refused by `check`.
+        Node::Other(..) => {}
     }
 }
 
-/// A parser for the supported subset of the `regex` module's syntax. Errors
-/// name the construct that is not supported.
-struct Parser {
-    chars: Vec<char>,
-    i: usize,
+/// What the matcher does not run in a pattern used for `role`, named, in
+/// the order the pattern reads.
+fn check(regex: &Regex, role: Role) -> Result<(), String> {
+    if !regex.flags.is_empty() {
+        return Err(format!("inline flags (?{})", regex.flags));
+    }
+    let mut checker = Checker {
+        role,
+        closed: vec![false; regex.groups + 1],
+        ahead: false,
+        enclosed: false,
+    };
+    checker.node(&regex.node, None)
+}
+
+struct Checker {
     role: Role,
-    groups: usize,
-    names: Vec<(String, usize)>,
+    /// Per group number: whether the group closed before this point.
     closed: Vec<bool>,
-    optional: Vec<bool>,
-    /// Groups open around the current position.
-    depth: usize,
-    /// Lookaheads open around the current position.
-    ahead: usize,
+    /// Inside a lookahead.
+    ahead: bool,
+    /// Inside an alternative, a repeat or a lookahead, where the `regex`
+    /// module may rebuild what follows a lazy repeat.
+    enclosed: bool,
 }
 
-/// The deepest group nesting accepted. The parser, and every walk over the
-/// parsed pattern, recurses once per level; a template from a model's
-/// `tokenizer_config.json` must not be able to overflow the stack.
-const MAX_GROUP_DEPTH: usize = 100;
-
-type Parsed = Result<Node, String>;
-
-impl Parser {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.i).copied()
-    }
-
-    fn eat(&mut self, c: char) -> bool {
-        let found = self.peek() == Some(c);
-        self.i += usize::from(found);
-        found
-    }
-
-    /// A literal character at `k` that no quantifier follows.
-    fn literal_at(&self, k: usize) -> bool {
-        let next = match self.chars.get(k..) {
-            Some(['\\', c, rest @ ..]) if c.is_ascii_punctuation() || *c == 'n' => rest,
-            Some([c, rest @ ..]) if !".^$*+?{}[]\\|()".contains(*c) => rest,
-            _ => return false,
-        };
-        !matches!(next.first(), Some('*' | '+' | '?' | '{'))
-    }
-
-    fn rest_starts_with(&self, s: &str) -> bool {
-        s.chars()
-            .enumerate()
-            .all(|(k, c)| self.chars.get(self.i + k) == Some(&c))
-    }
-
-    /// Groups from number `first` on can be left unset by a match.
-    fn mark_optional(&mut self, first: usize) {
-        for flag in &mut self.optional[first + 1..] {
-            *flag = true;
-        }
-    }
-
-    fn alt(&mut self) -> Parsed {
-        let first = self.groups;
-        let mut branches = vec![self.seq()?];
-        while self.eat('|') {
-            branches.push(self.seq()?);
-        }
-        if branches.len() == 1 {
-            return Ok(branches.remove(0));
-        }
-        // The `regex` module merges alternatives of one character into one
-        // class, and a merged class with two negated characters matches as if
-        // both were negated in one: `[^a]|[^b]` matches neither `a` nor `b`.
-        if branches.iter().filter(|b| b.negated_char()).count() > 1 {
-            return Err("alternatives that can end in a negated class of one character".into());
-        }
-        self.mark_optional(first);
-        Ok(Node::Alt(branches))
-    }
-
-    fn seq(&mut self) -> Parsed {
-        let mut items = Vec::new();
-        while let Some(c) = self.peek() {
-            if c == '|' || c == ')' {
-                break;
-            }
-            let first = self.groups;
-            let atom = self.atom()?;
-            let rep = match self.peek() {
-                Some('*') => Rep::Star,
-                Some('+') => Rep::Plus,
-                Some('?') => Rep::Opt,
-                _ => {
-                    items.push(atom);
-                    continue;
+impl Checker {
+    fn node(&mut self, node: &Node, items: Option<(&[Node], usize)>) -> Result<(), String> {
+        match node {
+            Node::One(set) => set.property().map_or(Ok(()), |name| {
+                Err(format!("Unicode property or POSIX class {name}"))
+            }),
+            Node::Look(Look::NotWordBoundary) => Err("escape \\B".into()),
+            Node::Look(_) => Ok(()),
+            Node::Around {
+                behind,
+                negated,
+                node,
+            } => {
+                // Patterns used only with `finditer` are never searched
+                // partially, where a zero-width assertion would change the result.
+                if self.role == Role::Delimiter || *behind || *negated {
+                    return Err("look-around".into());
                 }
-            };
-            self.i += 1;
-            let rep = match (rep, self.eat('?')) {
-                (rep, false) => rep,
-                (Rep::Star, true) => Rep::LazyStar,
-                _ => return Err("lazy quantifier other than *?".into()),
-            };
-            if matches!(self.peek(), Some('*' | '+' | '?' | '{')) {
-                return Err("repeated or possessive quantifier".into());
+                let saved = (self.ahead, self.enclosed);
+                (self.ahead, self.enclosed) = (true, true);
+                let checked = self.node(node, None);
+                (self.ahead, self.enclosed) = saved;
+                checked
             }
-            let node = match (atom, rep) {
-                (Node::One(set), Rep::Star | Rep::Plus | Rep::LazyStar) => Node::Repeat(set, rep),
-                // The `regex` module does not retry a repeat's body at a
-                // position where it failed, even when the groups a
-                // backreference in it reads have changed since.
-                (atom, Rep::Opt) if atom.has_backref() => {
-                    return Err("backreference inside an optional group".into())
+            Node::Group(group, inner) => {
+                if group.is_some() && self.ahead {
+                    return Err("group in a lookahead".into());
                 }
-                (atom @ (Node::One(_) | Node::Group(..)), Rep::Opt) => Node::Opt(Box::new(atom)),
-                _ => return Err("repeat of a group or an assertion".into()),
-            };
-            // Partial searches match the `regex` module for `.*?` before a
-            // literal, and for a lazy repeat after another item and before `\b`
-            // and a literal (see the README).
-            if rep == Rep::LazyStar && self.role == Role::Delimiter {
-                let dot_literal =
-                    matches!(node, Node::Repeat(Set::Any, _)) && self.literal_at(self.i);
-                let boundary = !items.is_empty()
-                    && self.rest_starts_with("\\b")
-                    && self.literal_at(self.i + 2);
-                if !dot_literal && !boundary {
-                    return Err("lazy repeat in this position of an open or close pattern".into());
+                self.node(inner, None)?;
+                if let Some(closed) = group.and_then(|g| self.closed.get_mut(g)) {
+                    *closed = true;
                 }
+                Ok(())
             }
-            if rep == Rep::Opt {
-                self.mark_optional(first);
+            Node::Alt(branches) => {
+                let enclosed = std::mem::replace(&mut self.enclosed, true);
+                for branch in branches {
+                    self.node(branch, None)?;
+                }
+                self.enclosed = enclosed;
+                // The `regex` module merges alternatives of one character into
+                // one class, and a merged class with two negated characters
+                // matches as if both were negated in one: `[^a]|[^b]` matches
+                // neither `a` nor `b`.
+                if branches.iter().filter(|b| b.negated_char()).count() > 1 {
+                    return Err(
+                        "alternatives that can end in a negated class of one character".into(),
+                    );
+                }
+                Ok(())
             }
-            items.push(node);
-        }
-        Ok(if items.len() == 1 {
-            items.remove(0)
-        } else {
-            Node::Cat(items)
-        })
-    }
-
-    fn atom(&mut self) -> Parsed {
-        let c = self.peek().unwrap_or_default();
-        self.i += 1;
-        Ok(match c {
-            '.' => Node::One(Set::Any),
-            '^' => Node::Look(Look::Start),
-            '$' => Node::Look(Look::Dollar),
-            '\\' => return self.escape(false),
-            '[' => return self.class(),
-            '(' => return self.group(),
-            '*' | '+' | '?' => return Err(format!("'{c}' without an atom")),
-            '{' => return Err("'{' (a counted repeat or a literal brace)".into()),
-            '}' | ']' => return Err(format!("literal '{c}'")),
-            c => Node::One(Set::Char(c)),
-        })
-    }
-
-    fn escape(&mut self, in_class: bool) -> Parsed {
-        let c = self.peek().ok_or("trailing backslash")?;
-        self.i += 1;
-        Ok(match c {
-            c if c.is_ascii_punctuation() => Node::One(Set::Char(c)),
-            'n' => Node::One(Set::Char('\n')),
-            'w' => Node::One(Set::Word),
-            's' => Node::One(Set::Space),
-            'b' if !in_class => Node::Look(Look::WordBoundary),
-            'Z' if !in_class => Node::Look(Look::End),
-            '1'..='9' if !in_class && !self.peek().is_some_and(|d| d.is_ascii_digit()) => {
-                let group = c as usize - '0' as usize;
+            Node::Cat(nodes) => {
+                for (i, node) in nodes.iter().enumerate() {
+                    self.node(node, Some((nodes, i)))?;
+                }
+                Ok(())
+            }
+            Node::Repeat {
+                node: body,
+                min,
+                max,
+                kind,
+            } => {
+                let enclosed = std::mem::replace(&mut self.enclosed, true);
+                self.node(body, None)?;
+                self.enclosed = enclosed;
+                if *kind == Quantifier::Possessive {
+                    return Err("possessive quantifier".into());
+                }
+                let optional = (*min, *max, *kind) == (0, Some(1), Quantifier::Greedy);
+                match body.as_ref() {
+                    Node::One(_) => {}
+                    // The `regex` module does not retry a repeat's body at a
+                    // position where it failed, even when the groups a
+                    // backreference in it reads have changed since.
+                    body if optional && body.has_backref() => {
+                        return Err("backreference inside an optional group".into())
+                    }
+                    Node::Group(..) if optional => {}
+                    _ => return Err("repeat of a group or an assertion".into()),
+                }
+                // In an open or close pattern, partial searches match the
+                // module's for `*?` in the matcher's own positions, and for a
+                // lazy repeat without a maximum before a literal, outside
+                // alternatives, repeats and lookaheads (its tail is checked
+                // once compiled). With a maximum, the module's search for a
+                // literal that follows skips starts by the maximum's width.
+                let plain = (*min, *max) == (0, None)
+                    && items.is_some_and(|(items, i)| plain_lazy(items, i));
+                if *kind == Quantifier::Lazy
+                    && self.role == Role::Delimiter
+                    && !plain
+                    && (self.enclosed || max.is_some())
+                {
+                    return Err(LAZY_POSITION.into());
+                }
+                Ok(())
+            }
+            Node::Backref(group) => {
                 if self.role == Role::Delimiter {
                     return Err("backreference in an open or close pattern".into());
                 }
-                if self.ahead > 0 {
+                if self.ahead {
                     return Err("backreference in a lookahead".into());
                 }
-                if !self.closed.get(group).copied().unwrap_or(false) {
+                if !self.closed.get(*group).copied().unwrap_or(false) {
                     return Err("backreference to a later group".into());
                 }
-                Node::Backref(group)
+                Ok(())
             }
-            c => return Err(format!("escape \\{c}")),
-        })
-    }
-
-    /// `[...]` or `[^...]` of literal characters, ranges of them, `\w` and
-    /// `\s`. A `-` is literal only as the last item; one next to `\w` or `\s`
-    /// elsewhere is refused (the `regex` module reads it as a literal, Python's
-    /// `re` rejects it).
-    fn class(&mut self) -> Parsed {
-        let negated = self.eat('^');
-        let mut ranges = Vec::new();
-        let (mut word, mut space) = (false, false);
-        loop {
-            let c = self.peek().ok_or("unterminated character class")?;
-            self.i += 1;
-            let empty = ranges.is_empty() && !word && !space;
-            let lo = match c {
-                ']' if !empty => break,
-                '-' if self.peek() == Some(']') && !empty => '-',
-                c => match self.class_item(c)? {
-                    Set::Char(lo) => lo,
-                    set => {
-                        if self.range_follows() {
-                            let e = self.chars[self.i - 1];
-                            return Err(format!("'-' after \\{e} in a character class"));
-                        }
-                        word |= set == Set::Word;
-                        space |= set == Set::Space;
-                        continue;
-                    }
-                },
-            };
-            let mut hi = lo;
-            if self.range_follows() {
-                let c = self.chars[self.i + 1];
-                self.i += 2;
-                hi = match self.class_item(c)? {
-                    Set::Char(hi) => hi,
-                    _ => {
-                        let e = self.chars[self.i - 1];
-                        return Err(format!("'-' before \\{e} in a character class"));
-                    }
-                };
-                if hi < lo {
-                    return Err("character range out of order".into());
-                }
-            }
-            ranges.push((lo, hi));
+            Node::Other(kind, _) => Err(kind.name().into()),
         }
-        Ok(Node::One(Set::Class {
-            negated,
-            ranges: ranges.into(),
-            word,
-            space,
-        }))
-    }
-
-    /// A `-` that makes a range (not one before the closing `]`) comes next.
-    fn range_follows(&self) -> bool {
-        self.peek() == Some('-') && !matches!(self.chars.get(self.i + 1), Some(']') | None)
-    }
-
-    /// One item of a class: a literal character, `\w` or `\s`.
-    fn class_item(&mut self, c: char) -> Result<Set, String> {
-        match c {
-            '\\' => match self.escape(true)? {
-                Node::One(set) => Ok(set),
-                _ => Err("character class".into()),
-            },
-            '[' | ']' | '-' | '^' | '&' | '|' | '~' => Err(format!("'{c}' in a character class")),
-            c => Ok(Set::Char(c)),
-        }
-    }
-
-    fn group(&mut self) -> Parsed {
-        let group = if self.rest_starts_with("?:") {
-            self.i += 2;
-            None
-        } else if self.rest_starts_with("?P<") {
-            self.i += 3;
-            let end = self.chars[self.i..]
-                .iter()
-                .position(|&c| c == '>')
-                .ok_or("group name")?;
-            let name: String = self.chars[self.i..self.i + end].iter().collect();
-            self.i += end + 1;
-            if self.ahead > 0 {
-                return Err("group in a lookahead".into());
-            }
-            let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if !valid || self.names.iter().any(|(n, _)| *n == name) {
-                return Err(format!("group name {name:?}"));
-            }
-            self.groups += 1;
-            self.names.push((name, self.groups));
-            self.closed.push(false);
-            self.optional.push(false);
-            Some(self.groups)
-        } else if self.role == Role::Finditer && self.rest_starts_with("?=") {
-            // Patterns used only with `finditer` are never searched
-            // partially, where a zero-width assertion would change the result.
-            self.i += 2;
-            if self.depth == MAX_GROUP_DEPTH {
-                return Err(format!("groups nested more than {MAX_GROUP_DEPTH} deep"));
-            }
-            self.depth += 1;
-            self.ahead += 1;
-            let body = self.alt()?;
-            self.ahead -= 1;
-            self.depth -= 1;
-            if !self.eat(')') {
-                return Err("unbalanced parenthesis".into());
-            }
-            return Ok(Node::Ahead(Box::new(body)));
-        } else if ["?=", "?!", "?<=", "?<!"]
-            .iter()
-            .any(|s| self.rest_starts_with(s))
-        {
-            return Err("look-around".into());
-        } else if self.peek() == Some('?') {
-            return Err("group syntax".into());
-        } else {
-            return Err("unnamed capturing group".into());
-        };
-        if self.depth == MAX_GROUP_DEPTH {
-            return Err(format!("groups nested more than {MAX_GROUP_DEPTH} deep"));
-        }
-        self.depth += 1;
-        let inner = self.alt()?;
-        self.depth -= 1;
-        if !self.eat(')') {
-            return Err("unbalanced parenthesis".into());
-        }
-        if let Some(g) = group {
-            self.closed[g] = true;
-        }
-        Ok(Node::Group(group, Box::new(inner)))
     }
 }

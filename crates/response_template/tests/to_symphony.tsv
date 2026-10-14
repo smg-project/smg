@@ -1,0 +1,320 @@
+serve/qwen2	refused	JsonEnvelope (Field 'tool_calls': a call as one JSON object holding its name and arguments)
+serve/qwen3_5	table	anchors ["<|im_start|>assistant\n"]; 0:outside content trimmed drops ["<|im_end|>", "<|endoftext|>"]; 1:thinking reasoning trimmed in ["<think>"] out ["</think>"]; 2:tool_calls calls in ["<tool_call>"] out ["</tool_call>"] header [\s* "<function=" NAME([^\n>]+) ">"] params ["<parameter=" KEY([^\n>]+) ">" \s* VALUE(.*?)] ends [[\s* "</parameter>"]] values raw trailer ["</function>" \s*]
+serve/gemma4	refused	JsonArguments (Field 'tool_calls': a call named by its open or the template, its arguments JSON) JsonDialect (Field 'tool_calls': JSON with unquoted keys or its own string delimiters)
+shapes/literal-anchors-json-tools	refused	JsonArguments (Field 'tool_calls': a call named by its open or the template, its arguments JSON) JsonDialect (Field 'tool_calls': JSON with unquoted keys or its own string delimiters)
+shapes/xml-invoke-word-boundary	table	anchors ["<|begin|>assistant"]; 0:outside content framing; 1:content content trimmed in ["to=all<|body|>"] out ["<|pause|>", "<|stop|>"]; 2:reasoning_content reasoning trimmed in ["to=me<|body|>"] out ["<|pause|>"]; 3:tool_calls calls in ["<ns:call"] out ["</ns:call>"] header [\b [^>]*? \b "name=\"" NAME([^"]+) "\">"] params ["<ns:arg" \b [^>]*? \b "name=\"" KEY([^"]+) "\"" [^>]*? ">" VALUE(.*?)] ends [["</ns:arg>"]] values json(allow_non_json)
+shapes/content-only-close-pattern	table	anchors ["<|BOT_TURN|>"]; 0:outside content trimmed drops ["<|TURN_END|>"]
+synthetic/base	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/strip-true	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/strip-false	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/unwrapped	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) CallTransform (Field 'tool_calls': a transform with no function) NoLiteral (Field 'tool_calls': an open whose first piece after whitespace is not literal text)
+synthetic/greedy-tag	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) TagPattern (Field 'tool_calls': the tag: atom 3: a greedy run of any character with no bound) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/overlap-close	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/posix-name	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Property (Field 'tool_calls': the property or POSIX class [:alpha:] in a class)
+synthetic/setop-name	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/brace-quant	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text)
+synthetic/dollar-open	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) EndOfText (Field 'content': $, \Z or \z) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/defaults	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/version	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/literal-anchor	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/literal-open	refused	NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/close-pattern	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/text-strip-false	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/content-repeats-join	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) RepeatedTextField (Field 'content': a text field that repeats) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/value-parser-json	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/merge-duplicates	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) MergeDuplicates (Field 'tool_calls': merge_duplicates) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/implicit-content	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/no-content-field	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/extra-field	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/optional-false	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/backreference-tag	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Backreference (Field 'tool_calls': a backreference to group 1) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/lookahead-open	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) LookAhead (Field 'content': a lookahead) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/word-boundary-open	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/abs-end-tag	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) EndOfText (Field 'tool_calls': $, \Z or \z) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/zero-width-open	refused	StartOfText (Field 'thinking': ^ or \A) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/transform-extra-key	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/transform-aliased	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/multiline-caret-open	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) InlineFlags (Field 'content': inline flags (?m)) StartOfText (Field 'content': ^ or \A) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/verbose-open	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/json-body	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) JsonArguments (Field 'tool_calls': a call named by its open or the template, its arguments JSON) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/kv-lines	refused	NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) KeyValueLines (Field 'tool_calls': arguments as key-value lines) Capture (Field 'tool_calls': the Name group is not one run of a class)
+synthetic/unicode-delimiters	table	anchors ["【助手】"]; 0:outside content framing; 1:thinking reasoning trimmed in ["【思考】"] out ["【/思考】"]; 2:content content trimmed in ["【回答】"] out ["【/回答】"]; 3:tool_calls calls in ["【工具:"] out ["【/工具】"] header [NAME(\w+) "】"] params ["〈" KEY(\w+) "〉" VALUE(.*?)] ends [["〈/〉"]] values text
+behaviour/json-allow-non-json	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/json-strict	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/int	table	anchors ["<A>"]; 0:outside content framing; 1:n content framing in ["<n>"] out ["</n>"]
+behaviour/int-no-strip	table	anchors ["<A>"]; 0:outside content framing; 1:n content framing in ["<n>"] out ["</n>"]
+behaviour/float	table	anchors ["<A>"]; 0:outside content framing; 1:f content framing in ["<f>"] out ["</f>"]
+behaviour/bool	table	anchors ["<A>"]; 0:outside content framing; 1:b content framing in ["<b>"] out ["</b>"]
+behaviour/kv-lines-args	table	anchors ["<A>"]; 0:outside content framing; 1:kv content framing in ["<kv>"] out ["</kv>"]
+behaviour/kv-lines-none-sep	table	anchors ["<A>"]; 0:outside content framing; 1:kv content framing in ["<kv>"] out ["</kv>"]
+behaviour/kv-lines-empty-sep	table	anchors ["<A>"]; 0:outside content framing; 1:kv content framing in ["<kv>"] out ["</kv>"]
+behaviour/xml-no-tag-pattern	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/xml-bad-tag-pattern	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/xml-no-key-group	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/xml-optional-value	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/xml-alternative-value	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/xml-alternative-key	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/xml-optional-value-parsed	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/xml-merge-list-value	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/xml-nested	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/bad-value-parser	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/value-parser-not-dict	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/content-args-not-dict	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/join-non-string	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/join-default-list	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/join-default-str	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/repeats-default-list	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/repeats-default-str	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/optional-required	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]; 2:y content framing in ["<y>"] out ["</y>"]
+behaviour/transform-each	table	anchors ["<A>"]; 0:outside content framing; 1:calls content framing in ["<c>"] out ["</c>"]
+behaviour/transform-scalar	refused	TextFieldDelimiter (Field 'x': the open "<x " is followed by more than whitespace)
+behaviour/transform-missing	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/transform-unknown-root	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/capture-optional-group	refused	TextFieldDelimiter (Field 'x': the open "<x n=" is followed by more than whitespace)
+behaviour/capture-named-content	refused	TextFieldDelimiter (Field 'x': the open "<x " is followed by more than whitespace)
+behaviour/no-close-field	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out []; 2:y content framing in ["<y>"] out ["</y>"]
+behaviour/implicit-no-close	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/literal-prefix-overlap	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<<<", "<<", "<"] out ["ENDX", "END", "E"]
+behaviour/close-zero-width	refused	InlineFlags (Field 'body': inline flags (?m)) EndOfText (Field 'body': $, \Z or \z)
+behaviour/close-absolute-end	refused	EndOfText (Field 'body': $, \Z or \z)
+behaviour/close-dollar	refused	EndOfText (Field 'body': $, \Z or \z)
+behaviour/close-word-boundary	refused	NoLiteral (Field 'body': a close whose last piece before whitespace is not literal text)
+behaviour/open-and-close-empty	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text) NoLiteral (Field 'x': a close whose last piece before whitespace is not literal text)
+behaviour/greedy-open	refused	TextFieldDelimiter (Field 'x': the open "<x" is followed by more than whitespace)
+behaviour/non-string-defaults	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/version-float	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/version-bool	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+behaviour/unrepresentable-dropped	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]; 2:f content framing in ["<f>"] out ["</f>"]; 3:s content framing in ["<s>"] out ["</s>"]; 4:e content framing in ["<e>"] out ["</e>"]
+behaviour/unrepresentable-overwritten	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]; 2:k content framing in ["<k>"] out ["</k>"]
+behaviour/unrepresentable-key-clash	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': tool calls with no transform, or one that is not an object)
+behaviour/optional-backreference	refused	Backreference (response_template: a backreference to group 1)
+behaviour/negated-class-alternation	refused	TextFieldDelimiter (Field 'x': the open "<" is followed by more than whitespace) TextFieldDelimiter (Field 'x': the open "<" is followed by more than whitespace)
+behaviour/key-order-after-split	refused	TextFieldDelimiter (Field 'r': the open "^^" is followed by more than whitespace)
+behaviour/string-delims-overlap	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+load/open-list-dedupe	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<ab>", "<a>"] out ["</x>"]
+load/join-repeats-truthy	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+load/transform-placeholder-only	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+load/anchor-pattern-empty-match	refused	AnchorNotFinite (response_template: a start anchor pattern that is not literal text)
+load/tag-pattern-empty-match	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+load/string-delims-shape	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+load/string-delims-empty	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+load/optional-string	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+dialect/000	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["a{x}"] out ["</x>"]
+dialect/001	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["a{ 1}"] out ["</x>"]
+dialect/002	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["a{}"] out ["</x>"]
+dialect/003	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/004	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/005	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["a{1,x}"] out ["</x>"]
+dialect/006	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<t>{"] out ["</x>"]
+dialect/007	refused	TextFieldDelimiter (Field 'x': the open "<t>" is followed by more than whitespace)
+dialect/008	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<t>"] out ["</x>"]
+dialect/009	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["<t>"] out ["</x>"]
+dialect/010	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/011	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in [" <t>"] out ["</x>"]
+dialect/012	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/013	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/014	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/016	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/017	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/018	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/019	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/020	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/021	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/022	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/023	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/024	refused	MarkerInsideMarker (response_template: in "1:x", the marker "\0<" hides "</x>", which moves it)
+dialect/025	refused	MarkerInsideMarker (response_template: in "1:x", the marker "\n<" hides "</x>", which moves it)
+dialect/026	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["A"] out ["</x>"]
+dialect/027	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["A"] out ["</x>"]
+dialect/028	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["A"] out ["</x>"]
+dialect/035	refused	MarkerInsideMarker (response_template: in "0:outside", the marker "</x>" hides "x", which moves it)
+dialect/036	refused	MarkerInsideMarker (response_template: in "0:outside", the marker "</x>" hides "x", which moves it)
+dialect/038	refused	InlineFlags (Field 'x': inline flags (?i))
+dialect/039	refused	InlineFlags (Field 'x': inline flags (?i))
+dialect/040	refused	TextFieldDelimiter (Field 'x': the open "a" is followed by more than whitespace)
+dialect/041	refused	InlineFlags (Field 'x': inline flags (?-s))
+dialect/042	refused	InlineFlags (Field 'x': inline flags (?m)) EndOfText (Field 'x': $, \Z or \z)
+dialect/043	refused	InlineFlags (Field 'x': inline flags (?m)) StartOfText (Field 'x': ^ or \A)
+dialect/044	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["a"] out ["</x>"]
+dialect/045	refused	InlineFlags (Field 'x': inline flags (?a))
+dialect/046	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/047	refused	InlineFlags (Field 'x': inline flags (?L))
+dialect/049	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["a"] out ["</x>"]
+dialect/051	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["a"] out ["</x>"]
+dialect/052	refused	OtherRegex (Field 'x': an atomic group)
+dialect/053	refused	OtherRegex (Field 'x': a branch reset group)
+dialect/054	refused	OtherRegex (Field 'x': a group call)
+dialect/055	refused	Possessive (Field 'x': a possessive repeat)
+dialect/056	refused	OtherRegex (Field 'x': fuzzy matching)
+dialect/057	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["a"] out ["</x>"]
+dialect/059	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["N"] out ["</x>"]
+dialect/061	refused	Property (Field 'x': the property or POSIX class \pL)
+dialect/062	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["px"] out ["</x>"]
+dialect/063	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["g<0>"] out ["</x>"]
+dialect/064	table	anchors ["<A>"]; 0:outside content framing; 1:x content framing in ["g"] out ["</x>"]
+dialect/065	refused	OtherRegex (Field 'x': the escape \K)
+dialect/066	refused	OtherRegex (Field 'x': the escape \G)
+dialect/067	refused	OtherRegex (Field 'x': the escape \X)
+dialect/068	refused	Property (Field 'x': the property or POSIX class \h)
+dialect/069	refused	OtherRegex (Field 'x': the escape \R)
+dialect/070	refused	OtherRegex (Field 'x': the escape \m)
+dialect/071	refused	OtherRegex (Field 'x': the escape \M)
+dialect/072	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/073	refused	NotWordBoundary (Field 'x': \B)
+dialect/074	refused	EndOfText (Field 'x': $, \Z or \z)
+dialect/075	refused	EndOfText (Field 'x': $, \Z or \z)
+dialect/076	refused	EndOfText (Field 'x': $, \Z or \z)
+dialect/077	refused	StartOfText (Field 'x': ^ or \A)
+dialect/078	refused	StartOfText (Field 'x': ^ or \A)
+dialect/079	refused	InlineFlags (Field 'x': inline flags (?m)) StartOfText (Field 'x': ^ or \A)
+dialect/080	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/081	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/082	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/083	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/093	refused	Backreference (Field 'x': a backreference to group 1)
+dialect/094	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/095	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/096	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/097	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/098	refused	OtherRegex (Field 'x': the verb (*FAIL))
+dialect/100	refused	InlineFlags (Field 'x': inline flags (?e))
+dialect/103	refused	LookAhead (Field 'x': a lookahead)
+dialect/104	refused	LookBehind (Field 'x': a lookbehind)
+dialect/105	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/106	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/107	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/108	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+dialect/111	refused	NestedRepeat (Field 'x': a repeat of a group, other than an optional one)
+dialect/112	refused	NestedRepeat (Field 'x': a repeat of a group, other than an optional one)
+dialect/113	refused	NestedRepeat (Field 'x': a repeat of a group, other than an optional one)
+hf-tests/test_field_without_close_runs_to_end_of_stream/1	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:content content trimmed in ["<resp>"] out []
+hf-tests/test_int_content_parser/1	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:count content framing in ["<n>"] out ["</n>"]
+hf-tests/test_join_concatenates_repeated_matches/1	refused	RepeatedTextField (Field 'content': a text field that repeats) RepeatedTextField (Field 'thinking': a text field that repeats)
+hf-tests/test_join_requires_string_matches/1	table	anchors ["a"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+hf-tests/test_kv_lines_parser/1	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:metadata content framing in ["<meta>"] out ["</meta>"]
+hf-tests/test_literal_list_defers_prefix_overlapping_literal/1	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["ENDX", "END"]
+hf-tests/test_literal_list_open_and_close/1	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:x content framing in ["<bb>", "<a>"] out ["</bb>", "</a>"]
+hf-tests/test_literal_list_streams_without_64_byte_hold/1	table	anchors ["<|assistant|>"]; 0:outside content trimmed drops ["<|tool_response>", "<turn|>", "<eos>"]
+hf-tests/test_optional_false_raises_when_missing/1	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:content content trimmed in ["<response>"] out ["</response>"]
+hf-tests/test_transform_dotted_path_errors/1	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+hf-tests/test_transform_dotted_path_errors/2	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+hf-tests/test_transform_dotted_path_errors/3	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:x content framing in ["<x>"] out ["</x>"]
+hf-tests/test_transform_dotted_paths/1	refused	DottedPath (Field 'tool_calls': the arguments at {content.args})
+hf-tests/test_transform_dotted_paths_with_transform_each/1	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) TransformEach (Field 'tool_calls': tool calls given as a list)
+hf-tests/test_history_bleed_is_guarded_by_prefix_not_by_response_anchor/1	refused	EndOfText (Field 'content': $, \Z or \z)
+hf-tests/test_prefix_with_open_close_inside_truncated_region/1	refused	EndOfText (Field 'body': $, \Z or \z)
+hf-tests/test_dirty_flag_marks_structured_regions/1	table	anchors ["<|assistant|>"]; 0:outside content framing; 1:thinking reasoning trimmed in ["<t>"] out ["</t>"]; 2:score content framing in ["<n>"] out ["</n>"]; 3:json_call content framing in ["<j>"] out ["</j>"]; 4:xml_call content framing in ["<x>"] out ["</x>"]; 5:kv_call content framing in ["<kv>"] out ["</kv>"]
+hf-tests/test_merge_duplicates_arguments_are_cast_element_wise/1	refused	MergeDuplicates (Field 'tool_calls': merge_duplicates)
+hf-tests/test_non_tool_call_regions_are_untouched/1	refused	TextFieldDelimiter (Field 'citation': the open "<cite source=" is followed by more than whitespace)
+hf-tests/cohere_template	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) TransformEach (Field 'tool_calls': tool calls given as a list)
+hf-tests/ernie_template	refused	StartOfText (Field 'thinking': ^ or \A) JsonEnvelope (Field 'tool_calls': a call as one JSON object holding its name and arguments)
+hf-tests/gemma4_template	refused	JsonArguments (Field 'tool_calls': a call named by its open or the template, its arguments JSON) JsonDialect (Field 'tool_calls': JSON with unquoted keys or its own string delimiters)
+hf-tests/gpt_oss_template	refused	JsonArguments (Field 'tool_calls': a call named by its open or the template, its arguments JSON)
+hf-tests/inkling_template	refused	RepeatedTextField (Field 'thinking': a text field that repeats) NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) RepeatedTextField (Field 'content': a text field that repeats) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) DottedPath (Field 'tool_calls': the arguments at {content.args}) NoLiteral (Field 'tool_calls': an open whose first piece after whitespace is not literal text)
+hf-tests/qwen3_template	table	anchors ["<|im_start|>assistant\n"]; 0:outside content framing; 1:thinking reasoning trimmed in ["<think>"] out ["</think>"]; 2:tool_calls calls in ["<tool_call>"] out ["</tool_call>"] header [\s* "<function=" NAME(\w+) ">"] params ["<parameter=" KEY(\w+) ">" \s* VALUE(.*?)] ends [[\s* "</parameter>"]] values json(allow_non_json)
+hf-tests/smollm_template	refused	JsonEnvelope (Field 'tool_calls': a call as one JSON object holding its name and arguments)
+hf-tests/_XML_STRING_ARGS_TEMPLATE	table	anchors ["<|im_start|>assistant\n"]; 0:outside content framing; 1:tool_calls calls in ["<tool_call>"] out ["</tool_call>"] header [\s* "<function=" NAME(\w+) ">"] params ["<parameter=" KEY(\w+) ">" \s* VALUE(.*?)] ends [[\s* "</parameter>"]] values raw
+hf-tests/_KV_LINES_TOOLS_TEMPLATE	refused	KeyValueLines (Field 'tool_calls': arguments as key-value lines)
+random/000	refused	StartOfText (Field 'x': ^ or \A)
+random/001	refused	CallTransform (Field 'tool_calls': tool calls with no transform, or one that is not an object)
+random/002	table	anchors ["<|start|>"]; 0:outside content framing; 1:content content trimmed in ["[["] out ["]]"]
+random/003	refused	TextFieldDelimiter (Field 'x': the open "[[" is followed by more than whitespace) RepeatedTextField (Field 'content': a text field that repeats) RepeatedTextField (Field 'thinking': a text field that repeats)
+random/004	refused	ImplicitField (Field 'tool_calls': the field with no open is "tool_calls") NoLiteral (Field 'answer': an open whose first piece after whitespace is not literal text)
+random/005	refused	TextFieldDelimiter (Field 'x': the close ";" follows more than whitespace)
+random/006	refused	RepeatedTextField (Field 'thinking': a text field that repeats) SharedOpenMarker (Field 'thinking': the open "pq" also opens "answer") CallTransform (Field 'tool_calls': a transform with no function)
+random/007	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function)
+random/008	refused	ImplicitField (Field 'thinking': the field with no open is "thinking") SharedField (Field 'reasoning_content': "reasoning_content" and "thinking" are one field of a message) CallTransform (Field 'tool_calls': a transform with no function) StartOfText (Field 'x': ^ or \A) Default (response_template: a default for "reasoning_content")
+random/009	refused	CallTransform (Field 'tool_calls': a transform with no function)
+random/010	table	anchors ["<|start|>"]; 0:outside content framing; 1:note content framing in ["::"] out [";;"]
+random/011	refused	TextFieldTransform (Field 'content': a transform of a text field) StartOfText (Field 'x': ^ or \A) SharedField (Field 'reasoning_content': "reasoning_content" and "thinking" are one field of a message)
+random/012	table	anchors ["<A>", "<B>"]; 0:outside content framing; 1:reasoning_content reasoning trimmed in ["[["] out ["]]]", "]]"]
+random/013	refused	TextFieldContent (Field 'reasoning_content': a text field whose content is not text) TextFieldTransform (Field 'reasoning_content': a transform of a text field)
+random/014	refused	RepeatedTextField (Field 'reasoning_content': a text field that repeats) UntrimmedSlack (Field 'reasoning_content': whitespace after the open is taken from "reasoning_content", which keeps it) UntrimmedSlack (Field 'reasoning_content': whitespace before the close is taken from "reasoning_content", which keeps it)
+random/015	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': tool calls with no transform, or one that is not an object) MergeDuplicates (Field 'tool_calls': merge_duplicates) StartOfText (Field 'tool_calls': ^ or \A)
+random/016	refused	ImplicitField (Field 'reasoning_content': the field with no open is "reasoning_content") SharedField (Field 'thinking': "thinking" and "reasoning_content" are one field of a message) RepeatedTextField (Field 'thinking': a text field that repeats) Default (response_template: a default for "thinking")
+random/017	refused	NoLiteral (Field 'x': an open whose first piece after whitespace is not literal text)
+random/018	refused	CallTransform (Field 'tool_calls': a transform with no function) SharedOpenMarker (Field 'tool_calls': the open "<|a|>" also opens "answer") NoLiteral (Field 'note': an open whose first piece after whitespace is not literal text)
+random/019	refused	ImplicitField (Field 'thinking': the field with no open is "thinking") NoLiteral (Field 'answer': an open whose first piece after whitespace is not literal text)
+random/020	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function)
+random/021	refused	ImplicitField (Field 'thinking': the field with no open is "thinking") CallTransform (Field 'tool_calls': a transform with no function) StartOfText (Field 'tool_calls': ^ or \A)
+random/022	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field) TextFieldDelimiter (Field 'thinking': the close "】" follows more than whitespace) RepeatedTextField (Field 'content': a text field that repeats) UntrimmedSlack (Field 'content': whitespace after the open is taken from "content", which keeps it) StartOfText (Field 'answer': ^ or \A)
+random/023	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) RepeatedTextField (Field 'thinking': a text field that repeats) NoLiteral (Field 'thinking': an open whose first piece after whitespace is not literal text) TextFieldDelimiter (Field 'thinking': the close "<|/a|>" follows more than whitespace)
+random/024	refused	ImplicitField (Field 'reasoning_content': the field with no open is "reasoning_content") NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) JsonEnvelope (Field 'tool_calls': a call as one JSON object holding its name and arguments)
+random/025	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': tool calls with no transform, or one that is not an object)
+random/026	refused	RepeatedTextField (Field 'content': a text field that repeats) StartOfText (Field 'content': ^ or \A)
+random/027	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) JsonEnvelope (Field 'tool_calls': a call as one JSON object holding its name and arguments) TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field)
+random/028	refused	RepeatedTextField (Field 'content': a text field that repeats) UntrimmedSlack (Field 'content': whitespace after the close is taken from "content", which keeps it) UntrimmedSlack (Field 'thinking': whitespace after the close is taken from "content", which keeps it) TextFieldDelimiter (Field 'answer': the close "]]" follows more than whitespace)
+random/029	refused	MarkerInsideMarker (response_template: in "0:outside", the marker "qp" hides "pq", which moves it) MarkerInsideMarker (response_template: in "1:x", the marker "pq" hides "qp", which moves it)
+random/030	refused	RepeatedTextField (Field 'content': a text field that repeats)
+random/031	refused	ImplicitField (Field 'tool_calls': the field with no open is "tool_calls")
+random/032	refused	TextFieldContent (Field 'content': a text field whose content is not text) TextFieldTransform (Field 'content': a transform of a text field)
+random/033	refused	TextFieldDelimiter (Field 'answer': the open "pq" is followed by more than whitespace)
+random/034	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field) SharedField (Field 'reasoning_content': "reasoning_content" and "thinking" are one field of a message) TextFieldContent (Field 'reasoning_content': a text field whose content is not text) RepeatedTextField (Field 'reasoning_content': a text field that repeats) NoLiteral (Field 'reasoning_content': an open whose first piece after whitespace is not literal text) NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': tool calls with no transform, or one that is not an object)
+random/035	refused	CallTransform (Field 'tool_calls': a transform with no function) SharedOpenMarker (Field 'tool_calls': the open "::" also opens "note")
+random/036	refused	TextFieldDelimiter (Field 'answer': the open "::" is followed by more than whitespace) TextFieldDelimiter (Field 'reasoning_content': the close "qp" follows more than whitespace) TextFieldDelimiter (Field 'x': the open "[[" is followed by more than whitespace)
+random/037	refused	ImplicitField (Field 'tool_calls': the field with no open is "tool_calls") TextFieldContent (Field 'thinking': a text field whose content is not text) StartOfText (Field 'thinking': ^ or \A) Default (response_template: a default for "tool_calls")
+random/038	refused	ImplicitField (Field 'thinking': the field with no open is "thinking")
+random/039	refused	RepeatedTextField (Field 'content': a text field that repeats) RepeatedTextField (Field 'thinking': a text field that repeats) TextFieldDelimiter (Field 'thinking': the close "</t>" follows more than whitespace) SharedField (Field 'reasoning_content': "reasoning_content" and "thinking" are one field of a message) RepeatedTextField (Field 'reasoning_content': a text field that repeats) Default (response_template: a default for "thinking")
+random/040	refused	CallTransform (Field 'tool_calls': a transform with no function)
+random/041	refused	TextFieldDelimiter (Field 'answer': the close "q" follows more than whitespace) NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) JsonArguments (Field 'tool_calls': a call named by its open or the template, its arguments JSON) StartOfText (Field 'note': ^ or \A) TextFieldContent (Field 'reasoning_content': a text field whose content is not text) TextFieldTransform (Field 'reasoning_content': a transform of a text field) UntrimmedSlack (Field 'reasoning_content': whitespace after the open is taken from "reasoning_content", which keeps it)
+random/042	refused	ImplicitField (Field 'reasoning_content': the field with no open is "reasoning_content") SharedField (Field 'thinking': "thinking" and "reasoning_content" are one field of a message) TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field)
+random/043	table	anchors ["<A>", "<B>"]; 0:outside content framing; 1:reasoning_content reasoning trimmed in ["【"] out ["】"]
+random/044	table	anchors ["<A>"]; 0:outside content framing
+random/045	table	anchors ["<A>"]; 0:outside content framing
+random/046	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) RepeatedTextField (Field 'thinking': a text field that repeats)
+random/047	refused	RepeatedTextField (Field 'content': a text field that repeats) UntrimmedSlack (Field 'content': whitespace after the close is taken from "content", which keeps it)
+random/048	refused	TextFieldContent (Field 'content': a text field whose content is not text) TextFieldTransform (Field 'content': a transform of a text field) UntrimmedSlack (Field 'content': whitespace after the open is taken from "content", which keeps it) StartOfText (Field 'answer': ^ or \A)
+random/049	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field) TextFieldDelimiter (Field 'thinking': the open "<think>" is followed by more than whitespace) NoLiteral (Field 'note': an open whose first piece after whitespace is not literal text) NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) TransformEach (Field 'tool_calls': tool calls given as a list)
+random/050	refused	TextFieldContent (Field 'content': a text field whose content is not text) TextFieldTransform (Field 'content': a transform of a text field) UntrimmedSlack (Field 'content': whitespace before the close is taken from "content", which keeps it) NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function) RepeatedTextField (Field 'reasoning_content': a text field that repeats)
+random/051	refused	StartOfText (Field 'thinking': ^ or \A) CallTransform (Field 'tool_calls': a transform with no function)
+random/052	refused	SharedField (Field 'reasoning_content': "reasoning_content" and "thinking" are one field of a message) TextFieldContent (Field 'reasoning_content': a text field whose content is not text) RepeatedTextField (Field 'reasoning_content': a text field that repeats)
+random/053	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function)
+random/054	refused	TextFieldContent (Field 'content': a text field whose content is not text) TextFieldTransform (Field 'content': a transform of a text field) NoLiteral (Field 'content': an open whose first piece after whitespace is not literal text) StartOfText (Field 'thinking': ^ or \A)
+random/055	refused	ImplicitField (Field 'reasoning_content': the field with no open is "reasoning_content") NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function) Default (response_template: a default for "tool_calls")
+random/056	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function) StartOfText (Field 'x': ^ or \A) TextFieldDelimiter (Field 'x': the close ";;" follows more than whitespace)
+random/057	refused	ImplicitField (Field 'reasoning_content': the field with no open is "reasoning_content")
+random/058	refused	TextFieldDelimiter (Field 'x': the close "<|/a|>" follows more than whitespace) TextFieldContent (Field 'reasoning_content': a text field whose content is not text) TextFieldTransform (Field 'reasoning_content': a transform of a text field) RepeatedTextField (Field 'reasoning_content': a text field that repeats)
+random/059	refused	RepeatedTextField (Field 'thinking': a text field that repeats)
+random/060	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field) RepeatedTextField (Field 'thinking': a text field that repeats)
+random/061	refused	ImplicitField (Field 'reasoning_content': the field with no open is "reasoning_content")
+random/062	table	anchors ["<A>\n", "<A>"]; 0:outside content framing; 1:answer content framing in ["[["] out ["]]"]; 2:content content in ["<|a|>"] out ["<|/a|>>", "<|/a|>"]
+random/063	refused	ImplicitField (Field 'tool_calls': the field with no open is "tool_calls")
+random/064	refused	ImplicitField (Field 'tool_calls': the field with no open is "tool_calls") TextFieldDelimiter (Field 'content': the open "<t>" is followed by more than whitespace)
+random/065	refused	TextFieldContent (Field 'content': a text field whose content is not text)
+random/066	refused	TextFieldContent (Field 'reasoning_content': a text field whose content is not text)
+random/067	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function)
+random/068	refused	RepeatedTextField (Field 'thinking': a text field that repeats)
+random/069	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function) StartOfText (Field 'thinking': ^ or \A)
+random/070	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field) SharedField (Field 'reasoning_content': "reasoning_content" and "thinking" are one field of a message)
+random/071	refused	ImplicitField (Field 'thinking': the field with no open is "thinking") NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function) JsonDialect (Field 'tool_calls': JSON with unquoted keys or its own string delimiters)
+random/072	refused	RepeatedTextField (Field 'content': a text field that repeats) TextFieldDelimiter (Field 'answer': the open "<<" is followed by more than whitespace)
+random/073	refused	ImplicitField (Field 'tool_calls': the field with no open is "tool_calls") TextFieldDelimiter (Field 'x': the close ";" follows more than whitespace)
+random/074	refused	TextFieldDelimiter (Field 'x': the close "q" follows more than whitespace)
+random/075	refused	NoLiteral (Field 'answer': an open whose first piece after whitespace is not literal text)
+random/076	refused	ImplicitField (Field 'tool_calls': the field with no open is "tool_calls") TextFieldDelimiter (Field 'tool_calls': the close "q" follows more than whitespace) StartOfText (Field 'note': ^ or \A) NoLiteral (Field 'reasoning_content': an open whose first piece after whitespace is not literal text)
+random/077	refused	ImplicitField (Field 'thinking': the field with no open is "thinking") Default (response_template: a default for "thinking")
+random/078	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field)
+random/079	table	anchors ["<A>\n", "<A>"]; 0:outside content framing
+random/080	refused	MarkerInsideMarker (response_template: in "0:outside", the marker "</think>" hides "<", which moves it) MarkerInsideMarker (response_template: in "0:outside", the marker "<|/a|>" hides "<", which moves it) MarkerInsideMarker (response_template: in "1:note", the marker "<<" hides "<|/a|>", which moves it) MarkerInsideMarker (response_template: in "2:content", the marker "</think>" hides ">>>", which moves it) MarkerInsideMarker (response_template: in "2:content", the marker "<|a|>" hides ">>>", which moves it) MarkerInsideMarker (response_template: in "2:content", the marker "<|/a|>" hides ">>>", which moves it)
+random/081	refused	TextFieldContent (Field 'reasoning_content': a text field whose content is not text) TextFieldTransform (Field 'reasoning_content': a transform of a text field) TextFieldDelimiter (Field 'answer': the open "[[" is followed by more than whitespace) SharedField (Field 'thinking': "thinking" and "reasoning_content" are one field of a message) UntrimmedSlack (Field 'thinking': whitespace after the open is taken from "thinking", which keeps it)
+random/082	refused	ImplicitField (Field 'thinking': the field with no open is "thinking")
+random/083	table	anchors ["<A>"]; 0:outside content framing
+random/084	refused	RepeatedTextField (Field 'reasoning_content': a text field that repeats) StartOfText (Field 'note': ^ or \A)
+random/085	refused	TextFieldDelimiter (Field 'content': the open "<|a|>" is followed by more than whitespace)
+random/086	table	anchors ["<A>", "<B>"]; 0:outside content framing
+random/087	refused	NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': a transform with no function)
+random/088	refused	CallTransform (Field 'tool_calls': tool calls with no transform, or one that is not an object) TextFieldContent (Field 'reasoning_content': a text field whose content is not text) TextFieldTransform (Field 'reasoning_content': a transform of a text field)
+random/089	refused	TextFieldTransform (Field 'content': a transform of a text field) RepeatedTextField (Field 'content': a text field that repeats) TextFieldContent (Field 'thinking': a text field whose content is not text) TextFieldTransform (Field 'thinking': a transform of a text field) RepeatedTextField (Field 'thinking': a text field that repeats) StartOfText (Field 'thinking': ^ or \A) CallTransform (Field 'tool_calls': a transform with no function) Default (response_template: a default for "content")
+random/090	refused	ImplicitField (Field 'thinking': the field with no open is "thinking")
+random/091	refused	TextFieldContent (Field 'thinking': a text field whose content is not text) SharedField (Field 'reasoning_content': "reasoning_content" and "thinking" are one field of a message)
+random/092	refused	ImplicitField (Field 'tool_calls': the field with no open is "tool_calls")
+random/093	table	anchors ["<A>", "<B>"]; 0:outside content framing
+random/094	refused	TextFieldDelimiter (Field 'answer': the close "<|/a|>" follows more than whitespace) RepeatedTextField (Field 'content': a text field that repeats) TextFieldDelimiter (Field 'content': the open "::" is followed by more than whitespace)
+random/095	refused	TextFieldContent (Field 'content': a text field whose content is not text) NonRepeatingCalls (Field 'tool_calls': tool calls that do not repeat: one region holds every call) CallTransform (Field 'tool_calls': tool calls with no transform, or one that is not an object) StartOfText (Field 'x': ^ or \A)
+random/096	refused	TextFieldContent (Field 'reasoning_content': a text field whose content is not text) RepeatedTextField (Field 'reasoning_content': a text field that repeats) TextFieldDelimiter (Field 'reasoning_content': the close ";" follows more than whitespace) SharedField (Field 'thinking': "thinking" and "reasoning_content" are one field of a message) TextFieldDelimiter (Field 'answer': the close ";" follows more than whitespace)
+random/097	refused	SharedField (Field 'thinking': "thinking" and "reasoning_content" are one field of a message) TextFieldTransform (Field 'content': a transform of a text field) RepeatedTextField (Field 'content': a text field that repeats)
+random/098	refused	RepeatedTextField (Field 'thinking': a text field that repeats) NoLiteral (Field 'note': an open whose first piece after whitespace is not literal text)
+random/099	refused	RepeatedTextField (Field 'thinking': a text field that repeats)
+synthetic/qwen3_5-unclosed-parameter	refused	EndOfText (Field 'tool_calls': $, \Z or \z) EndBeforeTrailer (Field 'tool_calls': the call's shape: value's end 1 reads past itself, where the trailer may begin)
+trl/gptoss	refused	JsonArguments (Field 'tool_calls': a call named by its open or the template, its arguments JSON)
+trl/glm4moe	refused	EndOfText (Field 'content': $, \Z or \z)

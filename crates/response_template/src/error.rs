@@ -1,10 +1,14 @@
 //! Errors. Loading fails where transformers raises (`Invalid`) or on a
 //! construct this crate does not reproduce (`Unsupported`); parsing fails with
-//! the class of the exception transformers raises.
+//! the class of the exception transformers raises, or on a template this
+//! crate does not run.
 
 use std::fmt;
 
-/// Why [`load_response_template`](crate::load_response_template) refused a template.
+/// Why [`load_response_template`](crate::load_response_template) or
+/// [`read_response_template`](crate::read_response_template) refused a
+/// template, or why this crate does not run one
+/// ([`ResponseTemplate::unsupported`](crate::ResponseTemplate::unsupported)).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoadError {
@@ -12,7 +16,9 @@ pub enum LoadError {
     #[error("{scope}: {message}")]
     Invalid { scope: String, message: String },
     /// This crate would not parse this template exactly as transformers does
-    /// (which may accept it, or reject it for another reason), so it refuses it.
+    /// (which may accept it, or reject it for another reason), so it refuses
+    /// it: the reader does not read a pattern of it, or the parser does not
+    /// run what it uses.
     #[error("{scope}: unsupported {feature}")]
     Unsupported { scope: String, feature: Unsupported },
 }
@@ -92,6 +98,10 @@ pub enum ParseError {
     /// `finalize` while the message holds it.
     #[error("value not representable in JSON: {0}")]
     Unrepresentable(&'static str),
+    /// This crate does not run the template (see
+    /// [`ResponseTemplate::unsupported`](crate::ResponseTemplate::unsupported)).
+    #[error("{scope}: unsupported {feature}")]
+    Unsupported { scope: String, feature: Unsupported },
 }
 
 /// A Python exception raised inside the port, before it is tied to a field.

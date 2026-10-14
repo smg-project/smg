@@ -4,7 +4,9 @@
 //!
 //! - Loading: a template transformers accepts loads here unless
 //!   `tests/unsupported.tsv` lists it with the reason this crate reports; one
-//!   transformers rejects is rejected here too.
+//!   transformers rejects is rejected here too. Reading takes every template
+//!   transformers accepts, except a pattern with a construct the reader does
+//!   not read.
 //! - Every session of a loaded template: the whole output in one `feed` (the
 //!   final message and the trace of events), every two-way split (every final
 //!   message, and the traces as one digest), and the recorded chunkings.
@@ -31,8 +33,8 @@ use common::{
 };
 use serde_json::{json, Value};
 use smg_response_template::{
-    load_response_template, Event, LoadError, ParseError, PyErrorKind, ResponseParser,
-    ResponseTemplate,
+    load_response_template, read_response_template, Event, LoadError, ParseError, PyErrorKind,
+    ResponseParser, ResponseTemplate,
 };
 
 /// The transformers release the crate reproduces; the fixtures record the
@@ -237,6 +239,61 @@ fn templates_load_like_transformers() {
     assert!(
         failures.is_empty(),
         "{} load mismatches:\n{}\nunsupported seen: {unsupported_seen:#?}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// What the reader does not read (the README lists these): a template that
+/// transformers accepts may be refused when read only for one of them.
+const NOT_READ: [&str; 7] = [
+    "regex: a Unicode property \\p{...}",
+    "regex: a named character \\N{...}",
+    "regex: a POSIX class other than the POSIX names",
+    "regex: a group name outside ASCII",
+    "regex: a group inside a group of the same name",
+    "regex: version 1 behaviour (?V1)",
+    "regex: groups nested more than 100 deep",
+];
+
+/// Reading takes every template transformers accepts, except one with a
+/// pattern the reader does not read, and rejects every one transformers
+/// rejects; a template read here loads exactly when this crate runs it.
+#[test]
+fn templates_read_like_transformers() {
+    let dir = fixtures_dir();
+    let mut failures = Vec::new();
+    let mut not_read = BTreeMap::new();
+    for row in read_jsonl(&dir, "templates") {
+        let id = row["id"].as_str().unwrap();
+        let spec = untag(&row["template"]);
+        let hf_ok = row["hf"].get("ok").is_some();
+        match (read_response_template(&spec), hf_ok) {
+            (Ok(template), true) => {
+                let runs = template.unsupported().cloned();
+                if load_response_template(&spec).err() != runs {
+                    failures.push(format!("{id}: loads otherwise than it runs ({runs:?})"));
+                }
+            }
+            (Ok(_), false) => {
+                failures.push(format!("{id}: transformers rejects it, it reads here"));
+            }
+            (Err(LoadError::Unsupported { feature, .. }), true) => {
+                let feature = feature.to_string();
+                if !NOT_READ.contains(&feature.as_str()) {
+                    failures.push(format!(
+                        "{id}: transformers reads it, refused here: {feature}"
+                    ));
+                }
+                not_read.insert(id.to_owned(), feature);
+            }
+            (Err(e), true) => failures.push(format!("{id}: transformers reads it: {e}")),
+            (Err(_), false) => {}
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} read mismatches:\n{}\nnot read: {not_read:#?}",
         failures.len(),
         failures.join("\n")
     );

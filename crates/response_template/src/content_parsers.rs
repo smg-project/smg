@@ -1,10 +1,12 @@
 //! Content parsers and transforms, ported from transformers'
-//! `content_parsers.py`. `content_args` are checked when the template loads:
-//! shapes transformers would only fail on while parsing, or read through
-//! Python's dynamic typing, are refused as `Unsupported::ContentArgs`.
+//! `content_parsers.py`. `content_args` are checked when the template is
+//! read: shapes transformers would only fail on while parsing, or read
+//! through Python's dynamic typing, are refused as `Unsupported::ContentArgs`.
 
 use serde_json::{Map, Value};
 
+#[cfg(feature = "symphony")]
+use crate::pyre::Regex;
 use crate::{
     error::{LoadError, PyError, PyErrorKind, PyResult, Taint, Unsupported},
     py::{self, JsonError},
@@ -54,6 +56,9 @@ pub(crate) struct Content {
     allow_non_json: bool,
     /// `None`: transformers raises `ValueError` on every close.
     tag_pattern: Option<Pattern>,
+    /// The tag pattern as the `regex` module reads it, for the compile.
+    #[cfg(feature = "symphony")]
+    tag_regex: Option<Regex>,
     value_parser: Option<Box<Content>>,
     merge_duplicates: bool,
     line_sep: String,
@@ -61,6 +66,83 @@ pub(crate) struct Content {
 }
 
 impl Content {
+    /// The parser without `content_args`.
+    pub(crate) fn plain(parser: ContentParser) -> Self {
+        Self {
+            parser,
+            strip: true,
+            string_delims: Vec::new(),
+            unquoted_keys: false,
+            allow_non_json: false,
+            tag_pattern: None,
+            #[cfg(feature = "symphony")]
+            tag_regex: None,
+            value_parser: None,
+            merge_duplicates: false,
+            line_sep: String::new(),
+            kv_sep: String::new(),
+        }
+    }
+
+    /// A value parser as a compiled table reads a tagged value with it: `parser`, its `strip`,
+    /// and for `json` its dialect and whether text that is not JSON reads as text.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn value(
+        parser: ContentParser,
+        strip: bool,
+        unquoted_keys: bool,
+        allow_non_json: bool,
+        string_delims: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            strip,
+            string_delims,
+            unquoted_keys,
+            allow_non_json,
+            ..Self::plain(parser)
+        }
+    }
+
+    /// Whether the parser strips its text (`strip`, on unless `content_args` turn it off).
+    #[cfg(feature = "symphony")]
+    pub(crate) fn strips(&self) -> bool {
+        self.strip
+    }
+
+    /// Whether the JSON is written in a dialect: keys without quotes, or strings between the
+    /// template's own delimiters.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn json_dialect(&self) -> bool {
+        self.unquoted_keys || !self.string_delims.is_empty()
+    }
+
+    /// Whether a key written twice keeps every value (`merge_duplicates`).
+    #[cfg(feature = "symphony")]
+    pub(crate) fn merges_duplicates(&self) -> bool {
+        self.merge_duplicates
+    }
+
+    /// `xml-inline`'s `tag_pattern` as the `regex` module reads it, when there is one that this
+    /// crate runs.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn tag_regex(&self) -> Option<&Regex> {
+        self.tag_regex.as_ref()
+    }
+
+    /// The parser a tagged value's text reads with (`value_parser`), when the template names one.
+    #[cfg(feature = "symphony")]
+    pub(crate) fn value_parser(&self) -> Option<&Self> {
+        self.value_parser.as_deref()
+    }
+
+    /// `json`'s dialect and fallback: whether keys may be bare (`unquoted_keys`), the delimiters
+    /// of its own strings (`string_delims`), and whether text that is not JSON reads as `text`
+    /// (`allow_non_json`).
+    #[cfg(feature = "symphony")]
+    pub(crate) fn json_args(&self) -> (bool, &[(String, String)], bool) {
+        (self.unquoted_keys, &self.string_delims, self.allow_non_json)
+    }
+
     /// Check the `content_args` the parser reads (`None` when absent).
     pub(crate) fn new(parser: ContentParser, args: Option<&Value>) -> Result<Self, Unsupported> {
         let empty = Map::new();
@@ -76,16 +158,8 @@ impl Content {
             Some(_) => Err(Unsupported::ContentArgs(key)),
         };
         let mut content = Self {
-            parser,
             strip: flag("strip", true),
-            string_delims: Vec::new(),
-            unquoted_keys: false,
-            allow_non_json: false,
-            tag_pattern: None,
-            value_parser: None,
-            merge_duplicates: false,
-            line_sep: String::new(),
-            kv_sep: String::new(),
+            ..Self::plain(parser)
         };
         match parser {
             ContentParser::Json => {
@@ -100,7 +174,14 @@ impl Content {
                 content.merge_duplicates = flag("merge_duplicates", false);
                 content.tag_pattern = match args.get("tag_pattern") {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(source)) => Some(tag_pattern(source)?),
+                    Some(Value::String(source)) => {
+                        let pattern = tag_pattern(source)?;
+                        #[cfg(feature = "symphony")]
+                        {
+                            content.tag_regex = Regex::parse(source).ok();
+                        }
+                        Some(pattern)
+                    }
                     Some(_) => return Err(Unsupported::ContentArgs("tag_pattern")),
                 };
                 content.value_parser = value_parser(args.get("value_parser"))?;
@@ -377,7 +458,7 @@ fn quote_keys(text: &str) -> String {
 }
 
 /// `_PLACEHOLDER.fullmatch(s)` for `\{(\w+(?:\.\w+)*)\}`: the dotted path.
-fn placeholder(s: &str) -> Option<&str> {
+pub(crate) fn placeholder(s: &str) -> Option<&str> {
     let path = s.strip_prefix('{')?.strip_suffix('}')?;
     is_path(path).then_some(path)
 }

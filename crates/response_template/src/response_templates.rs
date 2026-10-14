@@ -1,6 +1,7 @@
 //! Template loading and validation, ported from transformers'
-//! `response_templates.py`. Loading also refuses, as `Unsupported`, what the
-//! parser would not reproduce exactly.
+//! `response_templates.py`. Reading a template takes everything transformers
+//! takes; loading it also refuses, as `Unsupported`, what this crate's parser
+//! would not reproduce exactly.
 
 use std::{cmp::Reverse, collections::HashSet, sync::Arc};
 
@@ -10,16 +11,30 @@ use crate::{
     content_parsers::{self, Content, ContentParser},
     error::{LoadError, Unsupported},
     py,
-    pyre::{Pattern, Role},
+    pyre::{Pattern, Regex, Role},
 };
 
-/// An open or close delimiter; `literals` when it came from literal strings,
-/// `can_extend` when one of them is a strict prefix of another.
+/// An open or close delimiter, or the start anchor: the pattern as the
+/// `regex` module reads it (`None` for literal strings), and as this crate's
+/// matcher runs it (`None` when it does not). `literals` when it came from
+/// literal strings, which `texts` holds in the order the pattern tries them
+/// (longest first); `can_extend` when one of them is a strict prefix of
+/// another.
 #[derive(Debug)]
 pub(crate) struct Delimiter {
-    pub(crate) pattern: Pattern,
+    pub(crate) regex: Option<Regex>,
+    pub(crate) pattern: Option<Pattern>,
     pub(crate) literals: bool,
+    #[cfg(feature = "symphony")]
+    pub(crate) texts: Vec<String>,
     pub(crate) can_extend: bool,
+}
+
+impl Delimiter {
+    /// The names of the pattern's named groups.
+    pub(crate) fn group_names(&self) -> impl Iterator<Item = &str> {
+        self.regex.iter().flat_map(Regex::group_names)
+    }
 }
 
 /// transformers: `ResponseTemplateField`.
@@ -41,7 +56,10 @@ pub(crate) struct Template {
     pub(crate) defaults: Map<String, Value>,
     pub(crate) fields: Vec<ResponseTemplateField>,
     pub(crate) implicit: Option<usize>,
-    start_anchor: Pattern,
+    pub(crate) start_anchor: Delimiter,
+    /// Why this crate's parser does not run the template, if it does not:
+    /// the first construct it does not reproduce.
+    unsupported: Option<LoadError>,
 }
 
 /// transformers: `ResponseTemplate`, a loaded template. Cheap to clone.
@@ -52,10 +70,27 @@ impl ResponseTemplate {
     /// transformers: `truncate_past_last_anchor`. The text after the last
     /// start anchor, or the whole text when there is none.
     pub fn truncate_past_last_anchor<'a>(&self, text: &'a str) -> &'a str {
-        match self.0.start_anchor.finditer(text).last() {
-            Some(m) => &text[m.end..],
-            None => text,
-        }
+        &text[self.last_anchor_end(text).unwrap_or(0)..]
+    }
+
+    /// Where the last start anchor in `text` ends, or `None` without one; a
+    /// caller can then tell a prompt that holds no anchor, which
+    /// [`truncate_past_last_anchor`](Self::truncate_past_last_anchor) keeps
+    /// whole, from one that ends with it. `None` also when this crate's
+    /// matcher does not run the anchor pattern (see
+    /// [`unsupported`](Self::unsupported)).
+    pub fn last_anchor_end(&self, text: &str) -> Option<usize> {
+        let anchor = self.0.start_anchor.pattern.as_ref()?;
+        anchor.finditer(text).last().map(|m| m.end)
+    }
+
+    /// Why this crate's parser does not run the template
+    /// (`LoadError::Unsupported`, naming the first construct it does not
+    /// reproduce), or `None` when it does. A template from
+    /// [`load_response_template`] always runs; one from
+    /// [`read_response_template`] may not.
+    pub fn unsupported(&self) -> Option<&LoadError> {
+        self.0.unsupported.as_ref()
     }
 }
 
@@ -73,13 +108,20 @@ fn unsupported(scope: &str, feature: Unsupported) -> LoadError {
     }
 }
 
-/// transformers: `_compile_anchor`.
+/// Keep the first construct this crate's parser does not run.
+fn refuse(refusal: &mut Option<LoadError>, scope: &str, feature: Unsupported) {
+    refusal.get_or_insert_with(|| unsupported(scope, feature));
+}
+
+/// transformers: `_compile_anchor`. A pattern the reader does not read is
+/// refused here; one the matcher does not run is noted in `refusal`.
 fn compile_anchor(
     scope: &str,
     spec: &Map<String, Value>,
     literal_key: &str,
     pattern_key: &str,
     role: Role,
+    refusal: &mut Option<LoadError>,
 ) -> Result<Option<Delimiter>, LoadError> {
     if spec.contains_key(literal_key) && spec.contains_key(pattern_key) {
         return Err(invalid(
@@ -135,8 +177,11 @@ fn compile_anchor(
         // Longest first (in characters, stable), as transformers sorts them.
         literals.sort_by_key(|s| Reverse(s.chars().count()));
         return Ok(Some(Delimiter {
-            pattern: Pattern::literals(&literals),
+            regex: None,
+            pattern: Some(Pattern::literals(&literals)),
             literals: true,
+            #[cfg(feature = "symphony")]
+            texts: literals,
             can_extend,
         }));
     }
@@ -149,10 +194,17 @@ fn compile_anchor(
             format!("invalid {pattern_key} regex: not a string"),
         ));
     };
-    let pattern = Pattern::new(source, role).map_err(|feature| unsupported(scope, feature))?;
+    let regex =
+        Regex::parse(source).map_err(|e| unsupported(scope, Unsupported::Regex(e.to_string())))?;
+    let pattern = Pattern::compile(&regex, role)
+        .map_err(|feature| refuse(refusal, scope, feature))
+        .ok();
     Ok(Some(Delimiter {
+        regex: Some(regex),
         pattern,
         literals: false,
+        #[cfg(feature = "symphony")]
+        texts: Vec::new(),
         can_extend: false,
     }))
 }
@@ -211,8 +263,13 @@ const ALLOWED_FIELD_KEYS: [&str; 11] = [
     "transform_each",
 ];
 
-/// transformers: `_build_field`.
-fn build_field(name: &str, field: &Value) -> Result<ResponseTemplateField, LoadError> {
+/// transformers: `_build_field`. What this crate's parser does not run is
+/// noted in `refusal`.
+fn build_field(
+    name: &str,
+    field: &Value,
+    refusal: &mut Option<LoadError>,
+) -> Result<ResponseTemplateField, LoadError> {
     let scope = format!("Field '{name}'");
     let Value::Object(field) = field else {
         return Err(invalid(&scope, format!("{scope} must be a dict")));
@@ -229,8 +286,22 @@ fn build_field(name: &str, field: &Value) -> Result<ResponseTemplateField, LoadE
             .ok_or_else(|| invalid(&scope, format!("unknown content parser '{s}'")))?,
         Some(other) => return Err(invalid(&scope, format!("unknown content parser {other}"))),
     };
-    let open = compile_anchor(&scope, field, "open", "open_pattern", Role::Delimiter)?;
-    let close = compile_anchor(&scope, field, "close", "close_pattern", Role::Delimiter)?;
+    let open = compile_anchor(
+        &scope,
+        field,
+        "open",
+        "open_pattern",
+        Role::Delimiter,
+        refusal,
+    )?;
+    let close = compile_anchor(
+        &scope,
+        field,
+        "close",
+        "close_pattern",
+        Role::Delimiter,
+        refusal,
+    )?;
     let join = match field.get("join") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(s.clone()),
@@ -270,11 +341,7 @@ fn build_field(name: &str, field: &Value) -> Result<ResponseTemplateField, LoadE
         None => {
             // Named captures only reach the output through a transform.
             let delimiters = open.iter().chain(close.iter());
-            if delimiters
-                .flat_map(|d| d.pattern.group_names())
-                .next()
-                .is_some()
-            {
+            if delimiters.flat_map(Delimiter::group_names).next().is_some() {
                 return Err(invalid(
                     &scope,
                     "open_pattern/close_pattern declares named group(s), but the field has no 'transform'",
@@ -282,17 +349,24 @@ fn build_field(name: &str, field: &Value) -> Result<ResponseTemplateField, LoadE
             }
         }
     }
-    let content = Content::new(parser, field.get("content_args"))
-        .map_err(|feature| unsupported(&scope, feature))?;
-    let nullable = |d: &Option<Delimiter>| d.as_ref().is_some_and(|d| d.pattern.nullable());
+    // transformers reads `content_args` only while parsing.
+    let content = Content::new(parser, field.get("content_args")).unwrap_or_else(|feature| {
+        refuse(refusal, &scope, feature);
+        Content::plain(parser)
+    });
+    let nullable = |d: &Option<Delimiter>| {
+        d.as_ref()
+            .and_then(|d| d.pattern.as_ref())
+            .is_some_and(Pattern::nullable)
+    };
     if nullable(&open) && nullable(&close) {
-        return Err(unsupported(&scope, Unsupported::EmptyMatch));
+        refuse(refusal, &scope, Unsupported::EmptyMatch);
     }
     if transform
         .as_ref()
         .is_some_and(|t| content_parsers::shares_values(t, transform_each, parser))
     {
-        return Err(unsupported(&scope, Unsupported::SharedValue));
+        refuse(refusal, &scope, Unsupported::SharedValue);
     }
     Ok(ResponseTemplateField {
         name: name.to_owned(),
@@ -311,13 +385,28 @@ fn build_field(name: &str, field: &Value) -> Result<ResponseTemplateField, LoadE
 /// (`LoadError::Invalid`), and what this crate would not parse exactly as it
 /// does (`LoadError::Unsupported`, naming the construct).
 pub fn load_response_template(spec: &Value) -> Result<ResponseTemplate, LoadError> {
+    let template = read_response_template(spec)?;
+    match template.unsupported() {
+        Some(refusal) => Err(refusal.clone()),
+        None => Ok(template),
+    }
+}
+
+/// transformers: `load_response_template`, for every template it takes: the
+/// template is read, its patterns as the `regex` module reads them, also
+/// where this crate's parser does not run it ([`ResponseTemplate::unsupported`]
+/// says why). Rejects what transformers rejects (`LoadError::Invalid`), and,
+/// as `LoadError::Unsupported`, a pattern with a construct the reader does not
+/// read (listed in the README).
+pub fn read_response_template(spec: &Value) -> Result<ResponseTemplate, LoadError> {
     let spec = validate_template_shape(spec)?;
+    let mut refusal = None;
     let fields = spec
         .get("fields")
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
-        .map(|(name, raw)| build_field(name, raw))
+        .map(|(name, raw)| build_field(name, raw, &mut refusal))
         .collect::<Result<Vec<_>, _>>()?;
     let implicit: Vec<&str> = fields
         .iter()
@@ -340,14 +429,14 @@ pub fn load_response_template(spec: &Value) -> Result<ResponseTemplate, LoadErro
         "start_anchor",
         "start_anchor_pattern",
         Role::Finditer,
+        &mut refusal,
     )?
     .ok_or_else(|| {
         invalid(
             scope,
             "response_template must define 'start_anchor' or 'start_anchor_pattern'.",
         )
-    })?
-    .pattern;
+    })?;
     let defaults = spec
         .get("defaults")
         .and_then(Value::as_object)
@@ -358,7 +447,7 @@ pub fn load_response_template(spec: &Value) -> Result<ResponseTemplate, LoadErro
     if fields.iter().any(|f| {
         f.repeats && f.join.is_none() && defaults.get(&f.name).is_some_and(Value::is_array)
     }) {
-        return Err(unsupported(scope, Unsupported::SharedValue));
+        refuse(&mut refusal, scope, Unsupported::SharedValue);
     }
     let implicit = fields.iter().position(|f| f.open.is_none());
     Ok(ResponseTemplate(Arc::new(Template {
@@ -366,5 +455,6 @@ pub fn load_response_template(spec: &Value) -> Result<ResponseTemplate, LoadErro
         fields,
         implicit,
         start_anchor,
+        unsupported: refusal,
     })))
 }

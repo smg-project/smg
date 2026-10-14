@@ -1,0 +1,109 @@
+compiled	hf-pipelines/any_to_any_gemma3_style#no-anchor	X9
+compiled	hf-pipelines/any_to_any_gemma3_style#prefill	X2
+compiled	hf-pipelines/any_to_any_gemma3_style#prompt-opens-thought-no-close	X3
+compiled	hf-pipelines/text_generation_chatml#no-anchor	X9
+compiled	hf-pipelines/text_generation_chatml#prefill	X2
+compiled	hf-pipelines/text_generation_chatml#prompt-opens-thought-no-close	X3
+compiled	hf-tests/_XML_STRING_ARGS_TEMPLATE#call-cut-in-arguments	X5
+compiled	hf-tests/qwen3_template#call-cut-in-arguments	X5
+compiled	hub/cohere-north#no-anchor	X9
+compiled	hub/cohere-north#prefill	X2
+compiled	hub/muse-glimmer#call-cut-in-arguments	X5
+compiled	hub/muse-glimmer#ends-on-end-of-text	X3
+compiled	hub/muse-glimmer#prefill	X2
+compiled	hub/muse-glimmer#reasoning-only	X3
+compiled	serve/qwen3_5#call-cut-in-arguments	X5
+compiled	serve/qwen3_5#prefill-reasoning	X2
+compiled	trl/qwen3_5#call-cut-in-arguments	X5
+compiled	trl/qwen3_5#prefill-reasoning	X2
+hf	behaviour/bad-value-parser#0	X5
+hf	behaviour/content-args-not-dict#0	X5
+hf	behaviour/float#2	X5
+hf	behaviour/float#3	X5
+hf	behaviour/float#5	X5
+hf	behaviour/int#3	X5
+hf	behaviour/int#4	X5
+hf	behaviour/int-no-strip#1	X5
+hf	behaviour/join-default-list#0	X5
+hf	behaviour/join-non-string#0	X5
+hf	behaviour/json-allow-non-json#1	X5
+hf	behaviour/json-allow-non-json#4	X5
+hf	behaviour/json-strict#0	X5
+hf	behaviour/json-strict#2	X5
+hf	behaviour/json-strict#4	X5
+hf	behaviour/json-strict#5	X5
+hf	behaviour/json-strict#6	X5
+hf	behaviour/json-strict#8	X5
+hf	behaviour/json-strict#prefix-error	X5
+hf	behaviour/kv-lines-args#0	X5
+hf	behaviour/kv-lines-empty-sep#0	X5
+hf	behaviour/optional-required#0	X5
+hf	behaviour/optional-required#1	X5
+hf	behaviour/optional-required#2	X5
+hf	behaviour/repeats-default-str#0	X5
+hf	behaviour/string-delims-overlap#1	X5
+hf	behaviour/string-delims-overlap#2	X5
+hf	behaviour/transform-each#1	X5
+hf	behaviour/transform-each#2	X5
+hf	behaviour/transform-each#3	X5
+hf	behaviour/transform-each#4	X5
+hf	behaviour/transform-each#prefix-closed	X5
+hf	behaviour/transform-missing#0	X5
+hf	behaviour/transform-missing#1	X5
+hf	behaviour/transform-missing#2	X5
+hf	behaviour/transform-unknown-root#0	X5
+hf	behaviour/unrepresentable-dropped#3	X5
+hf	behaviour/unrepresentable-overwritten#1	X5
+hf	behaviour/unrepresentable-overwritten#3	X5
+hf	behaviour/unrepresentable-overwritten#4	X5
+hf	behaviour/value-parser-not-dict#0	X5
+hf	behaviour/xml-alternative-key#0	X5
+hf	behaviour/xml-bad-tag-pattern#0	X5
+hf	behaviour/xml-no-key-group#0	X5
+hf	behaviour/xml-no-tag-pattern#0	X5
+hf	hf-tests/qwen3_template#34	X9
+hf	hf-tests/qwen3_template#35	X2
+hf	hf-tests/qwen3_template#tail-0	X2
+hf	hf-tests/qwen3_template#tail-0-no-tools	X2
+hf	hf-tests/qwen3_template#tail-2	X2
+hf	hf-tests/qwen3_template#tail-2-no-tools	X2
+hf	hf-tests/test_join_requires_string_matches/1#54	X5
+hf	hf-tests/test_optional_false_raises_when_missing/1#65	X5
+hf	hf-tests/test_transform_dotted_path_errors/1#67	X5
+hf	hf-tests/test_transform_dotted_path_errors/2#68	X5
+hf	hf-tests/test_transform_dotted_path_errors/3#69	X5
+hf	random/002#0	X9 X1
+hf	random/002#1	X2 X1
+hf	random/002#2	X1
+hf	random/002#4	X1
+hf	random/002#5	X1
+hf	random/002#6	X1
+hf	random/002#7	X9 X1
+hf	random/002#8	X1
+hf	random/002#9	X1
+hf	random/012#4	X1
+hf	random/012#6	X1
+hf	random/012#7	X1
+hf	random/012#9	X1
+hf	random/043#0	X1
+hf	random/043#1	X1
+hf	random/043#2	X1
+hf	random/043#3	X9 X1
+hf	random/043#4	X9 X1
+hf	random/043#5	X1
+hf	random/043#7	X1
+hf	random/043#8	X9 X1
+hf	random/062#1	X1
+hf	random/062#5	X1
+hf	serve/qwen3_5#tail-0	X2
+hf	serve/qwen3_5#tail-0-no-tools	X2
+hf	serve/qwen3_5#tail-2	X2
+hf	serve/qwen3_5#tail-2-no-tools	X2
+hf	shapes/content-only-close-pattern#prefix	X2
+hf	shapes/content-only-close-pattern#twice	X1
+hf	shapes/xml-invoke-word-boundary#tail-0	X2 X1
+hf	shapes/xml-invoke-word-boundary#tail-0-no-tools	X2 X1
+hf	shapes/xml-invoke-word-boundary#tail-2	X2 X1
+hf	shapes/xml-invoke-word-boundary#tail-2-no-tools	X2 X1
+hf	shapes/xml-invoke-word-boundary#tail-4	X1
+hf	shapes/xml-invoke-word-boundary#tail-4-no-tools	X1
