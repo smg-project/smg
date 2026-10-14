@@ -2,10 +2,12 @@
 //! process's pool: `RAYON_NUM_THREADS` sizes the pool the direct encoder
 //! splits a long input over; with `tokenizers-v1`, `SMG_BENCH_THREADS` sets
 //! that encoder's internal thread count instead. `PARALLEL_BENCH_TOKENIZERS`
-//! = `name=dir,...`, `PARALLEL_BENCH_TOKENS` = the prompt sizes (default
-//! 131072,262144,1048576), `PARALLEL_BENCH_ROUNDS` (default 5). One JSON line
-//! per measurement. `PARALLEL_BENCH_CORPUS=prose` uses repeated paragraphs
-//! (the word reuse of ordinary text) instead of the default wide vocabulary.
+//! = `name=dir,...` (without it the bench says so on one line and exits
+//! without measuring, so a plain `cargo bench` of the crate passes it by),
+//! `PARALLEL_BENCH_TOKENS` = the prompt sizes (default 131072,262144,1048576),
+//! `PARALLEL_BENCH_ROUNDS` (default 5). One JSON line per measurement.
+//! `PARALLEL_BENCH_CORPUS=prose` uses repeated paragraphs (the word reuse of
+//! ordinary text) instead of the default wide vocabulary.
 #![expect(
     clippy::expect_used,
     clippy::print_stdout,
@@ -97,7 +99,10 @@ fn body(seed: u64, bytes: usize) -> String {
 }
 
 fn main() {
-    let specs = std::env::var("PARALLEL_BENCH_TOKENIZERS").expect("PARALLEL_BENCH_TOKENIZERS");
+    let Ok(specs) = std::env::var("PARALLEL_BENCH_TOKENIZERS") else {
+        println!("PARALLEL_BENCH_TOKENIZERS unset (name=dir,... selects the tokenizers): nothing measured");
+        return;
+    };
     let sizes: Vec<usize> = std::env::var("PARALLEL_BENCH_TOKENS")
         .unwrap_or_else(|_| "131072,262144,1048576".into())
         .split(',')
