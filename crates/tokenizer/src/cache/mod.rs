@@ -101,11 +101,15 @@ impl CachedTokenizer {
             None
         };
 
-        // The special tokens the cache splits at: those whose splice the
-        // tokenizer reproduces, found once at construction; none without L1.
+        // The special tokens the cache splits at: those matched on the raw
+        // text (not after normalization) whose splice the tokenizer
+        // reproduces, found once at construction; none without L1.
         let special_tokens = if config.enable_l1 {
+            let after_normalization = inner.special_tokens_after_normalization();
+            let mut candidates = Self::extract_special_token_strings(&inner);
+            candidates.retain(|token| !after_normalization.contains(token));
             SpecialTokenBoundaries::for_encoder(
-                &Self::extract_special_token_strings(&inner),
+                &candidates,
                 &inner.added_token_strings(),
                 inner.as_ref(),
             )
@@ -482,6 +486,10 @@ impl Tokenizer for CachedTokenizer {
 
     fn added_token_strings(&self) -> Vec<String> {
         self.inner.added_token_strings()
+    }
+
+    fn special_tokens_after_normalization(&self) -> Vec<String> {
+        self.inner.special_tokens_after_normalization()
     }
 }
 
@@ -900,6 +908,114 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    /// Tokenizer that extracts its added tokens in two passes, as the
+    /// `tokenizers` crate does: the raw-pass special `<|s|>` first, then on
+    /// the pieces left over the normalized special `<|n|>` and the longer
+    /// normalized, non-special `a<|n|>b` (leftmost-longest among them).
+    struct TwoPassTokenizer {
+        special_tokens: SpecialTokens,
+        second_pass: aho_corasick::AhoCorasick,
+    }
+
+    impl TwoPassTokenizer {
+        fn new() -> Self {
+            Self {
+                special_tokens: SpecialTokens {
+                    additional_special_tokens: vec!["<|s|>".to_owned(), "<|n|>".to_owned()],
+                    ..Default::default()
+                },
+                second_pass: aho_corasick::AhoCorasickBuilder::new()
+                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                    .build(["<|n|>", "a<|n|>b"])
+                    .unwrap(),
+            }
+        }
+
+        fn second_pass(&self, piece: &str, ids: &mut Vec<TokenIdType>) {
+            let mut last = 0;
+            for found in self.second_pass.find_iter(piece) {
+                ids.extend(piece[last..found.start()].bytes().map(TokenIdType::from));
+                ids.push(2000 + found.pattern().as_u32());
+                last = found.end();
+            }
+            ids.extend(piece[last..].bytes().map(TokenIdType::from));
+        }
+    }
+
+    impl Encoder for TwoPassTokenizer {
+        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
+            let mut ids = Vec::new();
+            let mut last = 0;
+            for (start, _) in input.match_indices("<|s|>") {
+                self.second_pass(&input[last..start], &mut ids);
+                ids.push(1000);
+                last = start + "<|s|>".len();
+            }
+            self.second_pass(&input[last..], &mut ids);
+            Ok(Encoding::Plain(ids))
+        }
+
+        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+            inputs
+                .iter()
+                .map(|i| self.encode(i, add_special_tokens))
+                .collect()
+        }
+    }
+
+    impl Decoder for TwoPassTokenizer {
+        fn decode(&self, _token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl traits::Tokenizer for TwoPassTokenizer {
+        fn vocab_size(&self) -> usize {
+            2002
+        }
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            &self.special_tokens
+        }
+        fn token_to_id(&self, _token: &str) -> Option<TokenIdType> {
+            None
+        }
+        fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
+            None
+        }
+        fn special_tokens_after_normalization(&self) -> Vec<String> {
+            vec!["<|n|>".to_owned()]
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn a_special_token_matched_after_normalization_is_no_boundary() {
+        // `<|n|>` is extracted in the second pass, where the longer `a<|n|>b`
+        // wins over it; a raw-text matcher cannot see that pass, so `<|n|>`
+        // is no boundary (and the longer token, matched there too, is no
+        // consuming pattern). Split at it, the cache would encode `a<|n|>` as
+        // `a`, `<|n|>` and the rest after `<|n|>`, where the tokenizer has
+        // one token.
+        let config = CacheConfig {
+            enable_l0: false,
+            enable_l1: true,
+            ..Default::default()
+        };
+        let plain = TwoPassTokenizer::new();
+        let cached = CachedTokenizer::new(Arc::new(TwoPassTokenizer::new()), config);
+        let text = "<|s|>xa<|n|>by<|s|>z";
+        for input in [text, text] {
+            assert_eq!(
+                cached.encode(input, false).unwrap().token_ids(),
+                plain.encode(input, false).unwrap().token_ids()
+            );
+        }
+        let stats = cached.l1_cache_stats().unwrap();
+        assert_eq!((stats.misses, stats.hits), (1, 1), "{stats:?}");
     }
 
     /// Tokenizer with the special tokens `/think` and `<|im_end|>` and the

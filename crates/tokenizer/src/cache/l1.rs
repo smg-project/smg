@@ -2,7 +2,11 @@
 //!
 //! Caches tokenization results at ALL special token boundaries.
 //! Special tokens (like `<|im_start|>`, `<|im_end|>`) are atomic in BPE tokenizers (special: true, normalized: false),
-//! making them the ONLY safe split points that guarantee correctness.
+//! making them the ONLY safe split points that guarantee correctness. A tokenizer extracts its added tokens in two
+//! passes: the `normalized: false` ones from the raw text, then the `normalized: true` ones from the pieces that pass
+//! leaves, after normalization. The cache lives in the first pass: its boundaries are raw-pass special tokens and the
+//! tokens it matches so that no boundary falls inside them are raw-pass added tokens; a token of the second pass can
+//! neither displace a raw-pass token nor be a boundary of a raw-text matcher.
 //!
 //! **Design**: Cache at every special token boundary (not at fixed granularity intervals)
 //! - Simple: No granularity parameter, no search windows
@@ -136,8 +140,10 @@ impl SpecialTokenBoundaries {
     /// extract at all) is no boundary, so the cache never splits at it; the
     /// tokens that are left are logged at debug level with the ones dropped.
     /// `other_added_tokens` are the tokenizer's added tokens that are not
-    /// special: matched so that no boundary falls inside one, never
-    /// boundaries themselves.
+    /// special and are extracted in the same raw pass as the specials:
+    /// matched so that no boundary falls inside one, never boundaries
+    /// themselves (a token extracted after normalization is not among them:
+    /// it cannot take a raw-pass token's place).
     pub(super) fn for_encoder<S: AsRef<str>, T: AsRef<str>, E: Encoder + ?Sized>(
         special_tokens: &[S],
         other_added_tokens: &[T],

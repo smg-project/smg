@@ -1225,7 +1225,16 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         self.tokenizer
             .get_added_tokens_decoder()
             .values()
-            .filter(|token| !token.special)
+            .filter(|token| !token.special && !token.normalized)
+            .map(|token| token.content.clone())
+            .collect()
+    }
+
+    fn special_tokens_after_normalization(&self) -> Vec<String> {
+        self.tokenizer
+            .get_added_tokens_decoder()
+            .values()
+            .filter(|token| token.special && token.normalized)
             .map(|token| token.content.clone())
             .collect()
     }
@@ -1796,6 +1805,48 @@ mod tests {
 
     use super::derive_thinking_mode;
     use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
+
+    /// The added tokens a prefix cache may match are those of the raw pass
+    /// (`normalized: false`); a special token matched after normalization is
+    /// reported apart, so the cache does not split at it.
+    #[test]
+    fn the_cache_sees_the_raw_pass_added_tokens_and_the_normalized_specials_apart() {
+        use tokenizers::{
+            models::bpe::{Merges, Vocab, BPE},
+            AddedToken,
+        };
+
+        use super::HuggingFaceTokenizer;
+        use crate::traits::Tokenizer as TokenizerTrait;
+        let mut vocab = Vocab::default();
+        for (id, piece) in ["<unk>", "a", "b", "<", ">"].iter().enumerate() {
+            vocab.insert((*piece).to_string(), id as u32);
+        }
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Merges::new())
+            .unk_token("<unk>".into())
+            .build()
+            .expect("model");
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer
+            .add_special_tokens([
+                AddedToken::from("<|s|>", true),
+                AddedToken::from("<|n|>", true).normalized(true),
+            ])
+            .expect("special tokens added");
+        tokenizer
+            .add_tokens([
+                AddedToken::from("</think>", false).normalized(false),
+                AddedToken::from("a<", false),
+            ])
+            .expect("added tokens added");
+        let wrapped = HuggingFaceTokenizer::from_tokenizer(tokenizer);
+        assert_eq!(wrapped.added_token_strings(), vec!["</think>".to_owned()]);
+        assert_eq!(
+            wrapped.special_tokens_after_normalization(),
+            vec!["<|n|>".to_owned()]
+        );
+    }
 
     /// With the piece table the step algorithm streams byte for byte what it
     /// streams through the `tokenizers` window decode. Random streams of word
