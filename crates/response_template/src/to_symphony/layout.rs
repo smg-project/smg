@@ -749,9 +749,8 @@ impl<R: Fn(Case) -> Option<String>> Learner<'_, R> {
                 read: error.to_string(),
             });
         }
-        // Every byte of the output is in one event, in order, so each event's bytes stand where
-        // the bytes before them end. A table that writes a text the model did not (a joiner)
-        // cannot be cut so.
+        // Every byte of the output is in one event, in order (conservation), so each event's
+        // bytes stand where the bytes before them end.
         if out.text() != output {
             return Err(NoLayout::Unexplained(case));
         }

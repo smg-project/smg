@@ -49,14 +49,6 @@
 //!   held until more text in the stay shows it was inside the text, or the stay ends and drops it.
 //!   Whitespace is what Python's `str.strip` removes: Unicode's white space and the separators
 //!   U+001C to U+001F.
-//! - A **join row** names a content or reasoning state whose stays the template joins with a text
-//!   (Hugging Face's `join`): a later stay shows the joiner first, so the stays read as one value
-//!   with the joiner between them. A stay of the turn's own state counts once its first byte
-//!   arrives, as an implicit field opens; a stay of any other state counts from the row that
-//!   enters it, as a field with an opener does, even when nothing follows. The joiner is the one
-//!   text an event shows that the model did not write: `Events::text` holds it where the stay it
-//!   joins starts, and a table without the row conserves the output byte for byte. With no row,
-//!   or an empty joiner, stays follow one another as they are.
 //! - The **stop tokens** are the terminals that are tokens the engine stops on (Harmony's
 //!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
 //!   derived from the table can end a region one of them closes with no text of its own, since
@@ -280,8 +272,6 @@ struct State {
     framing: bool,
     /// The state's text is trimmed stay by stay (the trim row).
     trimmed: bool,
-    /// The text that joins the state's stays (the join row).
-    joiner: Option<String>,
     /// The stream's stop closes the call open in the state (the stop row).
     closes_at_stop: bool,
 }
@@ -295,12 +285,8 @@ pub(crate) struct Replay {
     pub(crate) state: usize,
     /// Whether the turn's first piece is still to come, for a table with a start row.
     pub(crate) at_turn_start: bool,
-    /// Whether the prompt wrote a byte in the stay the output continues.
-    pub(crate) touched: bool,
-    /// Whether it wrote text other than whitespace there.
+    /// Whether the prompt wrote text other than whitespace in the stay the output continues.
     pub(crate) begun: bool,
-    /// The joined states with a stay the replay saw.
-    pub(crate) joined: Vec<usize>,
 }
 
 /// A literal that starts the model's turn in the prompt, and the state the output starts in after
@@ -395,7 +381,6 @@ impl Format {
             emits,
             framing: false,
             trimmed: false,
-            joiner: None,
             closes_at_stop: false,
         });
         self
@@ -451,16 +436,6 @@ impl Format {
     pub fn trims(mut self, state: &str) -> Self {
         let state = self.state_named(state);
         self.states[state].trimmed = true;
-        self
-    }
-
-    /// A later stay of `state`, a content or reasoning state, shows `text` first: the template
-    /// joins the stays with it (see the join row in [`crate::format`]). Naming the state again
-    /// replaces its joiner. The state must already be in the table.
-    #[must_use]
-    pub fn joins(mut self, state: &str, text: &str) -> Self {
-        let state = self.state_named(state);
-        self.states[state].joiner = Some(text.to_string());
         self
     }
 
@@ -631,10 +606,10 @@ impl Format {
     /// replay puts the turn. A call's markers are the terminals on the rows into or out of an
     /// arguments state or a calls wrapper; a table whose thought is framed by them alone
     /// (Inkling's) shows none. A state's own text rows stay with it: a trimmed stay is still
-    /// trimmed, a framing state's text still dropped, a joiner still shown; and a tag the end cut
-    /// short is still dropped, as the legacy parsers drop it on both their paths. A table without
-    /// a thought changes only in what it shows; the thought-first mark and the layout, which
-    /// serve the tags alone, go.
+    /// trimmed, a framing state's text still dropped; and a tag the end cut short is still
+    /// dropped, as the legacy parsers drop it on both their paths. A table without a thought
+    /// changes only in what it shows; the thought-first mark and the layout, which serve the tags
+    /// alone, go.
     #[must_use]
     pub fn without_reasoning(mut self) -> Self {
         let calls = self.terminals_of_calls();
@@ -821,18 +796,8 @@ impl Format {
         let (turn, start) = self.turn(prompt);
         let mut scanner = Scanner::new(self.terminal_texts());
         let (mut state, mut rest) = (start, start);
-        // Whether the prompt wrote a byte, and text other than whitespace, in the stay the output
-        // continues; and the joined states with a stay the replay saw.
-        let (mut touched, mut begun) = (false, false);
-        let mut joined: Vec<usize> = Vec::new();
-        let count = |state: usize, joined: &mut Vec<usize>| {
-            if self.joiner(state).is_some() && !joined.contains(&state) {
-                joined.push(state);
-            }
-        };
-        if start != 0 {
-            count(start, &mut joined);
-        }
+        // Whether the prompt wrote text other than whitespace in the stay the output continues.
+        let mut begun = false;
         // An anchor that names its own state leaves no start to choose.
         let mut at_turn_start = self.start.is_some() && start == 0;
         let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
@@ -841,8 +806,7 @@ impl Format {
                 if let Some(opened) = self.opening(state, &piece) {
                     at_turn_start = false;
                     if opened != state {
-                        (touched, begun) = (false, false);
-                        count(opened, &mut joined);
+                        begun = false;
                     }
                     (state, rest) = (opened, opened);
                 }
@@ -851,31 +815,22 @@ impl Format {
                 Piece::Marker(index) if self.ignored(index) => continue,
                 Piece::Marker(index) => match self.next(state, index) {
                     Some(to) => {
-                        (state, touched, begun) = (to, false, false);
-                        if to != 0 {
-                            count(to, &mut joined);
-                        }
+                        (state, begun) = (to, false);
                         continue;
                     }
                     None => self.terminal_text(index).to_string(),
                 },
                 Piece::Text(text) => text,
             };
-            if state == 0 && !touched {
-                count(0, &mut joined);
-            }
-            touched = true;
             begun |= !text.chars().all(is_strip_space);
         }
         if self.emits(state) == Emits::Arguments {
-            (state, touched, begun) = (rest, false, false);
+            (state, begun) = (rest, false);
         }
         Replay {
             state,
             at_turn_start,
-            touched,
             begun,
-            joined,
         }
     }
 
@@ -1015,34 +970,6 @@ impl Format {
         self.states[index].trimmed
     }
 
-    /// The text that joins the stays of state `index`, if the table names one.
-    pub(crate) fn joiner(&self, index: usize) -> Option<&str> {
-        self.states[index].joiner.as_deref()
-    }
-
-    /// Why the first state with the row `has` names cannot have its text trimmed or joined, when
-    /// one cannot: the text is a call's or a wrapper's, or the template discards it.
-    fn text_row_misfit(&self, row: &str, has: impl Fn(&State) -> bool) -> Option<String> {
-        self.states
-            .iter()
-            .filter(|state| has(state))
-            .find_map(|state| {
-                if matches!(state.emits, Emits::Arguments | Emits::Wrapper) {
-                    Some(format!(
-                        "format {}: state {:?} is {row}, but it emits {:?}",
-                        self.name, state.name, state.emits
-                    ))
-                } else if state.framing {
-                    Some(format!(
-                        "format {}: state {:?} is {row}, but its text is framing",
-                        self.name, state.name
-                    ))
-                } else {
-                    None
-                }
-            })
-    }
-
     /// What every table must hold before an engine runs it: a state to start in, which does not
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay or by
     /// the start row, either of which pushes `ReasoningStart`; an arguments state at the start has
@@ -1050,7 +977,7 @@ impl Format {
     /// every terminal, a turn opener and turn anchors that are not empty and not both named, a
     /// start row only where a turn's first byte is read from the first state and no opener replays
     /// it, a stop row only for an arguments state, a framing row only for a state of content or
-    /// wrapping, a trim or join row only for a state of content or reasoning that is not framing,
+    /// wrapping, a trim row only for a state of content or reasoning that is not framing,
     /// a thought when the table thinks first, and, for a shaped call, a shape a stream can run,
     /// opened only through its terminal (the turn does not start in its state), no terminal the
     /// table ignores, and, when its header is not empty, no row into its state from a state that
@@ -1132,10 +1059,26 @@ impl Format {
                 self.name, state.name, state.emits
             ));
         }
-        if let Some(why) = self
-            .text_row_misfit("trimmed", |state| state.trimmed)
-            .or_else(|| self.text_row_misfit("joined", |state| state.joiner.is_some()))
-        {
+        let misfit = self
+            .states
+            .iter()
+            .filter(|state| state.trimmed)
+            .find_map(|state| {
+                if matches!(state.emits, Emits::Arguments | Emits::Wrapper) {
+                    Some(format!(
+                        "format {}: state {:?} is trimmed, but it emits {:?}",
+                        self.name, state.name, state.emits
+                    ))
+                } else if state.framing {
+                    Some(format!(
+                        "format {}: state {:?} is trimmed, but its text is framing",
+                        self.name, state.name
+                    ))
+                } else {
+                    None
+                }
+            });
+        if let Some(why) = misfit {
             return Err(why);
         }
         if self.thinks_first
@@ -1865,41 +1808,6 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"answer\"")]
     fn a_trim_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().trims("answer");
-    }
-
-    #[test]
-    fn a_join_row_names_a_state_of_content_or_reasoning_that_is_not_framing() {
-        let format = Format::new("joined")
-            .state("content", Emits::Content)
-            .state("thought", Emits::Reasoning)
-            .state("between", Emits::Wrapper)
-            .state("outside", Emits::Content)
-            .framing("outside")
-            .joins("content", "|")
-            .joins("thought", "\n")
-            .joins("content", "");
-        assert_eq!(
-            format.joiner(0),
-            Some(""),
-            "a state named again takes the later joiner"
-        );
-        assert_eq!(format.joiner(1), Some("\n"));
-        assert_eq!(format.joiner(2), None);
-        assert!(format.validate().is_ok());
-        assert_eq!(
-            format.clone().joins("between", "|").validate(),
-            Err("format joined: state \"between\" is joined, but it emits Wrapper".to_string())
-        );
-        assert_eq!(
-            format.joins("outside", "|").validate(),
-            Err("format joined: state \"outside\" is joined, but its text is framing".to_string())
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "format t: no state named \"answer\"")]
-    fn a_join_row_for_a_state_the_table_lacks_is_a_programming_error() {
-        let _ = two_states().joins("answer", "|");
     }
 
     #[test]

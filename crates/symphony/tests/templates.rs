@@ -2,7 +2,7 @@
 //! outputs. A response template is the `response_template` a checkpoint's `tokenizer_config.json`
 //! declares, or one of transformers' own; each table here spells one with the rows a template
 //! needs: a framing state for the text outside every field, turn anchors, a start row, trimmed
-//! and joined stays, and the stop tokens that are terminals. The calls are spelled where a call
+//! stays, and the stop tokens that are terminals. The calls are spelled where a call
 //! syntax the crate has reads the template's (Gemma's, the JSON object, a call given as data whose
 //! header names the tool), and left out where none does yet.
 //!
@@ -199,7 +199,7 @@ fn ernie() -> Format {
 /// `<|message_model|>`, each message a thought, an answer or a call after its own marker (an
 /// author's name and other text before the marker are outside), all of them closed by
 /// `<|end_message|>`, and nothing kept outside them. The thoughts and the answers repeat, joined
-/// with `""` and not stripped: no join row and no trim row. `<|end_message|>` ends a message
+/// with `""` and not stripped: no trim row. `<|end_message|>` ends a message
 /// inside the turn; the stop token, `<|content_model_end_sampling|>` (the `config.json` of
 /// `thinkingmachines/Inkling`), ends the turn and is not a terminal here.
 fn inkling() -> Format {

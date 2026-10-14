@@ -231,7 +231,8 @@ fn gemma4_template() -> Box<dyn Parser> {
 /// Inkling's messages, spelled from transformers v5.18.0's `tests/utils/test_chat_parsing.py`
 /// (`inkling_template`): each message is a thought, an answer or a call after its own marker, all
 /// of them closed by `<|end_message|>`, and nothing is kept outside them; the thoughts and the
-/// answers repeat, joined with `""` (no row) and not stripped (no trim row).
+/// answers repeat, joined with `""`, as the engine's stays follow one another, and not stripped
+/// (no trim row).
 fn inkling_template() -> Box<dyn Parser> {
     Box::new(Engine::new(
         Format::new("inkling template")

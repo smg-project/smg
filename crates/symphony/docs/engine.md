@@ -70,10 +70,6 @@ is a later step).
   which releases it as the state's text, or a row ends the stay or the stream ends, which drops
   it. Held bytes have not reached the ledger, so the tokens are counted in the output's order
   whatever the run turns out to be.
-- A table can join a state's stays with a text (`Format::joins`): a later stay shows the joiner
-  first, as the state's text with no tokens. A stay of the turn's own state counts once its first
-  byte arrives, a stay of any other state from the row that enters it; stays the prompt's replay
-  saw count too.
 - A call given as data (`CallSyntax::Shaped`) opens only when the header after its terminal
   matches: the engine holds the terminal and every byte after it, and takes no row, until the
   header decides. A header that cannot match gives the terminal back: its first character is the

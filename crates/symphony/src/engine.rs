@@ -57,10 +57,8 @@ pub struct Engine {
     stage: Stage,
     /// Whether the turn's first piece is still to come, for a table with a start row.
     at_turn_start: bool,
-    /// The stay in the current state, as far as a trimmed or joined state needs it.
+    /// The stay in the current state, as far as a trimmed state needs it.
     stay: Stay,
-    /// The joined states with a stay in this turn: the next stay of one shows its joiner.
-    joined: Vec<usize>,
     /// A shaped call whose terminal arrived and whose header is still being read.
     pending: Option<Pending>,
 }
@@ -80,12 +78,10 @@ struct Pending {
     call: shape::Assembler,
 }
 
-/// The stay in a state, from the row that entered it to the row that leaves it, as trimming and
-/// joining read it: whether any byte has arrived, whether text other than whitespace has, and
-/// the run held after the last of it.
+/// The stay in a state, from the row that entered it to the row that leaves it, as trimming reads
+/// it: whether text other than whitespace has arrived, and the run held after the last of it.
 #[derive(Debug, Default)]
 struct Stay {
-    touched: bool,
     begun: bool,
     held: Vec<Held>,
 }
@@ -245,7 +241,7 @@ impl Engine {
     /// A table [`Format::validate`] refuses: no state, a first state that emits reasoning, an
     /// arguments state with no call syntax, a terminal with no text, an empty turn opener or
     /// anchor, an opener beside anchors, a start row where the first state holds a call or an
-    /// opener replays the turn, a stop, framing, trim or join row on a state it does not fit, or
+    /// opener replays the turn, a stop, framing or trim row on a state it does not fit, or
     /// a shaped call a stream cannot run, or one a table cannot open through its terminal (see
     /// [`Format::validate`]). Definitions are written in the crate, so that is a programming
     /// error; a shape built at run time is checked before its table is.
@@ -270,7 +266,6 @@ impl Engine {
             stage: Stage::Fresh,
             at_turn_start,
             stay: Stay::default(),
-            joined: Vec::new(),
             pending: None,
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
@@ -387,7 +382,6 @@ impl Engine {
                 self.at_turn_start = false;
                 if state != self.state {
                     self.enter(state, out);
-                    self.join(state, out);
                 }
             }
         }
@@ -470,7 +464,6 @@ impl Engine {
             self.at_turn_start = false;
             if from != self.state {
                 self.enter(from, out);
-                self.join(from, out);
             }
         }
         let call = Box::new(ShapedCall {
@@ -504,11 +497,6 @@ impl Engine {
     }
 
     fn text(&mut self, text: &str, out: &mut Events) {
-        // A stay of the turn's own state counts for its joiner once its first byte arrives.
-        if self.state == 0 && !self.stay.touched {
-            self.stay.touched = true;
-            self.join(0, out);
-        }
         if self.format.is_framing(self.state) {
             out.push(Event::Dropped {
                 text: self.tokens.text(text),
@@ -586,31 +574,6 @@ impl Engine {
                 Some(Held::Space(space)) => space.push_str(tail),
                 _ => self.stay.held.push(Held::Space(tail.to_string())),
             }
-        }
-    }
-
-    /// A stay of `state` begins for its joiner: the first in the turn is noted, and a later one
-    /// shows the joiner, as the state's text with no tokens of its own.
-    fn join(&mut self, state: usize, out: &mut Events) {
-        let Some(joiner) = self.format.joiner(state) else {
-            return;
-        };
-        if !self.joined.contains(&state) {
-            self.joined.push(state);
-            return;
-        }
-        if joiner.is_empty() {
-            return;
-        }
-        let text = if self.tokens.counting() {
-            Text::new(joiner, 0)
-        } else {
-            Text::uncounted(joiner)
-        };
-        if self.format.emits(state) == Emits::Reasoning {
-            out.push_reasoning(text);
-        } else {
-            out.push_content(text);
         }
     }
 
@@ -717,10 +680,6 @@ impl Engine {
             }
         }
         self.enter_with(next, call, out);
-        // A stay of any state but the turn's own counts for its joiner from the row that enters it.
-        if next != 0 {
-            self.join(next, out);
-        }
     }
 
     /// Moves into state `next`, with the reasoning events and the call that come with the move.
@@ -824,16 +783,12 @@ impl Engine {
         let Replay {
             state,
             at_turn_start,
-            touched,
             begun,
-            joined,
         } = self.format.replayed(prompt);
         self.at_turn_start = at_turn_start;
         if state != self.state {
             self.enter(state, out);
         }
-        self.joined = joined;
-        self.stay.touched = touched;
         self.stay.begun = begun;
     }
 
@@ -949,7 +904,6 @@ mod tests {
     use super::*;
     use crate::{
         formats::{glm, qwen3},
-        input::TokenSpan,
         tagged::{Placement, Spelling},
     };
 
@@ -1533,9 +1487,8 @@ mod tests {
 
     /// Replays `output` after `prompt` cut at every two-way split and character by character,
     /// and checks that each cut says what the whole does, and that the events account for the
-    /// output's bytes, the joiners of a joined table aside.
+    /// output's bytes.
     fn same_at_every_cut(format: &Format, prompt: &str, output: &str) -> [String; 4] {
-        let joined = (0..format.states()).any(|state| format.joiner(state).is_some());
         let replay = |cuts: &[usize]| {
             let mut engine = Engine::new(format.clone(), declared());
             let mut out = Events::new();
@@ -1571,9 +1524,7 @@ mod tests {
                 )
                 .expect("end");
             let events = out.drain();
-            if !joined {
-                assert_eq!(bytes(&events), output, "{cuts:?}");
-            }
+            assert_eq!(bytes(&events), output, "{cuts:?}");
             (kinds(&events), trimmed_space(&events), bytes(&events))
         };
         let whole = replay(&[]);
@@ -1643,7 +1594,7 @@ mod tests {
 
     #[test]
     fn each_stay_is_trimmed_on_its_own() {
-        // The content's own close is a row back into it: two stays, each trimmed, joined.
+        // The content's own close is a row back into it: two stays, each trimmed.
         let [content, ..] = same_at_every_cut(
             &gemma_trimmed(),
             "<|turn>model\n",
@@ -1695,200 +1646,6 @@ mod tests {
             );
             assert_eq!(bytes(&events), output);
         }
-    }
-
-    /// Inkling's messages, spelled from transformers v5.18.0's `tests/utils/test_chat_parsing.py`
-    /// (`inkling_template`): each message is a thought, an answer or a call after its own marker,
-    /// all of them closed by `<|end_message|>`, nothing kept outside them, and the thoughts and the
-    /// answers repeat, joined with `""` and not stripped.
-    fn inkling() -> Format {
-        Format::new("inkling")
-            .terminal("thought", "<|content_thinking|>")
-            .terminal("answer", "<|content_text|>")
-            .terminal("call", "<|content_invoke_tool_json|>")
-            .terminal("end", "<|end_message|>")
-            .state("outside", Emits::Content)
-            .state("reasoning", Emits::Reasoning)
-            .state("content", Emits::Content)
-            .state("calls", Emits::Arguments)
-            .transition("outside", "thought", "reasoning")
-            .transition("outside", "answer", "content")
-            .transition("outside", "call", "calls")
-            .transition("reasoning", "end", "outside")
-            .transition("content", "end", "outside")
-            .transition("calls", "end", "outside")
-            .calls(CallSyntax::Json)
-            .framing("outside")
-            .turn_anchor("<|message_model|>")
-    }
-
-    /// The content and the reasoning a client folds from `events`, and the bytes they account for.
-    fn joined_text(events: &[Event]) -> (String, String, String) {
-        let [content, reasoning, ..] = kinds(events);
-        (content, reasoning, bytes(events))
-    }
-
-    #[test]
-    fn stays_joined_with_nothing_follow_one_another_as_they_are() {
-        // As Hugging Face's parser reads the test template: `" A " + "" + " B "`.
-        let [content, ..] = same_at_every_cut(
-            &inkling(),
-            "<|message_model|>",
-            "<|content_text|> A <|end_message|><|message_model|><|content_text|> B <|end_message|>",
-        );
-        assert_eq!(content, " A  B ");
-        let [content, reasoning, ..] = same_at_every_cut(
-            &inkling().joins("content", "").joins("reasoning", ""),
-            "<|message_model|>",
-            "<|content_thinking|>one <|end_message|><|message_model|><|content_thinking|>two\
-             <|end_message|><|message_model|><|content_text|>\nHi\n<|end_message|>",
-        );
-        assert_eq!([content, reasoning], ["\nHi\n", "one two"]);
-    }
-
-    #[test]
-    fn a_later_stay_of_a_state_with_an_opener_shows_the_joiner_from_its_row() {
-        // A joiner none of the public templates writes, on Inkling's messages; each case is what
-        // Hugging Face's parser gives with `"join": "|"`.
-        let piped = || inkling().joins("content", "|").joins("reasoning", "|");
-        for (output, content, reasoning) in [
-            (
-                "<|content_text|>A<|end_message|><|message_model|><|content_text|>B<|end_message|>",
-                "A|B",
-                "",
-            ),
-            (
-                "<|content_text|>A<|end_message|><|message_model|><|content_text|><|end_message|>",
-                "A|",
-                "",
-            ),
-            (
-                "<|content_text|><|end_message|><|message_model|><|content_text|>B<|end_message|>",
-                "|B",
-                "",
-            ),
-            (
-                "<|content_thinking|>one<|end_message|><|message_model|><|content_thinking|>two\
-                 <|end_message|>",
-                "",
-                "one|two",
-            ),
-        ] {
-            let events = run_after(piped(), "<|message_model|>", output);
-            let (shown, thought, conserved) = joined_text(&events);
-            assert_eq!(
-                [shown.as_str(), thought.as_str()],
-                [content, reasoning],
-                "{output:?}"
-            );
-            // The joiner is the one text the model did not write: one byte past the output's.
-            assert_eq!(conserved.len(), output.len() + 1, "{output:?}");
-        }
-    }
-
-    #[test]
-    fn a_later_stay_of_the_turns_own_state_shows_the_joiner_from_its_first_byte() {
-        // An answer outside every marker that repeats with `"join": "|"` and closes at `<c>`, a
-        // thought between `<t>` and `</t>`: each case is what Hugging Face's parser gives.
-        let implicit = || {
-            Format::new("implicit")
-                .terminal("close", "<c>")
-                .terminal("think_open", "<t>")
-                .terminal("think_close", "</t>")
-                .state("content", Emits::Content)
-                .state("reasoning", Emits::Reasoning)
-                .transition("content", "close", "content")
-                .transition("content", "think_open", "reasoning")
-                .transition("reasoning", "think_close", "content")
-                .turn_anchor("S")
-                .trims("content")
-                .trims("reasoning")
-                .joins("content", "|")
-                .joins("reasoning", "|")
-        };
-        for (prompt, output, content, reasoning) in [
-            ("S", "A<c>B", "A|B", ""),
-            ("S", "A<c><c>B", "A|B", ""),
-            ("S", "A<c>  ", "A|", ""),
-            ("S", "A<t>x</t>B", "A|B", "x"),
-            ("S", "<t>x</t><t></t>", "", "x|"),
-            // The prompt began the answer: its continuation is no later stay (the prompt's own
-            // text stays the prompt's).
-            ("SA", " more<c>B", " more|B", ""),
-        ] {
-            let [shown, thought, ..] = same_at_every_cut(&implicit(), prompt, output);
-            assert_eq!(
-                [shown.as_str(), thought.as_str()],
-                [content, reasoning],
-                "{prompt:?} {output:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_joiner_carries_no_token_and_held_whitespace_keeps_its_count() {
-        // One token per character: every token is counted once, the joiner's none, whatever
-        // trimming dropped or released.
-        let output = "<|content_text|> A <|end_message|><|message_model|><|content_text|>B \
-                      <|end_message|>";
-        let format = inkling().joins("content", "|").trims("content");
-        let spans: Vec<TokenSpan> = output
-            .char_indices()
-            .map(|(at, c)| TokenSpan {
-                token_id: 0,
-                start: at,
-                end: at + c.len_utf8(),
-                continued: false,
-            })
-            .collect();
-        let mut engine = Engine::new(format, declared());
-        let mut out = Events::new();
-        for input in [
-            Input::Prompt {
-                token_ids: &[],
-                text: "<|message_model|>",
-            },
-            Input::Delta {
-                token_ids: &[],
-                text: output,
-                spans: &spans,
-            },
-            Input::End {
-                finish: EngineFinish::Stop,
-            },
-        ] {
-            engine.feed(input, &mut out).expect("in order");
-        }
-        let events = out.drain();
-        let counted: u32 = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => text.tokens,
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.tokens,
-                _ => None,
-            })
-            .sum();
-        assert_eq!(counted as usize, output.chars().count());
-        assert_eq!(joined_text(&events).0, "A|B");
-    }
-
-    #[test]
-    fn a_stay_the_prompt_opened_is_no_later_stay() {
-        // The prompt's last message opened an answer: the output continues it, and the next
-        // answer is the later one.
-        let prompt =
-            "<|message_model|><|content_text|>A<|end_message|><|message_model|><|content_text|>";
-        let events = run_after(
-            inkling().joins("content", "|"),
-            prompt,
-            "B<|end_message|><|message_model|><|content_text|>C<|end_message|>",
-        );
-        assert_eq!(joined_text(&events).0, "B|C");
-        let joiner = events.iter().find_map(|event| match event {
-            Event::Content(text) if text.text.starts_with('|') => Some(text.clone()),
-            _ => None,
-        });
-        assert_eq!(joiner.map(|text| text.text), Some("|C".to_string()));
     }
 
     #[test]

@@ -209,8 +209,6 @@ impl Events {
     /// The output bytes these events account for, in order: content, reasoning, dropped and
     /// malformed text, and the source bytes of tool-call events. For a complete, well-formed
     /// parse this equals the model's output byte for byte; that is the conservation property.
-    /// The one text it holds that the model did not write is the joiner of a table that joins a
-    /// state's stays (`Format::joins`), where the stay it joins starts.
     pub fn text(&self) -> String {
         let mut out = String::new();
         for event in &self.items {
