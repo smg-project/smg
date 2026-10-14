@@ -1130,6 +1130,12 @@ impl Decoder for HuggingFaceTokenizer {
         if let Some(table) = &self.byte_level {
             return Ok(table.decode(token_ids, skip_special_tokens));
         }
+        // A sentencepiece-style vocabulary with byte fallback decodes through
+        // its piece table, as its streaming windows do: one pass over the ids
+        // in place of the `tokenizers` decoder chain over every piece.
+        if let Some(table) = &self.pieces {
+            return Ok(table.render(token_ids, skip_special_tokens));
+        }
         self.tokenizer
             .decode(token_ids, skip_special_tokens)
             .map_err(|e| Error::msg(format!("Decoding failed: {e}")))
@@ -1873,6 +1879,48 @@ mod tests {
             after_normalization,
             vec!["<|n|>".to_owned(), "a<".to_owned()]
         );
+    }
+
+    /// The one-shot decode through the piece table is byte for byte the
+    /// `tokenizers` decode: random id sequences of word pieces, byte runs
+    /// (valid, incomplete, lost), specials, a lone marker and a piece ending
+    /// in U+FFFD, with and without the trailing strip, under both
+    /// special-token settings, long and short.
+    #[test]
+    fn the_piece_table_decodes_what_the_tokenizers_decode_decodes() {
+        use super::HuggingFaceTokenizer;
+        use crate::{
+            byte_fallback::tests::{random_ids, synthetic as synthetic_for_decode},
+            traits::Decoder as _,
+        };
+        for strip in [false, true] {
+            for skip in [false, true] {
+                let with = HuggingFaceTokenizer::from_tokenizer(synthetic_for_decode(strip));
+                assert!(with.pieces.is_some(), "the synthetic chain has a table");
+                let mut without = HuggingFaceTokenizer::from_tokenizer(synthetic_for_decode(strip));
+                without.pieces = None;
+                let mut state =
+                    0x2545_F491_4F6C_DD1Du64 ^ u64::from(strip) ^ (u64::from(skip) << 1);
+                for round in 0..2_000usize {
+                    let ids = random_ids(&mut state, 1 + round % 40);
+                    assert_eq!(
+                        with.decode(&ids, skip).unwrap(),
+                        without.decode(&ids, skip).unwrap(),
+                        "ids {ids:?} strip {strip} skip {skip}"
+                    );
+                }
+                // A long sequence, as a one-shot decode of a whole output is.
+                let long: Vec<u32> = (0..400)
+                    .flat_map(|r| random_ids(&mut state, 1 + r % 40))
+                    .collect();
+                assert_eq!(
+                    with.decode(&long, skip).unwrap(),
+                    without.decode(&long, skip).unwrap(),
+                    "{} ids, strip {strip} skip {skip}",
+                    long.len()
+                );
+            }
+        }
     }
 
     /// With the piece table the step algorithm streams byte for byte what it
