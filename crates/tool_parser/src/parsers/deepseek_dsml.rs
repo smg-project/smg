@@ -291,7 +291,7 @@ impl DeepSeekDsmlParser {
 
     /// Bytes at the end of `text` that are not content yet: a suffix that
     /// could still become an opener's sentinel or an end tag once the next
-    /// piece arrives (`</｜DSML｜`, `tool`, `_c`, `alls`, `>` come as separate
+    /// piece arrives (`</｜DSML｜`, `tool`, `_c`, `all`, `s`, `>` come as separate
     /// pieces), and the run of whitespace before it. Whitespace waits for the
     /// next piece because the one-shot path trims it in front of a block and
     /// the block close takes it after the last invoke; text that follows

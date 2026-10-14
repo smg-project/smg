@@ -903,9 +903,9 @@ async fn stream_pieces(
     (text, names, args)
 }
 
-/// The pieces of a streamed tool-call answer as a recorded engine delivered
-/// them: the opener and the block close each come as `<｜DSML｜` / `</｜DSML｜`
-/// plus sub-word pieces, with the model's newlines around them.
+/// The pieces of a streamed tool-call answer in the shape a recorded engine
+/// delivered them: the opener and the block close each come as `<｜DSML｜` /
+/// `</｜DSML｜` plus sub-word pieces, with the model's newlines around them.
 fn recorded_v4_pieces() -> Vec<&'static str> {
     vec![
         "",
@@ -913,7 +913,8 @@ fn recorded_v4_pieces() -> Vec<&'static str> {
         "<｜DSML｜",
         "tool",
         "_c",
-        "alls",
+        "all",
+        "s",
         ">",
         "\n",
         "<｜DSML｜",
@@ -955,15 +956,16 @@ fn recorded_v4_pieces() -> Vec<&'static str> {
         "</｜DSML｜",
         "tool",
         "_c",
-        "alls",
+        "all",
+        "s",
         ">",
     ]
 }
 
 /// A streamed tool-call answer carries no markup in its visible text: the
-/// block close arriving as `</｜DSML｜` + `tool` + `_c` + `alls` + `>` after the
-/// last invoke, and the newline before it, are dropped as the one-shot path
-/// never shows them; the leading blank line is trimmed the same way.
+/// block close arriving as `</｜DSML｜` + `tool` + `_c` + `all` + `s` + `>` after
+/// the last invoke, and the newline before it, are dropped as the one-shot
+/// path never shows them; the leading blank line is trimmed the same way.
 #[tokio::test]
 async fn test_deepseek_v4_streaming_drops_the_block_close_delivered_in_pieces() {
     let tools = add_integers_tool();
