@@ -154,7 +154,7 @@ def _start_scheduler_processes(
             for tp_rank in tp_rank_range:
                 reader, writer = mp.Pipe(duplex=False)
 
-                # Calculate GPU ID for this rank
+                # SGLang leaves the PP offset unstepped, which can collide with TP ranks.
                 gpu_id = (
                     cfg.base_gpu_id
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node * cfg.gpu_id_step)
