@@ -51,7 +51,7 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
-    routers::{error, RouterTrait},
+    routers::{error, grpc::regular::symphony::template::Templates, RouterTrait},
     worker::{RoutingPool, WorkerRegistry, WorkerType},
 };
 
@@ -139,6 +139,7 @@ impl GrpcRouter {
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
             parser: ctx.router_config.parser,
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
         });
 
         // The admission queue's timeout also bounds how long an accepted

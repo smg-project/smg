@@ -1624,6 +1624,7 @@ mod alias_pipeline_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::grpc::regular::symphony::template::Templates,
         worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
     };
 
@@ -1673,6 +1674,7 @@ mod alias_pipeline_tests {
         );
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
@@ -1763,6 +1765,7 @@ mod request_release_tests {
                 SUPPORTS_VISION_LABEL,
             },
             proto_wrapper::ENGINE_ERROR_MESSAGE,
+            regular::symphony::template::Templates,
             utils::tonic_ext::TonicStatusExt,
         },
         worker::{
@@ -2194,6 +2197,7 @@ mod request_release_tests {
             )
         });
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
@@ -3743,6 +3747,7 @@ mod request_release_tests {
             )
         });
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
@@ -4221,6 +4226,7 @@ mod request_release_tests {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
         let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
             tokenizer_registry: Arc::new(TokenizerRegistry::new()),
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
@@ -4301,6 +4307,7 @@ mod rate_limit_reserve_tests {
     use crate::{
         config::types::RouterConfig,
         rate_limit::{RateLimitManager, Reservation, ReserveRequest},
+        routers::grpc::regular::symphony::template::Templates,
         tenant::TenantKey,
     };
 
@@ -4320,6 +4327,7 @@ mod rate_limit_reserve_tests {
             .await
             .unwrap();
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),

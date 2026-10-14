@@ -4,21 +4,26 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        client::GenerateRequestBuildOptions,
-        common::stages::{helpers, BuildStage},
-        context::{
-            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-            PreparationOutput, RequestContext,
+use crate::{
+    config::ParserChoice,
+    routers::{
+        error,
+        grpc::{
+            client::GenerateRequestBuildOptions,
+            common::stages::{helpers, BuildStage},
+            context::{
+                AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+                PreparationOutput, RequestContext,
+            },
+            multimodal::{
+                assemble_media_refs, assemble_multimodal_data,
+                assemble_multimodal_data_after_encode, assembly_error_response,
+                reserve_multimodal_inflight,
+            },
+            regular::symphony,
+            spec::{MessagesResponseSpec, ResponseSpec},
+            utils,
         },
-        multimodal::{
-            assemble_media_refs, assemble_multimodal_data, assemble_multimodal_data_after_encode,
-            assembly_error_response, reserve_multimodal_inflight,
-        },
-        spec::{MessagesResponseSpec, ResponseSpec},
-        utils,
     },
 };
 
@@ -171,6 +176,26 @@ impl BuildStage for MessageRequestBuildingStage {
 
         // The ids are the prompt; the text rides along only when the request
         // carries media (see `helpers::wire_prompt_text`).
+        // Symphony's assignment, taken while the rendered prompt is still here (see
+        // `regular::symphony`): the response spec carries it to the drivers, and the state
+        // records which parser reads the message for the response's header.
+        let names = ctx
+            .components
+            .parser_resolver
+            .names(&messages_request.model);
+        let assignment = symphony::assign_messages(
+            ctx.state.parser.unwrap_or_default(),
+            &names,
+            messages_request.as_ref(),
+            tool_constraints.as_ref(),
+            &processed_messages.text,
+            &ctx.components.templates,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        ctx.state.parser = Some(match assignment {
+            Some(_) => ParserChoice::Symphony,
+            None => ParserChoice::Legacy,
+        });
         let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
         let mut proto_request = builder_client
             .build_messages_request(
@@ -246,9 +271,10 @@ impl BuildStage for MessageRequestBuildingStage {
         );
         let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
         spec.reasoning_in_prefill = reasoning_in_prefill;
+        spec.symphony = assignment;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
-            spec: ResponseSpec::Messages(spec),
+            spec: ResponseSpec::Messages(Box::new(spec)),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,

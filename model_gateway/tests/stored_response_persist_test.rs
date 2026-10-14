@@ -89,6 +89,7 @@ async fn app() -> (Router, tokio::task::AbortHandle) {
             output_tokens: 3,
             finish_reasons: vec!["stop"],
             generation: Default::default(),
+            requests: Default::default(),
         }
         .serve(listener),
     );

@@ -48,6 +48,7 @@ use crate::{
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
         error::internal_error,
+        grpc::regular::symphony::template::Templates,
     },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
@@ -211,9 +212,12 @@ pub(crate) struct SharedComponents {
     /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
     /// of the not-ready 503 of a load in flight.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
-    /// Which parser reads a chat completion's output unless the request's `X-SMG-Parser`
-    /// header says otherwise (see `regular::symphony`).
+    /// Which parser reads a chat completion's or a message's output unless the request's
+    /// `X-SMG-Parser` header says otherwise (see `regular::symphony`).
     pub parser: ParserChoice,
+    /// The tables the registered tokenizers' response templates compile into, which the parser
+    /// name `hf` selects (see `regular::symphony::template`).
+    pub templates: Arc<Templates>,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
@@ -223,11 +227,11 @@ pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
-    /// The parser for this chat completion. Chat preparation sets the request's choice, from its
-    /// `X-SMG-Parser` header or the configured default; request building then sets the parser that
-    /// reads the response, Symphony when a table takes the request and legacy otherwise, which the
-    /// response reports as `x-smg-parser`. `None` on the other endpoints, which keep the legacy
-    /// parsers.
+    /// The parser for this chat completion or message. Preparation sets the request's choice,
+    /// from its `X-SMG-Parser` header or the configured default; request building then sets the
+    /// parser that reads the response, Symphony when a table takes the request and legacy
+    /// otherwise, which the response reports as `x-smg-parser`. `None` on the other endpoints,
+    /// which keep the legacy parsers.
     pub parser: Option<ParserChoice>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`

@@ -28,7 +28,7 @@ use wfaas::{
 use super::data::TokenizerWorkflowData;
 use crate::{
     app_context::AppContext,
-    config::TokenizerCacheConfig,
+    config::{TokenizerCacheConfig, TEMPLATE_PARSER},
     routers::grpc::multimodal::{
         load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
     },
@@ -345,6 +345,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                             "Successfully loaded tokenizer '{}' (id: {}) with vocab_size: {:?}",
                             name, id, vocab_size
                         );
+                        hint_response_template(&app_context, &name, id);
                     }
                     LoadOutcome::AlreadyExists { id } => {
                         if config.fail_on_duplicate {
@@ -574,6 +575,30 @@ async fn fetch_tokenizer_from_worker(
 // ============================================================================
 // Workflow Builder
 // ============================================================================
+
+/// A tokenizer that ships a `response_template` is read with its table only when the parser
+/// flags name `hf` (see `routers::grpc::regular::symphony`): says so once per tokenizer when
+/// they do not, so the choice is a known one.
+fn hint_response_template(app_context: &AppContext, model: &str, tokenizer_id: &str) {
+    let ships_template = app_context
+        .tokenizer_registry
+        .get_by_id(tokenizer_id)
+        .is_some_and(|entry| entry.tokenizer.response_template().is_some());
+    let names_template = [
+        &app_context.configured_tool_parser,
+        &app_context.configured_reasoning_parser,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|name| name.trim().eq_ignore_ascii_case(TEMPLATE_PARSER));
+    if ships_template && !names_template {
+        info!(
+            model,
+            "the tokenizer ships a response_template; --tool-call-parser {TEMPLATE_PARSER} and \
+             --reasoning-parser {TEMPLATE_PARSER} read with it under --parser symphony"
+        );
+    }
+}
 
 /// Create the tokenizer registration workflow
 ///

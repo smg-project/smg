@@ -657,6 +657,7 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
         history_tool_calls_count: 0,
         chat_tools: Vec::new(),
         stop_sequences: None,
+        symphony: None,
     };
     let result = processor(false)
         .process_messages_streaming_chunks(
@@ -754,6 +755,7 @@ fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
         history_tool_calls_count: 0,
         chat_tools: Vec::new(),
         stop_sequences: None,
+        symphony: None,
     }
 }
 
@@ -1842,6 +1844,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: None,
+            symphony: None,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -1925,6 +1928,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: Some(vec!["###".to_string()]),
+            symphony: None,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -2300,6 +2304,7 @@ async fn messages_blocks_and_inputs(
         history_tool_calls_count: 0,
         chat_tools: chat_spec(true).tools.unwrap(),
         stop_sequences: None,
+        symphony: None,
     };
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
     frames.push(complete(0, "stop"));

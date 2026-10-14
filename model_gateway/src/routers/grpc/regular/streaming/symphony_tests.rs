@@ -327,3 +327,182 @@ async fn malformed_call_text_is_content_and_keeps_its_logprobs() {
     assert!(choice.message.tool_calls.is_none());
     assert_eq!(kept_logprob_tokens(&choice), content);
 }
+
+/// The `lookup` tool the outputs call.
+fn lookup_tools() -> Vec<Tool> {
+    serde_json::from_value(json!([{
+        "type": "function", "function": {
+            "name": "lookup", "parameters": {"type": "object", "properties": {}}
+        }
+    }]))
+    .expect("tools")
+}
+
+/// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
+fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesResponseSpec {
+    MessagesResponseSpec {
+        thinking: thinking.then_some(messages::ThinkingConfig::Enabled {
+            budget_tokens: 1024,
+            display: None,
+        }),
+        reasoning_in_prefill: None,
+        tool_choice: None,
+        has_tools: true,
+        history_tool_calls_count: 0,
+        chat_tools: lookup_tools(),
+        stop_sequences: None,
+        symphony: Some(Assignment {
+            format,
+            prompt: prompt.to_string(),
+        }),
+    }
+}
+
+async fn message_events(
+    responses: Vec<proto::GenerateResponse>,
+    spec: MessagesResponseSpec,
+    stop: Option<&str>,
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
+    let (stream, server) = scripted_stream(responses, "0").await;
+    let (tx, rx) = sse_channel();
+    let stop = stop.map(|stop| StringOrArray::String(stop.to_string()));
+    let result = processor(true)
+        .process_messages_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (stop, None, false, false, false),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    (result, events)
+}
+
+/// The content blocks of a streamed message as `(type, text or name, input JSON)`, rebuilt from
+/// the deltas: blocks must open and close one at a time, with indices in order.
+fn message_blocks(events: &[Value]) -> Vec<(String, String, Value)> {
+    let mut blocks: Vec<(String, String, String)> = Vec::new();
+    let mut open: Option<u64> = None;
+    for event in events {
+        match event["type"].as_str() {
+            Some("content_block_start") => {
+                assert_eq!(open, None, "a block starts while another is open: {event}");
+                assert_eq!(
+                    event["index"].as_u64(),
+                    Some(blocks.len() as u64),
+                    "{event}"
+                );
+                open = Some(blocks.len() as u64);
+                let block = &event["content_block"];
+                let kind = block["type"].as_str().unwrap_or("").to_string();
+                let name = block["name"].as_str().unwrap_or("").to_string();
+                blocks.push((kind, name, String::new()));
+            }
+            Some("content_block_delta") => {
+                assert_eq!(
+                    open,
+                    event["index"].as_u64(),
+                    "a delta for a closed block: {event}"
+                );
+                let delta = &event["delta"];
+                let last = blocks.last_mut().expect("an open block");
+                for key in ["thinking", "text", "partial_json"] {
+                    if let Some(part) = delta[key].as_str() {
+                        last.2.push_str(part);
+                    }
+                }
+            }
+            Some("content_block_stop") => {
+                assert_eq!(open.take(), event["index"].as_u64(), "{event}");
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(open, None, "a block is left open");
+    blocks
+        .into_iter()
+        .map(|(kind, name, body)| {
+            let value = if kind == "tool_use" {
+                serde_json::from_str(&body).expect("the input as JSON")
+            } else {
+                Value::String(body)
+            };
+            (kind, name, value)
+        })
+        .collect()
+}
+
+fn message_stop_reason(events: &[Value]) -> Value {
+    events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .expect("a message_delta")["delta"]["stop_reason"]
+        .clone()
+}
+
+#[tokio::test]
+async fn symphony_streams_a_message_as_thinking_text_and_tool_use_blocks() {
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", true);
+    let responses = vec![
+        chunk(0, &QWEN3_OUTPUT[..9]),
+        chunk(0, &QWEN3_OUTPUT[9..32]),
+        chunk(0, &QWEN3_OUTPUT[32..]),
+        complete(0, "stop"),
+    ];
+    let (result, events) = message_events(responses, spec, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(events[0]["type"], "message_start");
+    let blocks = message_blocks(&events);
+    assert_eq!(blocks.len(), 3, "{blocks:?}");
+    assert_eq!(blocks[0].0, "thinking");
+    assert_eq!(blocks[0].2, "plan");
+    assert_eq!(blocks[1].0, "text");
+    assert_eq!(blocks[1].2.as_str().map(str::trim), Some("Hello"));
+    assert_eq!(blocks[2].0, "tool_use");
+    assert_eq!(blocks[2].1, "lookup");
+    assert_eq!(blocks[2].2, json!({"q": 1}));
+    assert_eq!(message_stop_reason(&events), "tool_use");
+    assert_eq!(events.last().expect("events")["type"], "message_stop");
+    // The table's framing never reaches the client.
+    let text: String = events
+        .iter()
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect();
+    assert!(!text.contains("<tool_call>"), "{text:?}");
+}
+
+#[tokio::test]
+async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() {
+    // The token limit.
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let (result, events) =
+        message_events(vec![chunk(0, "Hello"), complete(0, "length")], spec, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(message_blocks(&events)[0].2, "Hello");
+    assert_eq!(message_stop_reason(&events), "max_tokens");
+    // The turn's end.
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let (_, events) =
+        message_events(vec![chunk(0, "Hello"), complete(0, "stop")], spec, None).await;
+    assert_eq!(message_stop_reason(&events), "end_turn");
+    // A stop sequence the decoder matched.
+    let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    let (_, events) = message_events(
+        vec![chunk(0, "Hello END more"), complete(0, "stop")],
+        spec,
+        Some("END"),
+    )
+    .await;
+    assert_eq!(message_blocks(&events)[0].2, "Hello ");
+    assert_eq!(message_stop_reason(&events), "stop_sequence");
+    let delta = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .expect("a message_delta");
+    assert_eq!(delta["delta"]["stop_sequence"], "END");
+}

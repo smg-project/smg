@@ -59,6 +59,7 @@ impl ProcessStage for MessageResponseProcessingStage {
                 "Wrong response spec",
             ));
         };
+        let messages_request = *messages_request;
 
         let is_streaming = ctx.streaming;
 

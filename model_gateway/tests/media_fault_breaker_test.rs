@@ -182,6 +182,7 @@ async fn answers_of(
                     output_tokens: 2,
                     finish_reasons: vec!["stop"],
                     generation: Default::default(),
+                    requests: Default::default(),
                 },
             }))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))

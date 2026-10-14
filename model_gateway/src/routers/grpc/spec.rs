@@ -33,7 +33,7 @@ pub(crate) enum ResponseSpec {
     Chat(Box<ChatResponseSpec>),
     Generate(GenerateResponseSpec),
     Completion(CompletionResponseSpec),
-    Messages(MessagesResponseSpec),
+    Messages(Box<MessagesResponseSpec>),
     /// Embedding/classify response processing needs only dispatch metadata.
     Embedding,
     Classify,
@@ -199,6 +199,8 @@ pub(crate) struct MessagesResponseSpec {
     /// Messages tools pre-converted to Chat tools for parser reuse.
     pub chat_tools: Vec<Tool>,
     pub stop_sequences: Option<Vec<String>>,
+    /// Symphony's assignment when a table reads the message (see `regular::symphony`).
+    pub symphony: Option<Assignment>,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
@@ -217,6 +219,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .map(utils::message_utils::extract_chat_tools)
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
+            symphony: None,
         }
     }
 }

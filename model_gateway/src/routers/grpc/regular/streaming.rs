@@ -2230,6 +2230,45 @@ impl StreamingProcessor {
         Ok(())
     }
 
+    /// Ends Symphony's reading of the message: `flushed`, the text the decoder released last,
+    /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`])
+    /// and the reasoning tokens they cost are added to `thinking_tokens`.
+    async fn end_symphony_message(
+        tx: &SseSender,
+        buffer: &mut Vec<u8>,
+        (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
+        flushed: Option<&str>,
+        finish: EngineFinish,
+        thinking_tokens: &mut u32,
+    ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
+        let mut events = match flushed {
+            Some(text) => reader.tail(text)?,
+            None => Vec::new(),
+        };
+        events.extend(reader.end(finish)?);
+        *thinking_tokens += reasoning_text_tokens(&events);
+        Self::send_symphony_blocks(tx, buffer, machine, &events).await
+    }
+
+    /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
+    /// gives, in order; the stop reason when a `Finish` was among the events.
+    async fn send_symphony_blocks(
+        tx: &SseSender,
+        buffer: &mut Vec<u8>,
+        machine: &mut adapt::messages::Stream,
+        events: &[Event],
+    ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
+        let mut stop = None;
+        let mut blocks = Vec::new();
+        for event in events {
+            stop = machine.feed(event, &mut blocks).or(stop);
+        }
+        for block in &blocks {
+            Self::send_messages_event(tx, buffer, block).await?;
+        }
+        Ok(stop)
+    }
+
     /// Send a `MessageStreamEvent` through the SSE channel using a reusable buffer.
     async fn send_messages_event(
         tx: &SseSender,
@@ -2604,17 +2643,31 @@ impl StreamingProcessor {
         let chat_tools: &[Tool] = &original_request.chat_tools;
 
         // Create fresh streaming tool parser (not pooled — streaming parsers maintain state)
-        let mut streaming_tool_parser: Option<Box<dyn ToolParser>> =
-            if has_tools && tool_choice_enabled && (tool_parser_available || used_json_schema) {
-                let parser_name = if used_json_schema {
-                    Some("json")
-                } else {
-                    tool_parser_name.as_deref()
-                };
-                utils::create_tool_parser(&self.tool_parser_factory, parser_name, model)
+        let mut streaming_tool_parser: Option<Box<dyn ToolParser>> = if has_tools
+            && tool_choice_enabled
+            && original_request.symphony.is_none()
+            && (tool_parser_available || used_json_schema)
+        {
+            let parser_name = if used_json_schema {
+                Some("json")
             } else {
-                None
+                tool_parser_name.as_deref()
             };
+            utils::create_tool_parser(&self.tool_parser_factory, parser_name, model)
+        } else {
+            None
+        };
+        // Symphony's reader and the content-block machine, when a table reads the message
+        // (see `regular::symphony`): the engine's tokens go through the reader, its events
+        // through the machine, and the parsers above are not run. The `Finish` event gives the
+        // stop reason.
+        let mut symphony = original_request
+            .symphony
+            .as_ref()
+            .map(|assignment| Reader::new(assignment, chat_tools))
+            .transpose()?
+            .map(|reader| (reader, adapt::messages::Stream::new()));
+        let mut symphony_stop: Option<messages::StopReason> = None;
 
         // Phase 1: Emit message_start with skeleton Message
         let start_message = Message {
@@ -2684,6 +2737,24 @@ impl StreamingProcessor {
                     completion_tokens.record_chunk(&chunk);
                     chunk_tokens = chunk.token_ids().len() as u32;
 
+                    if let Some((reader, machine)) = symphony.as_mut() {
+                        let (events, should_stop) =
+                            reader.read(&mut stop_decoder, chunk.token_ids())?;
+                        if should_stop {
+                            stopped = true;
+                            finish_reason_str = "stop".to_string();
+                            matched_stop = stop_decoder
+                                .matched_stop()
+                                .map(|s| Value::String(s.to_string()));
+                        }
+                        parsed_thinking_tokens += reasoning_text_tokens(&events);
+                        symphony_stop =
+                            Self::send_symphony_blocks(tx, &mut sse_buffer, machine, &events)
+                                .await?
+                                .or(symphony_stop);
+                        continue;
+                    }
+
                     let (chunk_text, should_stop) =
                         Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids())?;
 
@@ -2740,6 +2811,19 @@ impl StreamingProcessor {
                     if flushed.is_some() {
                         chunk_tokens = std::mem::take(&mut held_tokens);
                     }
+                    if let Some((reader, machine)) = symphony.as_mut() {
+                        symphony_stop = Self::end_symphony_message(
+                            tx,
+                            &mut sse_buffer,
+                            (reader, machine),
+                            flushed.as_deref(),
+                            engine_finish(&finish_reason_str),
+                            &mut parsed_thinking_tokens,
+                        )
+                        .await?
+                        .or(symphony_stop);
+                        continue;
+                    }
                     flushed
                 }
                 Some(ProtoResponseVariant::None) => continue,
@@ -2756,7 +2840,7 @@ impl StreamingProcessor {
                             .matched_stop()
                             .map(|s| Value::String(s.to_string()));
                     }
-                    match tail {
+                    let flushed = match tail {
                         SequenceDecoderOutput::Text(text)
                         | SequenceDecoderOutput::StoppedWithText(text)
                             if !text.is_empty() =>
@@ -2764,7 +2848,34 @@ impl StreamingProcessor {
                             chunk_tokens = std::mem::take(&mut held_tokens);
                             Some(text)
                         }
-                        _ => continue,
+                        _ => None,
+                    };
+                    if let Some((reader, machine)) = symphony.as_mut() {
+                        // A stream that ends without Complete is cut: the reader ends on an
+                        // abort, which leaves an open call cut, as the message says.
+                        if reader.ended() {
+                            continue;
+                        }
+                        let finish = if finish_reason_str.is_empty() {
+                            EngineFinish::Abort
+                        } else {
+                            engine_finish(&finish_reason_str)
+                        };
+                        symphony_stop = Self::end_symphony_message(
+                            tx,
+                            &mut sse_buffer,
+                            (reader, machine),
+                            flushed.as_deref(),
+                            finish,
+                            &mut parsed_thinking_tokens,
+                        )
+                        .await?
+                        .or(symphony_stop);
+                        continue;
+                    }
+                    match flushed {
+                        Some(text) => Some(text),
+                        None => continue,
                     }
                 }
                 None if reasoning_parser.is_some() => Some(String::new()),
@@ -3238,6 +3349,17 @@ impl StreamingProcessor {
             Some(messages::StopReason::StopSequence)
         } else {
             Some(messages::StopReason::EndTurn)
+        };
+        // Symphony's stop reason is the `Finish` event's; a stop sequence the decoder or the
+        // engine matched is reported as such, as the message says.
+        let stop_reason = match symphony_stop {
+            Some(messages::StopReason::EndTurn)
+                if matched_stop.as_ref().is_some_and(Value::is_string) =>
+            {
+                Some(messages::StopReason::StopSequence)
+            }
+            Some(stop) => Some(stop),
+            None => stop_reason,
         };
 
         let stop_sequence = if matches!(stop_reason, Some(messages::StopReason::StopSequence)) {

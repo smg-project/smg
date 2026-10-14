@@ -353,42 +353,44 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        let tool_call_constraint = if let (false, Some(tool_choice)) =
-            (constraint_tools.is_empty(), request.tool_choice.as_ref())
-        {
-            let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
-            // When Symphony reads the response, its table gives the forced call
-            // its tag, so the call comes back in the syntax the table parses (see
-            // `regular::symphony`, which decides both with one predicate); the
-            // older registry decides for every other request. Only the chat
-            // stage chooses a parser: transcription, which shares this
-            // preparation, keeps the legacy parsers.
-            let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
-            let names = ctx.components.parser_resolver.names(&request.model);
-            let symphony_constraint =
-                symphony::constraint(parser, &names, request, &constraint_tools, reasoning);
-            match symphony_constraint {
-                Some(constraint) => Some(constraint),
-                None => ctx
-                    .components
-                    .tool_parser_factory
-                    .registry()
-                    .generate_tool_constraint(
-                        names.tool.as_deref(),
-                        &constraint_tools,
-                        tool_choice,
-                        reasoning,
+        let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
+        // When Symphony reads the response, its table gives a forced call, or a
+        // JSON response_format, its tag, so the output comes back in the syntax
+        // the table parses (see `regular::symphony`, which decides both with one
+        // predicate); the older registry decides for every other request. Only
+        // the chat stage chooses a parser: transcription, which shares this
+        // preparation, keeps the legacy parsers.
+        let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
+        let names = ctx.components.parser_resolver.names(&request.model);
+        let symphony_constraint = symphony::constraint(
+            parser,
+            &names,
+            request,
+            &constraint_tools,
+            reasoning,
+            &ctx.components.templates,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        let tool_call_constraint = match (symphony_constraint, request.tool_choice.as_ref()) {
+            (Some(constraint), _) => Some(constraint),
+            (None, Some(tool_choice)) if !constraint_tools.is_empty() => ctx
+                .components
+                .tool_parser_factory
+                .registry()
+                .generate_tool_constraint(
+                    names.tool.as_deref(),
+                    &constraint_tools,
+                    tool_choice,
+                    reasoning,
+                )
+                .map_err(|e| {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
+                    error::bad_request(
+                        "invalid_tool_configuration",
+                        format!("Invalid tool configuration: {e}"),
                     )
-                    .map_err(|e| {
-                        error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                        error::bad_request(
-                            "invalid_tool_configuration",
-                            format!("Invalid tool configuration: {e}"),
-                        )
-                    })?,
-            }
-        } else {
-            None
+                })?,
+            (None, _) => None,
         };
 
         let preserve_reasoning_special_tokens = request.separate_reasoning

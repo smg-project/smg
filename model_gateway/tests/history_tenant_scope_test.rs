@@ -47,6 +47,7 @@ async fn app(trust_tenant_header: bool) -> (Router, tokio::task::AbortHandle) {
             output_tokens: 2,
             finish_reasons: vec!["stop"],
             generation: Default::default(),
+            requests: Default::default(),
         }
         .serve(listener),
     );

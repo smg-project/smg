@@ -216,6 +216,15 @@ pub(crate) fn process_messages_prompt(
     ))
 }
 
+/// Whether the request's last input message is the assistant's: the model continues it, so
+/// the response is no new turn.
+pub(crate) fn continues_assistant(request: &CreateMessageRequest) -> bool {
+    request
+        .messages
+        .last()
+        .is_some_and(|message| message.role == messages::Role::Assistant)
+}
+
 /// The tools the template renders for a request: the custom tools as chat
 /// tools, narrowed by `tool_choice` the way the chat path narrows them (a
 /// forced tool renders alone, and `none` renders none unless the renderer

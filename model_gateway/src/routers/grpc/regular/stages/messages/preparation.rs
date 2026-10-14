@@ -15,6 +15,7 @@ use crate::{
             common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext},
             multimodal,
+            regular::symphony,
             utils::{self, message_utils},
         },
     },
@@ -60,6 +61,13 @@ impl MessagePreparationStage {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
         let tokenizer = utils::resolve_tokenizer(ctx, "MessagePreparationStage::prepare_messages")
             .map_err(|e| *e)?;
+        // Which parser reads this message: the request's X-SMG-Parser header
+        // when it carries one, else the gateway's --parser flag (see
+        // `regular::symphony`). Decided once here; the constraint below and
+        // request building read the same choice.
+        let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
+            .map_err(|why| error::bad_request("invalid_parser_header", why))?;
+        ctx.state.parser = Some(parser);
 
         // Step 1: The tools the template renders (narrowed by tool_choice),
         // shared with count_tokens so both render the same prompt.
@@ -223,22 +231,32 @@ impl MessagePreparationStage {
             }
         }
 
-        // Step 4: Build tool constraints if tools present. On a thinking
-        // prompt a parser with a reasoning prefix gets its tag wrapped so a
-        // forced call follows the reasoning instead of preempting it.
-        let tool_call_constraint = if let (false, Some(tool_choice)) =
-            (filtered_tools.is_empty(), chat_tool_choice.as_ref())
-        {
-            let reasoning =
-                utils::messages_reasoning_starts_in_prefill(request, tokenizer.as_ref());
-            ctx.components
+        // Step 4: Build tool constraints if tools present. When Symphony reads
+        // the message, its table gives a forced call its tag (see
+        // `regular::symphony`, which decides both with one predicate); the older
+        // registry decides for every other request. On a thinking prompt a
+        // parser with a reasoning prefix gets its tag wrapped so a forced call
+        // follows the reasoning instead of preempting it.
+        let reasoning = utils::messages_reasoning_starts_in_prefill(request, tokenizer.as_ref());
+        let names = ctx.components.parser_resolver.names(&request.model);
+        let symphony_constraint = symphony::constraint_messages(
+            parser,
+            &names,
+            request,
+            &filtered_tools,
+            reasoning,
+            message_utils::continues_assistant(request),
+            &ctx.components.templates,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {
+            (Some(constraint), _) => Some(constraint),
+            (None, Some(tool_choice)) if !filtered_tools.is_empty() => ctx
+                .components
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(
-                    ctx.components
-                        .parser_resolver
-                        .tool_parser(&request.model)
-                        .as_deref(),
+                    names.tool.as_deref(),
                     &filtered_tools,
                     tool_choice,
                     reasoning,
@@ -249,9 +267,8 @@ impl MessagePreparationStage {
                         "invalid_tool_configuration",
                         format!("Invalid tool configuration: {e}"),
                     )
-                })?
-        } else {
-            None
+                })?,
+            (None, _) => None,
         };
 
         // Step 5: Create stop sequence decoder

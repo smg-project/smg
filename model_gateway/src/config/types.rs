@@ -22,6 +22,11 @@ use crate::{
     },
 };
 
+/// The parser name that reads a model with the table its tokenizer's `response_template`
+/// compiles into, under `--parser symphony` (see `routers::grpc::regular::symphony`): the same
+/// name for `--tool-call-parser` and `--reasoning-parser`, as vLLM names it.
+pub const TEMPLATE_PARSER: &str = "hf";
+
 /// The parser that reads a chat completion's output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

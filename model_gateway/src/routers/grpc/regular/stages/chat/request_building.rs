@@ -287,14 +287,32 @@ impl BuildStage for ChatRequestBuildingStage {
             chat_request.as_ref(),
             tool_constraints.as_ref(),
             &processed_messages.text,
-        );
+            &ctx.components.templates,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
         ctx.state.parser = Some(match assignment {
             Some(_) => ParserChoice::Symphony,
             None => ParserChoice::Legacy,
         });
+        // The table's structural tag stands in for a JSON response_format (see
+        // `regular::symphony::constraint`): the engine's request carries the tag
+        // alone, so no client reads the two as competing constraints.
+        let answered = assignment.is_some()
+            && chat_request.response_format.is_some()
+            && tool_constraints
+                .as_ref()
+                .is_some_and(|(kind, _)| kind == "structural_tag");
+        let engine_request = answered.then(|| openai_protocol::chat::ChatCompletionRequest {
+            response_format: None,
+            ..chat_request.as_ref().clone()
+        });
+        let engine_request = match &engine_request {
+            Some(request) => request,
+            None => chat_request.as_ref(),
+        };
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
-            &chat_request,
+            engine_request,
             processed_messages.text,
             token_ids,
             tool_constraints,

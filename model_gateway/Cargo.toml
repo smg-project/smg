@@ -89,6 +89,7 @@ openai-protocol = { workspace = true, features = ["axum"] }
 reasoning-parser.workspace = true
 tool-parser.workspace = true
 smg-symphony.workspace = true
+smg-response-template = { workspace = true, features = ["symphony"] }
 wfaas.workspace = true
 llm-tokenizer.workspace = true
 smg-auth.workspace = true

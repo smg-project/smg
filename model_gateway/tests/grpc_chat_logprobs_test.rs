@@ -51,6 +51,7 @@ async fn chat_logprobs(stream: bool) -> Vec<(String, f64)> {
             output_tokens: u32::try_from(CHUNKS.len() + 1).unwrap(),
             finish_reasons: vec!["stop"],
             generation: Default::default(),
+            requests: Default::default(),
         }
         .serve(listener),
     );

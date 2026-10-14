@@ -1995,14 +1995,16 @@ fn get_available_tool_call_parsers() -> Vec<String> {
         .clone()
 }
 
-/// The legacy parsers' names and Symphony's tables' (`symphony::formats::Table::name`), which
-/// `--parser symphony` reads with when both flags name one, sorted, each once.
+/// The legacy parsers' names, Symphony's tables' (`symphony::formats::Table::name`), which
+/// `--parser symphony` reads with when both flags name one, and `hf`, the table a model's
+/// response template compiles into, sorted, each once.
 fn with_symphony_tables(mut names: Vec<String>) -> Vec<String> {
     names.extend(
         symphony::formats::Table::ALL
             .iter()
             .map(|table| table.name().to_string()),
     );
+    names.push(config::TEMPLATE_PARSER.to_string());
     names.sort();
     names.dedup();
     names

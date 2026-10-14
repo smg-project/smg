@@ -1778,6 +1778,7 @@ mod tests {
             common::{attempt_ledger::AttemptLedger, retry::is_retryable_response},
             grpc::{
                 context::{PreparationOutput, SharedComponents},
+                regular::symphony::template::Templates,
                 utils,
             },
             PD_PREFILL_QUEUE_FULL,
@@ -4395,6 +4396,7 @@ mod tests {
         }))
         .unwrap();
         let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
             tokenizer_registry: Arc::new(TokenizerRegistry::new()),
             worker_registry: registry,
             tool_parser_factory: Default::default(),

@@ -1,47 +1,61 @@
-//! Symphony reading a chat response: the opt-in path that parses a model's output with one
-//! [`Engine`] per choice in place of the tool and reasoning parser crates.
+//! Symphony reading a chat response or a message: the opt-in path that parses a model's output
+//! with one [`Engine`] per choice in place of the tool and reasoning parser crates.
 //!
 //! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `legacy` by default),
 //! which a request's `X-SMG-Parser` header overrides for that one request ([`choice`]). With
-//! `symphony` on, the parser names set for the model decide ([`reads`]): the `tool_parser` and
-//! `reasoning_parser` of the model's card (worker labels), else the `--tool-call-parser` and
-//! `--reasoning-parser` flags, resolved as the legacy path resolves them (`ParserResolver`).
-//! A name a table answers to (`symphony::formats::Table::answering_to`: its own name, or a
-//! legacy parser's that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`)
-//! reads every request for the model with that table, whatever the model is, the tool-call name
-//! deciding; any other legacy tool-call parser's name keeps the legacy parsers, which is the way
-//! back for one model when its table misbehaves, `passthrough` among them; no name at all, or a
+//! `symphony` on, the parser names set for the model decide ([`reads`]): the
+//! `tool_parser` and `reasoning_parser` of the model's card (worker labels), else the
+//! `--tool-call-parser` and `--reasoning-parser` flags, resolved as the legacy path resolves them
+//! (`ParserResolver`). A name a table answers to (`symphony::formats::Table::answering_to`: its
+//! own name, or a legacy parser's that reads its format, `qwen` for `qwen3`, `qwen_xml` for
+//! `qwen3_tagged`) reads every request for the model with that table, whatever the model is, the
+//! tool-call name deciding; [`TEMPLATE_PARSER`] reads it with the table its tokenizer's
+//! `response_template` compiles into ([`template`]), and refuses the request when the model has
+//! none; any other legacy tool-call parser's name keeps the legacy parsers, which is the way back
+//! for one model when its table misbehaves, `passthrough` among them; no name at all, or a
 //! reasoning name alone that no table answers to, other than `passthrough`, takes the registry's
-//! table for the model
-//! (`symphony::formats::for_model`), and the legacy parsers with their own detection when it has
-//! none. The names are checked at startup and at a worker's registration ([`check_names`]).
-//! Every request read with `legacy` keeps the older parsers. The response names the parser that
-//! read it in `x-smg-parser`, legacy when the choice was Symphony but no table took the request,
-//! so a client comparing the two can tell which one read each answer.
+//! table for the model (`symphony::formats::for_model`), and the legacy parsers with their own
+//! detection when it has none. The names are checked at startup and at a worker's registration
+//! ([`check_names`]). Every request read with `legacy` keeps the older parsers. The response names
+//! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
+//! took the request, so a client comparing the two can tell which one read each answer. What a
+//! request asks of the channels takes a variant of the table rather than another reader: with no
+//! tools declared, or `tool_choice: none`, the table without its calls; with
+//! `separate_reasoning: false`, the table without its thought ([`assign`]).
 //!
-//! Request building assigns Symphony to a request ([`assign`]) and stores the [`Assignment`] in
-//! the response spec: the table, and the part of the rendered prompt the engine replays to find
-//! the state the generation starts in. Preparation asks the table for a forced or required call's
-//! structural tag ([`constraint`]) before the older registry. Both decide with one predicate,
-//! [`reads`], so the output a table's tag constrains is read by that table and never by the
-//! older parsers, which expect another syntax. The streaming and non-streaming
-//! drivers run one [`Reader`] per choice over the stop decoder's output and render its events
-//! with `symphony::adapt::chat`, so the client sees the deltas and the message it saw before.
+//! Request building assigns Symphony to a request ([`assign`], [`assign_messages`]) and stores
+//! the [`Assignment`] in the response spec: the table, and the part of the rendered prompt the
+//! engine replays to find the state the generation starts in. Preparation asks the table for the
+//! structural tag of a forced or required call, or of a JSON `response_format` ([`constraint`],
+//! [`constraint_messages`]) before the older registry. Both decide with one predicate, so the
+//! output a table's tag constrains is read by that table and never by the older parsers, which
+//! expect another syntax. The streaming and non-streaming drivers run one [`Reader`] per choice
+//! over the stop decoder's output and render its events with `symphony::adapt::chat` or
+//! `symphony::adapt::messages`, so the client sees the deltas and the message it saw before.
+
+pub(crate) mod template;
 
 use axum::http::HeaderMap;
 use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{Tool, ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
+    messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
 };
+use serde_json::{json, Value};
 use symphony::{
     formats::{for_model, table_for, Table},
-    Declared, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, TokenSpan,
+    grammar::Options,
+    Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, Parser as _, TokenSpan,
 };
 use tool_parser::ToolConstraint;
 use tracing::debug;
 
-use crate::{config::ParserChoice, routers::grpc::utils::Names};
+use self::template::Templates;
+use crate::{
+    config::{ParserChoice, TEMPLATE_PARSER},
+    routers::grpc::utils::{continues_final_assistant, Names},
+};
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
 /// gateway's `--parser` flag.
@@ -66,14 +80,25 @@ pub(crate) fn choice(
 /// for, so it keeps the legacy parsers, alone or beside another name.
 const PASSTHROUGH: &str = "passthrough";
 
+fn is_named(name: Option<&str>, what: &str) -> bool {
+    name.is_some_and(|name| name.trim().eq_ignore_ascii_case(what))
+}
+
 fn is_passthrough(name: Option<&str>) -> bool {
-    name.is_some_and(|name| name.trim().eq_ignore_ascii_case(PASSTHROUGH))
+    is_named(name, PASSTHROUGH)
+}
+
+/// Whether the parser names select the response template's table: either name is
+/// [`TEMPLATE_PARSER`]; [`check_names`] binds the other to it or to nothing.
+fn names_template(names: &Names) -> bool {
+    is_named(names.tool.as_deref(), TEMPLATE_PARSER)
+        || is_named(names.reasoning.as_deref(), TEMPLATE_PARSER)
 }
 
 /// The table the parser names set for a model select, when they do: the tool-call name's, else
 /// the reasoning name's when no tool-call name is set. A name is a table's own or a legacy
 /// parser's that reads its format ([`Table::answering_to`]); any other name selects none,
-/// `passthrough` among them, and so do no names at all.
+/// `passthrough` and [`TEMPLATE_PARSER`] among them, and so do no names at all.
 pub(crate) fn named_table(names: &Names) -> Option<Table> {
     names
         .tool
@@ -82,67 +107,48 @@ pub(crate) fn named_table(names: &Names) -> Option<Table> {
         .and_then(Table::answering_to)
 }
 
-/// The table that reads `request`'s response, if one does: the one [`selected`] by the parser
-/// names and the registry, unless the request asks what the older path answers differently. A
-/// table that reads calls from the output's first byte (`json`, `xlam`) reads a bare JSON answer
-/// as a call, so it declines a request that declares no tools: the request asked for no calls,
-/// and the older parsers read none. Preparation and request building both decide with this one
-/// predicate.
+/// The table that reads `model`'s responses under `parser`, if one does: the response template's
+/// when the `names` say [`TEMPLATE_PARSER`] (an error when the model has none that compiles, which
+/// refuses the request, since the names ask for what the model cannot give); else the one the
+/// names select ([`named_table`]), whatever the model; else the registry's for the model when no
+/// name is set, or when a reasoning name alone selects none, since every table reads the thought
+/// channel; `passthrough` alone is the choice to leave the thought as written, which no table
+/// does. A tool-call name no table answers to leaves the response to the legacy parsers. What a
+/// request asks of the channels takes a variant of the table ([`assign`]). Preparation and
+/// request building both decide with this one predicate.
 pub(crate) fn reads(
     parser: ParserChoice,
     names: &Names,
-    request: &ChatCompletionRequest,
-) -> Option<Format> {
-    let format = selected(parser, names, request)?;
-    let no_tools = request.effective_tools().next().is_none();
-    if format.starts_in_calls() && no_tools {
-        return None;
+    model: &str,
+    templates: &Templates,
+) -> Result<Option<Format>, String> {
+    if parser != ParserChoice::Symphony {
+        return Ok(None);
     }
-    Some(format)
-}
-
-/// The table `parser` and the parser `names` select for `request`: `parser` is Symphony, the
-/// request asks nothing the older path answers differently (the response separates reasoning,
-/// and `tool_choice` is not `none`), and a table is there to read it: the one the model's parser
-/// `names` select ([`named_table`]), whatever the model, or the registry's for the model when no
-/// name is set, or when a reasoning name alone selects none, since every table reads the thought
-/// channel; `passthrough` alone is the choice to leave the thought as written, which no table
-/// does. A tool-call name no table answers to leaves the response to the legacy parsers.
-fn selected(
-    parser: ParserChoice,
-    names: &Names,
-    request: &ChatCompletionRequest,
-) -> Option<Format> {
-    if parser != ParserChoice::Symphony
-        || !request.separate_reasoning
-        || matches!(
-            request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        )
-    {
-        return None;
+    if names_template(names) {
+        return templates.format(model).map(Some);
     }
     let table = match named_table(names) {
         Some(table) => table,
         None if names.tool.is_none() && !is_passthrough(names.reasoning.as_deref()) => {
-            return for_model(&request.model)
+            return Ok(for_model(model))
         }
-        None => return None,
+        None => return Ok(None),
     };
     // The registry's table comes with the model's own turn opener; a table named for a model
     // the registry reads with another, or does not know, replays from the table's own.
-    match for_model(&request.model) {
-        Some(format) if table_for(&request.model) == Some(table) => Some(format),
+    Ok(match for_model(model) {
+        Some(format) if table_for(model) == Some(table) => Some(format),
         _ => Some(table.format()),
-    }
+    })
 }
 
 /// Whether the parser names set for a model (the flags, or one worker's labels) are names the
-/// gateway reads with under `parser`: a legacy parser's, or, with Symphony on, a table's.
-/// `legacy_tool` and `legacy_reasoning` say whether the legacy registries have each name. A
-/// table no legacy parser shares binds the other name to the same table or to nothing: the
-/// legacy parsers read what a table declines (a response without separate reasoning, a
-/// `tool_choice` of `none`) by the names they are given, and have no parser of that name. The
+/// gateway reads with under `parser`: a legacy parser's, or, with Symphony on, a table's or
+/// [`TEMPLATE_PARSER`]. `legacy_tool` and `legacy_reasoning` say whether the legacy registries have each
+/// name. A table no legacy parser shares, and [`TEMPLATE_PARSER`], bind the other name to the same or to
+/// nothing: the legacy parsers read a forced call the table has no tag for by the names they are
+/// given, and have no parser of that name. The
 /// error says what is wrong with which name, for the startup or registration failure.
 pub(crate) fn check_names(
     parser: ParserChoice,
@@ -159,6 +165,24 @@ pub(crate) fn check_names(
         let Some(name) = name else {
             continue;
         };
+        if is_named(Some(name), TEMPLATE_PARSER) {
+            if !symphony {
+                return Err(format!(
+                    "unknown {kind} parser '{name}': the model's response template, which \
+                     --parser symphony reads with"
+                ));
+            }
+            if let Some(other) = other
+                .as_deref()
+                .filter(|other| !is_named(Some(other), TEMPLATE_PARSER))
+            {
+                return Err(format!(
+                    "{kind} parser '{name}' reads with the model's response template, so the \
+                     other parser must name '{TEMPLATE_PARSER}' or nothing, not '{other}'"
+                ));
+            }
+            continue;
+        }
         if legacy {
             continue;
         }
@@ -202,55 +226,246 @@ fn forces_call(tool_choice: &ToolChoice) -> bool {
     }
 }
 
-/// The structural tag the table gives a forced or required call to one of `tools`, with
-/// `reasoning_open` when the prompt leaves the model inside its thought. `None` when no table
-/// reads the response ([`reads`]), the choice forces no call, or the table has no grammar for its
-/// call syntax yet; the older registry then decides as before.
+/// The schema a JSON `response_format` asks the answer to follow: any object for `json_object`.
+fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Value> {
+    match response_format? {
+        ResponseFormat::JsonObject => Some(json!({"type": "object"})),
+        ResponseFormat::JsonSchema { json_schema } => Some(json_schema.schema.clone()),
+        ResponseFormat::Text => None,
+    }
+}
+
+/// The structural tag `format` writes for what the request asks of the whole answer: calls to
+/// `tools` when `forced` (at most one when `one_call`), else, for the response template's table
+/// alone (`compiled`, [`TEMPLATE_PARSER`]), an answer following `schema` when there is one; the
+/// registry's tables leave a JSON `response_format` to the engine's schema, as before.
+/// `reasoning_open` when the prompt leaves the model inside its thought. A registry table with
+/// no tag for a forced call leaves the older registry to decide, as before; the template's table
+/// refuses instead: its output has no other syntax the older path could constrain and the table
+/// still read, and so does a prompt that continues the assistant's message, since the tag writes
+/// a turn from its start.
+/// The constraint `grammar` gives, for the response template's table too (`compiled`,
+/// [`TEMPLATE_PARSER`]): a registry table with no tag leaves the older registry to decide, as
+/// before; the template's table refuses instead, since its output has no other syntax the older
+/// path could constrain and the table still read, and so does a prompt that `continues` the
+/// assistant's message, since the tag writes a turn from its start.
+fn tagged(
+    grammar: Option<Grammar>,
+    compiled: bool,
+    model: &str,
+    asked: &str,
+    continues: bool,
+) -> Result<Option<ToolConstraint>, String> {
+    match grammar {
+        Some(_) if compiled && continues => Err(format!(
+            "model '{model}' constrains {asked} from the start of a new assistant message, as its \
+             response template writes one, so it cannot continue the assistant's message"
+        )),
+        Some(grammar) => Ok(Some(ToolConstraint::StructuralTag(
+            grammar.payload().to_string(),
+        ))),
+        None if compiled => Err(format!(
+            "model '{model}' reads its output with its response template, whose table has no \
+             structural tag for {asked}"
+        )),
+        None => Ok(None),
+    }
+}
+
+/// The tag of a forced call to one of `tools`, at most one when `one_call`, with
+/// `reasoning_open` when the prompt leaves the model inside its thought ([`tagged`]).
+fn calls_tag(
+    format: &Format,
+    compiled: bool,
+    model: &str,
+    tools: &[Tool],
+    one_call: bool,
+    reasoning_open: bool,
+    continues: bool,
+) -> Result<Option<ToolConstraint>, String> {
+    let grammar = format.grammar_for(
+        tools,
+        Options {
+            at_least_one: true,
+            reasoning_open,
+            one_call,
+        },
+    );
+    tagged(grammar, compiled, model, "a forced tool choice", continues)
+}
+
+/// The tag of a JSON answer following `schema`, for the response template's table alone: the
+/// registry's tables leave a JSON `response_format` to the engine's schema, as before.
+fn answer_tag(
+    format: &Format,
+    model: &str,
+    schema: &Value,
+    reasoning_open: bool,
+    continues: bool,
+) -> Result<Option<ToolConstraint>, String> {
+    let grammar = format.answer_grammar(schema, reasoning_open);
+    tagged(grammar, true, model, "a JSON answer", continues)
+}
+
+/// The structural tag the table gives a chat request's forced or required call to one of `tools`,
+/// or its JSON `response_format`, with `reasoning_open` when the prompt leaves the model inside
+/// its thought ([`calls_tag`], [`answer_tag`]). `Ok(None)` when no table reads the response
+/// ([`reads`]), the request asks neither, or the table has no tag for it; the older registry then
+/// decides as before. An error refuses the request: the response template's table cannot
+/// constrain what is asked, or a `regex` or `ebnf` constraint would apply outside its format.
 pub(crate) fn constraint(
     parser: ParserChoice,
     names: &Names,
     request: &ChatCompletionRequest,
     tools: &[Tool],
     reasoning_open: bool,
-) -> Option<ToolConstraint> {
-    let format = reads(parser, names, request)?;
-    if !request.tool_choice.as_ref().is_some_and(forces_call) {
-        return None;
+    templates: &Templates,
+) -> Result<Option<ToolConstraint>, String> {
+    let Some(format) = reads(parser, names, &request.model, templates)? else {
+        return Ok(None);
+    };
+    let compiled = names_template(names);
+    if compiled && (request.regex.is_some() || request.ebnf.is_some()) {
+        return Err(format!(
+            "model '{}' writes its output in the format its response template declares, and a \
+             regex or ebnf constraint would apply outside it",
+            request.model
+        ));
     }
-    let grammar = format.grammar(tools, true, reasoning_open)?;
-    Some(ToolConstraint::StructuralTag(grammar.payload().to_string()))
+    let continues = continues_final_assistant(request);
+    if !tools.is_empty() && request.tool_choice.as_ref().is_some_and(forces_call) {
+        let one_call = matches!(request.tool_choice, Some(ToolChoice::Function { .. }))
+            || request.parallel_tool_calls == Some(false);
+        return calls_tag(
+            &format,
+            compiled,
+            &request.model,
+            tools,
+            one_call,
+            reasoning_open,
+            continues,
+        );
+    }
+    match answer_schema(request.response_format.as_ref()) {
+        Some(schema) if compiled => {
+            answer_tag(&format, &request.model, &schema, reasoning_open, continues)
+        }
+        _ => Ok(None),
+    }
 }
 
-/// Symphony's assignment to a response: the table that reads it, and the part of the rendered
-/// prompt the engine replays.
+/// [`constraint`] for a Messages request: a `tool_choice` of `any` or a named tool forces a call
+/// to one of `tools`, one call when the tool is named or parallel use is disabled. `continues`
+/// says whether the prompt continues the assistant's message.
+pub(crate) fn constraint_messages(
+    parser: ParserChoice,
+    names: &Names,
+    request: &CreateMessageRequest,
+    tools: &[Tool],
+    reasoning_open: bool,
+    continues: bool,
+    templates: &Templates,
+) -> Result<Option<ToolConstraint>, String> {
+    let Some(format) = reads(parser, names, &request.model, templates)? else {
+        return Ok(None);
+    };
+    let one_call = match &request.tool_choice {
+        _ if tools.is_empty() => return Ok(None),
+        Some(MessagesToolChoice::Tool { .. }) => true,
+        Some(MessagesToolChoice::Any {
+            disable_parallel_tool_use,
+        }) => *disable_parallel_tool_use == Some(true),
+        _ => return Ok(None),
+    };
+    calls_tag(
+        &format,
+        names_template(names),
+        &request.model,
+        tools,
+        one_call,
+        reasoning_open,
+        continues,
+    )
+}
+
+/// Symphony's assignment to a response: the table that reads it, as the request's asks make it
+/// ([`assign`]), and the part of the rendered prompt the engine replays.
 #[derive(Clone, Debug)]
 pub(crate) struct Assignment {
     pub format: Format,
     pub prompt: String,
 }
 
-/// Symphony's assignment to `request`, if a table reads the response ([`reads`]) and the
-/// constraint, when there is one, is not a JSON schema: the older path's forced call, whose
-/// output has no markers for a table to read, which the older registry writes where the table
-/// has no grammar for its syntax yet.
+/// The assignment of `format` to a response, with the part of `prompt` the engine replays. Not
+/// made when the constraint is a JSON schema: the older path's forced call, whose output has no
+/// markers for a table to read, which the older registry writes where the table has no tag.
+fn assignment(
+    format: Option<Format>,
+    model: &str,
+    constraint: Option<&(String, String)>,
+    prompt: &str,
+) -> Option<Assignment> {
+    let format = format?;
+    if constraint.is_some_and(|(kind, _)| kind == "json_schema") {
+        return None;
+    }
+    debug!(model, table = format.name(), "Symphony reads the response");
+    let prompt = format.replay(prompt).to_string();
+    Some(Assignment { format, prompt })
+}
+
+/// The table as the request's asks make it: without its calls when the request declares no tools
+/// or asks for none, as the legacy path runs no tool parser then, and a table that reads calls
+/// from the output's first byte (`json`, `xlam`) is content from it; without its thought when the
+/// request keeps the reasoning in the content, as the legacy path runs no reasoning parser then.
+fn asked(format: Format, no_calls: bool, no_reasoning: bool) -> Format {
+    let format = if no_calls {
+        format.without_calls()
+    } else {
+        format
+    };
+    if no_reasoning {
+        format.without_reasoning()
+    } else {
+        format
+    }
+}
+
+/// Symphony's assignment to a chat `request`, if a table reads the response ([`reads`]) and the
+/// constraint is not a JSON schema ([`assignment`]): the table without its calls for no tools or
+/// a `tool_choice` of `none`, without its thought for `separate_reasoning: false` ([`asked`]).
 pub(crate) fn assign(
     parser: ParserChoice,
     names: &Names,
     request: &ChatCompletionRequest,
     constraint: Option<&(String, String)>,
     prompt: &str,
-) -> Option<Assignment> {
-    let format = reads(parser, names, request)?;
-    if constraint.is_some_and(|(kind, _)| kind == "json_schema") {
-        return None;
-    }
-    debug!(
-        model = %request.model,
-        table = format.name(),
-        "Symphony reads the response"
-    );
-    let prompt = format.replay(prompt).to_string();
-    Some(Assignment { format, prompt })
+    templates: &Templates,
+) -> Result<Option<Assignment>, String> {
+    let format = reads(parser, names, &request.model, templates)?;
+    let no_calls = matches!(
+        request.tool_choice,
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+    ) || request.effective_tools().next().is_none();
+    let format = format.map(|format| asked(format, no_calls, !request.separate_reasoning));
+    Ok(assignment(format, &request.model, constraint, prompt))
+}
+
+/// [`assign`] for a Messages request: its thinking blocks are always its own, so only the
+/// calls' ask takes a variant.
+pub(crate) fn assign_messages(
+    parser: ParserChoice,
+    names: &Names,
+    request: &CreateMessageRequest,
+    constraint: Option<&(String, String)>,
+    prompt: &str,
+    templates: &Templates,
+) -> Result<Option<Assignment>, String> {
+    let format = reads(parser, names, &request.model, templates)?;
+    let no_calls = matches!(request.tool_choice, Some(MessagesToolChoice::None))
+        || request.tools.as_deref().is_none_or(<[_]>::is_empty);
+    let format = format.map(|format| asked(format, no_calls, false));
+    Ok(assignment(format, &request.model, constraint, prompt))
 }
 
 /// The engine's finish reason as Symphony takes it.
@@ -464,6 +679,9 @@ impl Reader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use llm_tokenizer::registry::TokenizerRegistry;
     use serde_json::{json, Value};
     use symphony::{formats::qwen3, CallSyntax};
 
@@ -493,6 +711,34 @@ mod tests {
             tool: tool.map(str::to_string),
             reasoning: reasoning.map(str::to_string),
         }
+    }
+
+    /// No tokenizer registered: the response template's table is never there.
+    fn templates() -> Templates {
+        Templates::new(Arc::new(TokenizerRegistry::new()))
+    }
+
+    /// [`super::assign`] with no templates: the names never say `hf`, so nothing is refused.
+    fn assign(
+        parser: ParserChoice,
+        names: &Names,
+        request: &ChatCompletionRequest,
+        constraint: Option<&(String, String)>,
+        prompt: &str,
+    ) -> Option<Assignment> {
+        super::assign(parser, names, request, constraint, prompt, &templates()).expect("no hf")
+    }
+
+    /// [`super::constraint`] with no templates, as [`assign`].
+    fn constraint(
+        parser: ParserChoice,
+        names: &Names,
+        request: &ChatCompletionRequest,
+        tools: &[Tool],
+        reasoning_open: bool,
+    ) -> Option<ToolConstraint> {
+        super::constraint(parser, names, request, tools, reasoning_open, &templates())
+            .expect("no hf")
     }
 
     #[test]
@@ -566,16 +812,22 @@ mod tests {
     }
 
     #[test]
-    fn a_table_that_reads_calls_from_the_first_byte_needs_tools() {
+    fn a_request_without_tools_is_read_by_every_table_and_its_calls_are_content() {
         // `json` and `xlam` read a bare JSON answer as a call: without tools the request asked
-        // for none, so the legacy parsers keep it; a table with call markers reads either way.
+        // for none, so the table goes without its calls and the answer is the text it was, as
+        // the legacy parsers leave it when they run no tool parser; a table with call markers
+        // goes the same way.
         let json = names(Some("json"), None);
         let without = request(json!({}));
-        assert!(assign(ParserChoice::Symphony, &json, &without, None, PROMPT).is_none());
-        let tools = serde_json::to_value(tools()).expect("tools");
-        let with = request(json!({"tools": tools}));
-        let assigned = assign(ParserChoice::Symphony, &json, &with, None, PROMPT);
-        assert_eq!(assigned.expect("assigned").format.name(), "json");
+        let assigned =
+            assign(ParserChoice::Symphony, &json, &without, None, PROMPT).expect("assigned");
+        assert_eq!(assigned.format.name(), "json");
+        assert_eq!(assigned.format.call_syntax(), None);
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let with = request(json!({"tools": declared}));
+        let assigned =
+            assign(ParserChoice::Symphony, &json, &with, None, PROMPT).expect("assigned");
+        assert!(assigned.format.call_syntax().is_some());
         let xlam = request(json!({"model": "Salesforce/Llama-xLAM-2-8b-fc-r"}));
         let by_registry = assign(
             ParserChoice::Symphony,
@@ -583,35 +835,22 @@ mod tests {
             &xlam,
             None,
             PROMPT,
-        );
-        assert!(by_registry.is_none());
-        let qwen = assign(
-            ParserChoice::Symphony,
-            &Names::default(),
-            &without,
-            None,
-            PROMPT,
-        );
-        assert_eq!(qwen.expect("assigned").format.name(), "qwen3");
-        // Inkling starts in an arguments state too, but its call has a marker after the tool's
-        // name, so a bare answer is never a call: the table reads a request without tools.
-        let inkling = assign(
-            ParserChoice::Symphony,
-            &names(Some("inkling"), None),
-            &without,
-            None,
-            PROMPT,
-        );
-        assert_eq!(inkling.expect("assigned").format.name(), "inkling");
-        // Llama Nemotron writes xLAM's list between markers: a bare answer is never a call there.
-        let nemotron = assign(
-            ParserChoice::Symphony,
-            &names(Some("llama_nemotron"), None),
-            &without,
-            None,
-            PROMPT,
-        );
-        assert_eq!(nemotron.expect("assigned").format.name(), "llama_nemotron");
+        )
+        .expect("assigned");
+        assert_eq!(by_registry.format.name(), "xlam");
+        assert_eq!(by_registry.format.call_syntax(), None);
+        for named in ["inkling", "llama_nemotron"] {
+            let assigned = assign(
+                ParserChoice::Symphony,
+                &names(Some(named), None),
+                &without,
+                None,
+                PROMPT,
+            )
+            .expect("assigned");
+            assert_eq!(assigned.format.name(), named);
+            assert_eq!(assigned.format.call_syntax(), None);
+        }
     }
 
     #[test]
@@ -831,44 +1070,60 @@ mod tests {
     }
 
     #[test]
-    fn a_request_no_table_reads_takes_no_constraint_from_one() {
-        // The older parsers read this response (it keeps the thought in the content), so a tag
-        // in the table's syntax would hand them a call they cannot read: the older registry
-        // decides, as it does for the whole request.
-        let unread = request(json!({"tool_choice": "required", "separate_reasoning": false}));
-        assert!(assign(
-            ParserChoice::Symphony,
-            &Names::default(),
-            &unread,
-            None,
-            PROMPT
-        )
-        .is_none());
+    fn the_requests_asks_take_a_variant_of_the_table_and_do_not_switch_the_reader() {
+        // A request that keeps the thought in the content, or asks for no calls, is read by the
+        // same table without its thought or its calls; the constraint is the full table's.
+        let table = |request: &ChatCompletionRequest| {
+            reads(
+                ParserChoice::Symphony,
+                &Names::default(),
+                &request.model,
+                &templates(),
+            )
+            .expect("read")
+            .expect("a table")
+        };
+        let assigned = |request: &ChatCompletionRequest| {
+            assign(
+                ParserChoice::Symphony,
+                &Names::default(),
+                request,
+                None,
+                PROMPT,
+            )
+            .expect("assigned")
+            .format
+        };
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let kept = request(
+            json!({"tools": declared, "tool_choice": "required", "separate_reasoning": false}),
+        );
+        assert_eq!(assigned(&kept), table(&kept).without_reasoning());
         assert!(constraint(
             ParserChoice::Symphony,
             &Names::default(),
-            &unread,
+            &kept,
+            &tools(),
+            false
+        )
+        .is_some());
+        let no_calls = request(json!({"tool_choice": "none"}));
+        assert_eq!(assigned(&no_calls), table(&no_calls).without_calls());
+        assert!(constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &no_calls,
             &tools(),
             false
         )
         .is_none());
-        let read = request(json!({"tool_choice": "required"}));
-        assert!(assign(
-            ParserChoice::Symphony,
-            &Names::default(),
-            &read,
-            None,
-            PROMPT
-        )
-        .is_some());
-        assert!(constraint(
-            ParserChoice::Symphony,
-            &Names::default(),
-            &read,
-            &tools(),
-            false
-        )
-        .is_some());
+        let neither = request(json!({"separate_reasoning": false}));
+        assert_eq!(
+            assigned(&neither),
+            table(&neither).without_calls().without_reasoning()
+        );
+        let both = request(json!({"tools": declared}));
+        assert_eq!(assigned(&both), table(&both));
     }
 
     #[test]
@@ -886,27 +1141,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_model_and_requests_the_older_path_answers_differently_are_not_assigned() {
+    fn an_unknown_model_and_a_json_schema_constraint_are_not_assigned() {
         assert!(assign(
             ParserChoice::Symphony,
             &Names::default(),
             &request(json!({"model": "unknown"})),
-            None,
-            PROMPT
-        )
-        .is_none());
-        assert!(assign(
-            ParserChoice::Symphony,
-            &Names::default(),
-            &request(json!({"separate_reasoning": false})),
-            None,
-            PROMPT
-        )
-        .is_none());
-        assert!(assign(
-            ParserChoice::Symphony,
-            &Names::default(),
-            &request(json!({"tool_choice": "none"})),
             None,
             PROMPT
         )
@@ -988,5 +1227,402 @@ mod tests {
         assert!(finished(&events).is_some());
         assert!(reader.ended());
         assert!(reader.end(EngineFinish::Stop).expect("ended").is_empty());
+    }
+
+    fn message_request(extra: Value) -> CreateMessageRequest {
+        let mut request = json!({
+            "model": "Qwen/Qwen3-8B", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            request[key] = value.clone();
+        }
+        serde_json::from_value(request).expect("messages request")
+    }
+
+    fn tag_of(constraint: Result<Option<ToolConstraint>, String>) -> Value {
+        match constraint {
+            Ok(Some(ToolConstraint::StructuralTag(tag))) => {
+                serde_json::from_str(&tag).expect("a tag as JSON")
+            }
+            other => panic!("a structural tag, not {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hf_reads_with_the_response_templates_table_and_refuses_a_model_without_one() {
+        let templates = template::fixtures::templates_with(
+            "Qwen/Qwen3-8B",
+            template::fixtures::qwen3_5_tokenizer(),
+        )
+        .await;
+        let hf = names(Some("hf"), Some(" HF "));
+        let read = |names: &Names, request: &ChatCompletionRequest| {
+            reads(ParserChoice::Symphony, names, &request.model, &templates)
+        };
+        // The template's table reads the model the registry knows with another table, named
+        // on both sides or on either alone.
+        for names in [&hf, &names(Some("hf"), None), &names(None, Some("hf"))] {
+            let format = read(names, &request(json!({})))
+                .expect("read")
+                .expect("a table");
+            assert_eq!(format.name(), "response_template");
+        }
+        assert!(
+            reads(ParserChoice::Legacy, &hf, "Qwen/Qwen3-8B", &templates)
+                .expect("read")
+                .is_none()
+        );
+        // What the request asks of the channels takes a variant of the templates' table.
+        let kept = request(json!({"separate_reasoning": false}));
+        let assigned = super::assign(ParserChoice::Symphony, &hf, &kept, None, PROMPT, &templates)
+            .expect("read")
+            .expect("assigned");
+        assert_eq!(
+            assigned.format,
+            read(&hf, &kept)
+                .expect("read")
+                .expect("a table")
+                .without_calls()
+                .without_reasoning()
+        );
+        // A model with no table of its own is refused with the reason, in both decisions.
+        let unknown = request(json!({"model": "unknown"}));
+        assert_eq!(
+            read(&hf, &unknown).expect_err("refused"),
+            "no tokenizer is registered for model 'unknown'"
+        );
+        assert!(super::assign(
+            ParserChoice::Symphony,
+            &hf,
+            &unknown,
+            None,
+            PROMPT,
+            &templates
+        )
+        .is_err());
+        let assigned = super::assign(
+            ParserChoice::Symphony,
+            &hf,
+            &request(json!({})),
+            None,
+            PROMPT,
+            &templates,
+        )
+        .expect("read")
+        .expect("assigned");
+        assert_eq!(assigned.format.name(), "response_template");
+        assert_eq!(assigned.prompt, "<|im_start|>assistant\n<think>\n");
+    }
+
+    #[test]
+    fn hf_is_a_name_under_symphony_alone_and_binds_the_other_name() {
+        let symphony = ParserChoice::Symphony;
+        assert_eq!(
+            check_names(symphony, &names(Some("hf"), None), false, false),
+            Ok(())
+        );
+        assert_eq!(
+            check_names(symphony, &names(None, Some("hf")), false, false),
+            Ok(())
+        );
+        assert_eq!(
+            check_names(symphony, &names(Some("HF"), Some(" hf ")), false, false),
+            Ok(())
+        );
+        let why = check_names(symphony, &names(Some("hf"), Some("qwen3")), false, true);
+        assert_eq!(
+            why.expect_err("bound"),
+            "tool-call parser 'hf' reads with the model's response template, so the other \
+             parser must name 'hf' or nothing, not 'qwen3'"
+        );
+        let why = check_names(symphony, &names(Some("qwen"), Some("hf")), true, false);
+        assert_eq!(
+            why.expect_err("bound"),
+            "reasoning parser 'hf' reads with the model's response template, so the other \
+             parser must name 'hf' or nothing, not 'qwen'"
+        );
+        let why = check_names(ParserChoice::Legacy, &names(Some("hf"), None), false, true);
+        assert_eq!(
+            why.expect_err("legacy"),
+            "unknown tool-call parser 'hf': the model's response template, which --parser \
+             symphony reads with"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_templates_table_gives_a_forced_call_and_a_json_answer_their_tags_or_refuses() {
+        let model = "Qwen/Qwen3-8B";
+        let with_layout =
+            template::fixtures::templates_with(model, template::fixtures::qwen3_5_tokenizer())
+                .await;
+        let without_layout =
+            template::fixtures::templates_with(model, template::fixtures::unrendered_tokenizer())
+                .await;
+        let hf = names(Some("hf"), Some("hf"));
+        let constrain = |templates: &Templates, extra: Value| {
+            super::constraint(
+                ParserChoice::Symphony,
+                &hf,
+                &request(extra),
+                &tools(),
+                false,
+                templates,
+            )
+        };
+        // A forced call, one call for a named function, and a JSON answer take the table's tags.
+        let required = tag_of(constrain(&with_layout, json!({"tool_choice": "required"})));
+        assert!(required["format"].is_object(), "{required}");
+        let named = tag_of(constrain(
+            &with_layout,
+            json!({"tool_choice": {"type": "function", "function": {"name": "lookup"}}}),
+        ));
+        assert_ne!(named, required, "one call ends where the turn does");
+        let answer = tag_of(constrain(
+            &with_layout,
+            json!({"response_format": {"type": "json_object"}}),
+        ));
+        assert!(answer["format"].is_object(), "{answer}");
+        // Nothing asked, nothing constrained.
+        assert!(constrain(&with_layout, json!({"tool_choice": "auto"}))
+            .expect("read")
+            .is_none());
+        // Without a layout the table has no tag for a call: the template's table refuses, where
+        // a registry table would leave the older registry to decide. Its content opens with no
+        // marker, so a JSON answer is written from the first byte, layout or not.
+        let why =
+            constrain(&without_layout, json!({"tool_choice": "required"})).expect_err("no tag");
+        assert!(
+            why.contains("no structural tag for a forced tool choice"),
+            "{why}"
+        );
+        let answer = tag_of(constrain(
+            &without_layout,
+            json!({"response_format": {"type": "json_object"}}),
+        ));
+        assert_eq!(answer["format"]["type"], "json_schema", "{answer}");
+        let plain = names(None, None);
+        assert!(
+            super::constraint(
+                ParserChoice::Symphony,
+                &plain,
+                &request(json!({"response_format": {"type": "json_object"}})),
+                &tools(),
+                false,
+                &templates(),
+            )
+            .expect("read")
+            .is_none(),
+            "the Qwen3 table has no layout, so the older registry's JSON schema stands"
+        );
+        // A regex or ebnf constraint would apply outside the template's format.
+        let why = constrain(
+            &with_layout,
+            json!({"tool_choice": "required", "regex": "a+"}),
+        )
+        .expect_err("refused");
+        assert!(why.contains("regex or ebnf"), "{why}");
+        // The tag writes a turn from its start: a continued assistant message is refused.
+        let continued = json!({
+            "tool_choice": "required",
+            "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "I"}],
+            "continue_final_message": true, "add_generation_prompt": false,
+        });
+        assert!(
+            continues_final_assistant(&request(continued.clone())),
+            "the request continues"
+        );
+        let why = constrain(&with_layout, continued).expect_err("refused");
+        assert!(
+            why.contains("cannot continue the assistant's message"),
+            "{why}"
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_are_read_by_the_same_tables_and_their_tool_choice_forces_calls() {
+        let symphony = ParserChoice::Symphony;
+        let plain = Names::default();
+        let read = reads(symphony, &plain, "Qwen/Qwen3-8B", &templates())
+            .expect("read")
+            .expect("the registry's table");
+        assert_eq!(read.name(), "qwen3");
+        assert!(
+            reads(ParserChoice::Legacy, &plain, "Qwen/Qwen3-8B", &templates())
+                .expect("read")
+                .is_none()
+        );
+        // A tool_choice of none takes the table without its calls.
+        let no_calls = assign_messages(
+            symphony,
+            &plain,
+            &message_request(json!({"tool_choice": {"type": "none"}})),
+            None,
+            PROMPT,
+            &templates(),
+        )
+        .expect("read")
+        .expect("assigned");
+        assert_eq!(no_calls.format.name(), "qwen3");
+        assert_eq!(no_calls.format.call_syntax(), None);
+        let constrain = |extra: Value| {
+            constraint_messages(
+                symphony,
+                &plain,
+                &message_request(extra),
+                &tools(),
+                false,
+                false,
+                &templates(),
+            )
+        };
+        let any = tag_of(constrain(json!({"tool_choice": {"type": "any"}})));
+        let one = tag_of(constrain(
+            json!({"tool_choice": {"type": "any", "disable_parallel_tool_use": true}}),
+        ));
+        let tool = tag_of(constrain(
+            json!({"tool_choice": {"type": "tool", "name": "lookup"}}),
+        ));
+        assert_ne!(any, one, "one call ends where the turn does");
+        assert_eq!(tool, one, "a named tool is one call");
+        assert!(constrain(json!({"tool_choice": {"type": "auto"}}))
+            .expect("read")
+            .is_none());
+        assert!(constrain(json!({})).expect("read").is_none());
+        let assigned = assign_messages(
+            symphony,
+            &plain,
+            &message_request(json!({})),
+            None,
+            PROMPT,
+            &templates(),
+        )
+        .expect("read")
+        .expect("assigned");
+        assert_eq!(assigned.format.name(), "qwen3");
+        assert_eq!(assigned.prompt, "<|im_start|>assistant\n<think>\n");
+        // The template's table reads messages too, and refuses what it cannot tag.
+        let hf = names(Some("hf"), None);
+        let unrendered = template::fixtures::templates_with(
+            "Qwen/Qwen3-8B",
+            template::fixtures::unrendered_tokenizer(),
+        )
+        .await;
+        let why = constraint_messages(
+            symphony,
+            &hf,
+            &message_request(json!({"tool_choice": {"type": "any"}})),
+            &tools(),
+            false,
+            false,
+            &unrendered,
+        )
+        .expect_err("no tag");
+        assert!(why.contains("no structural tag"), "{why}");
+    }
+
+    /// A Qwen3 output: a thought, content, and one call of the declared `lookup` tool.
+    const QWEN3_OUTPUT: &str = "<think>plan</think>\n\nHello <tool_call>\n\
+                                {\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>";
+
+    fn read_with(format: Format) -> Vec<Event> {
+        let assignment = Assignment {
+            format,
+            prompt: "<|im_start|>assistant\n".to_string(),
+        };
+        let mut reader = Reader::new(&assignment, &tools()).expect("a reader");
+        let mut events = reader.tail(QWEN3_OUTPUT).expect("read");
+        events.extend(reader.end(EngineFinish::Stop).expect("ended"));
+        events
+    }
+
+    fn content_of(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bare_answer_the_json_table_reads_as_a_call_comes_back_as_its_text() {
+        let assignment = Assignment {
+            format: symphony::formats::json().without_calls(),
+            prompt: String::new(),
+        };
+        let mut reader = Reader::new(&assignment, &[]).expect("a reader");
+        let answer = "{\"answer\": 42}";
+        let mut events = reader.tail(answer).expect("read");
+        events.extend(reader.end(EngineFinish::Stop).expect("ended"));
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) | Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, answer);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallStart { .. })));
+        let Some(Event::Finish { tool_calls, .. }) = events.last() else {
+            panic!("a finish");
+        };
+        assert_eq!(*tool_calls, 0);
+    }
+
+    #[test]
+    fn a_reader_over_a_tables_variant_gives_the_calls_or_the_thought_as_content() {
+        // The table itself: the thought apart, the call a call.
+        let events = read_with(qwen3(CallSyntax::Json));
+        assert!(events.iter().any(|e| matches!(e, Event::Reasoning(_))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallStart { .. })));
+        assert_eq!(content_of(&events).trim(), "Hello");
+        let Some(Event::Finish { tool_calls, .. }) = events.last() else {
+            panic!("a finish");
+        };
+        assert_eq!(*tool_calls, 1);
+        // Without its calls: the call and its markers are content, the finish counts no call.
+        let events = read_with(qwen3(CallSyntax::Json).without_calls());
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallStart { .. })));
+        assert!(events.iter().any(|e| matches!(e, Event::Reasoning(_))));
+        let content = content_of(&events);
+        assert!(
+            content
+                .trim_start()
+                .starts_with("Hello <tool_call>\n{\"name\": \"lookup\""),
+            "{content:?}"
+        );
+        assert!(content.ends_with("</tool_call>"), "{content:?}");
+        assert!(!content.contains("<think>"), "{content:?}");
+        let Some(Event::Finish { tool_calls, .. }) = events.last() else {
+            panic!("a finish");
+        };
+        assert_eq!(*tool_calls, 0);
+        // Without its thought: the thought and its markers are content, the call stays a call.
+        let events = read_with(qwen3(CallSyntax::Json).without_reasoning());
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::Reasoning(_) | Event::ReasoningStart)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallStart { .. })));
+        let content = content_of(&events);
+        assert!(content.starts_with("<think>plan</think>"), "{content:?}");
+        assert!(content.contains("Hello"), "{content:?}");
+        assert!(!content.contains("<tool_call>"), "{content:?}");
+        let Some(Event::Finish {
+            reasoning_tokens, ..
+        }) = events.last()
+        else {
+            panic!("a finish");
+        };
+        assert_eq!(*reasoning_tokens, 0);
     }
 }

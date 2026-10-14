@@ -1346,15 +1346,19 @@ struct CliArgs {
     // ==================== Parsers ====================
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
     /// symphony, a Symphony table's name here (and in --tool-call-parser, or
-    /// there alone) reads every model with that table; a legacy parser's name
-    /// keeps the legacy parsers. A worker's labels set the names per model.
+    /// there alone) reads every model with that table; `hf` reads each model
+    /// with the table its tokenizer's response_template compiles into; a
+    /// legacy parser's name keeps the legacy parsers. A worker's labels set
+    /// the names per model.
     #[arg(long, help_heading = "Parsers")]
     reasoning_parser: Option<String>,
 
     /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
     /// symphony, a Symphony table's name here (and in --reasoning-parser, or
-    /// here alone) reads every model with that table; a legacy parser's name
-    /// keeps the legacy parsers. A worker's labels set the names per model.
+    /// here alone) reads every model with that table; `hf` reads each model
+    /// with the table its tokenizer's response_template compiles into; a
+    /// legacy parser's name keeps the legacy parsers. A worker's labels set
+    /// the names per model.
     #[arg(long, help_heading = "Parsers")]
     tool_call_parser: Option<String>,
 

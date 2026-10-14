@@ -6,7 +6,8 @@ use anyhow::Result;
 
 use crate::{
     chat_template::{
-        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+        ChatTemplateContentFormat, ChatTemplateParams, ChatTemplateProcessor, ThinkingKeyName,
+        ThinkingToggle,
     },
     traits::{
         ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding,
@@ -45,6 +46,9 @@ pub struct MockTokenizer {
     /// generation-prompt flag as JSON, so a test can assert exactly what
     /// reached the template.
     json_chat_template: bool,
+    response_template: Option<serde_json::Value>,
+    /// When set, `apply_chat_template` renders with this template, as a checkpoint's would.
+    chat_template: Option<ChatTemplateProcessor>,
 }
 
 impl Default for MockTokenizer {
@@ -108,6 +112,8 @@ impl MockTokenizer {
             renderer_capabilities: RendererCapabilities::default(),
             content_format: ChatTemplateContentFormat::default(),
             json_chat_template: false,
+            response_template: None,
+            chat_template: None,
         }
     }
 
@@ -201,6 +207,27 @@ impl MockTokenizer {
             self.reverse_vocab.insert(id, token.to_string());
         }
         self
+    }
+
+    /// Name `text` as the end-of-sequence token: the one `eos_token_ids` reports, in the
+    /// vocabulary under the `<eos>` id.
+    pub fn with_eos_token(mut self, text: &str) -> Self {
+        self.vocab.insert(text.to_string(), 999);
+        self.reverse_vocab.insert(999, text.to_string());
+        self.special_tokens.eos_token = Some(text.to_string());
+        self
+    }
+
+    /// Report `template` from `response_template()`.
+    pub fn with_response_template(mut self, template: serde_json::Value) -> Self {
+        self.response_template = Some(template);
+        self
+    }
+
+    /// Render `apply_chat_template` with the Jinja `template`, as a checkpoint's tokenizer would.
+    pub fn with_chat_template(mut self, template: &str) -> Result<Self> {
+        self.chat_template = Some(ChatTemplateProcessor::new(template.to_string())?);
+        Ok(self)
     }
 }
 
@@ -305,6 +332,9 @@ impl TokenizerTrait for MockTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
+        if let Some(processor) = &self.chat_template {
+            return processor.apply_chat_template(messages, params);
+        }
         if self.json_chat_template {
             let mut rendered = serde_json::json!({
                 "messages": messages,
@@ -368,5 +398,9 @@ impl TokenizerTrait for MockTokenizer {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.response_template.as_ref()
     }
 }

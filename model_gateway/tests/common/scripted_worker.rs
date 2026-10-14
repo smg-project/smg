@@ -1,7 +1,10 @@
 //! Scripted gRPC worker for terminal-state contract tests.
 use std::{
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use futures::{stream, Stream};
@@ -18,6 +21,8 @@ pub struct ScriptedWorker {
     pub output_tokens: u32,
     pub finish_reasons: Vec<&'static str>,
     pub generation: AtomicUsize,
+    /// Every generate request received, for a test to read what the gateway sent.
+    pub requests: Arc<Mutex<Vec<ts::GenerateRequest>>>,
 }
 impl ScriptedWorker {
     #[expect(
@@ -47,6 +52,9 @@ impl TokenSpeedScheduler for ScriptedWorker {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         // Match ScriptedTokenizer: generated token IDs begin at 100.
         let request = request.into_inner();
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.push(request.clone());
+        }
         let (request_id, return_logprob) = (request.request_id, request.return_logprob);
         let ids: Vec<u32> = (0..self.output_tokens).map(|i| 100 + i).collect();
         // When asked, token `100 + i` reports logprob `-(i + 1)`.

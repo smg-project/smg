@@ -397,6 +397,77 @@ impl ResponseProcessor {
         Ok((choice, reasoning_tokens))
     }
 
+    /// The message as Symphony reads it (see `regular::symphony`): the output as one delta
+    /// through the stop decoder, the decoder's last text once decoding is finished, the engine's
+    /// finish, and the content blocks the events fold into (`adapt::messages::output`). A stop
+    /// sequence the decoder or the engine matched is the stop reason, as on the older path; the
+    /// thinking tokens are the engine's, or the reasoning text's, when the request asked for
+    /// thinking.
+    fn read_messages_with_symphony(
+        dispatch: &DispatchMetadata,
+        assignment: &Assignment,
+        complete: &ProtoGenerateComplete,
+        request: &MessagesResponseSpec,
+        stop_decoder: &mut StopSequenceDecoder,
+    ) -> Result<Message, String> {
+        let mut reader = Reader::new(assignment, &request.chat_tools)?;
+        stop_decoder.reset();
+        let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
+        let tail = stop_decoder
+            .finish()
+            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
+        utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
+        if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
+            tail
+        {
+            events.extend(reader.tail(&text)?);
+        }
+        let reason = if stopped || stop_decoder.is_stopped() {
+            "stop"
+        } else {
+            complete.finish_reason()
+        };
+        events.extend(reader.end(engine_finish(reason))?);
+        let output = adapt::messages::output(&events);
+        let stop_sequence = stop_decoder.matched_stop().map(String::from).or_else(|| {
+            complete
+                .matched_stop_json()
+                .and_then(|v| v.as_str().map(String::from))
+        });
+        let stop_reason = match output.stop_reason {
+            Some(messages::StopReason::EndTurn) if stop_sequence.is_some() => {
+                Some(messages::StopReason::StopSequence)
+            }
+            stop_reason => stop_reason,
+        };
+        let stop_sequence = stop_sequence
+            .filter(|_| matches!(stop_reason, Some(messages::StopReason::StopSequence)));
+        let thinking_requested = matches!(
+            &request.thinking,
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                    | messages::ThinkingConfig::Adaptive { .. }
+            )
+        );
+        let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
+        Ok(Message {
+            id: dispatch.request_id.clone(),
+            message_type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: output.content,
+            model: dispatch.model.clone(),
+            stop_reason,
+            stop_sequence,
+            stop_details: None,
+            usage: messages_usage_from_counts(
+                complete.prompt_tokens(),
+                complete.completion_tokens(),
+                thinking_requested.then_some(complete.reasoning_tokens().max(reasoning_tokens)),
+            ),
+            container: None,
+        })
+    }
+
     /// Process non-streaming chat response (collects all responses and builds final response)
     pub async fn process_non_streaming_chat_response(
         &self,
@@ -739,6 +810,19 @@ impl ResponseProcessor {
         }
         #[expect(clippy::unwrap_used, reason = "safe: checked len == 1 above")]
         let complete = all_responses.into_iter().next().unwrap();
+        if let Some(assignment) = &messages_request.symphony {
+            return Self::read_messages_with_symphony(
+                &dispatch,
+                assignment,
+                &complete,
+                &messages_request,
+                stop_decoder,
+            )
+            .map_err(|e| {
+                error!(function = "process_non_streaming_messages_response", error = %e, "Symphony failed to read the message");
+                error::internal_error("symphony_read_failed", e)
+            });
+        }
 
         // Check parser availability. Run parser when the user explicitly enabled thinking,
         // or when the selected parser needs structural special tokens (e.g. Inkling).

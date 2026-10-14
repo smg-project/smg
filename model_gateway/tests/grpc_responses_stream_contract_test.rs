@@ -5,6 +5,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
+#[expect(dead_code, reason = "a shared fixture; this test uses part of it")]
 #[path = "common/scripted_tokenizer.rs"]
 mod scripted_tokenizer;
 
@@ -89,6 +90,7 @@ async fn responses_result_with_finishes(
             output_tokens,
             finish_reasons,
             generation: Default::default(),
+            requests: Default::default(),
         }
         .serve(listener),
     );
