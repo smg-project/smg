@@ -1806,12 +1806,13 @@ struct IntegrationArgs {
     webrtc_stun_server: Option<String>,
 
     // ==================== Runtime ====================
-    /// Explicit async runtime worker-thread count, from 1 to 4096 on every
-    /// host (a refusal names the ceiling); a count above 4 x the CPUs
-    /// available to the process starts with a warning, since a worker thread
-    /// beyond the CPUs only waits for one. Leave unset to use tokio's default
-    /// (`available_parallelism()`), which already honors the cgroup CPU quota
-    /// on Rust 1.95+ and is therefore container-aware.
+    /// Async runtime worker-thread count, from 1 to 4096 on every host (a refusal
+    /// names the ceiling); a count above 4 x the CPUs available to the process
+    /// starts with a warning, since a worker thread beyond the CPUs only waits for
+    /// one. Unset: the available parallelism (the container's CPU quota) capped at
+    /// 8, the gateway's own budget: idle workers park and unpark on every streamed
+    /// chunk, so a runtime the size of a large quota costs CPU for no work. Set it
+    /// to size the runtime for a heavier deployment.
     #[arg(long, help_heading = "Runtime")]
     runtime_worker_threads: Option<usize>,
 }
@@ -3449,20 +3450,20 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
     (cli_args, igw_enabled_for_discovery)
 }
 
-/// Phase 4, serve: the async runtime (tokio's container-aware default size
-/// unless `--runtime-worker-threads` pins one; the size is logged by
-/// `startup` once the log subscriber is up), then [`server::run`]: the
-/// server until it stops, the log writers flushed and the tracer shut down
-/// on every exit, a clean stop and a failed start-up alike. The runtime is
-/// built only now: a refusal before this point costs no threads.
+/// Phase 4, serve: the async runtime (sized by `runtime_worker_threads`:
+/// the gateway's budget unless `--runtime-worker-threads` pins one; the size
+/// is logged by `startup` once the log subscriber is up), then
+/// [`server::run`]: the server until it stops, the log writers flushed and
+/// the tracer shut down on every exit, a clean stop and a failed start-up
+/// alike. The runtime is built only now: a refusal before this point costs
+/// no threads.
 fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = match server_config.runtime_worker_threads {
-        Some(n) => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(n)
-            .enable_all()
-            .build()?,
-        None => tokio::runtime::Runtime::new()?,
-    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(server::runtime_worker_threads(
+            server_config.runtime_worker_threads,
+        ))
+        .enable_all()
+        .build()?;
     server::run(&runtime, server_config)
 }
 

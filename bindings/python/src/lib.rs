@@ -1955,16 +1955,16 @@ impl Router {
             })
             .transpose()?;
 
-        // The runtime's default size unless a thread count is given (the
-        // validation above refused 0), as the CLI's `serve` builds it.
-        let runtime = match self.runtime_worker_threads {
-            Some(threads) => tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(threads)
-                .enable_all()
-                .build(),
-            None => tokio::runtime::Runtime::new(),
-        }
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Sized as the CLI sizes its runtime: an explicit count when one is
+        // given (the validation above refused 0), else the gateway's budget,
+        // not the container's quota.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(server::runtime_worker_threads(
+                self.runtime_worker_threads,
+            ))
+            .enable_all()
+            .build()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Release the GIL while the server runs so Python threads can make progress.
         py.detach(|| {

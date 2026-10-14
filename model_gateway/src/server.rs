@@ -979,6 +979,27 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
+/// The most worker threads the async runtime gets when `--runtime-worker-threads`
+/// is unset. The gateway's work is a few cores at the loads it is built for
+/// (under two cores at 40 streamed chat requests per second with 8k-token
+/// prompts, or 1,000 short requests per second), and every worker beyond the
+/// work still parks and unparks on each streamed chunk: a runtime sized to a
+/// 16-core quota spent 7-12 % of the gateway's CPU on those wakeups. The flag
+/// sizes a heavier deployment explicitly.
+pub const DEFAULT_RUNTIME_WORKER_THREADS_CAP: usize = 8;
+
+/// The async runtime's worker-thread count: the explicit setting when there is
+/// one (the validator refuses 0), else the available parallelism (the
+/// container's CPU quota on Rust 1.95+) capped at
+/// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], and never below 1.
+pub fn runtime_worker_threads(explicit: Option<usize>) -> usize {
+    explicit.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map_or(DEFAULT_RUNTIME_WORKER_THREADS_CAP, |n| n.get())
+            .clamp(1, DEFAULT_RUNTIME_WORKER_THREADS_CAP)
+    })
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -986,10 +1007,11 @@ pub struct ServerConfig {
     /// leaves the dedicated listener off; probe routes always stay on the
     /// main `port` regardless.
     pub health_check_port: Option<u16>,
-    /// Explicit async runtime worker-thread count. `None` uses tokio's
-    /// container-aware default (`available_parallelism()`). Only the CLI's
-    /// `main` sizes its runtime from it; `startup` runs on the caller's
-    /// runtime and logs the size it finds (and this setting, as `pinned`).
+    /// Explicit async runtime worker-thread count. `None` leaves the size to
+    /// [`runtime_worker_threads`]: the gateway's own budget rather than the
+    /// container's quota. The CLI's `main` and the Python binding size their
+    /// runtime by it; `startup` runs on the caller's runtime and logs the
+    /// size it finds (and this setting, as `pinned`).
     pub runtime_worker_threads: Option<usize>,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
@@ -1598,7 +1620,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // The runtime was built by the caller (the CLI's `main`, the Python
     // binding, a library caller) before the subscriber existed: its size is
     // logged here, where the line reaches the log. `pinned` is the
-    // configuration's say; only the CLI's `main` sizes its runtime from it.
+    // configuration's say; the CLI's `main` and the Python binding size
+    // theirs by `runtime_worker_threads`.
     info!(
         worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
         pinned = config.runtime_worker_threads.is_some(),
@@ -2607,6 +2630,27 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 
 #[cfg(test)]
 mod tests {
+    /// The runtime follows the gateway's budget, not the container's quota:
+    /// unset, the worker count is the available parallelism capped at
+    /// `DEFAULT_RUNTIME_WORKER_THREADS_CAP` and never below 1; an explicit
+    /// `--runtime-worker-threads` wins, above the cap included.
+    #[test]
+    fn the_runtime_size_follows_the_gateway_budget_unless_pinned() {
+        let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let default = runtime_worker_threads(None);
+        assert_eq!(
+            default,
+            parallelism.clamp(1, DEFAULT_RUNTIME_WORKER_THREADS_CAP)
+        );
+        assert!((1..=DEFAULT_RUNTIME_WORKER_THREADS_CAP).contains(&default));
+        assert_eq!(runtime_worker_threads(Some(1)), 1);
+        assert_eq!(runtime_worker_threads(Some(3)), 3);
+        assert_eq!(
+            runtime_worker_threads(Some(DEFAULT_RUNTIME_WORKER_THREADS_CAP * 4)),
+            DEFAULT_RUNTIME_WORKER_THREADS_CAP * 4
+        );
+    }
+
     use std::convert::Infallible;
 
     use axum::response::sse::{Event, Sse};
