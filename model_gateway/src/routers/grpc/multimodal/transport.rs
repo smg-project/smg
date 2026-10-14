@@ -533,12 +533,7 @@ pub const ONE_PASS_WIRE_ENV: &str = "SMG_MM_ONE_PASS_WIRE";
 fn one_pass_wire_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = std::env::var(ONE_PASS_WIRE_ENV).is_ok_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        });
+        let on = one_pass_wire_opted_in(std::env::var(ONE_PASS_WIRE_ENV).ok().as_deref());
         if on {
             info!(
                 env = ONE_PASS_WIRE_ENV,
@@ -546,6 +541,18 @@ fn one_pass_wire_enabled() -> bool {
             );
         }
         on
+    })
+}
+
+/// The switch's value read as the other `SMG_MM_` switches read theirs:
+/// `1`, `true`, `yes` or `on`, any case, surrounding space ignored; unset or
+/// anything else leaves the opt-in off.
+fn one_pass_wire_opted_in(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 
@@ -878,7 +885,10 @@ mod tests {
 
     /// Without the opt-in the stages get no wire dtype, whatever the fleet
     /// agrees on: every request takes the two-pass path. The resolution
-    /// itself still answers, for the opt-in and the tests of its rules.
+    /// itself still answers, for the opt-in and the tests of its rules. The
+    /// switch's spellings are checked on explicit values; the wrapper is
+    /// checked against the process's own setting, so the test holds whether
+    /// or not the environment it runs in opts in.
     #[test]
     fn the_one_pass_wire_write_is_opt_in() {
         use crate::{
@@ -909,14 +919,32 @@ mod tests {
             Some(EncoderDtype::BFloat16),
             "the fleet agrees on one dtype"
         );
-        assert!(
-            std::env::var_os(ONE_PASS_WIRE_ENV).is_none(),
-            "the test process must not opt in"
-        );
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+            Some("maybe"),
+        ] {
+            assert!(
+                !one_pass_wire_opted_in(value),
+                "{value:?} leaves the opt-in off"
+            );
+        }
+        for value in ["1", "true", "yes", "on", "TRUE", " On "] {
+            assert!(one_pass_wire_opted_in(Some(value)), "{value:?} opts in");
+        }
+        let expected = if one_pass_wire_enabled() {
+            Some(EncoderDtype::BFloat16)
+        } else {
+            None
+        };
         assert_eq!(
             mm_shared_image_wire_dtype_over(&registry, "qwen3-vl", pools),
-            None,
-            "the stages see no wire dtype without the opt-in"
+            expected,
+            "the stages see the fleet's wire dtype only with the opt-in"
         );
     }
 
