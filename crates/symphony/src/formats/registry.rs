@@ -19,9 +19,9 @@
 //! older parsers for it until its group lists the name under `also`.
 
 use super::{
-    deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, json, k2_horizon, kimi_k3,
-    lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral, olmo3, plain, qwen2_5,
-    qwen3, seed_oss, xlam,
+    deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest, json,
+    k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral,
+    olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -78,6 +78,8 @@ pub enum Table {
     Dots3,
     /// [`gemma4()`].
     Gemma4,
+    /// [`function_gemma()`].
+    FunctionGemma,
     /// [`glm()`].
     Glm,
     /// [`glm4()`].
@@ -90,7 +92,7 @@ pub enum Table {
 
 impl Table {
     /// Every table, in this order.
-    pub const ALL: [Table; 26] = [
+    pub const ALL: [Table; 27] = [
         Self::Qwen3,
         Self::Qwen3Tagged,
         Self::Qwen3TaggedDirect,
@@ -113,6 +115,7 @@ impl Table {
         Self::MiniCpm5,
         Self::Dots3,
         Self::Gemma4,
+        Self::FunctionGemma,
         Self::Glm,
         Self::Glm4,
         Self::K2Horizon,
@@ -145,6 +148,7 @@ impl Table {
             Self::MiniCpm5 => "minicpm5",
             Self::Dots3 => "dots3",
             Self::Gemma4 => "gemma4",
+            Self::FunctionGemma => "function_gemma",
             Self::Glm => "glm",
             Self::Glm4 => "glm4",
             Self::K2Horizon => "k2_horizon",
@@ -184,6 +188,7 @@ impl Table {
             Self::MiniCpm5 => minicpm5(),
             Self::Dots3 => dots3(),
             Self::Gemma4 => gemma4(),
+            Self::FunctionGemma => function_gemma(),
             Self::Glm => glm(),
             Self::Glm4 => glm4(),
             Self::K2Horizon => k2_horizon(),
@@ -480,6 +485,12 @@ const GROUPS: &[Group] = &[
         model: "microsoft/Fara1.5-9B",
         also: &["Fara1.5-4B"],
         table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "google/functiongemma-270m-it",
+        also: &[],
+        table: Table::FunctionGemma,
         opener: None,
     },
     Group {

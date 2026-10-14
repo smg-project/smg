@@ -1,5 +1,7 @@
-//! Gemma 4's calls, written from the table's markers as the template's `format_argument` macro
-//! writes them: `<|tool_call>call:NAME{`, the arguments, `}<tool_call|>`. The arguments are
+//! Gemma's calls, written from the table's markers as Gemma 4's `format_argument` macro writes
+//! them: `<|tool_call>call:NAME{`, the arguments, `}<tool_call|>`, in the table's spelling of the
+//! string token and the null word (FunctionGemma: `<escape>`, `None`, between its own markers).
+//! The arguments are
 //! `key:value` pairs joined by `,` with no space, one per property of the tool's schema, in the
 //! order of the keys ignoring case (the template's `dictsort`), each optional unless the schema
 //! requires it; the comma stands between two present pairs only, so the pairs take the [`joined`]
@@ -27,11 +29,11 @@ use super::{
     schema::{joined, joined_nodes, keyword, shape, Definitions},
     CallMarkers, Grammar, Tag,
 };
-use crate::gemma::STRING;
+use crate::gemma::Spelling;
 
-/// A bare literal as the template writes one: a number as Python prints it, `true`, `false` or
-/// `null`.
-const LITERAL: &str = r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?|true|false|null";
+/// A bare literal as the template writes one, but for the null word: a number as Python prints
+/// it, `true` or `false`; [`Ends::literal`] adds the spelling's null word, which is letters.
+const LITERALS: &str = r"-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?|true|false";
 /// A key written as it is: anything but the bytes that end or open a member.
 const KEY: &str = r"[^:,{}\[\]<]+";
 /// How deep a value may nest before its spelling gives way to a string or a bare literal: the walk
@@ -71,10 +73,16 @@ impl Walk {
 }
 
 /// The calls for `tools`: one tag per tool, triggered by the call's opener, `call:NAME{` after it,
-/// the arguments, then `}` and the call's close.
-pub(super) fn calls(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bool) -> Grammar {
+/// the arguments in `spelling`, then `}` and the call's close.
+pub(super) fn calls(
+    markers: &CallMarkers<'_>,
+    spelling: Spelling,
+    tools: &[&Tool],
+    at_least_one: bool,
+) -> Grammar {
     let ends = Ends {
         call_exits: &markers.call_exits,
+        spelling,
     };
     let tags = tools
         .iter()
@@ -95,9 +103,11 @@ pub(super) fn calls(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bo
 }
 
 /// What ends a string's text besides its own token: the terminals the table has a row for out of
-/// the arguments state, which the engine takes wherever they stand inside a call.
+/// the arguments state, which the engine takes wherever they stand inside a call; and the table's
+/// spelling of the token and the null word.
 struct Ends<'a> {
     call_exits: &'a [&'a str],
+    spelling: Spelling,
 }
 
 impl Ends<'_> {
@@ -228,7 +238,10 @@ impl Ends<'_> {
                     options
                         .iter()
                         .filter_map(Value::as_str)
-                        .map(|option| Grammar::ConstString(format!("{STRING}{option}{STRING}")))
+                        .map(|option| {
+                            let token = self.spelling.string;
+                            Grammar::ConstString(format!("{token}{option}{token}"))
+                        })
                         .collect(),
                 );
             }
@@ -244,6 +257,7 @@ impl Ends<'_> {
                 Grammar::ConstString("}".to_string()),
             ]),
             Some(("array", _)) => self.list(schema, definitions, walk),
+            Some(("null", _)) => Grammar::ConstString(self.spelling.null.to_string()),
             Some((_, value)) => value,
             None => self.any_value(),
         }
@@ -267,18 +281,24 @@ impl Ends<'_> {
     /// A string: the token, any text without the token or a marker the engine takes inside a
     /// call, the token.
     fn string(&self) -> Grammar {
+        let token = self.spelling.string;
         Grammar::Sequence(vec![
-            Grammar::ConstString(STRING.to_string()),
+            Grammar::ConstString(token.to_string()),
             Grammar::AnyText {
-                excludes: self.excluding(&[STRING]),
+                excludes: self.excluding(&[token]),
             },
-            Grammar::ConstString(STRING.to_string()),
+            Grammar::ConstString(token.to_string()),
         ])
+    }
+
+    /// A bare literal in the table's spelling: a number, `true`, `false`, or the null word.
+    fn literal(&self) -> String {
+        format!("{LITERALS}|{}", self.spelling.null)
     }
 
     /// A value the schema does not type: a string, or a bare literal.
     fn any_value(&self) -> Grammar {
-        Grammar::Or(vec![self.string(), Grammar::Regex(LITERAL.to_string())])
+        Grammar::Or(vec![self.string(), Grammar::Regex(self.literal())])
     }
 
     /// The members of an object the schema gives no properties: pairs of a bare key, `:` and a
@@ -367,8 +387,13 @@ mod tests {
         ]})
     }
 
+    /// A bare literal in Gemma 4's spelling.
+    fn literal() -> String {
+        format!("{LITERALS}|null")
+    }
+
     fn untyped() -> Value {
-        value!({"type": "or", "elements": [text(), {"type": "regex", "pattern": LITERAL}]})
+        value!({"type": "or", "elements": [text(), {"type": "regex", "pattern": literal()}]})
     }
 
     fn pair(key: &str, value: Value) -> Value {
@@ -470,6 +495,59 @@ mod tests {
     }
 
     #[test]
+    fn function_gemma_spells_its_string_token_and_null_word() {
+        // functiongemma-270m-it: the tag between its own markers, a string between `<escape>`
+        // tokens, a null `None`, `true` and `false` as under Gemma 4; the untyped value's literal
+        // takes the same word.
+        let tools = [tool(
+            "note",
+            value!({"type": "object", "properties": {
+                "title": {"type": "string"},
+                "due": {"type": ["string", "null"]},
+                "done": {"type": "boolean"},
+                "extra": {},
+            }, "required": ["title", "due", "done", "extra"]}),
+        )];
+        let payload = formats::function_gemma()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let string = value!({"type": "sequence", "elements": [
+            {"type": "const_string", "value": "<escape>"},
+            {"type": "any_text", "excludes": ["<escape>", "<end_function_call>"]},
+            {"type": "const_string", "value": "<escape>"},
+        ]});
+        let none = value!({"type": "const_string", "value": "None"});
+        let done = value!({"type": "or", "elements": [
+            {"type": "const_string", "value": "true"},
+            {"type": "const_string", "value": "false"},
+        ]});
+        let extra = value!({"type": "or", "elements": [
+            string,
+            {"type": "regex", "pattern": format!("{LITERALS}|None")},
+        ]});
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<start_function_call>"],
+                "tags": [{
+                    "type": "tag",
+                    "begin": "<start_function_call>call:note{",
+                    "content": {"type": "sequence", "elements": [
+                        pair("done", done),
+                        then(pair("due", value!({"type": "or", "elements": [string, none]}))),
+                        then(pair("extra", extra)),
+                        then(pair("title", string)),
+                    ]},
+                    "end": "}<end_function_call>",
+                }],
+                "at_least_one": true,
+            }})
+        );
+    }
+
+    #[test]
     fn an_object_and_a_list_take_the_same_spelling_and_an_enum_stands_between_the_tokens() {
         // Recorded: `new_preferences:{size:<|"|>large<|"|>,temperature:<|"|>hot<|"|>}` and
         // `recipients:[<|"|>admin@example.com<|"|>,<|"|>support@example.com<|"|>]`, `t0:null`.
@@ -555,6 +633,7 @@ mod tests {
         });
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let definitions = Definitions::of(&root);
         assert_eq!(
@@ -607,6 +686,7 @@ mod tests {
         });
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let definitions = Definitions::of(&root);
         let members = ends.members(&root, definitions, &mut Walk::new()).to_json();
@@ -674,6 +754,7 @@ mod tests {
         });
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let written = serde_json::to_string(
             &ends
@@ -748,6 +829,7 @@ mod tests {
         // listed twice is one branch.
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let root = value!({});
         let definitions = Definitions::of(&root);
@@ -796,6 +878,7 @@ mod tests {
         };
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let fits = strings(29);
         let grammar = ends.members(&fits, Definitions::of(&fits), &mut Walk::new());
@@ -834,6 +917,7 @@ mod tests {
         }
         let ends = Ends {
             call_exits: &["<tool_call|>"],
+            spelling: Spelling::GEMMA4,
         };
         let grammar = ends.members(&schema, Definitions::of(&schema), &mut Walk::new());
         let written = serde_json::to_string(&grammar.to_json()).expect("JSON");

@@ -1,7 +1,8 @@
 //! Gemma 4: reasoning between `<|channel>thought\n` and `<channel|>`, each call between
 //! `<|tool_call>` and `<tool_call|>` in Gemma's own spelling (`call:NAME{key:value,…}`, a string
-//! between `<|"|>` tokens, [`gemma`](crate::gemma)), everything else content. Recorded as
-//! `gemma-4-e4b-it` (google/gemma-4-E4B-it), 54,416 parse cases, 15,669 of them with calls:
+//! between `<|"|>` tokens, a null `null`: [`gemma`](crate::gemma)), everything else content.
+//! Recorded as `gemma-4-e4b-it` (google/gemma-4-E4B-it), 54,416 parse cases, 15,669 of them with
+//! calls:
 //!
 //! ```text
 //! <|channel>thought
@@ -10,7 +11,10 @@
 //! ```
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
-use crate::format::{CallSyntax, Emits, Format};
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    gemma::Spelling,
+};
 
 /// The Gemma 4 table.
 pub fn gemma4() -> Format {
@@ -27,7 +31,7 @@ pub fn gemma4() -> Format {
         .transition("content", "call_open", "call")
         .transition("reasoning", "call_open", "call")
         .transition("call", "call_close", "content")
-        .calls(CallSyntax::Gemma)
+        .calls(CallSyntax::Gemma(Spelling::GEMMA4))
         .opens_turn("<|turn>model")
 }
 

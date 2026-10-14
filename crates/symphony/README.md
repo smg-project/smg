@@ -52,7 +52,7 @@ and a client that wants the raw text back can have it.
 | `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
-| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `json()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `gemma4()`, `mistral()`, `llama_nemotron()`, `plain()`. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `json()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `gemma4()`, `function_gemma()`, `mistral()`, `llama_nemotron()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
@@ -136,7 +136,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 
 <!-- models: begin -->
 199 groups, 339 checkpoints, newest first.
-20 ready, 119 replaying a recorded set, 0 on main awaiting fixtures, 60 pending.
+20 ready, 120 replaying a recorded set, 0 on main awaiting fixtures, 59 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -250,7 +250,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2025-10-12 | [llama-3.3-nemotron-70b-reward-principle](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.3-nemotron-70b-reward-principle) | nvidia/Llama-3.3-Nemotron-70B-Reward-Principle | Llama-3.3-Nemotron-70B-Edit, Llama-3.3-Nemotron-70B-Feedback | `json` | 458,185 | replaying the set | `json`, none |
 | 2025-10-11 | [qwen3-vl-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-8b-instruct) | Qwen/Qwen3-VL-8B-Instruct | BAAI/RoboBrain2.5-4B, lightonai/OriOn-Qwen, lightonai/OriOn-Qwen-SR1, nvidia/Cosmos-Reason2-32B, Qwen3-VL-2B-Instruct, Qwen3-VL-32B-Instruct, Qwen3-VL-4B-Instruct, tencent/WeVisDoc-2B, tencent/WeVisDoc-4B | `qwen3` | 576,772 | replaying the set | `qwen`, `qwen3` |
 | 2025-10-11 | [qwen3-vl-8b-thinking](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-vl-8b-thinking) | Qwen/Qwen3-VL-8B-Thinking | Qwen3-VL-2B-Thinking, Qwen3-VL-32B-Thinking, Qwen3-VL-4B-Thinking | `qwen3` | 554,276 | replaying the set | `qwen`, `qwen3` |
-| 2025-10-08 | [functiongemma-270m-it](https://github.com/smg-project/bellwether/tree/main/fixtures/functiongemma-270m-it) | google/functiongemma-270m-it |  | — | 246,750 | pending | `json`, none |
+| 2025-10-08 | [functiongemma-270m-it](https://github.com/smg-project/bellwether/tree/main/fixtures/functiongemma-270m-it) | google/functiongemma-270m-it |  | `function_gemma` | 246,750 | replaying the set | `json`, none |
 | 2025-10-05 | [ai21-jamba-reasoning-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/ai21-jamba-reasoning-3b) | ai21labs/AI21-Jamba-Reasoning-3B |  | `qwen3` | 12,885 | replaying the set | none |
 | 2025-10-01 | [llama-3.1-nemotron-nano-vl-8b-v1-fp4-qad](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-nano-vl-8b-v1-fp4-qad) | nvidia/Llama-3.1-Nemotron-Nano-VL-8B-V1-FP4-QAD |  | — | 328,662 | pending | `json`, `nano_v3` |
 | 2025-09-30 | [qwen3-4b-saferl](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-4b-saferl) | Qwen/Qwen3-4B-SafeRL |  | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |

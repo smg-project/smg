@@ -177,6 +177,10 @@ fn llama_nemotron() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::llama_nemotron(), Declared::default()))
 }
 
+fn function_gemma() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::function_gemma(), Declared::default()))
+}
+
 fn plain() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::plain(), Declared::default()))
 }
@@ -266,6 +270,11 @@ const FORMATS: &[Subject] = &[
         name: "llama nemotron",
         new: llama_nemotron,
         outputs: LLAMA_NEMOTRON_OUTPUTS,
+    },
+    Subject {
+        name: "function gemma",
+        new: function_gemma,
+        outputs: FUNCTION_GEMMA_OUTPUTS,
     },
 ];
 
@@ -463,6 +472,24 @@ const LLAMA_NEMOTRON_OUTPUTS: &[&str] = &[
     "<TOOLCALL>not a list</TOOLCALL>",
     "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {}} junk]</TOOLCALL> after",
     "<think>Only a thought.</think>",
+    "Hello!",
+];
+
+/// FunctionGemma's calls: Gemma's spelling between `<start_function_call>` and
+/// `<end_function_call>`, `<escape>` around a string, `None` for a null; cut streams, a block that
+/// is no call, and text after the arguments.
+const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
+    "<start_function_call>call:get_weather{city:<escape>Paris<escape>,days:[1,2.5,true,None]}\
+     <end_function_call>",
+    "<start_function_call>call:get_weather{city:<escape>Paris<escape>}<end_function_call>\
+     <start_function_call>call:get_stock_price{}<end_function_call>",
+    "Let me check.<start_function_call>call:get_weather{city:<escape>Paris<escape>}\
+     <end_function_call>",
+    "<start_function_call>call:get_weather{city:<escape>Par",
+    "<start_function_call>call:get_wea",
+    "<start_function_call>not a call<end_function_call>",
+    "<start_function_call>call:get_weather{} trailing<end_function_call>",
+    "<start_function_call>call:f{a:<esc",
     "Hello!",
 ];
 

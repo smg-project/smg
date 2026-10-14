@@ -16,7 +16,6 @@ use serde_json::{json, Value};
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    gemma::STRING as GEMMA_STRING,
     tagged::{assembler::TAGS as TAGGED_TAGS, attributed::Typing, keyed::Tags as KeyedTags},
 };
 
@@ -319,7 +318,7 @@ impl Format {
             CallSyntax::Xml => {
                 return xml::calls(markers?, self.separator(), &named, at_least_one);
             }
-            CallSyntax::Gemma => gemma::calls(markers?, &named, at_least_one),
+            CallSyntax::Gemma(spelling) => gemma::calls(markers?, *spelling, &named, at_least_one),
             CallSyntax::NamedJson(marker) => {
                 return self.named_json_calls(marker, &named, at_least_one);
             }
@@ -352,7 +351,7 @@ impl Format {
             ],
             Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
-            Some(CallSyntax::Gemma) => &[GEMMA_STRING],
+            Some(CallSyntax::Gemma(spelling)) => std::slice::from_ref(&spelling.string),
             Some(CallSyntax::NamedArguments(marker)) => std::slice::from_ref(marker),
             _ => &[],
         };

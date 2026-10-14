@@ -875,9 +875,9 @@ const GROUPS: &[Group] = &[
         also: &[],
         released: "2025-10-08",
         smg: (Some("json"), None),
-        table: None,
+        table: Some(Table::FunctionGemma),
         set: Some(246_750),
-        status: Status::Pending,
+        status: Status::Replaying,
     },
     Group {
         slug: "gemma-3-12b-it-qat-q4-0-unquantized",

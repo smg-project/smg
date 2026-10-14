@@ -12,6 +12,7 @@
 //! [`Engine`]: crate::Engine
 pub mod deepseek_v4_1;
 pub mod dots3;
+pub mod function_gemma;
 pub mod gemma4;
 pub mod glm;
 pub mod glm4;
@@ -38,6 +39,7 @@ pub mod xlam;
 
 pub use deepseek_v4_1::deepseek_v4_1;
 pub use dots3::dots3;
+pub use function_gemma::function_gemma;
 pub use gemma4::gemma4;
 pub use glm::glm;
 pub use glm4::glm4;

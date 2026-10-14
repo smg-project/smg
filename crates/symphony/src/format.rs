@@ -35,7 +35,7 @@
 //! [`formats`]: crate::formats
 
 use crate::{
-    pythonic,
+    gemma, pythonic,
     tagged::{self, keyed},
 };
 
@@ -95,11 +95,12 @@ pub enum CallSyntax {
     /// the region ends at the next call's opener or the end of the turn, since the template writes
     /// no closing marker.
     NamedArguments(&'static str),
-    /// Gemma 4's `call:NAME{key:value,…}`: keys bare, a string between `<|"|>` tokens, numbers and
-    /// words bare, lists and objects nested the same way, the keys sorted by the template. The
-    /// terminals that enter and leave the state are the call's own markers, and the call's end
-    /// carries the closing one.
-    Gemma,
+    /// Gemma's `call:NAME{key:value,…}`: keys bare, a string between two tokens, numbers and
+    /// words bare, lists and objects nested the same way, the keys sorted by the template, in the
+    /// family's spelling of the string token and the null word (Gemma 4: `<|"|>` and `null`;
+    /// FunctionGemma: `<escape>` and `None`). The terminals that enter and leave the state are the
+    /// call's own markers, and the call's end carries the closing one.
+    Gemma(gemma::Spelling),
 }
 
 /// What the text inside a state is.

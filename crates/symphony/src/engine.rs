@@ -112,7 +112,7 @@ fn assembler(syntax: Option<CallSyntax>, index: u32, framed: bool) -> Box<dyn Ca
         Some(CallSyntax::NamedArguments(marker)) => {
             Box::new(json::named_arguments::Assembler::new(index, id, marker))
         }
-        Some(CallSyntax::Gemma) => Box::new(gemma::Assembler::new(index, id)),
+        Some(CallSyntax::Gemma(spelling)) => Box::new(gemma::Assembler::new(index, id, spelling)),
     }
 }
 

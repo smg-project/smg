@@ -23,8 +23,9 @@ blocks of `<parameter name="…">` tags for MiniMax M2 (the `attributed` module)
 per line or as a list, each value in the template's spelling, for Olmo 3 and LFM2.5 (the `pythonic`
 module); xLAM's bare list of JSON objects, written from the tools alone since its table has no
 markers; for MiniMax M3, the XML tree of elements with the table's separator before every tag (the
-`xml` module); Gemma 4's `call:NAME{key:value}` spelling, the keys sorted and each string between
-`<|"|>` tokens (the `gemma` module); for Inkling, the call marker and a JSON object whose `args` the
+`xml` module); Gemma's `call:NAME{key:value}` spelling, the keys sorted and each string between the
+table's tokens, `<|"|>` for Gemma 4 and `<escape>` for FunctionGemma, which also writes a null as
+`None` (the `gemma` module); for Inkling, the call marker and a JSON object whose `args` the
 schema accepts, wherever the marker stands in a message. The gateway's old parsers wrote these tags
 by hand, one function per parser; where one exists for a format Symphony has, the derived tag is
 pinned to it in the tests, so the switch changes nothing an engine sees.

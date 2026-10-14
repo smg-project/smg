@@ -257,6 +257,25 @@ whatever order the request gave them: the replay counts such a case as respelled
 difference (bellwether #110). `Format::grammar` writes a forced call's tag in this spelling, the
 keys sorted the same way (the grammar's `gemma` module).
 
+## FunctionGemma (`function_gemma`)
+
+What the table says beyond the others:
+
+- **Gemma's shape in the template's own tokens.** Each call stands between `<start_function_call>`
+  and `<end_function_call>`, `call:NAME{key:value,…}` inside with the keys sorted as Gemma 4 sorts
+  them; a string's text stands between `<escape>` tokens and a null is written `None`, while
+  `true` and `false` keep JSON's words (`gemma::Spelling::FUNCTION_GEMMA`). The assembler and the
+  grammar take the spelling from the table, so Gemma 4 and FunctionGemma share both. A bare
+  `null`, which this template never writes, comes back as the string `"null"`, as any bare text
+  the spelling does not know.
+- **No thought, content before the calls.** The generation prompt is `<start_of_turn>model\n`
+  whatever the request says, and the template renders no `reasoning_content`; the calls follow the
+  content one after another with nothing between them, and the turn ends after the last.
+
+What the table leaves open: the spellings come from the recorded common set, since the template is
+gated on the Hub: `true`, `None`, integers and a decimal are seen there, `false` and an exponent
+are not, so they follow Gemma 4's words and Python's print of a number until a set shows otherwise.
+
 ## K2-Horizon (`k2_horizon`)
 
 What the table leaves out, for want of fixtures: the template picks the thought's tag by

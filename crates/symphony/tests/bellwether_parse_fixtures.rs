@@ -80,9 +80,9 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{
-        deepseek_v4_1, dots3, for_model, gemma4, glm, glm4, groups, hy4, inkling, iquest, json,
-        k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
-        mistral, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        deepseek_v4_1, dots3, for_model, function_gemma, gemma4, glm, glm4, groups, hy4, inkling,
+        iquest, json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
+        minimax_m3, mistral, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -898,6 +898,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Json,
         GenerationPrompt::Plain,
     ),
+    // FunctionGemma: Gemma's calls between `<start_function_call>` and `<end_function_call>`,
+    // `<escape>` around a string and `None` for a null; the template has no thought.
+    (
+        "functiongemma-270m-it",
+        Family::FunctionGemma,
+        GenerationPrompt::Plain,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -996,6 +1003,8 @@ enum Family {
     Dots3,
     /// [`gemma4`]: `call:NAME{…}` calls in Gemma's spelling, the thought a channel.
     Gemma4,
+    /// [`function_gemma`]: Gemma's calls in FunctionGemma's tokens, no thought.
+    FunctionGemma,
     /// [`plain`]: content and nothing else.
     Plain,
 }
@@ -1022,7 +1031,7 @@ impl Family {
     /// separators=(",", ":"))` does: a case whose arguments differ from the reference's only so,
     /// equal as values, is counted as respelled, not as a difference.
     fn respells_arguments(self) -> bool {
-        matches!(self, Self::Inkling | Self::Gemma4)
+        matches!(self, Self::Inkling | Self::Gemma4 | Self::FunctionGemma)
     }
 
     /// The table for one of the model's cases: the family's, with the model's own turn opener
@@ -1067,6 +1076,7 @@ impl Family {
             Self::MiniCpm5 => minicpm5(),
             Self::Dots3 => dots3(),
             Self::Gemma4 => gemma4(),
+            Self::FunctionGemma => function_gemma(),
             Self::Plain => plain(),
         }
     }
@@ -1091,6 +1101,7 @@ impl Family {
             | Self::K2Horizon
             | Self::Inkling
             | Self::Gemma4
+            | Self::FunctionGemma
             | Self::Mistral
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
