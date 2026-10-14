@@ -354,20 +354,53 @@ def test_a_source_that_cannot_be_read_leaves_the_batch_without_a_record(caplog):
         failing = False
         assert recorder.stamp(_batch(4)).load.sample == 2  # the numbering continues
     assert _messages(caplog, logging.WARNING) == [
-        "load record unavailable; the KV-event stream carries cache events only until it can "
-        "be read again"
+        "load record unavailable for the stream (no rank); the KV-event stream carries cache "
+        "events only until it can be read again"
     ]
     assert "RuntimeError: snapshot gone" in caplog.text
     assert _messages(caplog, logging.DEBUG) == [
-        "load record unavailable (2 in a row)",
-        "load record unavailable (3 in a row)",
+        "load record unavailable for the stream (no rank) (2 in a row)",
+        "load record unavailable for the stream (no rank) (3 in a row)",
     ]
-    assert _messages(caplog, logging.INFO) == ["load record available again after 3 failed read(s)"]
+    assert _messages(caplog, logging.INFO) == [
+        "load record for the stream (no rank) available again after 3 failed read(s)"
+    ]
     # A second outage is reported again.
     failing = True
     with caplog.at_level(logging.DEBUG, logger=load_record.logger.name):
         assert not recorder.stamp(_batch(5)).HasField("load")
     assert len(_messages(caplog, logging.WARNING)) == 2
+
+
+def test_one_ranks_outage_is_reported_once_while_another_rank_reads_fine(caplog):
+    """One recorder serves every rank of a relayed stream: a rank whose read
+    keeps failing while another reads fine is one outage (one warning, one
+    info line when it ends), not one per interleaved batch."""
+    source, clock = Source(), Clock()
+    broken = {0}
+
+    def read(rank):
+        if rank in broken:
+            raise RuntimeError(f"rank {rank} snapshot gone")
+        return source(rank)
+
+    recorder = _recorder(read, clock)
+    with caplog.at_level(logging.DEBUG, logger=load_record.logger.name):
+        for seq in range(1, 7):  # ranks 1, 0, 1, 0, 1, 0
+            assert recorder.stamp(_batch(seq, rank=seq % 2)).HasField("load") == (seq % 2 == 1)
+        broken.clear()
+        assert recorder.stamp(_batch(7, rank=0)).HasField("load")
+    assert _messages(caplog, logging.WARNING) == [
+        "load record unavailable for rank 0; the KV-event stream carries cache events only "
+        "until it can be read again"
+    ]
+    assert _messages(caplog, logging.DEBUG) == [
+        "load record unavailable for rank 0 (2 in a row)",
+        "load record unavailable for rank 0 (3 in a row)",
+    ]
+    assert _messages(caplog, logging.INFO) == [
+        "load record for rank 0 available again after 3 failed read(s)"
+    ]
 
 
 def test_a_source_with_nothing_to_report_yet_is_not_an_outage(caplog):

@@ -151,6 +151,11 @@ def load_changed(last: common_pb2.EngineLoad, current: common_pb2.EngineLoad) ->
     return delta > 50.0 or delta > 0.05 * max(last.gen_throughput, current.gen_throughput)
 
 
+def _rank_name(rank: int | None) -> str:
+    """How the log names a rank; a batch that names none is the stream's own."""
+    return "the stream (no rank)" if rank is None else f"rank {rank}"
+
+
 class LoadRecorder:
     """One subscriber's load records: numbered, telemetry-trimmed and paced.
 
@@ -185,8 +190,8 @@ class LoadRecorder:
         # The rank and sequence of the last batch sent: what a heartbeat names.
         self._last_rank: int | None = None
         self._last_sequence: int | None = None
-        # Failed reads of the source in a row: the outage being reported.
-        self._failed_reads = 0
+        # Failed reads of the source in a row, per rank: the outages being reported.
+        self._failed_reads: dict[int | None, int] = {}
 
     def poll_timeout(self, recv_timeout: float) -> float:
         """How long the stream may wait for the next batch before the record
@@ -200,25 +205,37 @@ class LoadRecorder:
         outage is a warning with the traceback, the repeats debug lines, and
         the read that ends it an info line with their count: a read that keeps
         failing (a snapshot gone, a reader whose shape changed) is one loud
-        line at the default level, not a flood and not silence."""
+        line at the default level, not a flood and not silence. The count is
+        kept per rank: one recorder serves every rank of a relayed stream, and
+        a rank that fails while another reads fine is one outage, not one per
+        interleaved batch."""
         try:
             record = self._source(rank)
         except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
-            self._failed_reads += 1
-            if self._failed_reads == 1:
+            failed = self._failed_reads.get(rank, 0) + 1
+            self._failed_reads[rank] = failed
+            if failed == 1:
                 logger.warning(
-                    "load record unavailable; the KV-event stream carries cache events only "
-                    "until it can be read again",
+                    "load record unavailable for %s; the KV-event stream carries cache events "
+                    "only until it can be read again",
+                    _rank_name(rank),
                     exc_info=True,
                 )
             else:
                 logger.debug(
-                    "load record unavailable (%d in a row)", self._failed_reads, exc_info=True
+                    "load record unavailable for %s (%d in a row)",
+                    _rank_name(rank),
+                    failed,
+                    exc_info=True,
                 )
             return None
-        if self._failed_reads:
-            logger.info("load record available again after %d failed read(s)", self._failed_reads)
-            self._failed_reads = 0
+        failed = self._failed_reads.pop(rank, 0)
+        if failed:
+            logger.info(
+                "load record for %s available again after %d failed read(s)",
+                _rank_name(rank),
+                failed,
+            )
         return record
 
     def _numbered(
