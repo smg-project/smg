@@ -157,7 +157,7 @@ def _start_scheduler_processes(
                 # Calculate GPU ID for this rank
                 gpu_id = (
                     cfg.base_gpu_id
-                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node * cfg.gpu_id_step)
                     + (tp_rank % tp_size_per_node) * cfg.gpu_id_step
                 )
 

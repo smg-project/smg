@@ -178,10 +178,18 @@ def test_ready_failure_terminates_every_started_scheduler(monkeypatch, scheduler
             1,
             [(1, 0, 1), (1, 1, 4)],
         ),
+        ({"pp_size": 2}, 1, [(0, 0, 4), (0, 1, 6), (1, 0, 8), (1, 1, 10)]),
         ({"dp_size": 2}, 1, None),
         ({"ep_join_mode": "scale", "node_rank": 1}, 1, None),
     ],
-    ids=["unchanged", "resolved-tp", "resolved-pp", "resolved-dp", "elastic-ep-scale"],
+    ids=[
+        "unchanged",
+        "resolved-tp",
+        "resolved-pp",
+        "local-pp-stride",
+        "resolved-dp",
+        "elastic-ep-scale",
+    ],
 )
 def test_schedulers_start_with_the_run_scheduler_process_arguments(
     monkeypatch, scheduler_launcher_mod, overrides, raw_dp_size, placements
