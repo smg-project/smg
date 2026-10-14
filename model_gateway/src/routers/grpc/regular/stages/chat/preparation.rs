@@ -97,8 +97,10 @@ pub(crate) async fn prepare_chat_like(
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
 
         // Step 1: the request whose tools the template renders (every tool
-        // for a named tool_choice; the constraint built below forces the call)
-        let body_ref = utils::request_as_rendered(request);
+        // for a named tool_choice; the constraint built below forces the call;
+        // under `none` the tools stay only for a renderer that declares them
+        // itself)
+        let body_ref = utils::request_as_rendered(request, tokenizer.renderer_capabilities());
 
         // Resolve media-part ordering from the model registry so it stays owned
         // by the per-model spec. Falls back to vLLM-compatible media-first when

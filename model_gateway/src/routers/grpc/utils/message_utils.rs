@@ -5,13 +5,13 @@
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
 #![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
-    traits::{PromptEncoding, Tokenizer},
+    traits::{PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
     common::{self, StringOrArray, Tool as ChatTool, ToolChoice as ChatToolChoice},
@@ -46,6 +46,10 @@ pub(crate) struct MessagesPrompt<'a> {
     pub system: Option<&'a SystemContent>,
     pub thinking: Option<&'a ThinkingConfig>,
     pub stop_sequences: Option<&'a [String]>,
+    /// The request's tool choice, told to the template as the chat path
+    /// tells it; a renderer that declares the tools under `none` writes its
+    /// instruction not to call them from it.
+    pub tool_choice: Option<&'a messages::ToolChoice>,
 }
 
 impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
@@ -55,6 +59,7 @@ impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
             system: request.system.as_ref(),
             thinking: request.thinking.as_ref(),
             stop_sequences: request.stop_sequences.as_deref(),
+            tool_choice: request.tool_choice.as_ref(),
         }
     }
 }
@@ -66,6 +71,7 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
             system: request.system.as_ref(),
             thinking: request.thinking.as_ref(),
             stop_sequences: None,
+            tool_choice: request.tool_choice.as_ref(),
         }
     }
 }
@@ -89,6 +95,23 @@ pub fn process_messages(
         chat_tools,
         placeholder_tokens,
         media_order,
+    )
+}
+
+/// [`process_messages`] for a request without media: the entry point for
+/// callers outside the pipeline (bindings, tests), the Messages-side twin
+/// of `process_chat_messages_with_encoding`.
+pub fn process_messages_with_encoding(
+    request: &CreateMessageRequest,
+    tokenizer: &dyn Tokenizer,
+    chat_tools: Option<&[ChatTool]>,
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    process_messages(
+        request,
+        tokenizer,
+        chat_tools,
+        None,
+        MediaPartOrder::MediaFirst,
     )
 }
 
@@ -153,10 +176,22 @@ pub(crate) fn process_messages_prompt(
         None => None, // Let template use its default behavior
     };
 
-    // Step 6: Apply chat template
+    // Step 6: Apply chat template. The template learns the tool choice the
+    // way the chat path tells it (the chat value under the same kwarg): a
+    // renderer that declares the tools under `none` writes its instruction
+    // not to call them from this key.
+    let template_kwargs = request.tool_choice.map(|tool_choice| {
+        let mut kwargs = HashMap::with_capacity(1);
+        chat_utils::insert_tool_choice_kwarg(
+            &mut kwargs,
+            &convert_message_tool_choice(tool_choice),
+        );
+        kwargs
+    });
     let params = ChatTemplateParams {
         add_generation_prompt: true,
         tools: tools_json.as_deref(),
+        template_kwargs: template_kwargs.as_ref(),
         thinking,
         ..Default::default()
     };
@@ -183,16 +218,21 @@ pub(crate) fn process_messages_prompt(
 
 /// The tools the template renders for a request: the custom tools as chat
 /// tools, narrowed by `tool_choice` the way the chat path narrows them (a
-/// forced tool renders alone, and `none` renders none). Shared by the
-/// preparation stage and count_tokens so both render the same prompt.
-pub(crate) fn template_tools(
+/// forced tool renders alone, and `none` renders none unless the renderer
+/// declares the tools under `none` itself, see
+/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]). Shared
+/// by the preparation stage and count_tokens so both render the same prompt.
+pub fn template_tools(
     tools: Option<&[messages::Tool]>,
     tool_choice: Option<&messages::ToolChoice>,
+    capabilities: RendererCapabilities,
 ) -> Vec<ChatTool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
-    if matches!(tool_choice, Some(messages::ToolChoice::None)) {
+    if matches!(tool_choice, Some(messages::ToolChoice::None))
+        && !capabilities.declares_tools_under_tool_choice_none
+    {
         return Vec::new();
     }
     let chat_tools = extract_chat_tools(tools);
@@ -1494,7 +1534,11 @@ mod tests {
             "messages": [{"role": "user", "content": "Weather in Paris?"}]
         }))
         .unwrap();
-        let tools = template_tools(request.tools.as_deref(), request.tool_choice.as_ref());
+        let tools = template_tools(
+            request.tools.as_deref(),
+            request.tool_choice.as_ref(),
+            RendererCapabilities::default(),
+        );
         assert_eq!(tools.len(), 1, "a forced tool renders alone");
 
         let counted = count_input_tokens(
@@ -1509,8 +1553,9 @@ mod tests {
         assert_eq!(counted, 5);
     }
 
-    /// `tool_choice: {"type": "none"}` renders no tool, as on the chat path;
-    /// `auto` renders them all.
+    /// `tool_choice: {"type": "none"}` renders no tool, as on the chat path,
+    /// unless the renderer declares the tools under `none` itself; `auto`
+    /// renders them all.
     #[test]
     fn tool_choice_none_renders_no_tool() {
         let request = |tool_choice: Value| -> CountMessageTokensRequest {
@@ -1525,12 +1570,157 @@ mod tests {
             }))
             .unwrap()
         };
+        let plain = RendererCapabilities::default();
+        let declaring = RendererCapabilities {
+            declares_tools_under_tool_choice_none: true,
+            ..RendererCapabilities::default()
+        };
         let none = request(json!({"type": "none"}));
-        assert!(template_tools(none.tools.as_deref(), none.tool_choice.as_ref()).is_empty());
+        assert!(template_tools(none.tools.as_deref(), none.tool_choice.as_ref(), plain).is_empty());
+        assert_eq!(
+            template_tools(none.tools.as_deref(), none.tool_choice.as_ref(), declaring).len(),
+            1,
+            "the renderer that declares the tools under none gets them"
+        );
         let auto = request(json!({"type": "auto"}));
         assert_eq!(
-            template_tools(auto.tools.as_deref(), auto.tool_choice.as_ref()).len(),
+            template_tools(auto.tools.as_deref(), auto.tool_choice.as_ref(), plain).len(),
             1
+        );
+    }
+
+    /// The Messages path tells the template the request's tool choice as the
+    /// chat path tells it, whatever the renderer: the chat value under the
+    /// chat path's kwarg (`any` as `required`, a named tool as its function
+    /// object, `none` as `none` with the tools narrowed away), and no kwargs
+    /// when the request names no choice.
+    #[test]
+    fn the_messages_path_tells_the_template_the_tool_choice() {
+        let tok = llm_tokenizer::MockTokenizer::new().with_json_chat_template();
+        let rendered = |tool_choice: Option<Value>| -> Value {
+            let mut body = json!({
+                "model": "m",
+                "max_tokens": 16,
+                "tools": [{
+                    "name": "get_weather",
+                    "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+                }],
+                "messages": [{"role": "user", "content": "Weather in Paris?"}]
+            });
+            if let Some(tool_choice) = tool_choice {
+                body["tool_choice"] = tool_choice;
+            }
+            let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
+            let tools = template_tools(
+                request.tools.as_deref(),
+                request.tool_choice.as_ref(),
+                tok.renderer_capabilities(),
+            );
+            let tools_for_template = if tools.is_empty() {
+                None
+            } else {
+                Some(tools.as_slice())
+            };
+            let (processed, _) =
+                process_messages_with_encoding(&request, &tok, tools_for_template).unwrap();
+            serde_json::from_str(&processed.text).unwrap()
+        };
+        let any = rendered(Some(json!({"type": "any"})));
+        assert_eq!(any["template_kwargs"]["tool_choice"], json!("required"));
+        assert_eq!(any["tools"].as_array().map(Vec::len), Some(1));
+        let named = rendered(Some(json!({"type": "tool", "name": "get_weather"})));
+        assert_eq!(
+            named["template_kwargs"]["tool_choice"],
+            json!({"type": "function", "function": {"name": "get_weather"}})
+        );
+        let none = rendered(Some(json!({"type": "none"})));
+        assert_eq!(none["template_kwargs"]["tool_choice"], json!("none"));
+        assert!(
+            none.get("tools").is_none(),
+            "a plain renderer gets no tool under none: {none}"
+        );
+        let unset = rendered(None);
+        assert!(
+            unset.get("template_kwargs").is_none(),
+            "no choice, no kwargs: {unset}"
+        );
+    }
+
+    /// The K3 stand-in vocabulary of the kit test (`tests/kimi_k3_tool_choice_none.rs`):
+    /// byte-level ranks plus the K3 control tokens, under the config that
+    /// selects the renderer, so the rendering reads back as text.
+    fn k3_stand_in_dir() -> tempfile::TempDir {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let model: String = (0u32..256)
+            .map(|b| format!("{} {b}\n", STANDARD.encode([b as u8])))
+            .collect();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("tiktoken.model"), model).expect("tiktoken.model");
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder": {
+                "300": {"content": "<|open|>", "special": false},
+                "301": {"content": "<|close|>", "special": false},
+                "302": {"content": "<|sep|>", "special": false},
+                "303": {"content": "<|end_of_msg|>", "special": true}
+            }}"#,
+        )
+        .expect("tokenizer_config.json");
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"architectures": ["KimiK3ForConditionalGeneration"]}"#,
+        )
+        .expect("config.json");
+        dir
+    }
+
+    /// On the Messages path the K3 profile renders `tool_choice: {"type":
+    /// "none"}` as its reference does and as the chat path renders it: the
+    /// tool declaration before the conversation, the instruction not to call
+    /// it after (the template learns the choice from the chat path's kwarg).
+    #[test]
+    fn k3_declares_the_tool_and_forbids_the_call_on_the_messages_path() {
+        let dir = k3_stand_in_dir();
+        let tok = llm_tokenizer::create_tokenizer(dir.path().to_str().expect("utf-8 path"))
+            .expect("tokenizer");
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 64,
+            "tools": [{
+                "name": "get_weather",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }],
+            "tool_choice": {"type": "none"},
+            "messages": [{"role": "user", "content": "What is the weather in Paris?"}]
+        }))
+        .expect("the request");
+        let tools = template_tools(
+            request.tools.as_deref(),
+            request.tool_choice.as_ref(),
+            tok.renderer_capabilities(),
+        );
+        let (processed, _) = process_messages(
+            &request,
+            tok.as_ref(),
+            Some(tools.as_slice()),
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .expect("render");
+        let text = &processed.text;
+        let declaration = text
+            .find("Here are the available tools, described in JSONSchema.")
+            .unwrap_or_else(|| panic!("no tool declaration in {text:?}"));
+        assert!(text.contains(r#""name":"get_weather""#), "{text:?}");
+        let user = text
+            .find("What is the weather in Paris?")
+            .unwrap_or_else(|| panic!("no user turn in {text:?}"));
+        let forbids = text
+            .find("You MUST NOT call any tools in the next message.")
+            .unwrap_or_else(|| panic!("no tool_choice=none message in {text:?}"));
+        assert!(
+            declaration < user && user < forbids,
+            "declaration at {declaration}, user turn at {user}, instruction at {forbids}"
         );
     }
 

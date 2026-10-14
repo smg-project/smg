@@ -10,18 +10,22 @@ pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
-pub use chat_utils::{create_stop_decoder, process_chat_messages};
+pub use chat_utils::{
+    create_stop_decoder, process_chat_messages, process_chat_messages_with_encoding,
+    request_as_rendered,
+};
 pub(crate) use chat_utils::{
     encode_blocking, encode_prompt_blocking, filter_chat_request_by_tool_choice,
     filter_tools_by_tool_choice, generate_tool_call_id, get_history_tool_calls_count,
     missing_tokenizer_response, parse_finish_reason, parse_json_schema_response,
-    process_chat_messages_with_placeholders, request_as_rendered, resolve_tokenizer,
-    send_error_sse, validate_chat_content_parts,
+    process_chat_messages_with_placeholders, resolve_tokenizer, send_error_sse,
+    validate_chat_content_parts,
 };
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
     convert_proto_to_openai_logprobs,
 };
+pub use message_utils::{process_messages_with_encoding, template_tools};
 pub(crate) use metrics::{error_type_for_response, error_type_from_status, route_to_endpoint};
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
 // predicate instead of duplicating it.

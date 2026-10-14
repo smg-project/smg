@@ -72,14 +72,10 @@ use std::{
 };
 
 use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer};
-use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ToolChoice, ToolChoiceValue},
-    validated::Normalizable,
-};
+use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
-use smg::routers::grpc::utils::process_chat_messages;
+use smg::routers::grpc::utils::{process_chat_messages, request_as_rendered};
 use validator::Validate;
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
@@ -2325,7 +2321,8 @@ impl Drop for StopOnPanic<'_> {
 /// migration, the `tool_choice` default; a request the gateway would answer
 /// with 400 is a difference, not a rendering), then the tools narrowed by
 /// `tool_choice` as the chat preparation stage does before rendering (every
-/// tool for a named choice, the subset for `allowed_tools`, none for `none`).
+/// tool for a named choice, the subset for `allowed_tools`, none for `none`
+/// unless the renderer declares them itself), through the stage's own rule.
 /// `process_chat_messages` then renders it exactly as the gateway does before
 /// tokenizing, and the ids are the flat encode of that text, which is the
 /// gateway's tokenize step for a renderer that returns text to encode.
@@ -2339,24 +2336,11 @@ fn render(tok: &dyn Tokenizer, model: &str, request: &Value) -> Result<Rendered,
     request
         .validate()
         .map_err(|e| format!("the gateway rejects this request with 400: {e}"))?;
-    // `request_as_rendered`, crate-private, applies this rule: a named
-    // `tool_choice` renders every tool (the engine's own server renders them
-    // all and forces the call with its grammar); an `allowed_tools` choice
-    // renders its subset; `none` renders no tool.
-    if matches!(
-        request.tool_choice,
-        Some(ToolChoice::Value(ToolChoiceValue::None))
-    ) {
-        request.tools = None;
-    }
-    let narrowed = match (&request.tools, &request.tool_choice) {
-        (Some(_), Some(ToolChoice::Function { .. })) => None,
-        (Some(tools), Some(choice)) => choice.narrow_tools(tools),
-        _ => None,
-    };
-    if let Some(tools) = narrowed {
-        request.tools = Some(tools);
-    }
+    // The preparation stage's own rule: a named `tool_choice` renders every
+    // tool (the engine's own server renders them all and forces the call with
+    // its grammar); an `allowed_tools` choice renders its subset; `none`
+    // renders no tool unless the renderer declares the tools itself.
+    let request = request_as_rendered(&request, tok.renderer_capabilities());
     let processed = process_chat_messages(&request, tok, None)?;
     let ids = tok
         .encode(&processed.text, false)

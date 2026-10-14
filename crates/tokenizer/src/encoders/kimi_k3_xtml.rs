@@ -68,10 +68,14 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // The encoder parses `arguments` itself; the gateway forwards them as
     // written. The engine's own server rewrites `enable_thinking` into the
     // encoder's `thinking` before rendering, so the renderer and the parser
-    // read the alias.
+    // read the alias. `build_chat_segments` declares every tool it is given
+    // and renders `tool_choice=none` as an internal system message that
+    // forbids the call (the served entry point forwards both as sent), so the
+    // gateway keeps the tools of such a request.
     capabilities: RendererCapabilities {
         raw_tool_call_arguments: true,
         enable_thinking_alias: true,
+        declares_tools_under_tool_choice_none: true,
         ..RendererProfile::NO_CAPABILITIES
     },
     // The encoder resolves the mode by its own rule; the parser is armed

@@ -66,5 +66,6 @@ impl RendererProfile {
         enable_thinking_alias: false,
         native_assistant_continuation: false,
         raw_tool_call_arguments: false,
+        declares_tools_under_tool_choice_none: false,
     };
 }

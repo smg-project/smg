@@ -63,8 +63,11 @@ impl MessagePreparationStage {
 
         // Step 1: The tools the template renders (narrowed by tool_choice),
         // shared with count_tokens so both render the same prompt.
-        let filtered_tools =
-            message_utils::template_tools(request.tools.as_deref(), request.tool_choice.as_ref());
+        let filtered_tools = message_utils::template_tools(
+            request.tools.as_deref(),
+            request.tool_choice.as_ref(),
+            tokenizer.renderer_capabilities(),
+        );
         let chat_tool_choice = request
             .tool_choice
             .as_ref()

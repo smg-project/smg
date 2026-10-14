@@ -1,0 +1,35 @@
+{
+  "id": "k3_tool_none",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the weather in Paris?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather in a given location.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string",
+                "description": "The city and state, e.g. San Francisco, CA."
+              }
+            },
+            "required": [
+              "location"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "none",
+    "reasoning_effort": "max"
+  },
+  "expected_prompt_tokens": 227
+}

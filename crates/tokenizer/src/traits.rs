@@ -54,6 +54,11 @@ pub struct RendererCapabilities {
     /// reference's tolerance (non-object and double-encoded values); the
     /// gateway must forward them as written instead of pre-parsing them.
     pub raw_tool_call_arguments: bool,
+    /// The renderer declares the request's tools when `tool_choice` is
+    /// `none` and tells the model not to call them, as its reference does;
+    /// the gateway keeps the tools for it. Without it the gateway renders no
+    /// tool under `none`, so the model is not offered a call it may not make.
+    pub declares_tools_under_tool_choice_none: bool,
 }
 
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
