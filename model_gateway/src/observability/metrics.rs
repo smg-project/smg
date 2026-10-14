@@ -669,10 +669,6 @@ pub(crate) fn init_metrics() {
         "KV event ranks whose index may be stale after an unreplayed gap, by worker"
     );
     describe_gauge!(
-        "smg_kv_event_tail_depth",
-        "Live KV event batches held while a snapshot resync is in flight, by worker"
-    );
-    describe_gauge!(
         "smg_log_dropped_lines",
         "Log lines the lossy writer queue dropped since the process started, by sink \
          (stdout, file)"
@@ -2500,11 +2496,6 @@ impl Metrics {
     pub fn set_kv_event_degraded_ranks(worker_url: &str, count: usize) {
         gauge!("smg_kv_event_degraded_ranks", "worker" => intern_string(worker_url))
             .set(count as f64);
-    }
-
-    /// Live batches held for a worker while a snapshot resync is in flight.
-    pub fn set_kv_event_tail_depth(worker_url: &str, depth: usize) {
-        gauge!("smg_kv_event_tail_depth", "worker" => intern_string(worker_url)).set(depth as f64);
     }
 
     /// Publish the blocks the positional index holds for a worker. Called from

@@ -165,15 +165,6 @@ impl KvEventMonitor {
                 );
                 degraded_changed = true;
             }
-            Admission::Buffered => {
-                if let Some(cursor) = state.ranks.get_mut(&rank) {
-                    if !cursor.buffer_live(batch.clone()) {
-                        Metrics::record_kv_event_batch(worker_url, "tail_overflow");
-                    }
-                    Metrics::set_kv_event_tail_depth(worker_url, cursor.tail_len());
-                }
-                return BatchOutcome::Skipped;
-            }
         }
 
         on_batch(batch);
@@ -1213,48 +1204,6 @@ mod tests {
         assert!(sim.state.snapshot.is_none());
         assert_eq!(sim.state.resume_sequence(), 10);
         assert!(!sim.state.abandon_snapshot());
-    }
-
-    #[test]
-    fn recovery_snapshot_resync_applies_the_tail_in_order() {
-        let mut sim = Sim::new();
-        sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
-        sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
-        // Lost history: the subscriber asks for a snapshot out of band and
-        // holds live batches meanwhile.
-        sim.state.ranks.get_mut(&0).unwrap().begin_snapshot();
-        let live3 = batch(3, None, vec![removed(&[3])]);
-        let live4 = batch(4, None, vec![stored(Some(2), &[5])]);
-        assert_eq!(sim.feed(&live3), BatchOutcome::Skipped);
-        assert_eq!(sim.feed(&live4), BatchOutcome::Skipped);
-        assert_eq!(sim.state.ranks[&0].tail_len(), 2);
-        // The snapshot (engine state through sequence 2) replaces the rank.
-        let snapshot = batch(
-            2,
-            None,
-            vec![cleared(), stored(None, &[1, 2]), stored(Some(2), &[3])],
-        );
-        KvEventMonitor::apply_cleared(sim.worker, &sim.indexer, &mut sim.state.index);
-        sim.apply_direct(&snapshot);
-        let tail = sim
-            .state
-            .ranks
-            .get_mut(&0)
-            .unwrap()
-            .finish_snapshot(2)
-            .expect("tail intact");
-        assert_eq!(tail.len(), 2);
-        for b in &tail {
-            sim.apply_direct(b);
-        }
-        sim.reference_apply(&live3);
-        sim.reference_apply(&live4);
-        assert_eq!(
-            sim.deliver(&batch(5, None, vec![stored(Some(5), &[6])])),
-            BatchOutcome::Applied
-        );
-        assert!(!sim.state.ranks[&0].is_degraded());
-        sim.assert_matches_reference();
     }
 
     /// A store whose parent the index does not hold is placed from the root
