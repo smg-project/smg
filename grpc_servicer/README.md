@@ -82,10 +82,16 @@ by default) overrides the model's per-modality reference limits;
 meaning vLLM's own `--media-io-kwargs` decide) caps the frames a video is
 sampled to, so long clips stay bounded. All eight flag-backed settings are
 validated when the servicer starts, whatever the processor mode, so a stale
-unreadable value fails loudly. The inline cap is the worker's alone: the router
-has no per-item cap, and the 400 it relays for an oversized item quotes this
-flag; what the router bounds is the whole request body, with
-`--max-buffered-request-bytes`, which a large inline item needs raised as well.
+unreadable value fails loudly. Two layers bound an inline item: the router
+refuses a `data:` item above its own per-kind input bound
+(`SMG_IMAGE_MAX_INPUT_BYTES`, `SMG_VIDEO_MAX_INPUT_BYTES`,
+`SMG_AUDIO_MAX_INPUT_BYTES`; default 256 MiB each) with a 400
+`media_ref_too_large` before the worker sees it, and the worker refuses one
+above `--mm-max-item-bytes` with a message that names the worker as the flag's
+owner, which the router relays as a 400 `start_generation_failed`. With the
+defaults a 50 MB item clears the router and stops at the worker's 32 MiB, so
+that flag is the one to raise; the router's `--max-buffered-request-bytes` must
+also hold the whole request body.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 the model's spec opts in and every registered worker of the model advertises

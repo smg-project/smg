@@ -141,7 +141,13 @@ class TestItemBytes:
             _Item("image", "data:image/png;base64,AAAAAAAA"),
         ]
         mm_processor.enforce_item_bytes(items, 6)
-        with pytest.raises(ValueError, match="media_refs\\[1\\].*6 bytes, above the 5-byte cap"):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "media_refs\\[1\\].*6 bytes, above the 5-byte cap "
+                "\\(the worker's --mm-max-item-bytes, SMG_VLLM_MM_MAX_ITEM_BYTES\\)"
+            ),
+        ):
             mm_processor.enforce_item_bytes(items, 5)
 
 

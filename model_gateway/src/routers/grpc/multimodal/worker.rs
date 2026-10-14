@@ -603,8 +603,10 @@ impl WorkerMediaPipeline {
     /// The content part for one item, with the checks the Python servicer
     /// makes before fetching: a scheme this worker fetches, an inline payload
     /// under the cap, a modality the pipeline takes. The cap's message names
-    /// the worker as the flag's owner: the router has no per-item cap and only
-    /// relays the refusal, so a reader of its 400 knows which launcher to set.
+    /// the worker as the flag's owner: the router relays the refusal in its
+    /// 400, and its own per-item input bound (`SMG_*_MAX_INPUT_BYTES`, 256 MiB
+    /// by default) is checked earlier with a message of its own, so a reader
+    /// of either knows which launcher to set.
     fn part(
         &self,
         index: usize,

@@ -128,7 +128,7 @@ def enforce_item_bytes(items: Sequence[Any], max_bytes: int) -> None:
         if size is not None and size > max_bytes:
             raise ValueError(
                 f"media_refs[{index}]: inline payload is {size} bytes, above the "
-                f"{max_bytes}-byte cap ({ENV_MAX_ITEM_BYTES})"
+                f"{max_bytes}-byte cap (the worker's --mm-max-item-bytes, {ENV_MAX_ITEM_BYTES})"
             )
 
 
