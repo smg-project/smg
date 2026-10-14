@@ -447,7 +447,7 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
-    use symphony::{formats::qwen3, CallSyntax};
+    use symphony::{adapt, formats::qwen3, CallSyntax};
 
     use super::*;
 
@@ -921,5 +921,42 @@ mod tests {
         assert!(finished(&events).is_some());
         assert!(reader.ended());
         assert!(reader.end(EngineFinish::Stop).expect("ended").is_empty());
+    }
+
+    #[test]
+    fn the_content_spans_are_where_the_messages_content_stands_in_the_output() {
+        // A thought, content on both sides of a call, text after the call's object (malformed,
+        // which the message shows as content), and a call the end cuts off.
+        for output in [
+            "<think>plan</think>Hello <tool_call>\n{\"name\": \"lookup\", \"arguments\": {}} x\n</tool_call> done",
+            "Hi <tool_call>\n{\"name\": \"lookup\", \"argu",
+            "<think>plan</think>\n\nNo call.",
+        ] {
+            let mut engine = Engine::new(qwen3(CallSyntax::Json), Declared::of(&tools()));
+            let mut events = Events::new();
+            for input in [
+                Input::Prompt {
+                    token_ids: &[],
+                    text: "",
+                },
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+            ] {
+                engine.feed(input, &mut events).expect("read");
+            }
+            let events = events.drain();
+            let content: String = content_spans(&events)
+                .into_iter()
+                .map(|(start, end)| &output[start..end])
+                .collect();
+            let message = adapt::chat::message(0, &events).message;
+            assert_eq!(message.content, Some(content), "{output:?}");
+        }
     }
 }

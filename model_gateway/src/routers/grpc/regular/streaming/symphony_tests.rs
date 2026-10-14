@@ -222,25 +222,29 @@ async fn without_an_assignment_the_older_parsers_read_the_stream() {
 /// A whole `output` read by the non-streaming driver with the Qwen3 table, one logprob per
 /// character token: the choice and its reasoning token count.
 async fn fold(output: &str) -> (ChatChoice, u32) {
+    fold_with(output, "<|im_start|>assistant\n", None).await
+}
+
+/// [`fold`], replaying `prompt` and with `stop` as a stop sequence. The token at position `i`
+/// reports logprob `-i`, so a kept logprob says which token it is.
+async fn fold_with(output: &str, prompt: &str, stop: Option<&str>) -> (ChatChoice, u32) {
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
     let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
         output_ids: output_ids.clone(),
         finish_reason: "stop".to_string(),
         output_logprobs: Some(smg_grpc_client::tokenspeed_proto::OutputLogProbs {
-            token_logprobs: vec![-0.5; output_ids.len()],
+            token_logprobs: (0..output_ids.len()).map(|i| -(i as f32)).collect(),
             token_ids: output_ids,
             top_logprobs: Vec::new(),
         }),
         ..Default::default()
     });
-    let mut decoder =
-        StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
-    let spec = assigned(
-        chat_spec(true),
-        qwen3(CallSyntax::Json),
-        "<|im_start|>assistant\n",
-    );
+    let config = stop.map_or_else(StopSequenceConfig::default, |stop| {
+        StopSequenceConfig::default().with_stop_sequence(stop)
+    });
+    let mut decoder = StopSequenceDecoder::new(tokenizer.clone(), config, false);
+    let spec = assigned(chat_spec(true), qwen3(CallSyntax::Json), prompt);
     let processor = ResponseProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
@@ -326,4 +330,128 @@ async fn malformed_call_text_is_content_and_keeps_its_logprobs() {
     assert!(content.contains("not a call"), "{content}");
     assert!(choice.message.tool_calls.is_none());
     assert_eq!(kept_logprob_tokens(&choice), content);
+}
+
+/// `output` as the engine streams it: one chunk per character token, each with the logprob
+/// [`fold_with`] gives that token (`-i` at position `i`), then the Complete frame.
+fn chunks_with_logprobs(output: &str) -> Vec<proto::GenerateResponse> {
+    let mut frames: Vec<proto::GenerateResponse> = output
+        .chars()
+        .enumerate()
+        .map(|(position, character)| {
+            let mut frame = chunk(0, &character.to_string());
+            if let Some(proto::generate_response::Response::Chunk(chunk)) = &mut frame.response {
+                chunk.output_logprobs = Some(proto::OutputLogProbs {
+                    token_logprobs: vec![-(position as f32)],
+                    token_ids: chunk.token_ids.clone(),
+                    top_logprobs: Vec::new(),
+                });
+            }
+            frame
+        })
+        .collect();
+    frames.push(complete(0, "stop"));
+    frames
+}
+
+/// The `(token, logprob)` pairs of a `logprobs` object's `content`.
+fn token_logprobs(logprobs: &Value) -> Vec<(String, f64)> {
+    logprobs["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            let token = item["token"].as_str().expect("a token").to_string();
+            (token, item["logprob"].as_f64().expect("a logprob"))
+        })
+        .collect()
+}
+
+/// A whole output's logprobs are the ones the stream's content deltas carry: the content's
+/// tokens, not the thought or its markers, the call, the stop sequence or what follows it. Text
+/// after the call's object is malformed, which the message shows as content, so its token is the
+/// content's too.
+#[tokio::test]
+async fn unary_logprobs_cover_the_content_as_the_stream_does() {
+    let call = "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}} ";
+    // The thought is opened by the model, or by the prompt, whose replay starts the output
+    // inside it.
+    for (prompt, thought) in [
+        ("<|im_start|>assistant\n", "<think>why</think>"),
+        ("<|im_start|>assistant\n<think>\n", "why</think>"),
+    ] {
+        // The output's parts, each marked when it is content.
+        let parts = [
+            (thought, false),
+            ("Hi ", true),
+            (call, false),
+            ("x", true),
+            ("\n</tool_call>", false),
+            ("ok", true),
+            ("STOPmore", false),
+        ];
+        let output: String = parts.iter().map(|(part, _)| *part).collect();
+        let mut content = Vec::new();
+        let mut position = 0;
+        for (part, is_content) in parts {
+            for character in part.chars() {
+                if is_content {
+                    content.push((character.to_string(), -(position as f64)));
+                }
+                position += 1;
+            }
+        }
+
+        let (choice, _) = fold_with(&output, prompt, Some("STOP")).await;
+        assert_eq!(
+            choice.message.content.as_deref(),
+            Some("Hi xok"),
+            "{choice:?}"
+        );
+        assert_eq!(choice.message.reasoning_content.as_deref(), Some("why"));
+        let calls = choice.message.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(calls[0].function.name, "lookup");
+        let choice = serde_json::to_value(&choice).expect("a choice");
+        assert_eq!(token_logprobs(&choice["logprobs"]), content, "{choice}");
+
+        let spec = assigned(chat_spec(true), qwen3(CallSyntax::Json), prompt);
+        let (result, events) =
+            stream_events_stopping(chunks_with_logprobs(&output), spec, "STOP").await;
+        assert!(result.is_ok(), "{result:?}");
+        let streamed: Vec<(String, f64)> = events
+            .iter()
+            .filter_map(|event| event["choices"].get(0))
+            .filter(|choice| {
+                choice["delta"]["content"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+            })
+            .flat_map(|choice| token_logprobs(&choice["logprobs"]))
+            .collect();
+        assert_eq!(streamed, content, "prompt: {prompt:?}");
+    }
+}
+
+/// Text the decoder held back as a possible stop and released once decoding finished is the
+/// last token's: when it is content, the tokens that wrote it keep their logprobs, the one the
+/// decoder held with no text of its own among them.
+#[tokio::test]
+async fn text_the_decoder_held_keeps_its_tokens_logprobs() {
+    let (choice, _) = fold_with(
+        "<think>why</think>okST",
+        "<|im_start|>assistant\n",
+        Some("STOP"),
+    )
+    .await;
+    assert_eq!(
+        choice.message.content.as_deref(),
+        Some("okST"),
+        "{choice:?}"
+    );
+    let choice = serde_json::to_value(&choice).expect("a choice");
+    let logprobs: Vec<(String, f64)> = [("o", -18.0), ("k", -19.0), ("S", -20.0), ("T", -21.0)]
+        .into_iter()
+        .map(|(token, logprob)| (token.to_string(), logprob))
+        .collect();
+    assert_eq!(token_logprobs(&choice["logprobs"]), logprobs, "{choice}");
 }
