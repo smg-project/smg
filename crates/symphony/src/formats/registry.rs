@@ -20,7 +20,7 @@
 
 use super::{
     deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5,
-    ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    ling, minicpm5, minimax_m2, minimax_m3, mistral, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -61,6 +61,7 @@ pub enum Table {
     MinimaxM2,
     /// [`minimax_m3()`].
     MinimaxM3,
+    Mistral,
     /// [`kimi_k3()`].
     KimiK3,
     /// [`inkling()`].
@@ -83,7 +84,7 @@ pub enum Table {
 
 impl Table {
     /// Every table, in this order.
-    pub const ALL: [Table; 23] = [
+    pub const ALL: [Table; 24] = [
         Self::Qwen3,
         Self::Qwen3Tagged,
         Self::Qwen3TaggedDirect,
@@ -98,6 +99,7 @@ impl Table {
         Self::Xlam,
         Self::MinimaxM2,
         Self::MinimaxM3,
+        Self::Mistral,
         Self::KimiK3,
         Self::Inkling,
         Self::MiniCpm5,
@@ -127,6 +129,7 @@ impl Table {
             Self::Xlam => "xlam",
             Self::MinimaxM2 => "minimax_m2",
             Self::MinimaxM3 => "minimax_m3",
+            Self::Mistral => "mistral",
             Self::KimiK3 => "kimi_k3",
             Self::Inkling => "inkling",
             Self::MiniCpm5 => "minicpm5",
@@ -163,6 +166,7 @@ impl Table {
             Self::Xlam => xlam(),
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
+            Self::Mistral => mistral(),
             Self::KimiK3 => kimi_k3(),
             Self::Inkling => inkling(),
             Self::MiniCpm5 => minicpm5(),
@@ -314,6 +318,12 @@ const GROUPS: &[Group] = &[
         model: "deepseek-ai/DeepSeek-V4.1-Flash",
         also: &[],
         table: Table::DeepSeekV4_1,
+        opener: None,
+    },
+    Group {
+        model: "mistralai/Devstral-2-123B-Instruct-2512",
+        also: &[],
+        table: Table::Mistral,
         opener: None,
     },
     Group {
@@ -512,6 +522,51 @@ const GROUPS: &[Group] = &[
         model: "MiniMaxAI/MiniMax-M3",
         also: &[],
         table: Table::MinimaxM3,
+        opener: None,
+    },
+    Group {
+        model: "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+        also: &[],
+        table: Table::Mistral,
+        opener: None,
+    },
+    Group {
+        model: "mistralai/Ministral-3-14B-Reasoning-2512",
+        also: &[
+            "Ministral-3-3B-Reasoning-2512",
+            "Ministral-3-8B-Reasoning-2512",
+        ],
+        table: Table::Mistral,
+        opener: None,
+    },
+    Group {
+        model: "mistralai/Ministral-3-3B-Instruct-2512",
+        also: &[],
+        table: Table::Mistral,
+        opener: None,
+    },
+    Group {
+        model: "mistralai/Ministral-3-3B-Instruct-2512-BF16",
+        also: &[],
+        table: Table::Mistral,
+        opener: None,
+    },
+    Group {
+        model: "mistralai/Ministral-3-8B-Instruct-2512-BF16",
+        also: &[],
+        table: Table::Mistral,
+        opener: None,
+    },
+    Group {
+        model: "mistralai/Mistral-Medium-3.5-128B",
+        also: &[],
+        table: Table::Mistral,
+        opener: None,
+    },
+    Group {
+        model: "mistralai/Mistral-Small-4-119B-2603",
+        also: &[],
+        table: Table::Mistral,
         opener: None,
     },
     Group {

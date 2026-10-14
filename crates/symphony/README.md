@@ -52,7 +52,7 @@ and a client that wants the raw text back can have it.
 | `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
-| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `gemma4()`, `plain()`. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `gemma4()`, `mistral()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
@@ -75,7 +75,8 @@ and a client that wants the raw text back can have it.
 - `pythonic`: calls written as Python, `name(key=value)`.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
   `tagged`, `pythonic`, `attributed` for MiniMax M2's, dots3's, MiniCPM5's and DSML's, and `xml`
-  for MiniMax M3's; the JSON, compact keyed and xLAM list spellings in the module itself), with
+  for MiniMax M3's; the JSON, compact keyed, xLAM list, Inkling and Mistral spellings in the module
+  itself), with
   the argument shapes a JSON schema pins (`schema`).
 - `adapt`: the three API adapters, every response policy in one place.
 - `event`, `input`, `parser`: the contract above.
@@ -135,7 +136,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 
 <!-- models: begin -->
 159 groups, 277 checkpoints, newest first.
-20 ready, 80 replaying a recorded set, 0 on main awaiting fixtures, 59 pending.
+20 ready, 88 replaying a recorded set, 0 on main awaiting fixtures, 51 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -185,7 +186,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2026-04-06 | [granite-4.1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-4.1-3b) | ibm-granite/granite-4.1-3b | granite-4.1-30b | `qwen2.5` | 576,772 | replaying the set | none |
 | 2026-04-03 | [glm-5.1](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.1) | zai-org/GLM-5.1 |  | `glm` | 163,746 | replaying the set | `glm47_moe`, `glm45` |
 | 2026-04-01 | [nvidia-nemotron-labs-3-elastic-30b-a3b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-labs-3-elastic-30b-a3b-bf16) | nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | none |
-| 2026-03-31 | [mistral-medium-3.5-128b](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-medium-3.5-128b) | mistralai/Mistral-Medium-3.5-128B |  | — | 583,079 | pending | `mistral`, none |
+| 2026-03-31 | [mistral-medium-3.5-128b](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-medium-3.5-128b) | mistralai/Mistral-Medium-3.5-128B |  | `mistral` | 583,079 | replaying the set | `mistral`, none |
 | 2026-03-19 | [dots.mocr](https://github.com/smg-project/bellwether/tree/main/fixtures/dots.mocr) | dots-studio/dots.mocr | dots.mocr-svg | — | 328,662 | pending | none |
 | 2026-03-18 | [nemotron-cascade-2-30b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/nemotron-cascade-2-30b-a3b) | nvidia/Nemotron-Cascade-2-30B-A3B |  | `qwen3`, tagged calls | 12,829 | replaying the set | none |
 | 2026-03-10 | [nvidia-nemotron-3-super-120b-a12b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3-super-120b-a12b-bf16) | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16 | Nemotron-3-Labs-Ultra-Math-SFT, NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
@@ -201,7 +202,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2026-02-09 | [astabrief-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/astabrief-8b) | allenai/AstaBrief_8B | AstaBrief_8B_SFT | `qwen3` | 583,086 | replaying the set | none |
 | 2026-02-01 | [step-3.5-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/step-3.5-flash) | stepfun-ai/Step-3.5-Flash |  | `qwen3`, tagged calls | 54,181 | ready | `step3`, none |
 | 2026-01-30 | [qwen3-coder-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-coder-next) | Qwen/Qwen3-Coder-Next | Qwen3-Coder-Next-Base | `qwen3`, tagged calls | 490,469 | replaying the set | `qwen_xml`, `qwen3` |
-| 2026-01-23 | [mistral-small-4-119b-2603](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-small-4-119b-2603) | mistralai/Mistral-Small-4-119B-2603 |  | — | 583,079 | pending | `mistral`, none |
+| 2026-01-23 | [mistral-small-4-119b-2603](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-small-4-119b-2603) | mistralai/Mistral-Small-4-119B-2603 |  | `mistral` | 583,079 | replaying the set | `mistral`, none |
 | 2026-01-19 | [agentcpm-report](https://github.com/smg-project/bellwether/tree/main/fixtures/agentcpm-report) | openbmb/AgentCPM-Report |  | — | 328,660 | pending | none |
 | 2026-01-19 | [glm-4.7-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.7-flash) | zai-org/GLM-4.7-Flash |  | `glm` | 1,947 | replaying the set | `glm47_moe`, none |
 | 2026-01-14 | [nemotron-research-goosereason-4b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/nemotron-research-goosereason-4b-instruct) | nvidia/Nemotron-Research-GooseReason-4B-Instruct | OpenMOSS-Team/SciJudge-4B, OpenMOSS-Team/SciJudge-4B-2605 | `qwen2.5` | 576,772 | replaying the set | none |
@@ -223,14 +224,14 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2025-12-07 | [glm-4.6v-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6v-flash) | zai-org/GLM-4.6V-Flash |  | `glm4` | 492,389 | replaying the set | `glm45_moe`, none |
 | 2025-12-04 | [nvidia-nemotron-3-nano-30b-a3b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3-nano-30b-a3b-bf16) | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2025-12-01 | [trinity-mini](https://github.com/smg-project/bellwether/tree/main/fixtures/trinity-mini) | arcee-ai/Trinity-Mini |  | — | — | pending | none |
-| 2025-11-28 | [devstral-2-123b-instruct-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/devstral-2-123b-instruct-2512) | mistralai/Devstral-2-123B-Instruct-2512 |  | — | 570,194 | pending | none |
+| 2025-11-28 | [devstral-2-123b-instruct-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/devstral-2-123b-instruct-2512) | mistralai/Devstral-2-123B-Instruct-2512 |  | `mistral` | 570,194 | replaying the set | none |
 | 2025-11-25 | [nemotron-orchestrator-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/nemotron-orchestrator-8b) | nvidia/Nemotron-Orchestrator-8B | IQuestLab/Fleming-R1-32B | `qwen3` | 583,086 | replaying the set | none |
 | 2025-11-19 | [olmo-3-7b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/olmo-3-7b-instruct) | allenai/Olmo-3-7B-Instruct |  | `olmo3` | 570,199 | replaying the set | none |
-| 2025-10-31 | [ministral-3-14b-instruct-2512-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-14b-instruct-2512-bf16) | mistralai/Ministral-3-14B-Instruct-2512-BF16 |  | — | 570,194 | pending | none |
-| 2025-10-31 | [ministral-3-14b-reasoning-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-14b-reasoning-2512) | mistralai/Ministral-3-14B-Reasoning-2512 | Ministral-3-3B-Reasoning-2512, Ministral-3-8B-Reasoning-2512 | — | 583,079 | pending | none |
-| 2025-10-31 | [ministral-3-3b-instruct-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-3b-instruct-2512) | mistralai/Ministral-3-3B-Instruct-2512 |  | — | 570,194 | pending | none |
-| 2025-10-31 | [ministral-3-3b-instruct-2512-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-3b-instruct-2512-bf16) | mistralai/Ministral-3-3B-Instruct-2512-BF16 |  | — | 570,194 | pending | none |
-| 2025-10-31 | [ministral-3-8b-instruct-2512-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-8b-instruct-2512-bf16) | mistralai/Ministral-3-8B-Instruct-2512-BF16 |  | — | 570,194 | pending | none |
+| 2025-10-31 | [ministral-3-14b-instruct-2512-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-14b-instruct-2512-bf16) | mistralai/Ministral-3-14B-Instruct-2512-BF16 |  | `mistral` | 570,194 | replaying the set | none |
+| 2025-10-31 | [ministral-3-14b-reasoning-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-14b-reasoning-2512) | mistralai/Ministral-3-14B-Reasoning-2512 | Ministral-3-3B-Reasoning-2512, Ministral-3-8B-Reasoning-2512 | `mistral` | 583,079 | replaying the set | none |
+| 2025-10-31 | [ministral-3-3b-instruct-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-3b-instruct-2512) | mistralai/Ministral-3-3B-Instruct-2512 |  | `mistral` | 570,194 | replaying the set | none |
+| 2025-10-31 | [ministral-3-3b-instruct-2512-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-3b-instruct-2512-bf16) | mistralai/Ministral-3-3B-Instruct-2512-BF16 |  | `mistral` | 570,194 | replaying the set | none |
+| 2025-10-31 | [ministral-3-8b-instruct-2512-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/ministral-3-8b-instruct-2512-bf16) | mistralai/Ministral-3-8B-Instruct-2512-BF16 |  | `mistral` | 570,194 | replaying the set | none |
 | 2025-10-29 | [falcon-h1r-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/falcon-h1r-7b) | tiiuae/Falcon-H1R-7B |  | `qwen3` | 442,119 | replaying the set | none |
 | 2025-10-24 | [audio-flamingo-3-hf](https://github.com/smg-project/bellwether/tree/main/fixtures/audio-flamingo-3-hf) | nvidia/audio-flamingo-3-hf |  | — | 328,662 | pending | none |
 | 2025-10-22 | [minimax-m2](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m2) | MiniMaxAI/MiniMax-M2 |  | `minimax_m2` | 12,821 | replaying the set | `minimax_m2`, `minimax` |

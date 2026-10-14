@@ -84,6 +84,12 @@ pub enum CallSyntax {
     /// terminals that leave the state are the message's own; the object's close is the call's end,
     /// and the message's closing terminal is the region's.
     NamedJson(&'static str),
+    /// The tool's name as text, then this marker, then the arguments object alone: Mistral's
+    /// `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`. The terminal that enters the state is the
+    /// call's opener, which also opens the next call; the object's close is the call's end, and
+    /// the region ends at the next call's opener or the end of the turn, since the template writes
+    /// no closing marker.
+    NamedArguments(&'static str),
     /// Gemma 4's `call:NAME{key:value,…}`: keys bare, a string between `<|"|>` tokens, numbers and
     /// words bare, lists and objects nested the same way, the keys sorted by the template. The
     /// terminals that enter and leave the state are the call's own markers, and the call's end

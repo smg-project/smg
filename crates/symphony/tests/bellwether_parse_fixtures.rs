@@ -81,8 +81,8 @@ use symphony::{
     adapt,
     formats::{
         deepseek_v4_1, dots3, for_model, gemma4, glm, glm4, groups, hy4, inkling, iquest,
-        k2_horizon, kimi_k3, lfm2_5, ling, minicpm5, minimax_m2, minimax_m3, olmo3, plain, qwen2_5,
-        qwen3, seed_oss, xlam,
+        k2_horizon, kimi_k3, lfm2_5, ling, minicpm5, minimax_m2, minimax_m3, mistral, olmo3, plain,
+        qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -719,6 +719,48 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // LFM2.5's Python calls under d1's template, which adds nothing to the turn opener in either
     // thinking setting; the model writes `<think>` itself or not.
     ("d1-3b", Family::Lfm2_5, GenerationPrompt::ModelDecides),
+    // Mistral: `[THINK]` and `[/THINK]` the model's own, `[TOOL_CALLS]name[ARGS]{…}` per call; the
+    // prompt ends at `[/INST]` whatever the request says. The instruct templates have no thought.
+    (
+        "devstral-2-123b-instruct-2512",
+        Family::Mistral,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-14b-instruct-2512-bf16",
+        Family::Mistral,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-14b-reasoning-2512",
+        Family::Mistral,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "ministral-3-3b-instruct-2512",
+        Family::Mistral,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-3b-instruct-2512-bf16",
+        Family::Mistral,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "ministral-3-8b-instruct-2512-bf16",
+        Family::Mistral,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "mistral-medium-3.5-128b",
+        Family::Mistral,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "mistral-small-4-119b-2603",
+        Family::Mistral,
+        GenerationPrompt::ModelDecides,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -765,6 +807,8 @@ enum Family {
     Lfm2_5,
     /// [`xlam`]: a bare JSON list of calls.
     Xlam,
+    /// [`mistral`]: the tool's name, `[ARGS]` and the arguments object after `[TOOL_CALLS]`.
+    Mistral,
     /// [`minimax_m2`]: parameters named by an attribute, typed by the request tools.
     MinimaxM2,
     /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
@@ -795,6 +839,7 @@ impl Family {
             Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
+            Self::Mistral => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
     }
@@ -839,6 +884,7 @@ impl Family {
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::Mistral => mistral(),
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
@@ -868,6 +914,7 @@ impl Family {
             | Self::K2Horizon
             | Self::Inkling
             | Self::Gemma4
+            | Self::Mistral
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,

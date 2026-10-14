@@ -104,6 +104,9 @@ fn assembler(syntax: Option<CallSyntax>, index: u32) -> Box<dyn CallAssembler> {
         Some(CallSyntax::NamedJson(marker)) => {
             Box::new(json::named::Assembler::new(index, id, marker))
         }
+        Some(CallSyntax::NamedArguments(marker)) => {
+            Box::new(json::named_arguments::Assembler::new(index, id, marker))
+        }
         Some(CallSyntax::Gemma) => Box::new(gemma::Assembler::new(index, id)),
     }
 }

@@ -169,6 +169,10 @@ fn kimi_k3() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::kimi_k3(), Declared::default()))
 }
 
+fn mistral() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::mistral(), Declared::default()))
+}
+
 fn plain() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::plain(), Declared::default()))
 }
@@ -248,6 +252,11 @@ const FORMATS: &[Subject] = &[
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
+    },
+    Subject {
+        name: "mistral",
+        new: mistral,
+        outputs: MISTRAL_OUTPUTS,
     },
 ];
 
@@ -410,6 +419,22 @@ const LFM_OUTPUTS: &[&str] = &[
     "<think>The user asks.</think><|tool_call_start|>[get_weather(city='計画 🌍 \"q\"')]\
      <|tool_call_end|>",
     "<|tool_call_start|>[]<|tool_call_end|>Nothing to call.",
+];
+
+/// Mistral's calls: the tool's name, `[ARGS]`, the arguments object alone, one call per opener,
+/// the thought between `[THINK]` and `[/THINK]`.
+const MISTRAL_OUTPUTS: &[&str] = &[
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}",
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}[TOOL_CALLS]get_stock_price[ARGS]{}",
+    "Let me check.[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}",
+    "[THINK]The user asks about Paris.[/THINK][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}",
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Par",
+    "[TOOL_CALLS]get_wea",
+    "[TOOL_CALLS][TOOL_CALLS]get_weather[ARGS]{}",
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": @}",
+    "[TOOL_CALLS]get_weather[ARGS]{} trailing",
+    "[THINK]Only a thought.[/THINK]",
+    "Hello!",
 ];
 
 /// Seed-OSS: the tagged syntax under its own markers, a value as Python's repr, and Qwen's

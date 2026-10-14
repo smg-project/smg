@@ -140,6 +140,31 @@ table has no terminal for it, so such a message sits in the named-JSON header un
 `<|end_message|>` and comes back whole as `Malformed` (a name without a call), no byte lost; a
 recording of one decides what it is.
 
+## Mistral (`mistral`)
+
+What the table says beyond the others:
+
+- **A call has no closing marker.** `[TOOL_CALLS]` opens the call state, and the state's own rows
+  are the next `[TOOL_CALLS]` and the end of the turn: the arguments object's close ends the call
+  (`json::named_arguments`), the next opener or the turn's end ends the region. Text after a closed
+  object and before the next opener is the template's wrapping: whitespace dropped, anything else
+  malformed. The tool's name is the text between the opener and `[ARGS]`, taken as written; the
+  object after `[ARGS]` is the arguments alone, so `ToolCallStart` carries the name and the marker
+  as its source, and the fragments are the object's bytes.
+- **The prompt ends at `[/INST]`, or after a tool result.** The template writes no assistant opener
+  and no thought in the prompt, whatever the request says: the model writes `[THINK]` itself. After
+  a tool result the prompt ends in `[/TOOL_RESULTS]`, and its last `[/INST]` stands before the
+  previous turn's calls; the replay walks into the call state, which the prompt never enters, so
+  the output starts in content, where the template puts it.
+- **A forced call's tag has no end.** `Format::grammar` writes a tag per tool from `[TOOL_CALLS]`,
+  the name and `[ARGS]` to the schema, and nothing after it, as the template writes nothing: the
+  object the schema accepts ends the tag. The gateway's older `mistral` parser and its tag read
+  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, so nothing is pinned to it.
+
+What the table leaves open: whether every engine takes a tag whose `end` is empty (xgrammar's
+structural tag allows it; the Symphony e2e lane says so for the engines it runs); and the older
+list syntax, which no recorded group writes.
+
 ## MiniCPM5 (`minicpm5`)
 
 The template writes the turn as `<think>\n`, the reasoning, `\n</think>\n\n`, the content, a newline

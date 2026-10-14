@@ -318,6 +318,9 @@ impl Format {
             CallSyntax::NamedJson(marker) => {
                 return self.named_json_calls(marker, &named, at_least_one);
             }
+            CallSyntax::NamedArguments(marker) => {
+                self.named_arguments_calls(marker, &named, at_least_one)?
+            }
         };
         if !reasoning_open {
             return Some(calls);
@@ -345,6 +348,7 @@ impl Format {
             Some(CallSyntax::Attributed(tags)) => &[tags.parameter_open, tags.parameter_close],
             Some(CallSyntax::Tagged(..)) => &TAGGED_TAGS,
             Some(CallSyntax::Gemma) => &[GEMMA_STRING],
+            Some(CallSyntax::NamedArguments(marker)) => std::slice::from_ref(marker),
             _ => &[],
         };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
@@ -418,6 +422,42 @@ impl Format {
             .collect();
         Some(Grammar::TriggeredTags {
             triggers: vec![marker.to_string()],
+            tags,
+            at_least_one,
+        })
+    }
+
+    /// Mistral's named arguments: the call's opener triggers a tag per tool, the opener, the
+    /// tool's name and the marker as its `begin`, the arguments the tool's schema accepts as its
+    /// content, and nothing as its `end`, since the template writes no closing marker: the object
+    /// the schema accepts ends the tag, and the next opener or the end of the turn follows. The
+    /// opener is the terminal of the row from the turn's own state into the arguments state;
+    /// `None` for a table without one.
+    fn named_arguments_calls(
+        &self,
+        marker: &str,
+        tools: &[&Tool],
+        at_least_one: bool,
+    ) -> Option<Grammar> {
+        let (_, open, _) = self
+            .transitions()
+            .find(|&(source, _, target)| source == 0 && self.emits(target) == Emits::Arguments)?;
+        let open = self.terminal_text(open);
+        let tags = tools
+            .iter()
+            .map(|tool| {
+                Tag::new(
+                    format!("{open}{}{marker}", tool.function.name),
+                    Grammar::JsonSchema {
+                        schema: tool.function.parameters.clone(),
+                        style: None,
+                    },
+                    "",
+                )
+            })
+            .collect();
+        Some(Grammar::TriggeredTags {
+            triggers: vec![open.to_string()],
             tags,
             at_least_one,
         })
@@ -1259,6 +1299,55 @@ mod tests {
             formats::inkling().grammar(&tools, true, true),
             formats::inkling().grammar(&tools, true, false)
         );
+    }
+
+    #[test]
+    fn mistral_derives_a_tag_per_tool_from_the_opener_to_the_arguments_object() {
+        // No hand-written tag to pin to: the gateway's older `mistral` parser reads Mistral 7B
+        // v0.3's `[TOOL_CALLS][{…}]` list, another syntax. Per named tool, `[TOOL_CALLS]`, the
+        // name and `[ARGS]` begin the tag, the tool's schema is its content, and nothing ends it:
+        // the template writes no closing marker, so the object ends the tag and the next opener
+        // or the end of the turn follows. Mistral's prompt never leaves the thought open, and the
+        // tag with it open is the same tag after a prefix of free text.
+        let tools = weather_tools();
+        let payload = formats::mistral()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let schema = value!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let per_tool = |name: &str, schema: &Value| {
+            value!({
+                "type": "tag",
+                "begin": format!("[TOOL_CALLS]{name}[ARGS]"),
+                "content": {"type": "json_schema", "json_schema": schema},
+                "end": "",
+            })
+        };
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["[TOOL_CALLS]"],
+                "tags": [
+                    per_tool("get_weather", &schema),
+                    per_tool("lookup", &schema),
+                    per_tool("ping", &value!({})),
+                ],
+                "at_least_one": true,
+            }})
+        );
+        let open = formats::mistral()
+            .grammar(&tools, true, true)
+            .expect("a grammar");
+        assert!(matches!(
+            &open,
+            Grammar::Sequence(parts)
+                if parts.len() == 2
+                    && matches!(&parts[0], Grammar::AnyText { excludes }
+                        if excludes.contains(&"[TOOL_CALLS]".to_string())
+                            && excludes.contains(&"[ARGS]".to_string())
+                            && !excludes.contains(&"[THINK]".to_string()))
+        ));
     }
 
     #[test]

@@ -45,5 +45,7 @@ the close returns; from any other state, its own row into the block. So the mode
 the prompt left open on its way to the calls, whichever that was.
 
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
-trigger inside whatever message the model is writing. A table without calls gives `None`, and the
+trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool
+from `[TOOL_CALLS]`, the name and `[ARGS]` to the tool's schema, with no end, as the template writes
+nothing after the object. A table without calls gives `None`, and the
 gateway takes the JSON-schema path for it.
