@@ -69,7 +69,9 @@ struct RouterFamily {
     shadowed_by: Option<RouterId>,
 }
 
-/// The families in the order the weighted pick walks them.
+/// The families in the order the weighted pick walks them. A family's shadow
+/// is judged on the shadowing family's own legs and router, not on the order
+/// of this table.
 const ROUTER_FAMILIES: [RouterFamily; 5] = [
     RouterFamily {
         router: router_ids::GRPC_EPD,
@@ -236,25 +238,25 @@ impl Gateway {
 
     /// The families' weights for a model, in [`ROUTER_FAMILIES`] order: a
     /// family's legs' worker counts summed when every leg has workers and
-    /// its router is mounted, else 0; 0 as well for a family that another
-    /// family with weight shadows.
+    /// its router is mounted, else 0; 0 as well for a family shadowed by a
+    /// family that has weight.
     fn family_weights(
         &self,
         size: impl Fn(RoutingPool) -> usize,
     ) -> [usize; ROUTER_FAMILIES.len()] {
         let routers = self.routers.load();
+        // A family has weight when its router is mounted and every leg has workers.
+        let has_weight = |family: &RouterFamily| {
+            routers.contains_key(&family.router) && family.legs.iter().all(|pool| size(*pool) > 0)
+        };
         let mut weights = [0usize; ROUTER_FAMILIES.len()];
         for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
             let shadowed = family.shadowed_by.as_ref().is_some_and(|shadow| {
                 ROUTER_FAMILIES
                     .iter()
-                    .position(|other| other.router == *shadow)
-                    .is_some_and(|j| weights[j] > 0)
+                    .any(|other| other.router == *shadow && has_weight(other))
             });
-            if !shadowed
-                && routers.contains_key(&family.router)
-                && family.legs.iter().all(|pool| size(*pool) > 0)
-            {
+            if !shadowed && has_weight(family) {
                 weights[i] = family.legs.iter().map(|pool| size(*pool)).sum();
             }
         }
@@ -263,9 +265,9 @@ impl Gateway {
 
     /// One router drawn with probability proportional to its family's
     /// weight, `weights` in [`ROUTER_FAMILIES`] order ([`Self::family_weights`]
-    /// for the model-serving draw; the token-counting and decisions routes
-    /// weigh the families their own way). A family whose router is not
-    /// mounted takes no part; `None` when none has weight.
+    /// for the model-serving draw; other routes weigh the families their own
+    /// way). A family whose router is not mounted takes no part; `None` when
+    /// none has weight.
     fn pick_router_by_weights(
         &self,
         weights: &[usize; ROUTER_FAMILIES.len()],
