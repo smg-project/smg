@@ -17,6 +17,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -74,6 +75,13 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "20"))
 PAUSE_PROBE_TIMEOUT = float(os.getenv("TOKENSPEED_PAUSE_PROBE_TIMEOUT", "2"))
 # Profile round-trips include trace serialization, which can take minutes.
 PROFILE_TIMEOUT = 600.0
+# The engine refuses a flush while any request still pins cached blocks, and
+# it retires a finished request a scheduler round after its last token was
+# streamed: a flush issued right after a completion returns lands in that gap.
+# FlushCache repeats the non-mutating attempt this often, for at least this
+# long, before it reports the refusal.
+FLUSH_RETRY_INTERVAL_S = 0.05
+FLUSH_RETIRE_GRACE_S = 2.0
 LOG_MM_TENSOR_DATA = os.getenv("TOKENSPEED_LOG_MM_TENSOR_DATA", "").lower() in (
     "1",
     "true",
@@ -919,14 +927,30 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     ) -> common_pb2.FlushCacheResponse:
         """Flush the KV cache on the scheduler.
 
-        TokenSpeed's ``FlushCacheReqInput`` carries no wait-for-idle knob, so
-        ``timeout_s`` only widens the gRPC-side wait for the scheduler reply;
-        the flush itself is immediate (fails if requests are in flight).
+        TokenSpeed's ``FlushCacheReqInput`` carries no wait-for-idle knob: each
+        attempt is immediate, and the scheduler refuses it while any request
+        still pins cached blocks. A finished request is retired a scheduler
+        round after its last token was streamed, so an attempt made right
+        after a completion returns is refused although nothing is in flight.
+        The attempt is non-mutating and is repeated every
+        ``FLUSH_RETRY_INTERVAL_S`` until the engine accepts it, for the
+        request's ``timeout_s`` and never less than ``FLUSH_RETIRE_GRACE_S``;
+        a request that is really in flight still fails the flush, at the end
+        of that wait instead of at once.
         """
-        logger.debug("Receive flush cache request")
+        logger.debug("Receive flush cache request (timeout_s=%.1f)", request.timeout_s)
         comm_timeout = max(30.0, request.timeout_s + 10.0)
+        wait_s = request.timeout_s if math.isfinite(request.timeout_s) else 0.0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(wait_s, FLUSH_RETIRE_GRACE_S)
+        attempts = 0
         try:
-            result = await asyncio.wait_for(self.async_llm.flush_cache(), timeout=comm_timeout)
+            while True:
+                attempts += 1
+                result = await asyncio.wait_for(self.async_llm.flush_cache(), timeout=comm_timeout)
+                if result.success or loop.time() >= deadline:
+                    break
+                await asyncio.sleep(FLUSH_RETRY_INTERVAL_S)
         # asyncio.TimeoutError is a separate exception on Python 3.10.
         except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
             await context.abort(
@@ -939,10 +963,18 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             await context.abort(grpc.StatusCode.INTERNAL, f"Flush cache failed: {e}")
             return
 
+        if attempts > 1:
+            logger.debug(
+                "Flush cache %s after %d attempts",
+                "accepted" if result.success else "refused",
+                attempts,
+            )
         # TokenSpeed's FlushCacheReqOutput only carries `success` (no message
         # field); tolerate one appearing upstream later.
         message = getattr(result, "message", "") or (
-            "Cache flushed successfully" if result.success else "Cache flush failed"
+            "Cache flushed successfully"
+            if result.success
+            else f"Cache flush refused: requests still in flight after {attempts} attempts"
         )
         return common_pb2.FlushCacheResponse(success=bool(result.success), message=message)
 
