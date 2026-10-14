@@ -29,8 +29,7 @@
 //! outside the admission rules above and sets the rank's cursor to each
 //! chunk's stamp ([`RankState::resync_to`]); nothing is buffered because the
 //! stream is ordered. A snapshot delivered on a side channel, with live
-//! batches held meanwhile, is the protocol of
-//! `crates/kv_index/docs/recovery-protocol.md`; no servicer serves one, and
+//! batches held meanwhile, is not implemented: no servicer serves one, and
 //! this module carries nothing for it until one does.
 
 /// A sequence this far below the cursor is a restarted publisher, not a late
