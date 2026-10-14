@@ -488,11 +488,13 @@ fn test_validate_repetition_penalty_range() {
     }
 }
 
-/// Test max_output_tokens minimum validation (the public API's minimum is 16)
+/// `max_output_tokens` takes any count from 1, as `max_tokens` does on the
+/// chat endpoint (the public API's own floor of 16 is not imposed); 0 is
+/// refused.
 #[test]
 fn test_validate_max_output_tokens() {
     // Valid values
-    for val in [16, 100, 1000] {
+    for val in [1, 8, 16, 100, 1000] {
         let request = ResponsesRequest {
             input: ResponseInput::Text("test".to_string()),
             max_output_tokens: Some(val),
@@ -504,18 +506,16 @@ fn test_validate_max_output_tokens() {
         );
     }
 
-    // Invalid values
-    for val in [0, 1, 15] {
-        let request = ResponsesRequest {
-            input: ResponseInput::Text("test".to_string()),
-            max_output_tokens: Some(val),
-            ..Default::default()
-        };
-        assert!(
-            request.validate().is_err(),
-            "max_output_tokens {val} should be invalid"
-        );
-    }
+    // Invalid value
+    let request = ResponsesRequest {
+        input: ResponseInput::Text("test".to_string()),
+        max_output_tokens: Some(0),
+        ..Default::default()
+    };
+    assert!(
+        request.validate().is_err(),
+        "max_output_tokens 0 should be invalid"
+    );
 }
 
 /// Test max_tool_calls minimum validation
