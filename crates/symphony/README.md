@@ -136,7 +136,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 
 <!-- models: begin -->
 199 groups, 339 checkpoints, newest first.
-20 ready, 120 replaying a recorded set, 0 on main awaiting fixtures, 59 pending.
+12 ready, 128 replaying a recorded set, 0 on main awaiting fixtures, 59 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -155,11 +155,11 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2026-08-27 | [qwen-drive-1.0-4b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen-drive-1.0-4b) | Qwen/Qwen-Drive-1.0-4B |  | `qwen3`, tagged calls | 474,543 | replaying the set | `qwen`, `qwen3` |
 | 2026-08-25 | [glm-5.3](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3) | zai-org/GLM-5.3 | GLM-5.3-BF16 | `glm` | 503,273 | replaying the set | `glm47_moe`, `glm45` |
 | 2026-08-25 | [glm-5.3-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5.3-flash) | zai-org/GLM-5.3-Flash | GLM-5.3-Flash-BF16 | `glm` | 503,273 | replaying the set | `glm47_moe`, `glm45` |
-| 2026-08-24 | [qwen3.8-flash-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-flash-next) | Qwen/Qwen3.8-Flash-Next |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
+| 2026-08-24 | [qwen3.8-flash-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-flash-next) | Qwen/Qwen3.8-Flash-Next |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-09 | [dots3-note-prev](https://github.com/smg-project/bellwether/tree/main/fixtures/dots3-note-prev) | dots-studio/dots3-note-prev |  | `dots3` | 589,296 | replaying the set | none |
 | 2026-08-09 | [muse-glimmer-30b](https://github.com/smg-project/bellwether/tree/main/fixtures/muse-glimmer-30b) | meta-models/Muse-Glimmer-30B |  | — | 494,673 | pending | none |
-| 2026-08-08 | [qwen3.8-2.4t-a95b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-2.4t-a95b) | Qwen/Qwen3.8-2.4T-A95B |  | `qwen3`, tagged calls | 54,183 | ready | `qwen_xml`, `qwen3` |
-| 2026-08-05 | [qwen3.8-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-27b) | Qwen/Qwen3.8-27B | JetBrains/Qwen3.8-3.6-27B-blend | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
+| 2026-08-08 | [qwen3.8-2.4t-a95b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-2.4t-a95b) | Qwen/Qwen3.8-2.4T-A95B |  | `qwen3`, tagged calls | 474,553 | replaying the set | `qwen_xml`, `qwen3` |
+| 2026-08-05 | [qwen3.8-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.8-27b) | Qwen/Qwen3.8-27B | JetBrains/Qwen3.8-3.6-27B-blend | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-08-02 | [ling-3.0-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/ling-3.0-flash) | inclusionAI/Ling-3.0-flash | Ling-3.0-flash-fp4 | `ling` | 589,298 | replaying the set | none |
 | 2026-08-01 | [nvidia-nemotron-3.5-lightning-30b-a3b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3.5-lightning-30b-a3b-bf16) | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
 | 2026-07-23 | [arex-base](https://github.com/smg-project/bellwether/tree/main/fixtures/arex-base) | BAAI/AREX-Base |  | `qwen3`, tagged calls | 474,543 | replaying the set | none |
@@ -182,12 +182,12 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2026-05-01 | [apertus-v1.1-4b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-v1.1-4b-instruct) | swiss-ai/Apertus-v1.1-4B-Instruct | Apertus-v1.1-0.5B-Instruct, Apertus-v1.1-1.5B-Instruct | — | 184,972 | pending | none |
 | 2026-04-27 | [mimo-v2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.5) | XiaomiMiMo/MiMo-V2.5 | MiMo-V2.5-Base | `qwen3`, tagged calls, the value between the tags | 589,278 | replaying the set | none |
 | 2026-04-23 | [laguna-xs.2](https://github.com/smg-project/bellwether/tree/main/fixtures/laguna-xs.2) | poolside/Laguna-XS.2 |  | `glm4` | 490,452 | replaying the set | none |
-| 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
+| 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-04-19 | [bar-2x7b-base](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-base) | allenai/BAR-2x7B-Base |  | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-2x7b-code](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-code) | allenai/BAR-2x7B-Code | BAR-2x7B-Code-SFT, BAR-2x7B-Safety, BAR-2x7B-Tool-Use, BAR-5x7B | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-2x7b-math](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-math) | allenai/BAR-2x7B-Math | BAR-2x7B-Math-SFT | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-7b) | allenai/BAR-7B |  | — | 328,662 | pending | none |
-| 2026-04-15 | [qwen3.6-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-35b-a3b) | Qwen/Qwen3.6-35B-A3B |  | `qwen3`, tagged calls | 54,193 | ready | `qwen_xml`, `qwen3` |
+| 2026-04-15 | [qwen3.6-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-35b-a3b) | Qwen/Qwen3.6-35B-A3B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-04-09 | [minimax-m2.7](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m2.7) | MiniMaxAI/MiniMax-M2.7 |  | `minimax_m2` | 12,821 | replaying the set | `minimax_m2`, `minimax` |
 | 2026-04-06 | [granite-4.1-3b](https://github.com/smg-project/bellwether/tree/main/fixtures/granite-4.1-3b) | ibm-granite/granite-4.1-3b | granite-4.1-30b | `qwen2.5` | 576,772 | replaying the set | none |
 | 2026-04-04 | [exaone-4.5-33b](https://github.com/smg-project/bellwether/tree/main/fixtures/exaone-4.5-33b) | LGAI-EXAONE/EXAONE-4.5-33B |  | `qwen3` | 503,634 | replaying the set | none |
@@ -203,14 +203,14 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2026-03-02 | [gemma-4-e4b-it](https://github.com/smg-project/bellwether/tree/main/fixtures/gemma-4-e4b-it) | google/gemma-4-E4B-it | gemma-4-E2B-it | `gemma4` | 478,241 | replaying the set | `json`, none |
 | 2026-03-01 | [areal-sea-235b-a22b](https://github.com/smg-project/bellwether/tree/main/fixtures/areal-sea-235b-a22b) | inclusionAI/AReaL-SEA-235B-A22B | AReaL-tau2-merge-sft-235B | `qwen3` | 554,276 | replaying the set | none |
 | 2026-02-28 | [qwen3.5-2b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-2b) | Qwen/Qwen3.5-2B | ATH-MaaS/OvisOCR2, Qwen3.5-0.8B | `qwen3`, tagged calls | 461,722 | replaying the set | `qwen_xml`, `qwen3` |
-| 2026-02-27 | [qwen3.5-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-9b) | Qwen/Qwen3.5-9B | microsoft/FrogNano-4B-2609, Qwen3.5-4B | `qwen3`, tagged calls | 54,179 | ready | `qwen_xml`, `qwen3` |
+| 2026-02-27 | [qwen3.5-9b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-9b) | Qwen/Qwen3.5-9B | microsoft/FrogNano-4B-2609, Qwen3.5-4B | `qwen3`, tagged calls | 474,543 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-02-24 | [qwen3.5-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-27b) | Qwen/Qwen3.5-27B |  | `qwen3`, tagged calls | 54,179 | ready | `qwen_xml`, `qwen3` |
 | 2026-02-24 | [qwen3.5-35b-a3b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.5-35b-a3b) | Qwen/Qwen3.5-35B-A3B | Qwen3.5-122B-A10B, Qwen3.5-397B-A17B, xlangai/Qwen-CUA, xlangai/RoboFine-VLM-397B-A17B | `qwen3`, tagged calls | 474,543 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-02-13 | [webworld-32b](https://github.com/smg-project/bellwether/tree/main/fixtures/webworld-32b) | Qwen/WebWorld-32B | WebWorld-8B, WebWorld-14B | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2026-02-12 | [minimax-m2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/minimax-m2.5) | MiniMaxAI/MiniMax-M2.5 |  | `minimax_m2` | 12,821 | replaying the set | `minimax_m2`, `minimax` |
 | 2026-02-11 | [glm-5](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-5) | zai-org/GLM-5 |  | `glm` | 1,947 | replaying the set | `glm47_moe`, `glm45` |
 | 2026-02-09 | [astabrief-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/astabrief-8b) | allenai/AstaBrief_8B | AstaBrief_8B_SFT | `qwen3` | 583,086 | replaying the set | none |
-| 2026-02-01 | [step-3.5-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/step-3.5-flash) | stepfun-ai/Step-3.5-Flash |  | `qwen3`, tagged calls | 54,181 | ready | `step3`, none |
+| 2026-02-01 | [step-3.5-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/step-3.5-flash) | stepfun-ai/Step-3.5-Flash |  | `qwen3`, tagged calls | 54,165 | replaying the set | `step3`, none |
 | 2026-01-30 | [qwen3-coder-next](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-coder-next) | Qwen/Qwen3-Coder-Next | Qwen3-Coder-Next-Base | `qwen3`, tagged calls | 490,469 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-01-23 | [mistral-small-4-119b-2603](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-small-4-119b-2603) | mistralai/Mistral-Small-4-119B-2603 |  | `mistral` | 583,079 | replaying the set | `mistral`, none |
 | 2026-01-19 | [agentcpm-report](https://github.com/smg-project/bellwether/tree/main/fixtures/agentcpm-report) | openbmb/AgentCPM-Report |  | — | 328,660 | pending | none |
@@ -271,7 +271,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2025-08-30 | [hermes-4-14b](https://github.com/smg-project/bellwether/tree/main/fixtures/hermes-4-14b) | NousResearch/Hermes-4-14B |  | `qwen2.5` | 576,772 | replaying the set | none |
 | 2025-08-21 | [deepseek-v3.1](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.1) | deepseek-ai/DeepSeek-V3.1 | DeepSeek-V3.1-Base, tencent/DeepSeek-V3.1-Terminus-W4AFP8 | — | 19,299 | pending | `deepseek31`, `deepseek_v31` |
 | 2025-08-20 | [llama-3.1-nemotron-safety-guard-8b-v3](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-safety-guard-8b-v3) | nvidia/Llama-3.1-Nemotron-Safety-Guard-8B-v3 |  | `json` | 458,185 | replaying the set | `json`, none |
-| 2025-08-20 | [seed-oss-36b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/seed-oss-36b-instruct) | ByteDance-Seed/Seed-OSS-36B-Instruct | Seed-OSS-36B-Base-woSyn | `seed_oss` | 53,178 | ready | none |
+| 2025-08-20 | [seed-oss-36b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/seed-oss-36b-instruct) | ByteDance-Seed/Seed-OSS-36B-Instruct | Seed-OSS-36B-Base-woSyn | `seed_oss` | 495,977 | replaying the set | none |
 | 2025-08-13 | [apertus-8b-instruct-2509](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-8b-instruct-2509) | swiss-ai/Apertus-8B-Instruct-2509 |  | — | 137,178 | pending | none |
 | 2025-08-11 | [dler-llama-nemotron-8b-merge-research](https://github.com/smg-project/bellwether/tree/main/fixtures/dler-llama-nemotron-8b-merge-research) | nvidia/DLER-Llama-Nemotron-8B-Merge-Research |  | `llama_nemotron` | 416,850 | replaying the set | `json`, none |
 | 2025-08-11 | [dler-r1-1.5b-research](https://github.com/smg-project/bellwether/tree/main/fixtures/dler-r1-1.5b-research) | nvidia/DLER-R1-1.5B-Research | DLER-R1-7B-Research | — | 94,830 | pending | none |

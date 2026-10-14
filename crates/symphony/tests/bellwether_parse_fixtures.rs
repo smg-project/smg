@@ -115,7 +115,15 @@ const SLUG: &str = "qwen3-8b";
 /// reference on whole sets, which no per-case list could carry. The slug stays
 /// in the table so its family and prompt tail are kept; the issue brings it
 /// back.
-const SKIPPED: &[(&str, &str)] = &[];
+const SKIPPED: &[(&str, &str)] = &[
+    // bellwether #149 recorded its sets again without the common set (the 16 cases are gone from
+    // main 25b7767791), so the probes its family lists have no fixture to meet; replayed again
+    // once bellwether records them.
+    (
+        "step-3.5-flash",
+        "bellwether #149 dropped its common set, so the listed probes have no fixture to meet",
+    ),
+];
 /// bellwether's slugs for the checkpoints the tables read, in its manifests' spelling, each with
 /// the table that reads it and how its template ends the generation prompt. The fixtures carry
 /// the request and the output, not the rendered prompt, so the prompt's tail is stated here until
