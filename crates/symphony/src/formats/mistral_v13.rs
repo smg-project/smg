@@ -1,4 +1,4 @@
-//! Mistral: the thought between `[THINK]` and `[/THINK]`, which the model writes itself (the
+//! Mistral v13: the thought between `[THINK]` and `[/THINK]`, which the model writes itself (the
 //! generation prompt ends at `[/INST]` whatever the request says), and each call as `[TOOL_CALLS]`,
 //! the tool's name, `[ARGS]` and the arguments object alone, one call after another with nothing
 //! between or after them: `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`. Content comes before
@@ -10,6 +10,10 @@
 //! `ministral-3-3b-instruct-2512-bf16`, `ministral-3-8b-instruct-2512-bf16` and
 //! `ministral-3-14b-instruct-2512-bf16`, whose templates have no thought.
 //!
+//! The table is named after the tokenizer version that brought `[ARGS]`, and apart from the
+//! gateway's older `mistral` parser, which reads 7B v0.3's list: an operator naming `mistral` keeps
+//! that parser under `--parser symphony`, and the registry picks this table for the groups above.
+//!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::format::{CallSyntax, Emits, Format};
@@ -17,9 +21,9 @@ use crate::format::{CallSyntax, Emits, Format};
 /// The marker between a call's name and its arguments.
 pub const ARGS: &str = "[ARGS]";
 
-/// The Mistral table.
-pub fn mistral() -> Format {
-    Format::new("mistral")
+/// The Mistral v13 table.
+pub fn mistral_v13() -> Format {
+    Format::new("mistral_v13")
         .terminal("think_open", "[THINK]")
         .terminal("think_close", "[/THINK]")
         .terminal("call_open", "[TOOL_CALLS]")
@@ -49,7 +53,7 @@ mod tests {
     const PROMPT: &str = "[/INST]";
 
     fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(mistral(), Declared::default());
+        let mut parser = Engine::new(mistral_v13(), Declared::default());
         let mut out = Events::new();
         parser
             .feed(
@@ -250,7 +254,7 @@ mod tests {
         let prompt = "[INST]Weather in Paris?[/INST][TOOL_CALLS]get_weather[ARGS]{\"city\": \
                       \"Paris\"}</s>[TOOL_RESULTS]{\"temperature\": 18}[/TOOL_RESULTS]";
         assert_eq!(
-            mistral().replay(prompt),
+            mistral_v13().replay(prompt),
             &prompt[prompt.find("[/INST]").expect("the user turn's close")..]
         );
         let events = run(prompt, "It is 18 degrees.");
@@ -260,9 +264,9 @@ mod tests {
 
     #[test]
     fn the_table_validates_and_names_its_opener() {
-        let format = mistral();
+        let format = mistral_v13();
         format.validate().expect("a valid table");
-        assert_eq!(format.name(), "mistral");
+        assert_eq!(format.name(), "mistral_v13");
         assert_eq!(format.turn_opener(), Some("[/INST]"));
     }
 }

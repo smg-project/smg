@@ -1379,7 +1379,7 @@ mod tests {
         // or the end of the turn follows. Mistral's prompt never leaves the thought open, and the
         // tag with it open is the same tag after a prefix of free text.
         let tools = weather_tools();
-        let payload = formats::mistral()
+        let payload = formats::mistral_v13()
             .grammar(&tools, true, false)
             .expect("a grammar")
             .payload();
@@ -1405,7 +1405,7 @@ mod tests {
                 "at_least_one": true,
             }})
         );
-        let open = formats::mistral()
+        let open = formats::mistral_v13()
             .grammar(&tools, true, true)
             .expect("a grammar");
         assert!(matches!(

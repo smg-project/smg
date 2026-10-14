@@ -169,8 +169,8 @@ fn kimi_k3() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::kimi_k3(), Declared::default()))
 }
 
-fn mistral() -> Box<dyn Parser> {
-    Box::new(Engine::new(formats::mistral(), Declared::default()))
+fn mistral_v13() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::mistral_v13(), Declared::default()))
 }
 
 fn llama_nemotron() -> Box<dyn Parser> {
@@ -262,8 +262,8 @@ const FORMATS: &[Subject] = &[
         outputs: PLAIN_OUTPUTS,
     },
     Subject {
-        name: "mistral",
-        new: mistral,
+        name: "mistral v13",
+        new: mistral_v13,
         outputs: MISTRAL_OUTPUTS,
     },
     Subject {

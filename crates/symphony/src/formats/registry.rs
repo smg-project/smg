@@ -20,8 +20,8 @@
 
 use super::{
     deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest, json,
-    k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral,
-    olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
+    mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -64,8 +64,8 @@ pub enum Table {
     MinimaxM2,
     /// [`minimax_m3()`].
     MinimaxM3,
-    /// [`mistral()`].
-    Mistral,
+    /// [`mistral_v13()`].
+    MistralV13,
     /// [`llama_nemotron()`].
     LlamaNemotron,
     /// [`kimi_k3()`].
@@ -108,7 +108,7 @@ impl Table {
         Self::Json,
         Self::MinimaxM2,
         Self::MinimaxM3,
-        Self::Mistral,
+        Self::MistralV13,
         Self::LlamaNemotron,
         Self::KimiK3,
         Self::Inkling,
@@ -141,7 +141,7 @@ impl Table {
             Self::Json => "json",
             Self::MinimaxM2 => "minimax_m2",
             Self::MinimaxM3 => "minimax_m3",
-            Self::Mistral => "mistral",
+            Self::MistralV13 => "mistral_v13",
             Self::LlamaNemotron => "llama_nemotron",
             Self::KimiK3 => "kimi_k3",
             Self::Inkling => "inkling",
@@ -181,7 +181,7 @@ impl Table {
             Self::Json => json(),
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
-            Self::Mistral => mistral(),
+            Self::MistralV13 => mistral_v13(),
             Self::LlamaNemotron => llama_nemotron(),
             Self::KimiK3 => kimi_k3(),
             Self::Inkling => inkling(),
@@ -436,7 +436,7 @@ const GROUPS: &[Group] = &[
     Group {
         model: "mistralai/Devstral-2-123B-Instruct-2512",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
@@ -739,7 +739,7 @@ const GROUPS: &[Group] = &[
     Group {
         model: "mistralai/Ministral-3-14B-Instruct-2512-BF16",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
@@ -748,37 +748,37 @@ const GROUPS: &[Group] = &[
             "Ministral-3-3B-Reasoning-2512",
             "Ministral-3-8B-Reasoning-2512",
         ],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Ministral-3-3B-Instruct-2512",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Ministral-3-3B-Instruct-2512-BF16",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Ministral-3-8B-Instruct-2512-BF16",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Mistral-Medium-3.5-128B",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {
         model: "mistralai/Mistral-Small-4-119B-2603",
         also: &[],
-        table: Table::Mistral,
+        table: Table::MistralV13,
         opener: None,
     },
     Group {

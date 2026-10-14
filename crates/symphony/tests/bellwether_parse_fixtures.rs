@@ -82,7 +82,7 @@ use symphony::{
     formats::{
         deepseek_v4_1, dots3, for_model, function_gemma, gemma4, glm, glm4, groups, hy4, inkling,
         iquest, json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
-        minimax_m3, mistral, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        minimax_m3, mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -723,42 +723,42 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
     // prompt ends at `[/INST]` whatever the request says. The instruct templates have no thought.
     (
         "devstral-2-123b-instruct-2512",
-        Family::Mistral,
+        Family::MistralV13,
         GenerationPrompt::Plain,
     ),
     (
         "ministral-3-14b-instruct-2512-bf16",
-        Family::Mistral,
+        Family::MistralV13,
         GenerationPrompt::Plain,
     ),
     (
         "ministral-3-14b-reasoning-2512",
-        Family::Mistral,
+        Family::MistralV13,
         GenerationPrompt::ModelDecides,
     ),
     (
         "ministral-3-3b-instruct-2512",
-        Family::Mistral,
+        Family::MistralV13,
         GenerationPrompt::Plain,
     ),
     (
         "ministral-3-3b-instruct-2512-bf16",
-        Family::Mistral,
+        Family::MistralV13,
         GenerationPrompt::Plain,
     ),
     (
         "ministral-3-8b-instruct-2512-bf16",
-        Family::Mistral,
+        Family::MistralV13,
         GenerationPrompt::Plain,
     ),
     (
         "mistral-medium-3.5-128b",
-        Family::Mistral,
+        Family::MistralV13,
         GenerationPrompt::ModelDecides,
     ),
     (
         "mistral-small-4-119b-2603",
-        Family::Mistral,
+        Family::MistralV13,
         GenerationPrompt::ModelDecides,
     ),
     // Llama Nemotron: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`. The Super
@@ -985,8 +985,8 @@ enum Family {
     Xlam,
     /// [`json`]: one call object, or a list of them, alone in the turn.
     Json,
-    /// [`mistral`]: the tool's name, `[ARGS]` and the arguments object after `[TOOL_CALLS]`.
-    Mistral,
+    /// [`mistral_v13`]: the tool's name, `[ARGS]` and the arguments object after `[TOOL_CALLS]`.
+    MistralV13,
     /// [`llama_nemotron`]: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`.
     LlamaNemotron,
     /// [`minimax_m2`]: parameters named by an attribute, typed by the request tools.
@@ -1021,7 +1021,7 @@ impl Family {
             Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
-            Self::Mistral => ("[THINK]", "[/THINK]"),
+            Self::MistralV13 => ("[THINK]", "[/THINK]"),
             _ => ("<think>", "</think>"),
         }
     }
@@ -1067,7 +1067,7 @@ impl Family {
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
             Self::Json => json(),
-            Self::Mistral => mistral(),
+            Self::MistralV13 => mistral_v13(),
             Self::LlamaNemotron => llama_nemotron(),
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
@@ -1102,7 +1102,7 @@ impl Family {
             | Self::Inkling
             | Self::Gemma4
             | Self::FunctionGemma
-            | Self::Mistral
+            | Self::MistralV13
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,

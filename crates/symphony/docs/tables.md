@@ -140,7 +140,7 @@ table has no terminal for it, so such a message sits in the named-JSON header un
 `<|end_message|>` and comes back whole as `Malformed` (a name without a call), no byte lost; a
 recording of one decides what it is.
 
-## Mistral (`mistral`)
+## Mistral v13 (`mistral_v13`)
 
 What the table says beyond the others:
 
@@ -159,7 +159,9 @@ What the table says beyond the others:
 - **A forced call's tag has no end.** `Format::grammar` writes a tag per tool from `[TOOL_CALLS]`,
   the name and `[ARGS]` to the schema, and nothing after it, as the template writes nothing: the
   object the schema accepts ends the tag. The gateway's older `mistral` parser and its tag read
-  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, so nothing is pinned to it.
+  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, so nothing is pinned to it; the
+  table's name keeps that parser's apart, so `--tool-call-parser mistral` stays with it under
+  `--parser symphony`, and the registry picks this table for the v13 groups.
 
 What the table leaves open: whether every engine takes a tag whose `end` is empty (xgrammar's
 structural tag allows it; the Symphony e2e lane says so for the engines it runs); and the older

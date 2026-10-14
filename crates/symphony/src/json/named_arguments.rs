@@ -9,7 +9,7 @@
 //! ```
 //!
 //! and a turn's calls one after another, each from its own `[TOOL_CALLS]`, with nothing between
-//! or after them. The engine's table owns the opener ([`formats::mistral`]): it enters this
+//! or after them. The engine's table owns the opener ([`formats::mistral_v13`]): it enters this
 //! assembler after every `[TOOL_CALLS]`, and leaves at the next one or at the end of the turn. The
 //! bytes before the marker are the tool's name, as the template writes it and the only place it
 //! is written: `ToolCallStart` carries them with the marker as its source once the marker has
@@ -23,7 +23,7 @@
 //! streamed for as long as it is a JSON prefix and ends with the region, since the outline finds
 //! no close for it. The template writes neither.
 //!
-//! [`formats::mistral`]: crate::formats::mistral()
+//! [`formats::mistral_v13`]: crate::formats::mistral_v13()
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
