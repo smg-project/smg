@@ -506,7 +506,9 @@ impl DtypeOverrides {
 /// picked. `None` for an empty or a disagreeing set, and whenever a worker is
 /// served otherwise (the pixels' own bytes for an engine that normalizes on
 /// device, a wire that carries no preprocessed floats): the per-destination
-/// write then stays as it is.
+/// write then stays as it is. `None` as well unless [`ONE_PASS_WIRE_ENV`]
+/// opts the one-pass write in: by default every request takes the two-pass
+/// path.
 pub(crate) fn mm_shared_image_wire_dtype_over(
     registry: &WorkerRegistry,
     model_id: &str,
@@ -518,8 +520,9 @@ pub(crate) fn mm_shared_image_wire_dtype_over(
     shared_image_wire_dtype_over(registry, model_id, pools, &DtypeOverrides::from_env())
 }
 
-/// Opts the one-pass wire write in (`1`): the images of a request whose
-/// workers all read one wire dtype are then preprocessed straight into it.
+/// Opts the one-pass wire write in (`1`, `true`, `yes` or `on`, like the
+/// other `SMG_MM_` switches): the images of a request whose workers all read
+/// one wire dtype are then preprocessed straight into it.
 /// Off, the request takes the two-pass path (the patch layout, then the
 /// write in the worker's dtype at assembly), whose layout pass is the faster
 /// one on every image size but one since the vectorised patch layout landed;
@@ -529,7 +532,21 @@ pub const ONE_PASS_WIRE_ENV: &str = "SMG_MM_ONE_PASS_WIRE";
 
 fn one_pass_wire_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var(ONE_PASS_WIRE_ENV).is_ok_and(|value| value == "1"))
+    *ENABLED.get_or_init(|| {
+        let on = std::env::var(ONE_PASS_WIRE_ENV).is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        if on {
+            info!(
+                env = ONE_PASS_WIRE_ENV,
+                "the one-pass wire write is opted in: images are preprocessed straight into the workers' shared wire dtype"
+            );
+        }
+        on
+    })
 }
 
 fn shared_image_wire_dtype_over(
