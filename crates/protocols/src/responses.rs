@@ -3102,9 +3102,12 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
-    /// Maximum number of output tokens (the public API's minimum is 16)
+    /// Maximum number of output tokens. At least 1, as `max_tokens` on the
+    /// chat endpoint: the vendors' Responses contracts accept small values
+    /// (a one-word answer under 8), so the public API's own floor of 16 is
+    /// not imposed on the models served here.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(custom(function = "validate_max_output_tokens"))]
+    #[validate(range(min = 1))]
     pub max_output_tokens: Option<u32>,
 
     /// Maximum number of tool calls
@@ -3715,23 +3718,6 @@ fn request_mentions_json(request: &ResponsesRequest) -> bool {
         }
         }),
     }
-}
-
-/// The public API's `max_output_tokens` minimum.
-const MIN_MAX_OUTPUT_TOKENS: u32 = 16;
-
-fn validate_max_output_tokens(value: u32) -> Result<(), ValidationError> {
-    if value < MIN_MAX_OUTPUT_TOKENS {
-        let mut e = ValidationError::new("integer_below_min_value");
-        e.message = Some(
-            format!(
-                "Invalid 'max_output_tokens': integer below minimum value. Expected a value >= {MIN_MAX_OUTPUT_TOKENS}, but got {value} instead."
-            )
-            .into(),
-        );
-        return Err(e);
-    }
-    Ok(())
 }
 
 /// The public API's metadata limits: 16 pairs, 64-character keys, 512-character string values.

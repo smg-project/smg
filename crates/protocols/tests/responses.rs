@@ -4618,14 +4618,22 @@ fn unknown_input_message_role_is_rejected() {
     }
 }
 
+/// `max_output_tokens` takes any count from 1, as `max_tokens` does on the
+/// chat endpoint; the vendors' Responses contracts accept the small values
+/// their conformance cases send (8 for a one-word answer).
 #[test]
-fn max_output_tokens_below_sixteen_is_rejected() {
+fn max_output_tokens_below_one_is_rejected_and_small_values_pass() {
+    // The range rule's own code; the public API's `integer_below_min_value`
+    // is what the body extractor makes of a `range` error with a `min`.
     let request =
-        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 1})).unwrap();
-    assert!(validation_code(&request).contains("integer_below_min_value"));
-    let request =
-        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 16})).unwrap();
-    assert!(request.validate().is_ok());
+        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 0})).unwrap();
+    assert!(validation_code(&request).contains("range"));
+    for value in [1, 8, 16] {
+        let request =
+            plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": value}))
+                .unwrap();
+        assert!(request.validate().is_ok(), "max_output_tokens {value}");
+    }
 }
 
 #[test]
