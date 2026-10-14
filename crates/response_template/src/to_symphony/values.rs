@@ -35,7 +35,8 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Transformers;
 
-/// The reader a compiled table names.
+/// The reader as a value, for reading a value outside a table, as the tests do. A compiled table
+/// names the one shared reader instead (`compile`), since a table's reader compares by identity.
 pub static TRANSFORMERS: Transformers = Transformers;
 
 /// The types a string can be cast to: a member of one of them waits until it is whole.

@@ -5,6 +5,8 @@
 //! the stream's stop closes, each call `[c] NAME` and its parameters `<k KEY>VALUE</k>`, a value
 //! that may also end where the next parameter begins, a call before another closed by `[e]`.
 
+use std::sync::Arc;
+
 use symphony::{
     shape::{
         intern, Arguments, Atom, CallLayout, CallShape, Class, Dialect, End, Layout, LayoutError,
@@ -15,7 +17,7 @@ use symphony::{
 };
 
 use super::*;
-use crate::to_symphony::TRANSFORMERS;
+use crate::to_symphony::Transformers;
 
 fn word() -> Class {
     Class::new([('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')], false)
@@ -103,7 +105,7 @@ fn framed(shape: CallShape) -> Format {
         .framing("outside")
         .turn_anchor("<as>")
         .stop_tokens(["<s>"])
-        .reads_values_with(&TRANSFORMERS)
+        .reads_values_with(Arc::new(Transformers))
 }
 
 /// The second table: a call is `[c]` and the tool's name after a space; each parameter `<k KEY>`
@@ -158,7 +160,7 @@ fn stopped() -> Format {
         .closes_at_stop("call")
         .turn_anchor("[as]")
         .stop_tokens(["[s]"])
-        .reads_values_with(&TRANSFORMERS)
+        .reads_values_with(Arc::new(Transformers))
 }
 
 /// How a chat template written for these tests renders the probe on the first table; each test
@@ -693,7 +695,7 @@ fn varied(rows: impl FnOnce(Format) -> Format) -> Format {
         .framing("gap")
         .turn_anchor("<as>")
         .stop_tokens(["<s>"])
-        .reads_values_with(&TRANSFORMERS)
+        .reads_values_with(Arc::new(Transformers))
 }
 
 /// A thought as the first table has it, and an answer the stop ends or `</a>` closes, its text

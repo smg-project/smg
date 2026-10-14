@@ -16,7 +16,7 @@
 //!
 //! [`Format::reads_values_with`]: crate::Format::reads_values_with
 
-use std::{any::Any, fmt};
+use std::{fmt, sync::Arc};
 
 use serde_json::Value;
 
@@ -76,9 +76,9 @@ pub enum Duplicates {
     First,
 }
 
-/// How a table's shaped calls read their values. A reader is `'static` data a table names, so the
-/// table stays cheap to clone; the crate holds no template library's semantics, only this hook.
-pub trait ValueRead: Any + Send + Sync + fmt::Debug {
+/// How a table's shaped calls read their values. A table names its reader and shares it with every
+/// engine that reads the table; the crate holds no template library's semantics, only this hook.
+pub trait ValueRead: Send + Sync + fmt::Debug {
     /// The JSON for one tagged value's `text`, read by `parser` and typed by its parameter's
     /// `schema` (`None` when the request's tools declare no such parameter). The result is one JSON
     /// value.
@@ -128,22 +128,33 @@ impl ValueRead for Inferred {
     }
 }
 
-/// The reader a table names for its values, compared as the same reader: one of a type, at one
-/// place.
-#[derive(Clone, Copy)]
-pub(crate) struct Values(pub(crate) &'static dyn ValueRead);
+/// The reader a table names for its values: the default, or one reader the table was given, which
+/// the engines that read the table share. Two tables name the same reader when it is one value.
+#[derive(Clone)]
+pub(crate) enum Values {
+    /// [`Inferred`], the default.
+    Inferred,
+    /// A reader the table was given.
+    Reader(Arc<dyn ValueRead>),
+}
 
 impl Values {
-    /// The default, [`Inferred`].
-    pub(crate) fn inferred() -> Self {
-        Self(&Inferred)
+    /// The reader itself.
+    pub(crate) fn reader(&self) -> &dyn ValueRead {
+        match self {
+            Self::Inferred => &Inferred,
+            Self::Reader(reader) => reader.as_ref(),
+        }
     }
 }
 
 impl PartialEq for Values {
     fn eq(&self, other: &Self) -> bool {
-        let (this, that): (&dyn Any, &dyn Any) = (self.0, other.0);
-        this.type_id() == that.type_id() && std::ptr::addr_eq(self.0, other.0)
+        match (self, other) {
+            (Self::Inferred, Self::Inferred) => true,
+            (Self::Reader(this), Self::Reader(that)) => Arc::ptr_eq(this, that),
+            _ => false,
+        }
     }
 }
 
@@ -151,7 +162,7 @@ impl Eq for Values {}
 
 impl fmt::Debug for Values {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+        self.reader().fmt(formatter)
     }
 }
 
@@ -241,13 +252,16 @@ mod tests {
         }
     }
 
-    static OTHER: Other = Other;
-
     #[test]
-    fn a_reader_is_the_same_reader_by_its_type_and_its_place() {
-        assert_eq!(Values::inferred(), Values::inferred());
-        assert_eq!(Values(&OTHER), Values(&OTHER));
-        assert_ne!(Values(&OTHER), Values::inferred());
-        assert_eq!(format!("{:?}", Values(&OTHER)), "Other");
+    fn a_reader_is_the_same_reader_when_it_is_one_value() {
+        let other: Arc<dyn ValueRead> = Arc::new(Other);
+        assert_eq!(Values::Inferred, Values::Inferred);
+        assert_eq!(Values::Reader(other.clone()), Values::Reader(other.clone()));
+        assert_ne!(
+            Values::Reader(Arc::new(Other)),
+            Values::Reader(other.clone())
+        );
+        assert_ne!(Values::Reader(other.clone()), Values::Inferred);
+        assert_eq!(format!("{:?}", Values::Reader(other)), "Other");
     }
 }

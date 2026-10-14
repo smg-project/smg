@@ -22,7 +22,7 @@ use crate::{
     markers::{Piece, Scanner},
     parser::{ParseError, Parser},
     pythonic,
-    shape::{self, ValueRead},
+    shape::{self, Values},
     tagged::{self, Declared},
     tokens::Ledger,
 };
@@ -184,7 +184,7 @@ fn assembler(
     syntax: Option<CallSyntax>,
     index: u32,
     framed: bool,
-    values: &'static dyn ValueRead,
+    values: Values,
     declared: &Declared,
 ) -> Box<dyn CallAssembler> {
     let id = format!("call_{index}");

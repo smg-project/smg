@@ -92,6 +92,8 @@
 //! [`Engine`]: crate::Engine
 //! [`formats`]: crate::formats
 
+use std::sync::Arc;
+
 use crate::{
     engine::is_strip_space,
     gemma,
@@ -328,7 +330,7 @@ impl Format {
             start: None,
             structural_tokens: Vec::new(),
             stop_tokens: Vec::new(),
-            values: Values::inferred(),
+            values: Values::Inferred,
             thinks_first: false,
             marker_tokens: Vec::new(),
             layout: None,
@@ -468,14 +470,14 @@ impl Format {
     /// tagged tables read theirs ([`Inferred`](crate::shape::Inferred)). No other call syntax
     /// reads it.
     #[must_use]
-    pub fn reads_values_with(mut self, reader: &'static dyn ValueRead) -> Self {
-        self.values = Values(reader);
+    pub fn reads_values_with(mut self, reader: Arc<dyn ValueRead>) -> Self {
+        self.values = Values::Reader(reader);
         self
     }
 
     /// The reader a shaped call's values read with.
-    pub(crate) fn value_reader(&self) -> &'static dyn ValueRead {
-        self.values.0
+    pub(crate) fn value_reader(&self) -> Values {
+        self.values.clone()
     }
 
     /// The text that opens the turn the model writes, `<|im_start|>assistant` for ChatML: the

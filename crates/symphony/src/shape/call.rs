@@ -10,11 +10,11 @@
 //!
 //! - **The header** is read first, with a [`Matcher`], before the call opens: the engine holds the
 //!   terminal and everything after it, and moves nothing, until the header is decided. When it
-//!   matches ([`Header::Matched`]), [`Assembler::start`] starts the call (named by the header, by
+//!   matches ([`Header::Matched`]), `Assembler::start` starts the call (named by the header, by
 //!   the template, or later by the arguments' own object) and gives back the bytes that followed
 //!   the header, for the engine to read again in the call. When it cannot match
 //!   ([`Header::Failed`]), the terminal opened no call: the engine takes back what the header
-//!   read ([`Assembler::into_header_bytes`]) and reads the terminal and those bytes again from the
+//!   read (`Assembler::into_header_bytes`) and reads the terminal and those bytes again from the
 //!   terminal's second character, as a regular expression's search goes on from the place after
 //!   one where its pattern failed. A header holds at most the shape's cap of bytes undecided; past
 //!   it, it is no match.
@@ -53,7 +53,7 @@ use crate::{
     json::{self, arguments::Strings},
     shape::{
         Arguments, CallShape, Match, Matcher, NameSource, Schema, Slot, Suffix, ValueParser,
-        ValueRead, Verdict,
+        Values, Verdict,
     },
     tagged::Declared,
 };
@@ -65,10 +65,10 @@ const TEXT_AFTER_THE_ARGUMENTS: &str = "text after a call's arguments";
 pub enum Header {
     /// More bytes can still change the answer.
     Pending,
-    /// The header matched: [`Assembler::start`] starts the call.
+    /// The header matched: `Assembler::start` starts the call.
     Matched,
     /// The header cannot match: the terminal opened no call, and
-    /// [`Assembler::into_header_bytes`] gives back what the header read.
+    /// `Assembler::into_header_bytes` gives back what the header read.
     Failed,
 }
 
@@ -79,7 +79,7 @@ pub struct Assembler {
     id: String,
     shape: &'static CallShape,
     /// How the call's values read.
-    values: &'static dyn ValueRead,
+    values: Values,
     /// The terminal's last character, which a `\b` at the header's start reads.
     before: Option<char>,
     stage: Stage,
@@ -160,11 +160,11 @@ impl Assembler {
     /// An assembler for the call at `index`, with the id the format minted for it, of `shape`,
     /// whose values read with `values`, right after its region's terminal, whose last character is
     /// `before`.
-    pub fn new(
+    pub(crate) fn new(
         index: u32,
         id: impl Into<String>,
         shape: &'static CallShape,
-        values: &'static dyn ValueRead,
+        values: Values,
         before: Option<char>,
     ) -> Self {
         let matcher =
@@ -271,7 +271,7 @@ impl Assembler {
                 self.index,
                 shape,
                 (tag, ends, values),
-                (name, self.values),
+                (name, self.values.clone()),
                 before,
             ))),
             Arguments::Json(_) | Arguments::Envelope { .. } => Body::Value(Box::new(Value::new(
@@ -284,20 +284,6 @@ impl Assembler {
         held[end..].to_string()
     }
 
-    /// Whether the call has started: whether its `ToolCallStart` has been pushed.
-    pub fn started(&self) -> bool {
-        match &self.stage {
-            Stage::Body(body) => match body {
-                Body::Value(value) => match &value.reader {
-                    JsonReader::Json(_) => true,
-                    JsonReader::Envelope(assembler) => assembler.started(),
-                },
-                Body::Params(_) => true,
-            },
-            Stage::Header(_) | Stage::Matched { .. } | Stage::Done => false,
-        }
-    }
-
     /// Append the next bytes of the call, after its start, and push the events they complete,
     /// a parameter's value typed by `declared`. Every byte is the call's until the engine closes
     /// the region.
@@ -307,7 +293,7 @@ impl Assembler {
             return;
         };
         match body {
-            Body::Value(value) => value.feed(shape, (self.values, declared), bytes, out),
+            Body::Value(value) => value.feed(shape, (&self.values, declared), bytes, out),
             Body::Params(params) => params.feed(bytes, declared, out),
         }
     }
@@ -380,7 +366,7 @@ impl Assembler {
 
 /// The table's reader, asked about the members of one call's JSON arguments.
 struct Typing<'a> {
-    values: &'static dyn ValueRead,
+    values: &'a Values,
     declared: &'a Declared,
     name: &'a str,
 }
@@ -395,11 +381,14 @@ impl Typing<'_> {
 
 impl Strings for Typing<'_> {
     fn holds(&self, key: &str) -> bool {
-        !self.values.streams(&ValueParser::json(), self.schema(key))
+        !self
+            .values
+            .reader()
+            .streams(&ValueParser::json(), self.schema(key))
     }
 
     fn typed(&self, key: &str, raw: &str) -> Option<String> {
-        self.values.member(raw, self.schema(key))
+        self.values.reader().member(raw, self.schema(key))
     }
 }
 
@@ -418,7 +407,7 @@ impl Value {
     fn feed(
         &mut self,
         shape: &'static CallShape,
-        (values, declared): (&'static dyn ValueRead, &Declared),
+        (values, declared): (&Values, &Declared),
         bytes: &str,
         out: &mut Events,
     ) {
@@ -554,13 +543,17 @@ fn wrapping(text: &str, why: &MalformedReason, out: &mut Events) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{
         engine::Engine,
         format::{CallSyntax, Emits, Format},
         input::{EngineFinish, Input, TokenSpan},
         parser::Parser,
-        shape::{intern, Atom, Class, Dialect, Duplicates, End, Path, Pattern, ShapeError},
+        shape::{
+            intern, Atom, Class, Dialect, Duplicates, End, Path, Pattern, ShapeError, ValueRead,
+        },
     };
 
     fn word() -> Class {
@@ -1653,8 +1646,6 @@ mod tests {
         }
     }
 
-    static STRICT: Strict = Strict;
-
     fn tools() -> Declared {
         Declared::of(&[openai_protocol::common::Tool {
             tool_type: "function".to_string(),
@@ -1673,7 +1664,7 @@ mod tests {
 
     #[test]
     fn a_tables_reader_holds_and_types_the_json_members_it_says() {
-        let format = table(named(Pattern::default())).reads_values_with(&STRICT);
+        let format = table(named(Pattern::default())).reads_values_with(Arc::new(Strict));
         let events = run_declared(
             &format,
             &tools(),
@@ -1754,7 +1745,7 @@ mod tests {
             word: word(),
             hold_cap: 64,
         });
-        let format = table(shape).reads_values_with(&STRICT);
+        let format = table(shape).reads_values_with(Arc::new(Strict));
         let events = run_declared(
             &format,
             &tools(),

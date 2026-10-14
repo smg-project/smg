@@ -35,7 +35,7 @@
 //! ([`Arguments`]: one JSON value, an object that names the call, or tagged parameters, each a
 //! tag with its key and its value and the ends a value may have), and the trailer before the
 //! region's closing terminal. A table holds one as [`CallSyntax::Shaped`], [`intern`]ed, and the
-//! shape's [`Assembler`] turns a call written so into its events, giving back to the engine the
+//! shape's assembler turns a call written so into its events, giving back to the engine the
 //! bytes of a header that did not match. A value's text reads by the template's [`ValueParser`]
 //! and is typed by the table's [`ValueRead`]er, [`Inferred`] unless the table names another.
 //!
@@ -56,7 +56,7 @@ mod read;
 
 use std::fmt;
 
-pub use call::{Assembler, Header};
+pub(crate) use call::{Assembler, Header};
 pub use class::Class;
 pub use intern::Interner;
 pub use layout::{

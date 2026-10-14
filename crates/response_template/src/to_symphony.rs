@@ -44,7 +44,7 @@
 //!   the pattern, and the ways the value ends after it, each the text the match takes and then,
 //!   last, a lookahead, so that a value may end at its closing tag or where the next tag begins.
 //!   A value's text reads by the template's `value_parser`.
-//! - **Values.** The table reads its calls' values with [`TRANSFORMERS`], the crate's own port of
+//! - **Values.** The table reads its calls' values with [`Transformers`], the crate's own port of
 //!   transformers' typing.
 //!
 //! Everything else is refused by name ([`Refusals`], each with a stable [`Construct`] code), and
@@ -61,7 +61,10 @@ mod lower;
 mod refusal;
 mod values;
 
-use std::fmt::Write as _;
+use std::{
+    fmt::Write as _,
+    sync::{Arc, LazyLock},
+};
 
 use serde_json::Value;
 use symphony::{
@@ -69,7 +72,7 @@ use symphony::{
         self, Arguments, CallShape, Dialect, End, NameSource, ShapeError, Slot, ValueParser,
         HOLD_CAP,
     },
-    CallSyntax, Emits, Format,
+    CallSyntax, Emits, Format, ValueRead,
 };
 
 use self::{
@@ -89,6 +92,13 @@ use crate::{
     pyre::Node,
     response_templates::{Delimiter, ResponseTemplate, ResponseTemplateField, Template},
 };
+
+/// The reader every compiled table names, one value for the process, so two compiles of a
+/// template give equal tables: a table's reader compares by identity.
+fn transformers() -> Arc<dyn ValueRead> {
+    static SHARED: LazyLock<Arc<dyn ValueRead>> = LazyLock::new(|| Arc::new(Transformers));
+    Arc::clone(&SHARED)
+}
 
 /// A table compiled from a template, and a one-line description of what it reads, for logs and
 /// the pinned outcome lists.
@@ -1284,7 +1294,7 @@ impl Table {
 
     /// The table as a symphony format.
     fn format(&self, stops: &[&str]) -> Format {
-        let mut format = Format::new("response_template").reads_values_with(&TRANSFORMERS);
+        let mut format = Format::new("response_template").reads_values_with(transformers());
         for text in &self.terminals {
             format = format.terminal(text, text);
         }

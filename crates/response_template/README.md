@@ -196,7 +196,7 @@ the stream.
   `value_parser`. In a call with a trailer, a value's end must end with a
   literal the trailer cannot read, since the call's text ends where the trailer
   begins (`EndBeforeTrailer` otherwise).
-- Values of calls read with `to_symphony::TRANSFORMERS`, this crate's port of
+- Values of calls read with `to_symphony::Transformers`, this crate's port of
   `_sub_parse`, `_coerce`, `_schema_types` and `_coerce_tool_calls`, the code
   `parse_response` runs.
 

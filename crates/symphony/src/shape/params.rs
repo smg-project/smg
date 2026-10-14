@@ -31,7 +31,7 @@ use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
     shape::{
         Atom, CallShape, Duplicates, End, Match, Matcher, Pattern, Schema, Slot, Suffix,
-        ValueParser, ValueRead, Verdict,
+        ValueParser, Values, Verdict,
     },
     tagged::{assembler::push_quoted, value::Declared},
 };
@@ -49,7 +49,7 @@ pub(crate) struct Params {
     trigger: &'static str,
     /// How a value's text reads, and the reader that types it.
     parser: &'static ValueParser,
-    values: &'static dyn ValueRead,
+    values: Values,
     /// The call's name, whose tool's schema types its values.
     name: String,
     /// The keys written, for a reader that keeps the first of two.
@@ -100,7 +100,7 @@ impl Params {
         index: u32,
         shape: &'static CallShape,
         (tag, ends, parser): (&'static Pattern, &'static [End], &'static ValueParser),
-        (name, values): (String, &'static dyn ValueRead),
+        (name, values): (String, Values),
         before: Option<char>,
     ) -> Self {
         let trigger = match tag.0.first() {
@@ -296,7 +296,7 @@ impl Params {
         let span = |slot| found.span(slot).map_or("", |span| &parameter[span]);
         let (key, value) = (span(Slot::Key), span(Slot::Value));
         let again = self.keys.iter().any(|written| written == key);
-        if again && self.values.duplicates() == Duplicates::First {
+        if again && self.values.reader().duplicates() == Duplicates::First {
             out.push(Event::Malformed {
                 text: Text::uncounted(parameter),
                 why: MalformedReason::Other(KEY_WRITTEN_TWICE.to_string()),
@@ -312,7 +312,7 @@ impl Params {
         let mut member = String::from(if self.written == 0 { "{" } else { ", " });
         push_quoted(&mut member, key);
         member.push_str(": ");
-        member.push_str(&self.values.read(self.parser, value, schema));
+        member.push_str(&self.values.reader().read(self.parser, value, schema));
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: member,

@@ -27,6 +27,7 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use common::{read_json, read_jsonl};
@@ -35,7 +36,7 @@ use replay::{compiled, compiled_dir, pinned, rows};
 use serde_json::{json, Value};
 use smg_response_template::to_symphony::{
     layout::{self, learn, Case, Learned, NoLayout},
-    TRANSFORMERS,
+    Transformers,
 };
 use symphony::{
     grammar::Options,
@@ -209,7 +210,7 @@ fn muse() -> Format {
         .trims("reasoning")
         .trims("content")
         .stop_tokens(["<|end_of_text|>", "<|eot|>"])
-        .reads_values_with(&TRANSFORMERS)
+        .reads_values_with(Arc::new(Transformers))
 }
 
 /// transformers v5.18.0's `transformers serve` template for Qwen 3.5 (`serve/qwen3_5` in
@@ -273,7 +274,7 @@ fn serve_qwen3_5() -> Format {
         .trims("content")
         .trims("reasoning")
         .stop_tokens(["<|im_end|>", "<|endoftext|>"])
-        .reads_values_with(&TRANSFORMERS)
+        .reads_values_with(Arc::new(Transformers))
 }
 
 fn written(segments: impl IntoIterator<Item = Segment>) -> Written {
