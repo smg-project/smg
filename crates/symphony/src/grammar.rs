@@ -282,12 +282,14 @@ impl Format {
         let markers = self.call_markers();
         let markers = markers.as_ref();
         let calls = match self.call_syntax()? {
-            // The list stands alone in the turn, no marker before or after it, and its table has
-            // no thought: the list is the same either way. A call alone is forced as the list,
-            // as the gateway's older `json` parser forces it.
-            CallSyntax::JsonList | CallSyntax::JsonAlone => {
-                return Some(Self::json_list_calls(&named, at_least_one))
-            }
+            // xLAM's list stands alone in the turn, no marker before or after it, and its table
+            // has no thought: the list is the same either way; a call alone (`json`) is forced as
+            // the list, as the gateway's older `json` parser forces it. Between markers (Llama
+            // Nemotron) the list is one tag's content, and the thought takes the prefix below.
+            CallSyntax::JsonList | CallSyntax::JsonAlone => match markers {
+                None => return Some(Self::json_list_calls(&named, at_least_one)),
+                Some(markers) => Self::json_list_tag(markers, &named, at_least_one),
+            },
             CallSyntax::Json => Self::json_calls(markers?, &named, at_least_one),
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
                 Self::keyed_calls(markers?, &named, at_least_one)
@@ -475,7 +477,9 @@ impl Format {
     /// Markdown link, in 592 of the 13,085 recorded prose answers). The one place the grammar is
     /// narrower than the assembler: an output that starts with `[` and opens no object is content
     /// to the assembler and not writable here.
-    fn json_list_calls(tools: &[&Tool], at_least_one: bool) -> Grammar {
+    /// The list of the tools' calls as xLAM and Llama Nemotron write it: `[`, each call as
+    /// `{"name": NAME, "arguments": ` and the tool's schema, `, ` between calls, `]`.
+    fn json_list(tools: &[&Tool]) -> Grammar {
         let one_call = Grammar::Or(
             tools
                 .iter()
@@ -492,7 +496,7 @@ impl Format {
                 })
                 .collect(),
         );
-        let list = Grammar::Sequence(vec![
+        Grammar::Sequence(vec![
             Grammar::ConstString("[".to_string()),
             one_call.clone(),
             Grammar::Star(Box::new(Grammar::Sequence(vec![
@@ -500,7 +504,13 @@ impl Format {
                 one_call,
             ]))),
             Grammar::ConstString("]".to_string()),
-        ]);
+        ])
+    }
+
+    /// xLAM's list alone in the turn: the list, or, when no call is required, prose that does
+    /// not start with a bracket.
+    fn json_list_calls(tools: &[&Tool], at_least_one: bool) -> Grammar {
+        let list = Self::json_list(tools);
         if at_least_one {
             list
         } else {
@@ -513,6 +523,19 @@ impl Format {
                 ]),
                 list,
             ])
+        }
+    }
+
+    /// Llama Nemotron's list between its markers: one tag, the opener, the list, the closer.
+    fn json_list_tag(markers: &CallMarkers<'_>, tools: &[&Tool], at_least_one: bool) -> Grammar {
+        Grammar::TriggeredTags {
+            triggers: vec![markers.call_open.to_string()],
+            tags: vec![Tag::new(
+                markers.call_open,
+                Self::json_list(tools),
+                markers.call_close,
+            )],
+            at_least_one,
         }
     }
 
@@ -1302,6 +1325,50 @@ mod tests {
             formats::inkling().grammar(&tools, true, true),
             formats::inkling().grammar(&tools, true, false)
         );
+    }
+
+    #[test]
+    fn llama_nemotron_derives_one_tag_around_the_list_of_calls() {
+        // No hand-written tag to pin to: the gateway's older parsers have none for this syntax.
+        // One tag: `<TOOLCALL>` begins it, xLAM's list of the tools' calls is its content and
+        // `</TOOLCALL>` ends it. With the thought open, the tag follows a prefix of free text
+        // without the call's markers, the thought's own still writable.
+        let tools = weather_tools();
+        let payload = formats::llama_nemotron()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let list = formats::xlam()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .to_json();
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<TOOLCALL>"],
+                "tags": [{
+                    "type": "tag",
+                    "begin": "<TOOLCALL>",
+                    "content": list,
+                    "end": "</TOOLCALL>",
+                }],
+                "at_least_one": true,
+            }})
+        );
+        let open = formats::llama_nemotron()
+            .grammar(&tools, true, true)
+            .expect("a grammar");
+        assert!(matches!(
+            &open,
+            Grammar::Sequence(parts)
+                if parts.len() == 2
+                    && matches!(&parts[0], Grammar::AnyText { excludes }
+                        if excludes.contains(&"<TOOLCALL>".to_string())
+                            && excludes.contains(&"</TOOLCALL>".to_string())
+                            && !excludes.contains(&"<think>".to_string())
+                            && !excludes.contains(&"</think>".to_string()))
+        ));
     }
 
     #[test]

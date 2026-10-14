@@ -52,7 +52,7 @@ and a client that wants the raw text back can have it.
 | `Format`, `Emits`, `CallSyntax` | A model family's table: terminals (the marker strings), states (what the text in them is: content, reasoning, a call's arguments, wrapping), rows (`state + terminal = state`), the call syntax inside the arguments state, and the turn opener. Built with a small builder and checked by `Format::validate`. |
 | `Engine` | The one parser that runs any table: `Engine::new(format, declared)`. |
 | `Declared` | The parameter types the request's tools declare, which type a tagged call's values. |
-| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `json()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `gemma4()`, `mistral()`, `plain()`. |
+| `formats::*` | One function per family, each returning its table: `qwen3(syntax)`, `qwen2_5()`, `deepseek_v4_1()`, `seed_oss()`, `hy4()`, `ling()`, `iquest()`, `glm()`, `glm4()`, `k2_horizon()`, `olmo3()`, `lfm2_5()`, `xlam()`, `json()`, `minimax_m2()`, `minimax_m3()`, `kimi_k3()`, `inkling()`, `minicpm5()`, `dots3()`, `gemma4()`, `mistral()`, `llama_nemotron()`, `plain()`. |
 | `adapt::chat`, `adapt::responses`, `adapt::messages` | Pure functions from events to Chat Completions, Responses and Messages API shapes, streamed (`delta`, `Stream`) and whole (`message`, `output`); the driver adds only the envelope. |
 | `Grammar`, `Tag`, `Format::grammar` | The structural tag an engine takes for a forced or required call, derived from the same table and the request's tools, or `None` for a table without calls: `to_json()` as the engine reads it, `payload()` as a request carries it. |
 | `Scanner`, `Piece` | Marker matching across chunk boundaries, holding back a half-arrived marker. |
@@ -60,13 +60,13 @@ and a client that wants the raw text back can have it.
 
 ### The modules
 
-- `format`, `formats`: the table type and the twenty-one tables. A table is data, read by the engine
-  and by the grammar derivation alike; it says what the template writes and nothing about how to
-  parse it.
+- `format`, `formats`: the table type and the tables, one per family. A table is data, read by
+  the engine and by the grammar derivation alike; it says what the template writes and nothing
+  about how to parse it.
 - `engine`, `markers`, `tokens`: the engine, its scanner and its token ledger.
 - `json`: the JSON family's assembler (`{"name": ..., "arguments": {...}}` as it arrives,
-  streaming the model's own argument bytes), the bare JSON list (xLAM), and the partial-JSON and
-  prefix readers they rest on.
+  streaming the model's own argument bytes), the JSON list (xLAM's bare, Llama Nemotron's between
+  markers), and the partial-JSON and prefix readers they rest on.
 - `tagged`: the assemblers for arguments written as tags: Qwen 3.5's `<function=`/`<parameter=`,
   the keyed `<arg_key>`/`<arg_value>` pairs (GLM, Ling, Hy4, IQuest), the attributed
   `<parameter name="…">` tags in four spellings (MiniMax M2, dots3, MiniCPM5, DeepSeek's DSML,
@@ -75,7 +75,7 @@ and a client that wants the raw text back can have it.
 - `pythonic`: calls written as Python, `name(key=value)`.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
   `tagged`, `pythonic`, `attributed` for MiniMax M2's, dots3's, MiniCPM5's and DSML's, and `xml`
-  for MiniMax M3's; the JSON, compact keyed, xLAM list, Inkling and Mistral spellings in the module
+  for MiniMax M3's; the JSON, compact keyed, list, Inkling and Mistral spellings in the module
   itself), with
   the argument shapes a JSON schema pins (`schema`).
 - `adapt`: the three API adapters, every response policy in one place.
@@ -136,7 +136,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 
 <!-- models: begin -->
 159 groups, 277 checkpoints, newest first.
-20 ready, 88 replaying a recorded set, 0 on main awaiting fixtures, 51 pending.
+20 ready, 91 replaying a recorded set, 0 on main awaiting fixtures, 48 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -258,7 +258,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2025-08-20 | [llama-3.1-nemotron-safety-guard-8b-v3](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-safety-guard-8b-v3) | nvidia/Llama-3.1-Nemotron-Safety-Guard-8B-v3 |  | — | 458,185 | pending | `json`, none |
 | 2025-08-20 | [seed-oss-36b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/seed-oss-36b-instruct) | ByteDance-Seed/Seed-OSS-36B-Instruct | Seed-OSS-36B-Base-woSyn | `seed_oss` | 53,178 | ready | none |
 | 2025-08-13 | [apertus-8b-instruct-2509](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-8b-instruct-2509) | swiss-ai/Apertus-8B-Instruct-2509 |  | — | 137,178 | pending | none |
-| 2025-08-11 | [dler-llama-nemotron-8b-merge-research](https://github.com/smg-project/bellwether/tree/main/fixtures/dler-llama-nemotron-8b-merge-research) | nvidia/DLER-Llama-Nemotron-8B-Merge-Research |  | — | 416,850 | pending | `json`, none |
+| 2025-08-11 | [dler-llama-nemotron-8b-merge-research](https://github.com/smg-project/bellwether/tree/main/fixtures/dler-llama-nemotron-8b-merge-research) | nvidia/DLER-Llama-Nemotron-8B-Merge-Research |  | `llama_nemotron` | 416,850 | replaying the set | `json`, none |
 | 2025-08-10 | [glm-4.5v](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.5v) | zai-org/GLM-4.5V |  | `glm4` | 492,389 | replaying the set | `glm45_moe`, none |
 | 2025-08-05 | [qwen3-4b-instruct-2507](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-4b-instruct-2507) | Qwen/Qwen3-4B-Instruct-2507 |  | `qwen3` | 41,533 | ready | `qwen`, `qwen3` |
 | 2025-08-05 | [qwen3-4b-thinking-2507](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-4b-thinking-2507) | Qwen/Qwen3-4B-Thinking-2507 |  | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
@@ -267,7 +267,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2025-07-29 | [qwen3-30b-a3b-thinking-2507](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-30b-a3b-thinking-2507) | Qwen/Qwen3-30B-A3B-Thinking-2507 | NousResearch/nomos-1, Qwen3-235B-A22B-Thinking-2507 | `qwen3` | 54,418 | ready | `qwen`, `qwen3` |
 | 2025-07-28 | [qwen3-30b-a3b-instruct-2507](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3-30b-a3b-instruct-2507) | Qwen/Qwen3-30B-A3B-Instruct-2507 | Qwen3-235B-A22B-Instruct-2507 | `qwen3` | 41,533 | ready | `qwen`, `qwen3` |
 | 2025-07-28 | [step3](https://github.com/smg-project/bellwether/tree/main/fixtures/step3) | stepfun-ai/step3 |  | — | — | pending | `step3`, `step3` |
-| 2025-07-25 | [llama-3-3-nemotron-super-49b-v1-5](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-3-nemotron-super-49b-v1-5) | nvidia/Llama-3_3-Nemotron-Super-49B-v1_5 |  | — | 576,772 | pending | `json`, `nano_v3` |
+| 2025-07-25 | [llama-3-3-nemotron-super-49b-v1-5](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3-3-nemotron-super-49b-v1-5) | nvidia/Llama-3_3-Nemotron-Super-49B-v1_5 |  | `llama_nemotron` | 576,772 | replaying the set | `json`, `nano_v3` |
 | 2025-07-15 | [openreasoning-nemotron-1.5b](https://github.com/smg-project/bellwether/tree/main/fixtures/openreasoning-nemotron-1.5b) | nvidia/OpenReasoning-Nemotron-1.5B | OpenReasoning-Nemotron-32B, OpenReasoning-Nemotron-7B | — | 328,662 | pending | none |
 | 2025-07-15 | [openreasoning-nemotron-14b](https://github.com/smg-project/bellwether/tree/main/fixtures/openreasoning-nemotron-14b) | nvidia/OpenReasoning-Nemotron-14B |  | — | 328,662 | pending | none |
 | 2025-06-25 | [hunyuan-a13b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/hunyuan-a13b-instruct) | tencent/Hunyuan-A13B-Instruct |  | — | 328,662 | pending | none |
@@ -285,7 +285,7 @@ its group names it); whether the flags stay as aliases is an open question of th
 | 2025-03-24 | [deepseek-v3-0324](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3-0324) | deepseek-ai/DeepSeek-V3-0324 | DeepSeek-Prover-V2-671B | — | 19,299 | pending | `deepseek`, none |
 | 2025-03-22 | [qwen2.5-omni-7b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-omni-7b) | Qwen/Qwen2.5-Omni-7B | Qwen2.5-Omni-3B | `qwen2.5` | 328,662 | replaying the set | `qwen`, `qwen3` |
 | 2025-03-21 | [qwen2.5-vl-32b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-vl-32b-instruct) | Qwen/Qwen2.5-VL-32B-Instruct |  | `qwen2.5` | 328,662 | replaying the set | `qwen`, `qwen3` |
-| 2025-03-16 | [llama-3.1-nemotron-nano-8b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-nano-8b-v1) | nvidia/Llama-3.1-Nemotron-Nano-8B-v1 |  | — | 416,850 | pending | `json`, `nano_v3` |
+| 2025-03-16 | [llama-3.1-nemotron-nano-8b-v1](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-nano-8b-v1) | nvidia/Llama-3.1-Nemotron-Nano-8B-v1 |  | `llama_nemotron` | 416,850 | replaying the set | `json`, `nano_v3` |
 | 2025-03-05 | [qwq-32b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwq-32b) | Qwen/QwQ-32B |  | — | — | pending | `qwen`, `qwen3` |
 | 2025-03-04 | [llama-3.1-nemotron-8b-ultralong-1m-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-8b-ultralong-1m-instruct) | nvidia/Llama-3.1-Nemotron-8B-UltraLong-1M-Instruct |  | — | 458,185 | pending | `json`, none |
 | 2025-03-04 | [llama-3.1-nemotron-8b-ultralong-2m-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-nemotron-8b-ultralong-2m-instruct) | nvidia/Llama-3.1-Nemotron-8B-UltraLong-2M-Instruct |  | — | 458,185 | pending | `json`, none |

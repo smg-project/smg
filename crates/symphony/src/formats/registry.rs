@@ -20,8 +20,8 @@
 
 use super::{
     deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, json, k2_horizon, kimi_k3,
-    lfm2_5, ling, minicpm5, minimax_m2, minimax_m3, mistral, olmo3, plain, qwen2_5, qwen3,
-    seed_oss, xlam,
+    lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3, mistral, olmo3, plain, qwen2_5,
+    qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -64,7 +64,10 @@ pub enum Table {
     MinimaxM2,
     /// [`minimax_m3()`].
     MinimaxM3,
+    /// [`mistral()`].
     Mistral,
+    /// [`llama_nemotron()`].
+    LlamaNemotron,
     /// [`kimi_k3()`].
     KimiK3,
     /// [`inkling()`].
@@ -87,7 +90,7 @@ pub enum Table {
 
 impl Table {
     /// Every table, in this order.
-    pub const ALL: [Table; 25] = [
+    pub const ALL: [Table; 26] = [
         Self::Qwen3,
         Self::Qwen3Tagged,
         Self::Qwen3TaggedDirect,
@@ -104,6 +107,7 @@ impl Table {
         Self::MinimaxM2,
         Self::MinimaxM3,
         Self::Mistral,
+        Self::LlamaNemotron,
         Self::KimiK3,
         Self::Inkling,
         Self::MiniCpm5,
@@ -135,6 +139,7 @@ impl Table {
             Self::MinimaxM2 => "minimax_m2",
             Self::MinimaxM3 => "minimax_m3",
             Self::Mistral => "mistral",
+            Self::LlamaNemotron => "llama_nemotron",
             Self::KimiK3 => "kimi_k3",
             Self::Inkling => "inkling",
             Self::MiniCpm5 => "minicpm5",
@@ -173,6 +178,7 @@ impl Table {
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::Mistral => mistral(),
+            Self::LlamaNemotron => llama_nemotron(),
             Self::KimiK3 => kimi_k3(),
             Self::Inkling => inkling(),
             Self::MiniCpm5 => minicpm5(),
@@ -333,6 +339,12 @@ const GROUPS: &[Group] = &[
         opener: None,
     },
     Group {
+        model: "nvidia/DLER-Llama-Nemotron-8B-Merge-Research",
+        also: &[],
+        table: Table::LlamaNemotron,
+        opener: None,
+    },
+    Group {
         model: "dots-studio/dots3-note-prev",
         also: &[],
         table: Table::Dots3,
@@ -486,6 +498,18 @@ const GROUPS: &[Group] = &[
         model: "inclusionAI/Ling-3.0-flash",
         also: &["Ling-3.0-flash-fp4"],
         table: Table::Ling,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",
+        also: &[],
+        table: Table::LlamaNemotron,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+        also: &[],
+        table: Table::LlamaNemotron,
         opener: None,
     },
     Group {

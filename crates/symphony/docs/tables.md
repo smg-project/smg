@@ -183,6 +183,34 @@ What the table leaves open: no recorded group writes this format as its own (the
 Llama-3.x groups that the older parser reads have content cases only), so the table stands on its
 unit tests until one does.
 
+## Llama Nemotron (`llama_nemotron`)
+
+What the table says beyond the others:
+
+- **The calls are one list between markers.** `<TOOLCALL>` opens the call state and `</TOOLCALL>`
+  closes it; inside, the list assembler (`json::list`) reads `[{"name": …, "arguments": {…}},
+  …]` as it reads xLAM's bare list: each object a call, the brackets and the commas the template's
+  wrapping. Between markers prose has no place, so text where the list should be, a `[` that opens
+  no list of calls included, is malformed where the bare list takes it for content; the engine
+  picks that form for a table with a row into the arguments state. After the `]`, whitespace is
+  dropped and other text malformed, as for the bare list.
+- **The thought is the Super template's, and the model's own.** Llama-3.3-Nemotron-Super-49B-v1.5's
+  template renders an assistant message's content from its `</think>` on, so the model writes
+  `<think>…</think>` itself; `/no_think` in the system prompt makes the template close the thought
+  in the prompt (`<think>\n\n</think>\n\n`), and the request's `enable_thinking` changes nothing.
+  The Nano 8B and DLER templates have no thought. Bellwether records no reasoning case for the three
+  groups (their templates render no `reasoning_content`), so the thought's rows rest on the Super
+  template and the model cards, not on a replay.
+- **The tag is one tag around the list.** `Format::grammar` writes `<TOOLCALL>`, the tools' calls
+  as the list, `</TOOLCALL>`, and the table's thought takes the prefix the JSON syntax takes. The
+  gateway's older parsers have no tag for this syntax (`llama` reads Llama 3.2's pythonic calls,
+  `json` the bare object), so nothing is pinned.
+
+What the table leaves open: the thought's rows against a recorded reasoning case; Nemotron Nano 4B
+v1.1, whose template writes each call one `}` short (`{"name": …, "arguments": {…}]`), which
+bellwether's reference heals and this table does not read; and Nemotron Ultra's bare
+`{"name": …, "parameters": …}` object, Llama 3.1's own syntax, which the `json` table reads.
+
 ## MiniCPM5 (`minicpm5`)
 
 The template writes the turn as `<think>\n`, the reasoning, `\n</think>\n\n`, the content, a newline

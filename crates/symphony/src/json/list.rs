@@ -26,6 +26,12 @@
 //! still open is finished as the JSON assembler finishes one (a started call closed with what
 //! arrived, an object that never named a call `Malformed`), and a list left open reports what
 //! it held.
+//!
+//! Between markers (Llama Nemotron's `<TOOLCALL>[…]</TOOLCALL>`) a row of the table opens the
+//! region and its closing marker ends it, so prose has no place inside: [`Assembler::framed`]
+//! reports text where the list should be, a `[` that opens no list of calls included, as
+//! `Malformed` where the bare list takes it for content. The engine picks it for a table with a
+//! row into the arguments state.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -35,6 +41,7 @@ use crate::{
 const TEXT_BETWEEN_OBJECTS: &str = "text between a list's calls";
 const TEXT_AFTER_THE_LIST: &str = "text after the list's end";
 const TEXT_AFTER_THE_OBJECT: &str = "text after the call's object";
+const TEXT_IN_PLACE_OF_THE_LIST: &str = "text where the list of calls should be";
 
 /// The events of a JSON list of calls, each call with its own index from `first`.
 #[derive(Debug)]
@@ -50,6 +57,8 @@ pub struct Assembler {
     /// Whether a `[` opened a list, so that a finished object returns to the list or ends the
     /// output's calls.
     listed: bool,
+    /// Whether markers frame the list: text in place of it is malformed, not prose.
+    framed: bool,
 }
 
 #[derive(Debug)]
@@ -58,6 +67,8 @@ enum Stage {
     Deciding,
     /// The output is prose.
     Content,
+    /// Text where the list should be, between markers: every byte malformed.
+    Malformed,
     /// Inside the list, between objects.
     Between,
     /// Inside an object.
@@ -69,7 +80,8 @@ enum Stage {
 }
 
 impl Assembler {
-    /// An assembler positioned at the output's start, the first call taking index `first`.
+    /// An assembler positioned at the output's start, the first call taking index `first`: the
+    /// bare list, where anything but a list is prose.
     pub fn new(first: u32) -> Self {
         Self {
             next_index: first,
@@ -78,6 +90,7 @@ impl Assembler {
             objects: 0,
             lone_object: false,
             listed: false,
+            framed: false,
         }
     }
 
@@ -85,6 +98,15 @@ impl Assembler {
     pub fn object_or_list(first: u32) -> Self {
         Self {
             lone_object: true,
+            ..Self::new(first)
+        }
+    }
+
+    /// An assembler positioned after the marker that opens the list's region, the first call
+    /// taking index `first`: anything but a list is malformed.
+    pub fn framed(first: u32) -> Self {
+        Self {
+            framed: true,
             ..Self::new(first)
         }
     }
@@ -117,6 +139,8 @@ impl Assembler {
                     ))));
                 }
             }
+            // Every byte was reported as it arrived.
+            Stage::Malformed => {}
             Stage::Between => {
                 if !self.carried.is_empty() {
                     out.push(Event::Malformed {
@@ -155,16 +179,19 @@ impl Assembler {
                     )));
                     &text[at..]
                 } else {
-                    self.stage = Stage::Content;
-                    self.carried.push_str(&text[at..]);
-                    out.push(Event::Content(Text::uncounted(std::mem::take(
-                        &mut self.carried,
-                    ))));
+                    self.not_a_list(&text[at..], out);
                     ""
                 }
             }
             Stage::Content => {
                 out.push(Event::Content(Text::uncounted(text)));
+                ""
+            }
+            Stage::Malformed => {
+                out.push(Event::Malformed {
+                    text: Text::uncounted(text),
+                    why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.to_string()),
+                });
                 ""
             }
             Stage::Between => {
@@ -194,12 +221,9 @@ impl Assembler {
                         &text[at + 1..]
                     }
                     _ if self.objects == 0 => {
-                        // Not a list of calls after all: the `[` and everything held are prose.
-                        self.stage = Stage::Content;
-                        self.carried.push_str(&text[at..]);
-                        out.push(Event::Content(Text::uncounted(std::mem::take(
-                            &mut self.carried,
-                        ))));
+                        // Not a list of calls after all: the `[` and everything held are prose,
+                        // or malformed between markers.
+                        self.not_a_list(&text[at..], out);
                         ""
                     }
                     _ => {
@@ -263,6 +287,23 @@ impl Assembler {
                 }
                 ""
             }
+        }
+    }
+
+    /// The bytes held and `text` are not a list of calls: content under the bare list, malformed
+    /// between markers; every later byte comes back the same way.
+    fn not_a_list(&mut self, text: &str, out: &mut Events) {
+        self.carried.push_str(text);
+        let text = Text::uncounted(std::mem::take(&mut self.carried));
+        if self.framed {
+            self.stage = Stage::Malformed;
+            out.push(Event::Malformed {
+                text,
+                why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.to_string()),
+            });
+        } else {
+            self.stage = Stage::Content;
+            out.push(Event::Content(text));
         }
     }
 
@@ -494,6 +535,37 @@ mod tests {
             assert_eq!(bytes(&events), output, "cut at {cut}");
             assert_eq!(calls(&events), whole, "cut at {cut}");
         }
+    }
+
+    #[test]
+    fn between_markers_text_in_place_of_the_list_is_malformed() {
+        for output in [
+            "not a list",
+            "  [Note: draft] ok",
+            "{\"name\": \"f\", \"arguments\": {}}",
+        ] {
+            let mut assembler = Assembler::framed(0);
+            let mut out = Events::new();
+            assembler.feed(output, &mut out);
+            assembler.close(&mut out);
+            let events = out.drain();
+            assert_eq!(bytes(&events), output, "{output:?}");
+            assert!(calls(&events).is_empty(), "{output:?}");
+            assert!(
+                events
+                    .iter()
+                    .all(|event| matches!(event, Event::Malformed { .. })),
+                "{output:?}: {events:?}"
+            );
+        }
+        // The list itself reads the same between markers.
+        let mut assembler = Assembler::framed(0);
+        let mut out = Events::new();
+        assembler.feed(LIST, &mut out);
+        assembler.close(&mut out);
+        let events = out.drain();
+        assert_eq!(bytes(&events), LIST);
+        assert_eq!(calls(&events).len(), 2);
     }
 
     #[test]

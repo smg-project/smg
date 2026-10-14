@@ -84,8 +84,9 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     fn finish(self: Box<Self>, out: &mut Events);
 }
 
-/// The assembler for `syntax`'s next call, at `index`.
-fn assembler(syntax: Option<CallSyntax>, index: u32) -> Box<dyn CallAssembler> {
+/// The assembler for `syntax`'s next call, at `index`; `framed` says whether a row of the table
+/// enters the arguments state, so markers frame the region.
+fn assembler(syntax: Option<CallSyntax>, index: u32, framed: bool) -> Box<dyn CallAssembler> {
     let id = format!("call_{index}");
     match syntax {
         // `None` is unreachable: `Format::validate`, run by `Engine::new`, refuses a table with
@@ -96,6 +97,9 @@ fn assembler(syntax: Option<CallSyntax>, index: u32) -> Box<dyn CallAssembler> {
         }
         Some(CallSyntax::Keyed(tags)) => Box::new(tagged::keyed::Assembler::new(index, id, tags)),
         Some(CallSyntax::Pythonic(_)) => Box::new(pythonic::Assembler::new(index)),
+        // The list between markers (Llama Nemotron) takes text in place of it as malformed; the
+        // bare list the output starts in (xLAM) takes it for prose.
+        Some(CallSyntax::JsonList) if framed => Box::new(json::list::Assembler::framed(index)),
         Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index)),
         Some(CallSyntax::JsonAlone) => Box::new(json::list::Assembler::object_or_list(index)),
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id)),
@@ -275,7 +279,15 @@ impl Engine {
     /// The next call takes the next free index; the index is spent only when a call starts, so a
     /// `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
-        self.call = Some(assembler(self.format.call_syntax().copied(), self.calls));
+        let framed = self
+            .format
+            .transitions()
+            .any(|(_, _, to)| self.format.emits(to) == Emits::Arguments);
+        self.call = Some(assembler(
+            self.format.call_syntax().copied(),
+            self.calls,
+            framed,
+        ));
     }
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took

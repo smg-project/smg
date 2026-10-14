@@ -173,6 +173,10 @@ fn mistral() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::mistral(), Declared::default()))
 }
 
+fn llama_nemotron() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::llama_nemotron(), Declared::default()))
+}
+
 fn plain() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::plain(), Declared::default()))
 }
@@ -257,6 +261,11 @@ const FORMATS: &[Subject] = &[
         name: "mistral",
         new: mistral,
         outputs: MISTRAL_OUTPUTS,
+    },
+    Subject {
+        name: "llama nemotron",
+        new: llama_nemotron,
+        outputs: LLAMA_NEMOTRON_OUTPUTS,
     },
 ];
 
@@ -434,6 +443,26 @@ const MISTRAL_OUTPUTS: &[&str] = &[
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": @}",
     "[TOOL_CALLS]get_weather[ARGS]{} trailing",
     "[THINK]Only a thought.[/THINK]",
+    "Hello!",
+];
+
+/// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before
+/// it, the thought between `<think>` and `</think>`; the list cut, empty, or not a list.
+const LLAMA_NEMOTRON_OUTPUTS: &[&str] = &[
+    "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": \
+     [1, 2.5, true, null]}}]</TOOLCALL>",
+    "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, \
+     {\"name\": \"get_stock_price\", \"arguments\": {}}]</TOOLCALL>",
+    "Let me check.<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}]\
+     </TOOLCALL>",
+    "<think>The user asks about Paris.</think><TOOLCALL>[{\"name\": \"get_weather\", \
+     \"arguments\": {\"city\": \"Paris\"}}]</TOOLCALL>",
+    "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par",
+    "<TOOLCALL>[{\"name\": \"get_wea",
+    "<TOOLCALL>[]</TOOLCALL>",
+    "<TOOLCALL>not a list</TOOLCALL>",
+    "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {}} junk]</TOOLCALL> after",
+    "<think>Only a thought.</think>",
     "Hello!",
 ];
 

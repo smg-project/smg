@@ -81,8 +81,8 @@ use symphony::{
     adapt,
     formats::{
         deepseek_v4_1, dots3, for_model, gemma4, glm, glm4, groups, hy4, inkling, iquest,
-        k2_horizon, kimi_k3, lfm2_5, ling, minicpm5, minimax_m2, minimax_m3, mistral, olmo3, plain,
-        qwen2_5, qwen3, seed_oss, xlam,
+        k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
+        mistral, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -761,6 +761,24 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         Family::Mistral,
         GenerationPrompt::ModelDecides,
     ),
+    // Llama Nemotron: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`. The Super
+    // template has a thought the model writes itself (`/no_think` in the system prompt closes it
+    // in the prompt; the request's switch changes nothing); the Nano and DLER templates have none.
+    (
+        "dler-llama-nemotron-8b-merge-research",
+        Family::LlamaNemotron,
+        GenerationPrompt::Plain,
+    ),
+    (
+        "llama-3-3-nemotron-super-49b-v1-5",
+        Family::LlamaNemotron,
+        GenerationPrompt::ModelDecides,
+    ),
+    (
+        "llama-3.1-nemotron-nano-8b-v1",
+        Family::LlamaNemotron,
+        GenerationPrompt::Plain,
+    ),
 ];
 
 /// The turn opener a model's own chat template writes, for a model that reads another family's
@@ -809,6 +827,8 @@ enum Family {
     Xlam,
     /// [`mistral`]: the tool's name, `[ARGS]` and the arguments object after `[TOOL_CALLS]`.
     Mistral,
+    /// [`llama_nemotron`]: one JSON list of calls between `<TOOLCALL>` and `</TOOLCALL>`.
+    LlamaNemotron,
     /// [`minimax_m2`]: parameters named by an attribute, typed by the request tools.
     MinimaxM2,
     /// [`minimax_m3`]: an XML tree of arguments, typed by the request tools at every depth.
@@ -885,6 +905,7 @@ impl Family {
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
             Self::Mistral => mistral(),
+            Self::LlamaNemotron => llama_nemotron(),
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
@@ -918,14 +939,15 @@ impl Family {
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,
-            // MiniCPM5 and dots3 read `</think>` but not `<tool_call>`.
+            // MiniCPM5, dots3 and Llama Nemotron read `</think>` but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
             | Self::DeepSeekV4_1
             | Self::Lfm2_5
             | Self::MinimaxM2
             | Self::MiniCpm5
-            | Self::Dots3 => KNOWN_REASONING_PROBE,
+            | Self::Dots3
+            | Self::LlamaNemotron => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
         // A template that writes no thought for the probe's request leaves the reasoning out, so
@@ -1185,6 +1207,12 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
     ("glm-5", "parse/reasoning-with-marker-text"),
     ("glm-5.1", "parse/reasoning-with-marker-text"),
     ("glm-5.2", "parse/reasoning-with-marker-text"),
+    // Its template renders no `reasoning_content`, so bellwether refused the reasoning probe's
+    // request (the recorded common set holds the fence probe and ten more, not it).
+    (
+        "llama-3-3-nemotron-super-49b-v1-5",
+        "parse/reasoning-with-marker-text",
+    ),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
