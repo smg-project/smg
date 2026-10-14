@@ -187,7 +187,7 @@ def test_a_non_finite_or_negative_timeout_is_refused_before_any_attempt(
 
 def test_the_whole_rpc_stays_within_the_scheduler_bound(servicer_mod, monkeypatch):
     """The retry window never outlives the scheduler round-trip bound: an
-    attempt that hangs is cut at what is left of it, however long the grace."""
+    attempt that hangs is cut at what is left of it."""
     _fast(servicer_mod, monkeypatch, grace_s=60.0)
     monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_TIMEOUT_S", 0.05, raising=False)
     monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_MARGIN_S", 0.05, raising=False)
@@ -204,4 +204,24 @@ def test_the_whole_rpc_stays_within_the_scheduler_bound(servicer_mod, monkeypatc
         asyncio.run(servicer.FlushCache(common_pb2.FlushCacheRequest(), context))
 
     assert time.monotonic() - started < 5.0
+    assert [code for code, _ in context.aborts] == [grpc.StatusCode.DEADLINE_EXCEEDED]
+
+
+def test_a_refusing_engine_is_cut_at_the_scheduler_bound_not_the_grace(servicer_mod, monkeypatch):
+    """The attempts share one deadline: an engine that refuses every attempt
+    is cut at the scheduler bound with ``DEADLINE_EXCEEDED`` while the grace
+    would still allow attempts (a per-attempt timeout would retry for the whole
+    grace and answer a refusal instead)."""
+    _fast(servicer_mod, monkeypatch, grace_s=3.0)
+    monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_MARGIN_S", 0.05, raising=False)
+    servicer, attempts = _servicer(servicer_mod, [False])
+    context = _RecordingContext()
+
+    started = time.monotonic()
+    with pytest.raises(_Abort):
+        asyncio.run(servicer.FlushCache(common_pb2.FlushCacheRequest(), context))
+
+    assert time.monotonic() - started < 1.0
+    assert len(attempts) >= 2
     assert [code for code, _ in context.aborts] == [grpc.StatusCode.DEADLINE_EXCEEDED]
