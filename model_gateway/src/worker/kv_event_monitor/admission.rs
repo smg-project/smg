@@ -649,19 +649,6 @@ mod tests {
             self.feed(b)
         }
 
-        /// Apply a batch straight into the worker's index state, bypassing
-        /// admission (how a snapshot or a buffered tail lands).
-        fn apply_direct(&mut self, b: &KvEventBatch) {
-            for event in &b.events {
-                KvEventMonitor::apply_event(
-                    event,
-                    self.worker,
-                    &self.indexer,
-                    &mut self.state.index,
-                );
-            }
-        }
-
         fn assert_matches_reference(&self) {
             let production: BTreeSet<(u32, usize, ContentHash, SequenceHash)> =
                 self.indexer.debug_blocks().into_iter().collect();
