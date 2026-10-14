@@ -299,7 +299,9 @@ fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
 // clap renders `--help` by `help_heading`: the headings in first-use order,
 // the fields of a heading in declaration order. The sections below follow
 // that grouping, one header per heading, so a field is added under its
-// heading's header; a field's doc comment is its help text. The second
+// heading's header; the Mesh Server section is the exception, its flags
+// carry no heading and `--help` lists them under Options. A field's doc
+// comment is its help text. The second
 // spellings, each a `visible_alias` of its field and mirrored by the Python
 // launcher's `RouterArgs`: --cache-match-threshold (--cache-threshold),
 // --spill-abs-threshold (--balance-abs-threshold), --spill-rel-threshold
