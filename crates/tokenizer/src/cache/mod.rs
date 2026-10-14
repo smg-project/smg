@@ -105,7 +105,7 @@ impl CachedTokenizer {
         // text (not after normalization) whose splice the tokenizer
         // reproduces, found once at construction; none without L1.
         let special_tokens = if config.enable_l1 {
-            let after_normalization = inner.special_tokens_after_normalization();
+            let after_normalization = inner.added_tokens_after_normalization();
             let mut candidates = Self::extract_special_token_strings(&inner);
             candidates.retain(|token| !after_normalization.contains(token));
             SpecialTokenBoundaries::for_encoder(
@@ -488,8 +488,8 @@ impl Tokenizer for CachedTokenizer {
         self.inner.added_token_strings()
     }
 
-    fn special_tokens_after_normalization(&self) -> Vec<String> {
-        self.inner.special_tokens_after_normalization()
+    fn added_tokens_after_normalization(&self) -> Vec<String> {
+        self.inner.added_tokens_after_normalization()
     }
 }
 
@@ -912,8 +912,9 @@ mod tests {
 
     /// Tokenizer that extracts its added tokens in two passes, as the
     /// `tokenizers` crate does: the raw-pass special `<|s|>` first, then on
-    /// the pieces left over the normalized special `<|n|>` and the longer
-    /// normalized, non-special `a<|n|>b` (leftmost-longest among them).
+    /// the pieces left over the normalized `<|n|>`, which the configuration
+    /// names as the EOS, and the longer normalized `a<|n|>b` (leftmost-longest
+    /// among them).
     struct TwoPassTokenizer {
         special_tokens: SpecialTokens,
         second_pass: aho_corasick::AhoCorasick,
@@ -923,7 +924,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 special_tokens: SpecialTokens {
-                    additional_special_tokens: vec!["<|s|>".to_owned(), "<|n|>".to_owned()],
+                    additional_special_tokens: vec!["<|s|>".to_owned()],
+                    eos_token: Some("<|n|>".to_owned()),
                     ..Default::default()
                 },
                 second_pass: aho_corasick::AhoCorasickBuilder::new()
@@ -984,8 +986,8 @@ mod tests {
         fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
             None
         }
-        fn special_tokens_after_normalization(&self) -> Vec<String> {
-            vec!["<|n|>".to_owned()]
+        fn added_tokens_after_normalization(&self) -> Vec<String> {
+            vec!["<|n|>".to_owned(), "a<|n|>b".to_owned()]
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -993,12 +995,13 @@ mod tests {
     }
 
     #[test]
-    fn a_special_token_matched_after_normalization_is_no_boundary() {
-        // `<|n|>` is extracted in the second pass, where the longer `a<|n|>b`
-        // wins over it; a raw-text matcher cannot see that pass, so `<|n|>`
-        // is no boundary (and the longer token, matched there too, is no
-        // consuming pattern). Split at it, the cache would encode `a<|n|>` as
-        // `a`, `<|n|>` and the rest after `<|n|>`, where the tokenizer has
+    fn a_token_matched_after_normalization_is_no_boundary_whatever_the_configuration_calls_it() {
+        // `<|n|>` is the configuration's EOS, so the cache takes it as a
+        // candidate; it is extracted in the second pass, where the longer
+        // `a<|n|>b` wins over it. A raw-text matcher cannot see that pass, so
+        // `<|n|>` is no boundary (and the longer token, matched there too, is
+        // no consuming pattern). Split at it, the cache would encode `a<|n|>`
+        // as `a`, `<|n|>` and the rest after `<|n|>`, where the tokenizer has
         // one token.
         let config = CacheConfig {
             enable_l0: false,

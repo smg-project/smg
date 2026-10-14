@@ -1230,11 +1230,11 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .collect()
     }
 
-    fn special_tokens_after_normalization(&self) -> Vec<String> {
+    fn added_tokens_after_normalization(&self) -> Vec<String> {
         self.tokenizer
             .get_added_tokens_decoder()
             .values()
-            .filter(|token| token.special && token.normalized)
+            .filter(|token| token.normalized)
             .map(|token| token.content.clone())
             .collect()
     }
@@ -1807,10 +1807,10 @@ mod tests {
     use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
 
     /// The added tokens a prefix cache may match are those of the raw pass
-    /// (`normalized: false`); a special token matched after normalization is
-    /// reported apart, so the cache does not split at it.
+    /// (`normalized: false`); the tokens matched after normalization, special
+    /// or not, are reported apart, so the cache does not split at any of them.
     #[test]
-    fn the_cache_sees_the_raw_pass_added_tokens_and_the_normalized_specials_apart() {
+    fn the_cache_sees_the_raw_pass_added_tokens_and_the_normalized_ones_apart() {
         use tokenizers::{
             models::bpe::{Merges, Vocab, BPE},
             AddedToken,
@@ -1842,9 +1842,11 @@ mod tests {
             .expect("added tokens added");
         let wrapped = HuggingFaceTokenizer::from_tokenizer(tokenizer);
         assert_eq!(wrapped.added_token_strings(), vec!["</think>".to_owned()]);
+        let mut after_normalization = wrapped.added_tokens_after_normalization();
+        after_normalization.sort();
         assert_eq!(
-            wrapped.special_tokens_after_normalization(),
-            vec!["<|n|>".to_owned()]
+            after_normalization,
+            vec!["<|n|>".to_owned(), "a<".to_owned()]
         );
     }
 

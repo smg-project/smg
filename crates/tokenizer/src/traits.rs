@@ -376,12 +376,14 @@ pub trait Tokenizer: Encoder + Decoder {
         Vec::new()
     }
 
-    /// The special tokens that are matched after normalization rather than
-    /// on the raw text (`normalized: true`). A cache that splits text at
-    /// special tokens does not split at these: where they are extracted
-    /// depends on the normalized text and on the other tokens of that pass.
-    /// Empty when a tokenizer has none.
-    fn special_tokens_after_normalization(&self) -> Vec<String> {
+    /// The added tokens, special or not, that are matched after
+    /// normalization rather than on the raw text (`normalized: true`). A
+    /// cache that splits text at special tokens does not split at any of
+    /// these, whatever a configuration calls them (a BOS or EOS named there
+    /// can be such a token): where they are extracted depends on the
+    /// normalized text and on the other tokens of that pass. Empty when a
+    /// tokenizer has none.
+    fn added_tokens_after_normalization(&self) -> Vec<String> {
         Vec::new()
     }
 }
