@@ -9,6 +9,7 @@ import logging
 import multiprocessing as mp
 import signal
 
+from sglang.srt.arg_groups.overrides import resolved_view
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -90,6 +91,8 @@ def launch_scheduler_process_only(
     Raises:
         RuntimeError: If any scheduler process fails to initialize
     """
+    server_args.resolve_once()
+
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
@@ -123,25 +126,26 @@ def _start_scheduler_processes(
 ) -> dict:
     """Start scheduler processes and wait for every ready handshake."""
 
-    if server_args.dp_size == 1:
+    # Resolution preserves raw inputs; use the topology the engine will run.
+    cfg = resolved_view(server_args)
+
+    if cfg.dp_size == 1:
         # Single data parallel group - launch TP/PP schedulers
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
+        memory_saver_adapter = TorchMemorySaverAdapter.create(enable=cfg.enable_memory_saver)
         scheduler_pipe_readers = []
 
         # Calculate TP/PP distribution across nodes
-        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+        nnodes_per_tp_group = max(cfg.nnodes // cfg.pp_size, 1)
+        tp_size_per_node = cfg.tp_size // nnodes_per_tp_group
         tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+            tp_size_per_node * (cfg.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (cfg.node_rank % nnodes_per_tp_group + 1),
         )
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        pp_size_per_node = max(cfg.pp_size // cfg.nnodes, 1)
         pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+            pp_size_per_node * (cfg.node_rank // nnodes_per_tp_group),
+            pp_size_per_node * (cfg.node_rank // nnodes_per_tp_group + 1),
         )
 
         # Launch scheduler for each TP/PP rank combination
@@ -151,9 +155,9 @@ def _start_scheduler_processes(
 
                 # Calculate GPU ID for this rank
                 gpu_id = (
-                    server_args.base_gpu_id
+                    cfg.base_gpu_id
                     + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                    + (tp_rank % tp_size_per_node) * cfg.gpu_id_step
                 )
 
                 # Create scheduler process. The scheduler derives the attention and MoE

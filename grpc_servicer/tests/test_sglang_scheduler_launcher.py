@@ -44,6 +44,11 @@ def scheduler_launcher_mod(monkeypatch):
     stubs = {
         "sglang": _module("sglang"),
         "sglang.srt": _module("sglang.srt"),
+        "sglang.srt.arg_groups": _module("sglang.srt.arg_groups"),
+        "sglang.srt.arg_groups.overrides": _module(
+            "sglang.srt.arg_groups.overrides",
+            resolved_view=lambda args: getattr(args, "resolved", args),
+        ),
         "sglang.srt.managers": _module("sglang.srt.managers"),
         "sglang.srt.managers.data_parallel_controller": _module(
             "sglang.srt.managers.data_parallel_controller",
@@ -136,6 +141,7 @@ def test_ready_failure_terminates_every_started_scheduler(monkeypatch, scheduler
     monkeypatch.setattr(scheduler_launcher_mod.mp, "Process", Process)
 
     server_args = SimpleNamespace(
+        resolve_once=lambda: None,
         check_server_args=lambda: None,
         dp_size=1,
         enable_memory_saver=False,
@@ -159,8 +165,24 @@ def test_ready_failure_terminates_every_started_scheduler(monkeypatch, scheduler
     assert all(proc.join_timeouts == [2.0] for proc in Process.instances)
 
 
+@pytest.mark.parametrize(
+    "overrides,raw_dp_size,placements",
+    [
+        ({}, 1, [(0, 0, 4), (0, 1, 6)]),
+        # Resolved DP selects direct launch; TP spans two nodes.
+        ({"dp_size": 1, "tp_size": 4, "nnodes": 2, "node_rank": 1}, 2, [(0, 2, 4), (0, 3, 6)]),
+        # Resolved PP selects the second pipeline stage on this node.
+        (
+            {"pp_size": 2, "nnodes": 2, "node_rank": 1, "base_gpu_id": 1, "gpu_id_step": 3},
+            1,
+            [(1, 0, 1), (1, 1, 4)],
+        ),
+        ({"dp_size": 2}, 1, None),
+    ],
+    ids=["unchanged", "resolved-tp", "resolved-pp", "resolved-dp"],
+)
 def test_schedulers_start_with_the_run_scheduler_process_arguments(
-    monkeypatch, scheduler_launcher_mod
+    monkeypatch, scheduler_launcher_mod, overrides, raw_dp_size, placements
 ):
     class Reader:
         def poll(self, _timeout=None):
@@ -186,13 +208,14 @@ def test_schedulers_start_with_the_run_scheduler_process_arguments(
         def close(self):
             self.closed = True
 
-    writers = [Writer(), Writer()]
+    writers = [Writer() for _ in range(len(placements) if placements else 1)]
     pipes = iter([(Reader(), writer) for writer in writers])
     monkeypatch.setattr(scheduler_launcher_mod.mp, "set_start_method", lambda *_args, **_kw: None)
     monkeypatch.setattr(scheduler_launcher_mod.mp, "Pipe", lambda **_kwargs: next(pipes))
     monkeypatch.setattr(scheduler_launcher_mod.mp, "Process", Process)
 
     server_args = SimpleNamespace(
+        resolve_once=lambda: None,
         check_server_args=lambda: None,
         dp_size=1,
         enable_memory_saver=False,
@@ -203,23 +226,45 @@ def test_schedulers_start_with_the_run_scheduler_process_arguments(
         base_gpu_id=4,
         gpu_id_step=2,
     )
+    events = []
+    raw = vars(server_args).copy()
+
+    def resolve():
+        events.append("resolve")
+        server_args.resolved = SimpleNamespace(**(raw | overrides))
+
+    server_args.dp_size = raw_dp_size
+    server_args.resolve_once = resolve
+    server_args.check_server_args = lambda: events.append("validate")
     port_args = object()
 
     scheduler_launcher_mod.launch_scheduler_process_only(server_args, port_args=port_args)
 
+    assert events == ["resolve", "validate"]
+    assert server_args.dp_size == raw_dp_size
+    assert server_args.tp_size == 2
+    assert len(Process.instances) == len(writers)
+    assert all(writer.closed for writer in writers)
+    if placements is None:
+        assert Process.instances[0].kwargs == {
+            "target": scheduler_launcher_mod.run_data_parallel_controller_process,
+            "args": (server_args, port_args, writers[0]),
+        }
+        return
+
     signature = inspect.signature(scheduler_launcher_mod.run_scheduler_process)
-    assert len(Process.instances) == 2
-    for tp_rank, proc in enumerate(Process.instances):
+    for index, (proc, (pp_rank, tp_rank, gpu_id)) in enumerate(zip(Process.instances, placements)):
+        assert proc.kwargs["target"] is scheduler_launcher_mod.run_scheduler_with_signal_handling
         # By name: an extra positional argument still binds to a defaulted trailing
         # parameter, so a successful bind alone proves nothing.
         bound = signature.bind(*proc.kwargs["args"]).arguments
         assert bound["server_args"] is server_args
         assert bound["port_args"] is port_args
-        assert bound["gpu_id"] == 4 + 2 * tp_rank
+        assert bound["gpu_id"] == gpu_id
         assert bound["tp_rank"] == tp_rank
-        assert bound["pp_rank"] == 0
+        assert bound["pp_rank"] == pp_rank
         assert bound["dp_rank"] is None
-        assert bound["pipe_writer"] is writers[tp_rank]
+        assert bound["pipe_writer"] is writers[index]
         assert not {"display_tp_rank", "display_dp_rank", "display_moe_ep_rank"} & bound.keys()
     # smg-lab #292: the parent's copy of each ready pipe's write end is closed
     # once the rank has it, so a rank that dies before reporting shows as EOF.
@@ -277,6 +322,7 @@ def test_a_scheduler_process_that_dies_before_its_ready_report_fails_the_launch(
     )
     monkeypatch.setattr(scheduler_launcher_mod.mp, "Process", Process)
     server_args = SimpleNamespace(
+        resolve_once=lambda: None,
         check_server_args=lambda: None,
         dp_size=1,
         enable_memory_saver=False,
