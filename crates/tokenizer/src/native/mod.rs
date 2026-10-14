@@ -101,8 +101,8 @@ const PARALLEL_MIN_BYTES: usize = 64 << 10;
 /// The size a long text unit is cut into for the pool, at the first stable
 /// boundary past each multiple of it.
 const PARALLEL_CHUNK_BYTES: usize = 32 << 10;
-/// Text on each side of a candidate cut the first stage's pattern is run over
-/// to confirm a piece starts there.
+/// Text on each side of a candidate cut that every stage's pattern is run
+/// over to confirm a piece starts there (widened to the spaces around it).
 const CUT_CHECK_WINDOW: usize = 512;
 
 /// Piece bytes to the ids they tokenize to.
@@ -522,9 +522,13 @@ impl NativeEncoder {
         Ok(ids)
     }
 
-    /// The input as the units its encode is made of: the added tokens matched
-    /// on the raw text and the texts between them; for the thread pool a long
-    /// text is cut further at stable boundaries ([`Self::stable_cut`]).
+    /// The input as the units its encode is made of: the added tokens
+    /// matched on the raw text, then the ones matched after normalization on
+    /// the texts between them (the text is in its normal form here, see
+    /// [`Self::encode_with`]), and the texts between all of them; for the
+    /// thread pool a long text is cut further at stable boundaries
+    /// ([`Self::stable_cut`]). Both kinds of added token come out before any
+    /// cut: a cut inside one would turn it into pieces.
     fn units<'t>(&self, text: &'t str, chunked: bool) -> Vec<Segment<'t>> {
         let mut units = Vec::new();
         let push_text = |text: &'t str, units: &mut Vec<Segment<'t>>| {
@@ -538,12 +542,20 @@ impl NativeEncoder {
             }
             units.push(Segment::Text(rest));
         };
+        let push_normalized =
+            |text: &'t str, units: &mut Vec<Segment<'t>>| match &self.normalized_added {
+                Some(added) => added.split(text, |segment| match segment {
+                    Segment::Added(id) => units.push(Segment::Added(id)),
+                    Segment::Text(text) => push_text(text, units),
+                }),
+                None => push_text(text, units),
+            };
         match &self.raw_added {
             Some(added) => added.split(text, |segment| match segment {
                 Segment::Added(id) => units.push(Segment::Added(id)),
-                Segment::Text(text) => push_text(text, &mut units),
+                Segment::Text(text) => push_normalized(text, &mut units),
             }),
-            None => push_text(text, &mut units),
+            None => push_normalized(text, &mut units),
         }
         units
     }
@@ -555,14 +567,17 @@ impl NativeEncoder {
     /// point (letters, digits and punctuation stop at the space, a whitespace
     /// run cannot start before it) and the patterns have no lookbehind, so
     /// the pieces of the two halves are the pieces of the whole. `None` when
-    /// the text has no such point past `from`.
+    /// the text has no such point within `PARALLEL_CHUNK_BYTES` past `from`
+    /// (the search is bounded: a text whose candidates all fail stays one
+    /// unit instead of paying a window check per candidate to its end).
     fn stable_cut(&self, text: &str, from: usize) -> Option<usize> {
         if self.stages.is_empty() {
             return None;
         }
         let bytes = text.as_bytes();
+        let limit = from.saturating_add(PARALLEL_CHUNK_BYTES).min(text.len());
         let mut p = from;
-        while p + 1 < text.len() {
+        while p + 1 < limit {
             if bytes[p] == b' '
                 && text[p + 1..]
                     .chars()
@@ -1047,6 +1062,24 @@ mod tests {
                 special: &["<|endoftext|>"],
                 added: &[],
             },
+            // Added tokens with a space inside, matched after normalization
+            // (the default of `add_tokens`): a cut at that space would turn
+            // the token into pieces.
+            Shape {
+                name: "normalized-words",
+                nfc: false,
+                pre_tokenizers: vec![
+                    split(CL100K, SplitDelimiterBehavior::Isolated, false),
+                    byte_level(false),
+                ],
+                ignore_merges: false,
+                special: &["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+                added: &[
+                    ("foo bar", true),
+                    ("### Instruction", true),
+                    ("<tool_call>", false),
+                ],
+            },
         ]
     }
 
@@ -1301,6 +1334,49 @@ mod tests {
                 shape.name
             );
         }
+    }
+
+    /// An added token matched after normalization whose inner space is the
+    /// first cut candidate past the chunk size: it comes out as a unit of its
+    /// own before any cut, so the pooled ids are the one-piece ids.
+    #[test]
+    fn a_normalized_added_token_across_a_cut_stays_whole() {
+        let mut state = 0x0F1E_2D3C_4B5A_6978u64;
+        let shape = shapes()
+            .into_iter()
+            .find(|shape| shape.name == "normalized-words")
+            .expect("the shape");
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let foo_bar = tokenizer.token_to_id("foo bar").expect("the added token");
+        // No candidate before the token (letters only), the token's space as
+        // the first candidate past the chunk size, then text enough for cuts.
+        let mut text = "x".repeat(PARALLEL_CHUNK_BYTES + 5);
+        text.push_str("foo bar");
+        text.push_str(&long_text(&mut state, &[], 3 * PARALLEL_CHUNK_BYTES));
+        let units = native.units(&text, true);
+        assert!(
+            units
+                .iter()
+                .any(|unit| matches!(unit, Segment::Added(id) if *id == foo_bar)),
+            "the added token is a unit of its own ({} units)",
+            units.len()
+        );
+        assert!(units.len() >= 4, "{} units", units.len());
+        let pooled = native
+            .encode_with(tokenizer.get_model(), &text, true)
+            .expect("pooled");
+        let serial = native
+            .encode_with(tokenizer.get_model(), &text, false)
+            .expect("serial");
+        let reference = tokenizer
+            .encode(text.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(pooled, serial, "the pool changed the ids");
+        assert_eq!(pooled, reference, "against the reference");
+        assert!(pooled.contains(&foo_bar), "the token's id is in the ids");
     }
 
     #[test]
