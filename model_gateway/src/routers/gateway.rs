@@ -55,6 +55,53 @@ use crate::{
     worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry},
 };
 
+/// A router family the weighted selection chooses among: its router and the
+/// pools whose workers give it weight. A disaggregated family needs every
+/// one of its legs before it takes any weight; the weight is then the legs'
+/// worker counts summed, so operators migrate traffic between HTTP and gRPC
+/// and between regular and disaggregated workers by moving workers. The
+/// gRPC PD family stands aside while the EPD family has weight: a fleet with
+/// encode workers is served as EPD.
+struct RouterFamily {
+    router: RouterId,
+    legs: &'static [RoutingPool],
+    /// A family whose weight takes this one's place.
+    shadowed_by: Option<RouterId>,
+}
+
+/// The families in the order the weighted pick walks them.
+const ROUTER_FAMILIES: [RouterFamily; 5] = [
+    RouterFamily {
+        router: router_ids::GRPC_EPD,
+        legs: &[
+            RoutingPool::GrpcEncode,
+            RoutingPool::GrpcPrefill,
+            RoutingPool::GrpcDecode,
+        ],
+        shadowed_by: None,
+    },
+    RouterFamily {
+        router: router_ids::GRPC_PD,
+        legs: &[RoutingPool::GrpcPrefill, RoutingPool::GrpcDecode],
+        shadowed_by: Some(router_ids::GRPC_EPD),
+    },
+    RouterFamily {
+        router: router_ids::HTTP_PD,
+        legs: &[RoutingPool::HttpPrefill, RoutingPool::HttpDecode],
+        shadowed_by: None,
+    },
+    RouterFamily {
+        router: router_ids::GRPC_REGULAR,
+        legs: &[RoutingPool::GrpcPipelineRegular],
+        shadowed_by: None,
+    },
+    RouterFamily {
+        router: router_ids::HTTP_REGULAR,
+        legs: &[RoutingPool::HttpRegular],
+        shadowed_by: None,
+    },
+];
+
 pub struct Gateway {
     worker_registry: Arc<WorkerRegistry>,
     /// Copy-on-write: routers are registered at startup and only read per
@@ -187,48 +234,62 @@ impl Gateway {
         self.routers.load().len()
     }
 
-    /// Selects a router by weighting available router types by their worker counts.
-    /// PD routers only receive weight when both prefill and decode workers are
-    /// present on the same protocol; EPD requires encode, prefill, and decode
-    /// workers over gRPC. Incomplete role sets contribute 0.
-    ///
-    /// Weighting the router selection lets operators gradually migrate traffic between
-    /// HTTP / gRPC and regular / prefill-decode disaggregation workers.
+    /// The families' weights for a model, in [`ROUTER_FAMILIES`] order: a
+    /// family's legs' worker counts summed when every leg has workers and
+    /// its router is mounted, else 0; 0 as well for a family that another
+    /// family with weight shadows.
+    fn family_weights(
+        &self,
+        size: impl Fn(RoutingPool) -> usize,
+    ) -> [usize; ROUTER_FAMILIES.len()] {
+        let routers = self.routers.load();
+        let mut weights = [0usize; ROUTER_FAMILIES.len()];
+        for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
+            let shadowed = family.shadowed_by.as_ref().is_some_and(|shadow| {
+                ROUTER_FAMILIES
+                    .iter()
+                    .position(|other| other.router == *shadow)
+                    .is_some_and(|j| weights[j] > 0)
+            });
+            if !shadowed
+                && routers.contains_key(&family.router)
+                && family.legs.iter().all(|pool| size(*pool) > 0)
+            {
+                weights[i] = family.legs.iter().map(|pool| size(*pool)).sum();
+            }
+        }
+        weights
+    }
+
+    /// One router drawn with probability proportional to its family's
+    /// weight, `weights` in [`ROUTER_FAMILIES`] order ([`Self::family_weights`]
+    /// for the model-serving draw; the token-counting and decisions routes
+    /// weigh the families their own way). A family whose router is not
+    /// mounted takes no part; `None` when none has weight.
     fn pick_router_by_weights(
         &self,
-        grpc_epd: usize,
-        grpc_pd: usize,
-        http_pd: usize,
-        grpc_regular: usize,
-        http_regular: usize,
+        weights: &[usize; ROUTER_FAMILIES.len()],
     ) -> Option<Arc<dyn RouterTrait>> {
-        let options: [(usize, &RouterId); 5] = [
-            (grpc_epd, &router_ids::GRPC_EPD),
-            (grpc_pd, &router_ids::GRPC_PD),
-            (http_pd, &router_ids::HTTP_PD),
-            (grpc_regular, &router_ids::GRPC_REGULAR),
-            (http_regular, &router_ids::HTTP_REGULAR),
-        ];
-
         let routers = self.routers.load();
-        let total: usize = options
+        let mounted = |family: &RouterFamily| routers.contains_key(&family.router);
+        let total: usize = ROUTER_FAMILIES
             .iter()
-            .filter(|(weight, router_id)| *weight > 0 && routers.contains_key(*router_id))
-            .map(|(weight, _)| *weight)
+            .zip(weights)
+            .filter(|(family, weight)| **weight > 0 && mounted(family))
+            .map(|(_, weight)| *weight)
             .sum();
         if total == 0 {
             return None;
         }
-
         let pick = ((rand::random::<f64>() * total as f64) as usize).min(total - 1);
         let mut cum = 0usize;
-        for (weight, router_id) in &options {
-            if *weight == 0 || !routers.contains_key(*router_id) {
+        for (family, weight) in ROUTER_FAMILIES.iter().zip(weights) {
+            if *weight == 0 || !mounted(family) {
                 continue;
             }
             cum += weight;
             if pick < cum {
-                return routers.get(*router_id).cloned();
+                return routers.get(&family.router).cloned();
             }
         }
         None
@@ -265,42 +326,14 @@ impl Gateway {
             }
         }
         let size = |pool: RoutingPool| snapshot.pool(pool).len();
-        let grpc_encode = size(RoutingPool::GrpcEncode);
-        let grpc_prefill = size(RoutingPool::GrpcPrefill);
-        let grpc_decode = size(RoutingPool::GrpcDecode);
-        let http_prefill = size(RoutingPool::HttpPrefill);
-        let http_decode = size(RoutingPool::HttpDecode);
-        let grpc_regular = size(RoutingPool::GrpcPipelineRegular);
-        let http_regular = size(RoutingPool::HttpRegular);
-
-        let grpc_epd_ready = grpc_encode > 0
-            && grpc_prefill > 0
-            && grpc_decode > 0
-            && self.routers.load().contains_key(&router_ids::GRPC_EPD);
-        let grpc_epd = if grpc_epd_ready {
-            grpc_encode + grpc_prefill + grpc_decode
-        } else {
-            0
-        };
-        // A disaggregated family needs both legs before it takes any weight.
-        let grpc_pd = if !grpc_epd_ready && grpc_prefill > 0 && grpc_decode > 0 {
-            grpc_prefill + grpc_decode
-        } else {
-            0
-        };
-        let http_pd = if http_prefill > 0 && http_decode > 0 {
-            http_prefill + http_decode
-        } else {
-            0
-        };
-        self.pick_router_by_weights(grpc_epd, grpc_pd, http_pd, grpc_regular, http_regular)
-            .or_else(|| {
-                self.incomplete_disaggregated_router(
-                    grpc_encode,
-                    grpc_prefill + grpc_decode,
-                    http_prefill + http_decode,
-                )
-            })
+        let weights = self.family_weights(size);
+        self.pick_router_by_weights(&weights).or_else(|| {
+            self.incomplete_disaggregated_router(
+                size(RoutingPool::GrpcEncode),
+                size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
+                size(RoutingPool::HttpPrefill) + size(RoutingPool::HttpDecode),
+            )
+        })
     }
 
     /// The router for a model whose only workers are the legs of a
@@ -361,13 +394,13 @@ impl Gateway {
         }
         let size = |pool| snapshot.pool(pool).len();
         let grpc_prefill = size(RoutingPool::GrpcPrefill);
-        self.pick_router_by_weights(
+        self.pick_router_by_weights(&[
             grpc_prefill,
             grpc_prefill,
             0,
             size(RoutingPool::GrpcPipelineRegular),
             0,
-        )
+        ])
         .or_else(|| self.select_router_for_request(Some(model_id)))
     }
 
@@ -577,13 +610,13 @@ impl RouterTrait for Gateway {
                 // its prefill leg alone, whichever gRPC family is mounted.
                 let size = |pool| snapshot.pool(pool).len();
                 let grpc_prefill = size(RoutingPool::GrpcPrefill);
-                self.pick_router_by_weights(
+                self.pick_router_by_weights(&[
                     grpc_prefill,
                     grpc_prefill,
                     size(RoutingPool::HttpPrefill),
                     size(RoutingPool::GrpcPipelineRegular),
                     size(RoutingPool::HttpRegular),
-                )
+                ])
                 // A model no pool serves goes to the default router, like
                 // every other route, so the answer is its model_not_found.
                 .or_else(|| self.select_router_for_request(Some(model_id)))
@@ -724,7 +757,7 @@ impl RouterTrait for Gateway {
                     "Decisions requires a regular HTTP or SGLang gRPC worker for this model",
                 );
             }
-            self.pick_router_by_weights(0, 0, 0, grpc, http)
+            self.pick_router_by_weights(&[0, 0, 0, grpc, http])
         } else {
             self.select_router_for_request(Some(model_id))
         };
