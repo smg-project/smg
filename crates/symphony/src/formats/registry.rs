@@ -180,7 +180,8 @@ impl Table {
 struct Group {
     /// The primary's Hugging Face id, the organisation and the repository name.
     model: &'static str,
-    /// The group's other checkpoints, by repository name, under the primary's organisation.
+    /// The group's other checkpoints: by repository name under the primary's organisation, by
+    /// full id under another.
     also: &'static [&'static str],
     /// The table that reads the group's output.
     table: Table,
@@ -192,7 +193,7 @@ struct Group {
 impl Group {
     /// The group's checkpoints, by repository name: the primary first.
     fn repositories(&self) -> impl Iterator<Item = &'static str> {
-        std::iter::once(repository(self.model)).chain(self.also.iter().copied())
+        std::iter::once(repository(self.model)).chain(self.also.iter().map(|also| repository(also)))
     }
 
     /// Whether `repository` names one of the group's checkpoints, in any case.
@@ -212,9 +213,101 @@ fn repository(model: &str) -> &str {
 /// Every group whose table is on main, in bellwether's slug order.
 const GROUPS: &[Group] = &[
     Group {
-        model: "ai21labs/AI21-Jamba2-3B",
+        model: "openbmb/AgentCPM-Explore",
         also: &[],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "ai21labs/AI21-Jamba-Reasoning-3B",
+        also: &[],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "ai21labs/AI21-Jamba2-3B",
+        also: &["AI21-Jamba2-Mini"],
         table: Table::Qwen2_5,
+        opener: None,
+    },
+    Group {
+        model: "BAAI/AREX-2",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "BAAI/AREX-Base",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "BAAI/AREX-Turbo",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "allenai/AstaBrief_8B",
+        also: &["AstaBrief_8B_SFT"],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "internlm/Atria-Dawn-Preview",
+        also: &["Atria-Dawn-Preview-Ascend-w8a8"],
+        table: Table::Glm,
+        opener: None,
+    },
+    Group {
+        model: "baichuan-inc/Baichuan-M3-235B",
+        also: &[],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "internlm/CapRL-Qwen3VL-4B",
+        also: &["CapRL-Qwen3VL-2B"],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "internlm/CapRL-Video-4B",
+        also: &["inclusionAI/ArmorOCR"],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "tencent/ContextPilot-14B",
+        also: &[
+            "ByteDance-Seed/cudaLLM-8B",
+            "FreedomIntelligence/HuatuoGPT-3-32B",
+            "nvidia/Nemotron-Terminal-14B",
+            "nvidia/Nemotron-Terminal-32B",
+            "nvidia/Nemotron-Terminal-8B",
+            "OpenMOSS-Team/Qwen3-32B-ABC",
+            "ContextPilot-8B",
+        ],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/Cosmos3-Edge",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/Cosmos3-Edge-Policy-DROID",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "LiquidAI/d1-3B",
+        also: &[],
+        table: Table::Lfm2_5,
         opener: None,
     },
     Group {
@@ -230,26 +323,92 @@ const GROUPS: &[Group] = &[
         opener: None,
     },
     Group {
-        model: "google/gemma-4-E4B-it",
+        model: "tiiuae/Falcon-H1-Tiny-90M-Instruct",
+        also: &["Falcon-H1-Tiny-90M-Instruct-Curriculum"],
+        table: Table::Qwen2_5,
+        opener: None,
+    },
+    Group {
+        model: "tiiuae/Falcon-H1R-7B",
         also: &[],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "google/gemma-4-E4B-it",
+        also: &["gemma-4-E2B-it"],
         table: Table::Gemma4,
         opener: None,
     },
     Group {
-        model: "zai-org/GLM-4.6",
+        model: "zai-org/GLM-4.5V",
         also: &[],
         table: Table::Glm4,
         opener: None,
     },
     Group {
-        model: "zai-org/GLM-5.3-Flash",
+        model: "zai-org/GLM-4.6",
+        also: &["GLM-4.5", "GLM-4.5-Air"],
+        table: Table::Glm4,
+        opener: None,
+    },
+    Group {
+        model: "zai-org/GLM-4.6V",
+        also: &[],
+        table: Table::Glm4,
+        opener: None,
+    },
+    Group {
+        model: "zai-org/GLM-4.6V-Flash",
+        also: &[],
+        table: Table::Glm4,
+        opener: None,
+    },
+    Group {
+        model: "zai-org/GLM-4.7",
         also: &[],
         table: Table::Glm,
         opener: None,
     },
     Group {
-        model: "ibm-granite/granite-4.1-3b",
+        model: "zai-org/GLM-4.7-Flash",
         also: &[],
+        table: Table::Glm,
+        opener: None,
+    },
+    Group {
+        model: "zai-org/GLM-5",
+        also: &[],
+        table: Table::Glm,
+        opener: None,
+    },
+    Group {
+        model: "zai-org/GLM-5.1",
+        also: &[],
+        table: Table::Glm,
+        opener: None,
+    },
+    Group {
+        model: "zai-org/GLM-5.2",
+        also: &[],
+        table: Table::Glm,
+        opener: None,
+    },
+    Group {
+        model: "zai-org/GLM-5.3",
+        also: &["GLM-5.3-BF16"],
+        table: Table::Glm,
+        opener: None,
+    },
+    Group {
+        model: "zai-org/GLM-5.3-Flash",
+        also: &["GLM-5.3-Flash-BF16"],
+        table: Table::Glm,
+        opener: None,
+    },
+    Group {
+        model: "ibm-granite/granite-4.1-3b",
+        also: &["granite-4.1-30b"],
         table: Table::Qwen2_5,
         opener: Some("<|start_of_role|>assistant<|end_of_role|>"),
     },
@@ -267,7 +426,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "thinkingmachines/Inkling",
-        also: &[],
+        also: &["Inkling-Small"],
         table: Table::Inkling,
         opener: None,
     },
@@ -285,7 +444,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "IFM/K2-Horizon-36B",
-        also: &[],
+        also: &["K2-Horizon-32B", "K2-Horizon-375B-A23B"],
         table: Table::K2Horizon,
         opener: None,
     },
@@ -303,13 +462,13 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "LiquidAI/LFM2.5-1.2B-Instruct",
-        also: &[],
+        also: &["LFM2.5-1.2B-Thinking"],
         table: Table::Lfm2_5,
         opener: None,
     },
     Group {
         model: "inclusionAI/Ling-3.0-flash",
-        also: &[],
+        also: &["Ling-3.0-flash-fp4"],
         table: Table::Ling,
         opener: None,
     },
@@ -321,7 +480,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "XiaomiMiMo/MiMo-V2.5",
-        also: &[],
+        also: &["MiMo-V2.5-Base"],
         table: Table::Qwen3TaggedDirect,
         opener: None,
     },
@@ -333,6 +492,12 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "MiniMaxAI/MiniMax-M2",
+        also: &[],
+        table: Table::MinimaxM2,
+        opener: None,
+    },
+    Group {
+        model: "MiniMaxAI/MiniMax-M2.5",
         also: &[],
         table: Table::MinimaxM2,
         opener: None,
@@ -356,7 +521,80 @@ const GROUPS: &[Group] = &[
         opener: None,
     },
     Group {
+        model: "nvidia/Nemotron-Cascade-14B-Thinking",
+        also: &["Nemotron-Cascade-8B", "Nemotron-Cascade-8B-Thinking"],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/Nemotron-Cascade-2-30B-A3B",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/Nemotron-Orchestrator-8B",
+        also: &["IQuestLab/Fleming-R1-32B"],
+        table: Table::Qwen3,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/Nemotron-Research-GooseReason-4B-Instruct",
+        also: &[
+            "OpenMOSS-Team/SciJudge-4B",
+            "OpenMOSS-Team/SciJudge-4B-2605",
+        ],
+        table: Table::Qwen2_5,
+        opener: None,
+    },
+    Group {
         model: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+        also: &[
+            "Nemotron-3-Labs-Ultra-Math-SFT",
+            "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+        ],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16",
+        also: &[
+            "Nemotron-3-Labs-Ultra-Math-RL",
+            "NVIDIA-Nemotron-Labs-Teacher-Chat",
+            "NVIDIA-Nemotron-Labs-Teacher-Competition-Coding",
+            "NVIDIA-Nemotron-Labs-Teacher-General-Reasoning",
+            "NVIDIA-Nemotron-Labs-Teacher-Instruction-Following",
+            "NVIDIA-Nemotron-Labs-Teacher-STEM",
+        ],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/NVIDIA-Nemotron-Labs-3-Elastic-30B-A3B-BF16",
+        also: &[],
+        table: Table::Qwen3Tagged,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-BF16",
         also: &[],
         table: Table::Qwen3Tagged,
         opener: None,
@@ -365,6 +603,19 @@ const GROUPS: &[Group] = &[
         model: "allenai/Olmo-3-7B-Instruct",
         also: &[],
         table: Table::Olmo3,
+        opener: None,
+    },
+    Group {
+        model: "nvidia/OpenCodeReasoning-Nemotron-7B",
+        also: &[
+            "OpenCodeReasoning-Nemotron-1.1-14B",
+            "OpenCodeReasoning-Nemotron-1.1-32B",
+            "OpenCodeReasoning-Nemotron-1.1-7B",
+            "OpenCodeReasoning-Nemotron-14B",
+            "OpenCodeReasoning-Nemotron-32B",
+            "OpenCodeReasoning-Nemotron-32B-IOI",
+        ],
+        table: Table::Qwen2_5,
         opener: None,
     },
     Group {
@@ -405,7 +656,12 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "Qwen/Qwen2.5-VL-7B-Instruct",
-        also: &["Qwen2.5-VL-3B-Instruct", "Qwen2.5-VL-72B-Instruct"],
+        also: &[
+            "allenai/olmOCR-7B-0725",
+            "allenai/olmOCR-7B-0825",
+            "Qwen2.5-VL-3B-Instruct",
+            "Qwen2.5-VL-72B-Instruct",
+        ],
         table: Table::Qwen2_5,
         opener: None,
     },
@@ -423,7 +679,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "Qwen/Qwen3-30B-A3B-Thinking-2507",
-        also: &["Qwen3-235B-A22B-Thinking-2507"],
+        also: &["NousResearch/nomos-1", "Qwen3-235B-A22B-Thinking-2507"],
         table: Table::Qwen3,
         opener: None,
     },
@@ -448,11 +704,12 @@ const GROUPS: &[Group] = &[
     Group {
         model: "Qwen/Qwen3-8B",
         also: &[
+            "NousResearch/NousCoder-14B",
             "Qwen3-0.6B",
             "Qwen3-1.7B",
-            "Qwen3-4B",
             "Qwen3-14B",
             "Qwen3-32B",
+            "Qwen3-4B",
         ],
         table: Table::Qwen3,
         opener: None,
@@ -465,7 +722,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "Qwen/Qwen3-Coder-Next",
-        also: &[],
+        also: &["Qwen3-Coder-Next-Base"],
         table: Table::Qwen3Tagged,
         opener: None,
     },
@@ -508,9 +765,15 @@ const GROUPS: &[Group] = &[
     Group {
         model: "Qwen/Qwen3-VL-8B-Instruct",
         also: &[
+            "BAAI/RoboBrain2.5-4B",
+            "lightonai/OriOn-Qwen",
+            "lightonai/OriOn-Qwen-SR1",
+            "nvidia/Cosmos-Reason2-32B",
             "Qwen3-VL-2B-Instruct",
-            "Qwen3-VL-4B-Instruct",
             "Qwen3-VL-32B-Instruct",
+            "Qwen3-VL-4B-Instruct",
+            "tencent/WeVisDoc-2B",
+            "tencent/WeVisDoc-4B",
         ],
         table: Table::Qwen3,
         opener: None,
@@ -519,8 +782,8 @@ const GROUPS: &[Group] = &[
         model: "Qwen/Qwen3-VL-8B-Thinking",
         also: &[
             "Qwen3-VL-2B-Thinking",
-            "Qwen3-VL-4B-Thinking",
             "Qwen3-VL-32B-Thinking",
+            "Qwen3-VL-4B-Thinking",
         ],
         table: Table::Qwen3,
         opener: None,
@@ -533,19 +796,24 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "Qwen/Qwen3.5-2B",
-        also: &["Qwen3.5-0.8B"],
+        also: &["ATH-MaaS/OvisOCR2", "Qwen3.5-0.8B"],
         table: Table::Qwen3Tagged,
         opener: None,
     },
     Group {
         model: "Qwen/Qwen3.5-35B-A3B",
-        also: &["Qwen3.5-122B-A10B", "Qwen3.5-397B-A17B"],
+        also: &[
+            "Qwen3.5-122B-A10B",
+            "Qwen3.5-397B-A17B",
+            "xlangai/Qwen-CUA",
+            "xlangai/RoboFine-VLM-397B-A17B",
+        ],
         table: Table::Qwen3Tagged,
         opener: None,
     },
     Group {
         model: "Qwen/Qwen3.5-9B",
-        also: &["Qwen3.5-4B"],
+        also: &["microsoft/FrogNano-4B-2609", "Qwen3.5-4B"],
         table: Table::Qwen3Tagged,
         opener: None,
     },
@@ -569,7 +837,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "Qwen/Qwen3.8-27B",
-        also: &[],
+        also: &["JetBrains/Qwen3.8-3.6-27B-blend"],
         table: Table::Qwen3Tagged,
         opener: None,
     },
@@ -581,7 +849,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         model: "ByteDance-Seed/Seed-OSS-36B-Instruct",
-        also: &[],
+        also: &["Seed-OSS-36B-Base-woSyn"],
         table: Table::SeedOss,
         opener: None,
     },
