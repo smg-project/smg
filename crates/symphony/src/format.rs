@@ -251,16 +251,8 @@ pub struct Format {
     /// The state a turn starts in when it does not start with a terminal.
     start: Option<usize>,
     structural_tokens: Vec<String>,
-    /// The arguments states whose call the stream's stop closes.
-    stop_closes: Vec<usize>,
     /// The texts of the tokens the engine stops on that are terminals.
     stop_tokens: Vec<String>,
-    /// The states whose text the template discards.
-    framing: Vec<usize>,
-    /// The states whose stays are trimmed.
-    trimmed: Vec<usize>,
-    /// The states whose stays are joined, each with its joiner.
-    joiners: Vec<(usize, String)>,
     /// How a shaped call's values read.
     values: Values,
     thinks_first: bool,
@@ -284,6 +276,14 @@ struct Terminal {
 struct State {
     name: String,
     emits: Emits,
+    /// The template discards the state's text (the framing row).
+    framing: bool,
+    /// The state's text is trimmed stay by stay (the trim row).
+    trimmed: bool,
+    /// The text that joins the state's stays (the join row).
+    joiner: Option<String>,
+    /// The stream's stop closes the call open in the state (the stop row).
+    closes_at_stop: bool,
 }
 
 /// What the replay of a prompt leaves ([`Format::replayed`]): the state the output starts in,
@@ -341,11 +341,7 @@ impl Format {
             anchors: Vec::new(),
             start: None,
             structural_tokens: Vec::new(),
-            stop_closes: Vec::new(),
             stop_tokens: Vec::new(),
-            framing: Vec::new(),
-            trimmed: Vec::new(),
-            joiners: Vec::new(),
             values: Values::inferred(),
             thinks_first: false,
             marker_tokens: Vec::new(),
@@ -397,6 +393,10 @@ impl Format {
         self.states.push(State {
             name: name.to_string(),
             emits,
+            framing: false,
+            trimmed: false,
+            joiner: None,
+            closes_at_stop: false,
         });
         self
     }
@@ -430,7 +430,7 @@ impl Format {
     #[must_use]
     pub fn closes_at_stop(mut self, state: &str) -> Self {
         let state = self.state_named(state);
-        self.stop_closes.push(state);
+        self.states[state].closes_at_stop = true;
         self
     }
 
@@ -440,9 +440,7 @@ impl Format {
     #[must_use]
     pub fn framing(mut self, state: &str) -> Self {
         let state = self.state_named(state);
-        if !self.framing.contains(&state) {
-            self.framing.push(state);
-        }
+        self.states[state].framing = true;
         self
     }
 
@@ -452,9 +450,7 @@ impl Format {
     #[must_use]
     pub fn trims(mut self, state: &str) -> Self {
         let state = self.state_named(state);
-        if !self.trimmed.contains(&state) {
-            self.trimmed.push(state);
-        }
+        self.states[state].trimmed = true;
         self
     }
 
@@ -464,8 +460,7 @@ impl Format {
     #[must_use]
     pub fn joins(mut self, state: &str, text: &str) -> Self {
         let state = self.state_named(state);
-        self.joiners.retain(|&(joined, _)| joined != state);
-        self.joiners.push((state, text.to_string()));
+        self.states[state].joiner = Some(text.to_string());
         self
     }
 
@@ -686,9 +681,9 @@ impl Format {
         for (index, state) in self.states.iter_mut().enumerate() {
             if demoted[index] {
                 state.emits = Emits::Content;
+                state.closes_at_stop = false;
             }
         }
-        self.stop_closes.retain(|&index| !demoted[index]);
         self.calls = None;
         self.layout = None;
         self
@@ -1007,25 +1002,45 @@ impl Format {
 
     /// Whether the stream's stop closes the call in state `index`.
     pub(crate) fn stop_closes(&self, index: usize) -> bool {
-        self.stop_closes.contains(&index)
+        self.states[index].closes_at_stop
     }
 
     /// Whether the template discards the text in state `index`.
     pub(crate) fn is_framing(&self, index: usize) -> bool {
-        self.framing.contains(&index)
+        self.states[index].framing
     }
 
     /// Whether the text of state `index` is trimmed stay by stay.
     pub(crate) fn is_trimmed(&self, index: usize) -> bool {
-        self.trimmed.contains(&index)
+        self.states[index].trimmed
     }
 
     /// The text that joins the stays of state `index`, if the table names one.
     pub(crate) fn joiner(&self, index: usize) -> Option<&str> {
-        self.joiners
+        self.states[index].joiner.as_deref()
+    }
+
+    /// Why the first state with the row `has` names cannot have its text trimmed or joined, when
+    /// one cannot: the text is a call's or a wrapper's, or the template discards it.
+    fn text_row_misfit(&self, row: &str, has: impl Fn(&State) -> bool) -> Option<String> {
+        self.states
             .iter()
-            .find(|&&(state, _)| state == index)
-            .map(|(_, text)| text.as_str())
+            .filter(|state| has(state))
+            .find_map(|state| {
+                if matches!(state.emits, Emits::Arguments | Emits::Wrapper) {
+                    Some(format!(
+                        "format {}: state {:?} is {row}, but it emits {:?}",
+                        self.name, state.name, state.emits
+                    ))
+                } else if state.framing {
+                    Some(format!(
+                        "format {}: state {:?} is {row}, but its text is framing",
+                        self.name, state.name
+                    ))
+                } else {
+                    None
+                }
+            })
     }
 
     /// What every table must hold before an engine runs it: a state to start in, which does not
@@ -1100,43 +1115,28 @@ impl Format {
             }
         }
         if let Some(state) = self
-            .stop_closes
+            .states
             .iter()
-            .map(|&index| &self.states[index])
-            .find(|state| state.emits != Emits::Arguments)
+            .find(|state| state.closes_at_stop && state.emits != Emits::Arguments)
         {
             return Err(format!(
                 "format {}: a stop closes state {:?}, which holds no call",
                 self.name, state.name
             ));
         }
-        if let Some(state) = self
-            .framing
-            .iter()
-            .map(|&index| &self.states[index])
-            .find(|state| matches!(state.emits, Emits::Reasoning | Emits::Arguments))
-        {
+        if let Some(state) = self.states.iter().find(|state| {
+            state.framing && matches!(state.emits, Emits::Reasoning | Emits::Arguments)
+        }) {
             return Err(format!(
                 "format {}: state {:?} is framing, but it emits {:?}",
                 self.name, state.name, state.emits
             ));
         }
-        let trimmed = self.trimmed.iter().map(|&index| (index, "trimmed"));
-        let joined = self.joiners.iter().map(|&(index, _)| (index, "joined"));
-        for (index, row) in trimmed.chain(joined) {
-            let state = &self.states[index];
-            if matches!(state.emits, Emits::Arguments | Emits::Wrapper) {
-                return Err(format!(
-                    "format {}: state {:?} is {row}, but it emits {:?}",
-                    self.name, state.name, state.emits
-                ));
-            }
-            if self.is_framing(index) {
-                return Err(format!(
-                    "format {}: state {:?} is {row}, but its text is framing",
-                    self.name, state.name
-                ));
-            }
+        if let Some(why) = self
+            .text_row_misfit("trimmed", |state| state.trimmed)
+            .or_else(|| self.text_row_misfit("joined", |state| state.joiner.is_some()))
+        {
+            return Err(why);
         }
         if self.thinks_first
             && !self
@@ -1426,6 +1426,10 @@ mod tests {
             "an answer \n<tool_call>\n{}\n</tool_call>",
         ));
         assert_eq!(content, "an answer<tool_call>\n{}\n</tool_call>");
+        // A stop that closed the call closes nothing once the call is content.
+        let stopped = with_calls().closes_at_stop("calls").without_calls();
+        assert!(stopped.validate().is_ok());
+        assert!(!stopped.stop_closes(2));
         // A table whose output starts in its calls is content from its first byte.
         let alone = Format::new("j")
             .state("calls", Emits::Arguments)
@@ -1795,7 +1799,10 @@ mod tests {
             .framing("outside")
             .framing("between")
             .framing("outside");
-        assert_eq!(format.framing, [0, 1], "a state named twice is kept once");
+        let framed: Vec<usize> = (0..format.states())
+            .filter(|&s| format.is_framing(s))
+            .collect();
+        assert_eq!(framed, [0, 1], "a state named twice is kept once");
         assert!(format.is_framing(0));
         assert!(format.is_framing(1));
         assert!(!format.is_framing(2));
@@ -1832,7 +1839,10 @@ mod tests {
             .trims("content")
             .trims("thought")
             .trims("content");
-        assert_eq!(format.trimmed, [0, 1], "a state named twice is kept once");
+        let trimmed: Vec<usize> = (0..format.states())
+            .filter(|&s| format.is_trimmed(s))
+            .collect();
+        assert_eq!(trimmed, [0, 1], "a state named twice is kept once");
         assert!(format.is_trimmed(0) && format.is_trimmed(1) && !format.is_trimmed(2));
         assert!(format.validate().is_ok());
         assert_eq!(
