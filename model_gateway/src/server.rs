@@ -988,16 +988,51 @@ async fn v1_tokenizers_remove(
 /// sizes a heavier deployment explicitly.
 pub const DEFAULT_RUNTIME_WORKER_THREADS_CAP: usize = 8;
 
-/// The async runtime's worker-thread count: the explicit setting when there is
-/// one (the validator refuses 0), else the available parallelism (the
-/// container's CPU quota on Rust 1.95+) capped at
-/// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], and never below 1.
-pub fn runtime_worker_threads(explicit: Option<usize>) -> usize {
-    explicit.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map_or(DEFAULT_RUNTIME_WORKER_THREADS_CAP, |n| n.get())
-            .clamp(1, DEFAULT_RUNTIME_WORKER_THREADS_CAP)
-    })
+/// The environment variable tokio reads for its worker count when a builder
+/// leaves it unset; a runtime built by [`runtime_worker_threads`] always sets
+/// the count, so the variable is read here instead, with the same meaning.
+pub const TOKIO_WORKER_THREADS: &str = "TOKIO_WORKER_THREADS";
+
+/// The async runtime's worker-thread count, in this order: the explicit
+/// setting when there is one (the validator refuses 0), then
+/// `TOKIO_WORKER_THREADS` as tokio reads it (a positive integer; anything
+/// else is a configuration error naming the variable, where tokio would
+/// refuse to start), then the gateway's budget: the available parallelism
+/// (the container's CPU quota on Rust 1.95+) capped at
+/// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], never below 1, and the cap when
+/// the parallelism cannot be read.
+pub fn runtime_worker_threads(explicit: Option<usize>) -> Result<usize, String> {
+    let env_setting = std::env::var(TOKIO_WORKER_THREADS).ok();
+    runtime_worker_threads_from(
+        explicit,
+        env_setting.as_deref(),
+        std::thread::available_parallelism().ok(),
+    )
+}
+
+/// The rule behind [`runtime_worker_threads`], over the values it reads.
+fn runtime_worker_threads_from(
+    explicit: Option<usize>,
+    env_setting: Option<&str>,
+    parallelism: Option<std::num::NonZeroUsize>,
+) -> Result<usize, String> {
+    if let Some(count) = explicit {
+        return Ok(count);
+    }
+    if let Some(value) = env_setting {
+        return match value.parse::<usize>() {
+            Ok(count) if count >= 1 => Ok(count),
+            _ => Err(format!(
+                "{TOKIO_WORKER_THREADS}={value:?} is not a positive integer"
+            )),
+        };
+    }
+    Ok(parallelism
+        .map_or(
+            DEFAULT_RUNTIME_WORKER_THREADS_CAP,
+            std::num::NonZeroUsize::get,
+        )
+        .clamp(1, DEFAULT_RUNTIME_WORKER_THREADS_CAP))
 }
 
 pub struct ServerConfig {
@@ -1625,6 +1660,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     info!(
         worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
         pinned = config.runtime_worker_threads.is_some(),
+        tokio_worker_threads_env = std::env::var(TOKIO_WORKER_THREADS).is_ok(),
         "Tokio runtime sized"
     );
     // A pinned count well above the CPUs available to the process is the
@@ -2630,27 +2666,6 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 
 #[cfg(test)]
 mod tests {
-    /// The runtime follows the gateway's budget, not the container's quota:
-    /// unset, the worker count is the available parallelism capped at
-    /// `DEFAULT_RUNTIME_WORKER_THREADS_CAP` and never below 1; an explicit
-    /// `--runtime-worker-threads` wins, above the cap included.
-    #[test]
-    fn the_runtime_size_follows_the_gateway_budget_unless_pinned() {
-        let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let default = runtime_worker_threads(None);
-        assert_eq!(
-            default,
-            parallelism.clamp(1, DEFAULT_RUNTIME_WORKER_THREADS_CAP)
-        );
-        assert!((1..=DEFAULT_RUNTIME_WORKER_THREADS_CAP).contains(&default));
-        assert_eq!(runtime_worker_threads(Some(1)), 1);
-        assert_eq!(runtime_worker_threads(Some(3)), 3);
-        assert_eq!(
-            runtime_worker_threads(Some(DEFAULT_RUNTIME_WORKER_THREADS_CAP * 4)),
-            DEFAULT_RUNTIME_WORKER_THREADS_CAP * 4
-        );
-    }
-
     use std::convert::Infallible;
 
     use axum::response::sse::{Event, Sse};
@@ -2659,6 +2674,49 @@ mod tests {
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
+
+    /// The runtime follows the gateway's budget, not the container's quota:
+    /// unset and without `TOKIO_WORKER_THREADS`, the worker count is the
+    /// available parallelism capped at `DEFAULT_RUNTIME_WORKER_THREADS_CAP`,
+    /// never below 1, and the cap when the parallelism cannot be read; the
+    /// variable, as tokio reads it, comes before the budget; an explicit
+    /// `--runtime-worker-threads` comes first, above the cap included.
+    #[test]
+    fn the_runtime_size_follows_the_gateway_budget_unless_pinned() {
+        let cap = DEFAULT_RUNTIME_WORKER_THREADS_CAP;
+        let cores = |n: usize| std::num::NonZeroUsize::new(n);
+        assert_eq!(runtime_worker_threads_from(None, None, cores(16)), Ok(cap));
+        assert_eq!(runtime_worker_threads_from(None, None, cores(cap)), Ok(cap));
+        assert_eq!(runtime_worker_threads_from(None, None, cores(2)), Ok(2));
+        assert_eq!(runtime_worker_threads_from(None, None, cores(1)), Ok(1));
+        assert_eq!(runtime_worker_threads_from(None, None, None), Ok(cap));
+        assert_eq!(
+            runtime_worker_threads_from(None, Some("12"), cores(2)),
+            Ok(12)
+        );
+        assert_eq!(
+            runtime_worker_threads_from(None, Some("1"), cores(16)),
+            Ok(1)
+        );
+        assert_eq!(
+            runtime_worker_threads_from(Some(3), Some("12"), cores(16)),
+            Ok(3)
+        );
+        assert_eq!(
+            runtime_worker_threads_from(Some(cap * 4), None, cores(2)),
+            Ok(cap * 4)
+        );
+        for bad in ["0", "-1", "eight", "8 ", ""] {
+            let err = runtime_worker_threads_from(None, Some(bad), cores(16)).unwrap_err();
+            assert!(
+                err.contains(TOKIO_WORKER_THREADS) && err.contains(bad),
+                "{bad:?}: {err}"
+            );
+        }
+        // The reading wrapper: an explicit count needs neither the variable
+        // nor the parallelism.
+        assert_eq!(runtime_worker_threads(Some(5)), Ok(5));
+    }
 
     /// A request without `anthropic-version` is served (this gateway's own
     /// SDK clients send none); a version that is not a real calendar date of

@@ -1956,12 +1956,13 @@ impl Router {
             .transpose()?;
 
         // Sized as the CLI sizes its runtime: an explicit count when one is
-        // given (the validation above refused 0), else the gateway's budget,
-        // not the container's quota.
+        // given (the validation above refused 0), else `TOKIO_WORKER_THREADS`
+        // when set, else the gateway's budget rather than the container's
+        // quota.
+        let worker_threads = server::runtime_worker_threads(self.runtime_worker_threads)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(server::runtime_worker_threads(
-                self.runtime_worker_threads,
-            ))
+            .worker_threads(worker_threads)
             .enable_all()
             .build()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
