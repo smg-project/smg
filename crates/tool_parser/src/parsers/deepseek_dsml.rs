@@ -892,12 +892,14 @@ impl ToolParser for DeepSeekDsmlParser {
 
     fn take_unstreamed_normal_text(&mut self) -> String {
         // V4.1 holds back a suffix that could still become the separator plus
-        // a tool opener; V3.2/V4 hold `<`/`</` prefixes and, once the DSML
-        // sentinel has arrived, everything from it on. At end of stream the
-        // held text is content when no tool syntax ever started, and is
-        // dropped otherwise: a truncated opener or invoke is not content (the
-        // remaining arguments of a truncated invoke come from
-        // `get_unstreamed_tool_args`).
+        // a tool opener; V3.2/V4 hold a suffix that could still become an
+        // opener's sentinel, an end tag or the EOS marker (with the whitespace
+        // before it, see `held_suffix_len`) and, once the DSML sentinel has
+        // arrived, everything from it on. At end of stream the held text is
+        // content when no tool syntax ever started (the trailing whitespace of
+        // a plain stream comes back here), and is dropped otherwise: a
+        // truncated opener or invoke is not content (the remaining arguments
+        // of a truncated invoke come from `get_unstreamed_tool_args`).
         if self.in_tool_section || self.buffer.contains(DSML_OPEN) {
             self.buffer.clear();
             return String::new();

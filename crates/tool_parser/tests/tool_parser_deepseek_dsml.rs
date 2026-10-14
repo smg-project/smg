@@ -680,7 +680,7 @@ async fn test_deepseek_dsml_v4_streaming_bpe_chunked_opener() {
 }
 
 /// Same BPE-chunking scenario for V3.2 (block name `function_calls`).
-/// The bug is identical across variants — the `has_dsml` check is the same
+/// The bug is identical across variants: the opener detection is the same
 /// code path for both.
 #[tokio::test]
 async fn test_deepseek_dsml_v32_streaming_bpe_chunked_opener() {
