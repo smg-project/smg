@@ -103,3 +103,5 @@ harness = false
 [[bench]]
 name = "parallel_encode"
 harness = false
+# Needs PARALLEL_BENCH_TOKENIZERS: selected explicitly (`--bench parallel_encode`).
+bench = false
