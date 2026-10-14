@@ -118,6 +118,7 @@ fn the_l1_prefix_cache_matches_the_plain_encode_on_render_prompts() {
         }
         vocabularies += 1;
         let (mut compared_here, mut mismatched_here) = (0usize, 0usize);
+        let mut mismatched_with = [0usize; 2];
         for add_special_tokens in [false, true] {
             let cached = CachedTokenizer::new(
                 Arc::clone(&inner),
@@ -140,6 +141,7 @@ fn the_l1_prefix_cache_matches_the_plain_encode_on_render_prompts() {
                     };
                     if !same {
                         mismatched_here += 1;
+                        mismatched_with[usize::from(add_special_tokens)] += 1;
                         if mismatched_here <= 3 {
                             let (w, g) = (
                                 want.as_ref().map(|e| e.token_ids().len()).unwrap_or(0),
@@ -160,8 +162,10 @@ fn the_l1_prefix_cache_matches_the_plain_encode_on_render_prompts() {
         compared += compared_here;
         mismatches += mismatched_here;
         println!(
-            "L1-PARITY {name}: prompts {} compared {compared_here} mismatches {mismatched_here}",
-            texts.len()
+            "L1-PARITY {name}: prompts {} compared {compared_here} mismatches {mismatched_here} (add_special_tokens=false {}, true {})",
+            texts.len(),
+            mismatched_with[0],
+            mismatched_with[1]
         );
     }
     println!(

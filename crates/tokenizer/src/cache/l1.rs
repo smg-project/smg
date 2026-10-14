@@ -334,6 +334,58 @@ struct CachedPrefix {
     size_bytes: usize,
 }
 
+/// What `add_special_tokens` adds around a text's own ids: the ids the
+/// tokenizer's post-processor puts in front of them (a BOS) and after them
+/// (an EOS, a separator). The cache splices segments encoded without the flag
+/// and adds the frame once around the whole result, so an appended token
+/// lands at the end of the input and not after the first segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SpecialTokenFrame {
+    prepended: Vec<TokenIdType>,
+    appended: Vec<TokenIdType>,
+}
+
+impl SpecialTokenFrame {
+    /// The frame `encoder` adds, read off every probe of [`SPLICE_PROBES`]
+    /// encoded with and without the flag. `None` when the probes disagree
+    /// (what the flag adds depends on the text) or a probe's own ids do not
+    /// appear whole inside its flagged encode; the cache then does not serve
+    /// requests with the flag.
+    pub(super) fn probe<E: Encoder + ?Sized>(encoder: &E) -> Option<Self> {
+        let mut frame: Option<Self> = None;
+        for probe in SPLICE_PROBES {
+            let with = encoder.encode(probe, true).ok()?;
+            let without = encoder.encode(probe, false).ok()?;
+            let (with, without) = (with.token_ids(), without.token_ids());
+            if without.is_empty() {
+                return None;
+            }
+            let at = (0..=with.len().checked_sub(without.len())?)
+                .find(|&at| with[at..at + without.len()] == *without)?;
+            let found = Self {
+                prepended: with[..at].to_vec(),
+                appended: with[at + without.len()..].to_vec(),
+            };
+            match &frame {
+                None => frame = Some(found),
+                Some(known) if *known == found => {}
+                Some(_) => return None,
+            }
+        }
+        frame
+    }
+
+    /// The ids the flag puts in front of the text's own.
+    pub(super) fn prepended(&self) -> &[TokenIdType] {
+        &self.prepended
+    }
+
+    /// The ids the flag puts after the text's own.
+    pub(super) fn appended(&self) -> &[TokenIdType] {
+        &self.appended
+    }
+}
+
 /// L1 cache implementation with special-token-boundary prefix matching
 pub struct L1Cache {
     /// Sharded maps for concurrent access
@@ -375,8 +427,9 @@ impl L1Cache {
     /// `add_special_tokens || input[..boundary]` at every special token boundary,
     /// built with one incremental O(N) hashing pass.
     ///
-    /// Seeding with `add_special_tokens` maps prefixes tokenized with/without a
-    /// leading BOS to distinct keys (the first segment honors this flag).
+    /// The two values of `add_special_tokens` seed distinct keys; the entries
+    /// hold the text's own ids either way (the frame the flag adds is applied
+    /// around a result, never stored).
     fn boundary_seeds(
         input: &str,
         special_tokens: &SpecialTokenBoundaries,
@@ -484,20 +537,16 @@ impl L1Cache {
             return Ok(());
         }
 
-        self.populate_boundaries(
-            input,
-            &seeds,
-            tokenizer,
-            &special_tokens,
-            add_special_tokens,
-        )?;
+        self.populate_boundaries(input, &seeds, tokenizer, &special_tokens, None)?;
         Ok(())
     }
 
     /// Miss-path encode: tokenize `input` exactly once, caching the cumulative prefix
-    /// at every special token boundary, and return the assembled encoding. The
-    /// per-segment encodes concatenate to an uncached `encode(input, add_special_tokens)`
-    /// because special tokens are atomic in BPE.
+    /// at every special token boundary, and return the assembled encoding, equal
+    /// to an uncached `encode(input, add_special_tokens)`: the segments are
+    /// encoded in context and the frame the flag adds goes around the whole.
+    /// A request with the flag is served by the plain encode, uncached, when
+    /// the frame cannot be read off the tokenizer ([`SpecialTokenFrame::probe`]).
     pub fn populate_and_encode<E: Encoder + ?Sized>(
         &self,
         input: &str,
@@ -505,6 +554,14 @@ impl L1Cache {
         special_tokens: &[&str],
         add_special_tokens: bool,
     ) -> anyhow::Result<Encoding> {
+        let frame = if add_special_tokens {
+            match SpecialTokenFrame::probe(tokenizer) {
+                Some(frame) => Some(frame),
+                None => return tokenizer.encode(input, true),
+            }
+        } else {
+            None
+        };
         let special_tokens =
             SpecialTokenBoundaries::for_encoder::<_, &str, _>(special_tokens, &[], tokenizer);
         let seeds = Self::boundary_seeds(input, &special_tokens, add_special_tokens);
@@ -514,12 +571,15 @@ impl L1Cache {
             tokenizer,
             &special_tokens,
             add_special_tokens,
+            frame.as_ref(),
         )
     }
 
     /// Like [`Self::populate_and_encode`], but reuses the seed
     /// list a failed [`Self::lookup_with_seeds`] already computed, so the miss path
     /// neither re-scans for boundaries nor re-hashes the prefixes it just hashed.
+    /// `frame` is what `add_special_tokens` adds around the ids when it is set
+    /// (the caller's, read once at construction).
     pub(super) fn populate_with_seeds<E: Encoder + ?Sized>(
         &self,
         input: &str,
@@ -527,6 +587,7 @@ impl L1Cache {
         tokenizer: &E,
         special_tokens: &SpecialTokenBoundaries,
         add_special_tokens: bool,
+        frame: Option<&SpecialTokenFrame>,
     ) -> anyhow::Result<Encoding> {
         let Some(last) = seeds.last() else {
             // No special token boundaries — nothing cacheable; a single plain encode
@@ -534,42 +595,49 @@ impl L1Cache {
             return tokenizer.encode(input, add_special_tokens);
         };
 
-        // Tokenize + cache every boundary prefix; `running` covers input[0..last boundary].
+        // Tokenize + cache every boundary prefix; `running` covers input[0..last
+        // boundary], behind the frame's leading ids.
         let mut running =
-            self.populate_boundaries(input, seeds, tokenizer, special_tokens, add_special_tokens)?;
+            self.populate_boundaries(input, seeds, tokenizer, special_tokens, frame)?;
 
         // The trailing segment after the last boundary is not a cache key (boundaries
         // exclude input.len()); encoding it, after the special token that ends
-        // the boundary, completes the full tokenization.
+        // the boundary, completes the full tokenization; the frame's trailing ids
+        // come last.
         special_tokens.encode_segment_into(last, input, input.len(), tokenizer, &mut running)?;
+        if let Some(frame) = frame {
+            running.extend_from_slice(frame.appended());
+        }
         Ok(Encoding::Plain(running))
     }
 
     /// Shared core of the insert and fused-miss paths: walk the precomputed
-    /// `seeds`, encoding each segment once (the first as the start of the
-    /// input, each later one after the special token that ends the boundary
-    /// before it), cache the cumulative prefix at each boundary, and return
-    /// the running token vector (covering `input[0..last boundary]`). Nothing
-    /// is stored before every segment came back exact.
+    /// `seeds`, encoding each segment once without the flag (the first as the
+    /// start of the input, each later one after the special token that ends
+    /// the boundary before it), cache the cumulative prefix at each boundary,
+    /// and return the running token vector (covering `input[0..last boundary]`)
+    /// behind `frame`'s leading ids when there is a frame; the entries never
+    /// hold the frame. Nothing is stored before every segment came back exact.
     fn populate_boundaries<E: Encoder + ?Sized>(
         &self,
         input: &str,
         seeds: &[Seed],
         tokenizer: &E,
         special_tokens: &SpecialTokenBoundaries,
-        add_special_tokens: bool,
+        frame: Option<&SpecialTokenFrame>,
     ) -> anyhow::Result<Vec<TokenIdType>> {
-        let mut running_tokens = Vec::new();
+        let mut running_tokens: Vec<TokenIdType> =
+            frame.map_or_else(Vec::new, |frame| frame.prepended().to_vec());
+        let head = running_tokens.len();
         let mut last: Option<Seed> = None;
         let mut entries_to_insert = Vec::with_capacity(seeds.len());
         for &seed in seeds {
-            // The first segment is the start of the input (special tokens such
-            // as a BOS are added there and nowhere else); every later segment
+            // The first segment is the start of the input; every later segment
             // is encoded after the special token that ends the boundary before
             // it, as it is in the whole text.
             match last {
                 None => {
-                    let segment = tokenizer.encode(&input[..seed.end], add_special_tokens)?;
+                    let segment = tokenizer.encode(&input[..seed.end], false)?;
                     running_tokens.extend_from_slice(segment.token_ids());
                 }
                 Some(before) => special_tokens.encode_segment_into(
@@ -582,7 +650,7 @@ impl L1Cache {
             }
 
             // Convert current tokens to Arc<[TokenIdType]> for sharing
-            let prefix_tokens: Arc<[TokenIdType]> = running_tokens.as_slice().into();
+            let prefix_tokens: Arc<[TokenIdType]> = running_tokens[head..].into();
 
             // Size = text bytes + token storage
             let size_bytes = seed.end + prefix_tokens.len() * size_of::<TokenIdType>();
@@ -777,7 +845,7 @@ pub struct L1CacheStats {
 
 #[cfg(test)]
 mod tests {
-    use super::SpecialTokenBoundaries;
+    use super::{SpecialTokenBoundaries, SpecialTokenFrame};
     use crate::*;
 
     /// The special tokens of the test encoders below: atomic (one id each),
@@ -1086,16 +1154,18 @@ mod tests {
             .insert_at_boundaries(input, &tokenizer, special_tokens, false)
             .unwrap();
 
-        // Each flag must return its own prefix: BOS present only for `true`.
-        let (with_bos, _) = cache
+        // Each flag has its own entry (the keys differ); both hold the text's
+        // own ids, as the frame the flag adds goes around a result, never
+        // into the cache.
+        let (with_flag, _) = cache
             .longest_prefix_match(input, special_tokens, true)
             .expect("match for add_special_tokens=true");
-        let (without_bos, _) = cache
+        let (without_flag, _) = cache
             .longest_prefix_match(input, special_tokens, false)
             .expect("match for add_special_tokens=false");
 
-        assert_eq!(with_bos.first(), Some(&BOS_ID));
-        assert_ne!(without_bos.first(), Some(&BOS_ID));
+        assert_eq!(with_flag, without_flag);
+        assert_ne!(with_flag.first(), Some(&BOS_ID));
     }
 
     #[test]
@@ -1110,7 +1180,8 @@ mod tests {
             .insert_at_boundaries(input, &tokenizer, special_tokens, true)
             .unwrap();
 
-        // A lookup with the opposite flag must miss rather than return BOS tokens.
+        // A lookup with the opposite flag must miss rather than return the other
+        // flag's entry.
         assert!(cache
             .longest_prefix_match(input, special_tokens, false)
             .is_none());
@@ -1458,6 +1529,40 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "longest_prefix_match must return the shared cached Arc, not a clone of its contents"
+        );
+    }
+
+    /// Encoder with one id per byte and, when `add_special_tokens` is set,
+    /// the input's length as a trailing id: what the flag adds depends on
+    /// the text.
+    struct LengthTail;
+
+    impl Encoder for LengthTail {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+            let mut ids: Vec<TokenIdType> = input.bytes().map(TokenIdType::from).collect();
+            if add_special_tokens {
+                ids.push(TokenIdType::try_from(input.len()).unwrap_or(TokenIdType::MAX));
+            }
+            Ok(Encoding::Plain(ids))
+        }
+
+        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+            inputs
+                .iter()
+                .map(|i| self.encode(i, add_special_tokens))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_frame_probe_reads_what_the_flag_adds() {
+        let frame = SpecialTokenFrame::probe(&BosTokenizer).expect("a constant frame");
+        assert_eq!(frame.prepended(), &[BOS_ID]);
+        assert_eq!(frame.appended(), &[] as &[TokenIdType]);
+        assert_eq!(
+            SpecialTokenFrame::probe(&LengthTail),
+            None,
+            "a text-dependent addition is no frame"
         );
     }
 

@@ -26,7 +26,7 @@ use anyhow::Result;
 pub use fingerprint::TokenizerFingerprint;
 pub use l0::{CacheStats, L0Cache};
 pub use l1::{L1Cache, L1CacheStats};
-use l1::{PrefixLookup, SpecialTokenBoundaries};
+use l1::{PrefixLookup, SpecialTokenBoundaries, SpecialTokenFrame};
 use rayon::prelude::*;
 
 use crate::{
@@ -79,6 +79,9 @@ pub struct CachedTokenizer {
     fingerprint: TokenizerFingerprint,
     /// The special tokens L1 splits at, as one matcher built at construction.
     special_tokens: SpecialTokenBoundaries,
+    /// What `add_special_tokens` adds around a text's ids, applied once around
+    /// a spliced result; `None` with L1 on: such requests are not cached.
+    frame: Option<SpecialTokenFrame>,
 }
 
 impl CachedTokenizer {
@@ -116,6 +119,19 @@ impl CachedTokenizer {
         } else {
             SpecialTokenBoundaries::new::<&str>(&[])
         };
+        // What `add_special_tokens` adds around a text's ids, read once with L1
+        // on; when it cannot be, requests with the flag are not cached.
+        let frame = if config.enable_l1 {
+            let frame = SpecialTokenFrame::probe(inner.as_ref());
+            if frame.is_none() {
+                tracing::debug!(
+                    "the prefix cache does not serve requests with add_special_tokens: what the flag adds is not one frame on every probe"
+                );
+            }
+            frame
+        } else {
+            None
+        };
 
         Self {
             inner,
@@ -123,6 +139,7 @@ impl CachedTokenizer {
             l1,
             fingerprint,
             special_tokens,
+            frame,
         }
     }
 
@@ -205,21 +222,43 @@ impl Encoder for CachedTokenizer {
         // come back as itself in front of the suffix), the plain encode serves
         // the request, counted as a fallback in the L1 stats; a prefix cached
         // before that point stays, its own segments having come back exact.
+        // Segments are encoded without `add_special_tokens`; what the flag adds
+        // (a BOS in front, an EOS after) goes around the whole result once.
         if let Some(l1) = &self.l1 {
             let inner = self.inner.as_ref();
             let plain = || inner.encode(input, add_special_tokens);
-            let fallback = || {
-                l1.note_fallback();
-                plain()
-            };
-            // The result buffer, sized once: the shared prefix plus at most one
-            // id per byte of the rest of the input.
-            let buffer = |prefix: &[TokenIdType], from: usize| {
-                let mut tokens = Vec::with_capacity(prefix.len() + (input.len() - from));
-                tokens.extend_from_slice(prefix);
-                tokens
-            };
-            let encoding =
+            let encoding = if add_special_tokens && self.frame.is_none() {
+                // What the flag adds could not be read off the tokenizer: the
+                // plain encode, uncached in L1.
+                plain()?
+            } else {
+                let fallback = || {
+                    l1.note_fallback();
+                    plain()
+                };
+                // The frame the flag adds goes around the spliced ids: its leading
+                // ids first in the result buffer (never in a cached entry), its
+                // trailing ids last.
+                let frame = self.frame.as_ref().filter(|_| add_special_tokens);
+                let head = frame.map_or(0, |frame| frame.prepended().len());
+                // The result buffer, sized once: the frame, the shared prefix and
+                // at most one id per byte of the rest of the input.
+                let buffer = |prefix: &[TokenIdType], from: usize| {
+                    let tail = frame.map_or(0, |frame| frame.appended().len());
+                    let mut tokens =
+                        Vec::with_capacity(head + prefix.len() + (input.len() - from) + tail);
+                    if let Some(frame) = frame {
+                        tokens.extend_from_slice(frame.prepended());
+                    }
+                    tokens.extend_from_slice(prefix);
+                    tokens
+                };
+                let finish = |mut tokens: Vec<TokenIdType>| {
+                    if let Some(frame) = frame {
+                        tokens.extend_from_slice(frame.appended());
+                    }
+                    Encoding::Plain(tokens)
+                };
                 match l1.lookup_with_seeds(input, &self.special_tokens, add_special_tokens) {
                     PrefixLookup::Hit(prefix_tokens, hit, Some(deepest)) => {
                         // Also cache this input's deepest boundary: a later input that extends
@@ -230,7 +269,7 @@ impl Encoder for CachedTokenizer {
                             .special_tokens
                             .encode_segment_into(&hit, input, deepest.end, inner, &mut tokens)
                             .and_then(|()| {
-                                l1.insert_prefix(deepest.digest, deepest.end, &tokens);
+                                l1.insert_prefix(deepest.digest, deepest.end, &tokens[head..]);
                                 self.special_tokens.encode_segment_into(
                                     &deepest,
                                     input,
@@ -240,13 +279,12 @@ impl Encoder for CachedTokenizer {
                                 )
                             });
                         match spliced {
-                            Ok(()) => Encoding::Plain(tokens),
+                            Ok(()) => finish(tokens),
                             Err(_) => fallback()?,
                         }
                     }
                     PrefixLookup::Hit(prefix_tokens, hit, None) if hit.end < input.len() => {
-                        // The cached prefix already carries any leading special tokens;
-                        // the suffix is encoded after the boundary's token (never as segment 0)
+                        // The suffix is encoded after the boundary's token (never as segment 0)
                         // straight into the result: one allocation, one copy of the prefix.
                         let mut tokens = buffer(&prefix_tokens, hit.end);
                         match self.special_tokens.encode_segment_into(
@@ -256,15 +294,15 @@ impl Encoder for CachedTokenizer {
                             inner,
                             &mut tokens,
                         ) {
-                            Ok(()) => Encoding::Plain(tokens),
+                            Ok(()) => finish(tokens),
                             Err(_) => fallback()?,
                         }
                     }
                     // Defensive: boundaries always exclude input.len(), so a full-input
                     // match cannot occur; if it ever did, the entry is keyed on the whole
-                    // input and the cached tokens ARE the full encoding.
+                    // input and the cached tokens ARE the text's full encoding.
                     PrefixLookup::Hit(prefix_tokens, _, _) => {
-                        Encoding::Plain(prefix_tokens.to_vec())
+                        finish(buffer(&prefix_tokens, input.len()))
                     }
                     // No special token boundaries — nothing cacheable; single plain encode
                     // (preserves the inner tokenizer's native encoding variant).
@@ -276,6 +314,7 @@ impl Encoder for CachedTokenizer {
                             inner,
                             &self.special_tokens,
                             add_special_tokens,
+                            frame,
                         ) {
                             Ok(encoding) => encoding,
                             // A segment's splice is not exact for this input (nothing is
@@ -284,7 +323,8 @@ impl Encoder for CachedTokenizer {
                             Err(_) => fallback()?,
                         }
                     }
-                };
+                }
+            };
 
             if let Some(l0) = &self.l0 {
                 l0.insert(
@@ -1017,6 +1057,168 @@ mod tests {
                 plain.encode(input, false).unwrap().token_ids()
             );
         }
+        let stats = cached.l1_cache_stats().unwrap();
+        assert_eq!((stats.misses, stats.hits), (1, 1), "{stats:?}");
+    }
+
+    /// What [`FramesText`] puts after the text when `add_special_tokens` is set.
+    #[derive(Clone, Copy)]
+    enum Tail {
+        /// An EOS: a frame the cache can apply around a result.
+        Eos,
+        /// The input's length as an id: no frame.
+        TextLength,
+    }
+
+    /// Tokenizer whose post-processor frames a text when `add_special_tokens`
+    /// is set: a BOS in front, `tail` after it; the chat specials atomic.
+    struct FramesText {
+        special_tokens: SpecialTokens,
+        matcher: aho_corasick::AhoCorasick,
+        tail: Tail,
+    }
+
+    const FRAME_BOS: TokenIdType = 1;
+    const FRAME_EOS: TokenIdType = 2;
+
+    impl FramesText {
+        fn new(tail: Tail) -> Self {
+            let specials = ["<|im_start|>", "<|im_end|>"];
+            Self {
+                special_tokens: SpecialTokens {
+                    additional_special_tokens: specials.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                },
+                matcher: aho_corasick::AhoCorasickBuilder::new()
+                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                    .build(specials)
+                    .unwrap(),
+                tail,
+            }
+        }
+    }
+
+    impl Encoder for FramesText {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+            let mut ids = Vec::new();
+            if add_special_tokens {
+                ids.push(FRAME_BOS);
+            }
+            let mut last = 0;
+            for found in self.matcher.find_iter(input) {
+                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
+                ids.push(1000 + found.pattern().as_u32());
+                last = found.end();
+            }
+            ids.extend(input[last..].bytes().map(TokenIdType::from));
+            if add_special_tokens {
+                ids.push(match self.tail {
+                    Tail::Eos => FRAME_EOS,
+                    Tail::TextLength => {
+                        TokenIdType::try_from(input.len()).unwrap_or(TokenIdType::MAX)
+                    }
+                });
+            }
+            Ok(Encoding::Plain(ids))
+        }
+
+        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+            inputs
+                .iter()
+                .map(|i| self.encode(i, add_special_tokens))
+                .collect()
+        }
+    }
+
+    impl Decoder for FramesText {
+        fn decode(&self, _token_ids: &[TokenIdType], _skip_special_tokens: bool) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl traits::Tokenizer for FramesText {
+        fn vocab_size(&self) -> usize {
+            1002
+        }
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            &self.special_tokens
+        }
+        fn token_to_id(&self, _token: &str) -> Option<TokenIdType> {
+            None
+        }
+        fn id_to_token(&self, _id: TokenIdType) -> Option<String> {
+            None
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    const FRAMED_TEXT: &str =
+        "<|im_start|>system\nYou help.<|im_end|><|im_start|>user\nHi<|im_end|>";
+
+    #[test]
+    fn a_post_processor_that_appends_puts_its_token_at_the_end_of_the_whole_input() {
+        let config = CacheConfig {
+            enable_l0: false,
+            enable_l1: true,
+            ..Default::default()
+        };
+        let plain = FramesText::new(Tail::Eos);
+        let cached = CachedTokenizer::new(Arc::new(FramesText::new(Tail::Eos)), config);
+        let next_turn = format!("{FRAMED_TEXT}<|im_start|>assistant\nHello");
+        // Per flag: a miss, a hit, a hit with a suffix (the deepest boundary
+        // cached too), the hit there.
+        for input in [
+            FRAMED_TEXT,
+            FRAMED_TEXT,
+            next_turn.as_str(),
+            next_turn.as_str(),
+        ] {
+            for add_special_tokens in [true, false] {
+                assert_eq!(
+                    cached
+                        .encode(input, add_special_tokens)
+                        .unwrap()
+                        .token_ids(),
+                    plain.encode(input, add_special_tokens).unwrap().token_ids(),
+                    "{input:?} with add_special_tokens={add_special_tokens}"
+                );
+            }
+        }
+        let stats = cached.l1_cache_stats().unwrap();
+        assert_eq!(
+            (stats.misses, stats.hits, stats.fallbacks),
+            (2, 6, 0),
+            "both flag values are served from the cache: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn a_flag_whose_additions_depend_on_the_text_is_served_by_the_plain_encode() {
+        let config = CacheConfig {
+            enable_l0: false,
+            enable_l1: true,
+            ..Default::default()
+        };
+        let plain = FramesText::new(Tail::TextLength);
+        let cached = CachedTokenizer::new(Arc::new(FramesText::new(Tail::TextLength)), config);
+        for _ in 0..2 {
+            for add_special_tokens in [true, false] {
+                assert_eq!(
+                    cached
+                        .encode(FRAMED_TEXT, add_special_tokens)
+                        .unwrap()
+                        .token_ids(),
+                    plain
+                        .encode(FRAMED_TEXT, add_special_tokens)
+                        .unwrap()
+                        .token_ids(),
+                    "add_special_tokens={add_special_tokens}"
+                );
+            }
+        }
+        // Only the requests without the flag went through the cache.
         let stats = cached.l1_cache_stats().unwrap();
         assert_eq!((stats.misses, stats.hits), (1, 1), "{stats:?}");
     }
