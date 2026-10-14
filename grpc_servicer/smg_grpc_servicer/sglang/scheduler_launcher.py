@@ -9,7 +9,7 @@ import logging
 import multiprocessing as mp
 import signal
 
-from sglang.srt.arg_groups.overrides import resolved_view
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -91,6 +91,7 @@ def launch_scheduler_process_only(
     Raises:
         RuntimeError: If any scheduler process fails to initialize
     """
+    # No-op after serve_grpc publishes its config; resolves for direct callers.
     server_args.resolve_once()
 
     # Configure global environment
@@ -129,7 +130,7 @@ def _start_scheduler_processes(
     # Resolution preserves raw inputs; use the topology the engine will run.
     cfg = resolved_view(server_args)
 
-    if cfg.dp_size == 1:
+    if cfg.dp_size == 1 and cfg.ep_join_mode != "scale":
         # Single data parallel group - launch TP/PP schedulers
         memory_saver_adapter = TorchMemorySaverAdapter.create(enable=cfg.enable_memory_saver)
         scheduler_pipe_readers = []

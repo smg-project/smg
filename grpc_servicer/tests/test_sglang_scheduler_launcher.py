@@ -45,8 +45,8 @@ def scheduler_launcher_mod(monkeypatch):
         "sglang": _module("sglang"),
         "sglang.srt": _module("sglang.srt"),
         "sglang.srt.arg_groups": _module("sglang.srt.arg_groups"),
-        "sglang.srt.arg_groups.overrides": _module(
-            "sglang.srt.arg_groups.overrides",
+        "sglang.srt.arg_groups.model_override_base": _module(
+            "sglang.srt.arg_groups.model_override_base",
             resolved_view=lambda args: getattr(args, "resolved", args),
         ),
         "sglang.srt.managers": _module("sglang.srt.managers"),
@@ -144,6 +144,7 @@ def test_ready_failure_terminates_every_started_scheduler(monkeypatch, scheduler
         resolve_once=lambda: None,
         check_server_args=lambda: None,
         dp_size=1,
+        ep_join_mode=None,
         enable_memory_saver=False,
         nnodes=1,
         pp_size=1,
@@ -178,8 +179,9 @@ def test_ready_failure_terminates_every_started_scheduler(monkeypatch, scheduler
             [(1, 0, 1), (1, 1, 4)],
         ),
         ({"dp_size": 2}, 1, None),
+        ({"ep_join_mode": "scale", "node_rank": 1}, 1, None),
     ],
-    ids=["unchanged", "resolved-tp", "resolved-pp", "resolved-dp"],
+    ids=["unchanged", "resolved-tp", "resolved-pp", "resolved-dp", "elastic-ep-scale"],
 )
 def test_schedulers_start_with_the_run_scheduler_process_arguments(
     monkeypatch, scheduler_launcher_mod, overrides, raw_dp_size, placements
@@ -218,6 +220,7 @@ def test_schedulers_start_with_the_run_scheduler_process_arguments(
         resolve_once=lambda: None,
         check_server_args=lambda: None,
         dp_size=1,
+        ep_join_mode=None,
         enable_memory_saver=False,
         nnodes=1,
         pp_size=1,
@@ -325,6 +328,7 @@ def test_a_scheduler_process_that_dies_before_its_ready_report_fails_the_launch(
         resolve_once=lambda: None,
         check_server_args=lambda: None,
         dp_size=1,
+        ep_join_mode=None,
         enable_memory_saver=False,
         nnodes=1,
         pp_size=1,
