@@ -18,7 +18,11 @@ use tracing::warn;
 use crate::{
     config::{validate_worker_url, RouterConfig},
     routers::provider_support,
-    worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
+    worker::{
+        registry::WorkerId,
+        worker::{merge_labels, worker_to_info},
+        WorkerRegistry, WorkerType,
+    },
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
 
@@ -129,7 +133,8 @@ fn shown_key(key: &str) -> String {
 
 /// The labels a PATCH would leave on the worker: the request's merged into
 /// the existing ones (`UpdateWorkerPropertiesStep` keeps every key it does not
-/// name), held to the same cap as a registration, so repeated updates cannot
+/// name, except a running window under the other name when the request sets
+/// one, see `merge_labels`), held to the same cap as a registration, so repeated updates cannot
 /// grow a worker past it; an update that adds no key (a rewrite of keys the
 /// worker has) passes, so a worker over the cap through the labels discovered
 /// at registration can still be updated. This is the early check against the
@@ -141,16 +146,13 @@ fn validate_merged_labels(
     existing: &HashMap<String, String>,
     update: &HashMap<String, String>,
 ) -> Result<(), WorkerServiceError> {
-    let added = update
-        .keys()
-        .filter(|key| !existing.contains_key(*key))
-        .count();
-    let merged = existing.len() + added;
-    if added > 0 && merged > MAX_WORKER_LABELS {
+    let merged = merge_labels(existing, update).len();
+    if merged > existing.len() && merged > MAX_WORKER_LABELS {
         return Err(bad_request(format!(
-            "{merged} labels on the worker after this update ({} now, {added} new); at most \
+            "{merged} labels on the worker after this update ({} now, {} new); at most \
              {MAX_WORKER_LABELS} are accepted",
-            existing.len()
+            existing.len(),
+            merged - existing.len()
         )));
     }
     Ok(())
@@ -1002,6 +1004,34 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+    }
+
+    /// The early check counts the labels the merge leaves: a window set by
+    /// the update replaces a discovered one under the other name, so swapping
+    /// the window's name on a full worker passes (as the step would take it),
+    /// while a new key on a full worker is refused.
+    #[test]
+    fn the_early_cap_check_counts_the_labels_the_merge_leaves() {
+        let mut full: HashMap<String, String> = (1..MAX_WORKER_LABELS)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        full.insert("max_num_seqs".to_string(), "256".to_string());
+        assert_eq!(full.len(), MAX_WORKER_LABELS);
+        let swap = HashMap::from([("max_running_requests".to_string(), "512".to_string())]);
+        assert!(validate_merged_labels(&full, &swap).is_ok());
+        assert_eq!(merge_labels(&full, &swap).len(), MAX_WORKER_LABELS);
+        let new_key = HashMap::from([("k_new".to_string(), "v".to_string())]);
+        let message = validate_merged_labels(&full, &new_key)
+            .expect_err("a 129th label")
+            .to_string();
+        assert!(
+            message.contains("129 labels on the worker after this update (128 now, 1 new)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("new); at most 128 are accepted"),
+            "{message}"
+        );
     }
 
     /// The label cap holds for the worker, not the request: a PATCH merges

@@ -311,6 +311,36 @@ fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
         .and_then(|card| card.context_length)
 }
 
+/// The labels that name a worker's running window, in the order the reader
+/// (`Worker::max_running_requests`) prefers them.
+pub(crate) const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
+
+/// A worker's labels after a merge: `current` (the discovered labels at
+/// registration, the worker's own on a label update) with `by_hand` (the
+/// spec's own labels, the request's) on top. A window the operator set by
+/// hand is the worker's only window: a window under the other name is
+/// dropped, since the reader prefers `max_num_seqs` to `max_running_requests`
+/// and would otherwise take the engine's figure over the operator's, on
+/// every worker, expanded per rank or not. Registration, the admin label
+/// update and its early cap check all merge through here.
+pub(crate) fn merge_labels(
+    current: &std::collections::HashMap<String, String>,
+    by_hand: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut labels = current.clone();
+    if WINDOW_LABELS.iter().any(|key| by_hand.contains_key(*key)) {
+        for key in WINDOW_LABELS {
+            if !by_hand.contains_key(key) {
+                labels.remove(key);
+            }
+        }
+    }
+    for (key, value) in by_hand {
+        labels.insert(key.clone(), value.clone());
+    }
+    labels
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug + 'static {
@@ -533,9 +563,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// leg's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
         let labels = &self.metadata().spec.labels;
-        labels
-            .get("max_num_seqs")
-            .or_else(|| labels.get("max_running_requests"))
+        WINDOW_LABELS
+            .iter()
+            .find_map(|key| labels.get(*key))
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             // A figure wider than the count (an explicit flag above 65535 on

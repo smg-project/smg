@@ -8,13 +8,12 @@ use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::create_worker::{
-    merge_labels, model_card_for_labels, validate_parser_overrides,
-    warn_on_conflicting_parser_overrides,
+    model_card_for_labels, validate_parser_overrides, warn_on_conflicting_parser_overrides,
 };
 use crate::{
     worker::{
-        overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker, BasicWorkerBuilder,
-        RuntimeType, Worker,
+        overload::OverloadThresholds, service::MAX_WORKER_LABELS, worker::merge_labels,
+        BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
     },
     workflow::data::WorkerUpdateWorkflowData,
 };

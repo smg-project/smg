@@ -19,9 +19,11 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
-        circuit_breaker::CircuitBreakerConfig, overload::OverloadThresholds,
-        resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
-        Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
+        circuit_breaker::CircuitBreakerConfig,
+        overload::OverloadThresholds,
+        resilience::resolve_resilience,
+        worker::{merge_labels, RuntimeType, WINDOW_LABELS},
+        BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
 };
@@ -804,32 +806,6 @@ fn validate_zmq_worker_type(
     Ok(())
 }
 
-/// The worker's labels: the discovered ones with the operator's (`by_hand`,
-/// the spec's own) on top. A window the operator set by hand is the
-/// worker's only window: a discovered window under the other name is
-/// dropped, since the reader prefers `max_num_seqs` to `max_running_requests`
-/// and would otherwise take the engine's figure over the operator's, on
-/// every worker, expanded per rank or not. A label update through the admin
-/// API merges the same way (`update_worker_properties`), so the rule holds
-/// after registration too.
-pub(super) fn merge_labels(
-    discovered: &HashMap<String, String>,
-    by_hand: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut labels = discovered.clone();
-    if WINDOW_LABELS.iter().any(|key| by_hand.contains_key(*key)) {
-        for key in WINDOW_LABELS {
-            if !by_hand.contains_key(key) {
-                labels.remove(key);
-            }
-        }
-    }
-    for (key, value) in by_hand {
-        labels.insert(key.clone(), value.clone());
-    }
-    labels
-}
-
 /// The labels of one dp-aware rank worker: the engine's labels as they are,
 /// except the running window of an engine that splits it across its
 /// attention-DP workers (the `enable_dp_attention` / `attn_dp_size` labels:
@@ -876,10 +852,6 @@ fn labels_for_rank(
     }
     labels
 }
-
-/// The labels that name a worker's running window, in the order the reader
-/// prefers them.
-const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
 /// How many attention-DP workers the engine's labels say its running window
 /// is split across, `None` for an engine that runs the whole window on every
@@ -1946,7 +1918,8 @@ mod tests {
 mod rank_window_tests {
     use std::collections::HashMap;
 
-    use super::{labels_for_rank, merge_labels};
+    use super::labels_for_rank;
+    use crate::worker::worker::merge_labels;
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
