@@ -537,9 +537,10 @@ fn tool_calls_block(tool_calls: &[Value]) -> String {
     )
 }
 
-/// What follows the turn: nothing when the next message is not an assistant
-/// or latest-reminder turn; a task's token (the action task behind the
-/// assistant header and a think token); else, after a user, developer or
+/// What follows the turn: nothing when a next message exists and is not an
+/// assistant or latest-reminder turn; otherwise (the last turn included: the
+/// generation prompt) a task's token (the action task behind the assistant
+/// header and a think token); else, after a user, developer or
 /// mid-conversation system turn, the assistant header and the think token
 /// that opens the reasoning (thinking mode, kept at or after the last user
 /// turn or everywhere when thinking is not dropped) or closes it.
