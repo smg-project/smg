@@ -80,6 +80,21 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
     ) -> Result<(ChatChoice, u32), String> {
         stop_decoder.reset();
+        // Stop strings end the answer: in a completion that starts in reasoning
+        // they match only after the reasoning ends.
+        if original_request.separate_reasoning
+            && reasoning_parser_available
+            && original_request.reasoning_starts_in_prefill(tokenizer.as_ref())
+        {
+            if let Some(reasoning) = utils::reasoning_end_detector(
+                &self.reasoning_parser_factory,
+                reasoning_parser_name,
+                model,
+                tokenizer.think_in_prefill(),
+            ) {
+                stop_decoder.defer_stops_until_reasoning_ends(reasoning);
+            }
+        }
         if let Some(assignment) = &original_request.symphony {
             return Self::read_with_symphony(
                 request_id,

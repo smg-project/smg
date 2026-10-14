@@ -33,9 +33,10 @@ pub use parsers::chat_reasoning_starts_in_prefill;
 pub(crate) use parsers::{
     check_reasoning_parser_availability, check_tool_parser_availability, continues_final_assistant,
     create_reasoning_parser, create_tool_parser, get_tool_parser,
-    messages_reasoning_starts_in_prefill, reasoning_parser_requires_special_tokens,
-    reasoning_starts_in_prefill, rendered_prompt_reasoning_in_prefill,
-    should_mark_reasoning_started, tool_constraints_for_worker, Names, ParserResolver,
+    messages_reasoning_starts_in_prefill, reasoning_end_detector,
+    reasoning_parser_requires_special_tokens, reasoning_starts_in_prefill,
+    rendered_prompt_reasoning_in_prefill, should_mark_reasoning_started,
+    tool_constraints_for_worker, Names, ParserResolver,
 };
 pub(crate) use pd_bootstrap::account_pd_leg_failure;
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};

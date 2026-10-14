@@ -21,6 +21,20 @@ pub enum SequenceDecoderOutput {
     StoppedWithText(String),
 }
 
+/// Detects where reasoning ends in decoded completion text, for a completion
+/// that starts inside reasoning. Stop strings end the answer, not the
+/// reasoning: a [`StopSequenceDecoder`] armed with one matches them only in
+/// text decoded after the reasoning ends.
+pub trait ReasoningEnd: Send + Sync {
+    /// Observe the next decoded text while reasoning. Once the reasoning ends
+    /// within `text`, returns the byte length of the suffix of `text` after
+    /// the end; `None` while the reasoning continues.
+    fn observe(&mut self, text: &str) -> Option<usize>;
+
+    /// A detector for a new completion of the same request, in reasoning.
+    fn fresh(&self) -> Box<dyn ReasoningEnd>;
+}
+
 /// Configuration for stop sequences
 #[derive(Debug, Clone, Default)]
 pub struct StopSequenceConfig {
@@ -80,6 +94,11 @@ pub struct StopSequenceDecoder {
     /// True when there are no string stop sequences (only token-level stops).
     /// In this mode the jail buffer is bypassed entirely for lower overhead.
     token_only: bool,
+    /// Present while the completion is inside reasoning: stop strings are not
+    /// matched and no text is withheld until it reports the end.
+    reasoning: Option<Box<dyn ReasoningEnd>>,
+    /// The detector the decoder was armed with; `reset` re-arms from it.
+    reasoning_arm: Option<Box<dyn ReasoningEnd>>,
 }
 
 impl StopSequenceDecoder {
@@ -167,6 +186,18 @@ impl StopSequenceDecoder {
             stopped: false,
             matched_stop: None,
             token_only,
+            reasoning: None,
+            reasoning_arm: None,
+        }
+    }
+
+    /// Match stop strings only in text decoded after `reasoning` reports the
+    /// end of the reasoning the completion starts in. Arm before the first
+    /// token. Stop tokens are unaffected.
+    pub fn defer_stops_until_reasoning_ends(&mut self, reasoning: Box<dyn ReasoningEnd>) {
+        if !self.token_only {
+            self.reasoning = Some(reasoning.fresh());
+            self.reasoning_arm = Some(reasoning);
         }
     }
 
@@ -272,6 +303,43 @@ impl StopSequenceDecoder {
             return SequenceDecoderOutput::Text(new_text);
         }
 
+        // Inside reasoning nothing is matched or withheld; the text after the
+        // reasoning end is the first text stop strings can match.
+        if let Some(reasoning) = self.reasoning.as_mut() {
+            let Some(after) = reasoning.observe(&new_text) else {
+                return if new_text.is_empty() {
+                    SequenceDecoderOutput::Held
+                } else {
+                    SequenceDecoderOutput::Text(new_text)
+                };
+            };
+            self.reasoning = None;
+            let mut split = new_text.len().saturating_sub(after);
+            while !new_text.is_char_boundary(split) {
+                split += 1;
+            }
+            let mut reasoning_text = new_text;
+            let content = reasoning_text.split_off(split);
+            if reasoning_text.is_empty() {
+                return self.match_stops(content);
+            }
+            return match self.match_stops(content) {
+                SequenceDecoderOutput::Text(text) => {
+                    SequenceDecoderOutput::Text(reasoning_text + &text)
+                }
+                SequenceDecoderOutput::StoppedWithText(text) => {
+                    SequenceDecoderOutput::StoppedWithText(reasoning_text + &text)
+                }
+                SequenceDecoderOutput::Stopped => {
+                    SequenceDecoderOutput::StoppedWithText(reasoning_text)
+                }
+                SequenceDecoderOutput::Held => SequenceDecoderOutput::Text(reasoning_text),
+            };
+        }
+        self.match_stops(new_text)
+    }
+
+    fn match_stops(&mut self, new_text: String) -> SequenceDecoderOutput {
         self.jail_buffer.push_str(&new_text);
 
         // Check for stop sequences using Aho-Corasick. The jail only ever retains a
@@ -382,6 +450,7 @@ impl StopSequenceDecoder {
         self.sequence.clear();
         self.stopped = false;
         self.matched_stop = None;
+        self.reasoning = self.reasoning_arm.as_ref().map(|arm| arm.fresh());
     }
 
     /// Un-stop after a string match the caller does not count (the serving engine checks
@@ -457,8 +526,76 @@ mod tests {
 
     use super::StopSequenceDecoderBuilder;
     use crate::{
-        mock::MockTokenizer, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder,
+        mock::MockTokenizer, ReasoningEnd, SequenceDecoderOutput, StopSequenceConfig,
+        StopSequenceDecoder,
     };
+
+    /// Ends the reasoning at `</think>`, wherever the decoded text splits it.
+    struct ThinkEnd {
+        seen: String,
+    }
+
+    impl ReasoningEnd for ThinkEnd {
+        fn observe(&mut self, text: &str) -> Option<usize> {
+            let before = self.seen.len();
+            self.seen.push_str(text);
+            let end = self.seen.find("</think>")? + "</think>".len();
+            Some(self.seen.len() - end.max(before))
+        }
+
+        fn fresh(&self) -> Box<dyn ReasoningEnd> {
+            Box::new(ThinkEnd {
+                seen: String::new(),
+            })
+        }
+    }
+
+    /// The text a decoder emits for `tokens` and whether it stopped.
+    fn emitted(decoder: &mut StopSequenceDecoder, tokens: &[u32]) -> (String, bool) {
+        let mut text = String::new();
+        for &token in tokens {
+            match decoder.process_token(token).unwrap() {
+                SequenceDecoderOutput::Text(t) => text.push_str(&t),
+                SequenceDecoderOutput::StoppedWithText(t) => {
+                    text.push_str(&t);
+                    return (text, true);
+                }
+                SequenceDecoderOutput::Stopped => return (text, true),
+                SequenceDecoderOutput::Held => {}
+            }
+        }
+        if let SequenceDecoderOutput::Text(t) = decoder.finish().unwrap() {
+            text.push_str(&t);
+        }
+        (text, decoder.is_stopped())
+    }
+
+    #[test]
+    fn stops_match_only_after_reasoning_ends() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+            ("Question:", 10),
+            ("</think>", 11),
+            ("42", 12),
+        ]));
+        // "Question: Hello </think> 42 Question:"
+        let tokens = [10, 1, 11, 12, 10, 1];
+        let config = StopSequenceConfig::default().with_stop_sequence("Question:");
+
+        let mut plain = StopSequenceDecoder::new(tokenizer.clone(), config.clone(), false);
+        assert_eq!(emitted(&mut plain, &tokens), (String::new(), true));
+
+        let mut deferred = StopSequenceDecoder::new(tokenizer, config, false);
+        deferred.defer_stops_until_reasoning_ends(Box::new(ThinkEnd {
+            seen: String::new(),
+        }));
+        for _ in 0..2 {
+            let (text, stopped) = emitted(&mut deferred, &tokens);
+            assert!(stopped);
+            assert_eq!(text, "Question: Hello </think> 42 ");
+            assert_eq!(deferred.matched_stop(), Some("Question:"));
+            deferred.reset();
+        }
+    }
 
     #[test]
     fn test_stop_token_detection() {

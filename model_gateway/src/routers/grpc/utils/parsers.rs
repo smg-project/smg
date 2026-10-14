@@ -5,6 +5,7 @@ use std::sync::Arc;
 use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
+    ReasoningEnd,
 };
 use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
@@ -489,6 +490,66 @@ pub(crate) fn create_reasoning_parser(
         // Auto-detect based on model
         reasoning_parser_factory.registry().create_for_model(model)
     }
+}
+
+/// The end of the reasoning a completion starts in, found by a second
+/// instance of the response's reasoning parser, armed as the streaming
+/// response parser is.
+struct ParserReasoningEnd {
+    parser: Box<dyn ReasoningParser>,
+    factory: ReasoningParserFactory,
+    configured_parser: Option<String>,
+    model: String,
+    think_in_prefill: bool,
+}
+
+impl ReasoningEnd for ParserReasoningEnd {
+    fn observe(&mut self, text: &str) -> Option<usize> {
+        match self.parser.parse_reasoning_streaming_incremental(text) {
+            Ok(_) if self.parser.is_in_reasoning() => None,
+            Ok(result) => Some(result.normal_text.len().min(text.len())),
+            // The response parser fails on the same text; stops match from here.
+            Err(_) => Some(text.len()),
+        }
+    }
+
+    fn fresh(&self) -> Box<dyn ReasoningEnd> {
+        #[expect(
+            clippy::expect_used,
+            reason = "the parser was created from the same factory, name and model"
+        )]
+        reasoning_end_detector(
+            &self.factory,
+            self.configured_parser.as_deref(),
+            &self.model,
+            self.think_in_prefill,
+        )
+        .expect("the reasoning parser was available when the detector was made")
+    }
+}
+
+/// A detector of the reasoning end for a completion that starts in
+/// reasoning, so its stop strings match only the answer
+/// (`StopSequenceDecoder::defer_stops_until_reasoning_ends`); `None` when no
+/// reasoning parser is available.
+pub(crate) fn reasoning_end_detector(
+    reasoning_parser_factory: &ReasoningParserFactory,
+    configured_parser: Option<&str>,
+    model: &str,
+    think_in_prefill: bool,
+) -> Option<Box<dyn ReasoningEnd>> {
+    let mut parser = create_reasoning_parser(reasoning_parser_factory, configured_parser, model)?;
+    parser.mark_reasoning_started();
+    if think_in_prefill {
+        parser.mark_think_start_stripped();
+    }
+    Some(Box::new(ParserReasoningEnd {
+        parser,
+        factory: reasoning_parser_factory.clone(),
+        configured_parser: configured_parser.map(str::to_string),
+        model: model.to_string(),
+        think_in_prefill,
+    }))
 }
 
 /// Native Gemma4 channels derive their initial state from the rendered prompt,
@@ -1457,5 +1518,49 @@ mod hy_v4_tests {
             resolve_user_thinking(Some(&unknown), None, None, &tok),
             Some(true)
         );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_end_tests {
+    use std::sync::Arc;
+
+    use llm_tokenizer::{stop::StopSequenceDecoderBuilder, MockTokenizer, SequenceDecoderOutput};
+
+    use super::*;
+
+    /// A stop string the reasoning writes does not end a DeepSeek V4 or V4.1
+    /// completion that starts in reasoning; the same string in the answer does.
+    #[test]
+    fn deepseek_reasoning_gates_stop_strings_at_the_reasoning_end() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+            ("Question:", 10),
+            ("</think>", 11),
+            ("42", 12),
+        ]));
+        let factory = ReasoningParserFactory::new();
+        for parser in ["deepseek_v4", "deepseek_v41"] {
+            let mut decoder = StopSequenceDecoderBuilder::new(tokenizer.clone())
+                .stop_sequence("Question:")
+                .build();
+            let reasoning = reasoning_end_detector(&factory, Some(parser), "model", true)
+                .unwrap_or_else(|| panic!("{parser} is registered"));
+            decoder.defer_stops_until_reasoning_ends(reasoning);
+            // "Question: Hello </think> 42 Question: Hello"
+            let mut text = String::new();
+            for token in [10, 1, 11, 12, 10, 1] {
+                match decoder.process_token(token).unwrap() {
+                    SequenceDecoderOutput::Text(t) => text.push_str(&t),
+                    SequenceDecoderOutput::StoppedWithText(t) => {
+                        text.push_str(&t);
+                        break;
+                    }
+                    SequenceDecoderOutput::Stopped => break,
+                    SequenceDecoderOutput::Held => {}
+                }
+            }
+            assert!(decoder.is_stopped(), "{parser}");
+            assert_eq!(text, "Question: Hello </think> 42 ", "{parser}");
+        }
     }
 }

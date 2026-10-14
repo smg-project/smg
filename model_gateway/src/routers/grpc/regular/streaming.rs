@@ -618,14 +618,27 @@ impl StreamingProcessor {
                             no_stop_trim,
                             ignore_eos,
                         ) = stop_params;
-                        utils::create_stop_decoder(
+                        let mut decoder = utils::create_stop_decoder(
                             &tokenizer,
                             stop.as_ref(),
                             stop_token_ids.as_ref(),
                             skip_special_tokens,
                             no_stop_trim,
                             ignore_eos,
-                        )
+                        );
+                        // Stop strings end the answer: in a completion that starts in
+                        // reasoning they match only after the reasoning ends.
+                        if reasoning_parser_available && thinking_override {
+                            if let Some(reasoning) = utils::reasoning_end_detector(
+                                &self.reasoning_parser_factory,
+                                reasoning_parser_name.as_deref(),
+                                model,
+                                think_in_prefill,
+                            ) {
+                                decoder.defer_stops_until_reasoning_ends(reasoning);
+                            }
+                        }
+                        decoder
                     });
 
                     // Process tokens through stop decoder: Symphony's reader takes
