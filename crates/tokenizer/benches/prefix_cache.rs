@@ -6,7 +6,10 @@
 //! `PREFIX_BENCH_TOKENIZERS=name=dir[,name=dir...]` (directories holding a
 //! `tokenizer.json`), `PREFIX_BENCH_TOKENS=2048,8192,32768,81920` (the prompt
 //! sizes, default as shown), `PREFIX_BENCH_VARIANTS=40` (distinct requests
-//! prepared per scenario). One JSON line per measurement and a table at the end.
+//! prepared per scenario), `PREFIX_BENCH_SCENARIOS=encode,l0,l1,both,components`
+//! (the scenario groups to run, default all; a group left out constructs no
+//! cached tokenizer, so the inner tokenizer sees only that group's encodes).
+//! One JSON line per measurement and a table at the end.
 #![expect(
     clippy::expect_used,
     clippy::print_stdout,
@@ -349,6 +352,10 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(40);
     assert!(variants >= 3, "PREFIX_BENCH_VARIANTS must be at least 3");
+    let groups: Vec<String> = std::env::var("PREFIX_BENCH_SCENARIOS")
+        .map(|v| v.split(',').map(|g| g.trim().to_owned()).collect())
+        .unwrap_or_default();
+    let wanted = |group: &str| groups.is_empty() || groups.iter().any(|g| g == group);
     let budget = Duration::from_millis(300);
     let mut table: Vec<(String, String, usize, String, f64)> = Vec::new();
 
@@ -419,123 +426,133 @@ fn main() {
             let measured_tokens = reference.len();
 
             // The encode itself, the baseline every cache row is read against.
-            let stat = timed(usize::MAX, budget, |_| {
-                black_box(inner.encode(&text0, false).expect("encode"));
-            });
-            rows.push(("encode".into(), stat, [0; 4]));
+            if wanted("encode") {
+                let stat = timed(usize::MAX, budget, |_| {
+                    black_box(inner.encode(&text0, false).expect("encode"));
+                });
+                rows.push(("encode".into(), stat, [0; 4]));
+            }
 
             // L0 alone: a repeat (hit) and distinct inputs (miss + insert).
-            let t = cached(&inner, true, false);
-            assert_eq!(ids(&t, &text0), reference);
-            let before = counters(&t);
-            let stat = timed(usize::MAX, budget, |_| {
-                black_box(t.encode(&text0, false).expect("encode"));
-            });
-            rows.push(("l0_hit".into(), stat, delta(before, counters(&t))));
-            let t = cached(&inner, true, false);
-            let before = counters(&t);
-            let stat = timed(variants, budget, |v| {
-                black_box(t.encode(&unique[v], false).expect("encode"));
-            });
-            rows.push(("l0_miss".into(), stat, delta(before, counters(&t))));
+            if wanted("l0") {
+                let t = cached(&inner, true, false);
+                assert_eq!(ids(&t, &text0), reference);
+                let before = counters(&t);
+                let stat = timed(usize::MAX, budget, |_| {
+                    black_box(t.encode(&text0, false).expect("encode"));
+                });
+                rows.push(("l0_hit".into(), stat, delta(before, counters(&t))));
+                let t = cached(&inner, true, false);
+                let before = counters(&t);
+                let stat = timed(variants, budget, |v| {
+                    black_box(t.encode(&unique[v], false).expect("encode"));
+                });
+                rows.push(("l0_miss".into(), stat, delta(before, counters(&t))));
+            }
 
             // L1 alone: the same text again (a hit at the deepest boundary), the
             // next turn of a seen conversation (10 % and 1 % new text), and
             // distinct conversations (a miss that seeds every boundary).
-            let t = cached(&inner, false, true);
-            assert_eq!(ids(&t, &text0), reference);
-            let before = counters(&t);
-            let stat = timed(usize::MAX, budget, |_| {
-                black_box(t.encode(&text0, false).expect("encode"));
-            });
-            rows.push(("l1_repeat".into(), stat, delta(before, counters(&t))));
-            for (label, sh) in [("l1_next_turn_10", &tail10), ("l1_next_turn_1", &tail1)] {
+            if wanted("l1") {
                 let t = cached(&inner, false, true);
-                let first = sh.request(0);
-                t.encode(&first, false).expect("warm");
-                let second = sh.request(1);
-                assert_eq!(ids(&t, &second), ids(inner.as_ref(), &second), "{label}");
+                assert_eq!(ids(&t, &text0), reference);
                 let before = counters(&t);
-                let stat = timed(variants - 2, budget, |v| {
-                    black_box(t.encode(&sh.request(v + 2), false).expect("encode"));
+                let stat = timed(usize::MAX, budget, |_| {
+                    black_box(t.encode(&text0, false).expect("encode"));
                 });
-                rows.push((label.into(), stat, delta(before, counters(&t))));
+                rows.push(("l1_repeat".into(), stat, delta(before, counters(&t))));
+                for (label, sh) in [("l1_next_turn_10", &tail10), ("l1_next_turn_1", &tail1)] {
+                    let t = cached(&inner, false, true);
+                    let first = sh.request(0);
+                    t.encode(&first, false).expect("warm");
+                    let second = sh.request(1);
+                    assert_eq!(ids(&t, &second), ids(inner.as_ref(), &second), "{label}");
+                    let before = counters(&t);
+                    let stat = timed(variants - 2, budget, |v| {
+                        black_box(t.encode(&sh.request(v + 2), false).expect("encode"));
+                    });
+                    rows.push((label.into(), stat, delta(before, counters(&t))));
+                }
+                let t = cached(&inner, false, true);
+                let before = counters(&t);
+                let stat = timed(variants, budget, |v| {
+                    black_box(t.encode(&unique[v], false).expect("encode"));
+                });
+                rows.push(("l1_unique".into(), stat, delta(before, counters(&t))));
             }
-            let t = cached(&inner, false, true);
-            let before = counters(&t);
-            let stat = timed(variants, budget, |v| {
-                black_box(t.encode(&unique[v], false).expect("encode"));
-            });
-            rows.push(("l1_unique".into(), stat, delta(before, counters(&t))));
 
             // Both caches, the gateway's shape when L1 is switched on.
-            let t = cached(&inner, true, true);
-            t.encode(&tail10.request(0), false).expect("warm");
-            let before = counters(&t);
-            let stat = timed(variants - 1, budget, |v| {
-                black_box(t.encode(&tail10.request(v + 1), false).expect("encode"));
-            });
-            rows.push((
-                "both_next_turn_10".into(),
-                stat,
-                delta(before, counters(&t)),
-            ));
-            let t = cached(&inner, true, true);
-            let before = counters(&t);
-            let stat = timed(variants, budget, |v| {
-                black_box(t.encode(&unique[v], false).expect("encode"));
-            });
-            rows.push(("both_unique".into(), stat, delta(before, counters(&t))));
+            if wanted("both") {
+                let t = cached(&inner, true, true);
+                t.encode(&tail10.request(0), false).expect("warm");
+                let before = counters(&t);
+                let stat = timed(variants - 1, budget, |v| {
+                    black_box(t.encode(&tail10.request(v + 1), false).expect("encode"));
+                });
+                rows.push((
+                    "both_next_turn_10".into(),
+                    stat,
+                    delta(before, counters(&t)),
+                ));
+                let t = cached(&inner, true, true);
+                let before = counters(&t);
+                let stat = timed(variants, budget, |v| {
+                    black_box(t.encode(&unique[v], false).expect("encode"));
+                });
+                rows.push(("both_unique".into(), stat, delta(before, counters(&t))));
+            }
 
             // The steps a lookup is made of, on the same text.
-            let text_bytes = text0.as_bytes();
-            let stat = timed(usize::MAX, budget, |_| {
-                black_box(boundaries_per_string(&text0, &specials));
-            });
-            rows.push(("scan_per_special_string".into(), stat, [0; 4]));
-            let stat = timed(usize::MAX, budget, |_| {
-                black_box(boundaries_one_pass(&text0, &automaton));
-            });
-            rows.push(("scan_one_pass".into(), stat, [0; 4]));
-            let boundaries = boundaries_one_pass(&text0, &automaton);
-            let stat = timed(usize::MAX, budget, |_| {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&[0u8]);
-                let mut last = 0;
-                let mut digests = Vec::with_capacity(boundaries.len());
-                for &b in &boundaries {
-                    hasher.update(&text_bytes[last..b]);
-                    digests.push(*hasher.finalize().as_bytes());
-                    last = b;
-                }
-                black_box(digests);
-            });
-            rows.push(("hash_blake3_prefixes".into(), stat, [0; 4]));
-            let stat = timed(usize::MAX, budget, |_| {
-                let mut h = DefaultHasher::new();
-                h.write(text_bytes);
-                black_box(h.finish());
-            });
-            rows.push(("hash_siphash_text".into(), stat, [0; 4]));
-            let copy = text0.clone();
-            let stat = timed(usize::MAX, budget, |_| {
-                black_box(text_bytes == copy.as_bytes());
-            });
-            rows.push(("memcmp_text".into(), stat, [0; 4]));
-            let stat = timed(usize::MAX, budget, |_| {
-                black_box(reference.clone());
-            });
-            rows.push(("memcpy_ids".into(), stat, [0; 4]));
-            let stat = timed(usize::MAX, budget, |_| {
-                black_box(text0.to_string());
-            });
-            rows.push(("memcpy_text".into(), stat, [0; 4]));
-            for (label, sh) in [("encode_suffix_10", &tail10), ("encode_suffix_1", &tail1)] {
-                let suffix = sh.suffix(0);
+            if wanted("components") {
+                let text_bytes = text0.as_bytes();
                 let stat = timed(usize::MAX, budget, |_| {
-                    black_box(inner.encode(&suffix, false).expect("encode"));
+                    black_box(boundaries_per_string(&text0, &specials));
                 });
-                rows.push((label.into(), stat, [0; 4]));
+                rows.push(("scan_per_special_string".into(), stat, [0; 4]));
+                let stat = timed(usize::MAX, budget, |_| {
+                    black_box(boundaries_one_pass(&text0, &automaton));
+                });
+                rows.push(("scan_one_pass".into(), stat, [0; 4]));
+                let boundaries = boundaries_one_pass(&text0, &automaton);
+                let stat = timed(usize::MAX, budget, |_| {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&[0u8]);
+                    let mut last = 0;
+                    let mut digests = Vec::with_capacity(boundaries.len());
+                    for &b in &boundaries {
+                        hasher.update(&text_bytes[last..b]);
+                        digests.push(*hasher.finalize().as_bytes());
+                        last = b;
+                    }
+                    black_box(digests);
+                });
+                rows.push(("hash_blake3_prefixes".into(), stat, [0; 4]));
+                let stat = timed(usize::MAX, budget, |_| {
+                    let mut h = DefaultHasher::new();
+                    h.write(text_bytes);
+                    black_box(h.finish());
+                });
+                rows.push(("hash_siphash_text".into(), stat, [0; 4]));
+                let copy = text0.clone();
+                let stat = timed(usize::MAX, budget, |_| {
+                    black_box(text_bytes == copy.as_bytes());
+                });
+                rows.push(("memcmp_text".into(), stat, [0; 4]));
+                let stat = timed(usize::MAX, budget, |_| {
+                    black_box(reference.clone());
+                });
+                rows.push(("memcpy_ids".into(), stat, [0; 4]));
+                let stat = timed(usize::MAX, budget, |_| {
+                    black_box(text0.to_string());
+                });
+                rows.push(("memcpy_text".into(), stat, [0; 4]));
+                for (label, sh) in [("encode_suffix_10", &tail10), ("encode_suffix_1", &tail1)] {
+                    let suffix = sh.suffix(0);
+                    let stat = timed(usize::MAX, budget, |_| {
+                        black_box(inner.encode(&suffix, false).expect("encode"));
+                    });
+                    rows.push((label.into(), stat, [0; 4]));
+                }
             }
 
             for (scenario, stat, counts) in rows {

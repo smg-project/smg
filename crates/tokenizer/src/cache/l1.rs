@@ -165,22 +165,38 @@ impl SpecialTokenBoundaries {
         }
         // The tokens that can hide a boundary, the specials dropped above
         // among them: matched so that no boundary falls where the tokenizer
-        // extracts a longer token whole. The rest can never take a kept
-        // token's place and stay out, which keeps the automaton small.
-        let others: Vec<String> = Self::distinct(other_added_tokens)
+        // extracts a longer token whole. A token joins when it can take the
+        // place of a token already in the matcher (a kept special, or one
+        // that joined before it) in a leftmost-longest match, until nothing
+        // joins: the rest can neither displace nor cut into a match of the
+        // matcher's tokens and stay out, which keeps the automaton small.
+        let mut pending: Vec<String> = Self::distinct(other_added_tokens)
             .into_iter()
             .chain(dropped)
-            .filter(|token| !strings.contains(token) && Self::can_hide(token, &strings))
+            .filter(|token| !strings.contains(token))
             .collect();
+        let mut included = strings.clone();
+        let mut others = Vec::new();
+        loop {
+            let (hiding, rest): (Vec<String>, Vec<String>) = pending
+                .into_iter()
+                .partition(|token| Self::can_hide(token, &included));
+            if hiding.is_empty() {
+                break;
+            }
+            included.extend(hiding.iter().cloned());
+            others.extend(hiding);
+            pending = rest;
+        }
         Self::build(strings, ids, others)
     }
 
     /// Whether `token`, extracted whole by the tokenizer, can take the place
-    /// of one of the `kept` special tokens in a leftmost-longest match: it
+    /// of one of the `included` tokens in a leftmost-longest match: it
     /// contains one, or it ends with the start of one (a match beginning
-    /// earlier wins, so the special token after it is text).
-    fn can_hide(token: &str, kept: &[String]) -> bool {
-        kept.iter().any(|special| {
+    /// earlier wins, so the token after it is text).
+    fn can_hide(token: &str, included: &[String]) -> bool {
+        included.iter().any(|special| {
             token.contains(special.as_str())
                 || (1..token.len())
                     .filter(|&at| token.is_char_boundary(at))
@@ -1332,6 +1348,57 @@ mod tests {
                 .as_ref()
                 .map(aho_corasick::AhoCorasick::patterns_len),
             Some(3)
+        );
+    }
+
+    /// Encoder with the atomic special tokens `STOP` and `QQ` and the atomic
+    /// added tokens `kSTO`, `mQQk`, `nm` and `Pp`, extracted leftmost-longest.
+    struct ChainedTokens;
+
+    impl Encoder for ChainedTokens {
+        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
+            let matcher = aho_corasick::AhoCorasickBuilder::new()
+                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                .build(["STOP", "QQ", "kSTO", "mQQk", "nm", "Pp"])
+                .unwrap();
+            let mut ids: Vec<TokenIdType> = Vec::new();
+            let mut last = 0;
+            for found in matcher.find_iter(input) {
+                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
+                ids.push(1000 + found.pattern().as_u32());
+                last = found.end();
+            }
+            ids.extend(input[last..].bytes().map(TokenIdType::from));
+            Ok(Encoding::Plain(ids))
+        }
+
+        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
+            inputs
+                .iter()
+                .map(|i| self.encode(i, add_special_tokens))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_token_that_hides_a_hiding_token_joins_the_matcher_too() {
+        let matcher = SpecialTokenBoundaries::for_encoder(
+            &["STOP", "QQ"],
+            &["kSTO", "mQQk", "nm", "Pp"],
+            &ChainedTokens,
+        );
+        // `kSTO` and `mQQk` can take a special token's place; `nm` can take
+        // `mQQk`'s. On `nmQQkSTOPping` the tokenizer extracts `nm`, `QQ`,
+        // `kSTO` and `Pp`, never `STOP`: without `nm` the matcher would take
+        // `mQQk` at 1 and then `STOP` at 5, a boundary the tokenizer has not.
+        // `Pp` can take no included token's place and stays out.
+        assert_eq!(ends(matcher.find("nmQQkSTOPping")), vec![4]);
+        assert_eq!(
+            matcher
+                .automaton
+                .as_ref()
+                .map(aho_corasick::AhoCorasick::patterns_len),
+            Some(5)
         );
     }
 
