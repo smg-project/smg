@@ -8,7 +8,8 @@ use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::create_worker::{
-    model_card_for_labels, validate_parser_overrides, warn_on_conflicting_parser_overrides,
+    merge_labels, model_card_for_labels, validate_parser_overrides,
+    warn_on_conflicting_parser_overrides,
 };
 use crate::{
     worker::{
@@ -67,12 +68,12 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             .iter()
             .map(|worker| {
                 let existing = &worker.metadata().spec.labels;
-                let mut updated_labels = existing.clone();
-                if let Some(ref new_labels) = request.labels {
-                    for (key, value) in new_labels {
-                        updated_labels.insert(key.clone(), value.clone());
-                    }
-                }
+                // A window set here is the worker's only window, as at
+                // registration (see `create_worker::merge_labels`).
+                let updated_labels = match request.labels {
+                    Some(ref new_labels) => merge_labels(existing, new_labels),
+                    None => existing.clone(),
+                };
                 // A `constrained_decoding` label sent in the update must name a
                 // policy, as at registration (`create_worker`): a typo would
                 // otherwise read as `requested` from here on.
@@ -518,6 +519,7 @@ mod tests {
                     .dp_config(1, 2)
                     .label("block_size", "16")
                     .label("tier", "silver")
+                    .label("max_num_seqs", "256")
                     .priority(2)
                     .cost(1.5)
                     .health_config(HealthCheckConfig {
@@ -532,7 +534,12 @@ mod tests {
             let mut ctx = make_context(
                 Arc::clone(&app_ctx),
                 Arc::clone(&worker),
-                HashMap::from([("tier".to_string(), "gold".to_string())]),
+                HashMap::from([
+                    ("tier".to_string(), "gold".to_string()),
+                    // A window set by the update is the worker's only window:
+                    // the discovered one under the other name goes.
+                    ("max_running_requests".to_string(), "512".to_string()),
+                ]),
             );
             ctx.data.config.priority = Some(9);
             ctx.data.config.health = Some(HealthCheckUpdate {
@@ -567,6 +574,12 @@ mod tests {
             assert_eq!(updated.pd_pairing().key(), pair_key);
             assert_eq!(updated.metadata().spec.labels["tier"], "gold");
             assert_eq!(updated.metadata().spec.labels["block_size"], "16");
+            assert_eq!(
+                updated.metadata().spec.labels["max_running_requests"],
+                "512"
+            );
+            assert_eq!(updated.metadata().spec.labels.get("max_num_seqs"), None);
+            assert_eq!(updated.max_running_requests(), Some(512));
             assert_eq!(updated.priority(), 9);
             assert_eq!(updated.cost(), 1.5);
             assert_eq!(updated.metadata().health_config.timeout_secs, 7);

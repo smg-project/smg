@@ -62,11 +62,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             });
         }
 
-        // Merge labels: discovered first, then config (config takes precedence)
-        let mut labels = context.data.discovered_labels.clone();
-        for (key, value) in &config.labels {
-            labels.insert(key.clone(), value.clone());
-        }
+        // Merge labels: discovered first, then config (config takes precedence;
+        // a window set by hand is the worker's only window, see `merge_labels`).
+        let mut labels = merge_labels(&context.data.discovered_labels, &config.labels);
 
         validate_constrained_decoding_label(&labels, &config.url, "create_worker")?;
         let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
@@ -806,6 +804,32 @@ fn validate_zmq_worker_type(
     Ok(())
 }
 
+/// The worker's labels: the discovered ones with the operator's (`by_hand`,
+/// the spec's own) on top. A window the operator set by hand is the
+/// worker's only window: a discovered window under the other name is
+/// dropped, since the reader prefers `max_num_seqs` to `max_running_requests`
+/// and would otherwise take the engine's figure over the operator's, on
+/// every worker, expanded per rank or not. A label update through the admin
+/// API merges the same way (`update_worker_properties`), so the rule holds
+/// after registration too.
+pub(super) fn merge_labels(
+    discovered: &HashMap<String, String>,
+    by_hand: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut labels = discovered.clone();
+    if WINDOW_LABELS.iter().any(|key| by_hand.contains_key(*key)) {
+        for key in WINDOW_LABELS {
+            if !by_hand.contains_key(key) {
+                labels.remove(key);
+            }
+        }
+    }
+    for (key, value) in by_hand {
+        labels.insert(key.clone(), value.clone());
+    }
+    labels
+}
+
 /// The labels of one dp-aware rank worker: the engine's labels as they are,
 /// except the running window of an engine that splits it across its
 /// attention-DP workers (the `enable_dp_attention` / `attn_dp_size` labels:
@@ -817,11 +841,8 @@ fn validate_zmq_worker_type(
 /// unexpanded worker stands for the whole engine and keeps the whole window.
 /// A window the operator set by hand on the worker (`set_by_hand`, the
 /// spec's own labels, which win the merge) is the operator's statement
-/// about each rank worker: it stays as set and is the rank worker's only
-/// window (a discovered window under the other name is dropped, since the
-/// reader prefers `max_num_seqs` to `max_running_requests` and would
-/// otherwise take the engine's figure over the operator's); only a
-/// discovered window is shared.
+/// about each rank worker and stays as set (`merge_labels` already made it
+/// the worker's only window); only a discovered window is shared.
 fn labels_for_rank(
     labels: &HashMap<String, String>,
     dp: Option<(usize, usize)>,
@@ -834,15 +855,12 @@ fn labels_for_rank(
     let Some(width) = attention_dp_width(&labels, size) else {
         return labels;
     };
+    // A hand-set window is the worker's only window (the merge dropped the
+    // discovered one): nothing to share.
     if WINDOW_LABELS
         .iter()
         .any(|key| set_by_hand.contains_key(*key))
     {
-        for key in WINDOW_LABELS {
-            if !set_by_hand.contains_key(key) {
-                labels.remove(key);
-            }
-        }
         return labels;
     }
     for key in WINDOW_LABELS {
@@ -1928,7 +1946,7 @@ mod tests {
 mod rank_window_tests {
     use std::collections::HashMap;
 
-    use super::labels_for_rank;
+    use super::{labels_for_rank, merge_labels};
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -1945,37 +1963,48 @@ mod rank_window_tests {
         labels_for_rank(engine, dp, &HashMap::new())
     }
 
-    /// A window the operator set by hand on the worker is the operator's
-    /// statement about each rank worker: it stays as set, while a
-    /// discovered window under the other name is dropped rather than
-    /// divided, so the reader's preference between the names cannot
-    /// override the operator's figure; the other labels ride along.
+    /// A window the operator set by hand on the worker is the worker's only
+    /// window, whichever name the operator used: the merge drops a
+    /// discovered window under the other name (the reader prefers
+    /// `max_num_seqs`, which would otherwise override the operator's
+    /// figure), on an attention-DP engine, a plain data-parallel one and an
+    /// unexpanded worker alike; the other labels merge as before, the
+    /// operator's on top.
     #[test]
-    fn a_window_the_operator_set_by_hand_stays_as_set() {
-        let by_hand = labels(&[("max_running_requests", "2048")]);
-        let engine = labels(&[
-            ("max_running_requests", "2048"),
-            ("max_num_seqs", "8192"),
-            ("enable_dp_attention", "true"),
-            ("dp_size", "8"),
+    fn a_window_the_operator_set_by_hand_is_the_workers_only_window() {
+        let by_hand = labels(&[("max_running_requests", "512"), ("served_model_name", "m")]);
+        let replicas = labels(&[
+            ("max_num_seqs", "256"),
+            ("dp_size", "4"),
+            ("served_model_name", "engine"),
         ]);
-        let rank = labels_for_rank(&engine, Some((3, 8)), &by_hand);
+        let merged = merge_labels(&replicas, &by_hand);
         assert_eq!(
-            rank.get("max_running_requests").map(String::as_str),
-            Some("2048")
+            merged,
+            labels(&[
+                ("max_running_requests", "512"),
+                ("dp_size", "4"),
+                ("served_model_name", "m"),
+            ])
         );
-        assert_eq!(rank.get("max_num_seqs"), None);
-        assert_eq!(rank.get("dp_size").map(String::as_str), Some("8"));
+        assert_eq!(labels_for_rank(&merged, Some((1, 4)), &by_hand), merged);
+        assert_eq!(labels_for_rank(&merged, None, &by_hand), merged);
 
         let by_hand = labels(&[("max_num_seqs", "512")]);
-        let engine = labels(&[
-            ("max_running_requests", "16384"),
-            ("max_num_seqs", "512"),
-            ("attn_dp_size", "8"),
-        ]);
-        let rank = labels_for_rank(&engine, Some((0, 8)), &by_hand);
+        let attention = labels(&[("max_running_requests", "16384"), ("attn_dp_size", "8")]);
+        let merged = merge_labels(&attention, &by_hand);
+        assert_eq!(merged.get("max_running_requests"), None);
+        let rank = labels_for_rank(&merged, Some((0, 8)), &by_hand);
         assert_eq!(rank.get("max_num_seqs").map(String::as_str), Some("512"));
-        assert_eq!(rank.get("max_running_requests"), None);
+
+        let nothing_by_hand = labels(&[("served_model_name", "m")]);
+        let both = labels(&[("max_running_requests", "2048"), ("max_num_seqs", "256")]);
+        let merged = merge_labels(&both, &nothing_by_hand);
+        assert_eq!(
+            merged.get("max_running_requests").map(String::as_str),
+            Some("2048")
+        );
+        assert_eq!(merged.get("max_num_seqs").map(String::as_str), Some("256"));
     }
 
     /// An engine that splits its running window across its attention-DP
