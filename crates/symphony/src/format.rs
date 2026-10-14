@@ -165,6 +165,12 @@ pub enum CallSyntax {
     /// the region ends at the next call's opener or the end of the turn, since the template writes
     /// no closing marker.
     NamedArguments(&'static str),
+    /// The arguments object alone, named by the function the request forces
+    /// (`Declared::forced`): what the engine writes under the JSON-schema constraint the gateway
+    /// builds when `tool_choice` names a function, the one shape known from the request rather
+    /// than from the model. The table's one state is an arguments state entered at the output's
+    /// start; the object's close ends the call, and what follows is wrapping or malformed.
+    ForcedArguments,
     /// Gemma's `call:NAME{key:value,…}`: keys bare, a string between two tokens, numbers and
     /// words bare, lists and objects nested the same way, the keys sorted by the template, in the
     /// family's spelling of the string token and the null word (Gemma 4: `<|"|>` and `null`;
@@ -208,9 +214,12 @@ impl CallSyntax {
             Self::NamedJson(marker) | Self::NamedArguments(marker) => vec![*marker],
             Self::Gemma(spelling) => vec![spelling.string],
             Self::Shaped(shape) => shape.tag_texts(),
-            Self::Json | Self::Pythonic(_) | Self::JsonList | Self::JsonAlone | Self::Xml => {
-                Vec::new()
-            }
+            Self::Json
+            | Self::Pythonic(_)
+            | Self::JsonList
+            | Self::JsonAlone
+            | Self::ForcedArguments
+            | Self::Xml => Vec::new(),
         }
     }
 }

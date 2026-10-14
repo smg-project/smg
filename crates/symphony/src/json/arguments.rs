@@ -59,7 +59,7 @@ impl Strings for AsWritten {
 }
 
 /// The whitespace JSON allows before a value.
-fn json_space(c: char) -> bool {
+pub(crate) fn json_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r')
 }
 

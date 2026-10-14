@@ -8,10 +8,12 @@
 //! one call's growing object into the events of that call, on top of the outline and the prefix;
 //! [`named_arguments`] does the same for a call whose name stands before a marker and whose object
 //! is the arguments alone; [`arguments`] for a call's arguments alone, written as one value, the
-//! call named elsewhere.
+//! call named elsewhere; [`forced`] runs it for the call the request forces, whose arguments are
+//! the whole output.
 
 pub mod arguments;
 pub mod assembler;
+pub mod forced;
 pub mod list;
 pub mod named;
 pub mod named_arguments;

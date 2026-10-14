@@ -234,12 +234,16 @@ impl<'a> Lookup<'a> {
     }
 }
 
-/// The parameter types a request's tools declare, by function name and then parameter name.
+/// What a request declares about its calls: the parameter types its tools declare, by function
+/// name and then parameter name, and the function its `tool_choice` forces, when it names one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Declared {
     functions: HashMap<String, HashMap<String, Kind>>,
     /// Each function's `parameters` schema, for a kind below the top level.
     schemas: HashMap<String, Value>,
+    /// The function the request forces, whose arguments alone the output is under the gateway's
+    /// JSON-schema constraint ([`formats::forced`](crate::formats::forced())).
+    forced: Option<String>,
 }
 
 impl Declared {
@@ -256,7 +260,23 @@ impl Declared {
                 .entry(tool.function.name.clone())
                 .or_insert_with(|| tool.function.parameters.clone());
         }
-        Self { functions, schemas }
+        Self {
+            functions,
+            schemas,
+            forced: None,
+        }
+    }
+
+    /// With the function `name` the request forces (`tool_choice` naming it), for the format that
+    /// reads its arguments alone.
+    pub fn forcing(mut self, name: impl Into<String>) -> Self {
+        self.forced = Some(name.into());
+        self
+    }
+
+    /// The function the request forces, if it names one.
+    pub fn forced(&self) -> Option<&str> {
+        self.forced.as_deref()
     }
 
     /// The kind `function` declares for `parameter`, if it declares one.

@@ -557,6 +557,9 @@ impl Format {
                 shaped::calls(self, shape, self.layout()?, &named, count)?,
                 options.at_least_one,
             ),
+            // The forced call's constraint is the request's own schema, which the gateway writes
+            // for the function `tool_choice` names; the format derives nothing of its own.
+            CallSyntax::ForcedArguments => return None,
         };
         self.led(calls, options.reasoning_open, prefixed)
             .map(|grammar| self.bounded(grammar))

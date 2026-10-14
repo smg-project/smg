@@ -26,7 +26,9 @@ markers; for MiniMax M3, the XML tree of elements with the table's separator bef
 `xml` module); Gemma's `call:NAME{key:value}` spelling, the keys sorted and each string between the
 table's tokens, `<|"|>` for Gemma 4 and `<escape>` for FunctionGemma, which also writes a null as
 `None` (the `gemma` module); for Inkling, the call marker and a JSON object whose `args` the
-schema accepts, wherever the marker stands in a message. The gateway's old parsers wrote these tags
+schema accepts, wherever the marker stands in a message. The forced call's format (`forced`) derives
+no tag: its constraint is the request's own schema, which the gateway writes. The gateway's old
+parsers wrote these tags
 by hand, one function per parser; where one exists for a format Symphony has, the derived tag is
 pinned to it in the tests, so the switch changes nothing an engine sees.
 

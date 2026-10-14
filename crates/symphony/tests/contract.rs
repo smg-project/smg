@@ -309,6 +309,13 @@ fn function_gemma() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::function_gemma(), Declared::default()))
 }
 
+fn forced() -> Box<dyn Parser> {
+    Box::new(Engine::new(
+        formats::forced(),
+        Declared::default().forcing("get_weather"),
+    ))
+}
+
 fn plain() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::plain(), Declared::default()))
 }
@@ -796,6 +803,11 @@ const FORMATS: &[Subject] = &[
         new: params_tags,
         outputs: PARAMS_TAGS_OUTPUTS,
     },
+    Subject {
+        name: "forced",
+        new: forced,
+        outputs: FORCED_OUTPUTS,
+    },
 ];
 
 /// The Qwen 3.5 serve template: a thought, an answer and a call; two calls; a close without the
@@ -1097,6 +1109,19 @@ const FUNCTION_GEMMA_OUTPUTS: &[&str] = &[
     "<start_function_call>call:get_weather{} trailing<end_function_call>",
     "<start_function_call>call:f{a:<esc",
     "Hello!",
+];
+
+/// The forced call's arguments alone, as the engine writes them under the gateway's schema for a
+/// named function: whole, wrapped in whitespace, cut short, broken, followed by text, blank.
+const FORCED_OUTPUTS: &[&str] = &[
+    "{\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}",
+    "  {\"city\": \"Paris\"}\n",
+    "{\"city\": \"Par",
+    "{\"city\": @}",
+    "{\"city\": \"Paris\"} trailing",
+    "{}",
+    "   ",
+    "[1, 2]",
 ];
 
 /// Seed-OSS: the tagged syntax under its own markers, a value as Python's repr, and Qwen's
