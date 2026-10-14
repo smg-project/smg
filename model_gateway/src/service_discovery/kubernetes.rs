@@ -1,3 +1,24 @@
+//! Kubernetes worker discovery: the Pods a label selector names, as workers.
+//!
+//! A reflector keeps a store of the Pods in view consistent with the API
+//! server (initial list, watch, re-list on desync, reconnect with backoff);
+//! every watch event and a periodic tick run one level-triggered pass that
+//! turns the store into the published workers and hands them to the shared
+//! reconciler. What a Pod publishes:
+//!
+//! - It is in view when its labels match the worker selector, or in
+//!   disaggregated routing any of the role selectors; its role is the first
+//!   role selector it matches, in encode, prefill, decode order.
+//! - It is published only while Ready and Running and not being deleted: a
+//!   terminating Pod leaves the desired set at the start of its grace period.
+//! - It publishes one worker per data port (the worker-ports annotation, else
+//!   the configured port), identified as `{pod uid}:{port}`, so a Pod
+//!   recreated at the same address is a new instance and a container restart
+//!   inside it is not.
+//!
+//! Ownership, the registry diff and the job submissions belong to the shared
+//! reconciler; nothing here reads the registry.
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
@@ -5,13 +26,13 @@ use std::{
     time::Duration,
 };
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     api::Api,
     runtime::{
         reflector::{self, Store},
-        watcher::{watcher, Config},
+        watcher::{self, watcher, Config},
         WatchStreamExt,
     },
     Client,
@@ -129,36 +150,57 @@ impl ServiceDiscoveryConfig {
             let Some(first) = selectors.first() else {
                 return String::new();
             };
-            first
-                .iter()
-                .filter(|(k, v)| {
-                    selectors
-                        .iter()
-                        .skip(1)
-                        .all(|selector| selector.get(*k) == Some(*v))
-                })
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(",")
+            selector_string(first.iter().filter(|(k, v)| {
+                selectors
+                    .iter()
+                    .skip(1)
+                    .all(|selector| selector.get(*k) == Some(*v))
+            }))
         } else {
-            self.selector
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join(",")
+            selector_string(&self.selector)
         }
     }
 
-    fn disaggregated_selectors(&self) -> Vec<&HashMap<String, String>> {
+    /// The role selectors in the order a Pod is matched against them.
+    fn role_selectors(&self) -> [(&HashMap<String, String>, PodType); 3] {
         [
-            &self.encode_selector,
-            &self.prefill_selector,
-            &self.decode_selector,
+            (&self.encode_selector, PodType::Encode),
+            (&self.prefill_selector, PodType::Prefill),
+            (&self.decode_selector, PodType::Decode),
         ]
-        .into_iter()
-        .filter(|selector| !selector.is_empty())
-        .collect()
     }
+
+    /// The role selectors that are set.
+    fn disaggregated_selectors(&self) -> Vec<&HashMap<String, String>> {
+        self.role_selectors()
+            .into_iter()
+            .map(|(selector, _)| selector)
+            .filter(|selector| !selector.is_empty())
+            .collect()
+    }
+
+    /// The role a Pod's labels give it: the first role selector it matches, in
+    /// encode, prefill, decode order, and `Regular` when none does. Outside
+    /// disaggregated routing every Pod is `Regular`; the role selectors are
+    /// not read.
+    fn pod_type_of(&self, pod: &Pod) -> PodType {
+        if !self.disaggregated_mode {
+            return PodType::Regular;
+        }
+        self.role_selectors()
+            .into_iter()
+            .find(|(selector, _)| PodInfo::matches_selector(pod, selector))
+            .map_or(PodType::Regular, |(_, role)| role)
+    }
+}
+
+/// A selector as the API server reads it: `key=value` pairs joined by commas.
+fn selector_string<'a>(pairs: impl IntoIterator<Item = (&'a String, &'a String)>) -> String {
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Build a kube watcher Config that pushes the given label selector down to
@@ -203,6 +245,18 @@ pub enum PodType {
     Prefill,
     Decode,
     Regular,
+}
+
+impl PodType {
+    /// The worker pool a Pod of this role joins.
+    fn worker_type(&self) -> WorkerType {
+        match self {
+            Self::Encode => WorkerType::Encode,
+            Self::Prefill => WorkerType::Prefill,
+            Self::Decode => WorkerType::Decode,
+            Self::Regular => WorkerType::Regular,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -256,61 +310,26 @@ impl PodInfo {
 
     pub fn from_pod(pod: &Pod, config: Option<&ServiceDiscoveryConfig>) -> Option<Self> {
         let name = pod.metadata.name.clone()?;
-        let uid = match pod.metadata.uid.clone() {
-            Some(uid) => uid,
-            None => {
-                warn!(
-                    "Pod {} has no UID, skipping -- cannot track identity for reconciliation",
-                    name
-                );
-                return None;
-            }
+        let Some(uid) = pod.metadata.uid.clone() else {
+            warn!(
+                "Pod {} has no UID, skipping -- cannot track identity for reconciliation",
+                name
+            );
+            return None;
         };
         let status = pod.status.clone()?;
-        let raw_ip = status.pod_ip?;
-        // Parsed rather than kept as a string so the worker URL renders an
-        // IPv6 address in bracketed form; `format!("{ip}:{port}")` would
-        // produce the unusable `fd00::1:8080`.
-        let pod_ip: IpAddr = match raw_ip.parse() {
-            Ok(ip) => ip,
-            Err(e) => {
-                warn!("Pod {} has an unparsable Pod IP '{}': {e}", name, raw_ip);
-                return None;
-            }
-        };
-
-        let is_ready = if let Some(conditions) = &status.conditions {
+        let ip = pod_ip(&name, &status.pod_ip?)?;
+        let is_ready = status.conditions.as_ref().is_some_and(|conditions| {
             conditions
                 .iter()
                 .any(|condition| condition.type_ == "Ready" && condition.status == "True")
-        } else {
-            false
-        };
-
+        });
         let pod_status = status.phase.unwrap_or_else(|| "Unknown".to_string());
 
-        let pod_type = if let Some(config) = config {
-            if config.disaggregated_mode {
-                if Self::matches_selector(pod, &config.encode_selector) {
-                    Some(PodType::Encode)
-                } else if Self::matches_selector(pod, &config.prefill_selector) {
-                    Some(PodType::Prefill)
-                } else if Self::matches_selector(pod, &config.decode_selector) {
-                    Some(PodType::Decode)
-                } else {
-                    Some(PodType::Regular)
-                }
-            } else {
-                Some(PodType::Regular)
-            }
-        } else {
-            None
-        };
-
+        let pod_type = config.map(|config| config.pod_type_of(pod));
         let ports = config
             .map(|config| resolve_worker_ports(&name, pod, config))
             .unwrap_or_default();
-
         let bootstrap_ports = if matches!(&pod_type, Some(PodType::Encode | PodType::Prefill)) {
             config
                 .map(|config| resolve_bootstrap_ports(&name, pod, config, ports.len()))
@@ -318,33 +337,18 @@ impl PodInfo {
         } else {
             vec![None; ports.len()]
         };
-        let kv_connector = config.and_then(|config| {
-            let connector = annotation_value(pod, &config.kv_connector_annotation)?;
-            if connector != MOONCAKE_CONNECTOR
-                && connector != NIXL_CONNECTOR
-                && connector_profile(connector) != KvTransferProfile::Store
-            {
-                warn!(
-                    "Pod {}: {} annotation '{}' is not a connector with explicit PD handling; \
-                     using passthrough behavior",
-                    name, config.kv_connector_annotation, connector
-                );
-            }
-            Some(connector.to_string())
-        });
+        let kv_connector = config.and_then(|config| kv_connector_of(&name, pod, config));
         let kv_engine_ids = config
             .map(|config| resolve_kv_engine_ids(&name, pod, config, ports.len()))
             .unwrap_or_else(|| vec![None; ports.len()]);
-
-        // Extract model_id override from pod metadata if source is configured
         let model_id_override = config
-            .and_then(|c| c.model_id_source.as_ref())
+            .and_then(|config| config.model_id_source.as_ref())
             .and_then(|source| source.extract(pod));
 
         Some(PodInfo {
             name,
             uid,
-            ip: pod_ip,
+            ip,
             status: pod_status,
             is_ready,
             pod_type,
@@ -359,6 +363,32 @@ impl PodInfo {
     pub fn is_healthy(&self) -> bool {
         self.is_ready && self.status == "Running"
     }
+}
+
+/// The Pod's address, parsed rather than kept as a string so the worker URL
+/// renders an IPv6 address in bracketed form; `format!("{ip}:{port}")` on the
+/// string would produce the unusable `fd00::1:8080`.
+fn pod_ip(name: &str, raw: &str) -> Option<IpAddr> {
+    raw.parse()
+        .inspect_err(|e| warn!("Pod {} has an unparsable Pod IP '{}': {e}", name, raw))
+        .ok()
+}
+
+/// The KV connector a Pod announces. One the disaggregated pairing has no
+/// profile for is passed through as named, with a warning.
+fn kv_connector_of(name: &str, pod: &Pod, config: &ServiceDiscoveryConfig) -> Option<String> {
+    let connector = annotation_value(pod, &config.kv_connector_annotation)?;
+    if connector != MOONCAKE_CONNECTOR
+        && connector != NIXL_CONNECTOR
+        && connector_profile(connector) != KvTransferProfile::Store
+    {
+        warn!(
+            "Pod {}: {} annotation '{}' is not a connector with explicit PD handling; \
+             using passthrough behavior",
+            name, config.kv_connector_annotation, connector
+        );
+    }
+    Some(connector.to_string())
 }
 
 /// Parse a comma-separated port list. Preserves order, rejects 0 and junk.
@@ -494,44 +524,17 @@ fn run_service_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
 ) -> task::JoinHandle<()> {
-    // Log the appropriate selectors based on mode
     if config.disaggregated_mode {
-        let encode_selector = config
-            .encode_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let prefill_selector = config
-            .prefill_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let decode_selector = config
-            .decode_selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
-
         info!(
             "Starting K8s service discovery | disaggregated mode | encode: '{}' | prefill: '{}' | decode: '{}'",
-            encode_selector, prefill_selector, decode_selector
+            selector_string(&config.encode_selector),
+            selector_string(&config.prefill_selector),
+            selector_string(&config.decode_selector)
         );
     } else {
-        let label_selector = config
-            .selector
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(",");
-
         info!(
             "Starting K8s service discovery | selector: '{}'",
-            label_selector
+            selector_string(&config.selector)
         );
     }
 
@@ -548,78 +551,75 @@ fn run_service_discovery(
 
         debug!("K8s service discovery initialized");
 
-        let config_arc = Arc::new(config);
-
         // Level-triggered reconcile: the reflector keeps `store` consistent
         // with the API server (initial LIST → watch, re-LIST on desync,
         // reconnect with internal backoff). Every watch event and a periodic
         // tick trigger one pass diffing desired workers against the registry.
         let (store, writer) = reflector::store::<Pod>();
-        let notify = Arc::new(Notify::new());
+        let notify = Notify::new();
 
-        let watcher_config = build_watcher_config(&config_arc.list_label_selector());
+        let watcher_config = build_watcher_config(&config.list_label_selector());
         // managed_fields dominate pod object size and nothing here reads them;
         // pruning keeps the long-lived Store lean.
-        let mut stream = watcher(pods, watcher_config)
+        let stream = watcher(pods, watcher_config)
             .modify(|pod| pod.metadata.managed_fields = None)
             .default_backoff()
             .reflect(writer)
             .boxed();
 
-        let driver = {
-            let notify = Arc::clone(&notify);
-            async move {
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(_) => notify.notify_one(),
-                        Err(e) => {
-                            error!("K8s worker watcher error (auto-retrying with backoff): {e}");
-                        }
-                    }
-                }
-                error!("K8s worker watcher stream ended; discovery no longer receives updates");
-            }
-        };
-
-        let reconciler = async {
-            if store.wait_until_ready().await.is_err() {
-                error!("K8s worker watcher dropped before initial sync; reconciliation disabled");
-                return;
-            }
-            info!(
-                "K8s worker store synced, reconciling on change and every {}s",
-                config_arc.check_interval.as_secs()
-            );
-            let mut interval = time::interval(config_arc.check_interval);
-            interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    () = notify.notified() => {
-                        // Coalesce event bursts (relists, rollouts) into one pass.
-                        time::sleep(Duration::from_secs(1)).await;
-                    }
-                    _ = interval.tick() => {}
-                }
-                reconcile_once(&store, &config_arc, &app_context).await;
-            }
-        };
-
-        tokio::join!(driver, reconciler);
+        tokio::join!(
+            drive_watch(stream, &notify),
+            reconcile_on_change(&store, &notify, &config, &app_context)
+        );
     });
 
     handle
 }
 
-fn worker_type_for(pod_type: Option<&PodType>, disaggregated_mode: bool) -> WorkerType {
-    if disaggregated_mode {
-        match pod_type {
-            Some(PodType::Encode) => WorkerType::Encode,
-            Some(PodType::Prefill) => WorkerType::Prefill,
-            Some(PodType::Decode) => WorkerType::Decode,
-            _ => WorkerType::Regular,
+/// Wake the reconcile loop on every watch event. A watcher error is logged;
+/// the stream itself retries with its own backoff.
+async fn drive_watch(
+    mut stream: impl Stream<Item = watcher::Result<watcher::Event<Pod>>> + Unpin,
+    notify: &Notify,
+) {
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(_) => notify.notify_one(),
+            Err(e) => {
+                error!("K8s worker watcher error (auto-retrying with backoff): {e}");
+            }
         }
-    } else {
-        WorkerType::Regular
+    }
+    error!("K8s worker watcher stream ended; discovery no longer receives updates");
+}
+
+/// One reconcile pass on every notification, coalesced, and on every tick,
+/// once the store holds the initial list.
+async fn reconcile_on_change(
+    store: &Store<Pod>,
+    notify: &Notify,
+    config: &ServiceDiscoveryConfig,
+    app_context: &Arc<AppContext>,
+) {
+    if store.wait_until_ready().await.is_err() {
+        error!("K8s worker watcher dropped before initial sync; reconciliation disabled");
+        return;
+    }
+    info!(
+        "K8s worker store synced, reconciling on change and every {}s",
+        config.check_interval.as_secs()
+    );
+    let mut interval = time::interval(config.check_interval);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            () = notify.notified() => {
+                // Coalesce event bursts (relists, rollouts) into one pass.
+                time::sleep(Duration::from_secs(1)).await;
+            }
+            _ = interval.tick() => {}
+        }
+        reconcile_once(store, config, app_context).await;
     }
 }
 
@@ -659,7 +659,10 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
             workers.push(DiscoveredWorker {
                 discovery_id: format!("{}:{port}", info.uid),
                 endpoint,
-                worker_type: worker_type_for(info.pod_type.as_ref(), config.disaggregated_mode),
+                worker_type: info
+                    .pod_type
+                    .as_ref()
+                    .map_or(WorkerType::Regular, PodType::worker_type),
                 bootstrap_port: info.bootstrap_ports.get(index).copied().flatten(),
                 model_id_override: info.model_id_override.clone(),
                 kv_connector: info.kv_connector.clone(),
@@ -974,6 +977,29 @@ mod tests {
         assert!(pod_info.is_ready);
         assert_eq!(pod_info.pod_type, Some(PodType::Regular));
         assert_eq!(pod_info.bootstrap_ports, vec![None]);
+    }
+
+    /// The role is the first role selector a Pod matches, in encode, prefill,
+    /// decode order; a Pod matching none is Regular, and outside disaggregated
+    /// routing every Pod is Regular whatever its labels say.
+    #[test]
+    fn the_first_matching_role_selector_names_the_pod_type() {
+        let mut config = create_pd_config();
+        config.encode_selector = HashMap::from([("component".to_string(), "prefill".to_string())]);
+        let prefill_pod = create_pd_k8s_pod("prefill-pod", "10.0.0.1", "prefill", None);
+        let other_pod = make_labeled_pod("other-pod", "10.0.0.2", &[("app", "other")]);
+
+        assert_eq!(
+            config.pod_type_of(&prefill_pod),
+            PodType::Encode,
+            "a Pod matching the encode and the prefill selector is encode: the first match"
+        );
+        config.encode_selector.clear();
+        assert_eq!(config.pod_type_of(&prefill_pod), PodType::Prefill);
+        assert_eq!(config.pod_type_of(&other_pod), PodType::Regular);
+
+        config.disaggregated_mode = false;
+        assert_eq!(config.pod_type_of(&prefill_pod), PodType::Regular);
     }
 
     #[test]
