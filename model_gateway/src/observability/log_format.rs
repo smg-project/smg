@@ -135,7 +135,7 @@ where
         let normalized = event.normalized_metadata();
         let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
 
-        let mut timestamp = String::with_capacity(TIME_FORMAT.len());
+        let mut timestamp = String::with_capacity(32);
         self.timer.format_time(&mut Writer::new(&mut timestamp))?;
         writer.write_str("{\"timestamp\":")?;
         write_json(&mut writer, &timestamp)?;
@@ -418,7 +418,8 @@ mod tests {
     }
 
     /// Every field kind the gateway's spans and events use, from one set of
-    /// callsites, so two formats see identical metadata.
+    /// callsites, so two formats see identical metadata; a record bridged
+    /// from the `log` facade among the events.
     fn scenario() {
         let request = info_span!(
             target: "smg::otel-trace",
@@ -461,6 +462,17 @@ mod tests {
             info!(parent: &request, "explicit parent while another span is current");
             upstream.record("empty", 7u64);
             info!("the recorded field is on the span now");
+            // A record bridged from the `log` facade: its own target, file
+            // and line, the `log.*` fields flattened into the line.
+            let _ = tracing_log::format_trace(
+                &tracing_log::log::Record::builder()
+                    .level(tracing_log::log::Level::Warn)
+                    .target("hyper::proto")
+                    .file(Some("src/proto.rs"))
+                    .line(Some(7))
+                    .args(format_args!("bridged {}", 1))
+                    .build(),
+            );
         }
         request.record("status_code", 200u64);
         request.record("latency", 1234u64);
@@ -499,7 +511,7 @@ mod tests {
     fn the_lines_are_those_of_the_stock_json_format() {
         let stock = stock_lines();
         let fast = fast_lines();
-        assert_eq!(stock.lines().count(), 6, "{stock}");
+        assert_eq!(stock.lines().count(), 7, "{stock}");
         for (stock_line, fast_line) in stock.lines().zip(fast.lines()) {
             assert_eq!(fast_line, stock_line);
         }
