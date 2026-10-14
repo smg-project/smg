@@ -687,7 +687,10 @@ async fn apply_probe_completion(
     };
 
     if let Some((old, new)) = transition {
-        debug!(
+        // At INFO: a worker that leaves or rejoins routing is the line an
+        // outage is read from (a refusal names the pool's healthy count, not
+        // why it moved); the probe failures behind it are WARN lines already.
+        info!(
             worker_url = %worker.url(),
             ?old,
             ?new,
@@ -1466,6 +1469,7 @@ mod tests {
     /// open circuit breaker on trial too, or a restarted engine is Ready and
     /// still unroutable until the breaker's timeout.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn a_passing_probe_run_readmits_a_demoted_worker_with_its_breaker_on_trial() {
         let registry = Arc::new(WorkerRegistry::new());
         let worker = make_worker("http://w:1", 1, 1);
@@ -1495,6 +1499,9 @@ mod tests {
             applied,
             ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
         ));
+        // The transition is the INFO line an outage is read from.
+        assert!(logs_contain("Worker status transition"));
+        assert!(logs_contain("new=Ready"));
         assert_eq!(worker.status(), WorkerStatus::Ready);
         assert_eq!(
             worker.circuit_breaker_state(),
