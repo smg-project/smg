@@ -1002,7 +1002,16 @@ pub const TOKIO_WORKER_THREADS: &str = "TOKIO_WORKER_THREADS";
 /// [`DEFAULT_RUNTIME_WORKER_THREADS_CAP`], never below 1, and the cap when
 /// the parallelism cannot be read.
 pub fn runtime_worker_threads(explicit: Option<usize>) -> Result<usize, String> {
-    let env_setting = std::env::var(TOKIO_WORKER_THREADS).ok();
+    // Set but not UTF-8 is a setting, not an absence: refused as tokio refuses it.
+    let env_setting = match std::env::var(TOKIO_WORKER_THREADS) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            return Err(format!(
+                "{TOKIO_WORKER_THREADS}={raw:?} is not a positive integer"
+            ));
+        }
+    };
     runtime_worker_threads_from(
         explicit,
         env_setting.as_deref(),
@@ -1660,7 +1669,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     info!(
         worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
         pinned = config.runtime_worker_threads.is_some(),
-        tokio_worker_threads_env = std::env::var(TOKIO_WORKER_THREADS).is_ok(),
+        tokio_worker_threads_env = std::env::var_os(TOKIO_WORKER_THREADS).is_some(),
         "Tokio runtime sized"
     );
     // A pinned count well above the CPUs available to the process is the
