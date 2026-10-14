@@ -4282,6 +4282,8 @@ mod pd_usage_tests;
 mod symphony_tests;
 
 #[cfg(test)]
+mod delta_slicing_tests;
+#[cfg(test)]
 mod sse_bytes_tests;
 #[cfg(test)]
 mod usage_tests;

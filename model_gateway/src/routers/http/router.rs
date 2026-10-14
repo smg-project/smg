@@ -4942,6 +4942,234 @@ mod tests {
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
     }
+
+    // --- Streamed deltas per provider profile ---------------------------------
+    //
+    // The delta re-slicing of `routers::common::sse_rechunk` is MiniMax's
+    // stream contract and applies to MiniMax models only: under every other
+    // model id, and under a served model aliased under another vendor's name,
+    // the relay forwards every upstream SSE event before the next one exists.
+    // A guard: these tests pass on the code they were written against.
+
+    /// Deltas per stream: two characters each, so a re-slicer holds all of
+    /// them (their total stays under its slice threshold) until an idle flush
+    /// or the end of the stream.
+    const RELAY_DELTAS: usize = 12;
+    /// The upstream parks after this many deltas until the client has read
+    /// their text: whatever the client reads meanwhile left before the next
+    /// delta existed, with no clock in the assertion.
+    const RELAY_PARK_AFTER: usize = RELAY_DELTAS / 2;
+    /// The client's patience per half; a path that held the deltas back
+    /// fails here instead of hanging the suite.
+    const RELAY_PATIENCE: Duration = Duration::from_secs(10);
+
+    /// The text of upstream delta `i`.
+    fn relay_text(i: usize) -> String {
+        format!("{i:02}")
+    }
+
+    /// A worker whose chat completion streams `RELAY_DELTAS` short deltas and
+    /// `[DONE]`, parked after `RELAY_PARK_AFTER` of them until `resume` fires.
+    async fn spawn_parked_sse_worker(resume: Arc<tokio::sync::Notify>) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |_body: Bytes| {
+                let resume = resume.clone();
+                async move {
+                    let frames = stream::unfold((0usize, resume), |(i, resume)| async move {
+                        if i > RELAY_DELTAS {
+                            return None;
+                        }
+                        if i == RELAY_PARK_AFTER {
+                            resume.notified().await;
+                        }
+                        let frame = if i < RELAY_DELTAS {
+                            format!(
+                                "data: {{\"id\":\"chatcmpl-parked\",\"object\":\"chat.completion.chunk\",\
+                                 \"created\":1700000000,\"model\":\"m\",\"choices\":[{{\"index\":0,\
+                                 \"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n",
+                                relay_text(i)
+                            )
+                        } else {
+                            "data: [DONE]\n\n".to_string()
+                        };
+                        Some((Ok::<_, std::io::Error>(Bytes::from(frame)), (i + 1, resume)))
+                    });
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(frames),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The next non-empty content delta of the SSE body, `None` at its end.
+    async fn next_relayed_content_delta(body: &mut Body, pending: &mut Vec<u8>) -> Option<String> {
+        loop {
+            while let Some(end) = pending.windows(2).position(|w| w == b"\n\n") {
+                let event: Vec<u8> = pending.drain(..end + 2).collect();
+                let event = String::from_utf8_lossy(&event);
+                let Some(payload) = event.strip_prefix("data: ") else {
+                    continue;
+                };
+                let Ok(json) = serde_json::from_str::<Value>(payload.trim()) else {
+                    continue;
+                };
+                if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                    if !content.is_empty() {
+                        return Some(content.to_string());
+                    }
+                }
+            }
+            let frame = http_body_util::BodyExt::frame(body)
+                .await?
+                .expect("an SSE frame");
+            if let Some(data) = frame.data_ref() {
+                pending.extend_from_slice(data);
+            }
+        }
+    }
+
+    /// The content deltas of one streamed chat completion for `model` through
+    /// the relay, in two halves: those read while the upstream was parked
+    /// after its `RELAY_PARK_AFTER`th delta, and those read after it resumed.
+    async fn relayed_content_deltas_around_the_park(model: &str) -> (Vec<String>, Vec<String>) {
+        use openai_protocol::validated::Normalizable;
+
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let url = spawn_parked_sse_worker(resume.clone()).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "stream": true,
+        }))
+        .unwrap();
+        request.normalize();
+        let response = router
+            .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{model}");
+        let mut body = response.into_body();
+        let mut pending = Vec::new();
+
+        let parked_text: String = (0..RELAY_PARK_AFTER).map(relay_text).collect();
+        let mut parked = Vec::new();
+        let read = tokio::time::timeout(RELAY_PATIENCE, async {
+            while parked.concat() != parked_text {
+                assert!(
+                    parked_text.starts_with(&parked.concat()),
+                    "{model}: the parked half read as {parked:?}"
+                );
+                let delta = next_relayed_content_delta(&mut body, &mut pending)
+                    .await
+                    .unwrap_or_else(|| panic!("{model}: the stream ended at {parked:?}"));
+                parked.push(delta);
+            }
+        })
+        .await;
+        assert!(
+            read.is_ok(),
+            "{model}: the parked half did not reach the client within {RELAY_PATIENCE:?}: {parked:?}"
+        );
+
+        resume.notify_one();
+        let mut resumed = Vec::new();
+        let read = tokio::time::timeout(RELAY_PATIENCE, async {
+            while let Some(delta) = next_relayed_content_delta(&mut body, &mut pending).await {
+                resumed.push(delta);
+            }
+        })
+        .await;
+        assert!(
+            read.is_ok(),
+            "{model}: the stream did not end within {RELAY_PATIENCE:?} of the upstream resuming: {resumed:?}"
+        );
+        (parked, resumed)
+    }
+
+    /// Every upstream delta left the relay as its own event before the next
+    /// delta existed, on both sides of the park.
+    async fn assert_relay_keeps_one_delta_per_event(model: &str) {
+        let (parked, resumed) = relayed_content_deltas_around_the_park(model).await;
+        let expected = |deltas: std::ops::Range<usize>| deltas.map(relay_text).collect::<Vec<_>>();
+        assert_eq!(
+            parked,
+            expected(0..RELAY_PARK_AFTER),
+            "{model}: one event per upstream delta while the upstream was parked"
+        );
+        assert_eq!(
+            resumed,
+            expected(RELAY_PARK_AFTER..RELAY_DELTAS),
+            "{model}: one event per upstream delta after the upstream resumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_deepseek() {
+        assert_relay_keeps_one_delta_per_event("deepseek-v4.1").await;
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_kimi() {
+        assert_relay_keeps_one_delta_per_event("kimi-k3").await;
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_glm() {
+        assert_relay_keeps_one_delta_per_event("glm-5").await;
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_a_plain_served_model() {
+        assert_relay_keeps_one_delta_per_event("served-plain-relay-model").await;
+    }
+
+    /// A served model aliased under a Kimi name takes Kimi's profile for
+    /// either name (alias names unique to this test: the table is
+    /// process-wide), and Kimi's profile re-slices nothing.
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_a_served_model_aliased_under_a_kimi_name() {
+        ProviderProfile::register_model_aliases([("kimi-k3-relay-guard", "served-relay-guard")]);
+        assert_eq!(
+            ProviderProfile::for_model("served-relay-guard"),
+            ProviderProfile::Kimi
+        );
+        assert_relay_keeps_one_delta_per_event("served-relay-guard").await;
+        assert_relay_keeps_one_delta_per_event("kimi-k3-relay-guard").await;
+    }
+
+    /// MiniMax's stream contract: the relay holds the short deltas and
+    /// re-slices them into fewer, larger events (the parked half leaves on
+    /// the idle flush), the text unchanged.
+    #[tokio::test]
+    async fn the_relay_re_slices_a_minimax_stream_as_the_contract_asks() {
+        let (parked, resumed) = relayed_content_deltas_around_the_park("MiniMax-M3").await;
+        assert!(
+            parked.len() < RELAY_PARK_AFTER,
+            "re-sliced into fewer events than upstream deltas, got {parked:?}"
+        );
+        let all: String = parked.iter().chain(&resumed).map(String::as_str).collect();
+        let expected: String = (0..RELAY_DELTAS).map(relay_text).collect();
+        assert_eq!(
+            all, expected,
+            "the re-slicing changes the cuts, not the text"
+        );
+    }
 }
 
 #[cfg(test)]
