@@ -801,6 +801,23 @@ impl Format {
         &self.name
     }
 
+    /// Whether the table reads calls from the output's first byte, with no marker before them:
+    /// the output starts in an arguments state that no row enters, as xLAM's list and the `json`
+    /// table do. Such a table reads a bare JSON answer as a call. Inkling starts in an arguments
+    /// state too, but a row enters it, and its call has a marker after the tool's name; Llama
+    /// Nemotron writes xLAM's list, but between markers: neither reads a bare answer as a call.
+    pub fn starts_in_calls(&self) -> bool {
+        let starts_in_arguments = self
+            .states
+            .first()
+            .is_some_and(|state| state.emits == Emits::Arguments);
+        starts_in_arguments
+            && !self
+                .transitions
+                .iter()
+                .any(|row| self.states[row.to].emits == Emits::Arguments)
+    }
+
     fn state_named(&self, name: &str) -> usize {
         self.states
             .iter()

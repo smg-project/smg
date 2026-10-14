@@ -121,6 +121,19 @@ mod tests {
     }
 
     #[test]
+    fn the_output_starts_in_calls_here_and_in_xlam_only() {
+        use crate::formats::{inkling, llama_nemotron, plain, qwen3, xlam};
+        assert!(json().starts_in_calls());
+        assert!(xlam().starts_in_calls());
+        assert!(!qwen3(CallSyntax::Json).starts_in_calls());
+        assert!(!plain().starts_in_calls());
+        // Inkling starts in an arguments state, but a row enters it and its call has a marker
+        // after the name; Llama Nemotron writes xLAM's list between markers.
+        assert!(!inkling().starts_in_calls());
+        assert!(!llama_nemotron().starts_in_calls());
+    }
+
+    #[test]
     fn a_forced_call_is_written_as_the_list() {
         let tool: openai_protocol::common::Tool = serde_json::from_value(serde_json::json!({
             "type": "function",

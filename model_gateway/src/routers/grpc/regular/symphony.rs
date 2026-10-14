@@ -82,15 +82,33 @@ pub(crate) fn named_table(names: &Names) -> Option<Table> {
         .and_then(Table::answering_to)
 }
 
-/// The table that reads `request`'s response, if one does: `parser` is Symphony, the request
-/// asks nothing the older path answers differently (the response separates reasoning, and
-/// `tool_choice` is not `none`), and a table is there to read it: the one the model's parser
+/// The table that reads `request`'s response, if one does: the one [`selected`] by the parser
+/// names and the registry, unless the request asks what the older path answers differently. A
+/// table that reads calls from the output's first byte (`json`, `xlam`) reads a bare JSON answer
+/// as a call, so it declines a request that declares no tools: the request asked for no calls,
+/// and the older parsers read none. Preparation and request building both decide with this one
+/// predicate.
+pub(crate) fn reads(
+    parser: ParserChoice,
+    names: &Names,
+    request: &ChatCompletionRequest,
+) -> Option<Format> {
+    let format = selected(parser, names, request)?;
+    let no_tools = request.effective_tools().next().is_none();
+    if format.starts_in_calls() && no_tools {
+        return None;
+    }
+    Some(format)
+}
+
+/// The table `parser` and the parser `names` select for `request`: `parser` is Symphony, the
+/// request asks nothing the older path answers differently (the response separates reasoning,
+/// and `tool_choice` is not `none`), and a table is there to read it: the one the model's parser
 /// `names` select ([`named_table`]), whatever the model, or the registry's for the model when no
 /// name is set, or when a reasoning name alone selects none, since every table reads the thought
 /// channel; `passthrough` alone is the choice to leave the thought as written, which no table
 /// does. A tool-call name no table answers to leaves the response to the legacy parsers.
-/// Preparation and request building both decide with this one predicate.
-pub(crate) fn reads(
+fn selected(
     parser: ParserChoice,
     names: &Names,
     request: &ChatCompletionRequest,
@@ -545,6 +563,55 @@ mod tests {
                 "{alias} is no legacy parser's name"
             );
         }
+    }
+
+    #[test]
+    fn a_table_that_reads_calls_from_the_first_byte_needs_tools() {
+        // `json` and `xlam` read a bare JSON answer as a call: without tools the request asked
+        // for none, so the legacy parsers keep it; a table with call markers reads either way.
+        let json = names(Some("json"), None);
+        let without = request(json!({}));
+        assert!(assign(ParserChoice::Symphony, &json, &without, None, PROMPT).is_none());
+        let tools = serde_json::to_value(tools()).expect("tools");
+        let with = request(json!({"tools": tools}));
+        let assigned = assign(ParserChoice::Symphony, &json, &with, None, PROMPT);
+        assert_eq!(assigned.expect("assigned").format.name(), "json");
+        let xlam = request(json!({"model": "Salesforce/Llama-xLAM-2-8b-fc-r"}));
+        let by_registry = assign(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &xlam,
+            None,
+            PROMPT,
+        );
+        assert!(by_registry.is_none());
+        let qwen = assign(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &without,
+            None,
+            PROMPT,
+        );
+        assert_eq!(qwen.expect("assigned").format.name(), "qwen3");
+        // Inkling starts in an arguments state too, but its call has a marker after the tool's
+        // name, so a bare answer is never a call: the table reads a request without tools.
+        let inkling = assign(
+            ParserChoice::Symphony,
+            &names(Some("inkling"), None),
+            &without,
+            None,
+            PROMPT,
+        );
+        assert_eq!(inkling.expect("assigned").format.name(), "inkling");
+        // Llama Nemotron writes xLAM's list between markers: a bare answer is never a call there.
+        let nemotron = assign(
+            ParserChoice::Symphony,
+            &names(Some("llama_nemotron"), None),
+            &without,
+            None,
+            PROMPT,
+        );
+        assert_eq!(nemotron.expect("assigned").format.name(), "llama_nemotron");
     }
 
     #[test]
