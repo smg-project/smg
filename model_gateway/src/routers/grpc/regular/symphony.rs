@@ -6,10 +6,11 @@
 //! `symphony` on, the parser names set for the model decide ([`reads`]): the `tool_parser` and
 //! `reasoning_parser` of the model's card (worker labels), else the `--tool-call-parser` and
 //! `--reasoning-parser` flags, resolved as the legacy path resolves them (`ParserResolver`).
-//! Names that are one Symphony table's (`symphony::formats::Table::name`; both the same, or one
-//! alone) read every request for the model with that table, whatever the model is; a legacy
-//! parser's name keeps the legacy parsers, which is the way back for one model when its table
-//! misbehaves; no name at all takes the registry's table for the model
+//! A name that is a table's own (`symphony::formats::Table::name`) or a legacy parser's that
+//! reads a table's format (`qwen` is `qwen3`, `qwen_xml` is `qwen3_tagged`; [`table_named`])
+//! reads every request for the model with that table, whatever the model is, the tool-call name
+//! deciding; any other legacy parser's name keeps the legacy parsers, which is the way back for
+//! one model when its table misbehaves; no name at all takes the registry's table for the model
 //! (`symphony::formats::for_model`), and the legacy parsers with their own detection when it has
 //! none. The names are checked at startup and at a worker's registration ([`check_names`]).
 //! Every request read with `legacy` keeps the older parsers. The response names the parser that
@@ -59,28 +60,46 @@ pub(crate) fn choice(
         .ok_or_else(|| format!("{HEADER} must be legacy or symphony, not {spelled:?}"))
 }
 
-/// The table the parser names set for a model select, when they do: every name set is one
-/// table's ([`Table::named`]), the same one. A legacy parser's name, or two different tables,
-/// select none; so do no names at all.
+/// Legacy parser names that read a format a table reads, by the table. A legacy name with no
+/// row here keeps the legacy parsers under `--parser symphony`.
+const ALIASES: [(&str, Table); 9] = [
+    ("qwen", Table::Qwen3),
+    ("qwen_xml", Table::Qwen3Tagged),
+    ("qwen_coder", Table::Qwen3Tagged),
+    ("nemotron", Table::Qwen3Tagged),
+    ("glm47_moe", Table::Glm),
+    ("glm45_moe", Table::Glm4),
+    ("hy_v4", Table::Hy4),
+    ("deepseek_v41", Table::DeepSeekV4_1),
+    ("minimax", Table::MinimaxM2),
+];
+
+/// The table a parser name selects: the table whose own name it is ([`Table::named`]), else the
+/// one its legacy name is an alias of ([`ALIASES`]); `None` for a legacy name with neither.
+pub(crate) fn table_named(name: &str) -> Option<Table> {
+    Table::named(name).or_else(|| {
+        let name = name.trim().to_ascii_lowercase();
+        let (_, table) = ALIASES.iter().find(|(alias, _)| *alias == name)?;
+        Some(*table)
+    })
+}
+
+/// The table the parser names set for a model select, when they do: the tool-call name's
+/// ([`table_named`]), else the reasoning name's when no tool-call name is set. A name that is
+/// neither a table's nor a legacy alias selects none, and so do no names at all.
 pub(crate) fn named_table(names: &Names) -> Option<Table> {
-    let tables: Vec<Option<Table>> = [&names.tool, &names.reasoning]
-        .into_iter()
-        .flatten()
-        .map(|name| Table::named(name))
-        .collect();
-    let first = *tables.first()?;
-    if tables.iter().any(|table| *table != first) {
-        return None;
+    match &names.tool {
+        Some(tool) => table_named(tool),
+        None => names.reasoning.as_deref().and_then(table_named),
     }
-    first
 }
 
 /// The table that reads `request`'s response, if one does: `parser` is Symphony, the request
 /// asks nothing the older path answers differently (the response separates reasoning, and
 /// `tool_choice` is not `none`), and a table is there to read it: the one the model's parser
 /// `names` select ([`named_table`]), whatever the model, or the registry's for the model when no
-/// name is set. A legacy parser's name leaves the response to the legacy parsers. Preparation
-/// and request building both decide with this one predicate.
+/// name is set. A legacy parser's name with no alias leaves the response to the legacy parsers.
+/// Preparation and request building both decide with this one predicate.
 pub(crate) fn reads(
     parser: ParserChoice,
     names: &Names,
@@ -466,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn the_names_select_a_table_when_they_are_one_tables_and_nothing_otherwise() {
+    fn the_tool_call_name_selects_a_table_by_its_own_name_or_a_legacy_alias() {
         assert_eq!(named_table(&Names::default()), None);
         assert_eq!(
             named_table(&names(Some("kimi_k3"), Some("kimi_k3"))),
@@ -477,22 +496,74 @@ mod tests {
             named_table(&names(Some("qwen3_tagged"), None)),
             Some(Table::Qwen3Tagged)
         );
-        // A legacy parser's name, alone or beside a table's, and two tables select none.
-        assert_eq!(named_table(&names(Some("qwen"), None)), None);
-        assert_eq!(named_table(&names(Some("qwen"), Some("qwen3"))), None);
-        assert_eq!(named_table(&names(Some("kimi_k3"), Some("qwen3"))), None);
+        // A legacy name reads with the table of the format it reads.
+        assert_eq!(named_table(&names(Some("qwen"), None)), Some(Table::Qwen3));
+        assert_eq!(
+            named_table(&names(Some("qwen"), Some("qwen3"))),
+            Some(Table::Qwen3)
+        );
+        assert_eq!(
+            named_table(&names(Some(" QWEN_XML "), Some("qwen3"))),
+            Some(Table::Qwen3Tagged)
+        );
+        assert_eq!(
+            named_table(&names(Some("glm45_moe"), Some("glm45"))),
+            Some(Table::Glm4)
+        );
+        assert_eq!(
+            named_table(&names(Some("glm47_moe"), Some("glm45"))),
+            Some(Table::Glm)
+        );
+        // The reasoning name counts only without a tool-call name.
+        assert_eq!(named_table(&names(None, Some("hy_v4"))), Some(Table::Hy4));
+        assert_eq!(
+            named_table(&names(None, Some("minimax"))),
+            Some(Table::MinimaxM2)
+        );
+        assert_eq!(named_table(&names(None, Some("deepseek_r1"))), None);
+        // The tool-call name decides; a legacy name with no alias selects none.
+        assert_eq!(
+            named_table(&names(Some("kimi_k3"), Some("qwen3"))),
+            Some(Table::KimiK3)
+        );
+        assert_eq!(named_table(&names(Some("llama"), None)), None);
+        assert_eq!(named_table(&names(Some("llama"), Some("qwen3"))), None);
+    }
+
+    #[test]
+    fn every_alias_is_a_legacy_parsers_name_and_no_tables() {
+        let tools = tool_parser::ParserFactory::new();
+        let reasoning = reasoning_parser::ParserFactory::new();
+        for (alias, table) in ALIASES {
+            assert_eq!(Table::named(alias), None, "{alias} is a table's own name");
+            assert!(
+                tools.has_parser(alias) || reasoning.registry().has_parser(alias),
+                "{alias} is no legacy parser's name"
+            );
+            assert_eq!(table_named(alias), Some(table));
+        }
     }
 
     #[test]
     fn explicit_names_win_over_the_registry() {
-        // A table named for a model the registry does not know reads it; a legacy name leaves a
-        // model the registry knows to the legacy parsers; a table named for a model the registry
-        // reads with another wins, and replays from its own opener.
+        // A table named for a model the registry does not know reads it; a legacy name reads
+        // with its alias, or with no alias leaves a model the registry knows to the legacy
+        // parsers; a table named for a model the registry reads with another wins, and replays
+        // from its own opener.
         let unknown = request(json!({"model": "unknown"}));
         let ling = names(Some("ling"), Some("ling"));
         let assigned = assign(ParserChoice::Symphony, &ling, &unknown, None, PROMPT);
         assert_eq!(assigned.expect("assigned").format.name(), "ling");
-        let legacy = names(Some("qwen"), Some("qwen3"));
+        let aliased = names(Some("qwen"), Some("qwen3"));
+        let assigned = assign(
+            ParserChoice::Symphony,
+            &aliased,
+            &request(json!({})),
+            None,
+            PROMPT,
+        );
+        assert_eq!(assigned.expect("assigned").format.name(), "qwen3");
+        let legacy = names(Some("llama"), Some("deepseek_r1"));
         assert!(assign(
             ParserChoice::Symphony,
             &legacy,
