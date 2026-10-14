@@ -16,6 +16,11 @@
 //!   content too. A `[` that is followed by anything but an object or the `]` is prose as well
 //!   (`[Note: draft]`, a markdown link), and the `[` comes back as content with the rest.
 //!
+//! With [`Assembler::object_or_list`] (the `json` table), a `{` at the first byte is one call
+//! alone: the object goes to a [`json::Assembler`](super::Assembler) as a list's object does, and
+//! what follows it is the template's wrapping, whitespace dropped and anything else `Malformed`.
+//! A list reads as before. [`Assembler::new`] (the `xlam` table) keeps a `{` as prose.
+//!
 //! A region with no markers never closes by one, so [`Assembler::close`] is for a table that puts
 //! the list between markers after all; [`Assembler::finish`] is the end of the stream: an object
 //! still open is finished as the JSON assembler finishes one (a started call closed with what
@@ -29,6 +34,7 @@ use crate::{
 
 const TEXT_BETWEEN_OBJECTS: &str = "text between a list's calls";
 const TEXT_AFTER_THE_LIST: &str = "text after the list's end";
+const TEXT_AFTER_THE_OBJECT: &str = "text after the call's object";
 
 /// The events of a JSON list of calls, each call with its own index from `first`.
 #[derive(Debug)]
@@ -39,6 +45,11 @@ pub struct Assembler {
     carried: String,
     /// Objects that began, so that prose after the `[` is told from text between objects.
     objects: u32,
+    /// Whether a `{` at the first byte is one call alone ([`Self::object_or_list`]).
+    lone_object: bool,
+    /// Whether a `[` opened a list, so that a finished object returns to the list or ends the
+    /// output's calls.
+    listed: bool,
 }
 
 #[derive(Debug)]
@@ -65,6 +76,16 @@ impl Assembler {
             stage: Stage::Deciding,
             carried: String::new(),
             objects: 0,
+            lone_object: false,
+            listed: false,
+        }
+    }
+
+    /// [`Self::new`], also reading a `{` at the first byte as one call alone.
+    pub fn object_or_list(first: u32) -> Self {
+        Self {
+            lone_object: true,
+            ..Self::new(first)
         }
     }
 
@@ -121,8 +142,18 @@ impl Assembler {
                     // Held until the first object or the `]` says this is a list: prose after a
                     // `[` takes it back as content.
                     self.carried.push('[');
+                    self.listed = true;
                     self.stage = Stage::Between;
                     &text[at + 1..]
+                } else if first == '{' && self.lone_object {
+                    self.drop_carried(out);
+                    let index = self.next_index;
+                    self.objects += 1;
+                    self.stage = Stage::Object(Box::new(json::Assembler::new(
+                        index,
+                        format!("call_{index}"),
+                    )));
+                    &text[at..]
                 } else {
                     self.stage = Stage::Content;
                     self.carried.push_str(&text[at..]);
@@ -193,7 +224,11 @@ impl Assembler {
                     if object.started() {
                         self.next_index += 1;
                     }
-                    self.stage = Stage::Between;
+                    self.stage = if self.listed {
+                        Stage::Between
+                    } else {
+                        Stage::After
+                    };
                 }
                 &text[taken..]
             }
@@ -214,7 +249,14 @@ impl Assembler {
                     } else {
                         Event::Malformed {
                             text: Text::uncounted(&rest[..length]),
-                            why: MalformedReason::Other(TEXT_AFTER_THE_LIST.to_string()),
+                            why: MalformedReason::Other(
+                                if self.listed {
+                                    TEXT_AFTER_THE_LIST
+                                } else {
+                                    TEXT_AFTER_THE_OBJECT
+                                }
+                                .to_string(),
+                            ),
                         }
                     });
                     rest = &rest[length..];
@@ -397,6 +439,60 @@ mod tests {
                 .collect();
             assert_eq!(content, output, "{output:?}");
             assert!(calls(&events).is_empty(), "{output:?}");
+        }
+    }
+
+    fn run_alone(pieces: &[&str]) -> Vec<Event> {
+        let mut assembler = Assembler::object_or_list(0);
+        let mut out = Events::new();
+        for piece in pieces {
+            assembler.feed(piece, &mut out);
+        }
+        assembler.finish(&mut out);
+        out.drain()
+    }
+
+    #[test]
+    fn a_lone_object_is_one_call_and_what_follows_it_is_wrapping() {
+        let output = "  {\"name\": \"f\", \"parameters\": {\"a\": 1}}\n";
+        let events = run_alone(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            calls(&events),
+            [(0, "f".to_string(), r#"{"a": 1}"#.to_string())]
+        );
+        let dropped: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dropped, ["  ", "\n"]);
+        let output = "{\"name\": \"f\", \"arguments\": {}} tail";
+        let events = run_alone(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::Other(why) }
+                if text.text == "tail" && why == TEXT_AFTER_THE_OBJECT
+        )));
+        // A list reads as before, prose is content, and a cut object closes nothing.
+        assert_eq!(calls(&run_alone(&[LIST])).len(), 2);
+        assert!(calls(&run_alone(&["Sure: {\"name\": \"f\"}"])).is_empty());
+        let events = run_alone(&["{\"name\": \"f\", \"argu"]);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallEnd { .. })));
+        assert_eq!(bytes(&events), "{\"name\": \"f\", \"argu");
+        // The list-only assembler keeps a `{` as prose.
+        let events = run(&["{\"name\": \"f\", \"arguments\": {}}"]);
+        assert!(calls(&events).is_empty());
+        let whole = calls(&run_alone(&[output]));
+        for cut in 1..output.len() {
+            let events = run_alone(&[&output[..cut], &output[cut..]]);
+            assert_eq!(bytes(&events), output, "cut at {cut}");
+            assert_eq!(calls(&events), whole, "cut at {cut}");
         }
     }
 

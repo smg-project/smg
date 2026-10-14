@@ -165,6 +165,24 @@ What the table leaves open: whether every engine takes a tag whose `end` is empt
 structural tag allows it; the Symphony e2e lane says so for the engines it runs); and the older
 list syntax, which no recorded group writes.
 
+## JSON (`json`)
+
+What the table says beyond the others:
+
+- **One state, no markers, an object or a list.** As `xlam`, the output starts in the arguments
+  state and the assembler decides at the first byte that is not whitespace; unlike `xlam`, a `{`
+  there is one call alone (`json::list::Assembler::object_or_list`), whose object reads as a
+  list's object does, `arguments`, `parameters` or `args` naming the arguments. What follows the
+  object is the template's wrapping: whitespace dropped, anything else malformed.
+- **Prose before the JSON is content, whole.** The gateway's older `json` parser searches the
+  output for the first `{` or `[`; this table does not, as no other table scans for a marker.
+- **A forced call is the list.** `Format::grammar` writes the `xlam` list, as the older parser's
+  forced calls were written.
+
+What the table leaves open: no recorded group writes this format as its own (the Nemotron
+Llama-3.x groups that the older parser reads have content cases only), so the table stands on its
+unit tests until one does.
+
 ## MiniCPM5 (`minicpm5`)
 
 The template writes the turn as `<think>\n`, the reasoning, `\n</think>\n\n`, the content, a newline

@@ -19,8 +19,9 @@
 //! older parsers for it until its group lists the name under `also`.
 
 use super::{
-    deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, k2_horizon, kimi_k3, lfm2_5,
-    ling, minicpm5, minimax_m2, minimax_m3, mistral, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    deepseek_v4_1, dots3, gemma4, glm, glm4, hy4, inkling, iquest, json, k2_horizon, kimi_k3,
+    lfm2_5, ling, minicpm5, minimax_m2, minimax_m3, mistral, olmo3, plain, qwen2_5, qwen3,
+    seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -57,6 +58,8 @@ pub enum Table {
     Lfm2_5,
     /// [`xlam()`].
     Xlam,
+    /// [`json()`].
+    Json,
     /// [`minimax_m2()`].
     MinimaxM2,
     /// [`minimax_m3()`].
@@ -84,7 +87,7 @@ pub enum Table {
 
 impl Table {
     /// Every table, in this order.
-    pub const ALL: [Table; 24] = [
+    pub const ALL: [Table; 25] = [
         Self::Qwen3,
         Self::Qwen3Tagged,
         Self::Qwen3TaggedDirect,
@@ -97,6 +100,7 @@ impl Table {
         Self::Olmo3,
         Self::Lfm2_5,
         Self::Xlam,
+        Self::Json,
         Self::MinimaxM2,
         Self::MinimaxM3,
         Self::Mistral,
@@ -127,6 +131,7 @@ impl Table {
             Self::Olmo3 => "olmo3",
             Self::Lfm2_5 => "lfm2.5",
             Self::Xlam => "xlam",
+            Self::Json => "json",
             Self::MinimaxM2 => "minimax_m2",
             Self::MinimaxM3 => "minimax_m3",
             Self::Mistral => "mistral",
@@ -164,6 +169,7 @@ impl Table {
             Self::Olmo3 => olmo3(),
             Self::Lfm2_5 => lfm2_5(),
             Self::Xlam => xlam(),
+            Self::Json => json(),
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::Mistral => mistral(),

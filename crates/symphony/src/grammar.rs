@@ -283,8 +283,11 @@ impl Format {
         let markers = markers.as_ref();
         let calls = match self.call_syntax()? {
             // The list stands alone in the turn, no marker before or after it, and its table has
-            // no thought: the list is the same either way.
-            CallSyntax::JsonList => return Some(Self::json_list_calls(&named, at_least_one)),
+            // no thought: the list is the same either way. A call alone is forced as the list,
+            // as the gateway's older `json` parser forces it.
+            CallSyntax::JsonList | CallSyntax::JsonAlone => {
+                return Some(Self::json_list_calls(&named, at_least_one))
+            }
             CallSyntax::Json => Self::json_calls(markers?, &named, at_least_one),
             CallSyntax::Keyed(tags) if *tags == KeyedTags::PLAIN => {
                 Self::keyed_calls(markers?, &named, at_least_one)

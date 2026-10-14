@@ -66,6 +66,11 @@ pub enum CallSyntax {
     /// an arguments state entered at the output's start, and the assembler decides at the first
     /// byte that is not whitespace.
     JsonList,
+    /// One JSON call object, or a list of them, alone in the turn with no markers around it, or
+    /// content: the format the gateway's older `json` parser reads. The table's one state is an
+    /// arguments state entered at the output's start, and the assembler decides at the first byte
+    /// that is not whitespace: `{` is one call, `[` a list, anything else content.
+    JsonAlone,
     /// An XML tree of arguments: `<invoke name="…">`, then one element per argument, `<key>` to
     /// `</key>`, nested for an object and with `<item>` elements for a list, typed by the request's
     /// tools at every depth: MiniMax M3. The terminal that enters the state is the invoke tag's
