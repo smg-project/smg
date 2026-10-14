@@ -12,8 +12,8 @@ use openai_protocol::{
         ResponseEvent,
     },
     responses::{
-        IncludeField, IncompleteDetails, IncompleteReason, ResponseOutputItem, ResponseStatus,
-        ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        IncludeField, ResponseOutputItem, ResponseStatus, ResponseUsage, ResponsesRequest,
+        ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::json;
@@ -238,6 +238,12 @@ impl ResponseStreamEventEmitter {
         }
     }
 
+    /// Whether a streamed output item is a call cut short: a `function_call` whose status says
+    /// its arguments are not complete JSON.
+    fn is_cut_call(item: &serde_json::Value) -> bool {
+        item["type"] == "function_call" && item["status"] == "incomplete"
+    }
+
     fn next_sequence(&mut self) -> u64 {
         let seq = self.sequence_number;
         self.sequence_number += 1;
@@ -395,7 +401,8 @@ impl ResponseStreamEventEmitter {
         // the Responses contract reports that as status=incomplete with
         // incomplete_details and terminates the stream with
         // response.incomplete, mirroring the non-streaming conversion.
-        let truncated = self.finish_reason.as_deref() == Some("length");
+        let length = self.finish_reason.as_deref() == Some("length");
+        let truncated = length || output.iter().any(Self::is_cut_call);
         let failed = matches!(self.finish_reason.as_deref(), Some("failed" | "error"));
 
         // Build base response object
@@ -411,7 +418,7 @@ impl ResponseStreamEventEmitter {
         if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
             response_obj["error"] = error;
         }
-        if truncated {
+        if length {
             response_obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
 
@@ -874,17 +881,12 @@ impl ResponseStreamEventEmitter {
         let responses_usage = usage.map(|u| ResponsesUsage::Modern(ResponseUsage::from(&u)));
 
         // Match the streamed terminal event: a `length` finish reports
-        // status=incomplete with the truncation reason.
-        let (status, incomplete_details) = match self.finish_reason.as_deref() {
-            Some("failed" | "error") => (ResponseStatus::Failed, None),
-            Some("length") => (
-                ResponseStatus::Incomplete,
-                Some(IncompleteDetails {
-                    reason: IncompleteReason::MaxOutputTokens,
-                }),
-            ),
-            _ => (ResponseStatus::Completed, None),
-        };
+        // status=incomplete with the truncation reason, a cut call without one.
+        let cut_call = output.iter().any(|item| {
+            matches!(item, ResponseOutputItem::FunctionToolCall { status, .. } if status == "incomplete")
+        });
+        let (status, incomplete_details) =
+            super::utils::response_status(self.finish_reason.as_deref(), cut_call);
 
         // Build response using builder
         let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)

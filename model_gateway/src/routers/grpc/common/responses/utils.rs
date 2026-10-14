@@ -6,7 +6,10 @@ use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
     common::Tool,
-    responses::{CustomTool, NamespaceTool, ResponseTool, ResponsesRequest, ResponsesResponse},
+    responses::{
+        CustomTool, IncompleteDetails, IncompleteReason, NamespaceTool, ResponseStatus,
+        ResponseTool, ResponsesRequest, ResponsesResponse,
+    },
 };
 use serde_json::{json, to_value, Value};
 use smg_data_connector::{
@@ -45,13 +48,35 @@ pub(crate) fn generation_failure_error(finish_reason: Option<&str>) -> Option<Va
     })
 }
 
-/// Map a Chat finish reason to a generated function-call item's status.
-/// On token-limit truncation, preserve complete arguments and mark partial JSON incomplete.
+/// Map a Chat finish reason to a generated function-call item's status: a call whose arguments
+/// are not complete JSON was cut, by the token limit or an abort, unless the turn ended on the
+/// call (`tool_calls`), whose arguments stand as the parser wrote them.
 pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
     match finish_reason {
         Some("failed" | "error") => "in_progress",
-        Some("length") if serde_json::from_str::<Value>(arguments).is_err() => "incomplete",
+        Some("tool_calls") => "completed",
+        _ if serde_json::from_str::<Value>(arguments).is_err() => "incomplete",
         _ => "completed",
+    }
+}
+
+/// The response's status for the Chat finish reason, with why it is incomplete: a `length`
+/// finish is the token limit; a call cut by anything else (`cut_call`) leaves the response
+/// incomplete with no stated reason, as the item says.
+pub(crate) fn response_status(
+    finish_reason: Option<&str>,
+    cut_call: bool,
+) -> (ResponseStatus, Option<IncompleteDetails>) {
+    match finish_reason {
+        Some("failed" | "error") => (ResponseStatus::Failed, None),
+        Some("length") => (
+            ResponseStatus::Incomplete,
+            Some(IncompleteDetails {
+                reason: IncompleteReason::MaxOutputTokens,
+            }),
+        ),
+        _ if cut_call => (ResponseStatus::Incomplete, None),
+        _ => (ResponseStatus::Completed, None),
     }
 }
 
@@ -990,6 +1015,43 @@ mod tests {
         assert_eq!(
             resolve_function_identity(request.tools.as_deref(), "weather.lookup"),
             ("weather.lookup".into(), None)
+        );
+    }
+
+    #[test]
+    fn a_call_whose_arguments_are_not_complete_json_is_incomplete_unless_the_turn_ended_on_it() {
+        for finish in [Some("length"), Some("abort"), Some("stop"), None] {
+            assert_eq!(function_call_status(finish, "{\"a\": \"b"), "incomplete");
+            assert_eq!(function_call_status(finish, ""), "incomplete");
+            assert_eq!(function_call_status(finish, "{\"a\": 1}"), "completed");
+        }
+        for arguments in ["{\"a\": 1}", "", "weather in Paris"] {
+            assert_eq!(
+                function_call_status(Some("tool_calls"), arguments),
+                "completed"
+            );
+        }
+        assert_eq!(function_call_status(Some("failed"), "{"), "in_progress");
+        assert_eq!(
+            response_status(Some("abort"), true),
+            (ResponseStatus::Incomplete, None)
+        );
+        assert_eq!(
+            response_status(Some("abort"), false),
+            (ResponseStatus::Completed, None)
+        );
+        assert_eq!(
+            response_status(Some("length"), false),
+            (
+                ResponseStatus::Incomplete,
+                Some(IncompleteDetails {
+                    reason: IncompleteReason::MaxOutputTokens
+                })
+            )
+        );
+        assert_eq!(
+            response_status(Some("error"), true),
+            (ResponseStatus::Failed, None)
         );
     }
 }
