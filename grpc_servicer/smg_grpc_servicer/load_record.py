@@ -23,7 +23,9 @@ Python and the Rust servicer of one engine alike:
   on every batch, telemetry on the first record and the heartbeats only,
   a ``load_only`` batch when the record moved or after
   :data:`HEARTBEAT_INTERVAL` of silence (:data:`HEARTBEAT_BACKOFF` once the
-  engine has been idle for two heartbeats), checked every :data:`LOAD_TICK`.
+  engine has been idle for two heartbeats), checked every :data:`LOAD_TICK`;
+  a source it cannot read leaves the batch without a record, the outage
+  logged once and its end once.
 
 Imports only the stdlib and the generated proto, so it is unit-tested
 without any engine installed.
@@ -31,10 +33,13 @@ without any engine installed.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 
 from smg_grpc_proto.generated import common_pb2
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "HEARTBEAT_BACKOFF",
@@ -153,7 +158,8 @@ class LoadRecorder:
     :meth:`heartbeat` is asked between batches (every :attr:`load_tick`, see
     :meth:`poll_timeout`) and answers a ``load_only`` batch when one is due.
     ``source`` is the servicer's :data:`LoadSource`; ``clock`` is monotonic
-    seconds (tests pass their own).
+    seconds (tests pass their own). A source that raises leaves the batch
+    without a record and the heartbeat unsent (see :meth:`_read`).
     """
 
     def __init__(
@@ -179,11 +185,41 @@ class LoadRecorder:
         # The rank and sequence of the last batch sent: what a heartbeat names.
         self._last_rank: int | None = None
         self._last_sequence: int | None = None
+        # Failed reads of the source in a row: the outage being reported.
+        self._failed_reads = 0
 
     def poll_timeout(self, recv_timeout: float) -> float:
         """How long the stream may wait for the next batch before the record
         is checked again."""
         return min(recv_timeout, self.load_tick)
+
+    def _read(self, rank: int | None) -> common_pb2.EngineLoad | None:
+        """The source's record for ``rank``: ``None`` when it has none yet, and
+        when it cannot be read, in which case the batch goes without a record
+        (the gateway keeps the worker polled). The first failed read of an
+        outage is a warning with the traceback, the repeats debug lines, and
+        the read that ends it an info line with their count: a read that keeps
+        failing (a snapshot gone, a reader whose shape changed) is one loud
+        line at the default level, not a flood and not silence."""
+        try:
+            record = self._source(rank)
+        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
+            self._failed_reads += 1
+            if self._failed_reads == 1:
+                logger.warning(
+                    "load record unavailable; the KV-event stream carries cache events only "
+                    "until it can be read again",
+                    exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "load record unavailable (%d in a row)", self._failed_reads, exc_info=True
+                )
+            return None
+        if self._failed_reads:
+            logger.info("load record available again after %d failed read(s)", self._failed_reads)
+            self._failed_reads = 0
+        return record
 
     def _numbered(
         self, current: common_pb2.EngineLoad, *, load_only: bool
@@ -208,7 +244,7 @@ class LoadRecorder:
         self._last_sequence = batch.sequence_number
         self._last_sent_at = self._clock()
         self._idle_heartbeats = 0
-        current = self._source(rank)
+        current = self._read(rank)
         if current is not None:
             batch.load.CopyFrom(self._numbered(current, load_only=False))
         return batch
@@ -221,7 +257,7 @@ class LoadRecorder:
         would have no sequence to repeat."""
         if self._last_sequence is None:
             return None
-        current = self._source(self._last_rank)
+        current = self._read(self._last_rank)
         if current is None:
             return None
         changed = self._last_record is None or load_changed(self._last_record, current)

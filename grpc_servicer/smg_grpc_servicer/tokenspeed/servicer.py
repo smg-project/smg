@@ -838,22 +838,18 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         ``GetLoads`` converts it, read for every batch and heartbeat. An
         encode worker has no scheduler load, and an older engine without the
         replica would need a scheduler round trip per record: both push none
-        and stay polled."""
+        and stay polled. A read that raises is the recorder's to report."""
         if self._config.server_args.disaggregation_mode == "encode":
             return None
         store = getattr(self.async_llm, "load_snapshot_store", None)
         if store is None:
             return None
-        try:
-            return load_record(
-                store.fresh_snapshots(),
-                dp_rank,
-                max_total_num_tokens=self._max_total_num_tokens(),
-                max_running_requests=running_window(self.async_llm.server_args),
-            )
-        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
-            logger.debug("load record unavailable", exc_info=True)
-            return None
+        return load_record(
+            store.fresh_snapshots(),
+            dp_rank,
+            max_total_num_tokens=self._max_total_num_tokens(),
+            max_running_requests=running_window(self.async_llm.server_args),
+        )
 
     async def SubscribeKvEvents(
         self,

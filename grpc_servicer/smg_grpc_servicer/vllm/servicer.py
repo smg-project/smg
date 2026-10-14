@@ -844,28 +844,25 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         estimate on the first rank only, as the Rust servicer stamps its
         batches. A rank whose snapshot the servicer cannot read gets no
         record rather than another rank's figures; the first rank reports
-        zeros before its first snapshot, as ``GetLoads`` does."""
-        try:
-            first_rank = _first_rank(self.engine)
-            rank = first_rank if dp_rank is None else dp_rank
-            counts = self._scheduler_counts(rank)
-            if counts is None:
-                if rank != first_rank:
-                    return None
-                counts = (0, 0, 0.0)
-            num_running, num_waiting, kv_usage = counts
-            return load_record(
-                num_running,
-                num_waiting,
-                kv_usage,
-                self._loads.estimate(num_waiting) if rank == first_rank else None,
-                dp_rank=rank,
-                max_total_num_tokens=_kv_capacity_tokens(self.engine),
-                max_running_requests=_max_running_requests(self.engine),
-            )
-        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
-            logger.debug("load record unavailable", exc_info=True)
-            return None
+        zeros before its first snapshot, as ``GetLoads`` does. A read that
+        raises is the recorder's to report."""
+        first_rank = _first_rank(self.engine)
+        rank = first_rank if dp_rank is None else dp_rank
+        counts = self._scheduler_counts(rank)
+        if counts is None:
+            if rank != first_rank:
+                return None
+            counts = (0, 0, 0.0)
+        num_running, num_waiting, kv_usage = counts
+        return load_record(
+            num_running,
+            num_waiting,
+            kv_usage,
+            self._loads.estimate(num_waiting) if rank == first_rank else None,
+            dp_rank=rank,
+            max_total_num_tokens=_kv_capacity_tokens(self.engine),
+            max_running_requests=_max_running_requests(self.engine),
+        )
 
     async def GetTokenizer(
         self,

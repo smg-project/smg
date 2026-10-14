@@ -861,12 +861,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
     def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
         """The load record the KV-event stream carries for ``dp_rank``: the
         scheduler's published snapshot as ``GetLoads`` reports it, read for
-        every batch and heartbeat; ``None`` while none is published."""
-        try:
-            return load_record(self.request_manager.load_snapshot_reader.read_all(), dp_rank)
-        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
-            logger.debug("load record unavailable", exc_info=True)
-            return None
+        every batch and heartbeat; ``None`` while none is published. A read
+        that raises is the recorder's to report."""
+        return load_record(self.request_manager.load_snapshot_reader.read_all(), dp_rank)
 
     def _handle_epd_disaggregation_encode_request(
         self,

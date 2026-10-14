@@ -5,6 +5,8 @@ engine needed."""
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 pytest.importorskip("smg_grpc_proto")
@@ -322,3 +324,57 @@ def test_the_poll_timeout_is_the_tick_or_the_shorter_receive_timeout():
     recorder = _recorder(Source(), Clock())
     assert recorder.poll_timeout(1.0) == pytest.approx(0.1)
     assert recorder.poll_timeout(0.05) == pytest.approx(0.05)
+
+
+def _messages(caplog, level):
+    return [record.getMessage() for record in caplog.records if record.levelno == level]
+
+
+def test_a_source_that_cannot_be_read_leaves_the_batch_without_a_record(caplog):
+    """An outage of the source: the batches go out without a record and no
+    heartbeat is due, as before; the first failed read is a warning with the
+    traceback, the repeats debug lines with their count, the read that ends
+    the outage an info line with the count."""
+    source, clock = Source(), Clock()
+    failing = False
+
+    def read(rank):
+        if failing:
+            raise RuntimeError("snapshot gone")
+        return source(rank)
+
+    recorder = _recorder(read, clock)
+    with caplog.at_level(logging.DEBUG, logger=load_record.logger.name):
+        assert recorder.stamp(_batch(1)).load.sample == 1
+        failing = True
+        assert not recorder.stamp(_batch(2)).HasField("load")
+        clock.now += 10.0
+        assert recorder.heartbeat() is None
+        assert not recorder.stamp(_batch(3)).HasField("load")
+        failing = False
+        assert recorder.stamp(_batch(4)).load.sample == 2  # the numbering continues
+    assert _messages(caplog, logging.WARNING) == [
+        "load record unavailable; the KV-event stream carries cache events only until it can "
+        "be read again"
+    ]
+    assert "RuntimeError: snapshot gone" in caplog.text
+    assert _messages(caplog, logging.DEBUG) == [
+        "load record unavailable (2 in a row)",
+        "load record unavailable (3 in a row)",
+    ]
+    assert _messages(caplog, logging.INFO) == ["load record available again after 3 failed read(s)"]
+    # A second outage is reported again.
+    failing = True
+    with caplog.at_level(logging.DEBUG, logger=load_record.logger.name):
+        assert not recorder.stamp(_batch(5)).HasField("load")
+    assert len(_messages(caplog, logging.WARNING)) == 2
+
+
+def test_a_source_with_nothing_to_report_yet_is_not_an_outage(caplog):
+    """``None`` from the source (the engine is not up yet) is the known quiet
+    case: no record, no heartbeat, nothing logged."""
+    recorder = _recorder(lambda rank: None, Clock())
+    with caplog.at_level(logging.DEBUG, logger=load_record.logger.name):
+        assert not recorder.stamp(_batch(1)).HasField("load")
+        assert recorder.heartbeat() is None
+    assert caplog.records == []
