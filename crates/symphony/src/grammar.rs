@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
+pub use self::turn::{Turn, TurnAnswer, TurnChoice, TurnPosition, TurnSpelling};
 use crate::{
     format::{CallSyntax, Emits, Format},
     shape::{Layout, Message},
@@ -31,6 +32,7 @@ mod pythonic;
 mod schema;
 mod shaped;
 mod tagged;
+mod turn;
 mod xml;
 mod xtml;
 
@@ -121,10 +123,14 @@ impl Bound {
 
 impl Tag {
     fn new(begin: impl Into<String>, content: Grammar, end: impl Into<String>) -> Self {
+        Self::bounded(begin, content, Bound::Text(end.into()))
+    }
+
+    fn bounded(begin: impl Into<String>, content: Grammar, end: Bound) -> Self {
         Self {
             begin: begin.into(),
             content: Box::new(content),
-            end: Bound::Text(end.into()),
+            end,
         }
     }
 
