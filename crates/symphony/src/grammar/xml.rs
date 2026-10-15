@@ -40,7 +40,7 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
-    schema::{keyword, shape, Definitions},
+    schema::{keyword, kind, shape, Definitions},
     CallMarkers, Count, Grammar, Tag,
 };
 
@@ -54,7 +54,11 @@ const DEPTH: usize = 16;
 /// text. An acyclic schema unfolds as k^d elements for k properties over d levels, which the depth
 /// cap alone does not bound; ordinary tool schemas stay far below this. The budget is each invoke's
 /// own: a tag for many tools holds up to this many elements per tool. It counts elements, not
-/// bytes: a value's own spelling (an enum's words, a number's schema) is written as it is.
+/// bytes: a value's own spelling (an enum's words, a number's schema) is written as it is. A value
+/// past the budget is any text up to its own closing tag, as one past the depth cap is, so it
+/// cannot hold a descendant whose tag spells the same close (the separator stands before inner
+/// tags too); the budget makes that fallback reachable at any depth, where the depth cap kept it
+/// past the sixteenth.
 const NODES: usize = 1024;
 
 /// The elements one invoke may still write, and how many of them are held for the properties
@@ -84,16 +88,11 @@ impl Budget {
 }
 
 /// How a value's schema is written: as any text, at the depth cap or where the schema pins no type
-/// the syntax has; or by the type it pins, [`shape`]'s word for it, with the grammar the shape
-/// gives (a string's text, an enum's words, a number's schema), at the depth below. A schema typed
-/// `null` is written as nothing, and is neither ([`Writer::how`]).
+/// the syntax has; or by the type it pins, [`kind`]'s word for it, at the depth below. A schema
+/// typed `null` is written as nothing, and is neither ([`Writer::how`]).
 enum Writes {
     AnyText,
-    Typed {
-        kind: &'static str,
-        shaped: Grammar,
-        depth: usize,
-    },
+    Typed { kind: &'static str, depth: usize },
 }
 
 /// The block of calls for `tools`, written with `separator` before every tag, as many as `count`
@@ -183,6 +182,11 @@ impl Writer<'_> {
         let Some(properties) = properties else {
             return self.any_text(close);
         };
+        if !budget.has_an_element() {
+            // What the loop below would write for the whole object, before any property of it
+            // is classified: an object reached once the budget is spent costs nothing to skip.
+            return self.any_text(close);
+        }
         let required: Vec<&str> = keyword(schema, target, "required")
             .and_then(Value::as_array)
             .map(|names| names.iter().filter_map(Value::as_str).collect())
@@ -192,9 +196,8 @@ impl Writer<'_> {
         let classified: Vec<(&String, &Value, String, Option<Writes>)> = properties
             .iter()
             .map(|(key, schema)| {
-                let own = format!("</{key}>");
-                let writes = self.how(schema, definitions, &own, depth);
-                (key, schema, own, writes)
+                let writes = Self::how(schema, definitions, depth);
+                (key, schema, format!("</{key}>"), writes)
             })
             .collect();
         let mut later = classified
@@ -231,30 +234,21 @@ impl Writer<'_> {
 
     /// How a value's schema is written at `depth`, or `None` for a schema typed `null`, written
     /// as nothing: the one place that decides, for the count of an object's properties that write
-    /// and for the writing itself.
-    fn how(
-        &self,
-        schema: &Value,
-        definitions: Definitions<'_>,
-        close: &str,
-        depth: usize,
-    ) -> Option<Writes> {
+    /// and for the writing itself. The kind alone is asked ([`kind`]), so classifying an object or
+    /// an array builds no grammar for it.
+    fn how(schema: &Value, definitions: Definitions<'_>, depth: usize) -> Option<Writes> {
         let Some(depth) = depth.checked_sub(1) else {
             return Some(Writes::AnyText);
         };
-        match shape(schema, definitions, || self.text(close)) {
-            Some(("null", _)) => None,
-            Some((kind, shaped)) => Some(Writes::Typed {
-                kind,
-                shaped,
-                depth,
-            }),
+        match kind(schema, definitions) {
+            Some("null") => None,
+            Some(kind) => Some(Writes::Typed { kind, depth }),
             None => Some(Writes::AnyText),
         }
     }
 
     /// The value between an element's tags, as [`Self::how`] says it is written: any text, or by
-    /// the type the property's schema pins.
+    /// the type the property's schema pins, a string's or a number's grammar [`shape`]'s.
     fn value(
         &self,
         schema: &Value,
@@ -263,12 +257,7 @@ impl Writer<'_> {
         writes: Writes,
         budget: &mut Budget,
     ) -> Grammar {
-        let Writes::Typed {
-            kind,
-            shaped,
-            depth,
-        } = writes
-        else {
+        let Writes::Typed { kind, depth } = writes else {
             return self.any_text(close);
         };
         match kind {
@@ -281,7 +270,8 @@ impl Writer<'_> {
                 }
                 _ => self.any_text(close),
             },
-            _ => shaped,
+            _ => shape(schema, definitions, || self.text(close))
+                .map_or_else(|| self.any_text(close), |(_, shaped)| shaped),
         }
     }
 
@@ -297,7 +287,7 @@ impl Writer<'_> {
         let open = format!("{}<{ITEM}>", self.separator);
         let close = format!("{}</{ITEM}>", self.separator);
         let own = format!("</{ITEM}>");
-        let item = match self.how(items, definitions, &own, depth) {
+        let item = match Self::how(items, definitions, depth) {
             Some(writes) => Grammar::Sequence(vec![
                 Grammar::ConstString(open),
                 self.value(items, definitions, &own, writes, budget),
@@ -921,5 +911,35 @@ mod tests {
         let nest = first_invoke(&[tool("t", fan_out(1, 17))]);
         assert_eq!(elements_written(&nest), 17);
         assert_eq!(any_text_runs(&nest), 1, "the innermost, past the depth cap");
+    }
+
+    #[test]
+    fn a_recursive_definition_of_many_properties_keeps_every_top_level_element() {
+        // `D` has k properties, each a reference to `D`, and so has the root: k^16 unbounded.
+        // Under the budget, 1,024 elements, every top-level property with its own; an object
+        // reached once the budget is spent is any text before its properties are classified, so
+        // the walk is a few k-squared, not the budget times that.
+        let k = 300;
+        let mut properties = serde_json::Map::new();
+        for i in 0..k {
+            properties.insert(format!("p{i:03}"), value!({"$ref": "#/$defs/D"}));
+        }
+        let required: Vec<String> = properties.keys().cloned().collect();
+        let definition = value!({"type": "object", "properties": properties, "required": required});
+        let invoke = first_invoke(&[tool(
+            "t",
+            value!({
+                "type": "object",
+                "$defs": {"D": definition},
+                "properties": properties,
+                "required": required,
+            }),
+        )]);
+        assert_eq!(elements_written(&invoke), 1024);
+        assert_eq!(
+            element_keys(&invoke).len(),
+            k,
+            "every top-level property has its element"
+        );
     }
 }

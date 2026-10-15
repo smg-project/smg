@@ -136,51 +136,72 @@ pub(super) fn keyword<'a>(
         .or_else(|| target.and_then(|target| target.get(name)))
 }
 
-/// The type a property's schema pins, by the name the templates write (`integer` as `number`),
-/// and the grammar of a value of that type: a string as `text`, the syntax's own spelling of a
-/// value written as it is; a string `enum` as one of its values; a number, an object or an array
-/// as JSON the property's schema accepts, the tool's definitions attached; a boolean as JSON;
-/// `null` as the word. `None` when the schema pins no type the syntaxes have, or a `$ref` in it
-/// points at nothing (a grammar with such a pointer would not compile, and the whole call with
-/// it). A `$ref` lends its target's keywords, and the property's own win, as in JSON Schema
-/// 2020-12.
+/// The type a property's schema pins, by the name the templates write (`integer` as `number`), a
+/// string `enum` a string; `None` when the schema pins no type the syntaxes have, or a `$ref` in
+/// it points at nothing (a grammar with such a pointer would not compile, and the whole call with
+/// it). What [`shape`] decides before it writes the value's grammar, on its own for a writer that
+/// spells objects and arrays itself and needs no grammar for them. A `$ref` lends its target's
+/// keywords, and the property's own win, as in JSON Schema 2020-12.
+pub(super) fn kind(schema: &Value, definitions: Definitions<'_>) -> Option<&'static str> {
+    if !definitions.pointers_resolve(schema) {
+        return None;
+    }
+    let target = definitions.target_of(schema);
+    if string_enum(schema, target).is_some() {
+        return Some("string");
+    }
+    match keyword(schema, target, "type").and_then(Value::as_str)? {
+        "string" => Some("string"),
+        "integer" | "number" => Some("number"),
+        "boolean" => Some("boolean"),
+        "object" => Some("object"),
+        "array" => Some("array"),
+        "null" => Some("null"),
+        _ => None,
+    }
+}
+
+/// The words of a string `enum`, where the schema (or its `$ref` target) has one with a word in
+/// it and nothing else.
+fn string_enum<'a>(schema: &'a Value, target: Option<&'a Value>) -> Option<&'a [Value]> {
+    keyword(schema, target, "enum")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty() && values.iter().all(Value::is_string))
+        .map(Vec::as_slice)
+}
+
+/// The type a property's schema pins ([`kind`]) and the grammar of a value of that type: a string
+/// as `text`, the syntax's own spelling of a value written as it is; a string `enum` as one of its
+/// values; a number, an object or an array as JSON the property's schema accepts, the tool's
+/// definitions attached; a boolean as JSON; `null` as the word.
 pub(super) fn shape(
     schema: &Value,
     definitions: Definitions<'_>,
     text: impl FnOnce() -> Grammar,
 ) -> Option<(&'static str, Grammar)> {
-    if !definitions.pointers_resolve(schema) {
-        return None;
-    }
+    let kind = kind(schema, definitions)?;
     let target = definitions.target_of(schema);
-    let keyword = |name: &str| {
-        schema
-            .get(name)
-            .or_else(|| target.and_then(|target| target.get(name)))
-    };
-    if let Some(values) = keyword("enum").and_then(Value::as_array) {
-        if !values.is_empty() && values.iter().all(Value::is_string) {
-            let options = values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|value| Grammar::ConstString(value.to_string()))
-                .collect();
-            return Some(("string", Grammar::Or(options)));
-        }
-    }
     let json = |schema: Value| Grammar::JsonSchema {
         schema,
         style: None,
     };
-    match keyword("type").and_then(Value::as_str)? {
-        "string" => Some(("string", text())),
-        "integer" | "number" => Some(("number", json(definitions.attached_to(schema)))),
-        "boolean" => Some(("boolean", json(json!({"type": "boolean"})))),
-        "object" => Some(("object", json(definitions.attached_to(schema)))),
-        "array" => Some(("array", json(definitions.attached_to(schema)))),
-        "null" => Some(("null", Grammar::ConstString("null".to_string()))),
-        _ => None,
-    }
+    let grammar = match kind {
+        "string" => match string_enum(schema, target) {
+            Some(values) => Grammar::Or(
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|value| Grammar::ConstString(value.to_string()))
+                    .collect(),
+            ),
+            None => text(),
+        },
+        "number" | "object" | "array" => json(definitions.attached_to(schema)),
+        "boolean" => json(json!({"type": "boolean"})),
+        // The one kind left: `null`.
+        _ => Grammar::ConstString("null".to_string()),
+    };
+    Some((kind, grammar))
 }
 
 /// The definitions at the root of a tool's schema, `$defs` and `definitions`. Each property's
