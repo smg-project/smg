@@ -258,6 +258,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # n>1 emits a *list* of final dicts (non-streaming) or per-choice
         # streamed dicts tagged with ``index`` — both handled below.
         expanded_rid = getattr(req_obj, "rid", None)
+        # The stream closes once every requested choice has its Complete: the
+        # engine's iterator may stay open briefly after its final output, and a
+        # client must not wait on transport EOF for a response that is whole.
+        expected_choices = len(expanded_rid) if isinstance(expanded_rid, list) else 1
+        completed_indices: set[int] = set()
         if os.environ.get("SMG_CACHE_TRACE") == "1":
             logger.info(
                 "cache_request_mapping %s",
@@ -306,7 +311,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                         yield self._complete_response(
                             rid, item, item_reason, ci, no_stop_trim=no_stop_trim
                         )
-                    continue
+                    return
 
                 meta = output.get("meta_info", {})
                 reason_dict = _finish_reason_to_dict(meta.get("finish_reason"))
@@ -320,9 +325,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 choice_index = int(output.get("index", 0))
 
                 if request.stream:
-                    yield self._chunk_response(
+                    chunk_response = self._chunk_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+                    # A matched stop token may be the whole final engine delta;
+                    # trimmed, it leaves no client-visible payload, and an empty
+                    # Chunk before Complete would hold a streaming client at the
+                    # terminal boundary.
+                    if chunk_response.chunk.token_ids:
+                        yield chunk_response
                     if is_finished:
                         yield self._complete_response(
                             rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
@@ -331,6 +342,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     yield self._complete_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+
+                if is_finished:
+                    completed_indices.add(choice_index)
+                    if len(completed_indices) == expected_choices:
+                        return
 
         except ValueError as e:
             logger.warning("Generate invalid request %s: %s", rid, e)
