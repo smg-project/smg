@@ -2254,6 +2254,65 @@ fn m3_a_wide_property_leaves_each_later_sibling_its_element() {
     assert_eq!(elements_written(&tag), 1024);
 }
 
+/// A property typed `null` writes nothing and costs nothing: neither an element of its own nor one
+/// held for it as a later sibling, so the properties that do write still get the whole budget.
+#[test]
+fn m3_null_properties_cost_no_element() {
+    // 1,023 strings, a null, a required boolean: 1,024 elements written, the boolean typed.
+    let mut properties = serde_json::Map::new();
+    for i in 0..1023 {
+        properties.insert(format!("s{i:04}"), json!({"type": "string"}));
+    }
+    properties.insert("unull".to_string(), json!({"type": "null"}));
+    properties.insert("zflag".to_string(), json!({"type": "boolean"}));
+    let required: Vec<String> = properties.keys().cloned().collect();
+    let tool =
+        schema_tool(json!({"type": "object", "properties": properties, "required": required}));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    assert_eq!(elements_written(&tag), 1024);
+    assert_eq!(free_text_runs(&tag), 0, "nothing fell back");
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(
+        members.as_array().map(Vec::len),
+        Some(1024),
+        "the null property is left out"
+    );
+    assert_eq!(
+        members[1023],
+        expected_element(
+            "zflag",
+            json!({"type": "or", "elements": [
+                {"type": "const_string", "value": "true"},
+                {"type": "const_string", "value": "false"},
+                {"type": "const_string", "value": "True"},
+                {"type": "const_string", "value": "False"},
+            ]})
+        ),
+        "the boolean keeps its grammar"
+    );
+
+    // A null among the later siblings of a wide property holds no element: the wide property's
+    // descent gets it, and the string after both still has its own.
+    let mut properties = serde_json::Map::new();
+    properties.insert("config".to_string(), fan_out(8, 4));
+    properties.insert("none".to_string(), json!({"type": "null"}));
+    properties.insert("path".to_string(), json!({"type": "string"}));
+    let tool = schema_tool(json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["config", "none", "path"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    assert_eq!(
+        elements_written(&tag),
+        1024,
+        "no element is held for the null sibling"
+    );
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(members.as_array().map(Vec::len), Some(2));
+    assert_eq!(members[1], expected_element("path", expected_text("path")));
+}
+
 /// A list's item element counts against the budget like a property's; a list reached once the
 /// budget is spent is free text.
 #[test]

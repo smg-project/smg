@@ -38,11 +38,13 @@ const CALL_EXITS: [&str; 3] = ["</invoke>", "<invoke name=\"", "</tool_call>"];
 const DEPTH: usize = 16;
 /// How many elements one invoke's grammar may hold; past that, the values still to write are
 /// free text. An acyclic schema unfolds as k^d elements for k properties over d levels, which the
-/// depth cap alone does not bound; ordinary tool schemas stay far below this. The budget is spent
+/// depth cap alone does not bound; ordinary tool schemas stay far below this. The budget is each
+/// invoke's own: a tag for many tools holds up to this many elements per tool. The budget is spent
 /// depth first, in the schema's order, but an object's later properties each keep one element
 /// while an earlier one is descended into, so what runs short loses its structure from the inside
 /// out: the nested objects first, the top-level arguments last. The budget counts elements, not
-/// bytes: a value's own spelling (an enum's words, a number's schema) is written as it is.
+/// bytes: a value's own spelling (an enum's words, a number's schema) is written as it is, and a
+/// property typed `null`, written as nothing, costs none.
 const NODES: usize = 1024;
 
 /// MiniMax M3 format parser for tool calls.
@@ -680,8 +682,8 @@ impl MinimaxM3Parser {
 /// to itself stays bounded, the depth cap the outer bound. The elements of one invoke are counted
 /// against [`NODES`]: once they are spent, the values still to write (the rest of an object, a
 /// list) are free text, so a wide fan-out stays bounded too; before a property is descended into,
-/// one element is held for each of the properties after it, so an early object cannot take the
-/// elements its siblings need for their own tags.
+/// one element is held for each of the properties after it that writes one, so an early object
+/// cannot take the elements its siblings need for their own tags.
 ///
 /// The `symphony` crate's `grammar/xml.rs` writes the same model's block from its table, and
 /// spells the same output; it follows the references and the depth cap the same way, and takes
@@ -782,10 +784,11 @@ impl<'a> Elements<'a> {
 
     /// An object's elements: one per property in the schema's order, each
     /// optional unless the schema requires it, a property typed `null` left
-    /// out; free text up to `close` for a schema without properties, and for
-    /// the properties left once the invoke's element budget is spent. While
-    /// a property's value is written, one element is held for each property
-    /// after it, so each still gets its own tag.
+    /// out at no cost to the budget; free text up to `close` for a schema
+    /// without properties, and for the properties left once the invoke's
+    /// element budget is spent. While a property's value is written, one
+    /// element is held for each property after it that writes one, so each
+    /// still gets its own tag.
     fn members(&mut self, schema: &'a Value, close: &str, depth: usize) -> Value {
         let properties = schema
             .get("properties")
@@ -799,17 +802,28 @@ impl<'a> Elements<'a> {
             .and_then(Value::as_array)
             .map(|names| names.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let written: Vec<bool> = properties
+            .values()
+            .map(|schema| self.writes_an_element(schema, depth))
+            .collect();
+        let mut later = written.iter().filter(|writes| **writes).count();
         let mut elements: Vec<Value> = Vec::new();
-        for (at, (key, schema)) in properties.iter().enumerate() {
+        for ((key, schema), writes) in properties.iter().zip(written) {
+            if !writes {
+                continue;
+            }
+            later -= 1;
             if !self.takes_an_element() {
                 elements.push(Self::free_text(close));
                 break;
             }
-            let siblings = properties.len() - 1 - at;
-            self.reserved += siblings;
+            self.reserved += later;
             let element = self.element(key, schema, depth);
-            self.reserved -= siblings;
+            self.reserved -= later;
             let Some(element) = element else {
+                // `value` decides as `writes_an_element` does, so this is not reached; the
+                // element goes back should the two ever differ.
+                self.nodes += 1;
                 continue;
             };
             elements.push(if required.contains(&key.as_str()) {
@@ -822,6 +836,21 @@ impl<'a> Elements<'a> {
             return json!({ "type": "const_string", "value": "" });
         }
         json!({ "type": "sequence", "elements": elements })
+    }
+
+    /// Whether a property's schema writes an element: every type but `null`,
+    /// which is written as nothing, its references followed as [`Self::value`]
+    /// follows them; a schema at the depth cap or behind a reference that
+    /// recurs is free text, an element too.
+    fn writes_an_element(&mut self, schema: &'a Value, depth: usize) -> bool {
+        if depth == 0 {
+            return true;
+        }
+        let Some((schema, pushed)) = self.follow(schema) else {
+            return true;
+        };
+        self.unwind(pushed);
+        MinimaxM3Parser::schema_type(Some(schema)) != Some("null")
     }
 
     /// One element: the separator and `<key>`, the value, the separator and
