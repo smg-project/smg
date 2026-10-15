@@ -171,6 +171,9 @@ impl BuildStage for MessageRequestBuildingStage {
         // A worker whose engine takes a grammar on every turn gets the table's
         // tag for the calls the request allows under `auto`, when the request
         // asked for no constraint of its own (`regular::symphony::auto_constraint_messages`).
+        // The policy is read once, for the first attempt's worker: the attempt
+        // stamp carries the tag unshaped like a forced call's, so a retry's
+        // worker shapes it again but is not asked for its own policy.
         let tool_constraints = match tool_constraints {
             None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
                 == ConstrainedDecoding::Always =>

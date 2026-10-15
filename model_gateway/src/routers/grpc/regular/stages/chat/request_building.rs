@@ -52,6 +52,38 @@ impl ChatRequestBuildingStage {
 /// reasoning state. The caller supplies the `ResponseSpec`.
 /// `continued_final_message` is the rendered prompt's
 /// (`ProcessedMessages::continued_final_message`).
+/// Whether the rendered prompt leaves the model inside its thought, as the
+/// request's grammar and the plan's reasoning state both read it: native
+/// Gemma4 channels follow the rendered prompt (the first value, when that
+/// parser decides); other parsers keep their tokenizer-driven preference for
+/// the engine's reasoning gate (the second value falls back to it).
+fn reasoning_decision(
+    ctx: &RequestContext,
+    chat_request: &openai_protocol::chat::ChatCompletionRequest,
+    processed_text: &str,
+    continued_final_message: bool,
+) -> (Option<bool>, bool) {
+    let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+        &ctx.components.reasoning_parser_factory,
+        ctx.components
+            .parser_resolver
+            .reasoning_parser(&chat_request.model)
+            .as_deref(),
+        &chat_request.model,
+        processed_text,
+    );
+    let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
+        ctx.tokenizer_arc().is_some_and(|tokenizer| {
+            utils::chat_reasoning_starts_in_rendered_prefill(
+                chat_request,
+                continued_final_message,
+                tokenizer.as_ref(),
+            )
+        })
+    });
+    (reasoning_in_prefill, require_reasoning)
+}
+
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
@@ -124,26 +156,8 @@ pub(crate) async fn build_chat_backed_plan(
         .await?;
     }
 
-    // Native Gemma4 channels follow the rendered prompt; other parsers keep
-    // their tokenizer-driven preference for the engine's reasoning gate.
-    let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
-        &ctx.components.reasoning_parser_factory,
-        ctx.components
-            .parser_resolver
-            .reasoning_parser(&chat_request.model)
-            .as_deref(),
-        &chat_request.model,
-        &processed_text,
-    );
-    let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
-        ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::chat_reasoning_starts_in_rendered_prefill(
-                chat_request,
-                continued_final_message,
-                tokenizer.as_ref(),
-            )
-        })
-    });
+    let (reasoning_in_prefill, require_reasoning) =
+        reasoning_decision(ctx, chat_request, &processed_text, continued_final_message);
 
     // Now that the worker is known, a forced call's grammar takes the shape
     // its engine needs: the bare calls behind a reasoning parser's gate, the
@@ -291,20 +305,21 @@ impl BuildStage for ChatRequestBuildingStage {
         let names = ctx.components.parser_resolver.names(&chat_request.model);
         // A worker whose engine takes a grammar on every turn gets the table's
         // tag for the calls the request allows under `auto`, when the request
-        // asked for no constraint of its own (`regular::symphony::auto_constraint`);
-        // the attempt stamp carries it unshaped like a forced call's, so a
-        // retry's worker shapes it again.
+        // asked for no constraint of its own (`regular::symphony::auto_constraint`),
+        // built on the reasoning state the plan takes (`reasoning_decision`).
+        // The policy is read once, for the first attempt's worker: the attempt
+        // stamp carries the tag unshaped like a forced call's, so a retry's
+        // worker shapes it again but is not asked for its own policy.
         let tool_constraints = match tool_constraints {
             None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
                 == ConstrainedDecoding::Always =>
             {
-                let reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-                    utils::chat_reasoning_starts_in_rendered_prefill(
-                        &chat_request,
-                        processed_messages.continued_final_message,
-                        tokenizer.as_ref(),
-                    )
-                });
+                let (_, reasoning) = reasoning_decision(
+                    ctx,
+                    &chat_request,
+                    &processed_messages.text,
+                    processed_messages.continued_final_message,
+                );
                 symphony::auto_constraint(
                     ctx.state.parser.unwrap_or_default(),
                     &names,

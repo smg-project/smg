@@ -357,10 +357,12 @@ pub(crate) fn constraint(
 /// The tag of the calls a chat request's model may make under `auto`, for a worker whose engine
 /// takes a grammar on every turn ([`ConstrainedDecoding::Always`]): the table's grammar for the
 /// request's callable `tools` with no call required, at most one when parallel calls are off, and
-/// `reasoning_open` when the prompt leaves the model inside its thought. `Ok(None)` when no table
-/// reads the response ([`reads`]), the request has no callable tools (a thought and an answer are
-/// not constrained today), or a registry table has no tag; the response template's table refuses
-/// as [`tagged`] does for a forced call.
+/// `reasoning_open` when the prompt leaves the model inside its thought. The request asked for
+/// nothing, so nothing is refused: `Ok(None)` when no table reads the response ([`reads`]), the
+/// request has no callable tools or forbids the calls (`tool_choice: none`), it carries a
+/// constraint of its own that the tag would displace (a JSON `response_format`, a `regex`, an
+/// `ebnf`), it continues the assistant's message (the tag writes a turn from its start), or the
+/// table has no tag for the calls. A thought and an answer alone are not constrained today.
 pub(crate) fn auto_constraint(
     parser: ParserChoice,
     names: &Names,
@@ -372,31 +374,45 @@ pub(crate) fn auto_constraint(
     let Some(format) = reads(parser, names, &request.model, templates)? else {
         return Ok(None);
     };
-    // `tool_choice: none` keeps the tools in the prompt and forbids the calls, so there is
-    // nothing to constrain; the callable tools are not narrowed by it.
+    let own_constraint = answer_schema(request.response_format.as_ref()).is_some()
+        || request.regex.is_some()
+        || request.ebnf.is_some();
     if tools.is_empty()
         || matches!(
             request.tool_choice,
             Some(ToolChoice::Value(ToolChoiceValue::None))
         )
+        || own_constraint
+        || request.continues_final_assistant()
     {
         return Ok(None);
     }
-    let grammar = format.grammar_for(
+    Ok(auto_tag(
+        &format,
         tools,
-        Options {
-            at_least_one: false,
-            reasoning_open,
-            one_call: request.parallel_tool_calls == Some(false),
-        },
-    );
-    tagged(
-        grammar,
-        names_template(names),
-        &request.model,
-        "the calls it may make",
-        request.continues_final_assistant(),
-    )
+        reasoning_open,
+        request.parallel_tool_calls == Some(false),
+    ))
+}
+
+/// The tag of the calls `format` lets a model make under `auto`: no call required, one at most
+/// when `one_call`; `None` when the table has no tag for them.
+fn auto_tag(
+    format: &Format,
+    tools: &[Tool],
+    reasoning_open: bool,
+    one_call: bool,
+) -> Option<ToolConstraint> {
+    format
+        .grammar_for(
+            tools,
+            Options {
+                at_least_one: false,
+                reasoning_open,
+                one_call,
+            },
+        )
+        .map(|grammar| ToolConstraint::StructuralTag(grammar.payload().to_string()))
 }
 
 /// [`constraint`] for a Messages request: a `tool_choice` of `any` or a named tool forces a call
@@ -432,8 +448,9 @@ pub(crate) fn constraint_messages(
 }
 
 /// [`auto_constraint`] for a Messages request: the calls it may make under `auto` (or no choice),
-/// one at most when parallel use is disabled; `continues` says whether the prompt continues the
-/// assistant's message.
+/// one at most when parallel use is disabled; nothing when the prompt `continues` the assistant's
+/// message. A Messages request carries no constraint of its own (an `output_format` is refused
+/// before this).
 pub(crate) fn auto_constraint_messages(
     parser: ParserChoice,
     names: &Names,
@@ -447,7 +464,7 @@ pub(crate) fn auto_constraint_messages(
         return Ok(None);
     };
     let one_call = match &request.tool_choice {
-        _ if tools.is_empty() => return Ok(None),
+        _ if tools.is_empty() || continues => return Ok(None),
         Some(MessagesToolChoice::None) => return Ok(None),
         Some(MessagesToolChoice::Auto {
             disable_parallel_tool_use,
@@ -456,21 +473,7 @@ pub(crate) fn auto_constraint_messages(
         Some(MessagesToolChoice::Any { .. } | MessagesToolChoice::Tool { .. }) => return Ok(None),
         None => false,
     };
-    let grammar = format.grammar_for(
-        tools,
-        Options {
-            at_least_one: false,
-            reasoning_open,
-            one_call,
-        },
-    );
-    tagged(
-        grammar,
-        names_template(names),
-        &request.model,
-        "the calls it may make",
-        continues,
-    )
+    Ok(auto_tag(&format, tools, reasoning_open, one_call))
 }
 
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
@@ -1322,8 +1325,9 @@ mod tests {
     }
 
     /// For a worker on `always`, the calls a request may make under `auto` take the table's tag
-    /// with no call required; a request with no tools, or `tool_choice: none`, takes none; a
-    /// prompt that continues the assistant's message is refused as a forced call would be.
+    /// with no call required. Nothing is refused: a request with no tools, `tool_choice: none`,
+    /// a constraint of its own (a JSON `response_format`, a `regex`), or a prompt that continues
+    /// the assistant's message takes none, and so does a forced Messages choice.
     #[test]
     fn an_always_worker_takes_the_tables_tag_for_the_calls_auto_allows() {
         let auto = request(json!({"tool_choice": "auto"}));
@@ -1382,6 +1386,32 @@ mod tests {
         )
         .expect("no hf")
         .is_none());
+        for own in [
+            json!({"tool_choice": "auto", "response_format": {"type": "json_object"}}),
+            json!({"tool_choice": "auto", "regex": "[a-z]+"}),
+            json!({
+                "tool_choice": "auto",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "I was saying"}
+                ],
+                "continue_final_message": true, "add_generation_prompt": false
+            }),
+        ] {
+            assert!(
+                auto_constraint(
+                    ParserChoice::Symphony,
+                    &Names::default(),
+                    &request(own.clone()),
+                    &tools(),
+                    false,
+                    &templates(),
+                )
+                .expect("no hf")
+                .is_none(),
+                "{own}"
+            );
+        }
         let messages_auto = message_request(json!({
             "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
@@ -1403,6 +1433,17 @@ mod tests {
             .expect("no hf"),
             Some(ToolConstraint::StructuralTag(_))
         ));
+        assert!(auto_constraint_messages(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &messages_auto,
+            &tools,
+            false,
+            true,
+            &templates(),
+        )
+        .expect("no hf")
+        .is_none());
         let messages_any = message_request(json!({
             "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
             "tool_choice": {"type": "any"}
