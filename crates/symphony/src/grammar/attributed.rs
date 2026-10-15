@@ -118,6 +118,7 @@ fn string_attribute_calls(
                     Grammar::JsonSchema {
                         schema: Value::Bool(true),
                         style: None,
+                        excludes: Vec::new(),
                     },
                 ]),
             ]),

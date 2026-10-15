@@ -135,6 +135,7 @@ fn words<const N: usize>(schema: Value, python: [&str; N]) -> Grammar {
     let mut options = vec![Grammar::JsonSchema {
         schema,
         style: None,
+        excludes: Vec::new(),
     }];
     options.extend(
         python
