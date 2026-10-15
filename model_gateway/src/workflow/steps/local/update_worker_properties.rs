@@ -66,6 +66,14 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                         updated_labels.insert(key.clone(), value.clone());
                     }
                 }
+                // A `constrained_decoding` label sent in the update must name a
+                // policy, as at registration (`create_worker`): a typo would
+                // otherwise read as `requested` from here on.
+                super::create_worker::validate_constrained_decoding_label(
+                    &updated_labels,
+                    worker.url(),
+                    "update_worker_properties",
+                )?;
                 if updated_labels.len() > existing.len() && updated_labels.len() > MAX_WORKER_LABELS {
                     return Err(WorkflowError::StepFailed {
                         step_id: StepId::new("update_worker_properties"),
@@ -320,6 +328,41 @@ mod tests {
             updated_workers: None,
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    /// A `constrained_decoding` label sent in an update must name a policy,
+    /// as at registration: a typo is refused where the labels are merged,
+    /// and a policy goes through.
+    #[tokio::test]
+    async fn a_constrained_decoding_label_update_must_name_a_policy() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut typo = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("constrained_decoding".to_string(), "sometimes".to_string())]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut typo)
+            .await
+            .expect_err("a label that names no policy");
+        assert!(err.to_string().contains("'requested' or 'always'"), "{err}");
+        let mut always = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("constrained_decoding".to_string(), "always".to_string())]),
+        );
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut always)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
     }
 
     /// The cap is held where the labels are merged, not only at the admin

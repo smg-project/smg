@@ -399,8 +399,9 @@ own, not a `server_args` key): `always` for a model that takes a grammar on
 every turn, `requested` for one only when the request asks. The servicers read
 it as `constrained_decoding` off TokenSpeed's `ServerArgs`, else its
 `ModelConfig`. A router turns the field into the worker's `constrained_decoding`
-label and follows it per worker; an engine that declares nothing is served as
-`requested`, which is what every worker did before the label existed.
+label and records the policy there; the request paths that act on `always` are a
+separate change, so until they land every worker is served as `requested`, which
+is what every worker did before the label existed.
 
 #### Multi-node engines: the worker pod's liveness
 

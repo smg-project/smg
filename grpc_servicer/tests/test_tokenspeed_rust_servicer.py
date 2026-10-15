@@ -301,6 +301,7 @@ def test_model_facts_mirror_the_python_servicer(monkeypatch):
         "supported_modalities": [1, 3],
         "model_dtype": "bfloat16",
         "multimodal_encoder_dtype": "bfloat16",
+        "constrained_decoding": "",
     }
     # A text model: no modalities, an int EOS.
     text = SimpleNamespace(
@@ -1105,12 +1106,24 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     assert events == ["serving:False", "stop:5.0"]
 
 
-def test_server_facts_carry_the_engines_constrained_decoding_policy(monkeypatch):
+def test_model_facts_carry_the_engines_constrained_decoding_policy(monkeypatch):
     """The Rust servicer reports the engine's declared constrained-decoding
-    policy as the Python servicer does, from a field of the launcher's facts;
-    args that declare none leave it empty."""
+    policy as the Python servicer reads it: off the server args, else the
+    model config, which the launcher's model facts hold; neither declaring
+    one leaves the field empty, and the server facts never carry it."""
     _stub_servicer_module(monkeypatch)
-    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
-    always = rust.server_facts(SimpleNamespace(model="org/m", constrained_decoding="ALWAYS"))
-    assert always["constrained_decoding"] == "always"
-    assert rust.server_facts(FakeServerArgs())["constrained_decoding"] == ""
+    text = SimpleNamespace(
+        hf_config=SimpleNamespace(eos_token_id=2, model_type="qwen3", architectures=["Q"]),
+        context_len=4096,
+        vocab_size=100,
+        dtype="torch.float16",
+        is_multimodal=False,
+    )
+    assert rust.model_facts(FakeServerArgs(), model_config=text)["constrained_decoding"] == ""
+    declared = SimpleNamespace(constrained_decoding="ALWAYS", **vars(text))
+    assert rust.model_facts(FakeServerArgs(), model_config=declared)["constrained_decoding"] == (
+        "always"
+    )
+    args = SimpleNamespace(model="org/m", constrained_decoding="requested")
+    assert rust.model_facts(args, model_config=declared)["constrained_decoding"] == "requested"
+    assert "constrained_decoding" not in rust.server_facts(FakeServerArgs())
