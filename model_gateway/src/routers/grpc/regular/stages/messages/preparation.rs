@@ -277,7 +277,7 @@ impl MessagePreparationStage {
             (None, _) => None,
         };
 
-        let preserve_reasoning_special_tokens = utils::reasoning_parser_requires_special_tokens(
+        let legacy_parser_needs_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &ctx.components.reasoning_parser_factory,
             ctx.components
                 .parser_resolver
@@ -285,6 +285,16 @@ impl MessagePreparationStage {
                 .as_deref(),
             &request.model,
         );
+        // A Symphony table whose markers the decoder would drop as special tokens needs them
+        // kept: without them the table reads neither the thought nor the calls.
+        let preserve_reasoning_special_tokens = legacy_parser_needs_special_tokens
+            || symphony::keeps_special_tokens(
+                parser,
+                &names,
+                &request.model,
+                &ctx.components.templates,
+                tokenizer.as_ref(),
+            );
 
         // Derive skip_special_tokens from parser and constraint type:
         // - typed reasoning parsers need their control tokens preserved

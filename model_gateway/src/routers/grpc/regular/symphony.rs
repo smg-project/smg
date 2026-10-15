@@ -36,7 +36,10 @@
 pub(crate) mod template;
 
 use axum::http::HeaderMap;
-use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
+use llm_tokenizer::{
+    stop::{SequenceDecoderOutput, StopSequenceDecoder},
+    traits::Tokenizer,
+};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
@@ -294,6 +297,42 @@ fn answer_tag(
 ) -> Result<Option<ToolConstraint>, String> {
     let grammar = format.answer_grammar(schema, reasoning_open);
     tagged(grammar, true, model, "a JSON answer", continues)
+}
+
+/// Whether the table that reads `model`'s responses under `parser` ([`reads`]) needs the
+/// vocabulary's special tokens kept in the decoded output: one of its markers is, or holds, a
+/// token the stop decoder would drop with `skip_special_tokens` (Muse Spark's `<|message|>` and
+/// `<|eom|>`, Kimi K3's `<|open|>` and `<|sep|>`). A legacy reasoning parser says so of itself
+/// (`requires_special_tokens`); a table says nothing, so the gateway asks the tokenizer: a marker
+/// whose tokens decode to its text with the special tokens kept and to something else with them
+/// dropped is such a marker. `false` when no table reads the response, or when every marker
+/// survives the decoder either way (Qwen3's `<think>` and `<tool_call>` are added tokens the
+/// decoder keeps), so a model the older rule already serves is read as before.
+pub(crate) fn keeps_special_tokens(
+    parser: ParserChoice,
+    names: &Names,
+    model: &str,
+    templates: &Templates,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
+    match reads(parser, names, model, templates) {
+        Ok(Some(format)) => markers_hidden_by_the_decoder(&format, tokenizer),
+        _ => false,
+    }
+}
+
+/// Whether one of `format`'s markers loses text when its tokens are decoded with the special
+/// tokens dropped: the marker as the tokenizer encodes it decodes back to itself with them kept.
+fn markers_hidden_by_the_decoder(format: &Format, tokenizer: &dyn Tokenizer) -> bool {
+    format.terminal_texts().any(|marker| {
+        let Ok(encoding) = tokenizer.encode(marker, false) else {
+            return false;
+        };
+        let ids = encoding.token_ids();
+        let kept = tokenizer.decode(ids, false);
+        let dropped = tokenizer.decode(ids, true);
+        matches!((kept, dropped), (Ok(kept), Ok(dropped)) if kept == marker && dropped != marker)
+    })
 }
 
 /// The structural tag the table gives a chat request's forced or required call to one of `tools`,
@@ -1453,6 +1492,70 @@ mod tests {
         )
         .expect("no hf")
         .is_none());
+    }
+
+    /// A tokenizer whose decoder drops `<eos>` and `<bos>` as special tokens and keeps every
+    /// other token, the markers of two tables among them.
+    fn marker_tokenizer() -> llm_tokenizer::MockTokenizer {
+        llm_tokenizer::MockTokenizer::new().with_tokens(&[
+            ("<eos>", 1),
+            ("<bos>", 2),
+            ("<think>", 3),
+            ("</think>", 4),
+        ])
+    }
+
+    fn table_with_markers(open: &str, close: &str) -> Format {
+        Format::new("markers")
+            .terminal("open", open)
+            .terminal("close", close)
+            .state("content", symphony::Emits::Content)
+            .state("reasoning", symphony::Emits::Reasoning)
+            .transition("content", "open", "reasoning")
+            .transition("reasoning", "close", "content")
+    }
+
+    #[test]
+    fn a_table_whose_marker_the_decoder_drops_keeps_the_special_tokens() {
+        let tokenizer = marker_tokenizer();
+        // A marker the decoder drops with the special tokens: the table needs them kept.
+        assert!(markers_hidden_by_the_decoder(
+            &table_with_markers("<bos>", "<eos>"),
+            &tokenizer
+        ));
+        // Markers the decoder keeps either way, and a marker the tokenizer does not know,
+        // which decodes to nothing with or without them: read as before.
+        assert!(!markers_hidden_by_the_decoder(
+            &table_with_markers("<think>", "</think>"),
+            &tokenizer
+        ));
+        assert!(!markers_hidden_by_the_decoder(
+            &table_with_markers("<unknown>", "</unknown>"),
+            &tokenizer
+        ));
+        // Through the names: Qwen3's table over this vocabulary needs nothing, and no table
+        // (the legacy parsers, or `--parser legacy`) asks for nothing.
+        assert!(!keeps_special_tokens(
+            ParserChoice::Symphony,
+            &names(Some("qwen3"), None),
+            "Qwen/Qwen3-8B",
+            &templates(),
+            &tokenizer,
+        ));
+        assert!(!keeps_special_tokens(
+            ParserChoice::Symphony,
+            &names(Some("passthrough"), None),
+            "Qwen/Qwen3-8B",
+            &templates(),
+            &tokenizer,
+        ));
+        assert!(!keeps_special_tokens(
+            ParserChoice::Legacy,
+            &names(Some("qwen3"), None),
+            "Qwen/Qwen3-8B",
+            &templates(),
+            &tokenizer,
+        ));
     }
 
     #[test]
