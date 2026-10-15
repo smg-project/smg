@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""A strict stand-in for the two `scontrol` calls the Slurm provider makes,
+answering from a state file:
+
+- `scontrol show hostnames <hostlist>`, from the state's hostlist table. An
+  unknown hostlist is answered as Slurm does: exit 0, nothing on stdout.
+- `scontrol --json show nodes <name,...>`, from the state's node table. An
+  unknown node is left out, as Slurm leaves it out.
+
+Anything else is refused, and every call is recorded.
+"""
+
+import json
+import os
+import sys
+import time
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    with open(os.environ["SMG_FAKE_SLURM_CALLS"], "a") as calls:
+        calls.write(json.dumps({"command": "scontrol", "argv": argv, "at": time.time()}) + "\n")
+    with open(os.environ["SMG_FAKE_SLURM"]) as state_file:
+        state = json.load(state_file)
+
+    if len(argv) == 3 and argv[:2] == ["show", "hostnames"]:
+        names = state["hostlists"].get(argv[2])
+        if names is None:
+            print(f"Invalid hostlist: {argv[2]}", file=sys.stderr)
+            return 0
+        print("\n".join(names))
+        return 0
+
+    if len(argv) == 4 and argv[:3] == ["--json", "show", "nodes"]:
+        if "nodes" in state.get("fail", []):
+            print("slurm_load_node error: Unable to contact slurm controller", file=sys.stderr)
+            return 1
+        nodes = [
+            {
+                "name": name,
+                "address": state["nodes"][name].get("address", ""),
+                "hostname": state["nodes"][name].get("hostname", ""),
+                "state": ["MIXED"],
+            }
+            for name in argv[3].split(",")
+            if name in state["nodes"]
+        ]
+        print(json.dumps({"nodes": nodes, "errors": [], "warnings": []}))
+        return 0
+
+    print(f"scontrol: unexpected arguments {argv}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

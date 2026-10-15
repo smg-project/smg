@@ -343,16 +343,79 @@ class TestRouterInitialization:
         "args, message",
         [
             (RouterArgs(discovery_provider="file"), "needs discovery_file"),
-            (RouterArgs(discovery_file="/run/smg/workers.json"), "apply only to"),
-            (RouterArgs(discovery_check_interval_secs=5), "apply only to"),
+            (RouterArgs(discovery_file="/run/smg/workers.json"), "only to discovery_provider"),
+            (RouterArgs(discovery_check_interval_secs=5), "only to discovery_provider"),
             (
                 RouterArgs(service_discovery=True, discovery_file="/run/smg/workers.json"),
-                "apply only to",
+                "only to discovery_provider",
             ),
         ],
     )
     def test_from_args_rejects_an_incomplete_file_provider(self, args, message):
         """The file flags only configure the file provider, which needs a manifest."""
+        with (
+            patch("smg.router._Router") as rust_router,
+            pytest.raises(ValueError, match=message),
+        ):
+            Router.from_args(args)
+
+        rust_router.assert_not_called()
+
+    def test_from_args_passes_the_slurm_provider_as_a_discovery_mapping(self):
+        """The Slurm provider reaches Rust through the tagged `discovery`
+        mapping, with only the settings that were given."""
+        args = RouterArgs(
+            discovery_provider="slurm",
+            slurm_prefill_job_name=["prefill-a", "prefill-b"],
+            slurm_decode_job_name=["decode"],
+            slurm_port=8000,
+            slurm_bootstrap_port=8998,
+            slurm_partition="gpu",
+            discovery_check_interval_secs=10,
+            pd_disaggregation=True,
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["discovery"] == {
+            "provider": "slurm",
+            "prefill_job_names": ["prefill-a", "prefill-b"],
+            "decode_job_names": ["decode"],
+            "port": 8000,
+            "bootstrap_port": 8998,
+            "partition": "gpu",
+            "check_interval_secs": 10,
+        }
+        assert kwargs["service_discovery"] is False
+        for key in kwargs:
+            assert not key.startswith("slurm_"), key
+
+    @pytest.mark.parametrize(
+        "args, message",
+        [
+            (
+                RouterArgs(discovery_provider="slurm", slurm_job_name=["w"]),
+                "needs slurm_port",
+            ),
+            (RouterArgs(slurm_job_name=["w"]), "only to discovery_provider='slurm'"),
+            (
+                RouterArgs(
+                    discovery_provider="file",
+                    discovery_file="/run/smg/workers.json",
+                    slurm_port=8000,
+                ),
+                "only to discovery_provider='slurm'",
+            ),
+            (
+                RouterArgs(service_discovery=True, discovery_check_interval_secs=5),
+                "only to discovery_provider='file' or 'slurm'",
+            ),
+        ],
+    )
+    def test_from_args_rejects_misplaced_slurm_settings(self, args, message):
+        """The Slurm flags only configure the Slurm provider, which needs a port."""
         with (
             patch("smg.router._Router") as rust_router,
             pytest.raises(ValueError, match=message),

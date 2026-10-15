@@ -15,9 +15,8 @@ and an invalid edit and its fix.
 
 from __future__ import annotations
 
-import time
-
-from .harness import MODEL, NO_REREAD_SECS, free_port_range, served_by
+from ..discovery_common import MODEL, free_port_range, served_by
+from .harness import NO_REREAD_SECS
 
 # How long a watched change may take to apply: the event settling, one read,
 # and registration. Far below NO_REREAD_SECS, so no periodic reread can pass
@@ -46,7 +45,7 @@ def test_registration_provenance_and_round_robin(gateway, manifest, engines):
     assert all(w["labels"][PROVIDER] == "file" for w in workers), workers
 
     # Round-robin over the discovered fleet: both engines serve traffic.
-    assert served_by(gateway, 10) == {f"served-by-{a.port}", f"served-by-{b.port}"}
+    assert served_by(gateway, 10) == {a.served_by, b.served_by}
 
 
 def test_one_edit_adds_and_removes_several_workers(gateway, manifest, engines):
@@ -94,7 +93,7 @@ def test_an_unhealthy_engine_leaves_rotation_and_returns(gateway, manifest, engi
     manifest.write([{"url": a.url}, {"url": b.url}])
     gateway.start()
     gateway.wait_for_urls({a.url, b.url}, "both workers registered")
-    assert served_by(gateway, 10) == {f"served-by-{a.port}", f"served-by-{b.port}"}
+    assert served_by(gateway, 10) == {a.served_by, b.served_by}
 
     # The manifest has no readiness signal: the health checker takes a
     # failing engine out, and the reread brings it back once it recovers.
@@ -102,11 +101,11 @@ def test_an_unhealthy_engine_leaves_rotation_and_returns(gateway, manifest, engi
     gateway.wait_for(
         "the failing engine out of rotation", lambda workers: not ready(workers, a.url)
     )
-    assert served_by(gateway, 6) == {f"served-by-{b.port}"}
+    assert served_by(gateway, 6) == {b.served_by}
 
     a.healthy = True
     gateway.wait_for("the engine back once healthy", lambda workers: ready(workers, a.url))
-    assert f"served-by-{a.port}" in served_by(gateway, 10)
+    assert a.served_by in served_by(gateway, 10)
 
 
 def test_a_forty_worker_manifest_registers_and_unwinds(gateway, manifest, mock_worker):
@@ -245,13 +244,6 @@ def test_an_in_place_edit_takes_effect(gateway, manifest, mock_worker):
     assert {w["url"] for w in workers} == {prefill, decode}
 
 
-def wait_for_log(gateway, needle: str, what: str) -> None:
-    deadline = time.monotonic() + WATCHED
-    while needle not in gateway.log_path.read_text():
-        assert time.monotonic() < deadline, f"timed out waiting for {what}; {gateway.log_tail()}"
-        time.sleep(0.25)
-
-
 def test_changes_apply_as_they_happen(gateway, manifest, engines):
     a, b, c = engines(3)
     manifest.write([{"url": a.url}])
@@ -273,7 +265,9 @@ def test_changes_apply_as_they_happen(gateway, manifest, engines):
 def test_a_manifest_created_after_startup_applies_when_it_appears(gateway, manifest, engines):
     (engine,) = engines(1)
     gateway.start(check_interval_secs=NO_REREAD_SECS)
-    wait_for_log(gateway, "cannot read discovery manifest", "the startup read finding no manifest")
+    gateway.wait_for_log(
+        "cannot read discovery manifest", "the startup read finding no manifest", within=WATCHED
+    )
     assert gateway.workers() == []
 
     manifest.write([{"url": engine.url}])
@@ -289,7 +283,7 @@ def test_an_invalid_edit_is_rejected_at_once_and_its_fix_applies(gateway, manife
     manifest.write([{"url": b.url, "worker_typ": "regular"}])
     # The log line proves the watcher read the bad edit, so the unchanged
     # fleet is the provider keeping the last good manifest.
-    wait_for_log(gateway, "unknown field `worker_typ`", "the invalid edit rejected")
+    gateway.wait_for_log("unknown field `worker_typ`", "the invalid edit rejected", within=WATCHED)
     assert {w["url"] for w in gateway.workers() or []} == {a.url}
 
     manifest.write([{"url": b.url}])

@@ -36,8 +36,9 @@ use smg::{
         ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
         PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
         RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig, TurboJpegPolicy,
-        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        SlurmDiscoveryConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        TurboJpegPolicy, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -173,6 +174,8 @@ pub enum DiscoveryProvider {
     Kubernetes,
     #[value(name = "file")]
     File,
+    #[value(name = "slurm")]
+    Slurm,
 }
 
 impl DiscoveryProvider {
@@ -181,6 +184,7 @@ impl DiscoveryProvider {
         match self {
             Self::Kubernetes => "kubernetes",
             Self::File => "file",
+            Self::Slurm => "slurm",
         }
     }
 }
@@ -1089,10 +1093,54 @@ struct DiscoveryArgs {
     #[arg(long, help_heading = "Service Discovery (File)")]
     discovery_file: Option<PathBuf>,
 
-    /// Seconds between periodic rereads of the `--discovery-file` manifest,
-    /// which is also reread as soon as it changes (default: 30)
-    #[arg(long, help_heading = "Service Discovery (File)")]
+    /// Seconds between periodic rereads of the `--discovery-file` manifest
+    /// (which is also reread as soon as it changes), or between Slurm polls
+    /// (default: 30)
+    #[arg(long, help_heading = "Service Discovery")]
     discovery_check_interval_secs: Option<u64>,
+
+    // ==================== Service Discovery (Slurm) ====================
+    /// Slurm job name whose nodes are regular workers, for
+    /// `--discovery-provider slurm` (can be specified multiple times)
+    #[arg(long, action = ArgAction::Append, help_heading = "Service Discovery (Slurm)")]
+    slurm_job_name: Vec<String>,
+
+    /// Slurm job name whose nodes are encode workers (can be specified
+    /// multiple times)
+    #[arg(long, action = ArgAction::Append, help_heading = "Service Discovery (Slurm)")]
+    slurm_encode_job_name: Vec<String>,
+
+    /// Slurm job name whose nodes are prefill workers (can be specified
+    /// multiple times)
+    #[arg(long, action = ArgAction::Append, help_heading = "Service Discovery (Slurm)")]
+    slurm_prefill_job_name: Vec<String>,
+
+    /// Slurm job name whose nodes are decode workers (can be specified
+    /// multiple times)
+    #[arg(long, action = ArgAction::Append, help_heading = "Service Discovery (Slurm)")]
+    slurm_decode_job_name: Vec<String>,
+
+    /// Port of the inference server on every node of a discovered job
+    /// (required with `--discovery-provider slurm`)
+    #[arg(long, help_heading = "Service Discovery (Slurm)")]
+    slurm_port: Option<u16>,
+
+    /// Bootstrap port of the Slurm-discovered encode and prefill workers
+    #[arg(long, help_heading = "Service Discovery (Slurm)")]
+    slurm_bootstrap_port: Option<u16>,
+
+    /// Discover this Slurm user's jobs, by name or uid (default: the user the
+    /// gateway runs as)
+    #[arg(long, help_heading = "Service Discovery (Slurm)")]
+    slurm_user: Option<String>,
+
+    /// Discover only jobs charged to this Slurm account
+    #[arg(long, help_heading = "Service Discovery (Slurm)")]
+    slurm_account: Option<String>,
+
+    /// Discover only jobs in this Slurm partition
+    #[arg(long, help_heading = "Service Discovery (Slurm)")]
+    slurm_partition: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2959,22 +3007,32 @@ impl CliArgs {
         }
     }
 
-    /// The discovery configuration of the selected provider, or none. A
-    /// provider's own flags are ignored under another provider, as the
-    /// Kubernetes flags always were without discovery; the file flags have
-    /// no other use, so giving them without the file provider is an error,
-    /// as is the file provider without its manifest.
+    /// The discovery configuration of the selected provider, or none. The
+    /// Kubernetes flags are ignored under another provider, as they always
+    /// were without discovery; the file and Slurm flags have no other use, so
+    /// giving them without their provider is an error, as is either provider
+    /// without what it cannot run without.
     fn discovery_config(&self) -> ConfigResult<Option<DiscoveryConfig>> {
         let provider = self.selected_discovery_provider();
-        if provider != Some(DiscoveryProvider::File)
-            && (self.discovery.discovery_file.is_some()
-                || self.discovery.discovery_check_interval_secs.is_some())
+        let incompatible = |reason: &str| {
+            Err(ConfigError::IncompatibleConfig {
+                reason: reason.to_string(),
+            })
+        };
+        if provider != Some(DiscoveryProvider::File) && self.discovery.discovery_file.is_some() {
+            return incompatible("--discovery-file applies only to --discovery-provider file");
+        }
+        if !matches!(
+            provider,
+            Some(DiscoveryProvider::File | DiscoveryProvider::Slurm)
+        ) && self.discovery.discovery_check_interval_secs.is_some()
         {
-            return Err(ConfigError::IncompatibleConfig {
-                reason: "--discovery-file and --discovery-check-interval-secs apply only to \
-                         --discovery-provider file"
-                    .to_string(),
-            });
+            return incompatible(
+                "--discovery-check-interval-secs applies only to --discovery-provider file or slurm",
+            );
+        }
+        if provider != Some(DiscoveryProvider::Slurm) && self.has_slurm_flags() {
+            return incompatible("The --slurm-* flags apply only to --discovery-provider slurm");
         }
         Ok(match provider {
             None => None,
@@ -3007,7 +3065,44 @@ impl CliArgs {
                     .discovery_check_interval_secs
                     .unwrap_or(DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS),
             })),
+            Some(DiscoveryProvider::Slurm) => Some(DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
+                job_names: self.discovery.slurm_job_name.clone(),
+                encode_job_names: self.discovery.slurm_encode_job_name.clone(),
+                prefill_job_names: self.discovery.slurm_prefill_job_name.clone(),
+                decode_job_names: self.discovery.slurm_decode_job_name.clone(),
+                port: self
+                    .discovery
+                    .slurm_port
+                    .ok_or_else(|| ConfigError::MissingRequired {
+                        field: "--slurm-port".to_string(),
+                    })?,
+                bootstrap_port: self.discovery.slurm_bootstrap_port,
+                user: self.discovery.slurm_user.clone(),
+                account: self.discovery.slurm_account.clone(),
+                partition: self.discovery.slurm_partition.clone(),
+                check_interval_secs: self
+                    .discovery
+                    .discovery_check_interval_secs
+                    .unwrap_or(DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS),
+            })),
         })
+    }
+
+    /// Whether any `--slurm-*` flag was given.
+    fn has_slurm_flags(&self) -> bool {
+        [
+            &self.discovery.slurm_job_name,
+            &self.discovery.slurm_encode_job_name,
+            &self.discovery.slurm_prefill_job_name,
+            &self.discovery.slurm_decode_job_name,
+        ]
+        .iter()
+        .any(|names| !names.is_empty())
+            || self.discovery.slurm_port.is_some()
+            || self.discovery.slurm_bootstrap_port.is_some()
+            || self.discovery.slurm_user.is_some()
+            || self.discovery.slurm_account.is_some()
+            || self.discovery.slurm_partition.is_some()
     }
 
     /// Every worker url the mode starts with, in the order the flags list
@@ -4909,6 +5004,124 @@ mod tests {
         assert!(server.mesh_discovery_config.is_none());
     }
 
+    /// `--discovery-provider slurm` builds a Slurm configuration from the
+    /// `--slurm-*` flags, the shared interval included. Worker discovery runs
+    /// from it; router discovery does not.
+    #[test]
+    fn discovery_provider_slurm_builds_a_slurm_config() {
+        let cli = cli_args_from(&[
+            "--discovery-provider",
+            "slurm",
+            "--pd-disaggregation",
+            "--slurm-prefill-job-name",
+            "prefill-a",
+            "--slurm-prefill-job-name",
+            "prefill-b",
+            "--slurm-decode-job-name",
+            "decode",
+            "--slurm-port",
+            "8000",
+            "--slurm-bootstrap-port",
+            "8998",
+            "--slurm-user",
+            "svc",
+            "--slurm-account",
+            "acct",
+            "--slurm-partition",
+            "gpu",
+            "--discovery-check-interval-secs",
+            "10",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router.discovery,
+            Some(DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
+                job_names: vec![],
+                encode_job_names: vec![],
+                prefill_job_names: vec!["prefill-a".to_string(), "prefill-b".to_string()],
+                decode_job_names: vec!["decode".to_string()],
+                port: 8000,
+                bootstrap_port: Some(8998),
+                user: Some("svc".to_string()),
+                account: Some("acct".to_string()),
+                partition: Some("gpu".to_string()),
+                check_interval_secs: 10,
+            }))
+        );
+        assert!(router.health_check.remove_unhealthy_workers);
+
+        let server = cli.to_server_config(router).unwrap();
+        assert!(matches!(
+            server.service_discovery_config,
+            Some(RuntimeDiscoveryConfig::Slurm(_))
+        ));
+        assert!(server.mesh_discovery_config.is_none());
+
+        let defaults = cli_args_from(&[
+            "--discovery-provider",
+            "slurm",
+            "--slurm-job-name",
+            "smg-worker",
+            "--slurm-port",
+            "8000",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert!(matches!(
+            defaults.discovery,
+            Some(DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
+                check_interval_secs: DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS,
+                user: None,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn slurm_provider_needs_a_port() {
+        let err = cli_args_from(&["--discovery-provider", "slurm", "--slurm-job-name", "w"])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MissingRequired { ref field } if field == "--slurm-port"),
+            "{err}"
+        );
+    }
+
+    /// The Slurm flags configure nothing else, and the interval applies to the
+    /// file and Slurm providers only, so either given elsewhere is an error.
+    #[test]
+    fn slurm_flags_need_the_slurm_provider() {
+        for args in [
+            &["--slurm-job-name", "w"][..],
+            &["--slurm-port", "8000"][..],
+            &["--slurm-partition", "gpu"][..],
+            &[
+                "--discovery-provider",
+                "file",
+                "--discovery-file",
+                "w.json",
+                "--slurm-job-name",
+                "w",
+            ][..],
+            &[
+                "--service-discovery",
+                "--selector",
+                "app=w",
+                "--discovery-check-interval-secs",
+                "5",
+            ][..],
+        ] {
+            let err = cli_args_from(args)
+                .to_router_config(vec![], vec![])
+                .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::IncompatibleConfig { .. }),
+                "{args:?}: {err}"
+            );
+        }
+    }
+
     /// IGW mode follows the selected provider, whichever spelling selected it.
     #[test]
     fn selecting_a_discovery_provider_enables_igw() {
@@ -4916,6 +5129,14 @@ mod tests {
             &["--service-discovery"][..],
             &["--discovery-provider", "kubernetes"][..],
             &["--discovery-provider", "file", "--discovery-file", "w.json"][..],
+            &[
+                "--discovery-provider",
+                "slurm",
+                "--slurm-job-name",
+                "w",
+                "--slurm-port",
+                "8000",
+            ][..],
         ] {
             let mut cli = cli_args_from(selection);
             assert!(cli.enable_igw_for_discovery(), "{selection:?}");

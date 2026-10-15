@@ -189,6 +189,7 @@ pub mod metrics_labels {
     pub const DISCOVERY_STATIC: &str = "static";
     pub const DISCOVERY_KUBERNETES: &str = "kubernetes";
     pub const DISCOVERY_FILE: &str = "file";
+    pub const DISCOVERY_SLURM: &str = "slurm";
     pub const DISCOVERY_CONSUL: &str = "consul";
     pub const DISCOVERY_MANUAL: &str = "manual";
 

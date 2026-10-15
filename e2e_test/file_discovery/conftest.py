@@ -19,14 +19,14 @@ Gated behind SMG_FILE_E2E=1. Run locally:
 from __future__ import annotations
 
 import os
-import socket
-import subprocess
-import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 
 import pytest
 
-from .harness import FakeEngine, Gateway, Manifest, binary
+from ..discovery_common import Gateway
+from ..discovery_common import engines as engines  # noqa: F401  (fixture)
+from ..discovery_common import mock_worker as mock_worker  # noqa: F401  (fixture)
+from .harness import Manifest, file_gateway
 
 
 def pytest_collection_modifyitems(config, items):
@@ -38,47 +38,6 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture
-def engines() -> Iterator[Callable[[int], list[FakeEngine]]]:
-    started: list[FakeEngine] = []
-
-    def start(count: int) -> list[FakeEngine]:
-        new = [FakeEngine() for _ in range(count)]
-        started.extend(new)
-        return new
-
-    yield start
-    for engine in started:
-        engine.stop()
-
-
-@pytest.fixture
-def mock_worker() -> Iterator[Callable[..., None]]:
-    """Start the mock-worker binary; it is stopped after the test."""
-    procs: list[subprocess.Popen] = []
-
-    def start(*args: str, ready_port: int) -> None:
-        proc = subprocess.Popen(
-            [str(binary("MOCK_WORKER_BIN", "target/debug/mock-worker")), *args],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        procs.append(proc)
-        deadline = time.monotonic() + 30
-        while True:
-            assert proc.poll() is None, f"mock-worker exited ({proc.returncode})"
-            with socket.socket() as sock:
-                if sock.connect_ex(("127.0.0.1", ready_port)) == 0:
-                    return
-            assert time.monotonic() < deadline, f"mock-worker never listened on {ready_port}"
-            time.sleep(0.2)
-
-    yield start
-    for proc in procs:
-        proc.kill()
-        proc.wait(timeout=10)
-
-
-@pytest.fixture
 def manifest(tmp_path) -> Manifest:
     return Manifest(tmp_path / "workers.json")
 
@@ -87,6 +46,6 @@ def manifest(tmp_path) -> Manifest:
 def gateway(manifest, tmp_path) -> Iterator[Gateway]:
     """A gateway not yet started; a test starts it with any extra flags.
     Timeouts carry its log tail, so a failure explains itself."""
-    gw = Gateway(manifest, tmp_path / "smg.log")
+    gw = file_gateway(manifest, tmp_path / "smg.log")
     yield gw
     gw.stop()

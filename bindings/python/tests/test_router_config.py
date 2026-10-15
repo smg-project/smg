@@ -469,6 +469,16 @@ class TestDiscoveryMapping:
         with pytest.raises(ValueError, match="path"):
             _Router(worker_urls=[], discovery={"provider": "file"})
 
+    def test_slurm_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={"provider": "slurm", "job_names": ["smg-worker"], "port": 8000},
+        )
+
+    def test_slurm_mapping_needs_a_port(self):
+        with pytest.raises(ValueError, match="port"):
+            _Router(worker_urls=[], discovery={"provider": "slurm", "job_names": ["w"]})
+
     def test_mapping_and_service_discovery_conflict(self):
         with pytest.raises(ValueError, match="not both"):
             _Router(

@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""A strict stand-in for `squeue --json`, answering from a state file.
+
+Accepts exactly the arguments the Slurm provider passes, records every call,
+and answers like Slurm 23.11: the filters are checked but not applied, so the
+provider's own filtering is what keeps other jobs out.
+"""
+
+import json
+import os
+import sys
+import time
+
+
+def number(value: int) -> dict:
+    """A number as Slurm 23.02 and later print one."""
+    return {"set": True, "infinite": False, "number": value}
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    with open(os.environ["SMG_FAKE_SLURM_CALLS"], "a") as calls:
+        calls.write(json.dumps({"command": "squeue", "argv": argv, "at": time.time()}) + "\n")
+    with open(os.environ["SMG_FAKE_SLURM"]) as state_file:
+        state = json.load(state_file)
+
+    fixed = {"--json", "--states=RUNNING"}
+    names = [arg for arg in argv if arg.startswith("--name=")]
+    scope = [arg for arg in argv if arg == "--me" or arg.startswith("--user=")]
+    optional = [arg for arg in argv if arg.startswith(("--account=", "--partition="))]
+    unexpected = [arg for arg in argv if arg not in fixed and arg not in names + scope + optional]
+    if not fixed <= set(argv) or len(names) != 1 or len(scope) != 1 or unexpected:
+        print(f"squeue: unexpected arguments {argv}", file=sys.stderr)
+        return 2
+    if "squeue" in state.get("fail", []):
+        print("squeue: error: Unable to contact slurm controller", file=sys.stderr)
+        return 1
+
+    jobs = [
+        {
+            "cluster": state.get("cluster", "e2e"),
+            "job_id": job["id"],
+            "name": job["name"],
+            "job_state": [job.get("state", "RUNNING")],
+            "nodes": job["nodes"],
+            "start_time": number(job.get("start_time", 1_700_000_000)),
+            "restart_cnt": job.get("restart_cnt", 0),
+            "user_name": job.get("user", state["user"]),
+            "user_id": job.get("user_id", 1000),
+            "account": job.get("account", ""),
+            "partition": job.get("partition", "debug"),
+            "array_task_id": {"set": False, "infinite": False, "number": 0},
+        }
+        for job in state["jobs"]
+    ]
+    answer = {
+        "jobs": jobs,
+        "meta": {
+            "plugin": {"type": "", "name": "", "data_parser": "data_parser/v0.0.40"},
+            "client": {"source": "", "user": state["user"], "group": state["user"]},
+            "command": ["squeue"],
+            "slurm": {
+                "version": {"major": "23", "micro": "4", "minor": "11"},
+                "release": "23.11.4",
+                "cluster": state.get("cluster", "e2e"),
+            },
+        },
+        "errors": [],
+        "warnings": [],
+    }
+    print(json.dumps(answer))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

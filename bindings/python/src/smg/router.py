@@ -15,6 +15,20 @@ from smg.smg_rs import (
 )
 from smg.smg_rs import Router as _Router
 
+# The RouterArgs field of each Slurm discovery setting, and its key in the
+# `discovery` mapping.
+_SLURM_DISCOVERY_FIELDS = {
+    "slurm_job_name": "job_names",
+    "slurm_encode_job_name": "encode_job_names",
+    "slurm_prefill_job_name": "prefill_job_names",
+    "slurm_decode_job_name": "decode_job_names",
+    "slurm_port": "port",
+    "slurm_bootstrap_port": "bootstrap_port",
+    "slurm_user": "user",
+    "slurm_account": "account",
+    "slurm_partition": "partition",
+}
+
 
 def policy_from_str(policy_str: str | None) -> PolicyType:
     """Convert policy string to PolicyType enum."""
@@ -344,31 +358,48 @@ class Router:
 
         args_dict = vars(args).copy()
         # Kubernetes, by either spelling, reaches Rust as service_discovery;
-        # the file provider as the tagged `discovery` mapping. A provider this
-        # cannot pass on fails here instead of quietly starting the router
-        # without discovery.
+        # the file and Slurm providers as the tagged `discovery` mapping. A
+        # provider this cannot pass on fails here instead of quietly starting
+        # the router without discovery.
         provider = args.selected_discovery_provider()
-        file_flags = (
-            args.discovery_file is not None or args.discovery_check_interval_secs is not None
-        )
-        if file_flags and provider != "file":
+        if args.discovery_file is not None and provider != "file":
+            raise ValueError("discovery_file applies only to discovery_provider='file'")
+        if args.discovery_check_interval_secs is not None and provider not in ("file", "slurm"):
             raise ValueError(
-                "discovery_file and discovery_check_interval_secs apply only to"
-                " discovery_provider='file'"
+                "discovery_check_interval_secs applies only to discovery_provider='file' or 'slurm'"
             )
+        slurm_given = [
+            field for field in _SLURM_DISCOVERY_FIELDS if getattr(args, field) not in (None, [])
+        ]
+        if slurm_given and provider != "slurm":
+            raise ValueError(f"{', '.join(slurm_given)} apply only to discovery_provider='slurm'")
+        discovery: dict[str, str | int | list[str]] | None = None
         if provider == "file":
             if not args.discovery_file:
                 raise ValueError("discovery_provider='file' needs discovery_file")
-            discovery: dict[str, str | int] = {"provider": "file", "path": args.discovery_file}
-            if args.discovery_check_interval_secs is not None:
-                discovery["check_interval_secs"] = args.discovery_check_interval_secs
-            args_dict["discovery"] = discovery
+            discovery = {"provider": "file", "path": args.discovery_file}
+        elif provider == "slurm":
+            if args.slurm_port is None:
+                raise ValueError("discovery_provider='slurm' needs slurm_port")
+            discovery = {"provider": "slurm"}
+            for field, key in _SLURM_DISCOVERY_FIELDS.items():
+                if getattr(args, field) not in (None, []):
+                    discovery[key] = getattr(args, field)
         elif provider not in (None, "kubernetes"):
             raise ValueError(
                 f"Router.from_args cannot pass discovery provider {provider!r} to Rust"
             )
+        if discovery is not None:
+            if args.discovery_check_interval_secs is not None:
+                discovery["check_interval_secs"] = args.discovery_check_interval_secs
+            args_dict["discovery"] = discovery
         args_dict["service_discovery"] = provider == "kubernetes"
-        for key in ("discovery_provider", "discovery_file", "discovery_check_interval_secs"):
+        for key in (
+            "discovery_provider",
+            "discovery_file",
+            "discovery_check_interval_secs",
+            *_SLURM_DISCOVERY_FIELDS,
+        ):
             args_dict.pop(key)
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (

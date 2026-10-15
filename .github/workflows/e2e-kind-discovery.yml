@@ -15,6 +15,8 @@ on:
       - model_gateway/tests/k8s_discovery_test.rs
       - e2e_test/kind_discovery/**
       - e2e_test/file_discovery/**
+      - e2e_test/slurm_discovery/**
+      - e2e_test/discovery_common.py
       - .github/workflows/e2e-kind-discovery.yml
   workflow_dispatch:
     inputs:
@@ -79,3 +81,13 @@ jobs:
           pip install pytest requests
           SMG_FILE_E2E=1 pytest e2e_test/file_discovery \
             --confcutdir e2e_test/file_discovery -v
+
+      # The gateway against stand-in squeue and scontrol on its PATH, with
+      # one engine per loopback address (127.0.0.2, ...) on a shared port.
+      - name: Run Slurm discovery e2e
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          pip install pytest requests
+          SMG_SLURM_E2E=1 pytest e2e_test/slurm_discovery \
+            --confcutdir e2e_test/slurm_discovery -v -rs

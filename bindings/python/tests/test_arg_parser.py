@@ -43,6 +43,9 @@ class TestRouterArgs:
         assert args.selected_discovery_provider() is None
         assert args.discovery_file is None
         assert args.discovery_check_interval_secs is None
+        assert args.slurm_job_name == []
+        assert args.slurm_port is None
+        assert args.slurm_user is None
         assert args.selector == {}
         assert args.service_discovery_port == 80
         assert args.service_discovery_namespace is None
@@ -1092,6 +1095,48 @@ class TestParseRouterArgs:
         assert router_args.selected_discovery_provider() == "file"
         assert router_args.discovery_file == "/run/smg/workers.json"
         assert router_args.discovery_check_interval_secs == 5
+
+    def test_parse_discovery_provider_slurm(self):
+        """The Slurm provider's flags parse into RouterArgs, the job-name
+        flags repeatable."""
+        router_args = parse_router_args(
+            [
+                "--discovery-provider",
+                "slurm",
+                "--slurm-encode-job-name",
+                "encode",
+                "--slurm-prefill-job-name",
+                "prefill-a",
+                "--slurm-prefill-job-name",
+                "prefill-b",
+                "--slurm-decode-job-name",
+                "decode",
+                "--slurm-port",
+                "8000",
+                "--slurm-bootstrap-port",
+                "8998",
+                "--slurm-user",
+                "svc",
+                "--slurm-account",
+                "acct",
+                "--slurm-partition",
+                "gpu",
+                "--discovery-check-interval-secs",
+                "10",
+            ]
+        )
+
+        assert router_args.selected_discovery_provider() == "slurm"
+        assert router_args.slurm_job_name == []
+        assert router_args.slurm_encode_job_name == ["encode"]
+        assert router_args.slurm_prefill_job_name == ["prefill-a", "prefill-b"]
+        assert router_args.slurm_decode_job_name == ["decode"]
+        assert router_args.slurm_port == 8000
+        assert router_args.slurm_bootstrap_port == 8998
+        assert router_args.slurm_user == "svc"
+        assert router_args.slurm_account == "acct"
+        assert router_args.slurm_partition == "gpu"
+        assert router_args.discovery_check_interval_secs == 10
 
     def test_service_discovery_and_discovery_provider_are_exclusive(self):
         """Both spellings of one choice is a usage error, not a precedence rule."""
