@@ -55,12 +55,12 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   first and its parser refuses a block inside the thought; the gateway's legacy reasoning parser for
   this checkpoint ends the thought on `</think>` alone, so a block inside it stays in the thought
   there; this table reads the call.
-- **The template writes two newlines before the block.** They are what the template renders, not
-  what this table needs: the table enters the block on its opener wherever it stands, after the
-  thought's text or the content's last byte as much as after the newlines, and the newlines the model
-  writes are content, the model's own (the legacy parser trims them; bellwether #17's question, as
-  for Qwen3). The family's reference parser is the one that looks for the block after the two
-  newlines. The prompt ends with `<think>` in thinking mode and with `</think>` right after
+- **The template writes two newlines before the block.** They are what the template renders and
+  what this table's forced-call tag writes (`Tags::DSML_V4.before_block`), not what its reading
+  needs: the table enters the block on its opener wherever it stands, after the thought's text or
+  the content's last byte as much as after the newlines, and the newlines the model writes are
+  content, the model's own (the legacy parser trims them; bellwether #17's question, as for Qwen3).
+  The family's reference parser is the one that looks for the block after the two newlines. The prompt ends with `<think>` in thinking mode and with `</think>` right after
   `<｜Assistant｜>` in chat mode, so the replay starts the output inside the thought or in the content;
   bellwether has not recorded the group's set yet.
 
