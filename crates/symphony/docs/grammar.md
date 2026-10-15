@@ -39,13 +39,22 @@ owed at its end, so the forced call follows the reasoning instead of replacing i
 grammar from the first token, and a newline or nothing where the engine runs a reasoning parser and
 applies the grammar only after the model's own close; a prefix the thought's close ended would be
 owed a second time there, and the model would fill the gap with a fabricated observation and answer.
-A table without a thought has nothing to wrap, and the tag comes back as it is; a thought that does
-not close back to where it opened has no prefix yet, and the table gives `None` rather than a tag
-the model could write inside its thought. Kimi K3's tag takes no prefix: the block of calls can be
+A table without a thought has nothing to wrap, and the tag comes back as it is; a thought that
+closes only into the block has no prefix, its close being its own way in, and the table gives `None`
+rather than a tag the model could write inside its thought; a thought that closes into the text
+after it, as MiniMax M3's does, takes the prefix with that close as its own. Kimi K3's tag takes no prefix: the block of calls can be
 entered from the turn itself, from the thought or from the answer, and the tag has one way in per
 state: from a region with a close of its own, that close and then the row into the block from where
 the close returns; from any other state, its own row into the block. So the model closes whatever
 the prompt left open on its way to the calls, whichever that was.
+
+With the prompt's reasoning closed and the thought left to the model, which a table says with two
+rows from the turn's own state, one opening the thought and one closing an empty one (MiniMax M3's;
+its generation prompt adds no opener), the tag admits first what the model would write: the thought, its text free of the table's markers, and its close;
+or the bare close the turn's start also has a row for, which the model writes for an empty
+thought; or nothing. Then the calls. A forced call is written at once, so without this the tag
+would take the thought away, and the model, held to the call from its first token, answers worse
+than it reasons.
 
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool

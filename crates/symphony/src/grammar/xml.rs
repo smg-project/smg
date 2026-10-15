@@ -6,12 +6,12 @@
 //! `<invoke name="NAME">`, its arguments, the separator, `</invoke>` and a newline. Each argument
 //! is an element, the separator and `<key>`, its value, the separator and `</key>`, one per
 //! property in the schema's order, present when the schema requires the property and otherwise
-//! optional. `<tool_call>` triggers the tag, as the terminal that opens the block is the trigger
-//! under every syntax: the text before it is free (the thought and its close, an answer, and the
-//! separator the template writes before the block's opener), and free text cannot hold the
-//! opener, since the opener is the trigger, so what the engine constrains and what the table
-//! reads as the block's opening are the same bytes. The tag is the same whether the prompt left
-//! the thought open or not.
+//! optional. The separator and `<tool_call>` trigger the tag, the block's opening as the template
+//! writes it: a forced call's tag is written at once, so the separator the model writes before
+//! the opener has to be the tag's own, and the table drops it wherever it stands. What precedes
+//! the block (the model's thought, or the bare close of an empty one, when the prompt leaves the
+//! thought to the model; the free text that closes a thought the prompt left open) is the
+//! table's ([`Format::grammar`](crate::Format::grammar)), the same under every syntax.
 //!
 //! A value follows the property's type as the template writes it and the XML assembler reads it
 //! ([`tagged::xml`](crate::tagged::xml)): a string as it is, any text that holds neither the
@@ -66,9 +66,9 @@ pub(super) fn calls(
     }
     .separated(invokes);
     Some(count.triggered(
-        vec![block.open.to_string()],
+        vec![format!("{separator}{}", block.open)],
         vec![Tag::new(
-            format!("{}\n", block.open),
+            format!("{separator}{}\n", block.open),
             invokes,
             format!("{separator}{}", block.close),
         )],
@@ -270,6 +270,34 @@ mod tests {
         vec!["</invoke>", "<invoke name=\"", "</tool_call>"]
     }
 
+    /// The table's terminals in order, the separator included: what the thought's text may not
+    /// write.
+    fn terminals() -> Vec<&'static str> {
+        vec![
+            "<mm:think>",
+            "</mm:think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<invoke name=\"",
+            "</invoke>",
+            SEP,
+        ]
+    }
+
+    /// What the tag admits before the block when the prompt leaves the thought to the model: the
+    /// thought, or the bare close of an empty one, or nothing.
+    fn thought_first() -> Value {
+        value!({"type": "optional", "content": {"type": "or", "elements": [
+            {
+                "type": "tag",
+                "begin": "<mm:think>",
+                "content": {"type": "any_text", "excludes": terminals()},
+                "end": "</mm:think>",
+            },
+            {"type": "const_string", "value": "</mm:think>"},
+        ]}})
+    }
+
     /// An element: the separator and the key's tag, the value, the separator and the closing tag.
     fn element(key: &str, value: Value) -> Value {
         value!({"type": "sequence", "elements": [
@@ -294,7 +322,7 @@ mod tests {
             .grammar(tools, true, false)
             .expect("a grammar")
             .payload();
-        payload["format"]["tags"][0]["content"]["tags"][0].clone()
+        payload["format"]["elements"][1]["tags"][0]["content"]["tags"][0].clone()
     }
 
     #[test]
@@ -336,12 +364,12 @@ mod tests {
         });
         assert_eq!(
             payload,
-            value!({"format": {
+            value!({"format": {"type": "sequence", "elements": [thought_first(), {
                 "type": "triggered_tags",
-                "triggers": ["<tool_call>"],
+                "triggers": [format!("{SEP}<tool_call>")],
                 "tags": [{
                     "type": "tag",
-                    "begin": "<tool_call>\n",
+                    "begin": format!("{SEP}<tool_call>\n"),
                     "content": {
                         "type": "tags_with_separator",
                         "tags": [weather, ping],
@@ -351,7 +379,7 @@ mod tests {
                     "end": format!("{SEP}</tool_call>"),
                 }],
                 "at_least_one": true,
-            }})
+            }]}})
         );
     }
 
@@ -474,26 +502,49 @@ mod tests {
     }
 
     #[test]
-    fn the_thought_open_gives_the_same_tag_and_without_a_required_call_the_block_is_optional() {
+    fn the_thought_open_takes_the_prefix_and_closed_admits_the_models_thought_first() {
+        // The prompt that leaves the thought to the model (the template's default): the thought,
+        // or the bare close of an empty one, or nothing, then the block, which a forced call
+        // writes at once. The prompt that opened the thought: free text that writes neither a
+        // call marker nor the separator but may close the thought, nothing owed at its end, then
+        // the block as it is.
         let tools = weather_tools();
-        let required = formats::minimax_m3()
+        let closed = formats::minimax_m3()
             .grammar(&tools, true, false)
-            .expect("a grammar");
+            .expect("a grammar")
+            .payload();
+        let block = closed["format"]["elements"][1].clone();
         assert_eq!(
-            formats::minimax_m3().grammar(&tools, true, true),
-            Some(required.clone())
+            closed["format"],
+            value!({"type": "sequence", "elements": [thought_first(), block]})
+        );
+        assert_eq!(block["type"], "triggered_tags");
+        assert_eq!(block["at_least_one"], true);
+        let open = formats::minimax_m3()
+            .grammar(&tools, true, true)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            open["format"],
+            value!({"type": "sequence", "elements": [
+                {"type": "any_text", "excludes": [
+                    "<tool_call>", "</tool_call>", "<invoke name=\"", "</invoke>", SEP,
+                ]},
+                block,
+            ]})
         );
         let either = formats::minimax_m3()
             .grammar(&tools, false, false)
             .expect("a grammar")
-            .to_json();
-        assert_eq!(either["at_least_one"], false);
+            .payload();
+        assert_eq!(either["format"]["elements"][0], thought_first());
+        assert_eq!(either["format"]["elements"][1]["at_least_one"], false);
         assert_eq!(
-            either["tags"][0]["content"]["at_least_one"], true,
+            either["format"]["elements"][1]["tags"][0]["content"]["at_least_one"], true,
             "a block holds at least one invoke"
         );
-        let mut same = required.to_json();
+        let mut same = block;
         same["at_least_one"] = Value::Bool(false);
-        assert_eq!(either, same);
+        assert_eq!(either["format"]["elements"][1], same);
     }
 }

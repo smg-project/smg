@@ -75,6 +75,11 @@ What this table says beyond the DSML one:
   the turn opener `]~b]ai\n`, and the replay puts the output inside the thought or in content.
 - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
   has it; the recorded outputs close the thought first.
+- **A forced call admits the thought first.** The structural tag for a forced or required call
+  opens with the thought, or the bare `</mm:think>` of an empty one, or nothing, then the block,
+  whose trigger carries the separator the template writes before `<tool_call>`; with the thought
+  left open by the prompt, free text that may close it comes first instead (`docs/grammar.md`).
+  A JSON answer's tag (`response_format`) is led the same way.
 - **Two states for the calls, as for DSML:** `calls` is the template's wrapping (a newline after
   `<tool_call>` and after `</invoke>`), `invoke` one call's arguments, read by the XML assembler
   (`tagged::xml`); a second invoke before the first closed ends the first,
