@@ -819,9 +819,28 @@ impl Engine {
             &mut self.scanner,
             Scanner::new(self.format.terminal_texts()),
         );
-        // What the scanner held back as a possible terminal is text now that no more bytes come,
-        // except a tag the end cut short.
-        self.run(scanner.finish(), true, out);
+        // A call whose close the end cut inside the turn opener the close ends with (`<|end|>` of
+        // `<|end|><|start|>assistant`) was written whole: the model was opening its next message.
+        // The call closes as the close would close it, on the bytes that came.
+        let held = scanner.held().to_string();
+        let cut_close = (self.emits() == Emits::Arguments && self.pending.is_none())
+            .then(|| self.format.close_cut_in_opener(self.state, &held))
+            .flatten()
+            .filter(|_| self.call_closes(&held));
+        match cut_close {
+            Some(next) => {
+                if !self.close_call(Closed::ByMarker, &held, out) {
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(&held),
+                        why: DropReason::Wrapper,
+                    });
+                }
+                self.enter(next, out);
+            }
+            // What the scanner held back as a possible terminal is text now that no more bytes
+            // come, except a tag the end cut short.
+            None => self.run(scanner.finish(), true, out),
+        }
         self.end_stay(out);
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
@@ -997,6 +1016,114 @@ mod tests {
             list.push(event.clone());
         }
         list.text()
+    }
+
+    /// A call addressed to a tool, as a response template writes one: ` to=`, the name and the
+    /// header's close, then tagged parameters, its last close not written.
+    const ADDRESSED_CALL: &str = concat!(
+        " to=get_weather<|channel|>commentary<|message|>",
+        "<parameter name=\"city\">Paris</parameter><parameter name=\"days\">3</parameter>"
+    );
+
+    /// A table whose call closes with the opening of the next message (`<|end|>` then the turn's
+    /// anchor), or at the stop token `<|call|>`; `<|end|>` alone closes the answer.
+    fn turn_opened() -> Format {
+        use crate::shape::{
+            intern, Arguments, Atom, CallShape, Class, End, NameSource, Pattern, Slot, ValueParser,
+        };
+        let lit = |text: &str| Atom::Lit(text.into());
+        let run = |class: Class, min: u16, greedy: bool, slot: Slot| Atom::Run {
+            class,
+            min,
+            max: None,
+            greedy,
+            capture: Some(slot),
+        };
+        let shape = CallShape {
+            header: Pattern(
+                [
+                    run(
+                        Class::new([('\t', '\r'), (' ', ' '), ('<', '<')], true),
+                        1,
+                        true,
+                        Slot::Name,
+                    ),
+                    lit("<|channel|>commentary<|message|>"),
+                ]
+                .into(),
+            ),
+            name: NameSource::Header,
+            arguments: Arguments::Params {
+                tag: Pattern(
+                    [
+                        lit("<parameter name=\""),
+                        run(Class::new([('"', '"')], true), 1, true, Slot::Key),
+                        lit("\">"),
+                        run(Class::any(), 0, false, Slot::Value),
+                    ]
+                    .into(),
+                ),
+                ends: [End {
+                    consume: Pattern([lit("</parameter>")].into()),
+                    ahead: Pattern::default(),
+                }]
+                .into(),
+                values: ValueParser::Text { strip: false },
+            },
+            trailer: Pattern::default(),
+            word: Class::new([('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')], false),
+            hold_cap: 8192,
+        };
+        Format::new("turn_opened")
+            .terminal("answer", "<|channel|>final<|message|>")
+            .terminal("end", "<|end|>")
+            .terminal("recipient", " to=")
+            .terminal("next", "<|end|><|start|>assistant")
+            .terminal("call", "<|call|>")
+            .state("outside", Emits::Content)
+            .state("content", Emits::Content)
+            .state("calls", Emits::Arguments)
+            .transition("outside", "answer", "content")
+            .transition("content", "end", "outside")
+            .transition("outside", "recipient", "calls")
+            .transition("calls", "next", "outside")
+            .transition("calls", "call", "outside")
+            .calls(CallSyntax::Shaped(intern(shape)))
+            .closes_at_stop("calls")
+            .framing("outside")
+            .turn_anchor("<|start|>assistant")
+            .stop_tokens(["<|call|>"])
+    }
+
+    #[test]
+    fn a_close_the_end_cut_inside_the_next_messages_opening_closes_the_call() {
+        // The model wrote the call's close and was opening its next message when the end came:
+        // the call is whole, its end the close's bytes that came, at any finish.
+        for cut in ["<|end|>", "<|end|><|start|>", "<|end|><|start|>assist"] {
+            for finish in [EngineFinish::Length, EngineFinish::Stop] {
+                let output = format!("{ADDRESSED_CALL}{cut}");
+                let events = run(turn_opened(), &output, finish.clone());
+                assert_eq!(
+                    calls(&events),
+                    [(
+                        r#"{"city": "Paris", "days": 3}"#.to_string(),
+                        Some(cut.to_string())
+                    )],
+                    "{cut:?} {finish:?}"
+                );
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })));
+                assert_eq!(bytes(&events), output);
+            }
+        }
+        // A close cut before the opening is no close yet: the call stays cut.
+        let events = run(
+            turn_opened(),
+            &format!("{ADDRESSED_CALL}<|en"),
+            EngineFinish::Length,
+        );
+        assert_eq!(calls(&events)[0].0, r#"{"city": "Paris", "days": 3"#);
     }
 
     #[test]

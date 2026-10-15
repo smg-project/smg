@@ -926,6 +926,26 @@ impl Format {
         self.terminals.iter().map(|terminal| terminal.text.as_str())
     }
 
+    /// Where a close out of `state` leads when the end of the output cut it inside the turn opener
+    /// or anchor it ends with: `held`, the bytes the end left, is the close's beginning, past all
+    /// of it but that text (`<|end|>` or `<|end|><|start|>` of `<|end|><|start|>assistant`). The
+    /// model wrote the close and was opening its next message.
+    pub(crate) fn close_cut_in_opener(&self, state: usize, held: &str) -> Option<usize> {
+        let openers = self.turn_texts();
+        self.transitions()
+            .filter(|&(from, _, _)| from == state)
+            .find_map(|(_, on, to)| {
+                let close = self.terminal_text(on);
+                let before = openers.iter().find_map(|opener| {
+                    close
+                        .strip_suffix(opener)
+                        .filter(|before| !before.is_empty())
+                })?;
+                let cut = held.len() >= before.len() && held.len() < close.len();
+                (cut && close.starts_with(held)).then_some(to)
+            })
+    }
+
     /// Whether `tail`, at the end of the output in `state`, is a tag the end cut short: it begins
     /// with a whole structural token and is the beginning of a terminal that, whole, would move
     /// the engine out of `state` or be dropped where it stands. The beginning of a terminal the
