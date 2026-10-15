@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::worker::ConstrainedDecoding;
 use tracing::error;
 
 use crate::{
@@ -288,6 +289,35 @@ impl BuildStage for ChatRequestBuildingStage {
         // the one that reads the response is Symphony only when a table takes
         // the request, so the state records that for the response's header.
         let names = ctx.components.parser_resolver.names(&chat_request.model);
+        // A worker whose engine takes a grammar on every turn gets the table's
+        // tag for the calls the request allows under `auto`, when the request
+        // asked for no constraint of its own (`regular::symphony::auto_constraint`);
+        // the attempt stamp carries it unshaped like a forced call's, so a
+        // retry's worker shapes it again.
+        let tool_constraints = match tool_constraints {
+            None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
+                == ConstrainedDecoding::Always =>
+            {
+                let reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
+                    utils::chat_reasoning_starts_in_rendered_prefill(
+                        &chat_request,
+                        processed_messages.continued_final_message,
+                        tokenizer.as_ref(),
+                    )
+                });
+                symphony::auto_constraint(
+                    ctx.state.parser.unwrap_or_default(),
+                    &names,
+                    chat_request.as_ref(),
+                    &chat_request.callable_tools(),
+                    reasoning,
+                    &ctx.components.templates,
+                )
+                .map_err(|why| error::bad_request("invalid_parser_configuration", why))?
+                .map(|constraint| constraint.to_tuple())
+            }
+            other => other,
+        };
         let assignment = symphony::assign(
             ctx.state.parser.unwrap_or_default(),
             &names,

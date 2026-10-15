@@ -354,6 +354,51 @@ pub(crate) fn constraint(
     }
 }
 
+/// The tag of the calls a chat request's model may make under `auto`, for a worker whose engine
+/// takes a grammar on every turn ([`ConstrainedDecoding::Always`]): the table's grammar for the
+/// request's callable `tools` with no call required, at most one when parallel calls are off, and
+/// `reasoning_open` when the prompt leaves the model inside its thought. `Ok(None)` when no table
+/// reads the response ([`reads`]), the request has no callable tools (a thought and an answer are
+/// not constrained today), or a registry table has no tag; the response template's table refuses
+/// as [`tagged`] does for a forced call.
+pub(crate) fn auto_constraint(
+    parser: ParserChoice,
+    names: &Names,
+    request: &ChatCompletionRequest,
+    tools: &[Tool],
+    reasoning_open: bool,
+    templates: &Templates,
+) -> Result<Option<ToolConstraint>, String> {
+    let Some(format) = reads(parser, names, &request.model, templates)? else {
+        return Ok(None);
+    };
+    // `tool_choice: none` keeps the tools in the prompt and forbids the calls, so there is
+    // nothing to constrain; the callable tools are not narrowed by it.
+    if tools.is_empty()
+        || matches!(
+            request.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        )
+    {
+        return Ok(None);
+    }
+    let grammar = format.grammar_for(
+        tools,
+        Options {
+            at_least_one: false,
+            reasoning_open,
+            one_call: request.parallel_tool_calls == Some(false),
+        },
+    );
+    tagged(
+        grammar,
+        names_template(names),
+        &request.model,
+        "the calls it may make",
+        request.continues_final_assistant(),
+    )
+}
+
 /// [`constraint`] for a Messages request: a `tool_choice` of `any` or a named tool forces a call
 /// to one of `tools`, one call when the tool is named or parallel use is disabled. `continues`
 /// says whether the prompt continues the assistant's message.
@@ -382,6 +427,48 @@ pub(crate) fn constraint_messages(
         tools,
         one_call,
         reasoning_open,
+        continues,
+    )
+}
+
+/// [`auto_constraint`] for a Messages request: the calls it may make under `auto` (or no choice),
+/// one at most when parallel use is disabled; `continues` says whether the prompt continues the
+/// assistant's message.
+pub(crate) fn auto_constraint_messages(
+    parser: ParserChoice,
+    names: &Names,
+    request: &CreateMessageRequest,
+    tools: &[Tool],
+    reasoning_open: bool,
+    continues: bool,
+    templates: &Templates,
+) -> Result<Option<ToolConstraint>, String> {
+    let Some(format) = reads(parser, names, &request.model, templates)? else {
+        return Ok(None);
+    };
+    let one_call = match &request.tool_choice {
+        _ if tools.is_empty() => return Ok(None),
+        Some(MessagesToolChoice::None) => return Ok(None),
+        Some(MessagesToolChoice::Auto {
+            disable_parallel_tool_use,
+        }) => *disable_parallel_tool_use == Some(true),
+        // A forced choice has its own tag ([`constraint_messages`]).
+        Some(MessagesToolChoice::Any { .. } | MessagesToolChoice::Tool { .. }) => return Ok(None),
+        None => false,
+    };
+    let grammar = format.grammar_for(
+        tools,
+        Options {
+            at_least_one: false,
+            reasoning_open,
+            one_call,
+        },
+    );
+    tagged(
+        grammar,
+        names_template(names),
+        &request.model,
+        "the calls it may make",
         continues,
     )
 }
@@ -1231,6 +1318,105 @@ mod tests {
             &tools(),
             false
         )
+        .is_none());
+    }
+
+    /// For a worker on `always`, the calls a request may make under `auto` take the table's tag
+    /// with no call required; a request with no tools, or `tool_choice: none`, takes none; a
+    /// prompt that continues the assistant's message is refused as a forced call would be.
+    #[test]
+    fn an_always_worker_takes_the_tables_tag_for_the_calls_auto_allows() {
+        let auto = request(json!({"tool_choice": "auto"}));
+        let tag = auto_constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &auto,
+            &tools(),
+            false,
+            &templates(),
+        )
+        .expect("no hf");
+        let Some(ToolConstraint::StructuralTag(tag)) = tag else {
+            panic!("a structural tag");
+        };
+        let tag: Value = serde_json::from_str(&tag).expect("JSON");
+        assert!(tag["format"].is_object(), "{tag}");
+        let Some(ToolConstraint::StructuralTag(forced)) = constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &request(json!({"tool_choice": "required"})),
+            &tools(),
+            false,
+        ) else {
+            panic!("a forced tag");
+        };
+        let forced: Value = serde_json::from_str(&forced).expect("JSON");
+        assert_ne!(tag, forced, "the auto tag requires no call");
+        assert!(auto_constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &auto,
+            &[],
+            false,
+            &templates(),
+        )
+        .expect("no hf")
+        .is_none());
+        assert!(auto_constraint(
+            ParserChoice::Legacy,
+            &Names::default(),
+            &auto,
+            &tools(),
+            false,
+            &templates(),
+        )
+        .expect("legacy")
+        .is_none());
+        assert!(auto_constraint(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &request(json!({"tool_choice": "none"})),
+            &tools(),
+            false,
+            &templates(),
+        )
+        .expect("no hf")
+        .is_none());
+        let messages_auto = message_request(json!({
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto", "disable_parallel_tool_use": true}
+        }));
+        let tools: Vec<Tool> = serde_json::from_value(json!([{
+            "type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        }]))
+        .unwrap();
+        assert!(matches!(
+            auto_constraint_messages(
+                ParserChoice::Symphony,
+                &Names::default(),
+                &messages_auto,
+                &tools,
+                false,
+                false,
+                &templates(),
+            )
+            .expect("no hf"),
+            Some(ToolConstraint::StructuralTag(_))
+        ));
+        let messages_any = message_request(json!({
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "any"}
+        }));
+        assert!(auto_constraint_messages(
+            ParserChoice::Symphony,
+            &Names::default(),
+            &messages_any,
+            &tools,
+            false,
+            false,
+            &templates(),
+        )
+        .expect("no hf")
         .is_none());
     }
 

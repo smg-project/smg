@@ -19,7 +19,10 @@ use std::{
 
 use axum::{body::to_bytes, http::StatusCode, response::Response};
 use llm_tokenizer::{traits::Tokenizer, TokenizerRegistry};
-use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{ConstrainedDecoding, HealthCheckConfig},
+};
 use scripted_tokenizer::ScriptedTokenizer;
 use serde_json::{json, Value};
 use smg::{
@@ -101,6 +104,8 @@ struct Setup {
     parser: ParserChoice,
     reasoning_parser: Option<&'static str>,
     tool_parser: Option<&'static str>,
+    /// The worker's constrained-decoding policy, set on its spec.
+    constrained_decoding: Option<ConstrainedDecoding>,
 }
 
 impl Default for Setup {
@@ -114,6 +119,7 @@ impl Default for Setup {
             parser: ParserChoice::Symphony,
             reasoning_parser: Some("hf"),
             tool_parser: Some("hf"),
+            constrained_decoding: None,
         }
     }
 }
@@ -201,7 +207,7 @@ async fn serve(setup: Setup) -> Gateway {
         .await
         .unwrap();
     let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
-    let worker_entry = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+    let mut worker_entry = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
         .worker_type(WorkerType::Regular)
         .connection_mode(ConnectionMode::Grpc)
         .runtime_type(RuntimeType::TokenSpeed)
@@ -209,8 +215,11 @@ async fn serve(setup: Setup) -> Gateway {
         .health_config(HealthCheckConfig {
             disable_health_check: true,
             ..Default::default()
-        })
-        .build();
+        });
+    if let Some(policy) = setup.constrained_decoding {
+        worker_entry = worker_entry.constrained_decoding(policy);
+    }
+    let worker_entry = worker_entry.build();
     context
         .worker_registry
         .register(Arc::new(worker_entry))
@@ -507,6 +516,36 @@ async fn hf_gives_a_forced_call_and_a_json_answer_the_tables_tags() {
     assert_eq!(kind, "structural_tag");
     let request = gateway.requests.lock().expect("requests").last().cloned();
     assert!(request.is_some());
+}
+
+/// A worker on `constrained_decoding: always` gets the table's tag for the calls a request
+/// allows under `auto`, in Chat and in Messages; a request with no tools or `tool_choice: none`
+/// stays free, as every request does on a worker that says nothing.
+#[tokio::test]
+async fn always_constrains_the_calls_a_request_allows_under_auto() {
+    let gateway = serve(Setup {
+        constrained_decoding: Some(ConstrainedDecoding::Always),
+        ..Setup::default()
+    })
+    .await;
+    chat(&gateway, json!({"tools": tools()})).await;
+    let (kind, tag) = gateway.last_constraint().expect("a constraint under auto");
+    assert_eq!(kind, "structural_tag");
+    let tag: Value = serde_json::from_str(&tag).expect("the tag as JSON");
+    assert!(tag["format"].is_object(), "{tag}");
+    chat(&gateway, json!({"tools": null})).await;
+    assert_eq!(gateway.last_constraint(), None);
+    chat(&gateway, json!({"tools": tools(), "tool_choice": "none"})).await;
+    assert_eq!(gateway.last_constraint(), None);
+    messages(&gateway, false).await;
+    let (kind, _) = gateway
+        .last_constraint()
+        .expect("a constraint for Messages");
+    assert_eq!(kind, "structural_tag");
+
+    let requested = serve(Setup::default()).await;
+    chat(&requested, json!({"tools": tools()})).await;
+    assert_eq!(requested.last_constraint(), None);
 }
 
 #[tokio::test]

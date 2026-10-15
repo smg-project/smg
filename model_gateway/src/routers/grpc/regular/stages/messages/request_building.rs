@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::worker::ConstrainedDecoding;
 use tracing::error;
 
 use crate::{
@@ -167,6 +168,39 @@ impl BuildStage for MessageRequestBuildingStage {
             .components
             .parser_resolver
             .tool_parser(&messages_request.model);
+        // A worker whose engine takes a grammar on every turn gets the table's
+        // tag for the calls the request allows under `auto`, when the request
+        // asked for no constraint of its own (`regular::symphony::auto_constraint_messages`).
+        let tool_constraints = match tool_constraints {
+            None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
+                == ConstrainedDecoding::Always =>
+            {
+                let tools = ctx
+                    .tokenizer_arc()
+                    .map(|tokenizer| {
+                        utils::template_tools(
+                            messages_request.tools.as_deref(),
+                            messages_request.tool_choice.as_ref(),
+                            tokenizer.renderer_capabilities(),
+                        )
+                    })
+                    .unwrap_or_default();
+                symphony::auto_constraint_messages(
+                    ctx.state.parser.unwrap_or_default(),
+                    &ctx.components
+                        .parser_resolver
+                        .names(&messages_request.model),
+                    &messages_request,
+                    &tools,
+                    require_reasoning,
+                    continued_final_message,
+                    &ctx.components.templates,
+                )
+                .map_err(|why| error::bad_request("invalid_parser_configuration", why))?
+                .map(|constraint| constraint.to_tuple())
+            }
+            other => other,
+        };
         let unshaped_tool_constraints = tool_constraints.clone();
         let tool_constraints = utils::tool_constraints_for_worker(
             &ctx.components.tool_parser_factory,

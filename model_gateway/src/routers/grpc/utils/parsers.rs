@@ -10,6 +10,7 @@ use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
     profile::ProviderProfile,
+    worker::ConstrainedDecoding,
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
 use serde_json::Value;
@@ -388,6 +389,19 @@ pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
     )
 }
 
+/// Whether the selected worker's engine takes a grammar on every turn or only
+/// when the request asks, from its spec or its `constrained_decoding` label
+/// ([`ConstrainedDecoding::of`]); under PD the decode worker's, whose engine
+/// generates the tokens the grammar constrains. `Requested` without a selection.
+pub fn constrained_decoding_for(workers: Option<&WorkerSelection>) -> ConstrainedDecoding {
+    let worker = match workers {
+        Some(WorkerSelection::Single { worker }) => worker,
+        Some(WorkerSelection::Disaggregated { decode, .. }) => decode,
+        None => return ConstrainedDecoding::Requested,
+    };
+    ConstrainedDecoding::of(&worker.metadata().spec)
+}
+
 /// The request's tool constraint, shaped for the worker that will run it. A
 /// forced call's structural tag built on a thinking prompt opens with free
 /// text that fits either kind of engine (`ParserRegistry::generate_tool_constraint`);
@@ -649,6 +663,60 @@ mod tests {
             Some(ToolConstraint::StructuralTag(tag)) => ("structural_tag".to_string(), tag),
             other => panic!("expected a structural tag, got {other:?}"),
         }
+    }
+
+    /// The worker's constrained-decoding policy comes off its spec first, then
+    /// its `constrained_decoding` label; the decode worker's under PD; a
+    /// missing or unreadable value, and no selection, are `requested`.
+    #[test]
+    fn constrained_decoding_follows_the_spec_then_the_label_of_the_decode_worker() {
+        assert_eq!(
+            constrained_decoding_for(None),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(
+            constrained_decoding_for(Some(&worker(&[("constrained_decoding", "always")]))),
+            ConstrainedDecoding::Always
+        );
+        assert_eq!(
+            constrained_decoding_for(Some(&worker(&[("constrained_decoding", "sometimes")]))),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(
+            constrained_decoding_for(Some(&worker(&[]))),
+            ConstrainedDecoding::Requested
+        );
+        let spec_wins = BasicWorkerBuilder::new("grpc://engine:50051")
+            .worker_type(WorkerType::Regular)
+            .label("constrained_decoding", "requested")
+            .constrained_decoding(ConstrainedDecoding::Always)
+            .build();
+        assert_eq!(
+            constrained_decoding_for(Some(&WorkerSelection::Single {
+                worker: Arc::new(spec_wins),
+            })),
+            ConstrainedDecoding::Always
+        );
+        let prefill = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:50051")
+                .worker_type(WorkerType::Prefill)
+                .label("constrained_decoding", "always")
+                .build(),
+        );
+        let decode = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:50051")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        assert_eq!(
+            constrained_decoding_for(Some(&WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill,
+                decode,
+                runtime_type: openai_protocol::worker::RuntimeType::TokenSpeed,
+            })),
+            ConstrainedDecoding::Requested
+        );
     }
 
     /// The worker's `constrained_decoding_start` label names where its engine
