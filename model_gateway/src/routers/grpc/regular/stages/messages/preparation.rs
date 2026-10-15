@@ -239,19 +239,40 @@ impl MessagePreparationStage {
         // follows the reasoning instead of preempting it.
         let reasoning = utils::messages_reasoning_starts_in_prefill(request, tokenizer.as_ref());
         let names = ctx.components.parser_resolver.names(&request.model);
-        let symphony_constraint = symphony::constraint_messages(
+        let continues = message_utils::continues_assistant(request);
+        // Where the model's workers start a grammar at the first token, the response
+        // template's table constrains the whole turn instead, and what it gives stands (see
+        // `regular::symphony::turn`).
+        let engines =
+            symphony::turn::Engines::of(&ctx.components.worker_registry, &ctx.input.model_id);
+        let turn = symphony::turn::for_messages(
             parser,
             &names,
             request,
-            &filtered_tools,
-            reasoning,
-            message_utils::continues_assistant(request),
+            chat_tool_choice.as_ref(),
+            engines,
+            &processed_messages.text,
+            continues,
             &ctx.components.templates,
         )
-        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        .transpose()?;
+        let turned = turn.is_some();
+        let symphony_constraint = match turn {
+            Some(turn) => turn,
+            None => symphony::constraint_messages(
+                parser,
+                &names,
+                request,
+                &filtered_tools,
+                reasoning,
+                continues,
+                &ctx.components.templates,
+            )
+            .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
+        };
         let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {
             (Some(constraint), _) => Some(constraint),
-            (None, Some(tool_choice)) if !filtered_tools.is_empty() => ctx
+            (None, Some(tool_choice)) if !turned && !filtered_tools.is_empty() => ctx
                 .components
                 .tool_parser_factory
                 .registry()

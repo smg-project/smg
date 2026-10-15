@@ -295,16 +295,26 @@ impl BuildStage for ChatRequestBuildingStage {
             None => ParserChoice::Legacy,
         });
         // The table's structural tag stands in for a JSON response_format (see
-        // `regular::symphony::constraint`): the engine's request carries the tag
-        // alone, so no client reads the two as competing constraints.
-        let answered = assignment.is_some()
-            && chat_request.response_format.is_some()
+        // `regular::symphony::constraint`), and the response template's table's
+        // tag of a whole turn for a regex or an ebnf too (`regular::symphony::turn`):
+        // the engine's request carries the tag alone, so no client reads the two as
+        // competing constraints.
+        let tagged = assignment.is_some()
             && tool_constraints
                 .as_ref()
                 .is_some_and(|(kind, _)| kind == "structural_tag");
-        let engine_request = answered.then(|| openai_protocol::chat::ChatCompletionRequest {
-            response_format: None,
-            ..chat_request.as_ref().clone()
+        let answered = tagged && chat_request.response_format.is_some();
+        let framed = tagged
+            && symphony::names_template(&names)
+            && (chat_request.regex.is_some() || chat_request.ebnf.is_some());
+        let engine_request = (answered || framed).then(|| {
+            let mut request = chat_request.as_ref().clone();
+            request.response_format = None;
+            if framed {
+                request.regex = None;
+                request.ebnf = None;
+            }
+            request
         });
         let engine_request = match &engine_request {
             Some(request) => request,

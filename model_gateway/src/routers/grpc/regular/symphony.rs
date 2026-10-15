@@ -29,11 +29,14 @@
 //! structural tag of a forced or required call, or of a JSON `response_format` ([`constraint`],
 //! [`constraint_messages`]) before the older registry. Both decide with one predicate, so the
 //! output a table's tag constrains is read by that table and never by the older parsers, which
-//! expect another syntax. The streaming and non-streaming drivers run one [`Reader`] per choice
+//! expect another syntax. Where the model's workers start a grammar at the first token, the
+//! response template's table constrains the whole turn instead, when its calls spell one
+//! ([`turn`]). The streaming and non-streaming drivers run one [`Reader`] per choice
 //! over the stop decoder's output and render its events with `symphony::adapt::chat` or
 //! `symphony::adapt::messages`, so the client sees the deltas and the message it saw before.
 
 pub(crate) mod template;
+pub(crate) mod turn;
 
 use axum::http::HeaderMap;
 use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
@@ -90,7 +93,7 @@ fn is_passthrough(name: Option<&str>) -> bool {
 
 /// Whether the parser names select the response template's table: either name is
 /// [`TEMPLATE_PARSER`]; [`check_names`] binds the other to it or to nothing.
-fn names_template(names: &Names) -> bool {
+pub(crate) fn names_template(names: &Names) -> bool {
     is_named(names.tool.as_deref(), TEMPLATE_PARSER)
         || is_named(names.reasoning.as_deref(), TEMPLATE_PARSER)
 }
