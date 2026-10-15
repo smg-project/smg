@@ -451,8 +451,9 @@ impl Format {
     /// With `reasoning_open`, the prompt left the model inside its thought, and the tag follows a
     /// prefix of free text without the call markers, nothing owed at its end (the thought and its
     /// close, or nothing, by where the engine starts the grammar); a table without a thought has
-    /// no prefix, and the tag comes back as it is; a table whose thought does not close back to
-    /// where it opened has no prefix yet, and gives `None`. Kimi K3's tag has a way in per state
+    /// no prefix, and the tag comes back as it is; a table whose thought closes only into the
+    /// block has no prefix, its close being its own way in, and gives `None`; one whose thought
+    /// closes into the text after it (MiniMax M3's) takes the prefix. Kimi K3's tag has a way in per state
     /// its block is entered from, the state's close first when it has one, so it is the same
     /// either way; so is xLAM's list, whose table has no thought. With the thought left to the
     /// model (the turn's own state opens it and closes an empty one: MiniMax M3), the tag admits
@@ -698,7 +699,9 @@ impl Format {
     /// `body` after the prefix a prompt's open thought takes: free text that can write none of the
     /// table's terminals but the thought's own, nor the call syntax's inner tags, with nothing
     /// owed at its end. A table without a thought has no prefix, and gives `body` as it is; a
-    /// thought that does not close back to where it opened has no prefix yet, and gives `None`.
+    /// thought that closes only into the block has no prefix, its close being its own way in, and
+    /// gives `None`; one that closes into the text after it takes the prefix with that close as
+    /// its own ([`Self::thought_markers`]).
     fn after_the_thought(&self, body: Grammar) -> Option<Grammar> {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return Some(body);
@@ -765,7 +768,10 @@ impl Format {
     /// terminals and the call syntax's inner tags, and its close), or the bare close, or nothing
     /// at all, before `body`: a forced call is written at once, and without this the tag would
     /// take the thought away. A table whose prompt opens the thought has only the opener's row
-    /// there, if that, and adds nothing.
+    /// there, if that, and adds nothing. A prompt with the thought closed is both the template's
+    /// adaptive default and a request with thinking switched off (its generation prompt ends with
+    /// the thought's close): the tag admits the thought, or a second close, in both, and an answer
+    /// that writes one with thinking off reads back as content, as the legacy parser's tag has it.
     fn thought_the_model_may_write_first(&self, body: Grammar) -> Grammar {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return body;
