@@ -20,6 +20,8 @@
 
 use std::ops::Range;
 
+use super::prefix::Prefix;
+
 /// What the object so far reveals about the call.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outline {
@@ -77,13 +79,19 @@ pub fn outline(text: &str) -> Outline {
 /// The outline taken as the object arrives: it keeps its place and its state between pieces, so
 /// the text grows by appending and each byte is read once. `advance` takes the whole text so
 /// far, reads only what came after the last call, and the outline in `found` is the one
-/// [`outline`] gives for that text.
+/// [`outline`] gives for that text, unless the scanner judges the members' values too
+/// ([`Self::judging_values`]).
 #[derive(Clone, Debug, Default)]
 pub struct Scanner {
     found: Outline,
     /// Bytes read so far.
     at: usize,
     stage: Stage,
+    /// Whether a member's value other than the arguments is judged as a JSON prefix
+    /// ([`Self::judging_values`]).
+    judging: bool,
+    /// The judge of the value being read, while one is judged.
+    judge: Option<Prefix>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -145,6 +153,27 @@ impl Scanner {
     /// not the object's. `None` while the object is being read, and once it has closed.
     pub fn stopped_at(&self) -> Option<usize> {
         (matches!(self.stage, Stage::Done) && self.found.close.is_none()).then_some(self.at)
+    }
+
+    /// Stop too where a member's value other than the arguments stops being a JSON prefix: a
+    /// literal that runs into the text after an object whose brace was left off (`true</f>`), or
+    /// a container that text cuts (`{"x": 1</f>`), at the byte that broke it or at the first
+    /// letter of a word that is no literal. A string's bytes are a prefix until it closes, so a
+    /// string never stops the outline. The arguments are the caller's own to judge, as the
+    /// assembler does with every byte of them. Without this, a value's bytes are read for their
+    /// brackets and quotes only, as [`outline`] reads them.
+    #[must_use]
+    pub fn judging_values(mut self) -> Self {
+        self.judging = true;
+        self
+    }
+
+    /// Feed the value's byte `c` at `at` to the value's judge, while the value is judged, and
+    /// return where the value stopped being a JSON prefix, as an offset from its start, if it has.
+    fn judged(&mut self, text: &str, at: usize, c: char) -> Option<usize> {
+        self.judge
+            .as_mut()
+            .and_then(|judge| judge.feed(&text[at..at + c.len_utf8()]))
     }
 
     /// Read the bytes of `text` that came after the last call; `text` holds every byte fed so
@@ -243,6 +272,14 @@ impl Scanner {
                         end: None,
                     });
                 }
+                // Another member's value is judged where the caller asked for it; the arguments
+                // are the caller's own to judge, as the assembler does with every byte of them.
+                self.judge = (self.judging && key != Member::Arguments).then(Prefix::default);
+                if self.judged(text, at, c).is_some() {
+                    // No value starts with this byte: the outline stops at it.
+                    self.stage = Stage::Done;
+                    return false;
+                }
                 let shape = match c {
                     '"' => Shape::String { escaped: false },
                     '{' | '[' => Shape::Container {
@@ -261,46 +298,70 @@ impl Scanner {
             }
             Stage::Value { key, start, shape } => {
                 let (key, start) = (*key, *start);
-                match shape {
-                    Shape::String { escaped } => {
-                        match (*escaped, c) {
-                            (true, _) => *escaped = false,
-                            (false, '\\') => *escaped = true,
-                            (false, '"') => self.value_ends(text, key, start, at + 1),
-                            _ => {}
+                let end = match shape {
+                    Shape::String { escaped } => match (*escaped, c) {
+                        (true, _) => {
+                            *escaped = false;
+                            None
                         }
-                        true
-                    }
+                        (false, '\\') => {
+                            *escaped = true;
+                            None
+                        }
+                        (false, '"') => Some(at + 1),
+                        _ => None,
+                    },
                     Shape::Container {
                         depth,
                         in_string,
                         escaped,
-                    } => {
-                        match (*in_string, *escaped, c) {
-                            (true, true, _) => *escaped = false,
-                            (true, false, '\\') => *escaped = true,
-                            (true, false, '"') => *in_string = false,
-                            (true, false, _) => {}
-                            (false, _, '"') => *in_string = true,
-                            (false, _, '{' | '[') => *depth += 1,
-                            (false, _, '}' | ']') => {
-                                *depth -= 1;
-                                if *depth == 0 {
-                                    self.value_ends(text, key, start, at + c.len_utf8());
-                                }
-                            }
-                            _ => {}
+                    } => match (*in_string, *escaped, c) {
+                        (true, true, _) => {
+                            *escaped = false;
+                            None
                         }
-                        true
-                    }
+                        (true, false, '\\') => {
+                            *escaped = true;
+                            None
+                        }
+                        (true, false, '"') => {
+                            *in_string = false;
+                            None
+                        }
+                        (true, false, _) => None,
+                        (false, _, '"') => {
+                            *in_string = true;
+                            None
+                        }
+                        (false, _, '{' | '[') => {
+                            *depth += 1;
+                            None
+                        }
+                        (false, _, '}' | ']') => {
+                            *depth -= 1;
+                            (*depth == 0).then_some(at + c.len_utf8())
+                        }
+                        _ => None,
+                    },
                     Shape::Scalar => {
                         if matches!(c, ',' | '}' | ']') || c.is_whitespace() {
                             self.value_ends(text, key, start, at);
                             return false;
                         }
-                        true
+                        None
                     }
+                };
+                // The byte is the value's. A judged value stops the outline where it stops being
+                // a JSON prefix: at this byte, or at the first letter of a word that is no literal.
+                if let Some(from) = self.judged(text, at, c) {
+                    self.at = start + from;
+                    self.stage = Stage::Done;
+                    return false;
                 }
+                if let Some(end) = end {
+                    self.value_ends(text, key, start, end);
+                }
+                true
             }
             Stage::Done => false,
         }
@@ -318,6 +379,7 @@ impl Scanner {
             }
             Member::Other => {}
         }
+        self.judge = None;
         self.stage = Stage::Member;
     }
 }
@@ -532,6 +594,50 @@ mod tests {
         assert_eq!(stopped(r#"{"name": "f"}"#), None, "closed, not stopped");
         assert_eq!(stopped(r#"{"name": "f", "arg"#), None, "still reading");
         assert_eq!(stopped(""), None);
+    }
+
+    #[test]
+    fn a_judged_value_stops_the_outline_where_it_stops_being_json() {
+        let stopped = |text: &str| {
+            let mut scanner = Scanner::default().judging_values();
+            scanner.advance(text);
+            scanner.stopped_at()
+        };
+        let text = r#"{"name": "f", "arguments": {"a": 1}, "strict": true</f>"#;
+        assert_eq!(
+            stopped(text),
+            text.find("</f>"),
+            "a literal runs into the trailer"
+        );
+        let text = r#"{"name": "f", "arguments": {"a": 1}, "meta": {"x": 1</f>"#;
+        assert_eq!(
+            stopped(text),
+            text.find("</f>"),
+            "a container the text cuts"
+        );
+        let text = r#"{"name": "f", "arguments": {"a": 1}, "flag": nux}"#;
+        assert_eq!(
+            stopped(text),
+            text.find("nux"),
+            "a word that is no literal, from its first letter"
+        );
+        assert_eq!(
+            stopped(r#"{"name": "f", "arguments": {"a": 1}, "strict": true}"#),
+            None,
+            "a whole object closes"
+        );
+        assert_eq!(
+            stopped(r#"{"name": "f", "arguments": 12abc}"#),
+            None,
+            "the arguments are the caller's to judge"
+        );
+        let mut scanner = Scanner::default();
+        scanner.advance(r#"{"name": "f", "arguments": {"a": 1}, "strict": true</f>"#);
+        assert_eq!(
+            scanner.stopped_at(),
+            None,
+            "unjudged, the literal runs on, as the JSON syntax reads it"
+        );
     }
 
     #[test]

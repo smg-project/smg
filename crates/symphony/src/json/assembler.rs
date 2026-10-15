@@ -39,7 +39,8 @@ pub struct Assembler {
     done: bool,
     /// Whether the object ends where its bytes stop being a call's object: where its arguments
     /// stop being a JSON prefix, or where its outline stops short of the closing brace (the brace
-    /// left off, text where a member should be). The bytes from there on are then the caller's
+    /// left off, text where a member should be, another member's value that stops being JSON).
+    /// The bytes from there on are then the caller's
     /// ([`Self::refused_tail`]), for a shaped call's trailer to read, rather than the object's.
     ends_where_refused: bool,
     /// Where in `text` the object ended so, until the bytes from there were handed back.
@@ -71,10 +72,11 @@ impl Assembler {
     }
 
     /// The object ends where its bytes stop being a call's object: where its arguments stop being
-    /// a JSON prefix, or where its outline stops short of the closing brace (see
-    /// [`Self::refused_tail`]).
+    /// a JSON prefix, or where its outline stops short of the closing brace, the other members'
+    /// values judged as JSON too (see [`Self::refused_tail`]).
     pub fn ending_where_refused(mut self) -> Self {
         self.ends_where_refused = true;
+        self.scanner = std::mem::take(&mut self.scanner).judging_values();
         self
     }
 
@@ -698,6 +700,17 @@ mod tests {
             Some(("<".to_string(), Some('}'))),
             "the tail is what came in the piece the stop came in"
         );
+
+        let (events, tail) = feed(
+            r#"{"name": "f", "arguments": {"a": 1}, "strict": true</f>"#,
+            false,
+        );
+        assert_eq!(
+            events,
+            vec![start(head), value.clone(), end(r#", "strict": true"#)],
+            "a literal in another member runs into the trailer"
+        );
+        assert_eq!(tail, Some(("</f>".to_string(), Some('e'))));
 
         let (events, tail) = feed(r#"{"name": "f", "arguments": {"a": 1}, junk</f>"#, false);
         assert_eq!(

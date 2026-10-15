@@ -1146,9 +1146,9 @@ mod tests {
     }
 
     /// The same for an object that names the call: refused inside its arguments, or its outline
-    /// stopped short of its close (the brace left off, text where a member should be), the call
-    /// ends there, the trailer and the terminal are the region's wrapping, and the text after is
-    /// content.
+    /// stopped short of its close (the brace left off, text where a member should be, a literal
+    /// in another member running into the trailer), the call ends there, the trailer and the
+    /// terminal are the region's wrapping, and the text after is content.
     #[test]
     fn a_refused_envelope_hands_what_follows_to_the_trailer() {
         let envelope = intern(CallShape {
@@ -1226,6 +1226,22 @@ mod tests {
                 finish(1),
             ],
             "text where a member should be"
+        );
+        assert_eq!(
+            run(
+                &format,
+                "<c>{\"name\": \"f\", \"arguments\": {\"a\": 1}, \"strict\": true</f>\n</c>Done.",
+            ),
+            [
+                wrapper("<c>"),
+                start("f", "{\"name\": \"f\", \"arguments\": "),
+                arguments("{\"a\": 1}"),
+                end(", \"strict\": true"),
+                wrapper("</f>\n</c>"),
+                content("Done."),
+                finish(1),
+            ],
+            "a literal in another member runs into the trailer"
         );
     }
 
