@@ -2131,9 +2131,8 @@ mod tests {
     /// block, "none" turns a toggle template's thinking off, as for Chat.
     #[test]
     fn output_config_effort_arms_the_reasoning_parser_as_rendered() {
-        use crate::routers::grpc::{
-            spec::MessagesResponseSpec,
-            utils::{chat_reasoning_starts_in_prefill, messages_reasoning_starts_in_prefill},
+        use crate::routers::grpc::utils::{
+            chat_reasoning_starts_in_prefill, messages_reasoning_starts_in_prefill,
         };
         let mut tokenizer =
             llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
@@ -2166,12 +2165,6 @@ mod tests {
                 messages_reasoning_starts_in_prefill(&request, false, &tokenizer),
                 armed,
                 "{effort}"
-            );
-            // The response processors arm from the request's spec.
-            assert_eq!(
-                MessagesResponseSpec::from(&request).reasoning_starts_in_prefill(&tokenizer),
-                armed,
-                "spec {effort}"
             );
             let chat: openai_protocol::chat::ChatCompletionRequest =
                 serde_json::from_value(json!({

@@ -471,10 +471,9 @@ impl StreamingProcessor {
                 reasoning_parser_available || original_request.symphony.is_some();
         }
 
-        // If the template supports a thinking toggle and the user enabled it,
-        // the template injected `<think>` in the prefill — parsers should start
-        // in reasoning mode.
-        let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
+        // Request building decided whether the rendered prompt ends inside the
+        // model's thinking block; the parsers then start in reasoning mode.
+        let thinking_override = original_request.reasoning_in_prefill;
         let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if JSON schema constraint was used (specific function or required mode)
@@ -2599,14 +2598,8 @@ impl StreamingProcessor {
             reasoning_parser_name.as_deref(),
             model,
         );
-        let separate_reasoning = reasoning_requires_special_tokens
-            || matches!(
-                &original_request.thinking,
-                Some(
-                    messages::ThinkingConfig::Enabled { .. }
-                        | messages::ThinkingConfig::Adaptive { .. }
-                )
-            );
+        let separate_reasoning =
+            reasoning_requires_special_tokens || original_request.thinking_requested;
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
@@ -2614,7 +2607,7 @@ impl StreamingProcessor {
                 model,
             );
 
-        let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
+        let thinking_override = original_request.reasoning_in_prefill;
         let think_in_prefill = tokenizer.think_in_prefill();
 
         let tool_choice_enabled = !matches!(
@@ -2698,13 +2691,7 @@ impl StreamingProcessor {
         };
         // Thinking tokens of the turn: the engine's count when it keeps one,
         // else the tokens the parser routed to thinking, chunk by chunk.
-        let thinking_requested = matches!(
-            &original_request.thinking,
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                    | messages::ThinkingConfig::Adaptive { .. }
-            )
-        );
+        let thinking_requested = original_request.thinking_requested;
         let mut parsed_thinking_tokens: u32 = 0;
         let mut engine_thinking_tokens: u32 = 0;
         let mut was_in_reasoning = false;

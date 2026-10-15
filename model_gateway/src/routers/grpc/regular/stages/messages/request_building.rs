@@ -136,9 +136,11 @@ impl BuildStage for MessageRequestBuildingStage {
         }
 
         let continued_final_message = processed_messages.continued_final_message;
-        // Native Gemma4 channels follow the rendered prompt; other parsers keep
-        // their tokenizer-driven preference for the engine's reasoning gate.
-        let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+        // Whether the rendered prompt leaves the model inside its thought:
+        // native Gemma4 channels follow the rendered prompt when that parser
+        // decides; other parsers keep their tokenizer-driven preference for
+        // the engine's reasoning gate.
+        let require_reasoning = utils::rendered_prompt_reasoning_in_prefill(
             &ctx.components.reasoning_parser_factory,
             ctx.components
                 .parser_resolver
@@ -146,8 +148,8 @@ impl BuildStage for MessageRequestBuildingStage {
                 .as_deref(),
             &messages_request.model,
             &processed_messages.text,
-        );
-        let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
+        )
+        .unwrap_or_else(|| {
             ctx.tokenizer_arc().is_some_and(|tokenizer| {
                 utils::messages_reasoning_starts_in_prefill(
                     &messages_request,
@@ -312,9 +314,8 @@ impl BuildStage for MessageRequestBuildingStage {
             &proto_request,
         );
         let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
-        spec.reasoning_in_prefill = reasoning_in_prefill;
+        spec.reasoning_in_prefill = require_reasoning;
         spec.symphony = assignment;
-        spec.continues_final_assistant = continued_final_message;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
             spec: ResponseSpec::Messages(Box::new(spec)),

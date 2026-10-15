@@ -45,25 +45,18 @@ impl ChatRequestBuildingStage {
     }
 }
 
-/// Build the backend `GenerateRequest` from a chat-shaped request, shared by
-/// the chat endpoint and the transcription endpoint. Assembles multimodal
-/// data, applies sampling defaults (from the chat request), finalizes stops,
-/// and injects PD/EPD metadata — returning the plan, attempt stamp and rendered
-/// reasoning state. The caller supplies the `ResponseSpec`.
-/// `continued_final_message` is the rendered prompt's
-/// (`ProcessedMessages::continued_final_message`).
 /// Whether the rendered prompt leaves the model inside its thought, as the
-/// request's grammar and the plan's reasoning state both read it: native
-/// Gemma4 channels follow the rendered prompt (the first value, when that
-/// parser decides); other parsers keep their tokenizer-driven preference for
-/// the engine's reasoning gate (the second value falls back to it).
+/// request's grammar, the plan's reasoning state and the response spec all
+/// read it: native Gemma4 channels follow the rendered prompt when that
+/// parser decides; other parsers keep their tokenizer-driven preference for
+/// the engine's reasoning gate.
 fn reasoning_decision(
     ctx: &RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: &str,
     continued_final_message: bool,
-) -> (Option<bool>, bool) {
-    let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+) -> bool {
+    utils::rendered_prompt_reasoning_in_prefill(
         &ctx.components.reasoning_parser_factory,
         ctx.components
             .parser_resolver
@@ -71,8 +64,8 @@ fn reasoning_decision(
             .as_deref(),
         &chat_request.model,
         processed_text,
-    );
-    let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
+    )
+    .unwrap_or_else(|| {
         ctx.tokenizer_arc().is_some_and(|tokenizer| {
             utils::chat_reasoning_starts_in_rendered_prefill(
                 chat_request,
@@ -80,10 +73,16 @@ fn reasoning_decision(
                 tokenizer.as_ref(),
             )
         })
-    });
-    (reasoning_in_prefill, require_reasoning)
+    })
 }
 
+/// Build the backend `GenerateRequest` from a chat-shaped request, shared by
+/// the chat endpoint and the transcription endpoint. Assembles multimodal
+/// data, applies sampling defaults (from the chat request), finalizes stops,
+/// and injects PD/EPD metadata — returning the plan, attempt stamp and rendered
+/// reasoning state. The caller supplies the `ResponseSpec`.
+/// `continued_final_message` is the rendered prompt's
+/// (`ProcessedMessages::continued_final_message`).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
@@ -95,7 +94,7 @@ pub(crate) async fn build_chat_backed_plan(
     id_prefix: &'static str,
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
-) -> Result<(ExecutionPlan, AttemptStamp, Option<bool>), Response> {
+) -> Result<(ExecutionPlan, AttemptStamp, bool), Response> {
     let clients = ctx.state.clients.as_ref().ok_or_else(|| {
         error!(
             function = "build_chat_backed_plan",
@@ -156,7 +155,7 @@ pub(crate) async fn build_chat_backed_plan(
         .await?;
     }
 
-    let (reasoning_in_prefill, require_reasoning) =
+    let require_reasoning =
         reasoning_decision(ctx, chat_request, &processed_text, continued_final_message);
 
     // Now that the worker is known, a forced call's grammar takes the shape
@@ -265,7 +264,7 @@ pub(crate) async fn build_chat_backed_plan(
             inject_pd_metadata,
             tool_constraint,
         },
-        reasoning_in_prefill,
+        require_reasoning,
     ))
 }
 
@@ -314,7 +313,7 @@ impl BuildStage for ChatRequestBuildingStage {
             None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
                 == ConstrainedDecoding::Always =>
             {
-                let (_, reasoning) = reasoning_decision(
+                let reasoning = reasoning_decision(
                     ctx,
                     &chat_request,
                     &processed_messages.text,
@@ -382,7 +381,6 @@ impl BuildStage for ChatRequestBuildingStage {
         spec.unbilled_prompt_tokens = unbilled_prompt_tokens;
         spec.reasoning_in_prefill = reasoning_in_prefill;
         spec.symphony = assignment;
-        spec.continues_final_assistant = continued_final_message;
 
         Ok(BuildOutput {
             plan,

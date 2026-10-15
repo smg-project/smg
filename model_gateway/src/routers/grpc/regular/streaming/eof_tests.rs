@@ -11,9 +11,7 @@ use futures::{stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use llm_tokenizer::{traits::Encoding, SpecialTokens};
-use openai_protocol::{
-    chat::ChatCompletionRequest, profile::ProviderProfile, worker::HealthCheckConfig,
-};
+use openai_protocol::{chat::ChatCompletionRequest, worker::HealthCheckConfig};
 use prost::Message as ProstMessage;
 use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
@@ -652,17 +650,14 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
     let (tx, rx) = sse_channel();
     let spec = MessagesResponseSpec {
-        provider: ProviderProfile::Generic,
-        thinking: None,
-        reasoning_in_prefill: None,
+        thinking_requested: false,
+        reasoning_in_prefill: false,
         tool_choice: None,
         has_tools: false,
         history_tool_calls_count: 0,
         chat_tools: Vec::new(),
         stop_sequences: None,
         symphony: None,
-        continues_final_assistant: false,
-        reasoning_effort: None,
         first_tool_call_only: false,
     };
     let result = processor(false)
@@ -751,20 +746,14 @@ fn byte_fallback_reasoning_tokenizer() -> Arc<dyn Tokenizer> {
 
 fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
-        provider: ProviderProfile::Generic,
-        thinking: thinking.then_some(messages::ThinkingConfig::Enabled {
-            budget_tokens: 1024,
-            display: None,
-        }),
-        reasoning_in_prefill: None,
+        thinking_requested: thinking,
+        reasoning_in_prefill: false,
         tool_choice: None,
         has_tools: false,
         history_tool_calls_count: 0,
         chat_tools: Vec::new(),
         stop_sequences: None,
         symphony: None,
-        continues_final_assistant: false,
-        reasoning_effort: None,
         first_tool_call_only: false,
     }
 }
@@ -1844,20 +1833,14 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         let (stream, server) = scripted_stream(responses, "0").await;
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
-            provider: ProviderProfile::Generic,
-            thinking: Some(messages::ThinkingConfig::Enabled {
-                budget_tokens: 1024,
-                display: None,
-            }),
-            reasoning_in_prefill: None,
+            thinking_requested: true,
+            reasoning_in_prefill: false,
             tool_choice: None,
             has_tools: false,
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: None,
             symphony: None,
-            continues_final_assistant: false,
-            reasoning_effort: None,
             first_tool_call_only: false,
         };
         let result = processor(false)
@@ -1935,17 +1918,14 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (stream, server) = scripted_stream(vec![chunk(0, "Hi."), done], "0").await;
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
-            provider: ProviderProfile::Generic,
-            thinking: None,
-            reasoning_in_prefill: None,
+            thinking_requested: false,
+            reasoning_in_prefill: false,
             tool_choice: None,
             has_tools: false,
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
             stop_sequences: Some(vec!["###".to_string()]),
             symphony: None,
-            continues_final_assistant: false,
-            reasoning_effort: None,
             first_tool_call_only: false,
         };
         let result = processor(false)
@@ -2312,20 +2292,14 @@ async fn messages_blocks_and_inputs(
     texts: &[&str],
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
-        provider: ProviderProfile::Generic,
-        thinking: Some(messages::ThinkingConfig::Enabled {
-            budget_tokens: 1024,
-            display: None,
-        }),
-        reasoning_in_prefill: None,
+        thinking_requested: true,
+        reasoning_in_prefill: false,
         tool_choice,
         has_tools: true,
         history_tool_calls_count: 0,
         chat_tools: chat_spec(true).tools.unwrap(),
         stop_sequences: None,
         symphony: None,
-        continues_final_assistant: false,
-        reasoning_effort: None,
         first_tool_call_only: false,
     };
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
@@ -2460,7 +2434,7 @@ async fn vllm_native_auto_tool_stream_keeps_prefilled_reasoning() {
     }))
     .unwrap();
     let mut spec = ChatResponseSpec::from(&request);
-    spec.reasoning_in_prefill = Some(true);
+    spec.reasoning_in_prefill = true;
     let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
     frames.push(complete(0, "stop"));
     let (stream, server) = scripted_stream(frames, "0").await;
@@ -2529,7 +2503,7 @@ async fn vllm_json_tool_stream_keeps_prefilled_reasoning() {
         }))
         .unwrap();
         let mut spec = ChatResponseSpec::from(&request);
-        spec.reasoning_in_prefill = Some(true);
+        spec.reasoning_in_prefill = true;
         let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
         frames.push(complete(0, "stop"));
         let (stream, server) = scripted_stream(frames, "0").await;
@@ -2624,7 +2598,8 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                     resolver.reasoning_parser(model).as_deref(),
                     model,
                     prompt,
-                );
+                )
+                .unwrap_or(false);
                 let mut final_frame = complete(0, "stop");
                 if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
                     complete.output_ids = output.chars().map(u32::from).collect();
@@ -2753,7 +2728,8 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                     resolver.reasoning_parser(model).as_deref(),
                     model,
                     prompt,
-                );
+                )
+                .unwrap_or(false);
                 let mut final_frame = complete(0, "stop");
                 if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
                     complete.output_ids = output.chars().map(u32::from).collect();
