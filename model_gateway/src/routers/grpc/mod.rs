@@ -1,7 +1,7 @@
 //! gRPC router implementations
 
 use axum::response::Response;
-use openai_protocol::{chat::ChatCompletionRequest, common::StringOrArray};
+use openai_protocol::chat::ChatCompletionRequest;
 
 use crate::routers::error;
 
@@ -54,7 +54,6 @@ fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<
 #[derive(Debug)]
 pub struct ProcessedMessages {
     pub text: String,
-    pub stop_sequences: Option<StringOrArray>,
     /// Rendered prompt tokens the provider does not bill.
     pub unbilled_prompt_tokens: u32,
     /// The prompt continues the trailing assistant message instead of

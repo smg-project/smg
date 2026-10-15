@@ -22,7 +22,7 @@ use crate::{
                 reserve_multimodal_inflight,
             },
             regular::symphony,
-            spec::{MessagesResponseSpec, ResponseSpec},
+            spec::ResponseSpec,
             utils,
         },
     },
@@ -81,6 +81,7 @@ impl BuildStage for MessageRequestBuildingStage {
             token_ids,
             processed_messages,
             tool_constraints,
+            mut spec,
         } = prep
         else {
             debug_assert!(false, "pipeline guarantees Messages variant");
@@ -184,7 +185,7 @@ impl BuildStage for MessageRequestBuildingStage {
                     .tokenizer_arc()
                     .map(|tokenizer| {
                         utils::template_tools(
-                            messages_request.tools.as_deref(),
+                            &spec.chat_tools,
                             messages_request.tool_choice.as_ref(),
                             tokenizer.renderer_capabilities(),
                         )
@@ -313,12 +314,11 @@ impl BuildStage for MessageRequestBuildingStage {
             tool_parser.as_deref(),
             &proto_request,
         );
-        let mut spec = MessagesResponseSpec::from(messages_request.as_ref());
         spec.reasoning_in_prefill = require_reasoning;
         spec.symphony = assignment;
         Ok(BuildOutput {
             plan: ExecutionPlan::generate(self.plan_kind, proto_request),
-            spec: ResponseSpec::Messages(Box::new(spec)),
+            spec: ResponseSpec::Messages(spec),
             stamp: AttemptStamp {
                 id: id_stamp,
                 sampling_mask,

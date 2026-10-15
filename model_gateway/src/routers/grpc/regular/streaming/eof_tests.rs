@@ -1924,7 +1924,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
             has_tools: false,
             history_tool_calls_count: 0,
             chat_tools: Vec::new(),
-            stop_sequences: Some(vec!["###".to_string()]),
+            stop_sequences: Some(StringOrArray::Array(vec!["###".to_string()])),
             symphony: None,
             first_tool_call_only: false,
         };

@@ -1509,6 +1509,11 @@ impl Normalizable for CountMessageTokensRequest {
 }
 
 impl CountMessageTokensRequest {
+    /// The request's custom tools as chat tools, as [`CreateMessageRequest::chat_tools`].
+    pub fn chat_tools(&self) -> Vec<common::Tool> {
+        self.tools.as_deref().map(chat_tools).unwrap_or_default()
+    }
+
     /// Whether the request's final message is an assistant prefill the
     /// response continues (see [`continues_final_assistant`]).
     pub fn continues_final_assistant(&self) -> bool {

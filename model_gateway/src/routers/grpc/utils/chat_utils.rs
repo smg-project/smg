@@ -842,7 +842,6 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 return Ok((
                     ProcessedMessages {
                         text: String::new(),
-                        stop_sequences: request.stop.clone(),
                         unbilled_prompt_tokens: 0,
                         continued_final_message: false,
                     },
@@ -873,7 +872,6 @@ pub(crate) fn process_chat_messages_with_placeholders(
     Ok((
         ProcessedMessages {
             text,
-            stop_sequences: request.stop.clone(),
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
         },

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
-    common::{StringOrArray, ToolChoice, ToolChoiceValue},
+    common::{ToolChoice, ToolChoiceValue},
     messages::CreateMessageRequest,
 };
 use tracing::{debug, error};
@@ -16,6 +16,7 @@ use crate::{
             context::{PreparationOutput, RequestContext},
             multimodal,
             regular::symphony,
+            spec::MessagesResponseSpec,
             utils::{self, message_utils},
         },
     },
@@ -73,19 +74,19 @@ impl MessagePreparationStage {
             .map_err(|why| error::bad_request("invalid_parser_header", why))?;
         ctx.state.parser = Some(parser);
 
-        // Step 1: The tools the template renders (narrowed by tool_choice),
-        // shared with count_tokens so both render the same prompt.
+        // Step 1: The response spec, built here because its chat tools (the
+        // custom tools, converted once) are what the template renders,
+        // narrowed by tool_choice and shared with count_tokens so both render
+        // the same prompt; the constraints read the narrowed tools too, the
+        // parsers read them all from the spec.
+        let spec = Box::new(MessagesResponseSpec::from(request));
         let filtered_tools = message_utils::template_tools(
-            request.tools.as_deref(),
+            &spec.chat_tools,
             request.tool_choice.as_ref(),
             tokenizer.renderer_capabilities(),
         );
         let chat_tool_choice = request.tool_choice.as_ref().map(ToolChoice::from);
-        let tools_for_template = if filtered_tools.is_empty() {
-            None
-        } else {
-            Some(filtered_tools.as_slice())
-        };
+        let tools_for_template = (!filtered_tools.is_empty()).then_some(&*filtered_tools);
 
         // The media-part order and, for a request with media, the plan and the
         // placeholder tokens: resolved once, shared with count_tokens.
@@ -276,12 +277,6 @@ impl MessagePreparationStage {
             (None, _) => None,
         };
 
-        // Step 5: Create stop sequence decoder
-        let stop_for_decoder = request
-            .stop_sequences
-            .as_ref()
-            .map(|seqs| StringOrArray::Array(seqs.clone()));
-
         let preserve_reasoning_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &ctx.components.reasoning_parser_factory,
             ctx.components
@@ -312,9 +307,11 @@ impl MessagePreparationStage {
             }
         };
 
+        // Step 5: the stop sequence decoder, over the stop sequences the spec
+        // carries on to the stream's decoder.
         let stop_decoder = utils::create_stop_decoder(
             &tokenizer,
-            stop_for_decoder.as_ref(),
+            spec.stop_sequences.as_ref(),
             None, // no stop_token_ids in Messages API
             skip_special_tokens,
             false, // no_stop_trim default
@@ -328,6 +325,7 @@ impl MessagePreparationStage {
             token_ids,
             processed_messages,
             tool_constraints: tool_call_constraint.map(|c| c.to_tuple()),
+            spec,
         });
 
         // Store stop decoder and derived skip_special_tokens for response processing.

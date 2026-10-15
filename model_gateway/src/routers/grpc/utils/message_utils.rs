@@ -5,7 +5,7 @@
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
 #![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
@@ -14,7 +14,7 @@ use llm_tokenizer::{
     traits::{PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
-    common::{StringOrArray, Tool as ChatTool, ToolChoice as ChatToolChoice},
+    common::{Tool as ChatTool, ToolChoice as ChatToolChoice},
     messages::{
         self, CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
         InputMessage, SystemContent, ToolResultContent,
@@ -49,7 +49,6 @@ pub(crate) struct MessagesPrompt<'a> {
     pub thinking: Option<bool>,
     /// `output_config.effort`, rendered as the `reasoning_effort` kwarg.
     pub reasoning_effort: Option<&'a str>,
-    pub stop_sequences: Option<&'a [String]>,
     /// The request's tool choice, told to the template as the chat path
     /// tells it; a renderer that declares the tools under `none` writes its
     /// instruction not to call them from it.
@@ -63,7 +62,6 @@ impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
             system: request.system.as_ref(),
             thinking: request.template_thinking(),
             reasoning_effort: request.reasoning_effort(),
-            stop_sequences: request.stop_sequences.as_deref(),
             tool_choice: request.tool_choice.as_ref(),
         }
     }
@@ -76,7 +74,6 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
             system: request.system.as_ref(),
             thinking: request.template_thinking(),
             reasoning_effort: request.reasoning_effort(),
-            stop_sequences: None,
             tool_choice: request.tool_choice.as_ref(),
         }
     }
@@ -235,15 +232,10 @@ pub(crate) fn process_messages_prompt(
         .map_err(|e| format!("Failed to apply chat template: {e}"))?;
 
     // Step 7: Build ProcessedMessages
-    let stop_sequences = request
-        .stop_sequences
-        .map(|seqs| StringOrArray::Array(seqs.to_vec()));
-
     let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);
     Ok((
         ProcessedMessages {
             text,
-            stop_sequences,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
         },
@@ -251,31 +243,29 @@ pub(crate) fn process_messages_prompt(
     ))
 }
 
-/// The tools the template renders for a request: the custom tools as chat
-/// tools, narrowed by `tool_choice` the way the chat path narrows them (a
-/// forced tool renders alone, and `none` renders none unless the renderer
-/// declares the tools under `none` itself, see
-/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]). Shared
-/// by the preparation stage and count_tokens so both render the same prompt.
-pub fn template_tools(
-    tools: Option<&[messages::Tool]>,
+/// The tools the template renders for a request: `chat_tools` (the custom
+/// tools as chat tools) narrowed by `tool_choice` the way the chat path
+/// narrows them (a forced tool renders alone, and `none` renders none unless
+/// the renderer declares the tools under `none` itself, see
+/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]); borrowed
+/// when the choice does not narrow. Shared by the preparation stage and
+/// count_tokens so both render the same prompt.
+pub fn template_tools<'a>(
+    chat_tools: &'a [ChatTool],
     tool_choice: Option<&messages::ToolChoice>,
     capabilities: RendererCapabilities,
-) -> Vec<ChatTool> {
-    let Some(tools) = tools else {
-        return Vec::new();
-    };
+) -> Cow<'a, [ChatTool]> {
     if matches!(tool_choice, Some(messages::ToolChoice::None))
         && !capabilities.declares_tools_under_tool_choice_none
     {
-        return Vec::new();
+        return Cow::Borrowed(&[]);
     }
-    let chat_tools = messages::chat_tools(tools);
-    match tool_choice.map(ChatToolChoice::from) {
-        Some(tc) => {
-            chat_utils::filter_tools_by_tool_choice(&chat_tools, Some(&tc)).unwrap_or(chat_tools)
-        }
-        None => chat_tools,
+    match tool_choice
+        .map(ChatToolChoice::from)
+        .and_then(|choice| choice.narrow_tools(chat_tools))
+    {
+        Some(narrowed) => Cow::Owned(narrowed),
+        None => Cow::Borrowed(chat_tools),
     }
 }
 
@@ -1387,8 +1377,9 @@ mod tests {
             "messages": [{"role": "user", "content": "Weather in Paris?"}]
         }))
         .unwrap();
+        let chat_tools = request.chat_tools();
         let tools = template_tools(
-            request.tools.as_deref(),
+            &chat_tools,
             request.tool_choice.as_ref(),
             RendererCapabilities::default(),
         );
@@ -1429,15 +1420,15 @@ mod tests {
             ..RendererCapabilities::default()
         };
         let none = request(json!({"type": "none"}));
-        assert!(template_tools(none.tools.as_deref(), none.tool_choice.as_ref(), plain).is_empty());
+        assert!(template_tools(&none.chat_tools(), none.tool_choice.as_ref(), plain).is_empty());
         assert_eq!(
-            template_tools(none.tools.as_deref(), none.tool_choice.as_ref(), declaring).len(),
+            template_tools(&none.chat_tools(), none.tool_choice.as_ref(), declaring).len(),
             1,
             "the renderer that declares the tools under none gets them"
         );
         let auto = request(json!({"type": "auto"}));
         assert_eq!(
-            template_tools(auto.tools.as_deref(), auto.tool_choice.as_ref(), plain).len(),
+            template_tools(&auto.chat_tools(), auto.tool_choice.as_ref(), plain).len(),
             1
         );
     }
@@ -1464,15 +1455,16 @@ mod tests {
                 body["tool_choice"] = tool_choice;
             }
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
+            let chat_tools = request.chat_tools();
             let tools = template_tools(
-                request.tools.as_deref(),
+                &chat_tools,
                 request.tool_choice.as_ref(),
                 tok.renderer_capabilities(),
             );
             let tools_for_template = if tools.is_empty() {
                 None
             } else {
-                Some(tools.as_slice())
+                Some(&*tools)
             };
             let (processed, _) =
                 process_messages_with_encoding(&request, &tok, tools_for_template).unwrap();
@@ -1547,15 +1539,16 @@ mod tests {
             "messages": [{"role": "user", "content": "What is the weather in Paris?"}]
         }))
         .expect("the request");
+        let chat_tools = request.chat_tools();
         let tools = template_tools(
-            request.tools.as_deref(),
+            &chat_tools,
             request.tool_choice.as_ref(),
             tok.renderer_capabilities(),
         );
         let (processed, _) = process_messages(
             &request,
             tok.as_ref(),
-            Some(tools.as_slice()),
+            Some(&*tools),
             None,
             MediaPartOrder::MediaFirst,
         )

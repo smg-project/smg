@@ -2,10 +2,11 @@
 //! building and response processing.
 //!
 //! Request building is the last reader of the parsed request; the spec it
-//! produces is the only request-derived input available to response
-//! processing and streaming tasks. The Harmony variant is the one deliberate
-//! exception: its tool loop re-reads the request across iterations, so its
-//! spec explicitly owns a handle to it.
+//! hands on (the Messages spec is begun by preparation, which renders its
+//! tools, and completed by request building) is the only request-derived
+//! input available to response processing and streaming tasks. The Harmony
+//! variant is the one deliberate exception: its tool loop re-reads the
+//! request across iterations, so its spec explicitly owns a handle to it.
 
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use crate::routers::grpc::regular::{
     stages::decisions::scoring::DecisionScoring, symphony::Assignment,
 };
 
-/// Response-phase contract for one request, produced by request building.
+/// Response-phase contract for one request, handed on by request building.
 #[derive(Clone)]
 pub(crate) enum ResponseSpec {
     Chat(Box<ChatResponseSpec>),
@@ -154,6 +155,10 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
     }
 }
 
+/// The response-phase contract of a Messages request. Preparation builds it
+/// (`PreparationOutput::Messages`), since the template renders its chat
+/// tools; request building fills in what the rendered prompt and the worker
+/// decide.
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
     /// The `thinking` block asks for thinking (`enabled` or `adaptive`).
@@ -164,9 +169,12 @@ pub(crate) struct MessagesResponseSpec {
     pub tool_choice: Option<messages::ToolChoice>,
     pub has_tools: bool,
     pub history_tool_calls_count: usize,
-    /// Messages tools pre-converted to Chat tools for parser reuse.
+    /// The custom tools as chat tools, converted once: the template renders
+    /// them (narrowed by `tool_choice`), the constraints and the parsers
+    /// read them.
     pub chat_tools: Vec<Tool>,
-    pub stop_sequences: Option<Vec<String>>,
+    /// The stop sequences as the decoders match them.
+    pub stop_sequences: Option<StringOrArray>,
     /// Symphony's assignment when a table reads the message (see `regular::symphony`).
     pub symphony: Option<Assignment>,
     /// `disable_parallel_tool_use: true`: only the first tool call is
@@ -183,7 +191,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             has_tools: request.tools.is_some(),
             history_tool_calls_count: request.history_tool_calls_count(),
             chat_tools: request.chat_tools(),
-            stop_sequences: request.stop_sequences.clone(),
+            stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
         }

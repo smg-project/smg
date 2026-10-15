@@ -9,13 +9,14 @@ use axum::{
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
+    common::Tool as ChatTool,
     completion::CompletionRequest,
     decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{
         CountMessageTokensRequest, CountMessageTokensResponse, CreateMessageRequest, Message,
-        MessageDelta, MessageDeltaUsage, MessageStreamEvent, StopReason, Tool, ToolChoice, Usage,
+        MessageDelta, MessageDeltaUsage, MessageStreamEvent, StopReason, ToolChoice, Usage,
     },
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
@@ -722,7 +723,7 @@ impl GrpcRouter {
             .count_prompt_tokens(
                 &model_id,
                 message_utils::MessagesPrompt::from(&body),
-                body.tools.as_deref(),
+                &body.chat_tools(),
                 body.tool_choice.as_ref(),
             )
             .await
@@ -753,7 +754,7 @@ impl GrpcRouter {
         &self,
         model_id: &str,
         prompt: message_utils::MessagesPrompt<'_>,
-        tools: Option<&[Tool]>,
+        chat_tools: &[ChatTool],
         tool_choice: Option<&ToolChoice>,
     ) -> Result<u32, Response> {
         if !self.worker_registry.contains_model(model_id) {
@@ -771,8 +772,11 @@ impl GrpcRouter {
                     .as_ref(),
             ));
         };
-        let chat_tools =
-            message_utils::template_tools(tools, tool_choice, tokenizer.renderer_capabilities());
+        let tools = message_utils::template_tools(
+            chat_tools,
+            tool_choice,
+            tokenizer.renderer_capabilities(),
+        );
         let media = message_utils::resolve_messages_media(
             &self.shared_components,
             model_id,
@@ -783,7 +787,7 @@ impl GrpcRouter {
         message_utils::count_input_tokens(
             prompt,
             tokenizer,
-            &chat_tools,
+            &tools,
             media.placeholders(),
             media.media_order,
         )
@@ -826,7 +830,7 @@ impl GrpcRouter {
             .count_prompt_tokens(
                 model_id,
                 message_utils::MessagesPrompt::from(&*body),
-                body.tools.as_deref(),
+                &body.chat_tools(),
                 body.tool_choice.as_ref(),
             )
             .await

@@ -167,15 +167,16 @@ fn render(tok: &dyn Tokenizer, request: &ChatCompletionRequest) -> Rendered {
 /// template renders for this renderer, then the template, then the
 /// renderer's own encode.
 fn render_messages(tok: &dyn Tokenizer, request: &CreateMessageRequest) -> Rendered {
+    let chat_tools = request.chat_tools();
     let tools = template_tools(
-        request.tools.as_deref(),
+        &chat_tools,
         request.tool_choice.as_ref(),
         tok.renderer_capabilities(),
     );
     let tools_for_template = if tools.is_empty() {
         None
     } else {
-        Some(tools.as_slice())
+        Some(&*tools)
     };
     let (processed, encoding) =
         process_messages_with_encoding(request, tok, tools_for_template).expect("render");

@@ -2394,7 +2394,7 @@ impl StreamingProcessor {
     pub async fn process_messages_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        messages_request: MessagesResponseSpec,
+        mut messages_request: MessagesResponseSpec,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
@@ -2402,11 +2402,10 @@ impl StreamingProcessor {
         source: utils::StreamSource,
     ) -> Response {
         let source = source.with_backend(self.backend_type);
+        // The stream's decoder takes the spec's stop sequences; nothing reads
+        // them from the spec after this.
         let stop_params = (
-            messages_request
-                .stop_sequences
-                .clone()
-                .map(StringOrArray::Array),
+            messages_request.stop_sequences.take(),
             None::<Vec<u32>>, // No stop_token_ids in Messages API
             skip_special_tokens,
             false, // no_stop_trim

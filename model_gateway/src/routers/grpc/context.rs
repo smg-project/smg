@@ -573,6 +573,10 @@ pub(crate) enum PreparationOutput {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
         tool_constraints: Option<(String, String)>,
+        /// The response spec, built by preparation: the template rendered
+        /// the view of its chat tools that `tool_choice` leaves (see
+        /// `MessagesResponseSpec`).
+        spec: Box<super::spec::MessagesResponseSpec>,
     },
     /// Transcription reuses the chat backend request shape. The chat-shaped
     /// request is synthesized here (inside the pipeline) from the family's
