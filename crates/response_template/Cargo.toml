@@ -8,8 +8,6 @@ repository = "https://github.com/smg-project/smg"
 readme = "README.md"
 keywords = ["llm", "parser", "response-template"]
 categories = ["parsing", "text-processing"]
-# Not published while smg-symphony, which the `symphony` feature depends on, is not.
-publish = false
 
 [dependencies]
 openai-protocol = { workspace = true, optional = true }

@@ -1,6 +1,6 @@
 [package]
 name = "smg-symphony"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 description = "One parser for everything a model says: content, reasoning and tool calls as typed events from one streaming entry point"
 license = "Apache-2.0"
@@ -11,7 +11,6 @@ authors = [
 ]
 keywords = ["llm", "parser", "tool-calling", "reasoning", "streaming"]
 categories = ["parsing", "text-processing"]
-publish = false
 
 [lib]
 name = "symphony"

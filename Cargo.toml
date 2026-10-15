@@ -14,7 +14,7 @@ smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
 reasoning-parser = { version = "1.10.0", path = "crates/reasoning_parser" }
 smg-response-template = { version = "0.1.0", path = "crates/response_template" }
 tool-parser = { version = "1.10.0", path = "crates/tool_parser" }
-smg-symphony = { version = "0.0.1", path = "crates/symphony" }
+smg-symphony = { version = "0.1.0", path = "crates/symphony" }
 wfaas = { version = "1.1.0", path = "crates/workflow" }
 llm-tokenizer = { version = "1.10.0", path = "crates/tokenizer" }
 smg-auth = { version = "1.2.4", path = "crates/auth" }

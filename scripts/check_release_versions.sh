@@ -63,6 +63,8 @@ CRATES=(
     "engine-zmq-client|crates/engine_zmq_client|engine-zmq-client"
     "reasoning-parser|crates/reasoning_parser|reasoning-parser"
     "tool-parser|crates/tool_parser|tool-parser"
+    "smg-symphony|crates/symphony|smg-symphony"
+    "smg-response-template|crates/response_template|smg-response-template"
     "wfaas|crates/workflow|wfaas"
     "llm-tokenizer|crates/tokenizer|llm-tokenizer"
     "smg-auth|crates/auth|smg-auth"
