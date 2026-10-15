@@ -2775,7 +2775,7 @@ async fn server_info_advertises_the_engines_item_limits() {
 async fn server_info_advertises_where_the_engine_starts_a_grammar() {
     let mut model = model_info();
     model.engine_reasoning_parser = "glm45".to_string();
-    model.structured_outputs_start = "after_reasoning".to_string();
+    model.constrained_decoding_start = "after_reasoning".to_string();
     let mut h = harness_with(model, None, None).await;
     let info = h
         .client
@@ -2784,7 +2784,7 @@ async fn server_info_advertises_where_the_engine_starts_a_grammar() {
         .unwrap()
         .into_inner();
     assert_eq!(info.engine_reasoning_parser, "glm45");
-    assert_eq!(info.structured_outputs_start, "after_reasoning");
+    assert_eq!(info.constrained_decoding_start, "after_reasoning");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
     let mut h = harness_with(model_info(), None, None).await;
@@ -2795,7 +2795,7 @@ async fn server_info_advertises_where_the_engine_starts_a_grammar() {
         .unwrap()
         .into_inner();
     assert_eq!(info.engine_reasoning_parser, "");
-    assert_eq!(info.structured_outputs_start, "");
+    assert_eq!(info.constrained_decoding_start, "");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

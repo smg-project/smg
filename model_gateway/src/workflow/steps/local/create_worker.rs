@@ -1727,7 +1727,7 @@ mod tests {
             let info = ServerInfo::Vllm(Box::new(
                 smg_grpc_client::vllm_proto::GetServerInfoResponse {
                     engine_reasoning_parser: name.to_string(),
-                    structured_outputs_start: "after_reasoning".to_string(),
+                    constrained_decoding_start: "after_reasoning".to_string(),
                     ..Default::default()
                 },
             ));

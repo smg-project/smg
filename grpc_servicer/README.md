@@ -276,7 +276,7 @@ structured request either way, as it does behind vLLM's own frontend.
 Both vLLM servicers also advertise the engine's reasoning parser
 (`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
 a router reads off a worker's labels) and where its grammar starts on a prompt
-that ends inside the model's thinking block (`structured_outputs_start`): `after_reasoning` when
+that ends inside the model's thinking block (`constrained_decoding_start`): `after_reasoning` when
 a reasoning parser is set and `enable_in_reasoning` is off, since vLLM then
 holds a request's grammar back until the parser has seen the thought's end,
 `first_token` otherwise. A router shapes a forced tool call's grammar by it as
@@ -386,7 +386,7 @@ Both TokenSpeed servicers advertise, as `server_args` keys, the engine's
 reasoning parser (`engine_reasoning_parser`; `reasoning_parser` is the
 per-model parser override a router reads off a worker's labels) and where its
 grammar starts on a prompt that ends inside the model's thinking block
-(`structured_outputs_start`): always `first_token`, since this engine's grammar
+(`constrained_decoding_start`): always `first_token`, since this engine's grammar
 manager has no reasoning gate and starts every grammar at the first generated
 token (`--reasoning-parser` only has a JSON-schema constraint rewritten into a
 structural tag that lets the thought precede the JSON). A router shapes a
@@ -443,7 +443,7 @@ label is absent.
 They also advertise, as `server_args` keys, the engine's reasoning parser
 (`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
 a router reads off a worker's labels) and where its grammar starts on a prompt
-that ends inside the model's thinking block (`structured_outputs_start`):
+that ends inside the model's thinking block (`constrained_decoding_start`):
 `after_reasoning` with `--reasoning-parser`, since the scheduler then wraps its
 grammar backend in a reasoner that holds a request's grammar back until the
 parser's thought-end sequence has been generated (for a request that asks for

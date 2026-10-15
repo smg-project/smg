@@ -34,6 +34,10 @@ import threading
 from collections.abc import Mapping
 from typing import Any
 
+from smg_grpc_servicer.constrained_decoding import (
+    grammar_start_labels,
+    sglang_constrained_decoding_start,
+)
 from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 
@@ -57,10 +61,6 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     servicer_switch,
 )
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
-from smg_grpc_servicer.structured_outputs import (
-    grammar_start_labels,
-    sglang_structured_outputs_start,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +202,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     # The engine's reasoning parser and where it starts a grammar on a thinking
     # prompt, as the Python servicer adds them.
     args_dict.update(
-        grammar_start_labels(server_args, sglang_structured_outputs_start(server_args))
+        grammar_start_labels(server_args, sglang_constrained_decoding_start(server_args))
     )
     try:
         from sglang.version import __version__ as sglang_version

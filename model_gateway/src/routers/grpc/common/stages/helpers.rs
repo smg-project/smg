@@ -1601,8 +1601,8 @@ mod tool_constraint_restamp_tests {
         let factory = ToolParserFactory::new();
         let unshaped = forced_call_on_a_thinking_prompt(&factory);
         assert_eq!(shape_of(&unshaped.1), PREFIX_THEN_CALLS);
-        let after_reasoning = worker(&[("structured_outputs_start", "after_reasoning")]);
-        let first_token = worker(&[("structured_outputs_start", "first_token")]);
+        let after_reasoning = worker(&[("constrained_decoding_start", "after_reasoning")]);
+        let first_token = worker(&[("constrained_decoding_start", "first_token")]);
         let silent = worker(&[]);
 
         let (_, built_tag) = utils::tool_constraints_for_worker(

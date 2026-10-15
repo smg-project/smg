@@ -178,7 +178,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         mm_item_limits: model.mm_item_limits.clone(),
         max_num_seqs: max_num_seqs(state),
         engine_reasoning_parser: model.engine_reasoning_parser.clone(),
-        structured_outputs_start: model.structured_outputs_start.clone(),
+        constrained_decoding_start: model.constrained_decoding_start.clone(),
         ..Default::default()
     }
 }

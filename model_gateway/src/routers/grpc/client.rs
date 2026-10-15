@@ -965,7 +965,7 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // a forced tool call's grammar (`utils::tool_constraints_for_worker`); the
     // servicer writes both.
     "engine_reasoning_parser",
-    "structured_outputs_start",
+    "constrained_decoding_start",
     // A servicer's own vision verdict. `GetModelInfo.supports_vision` is a
     // proto3 bool, so a `false` there cannot be told from a field the servicer
     // never set and is dropped for this runtime (`ModelInfo::to_labels`); a
@@ -1014,7 +1014,7 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     // The engine's reasoning parser and where it starts a request's grammar
     // on a thinking prompt, as for SGLang above; the servicer writes both.
     "engine_reasoning_parser",
-    "structured_outputs_start",
+    "constrained_decoding_start",
     // RL control plane (crates/rl): where the engine's SGLang-compatible
     // control app listens and what it implements. The engine advertises
     // these; SMG's discovery turns them into the labels the RL crate reads.
@@ -1121,7 +1121,7 @@ mod tests {
     }
 
     /// A servicer's reasoning-parser facts flatten into the
-    /// `engine_reasoning_parser` and `structured_outputs_start` labels the
+    /// `engine_reasoning_parser` and `constrained_decoding_start` labels the
     /// forced tool-call grammar is shaped by, and never into
     /// `reasoning_parser`, the per-model parser override registration
     /// validates against the router's own registry; an engine whose servicer
@@ -1130,7 +1130,7 @@ mod tests {
     fn server_info_to_labels_carries_where_the_engine_starts_a_grammar() {
         let info = ServerInfo::Vllm(Box::new(vllm_proto::GetServerInfoResponse {
             engine_reasoning_parser: "glm45".to_string(),
-            structured_outputs_start: "after_reasoning".to_string(),
+            constrained_decoding_start: "after_reasoning".to_string(),
             ..Default::default()
         }));
         let labels = info.to_labels();
@@ -1139,13 +1139,13 @@ mod tests {
             Some("glm45")
         );
         assert_eq!(
-            labels.get("structured_outputs_start").map(String::as_str),
+            labels.get("constrained_decoding_start").map(String::as_str),
             Some("after_reasoning")
         );
         assert!(!labels.contains_key("reasoning_parser"));
         let silent = ServerInfo::Vllm(Box::default()).to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
-        assert!(!silent.contains_key("structured_outputs_start"));
+        assert!(!silent.contains_key("constrained_decoding_start"));
     }
 
     /// An SGLang servicer's own vision verdict travels in `server_args`,
@@ -1436,7 +1436,7 @@ mod tests {
     }
 
     /// The TokenSpeed servicer's grammar-start facts ride with the server args
-    /// and become the `engine_reasoning_parser` and `structured_outputs_start`
+    /// and become the `engine_reasoning_parser` and `constrained_decoding_start`
     /// labels, as for SGLang; the engine's own `reasoning_parser` argument is
     /// not the router's parser override and stays out.
     #[test]
@@ -1450,7 +1450,7 @@ mod tests {
                         string_value("kimi_k25"),
                     ),
                     (
-                        "structured_outputs_start".to_string(),
+                        "constrained_decoding_start".to_string(),
                         string_value("first_token"),
                     ),
                 ]),
@@ -1465,7 +1465,7 @@ mod tests {
             Some("kimi_k25")
         );
         assert_eq!(
-            labels.get("structured_outputs_start").map(String::as_str),
+            labels.get("constrained_decoding_start").map(String::as_str),
             Some("first_token")
         );
         assert!(!labels.contains_key("reasoning_parser"));
@@ -1483,7 +1483,7 @@ mod tests {
         }))
         .to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
-        assert!(!silent.contains_key("structured_outputs_start"));
+        assert!(!silent.contains_key("constrained_decoding_start"));
         assert!(!silent.contains_key("reasoning_parser"));
     }
 
@@ -1573,7 +1573,7 @@ mod tests {
     }
 
     /// The servicer's grammar-start facts ride with the server args and become
-    /// the `engine_reasoning_parser` and `structured_outputs_start` labels. The
+    /// the `engine_reasoning_parser` and `constrained_decoding_start` labels. The
     /// engine's own `reasoning_parser` argument, which the server args carry
     /// as well, is not the router's parser override and stays out.
     #[test]
@@ -1584,7 +1584,7 @@ mod tests {
                     ("reasoning_parser".to_string(), string_value("qwen3")),
                     ("engine_reasoning_parser".to_string(), string_value("qwen3")),
                     (
-                        "structured_outputs_start".to_string(),
+                        "constrained_decoding_start".to_string(),
                         string_value("after_reasoning"),
                     ),
                 ]),
@@ -1599,7 +1599,7 @@ mod tests {
             Some("qwen3")
         );
         assert_eq!(
-            labels.get("structured_outputs_start").map(String::as_str),
+            labels.get("constrained_decoding_start").map(String::as_str),
             Some("after_reasoning")
         );
         assert!(
@@ -1617,7 +1617,7 @@ mod tests {
         }))
         .to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
-        assert!(!silent.contains_key("structured_outputs_start"));
+        assert!(!silent.contains_key("constrained_decoding_start"));
         assert!(!silent.contains_key("reasoning_parser"));
     }
 

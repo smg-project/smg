@@ -147,7 +147,7 @@ pub(crate) async fn build_chat_backed_plan(
     // Now that the worker is known, a forced call's grammar takes the shape
     // its engine needs: the bare calls behind a reasoning parser's gate, the
     // thought and then the calls from the first token (the worker's
-    // `structured_outputs_start` label; see `utils::tool_constraints_for_worker`).
+    // `constrained_decoding_start` label; see `utils::tool_constraints_for_worker`).
     // The unshaped constraint stays on the attempt stamp: a retry gives the
     // worker it selects the same shaping (`helpers::ToolConstraintStamp`).
     let tool_parser = ctx

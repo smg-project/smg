@@ -35,7 +35,7 @@ type ReasoningPrefixFn = fn(GrammarStart) -> Option<serde_json::Value>;
 
 /// Where the engine that runs a forced call's grammar starts applying it on a
 /// prompt that ends inside the model's thinking block, as its worker
-/// advertises it (the `structured_outputs_start` label).
+/// advertises it (the `constrained_decoding_start` label).
 ///
 /// An engine's own server picks the grammar's shape from this: it sends
 /// xgrammar's reasoning-aware tags (the thought, its close, then the calls)
@@ -63,13 +63,13 @@ pub enum GrammarStart {
 
 impl GrammarStart {
     /// The worker label that carries it.
-    pub const LABEL: &'static str = "structured_outputs_start";
+    pub const LABEL: &'static str = "constrained_decoding_start";
     /// The label's value for [`Self::AfterReasoning`].
     pub const AFTER_REASONING: &'static str = "after_reasoning";
     /// The label's value for [`Self::FirstToken`].
     pub const FIRST_TOKEN: &'static str = "first_token";
 
-    /// The start a worker's `structured_outputs_start` label names; anything
+    /// The start a worker's `constrained_decoding_start` label names; anything
     /// else, the label's absence included, is [`Self::Unknown`].
     pub fn from_label(value: Option<&str>) -> Self {
         match value {

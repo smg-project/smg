@@ -58,8 +58,8 @@ from smg_grpc_servicer.tokenspeed.loads import (
 )
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
+from ..constrained_decoding import grammar_start_labels, tokenspeed_constrained_decoding_start
 from ..pd_pairing import pairing_protocol_from_env
-from ..structured_outputs import grammar_start_labels, tokenspeed_structured_outputs_start
 
 if TYPE_CHECKING:
     # Type-only — keeps these out of the cold-path graph when the servicer is
@@ -631,7 +631,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # in front of a grammar), for the gateway to shape a forced tool
         # call's grammar by.
         server_args_dict.update(
-            grammar_start_labels(self.server_args, tokenspeed_structured_outputs_start())
+            grammar_start_labels(self.server_args, tokenspeed_constrained_decoding_start())
         )
 
         # Control endpoint and capabilities for a fronting gateway (SMG reads

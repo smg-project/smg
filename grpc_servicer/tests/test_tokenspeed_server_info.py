@@ -73,13 +73,13 @@ def test_server_info_carries_where_the_engine_starts_a_grammar(servicer_mod, mon
     # without a reasoning parser, so the Router sends the thought and then the
     # calls; the parser rides along under its own name.
     gated = _server_info(servicer_mod, monkeypatch, reasoning_parser="kimi_k25").server_args
-    assert gated["structured_outputs_start"] == "first_token"
+    assert gated["constrained_decoding_start"] == "first_token"
     assert gated["engine_reasoning_parser"] == "kimi_k25"
     # The engine's own argument keeps its name; it is not the Router's parser
     # override, which the Router reads under `reasoning_parser` from labels.
     assert gated["reasoning_parser"] == "kimi_k25"
 
     plain = _server_info(servicer_mod, monkeypatch, reasoning_parser=None).server_args
-    assert plain["structured_outputs_start"] == "first_token"
+    assert plain["constrained_decoding_start"] == "first_token"
     assert "engine_reasoning_parser" not in plain
     assert plain["model"] == "m", "the other server args are reported as before"

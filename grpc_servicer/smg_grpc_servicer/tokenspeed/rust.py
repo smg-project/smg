@@ -34,6 +34,10 @@ import threading
 from collections.abc import Mapping
 from typing import Any
 
+from smg_grpc_servicer.constrained_decoding import (
+    grammar_start_labels,
+    tokenspeed_constrained_decoding_start,
+)
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 
 # The lifecycle's defaults and the switch's choices, re-exported: this
@@ -54,10 +58,6 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
     wait_for_ready_reports,
-)
-from smg_grpc_servicer.structured_outputs import (
-    grammar_start_labels,
-    tokenspeed_structured_outputs_start,
 )
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
@@ -198,7 +198,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         args_dict["pairing_protocol"] = pairing_protocol
     # The engine's reasoning parser and where it starts a grammar on a thinking
     # prompt, as the Python servicer adds them.
-    args_dict.update(grammar_start_labels(server_args, tokenspeed_structured_outputs_start()))
+    args_dict.update(grammar_start_labels(server_args, tokenspeed_constrained_decoding_start()))
     kv_events = resolve_kv_events_config(server_args)
     try:
         from tokenspeed.version import __version__ as tokenspeed_version

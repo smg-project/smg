@@ -363,13 +363,13 @@ def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
         rust.server_facts(_ReasoningServerArgs(reasoning_parser="kimi_k25"))["server_args_json"]
     )
     assert gated["engine_reasoning_parser"] == "kimi_k25"
-    assert gated["structured_outputs_start"] == "first_token"
+    assert gated["constrained_decoding_start"] == "first_token"
     # The engine's own argument stays under its own name; the Router's label
     # readers never take it as the per-model parser override.
     assert gated["reasoning_parser"] == "kimi_k25"
 
     plain = json.loads(rust.server_facts(_ReasoningServerArgs())["server_args_json"])
-    assert plain["structured_outputs_start"] == "first_token"
+    assert plain["constrained_decoding_start"] == "first_token"
     assert "engine_reasoning_parser" not in plain
 
 

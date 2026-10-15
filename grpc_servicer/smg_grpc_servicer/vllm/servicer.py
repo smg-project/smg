@@ -69,13 +69,13 @@ from smg_grpc_servicer.vllm.mm_salt import (
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
+    constrained_decoding_start,
     engine_reasoning_parser,
     mm_device_do_normalize,
     mm_item_limits,
     model_facts,
     running_window,
     server_facts,
-    structured_outputs_start,
 )
 
 from .mm_keys import (
@@ -762,9 +762,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt, for the Router to shape a forced tool call's
         # grammar by; likewise absent from an older package.
-        if "structured_outputs_start" in info.DESCRIPTOR.fields_by_name:
+        if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
-            info.structured_outputs_start = structured_outputs_start(self.engine.vllm_config)
+            info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
         return info
 
     async def GetLoads(

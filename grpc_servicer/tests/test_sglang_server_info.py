@@ -249,16 +249,16 @@ def test_server_info_carries_where_the_engine_starts_a_grammar(servicer_mod, mon
     gated = _server_info(servicer_mod, _ServerArgs(reasoning_parser="qwen3")).server_args
     # Behind --reasoning-parser the engine holds a request's grammar back until
     # the thought's end, so the Router sends the bare calls.
-    assert gated["structured_outputs_start"] == "after_reasoning"
+    assert gated["constrained_decoding_start"] == "after_reasoning"
     assert gated["engine_reasoning_parser"] == "qwen3"
     # The engine's own argument keeps its name; it is not the Router's parser
     # override, which the Router reads under `reasoning_parser` from labels.
     assert gated["reasoning_parser"] == "qwen3"
 
     plain = _server_info(servicer_mod, _ServerArgs(reasoning_parser=None)).server_args
-    assert plain["structured_outputs_start"] == "first_token"
+    assert plain["constrained_decoding_start"] == "first_token"
     assert "engine_reasoning_parser" not in plain
 
     older = _server_info(servicer_mod, _OlderServerArgs()).server_args
-    assert "structured_outputs_start" not in older and "engine_reasoning_parser" not in older
+    assert "constrained_decoding_start" not in older and "engine_reasoning_parser" not in older
     assert older["model_path"] == "org/model", "the other server args are reported as before"

@@ -1,4 +1,4 @@
-"""The ``structured_outputs_start`` and ``engine_reasoning_parser`` labels: where
+"""The ``constrained_decoding_start`` and ``engine_reasoning_parser`` labels: where
 an engine starts applying a request's grammar on a prompt that ends inside the
 model's thinking block, and the reasoning parser it runs, advertised through
 ``GetServerInfo`` for the Router to shape a forced tool call's grammar by. An
@@ -26,11 +26,11 @@ from typing import Any
 # a worker's labels and validates against its own registry at registration, and
 # the engines' parser names are the engines'.
 ENGINE_REASONING_PARSER_KEY = "engine_reasoning_parser"
-STRUCTURED_OUTPUTS_START_KEY = "structured_outputs_start"
+CONSTRAINED_DECODING_START_KEY = "constrained_decoding_start"
 
 # The label's values.
-STRUCTURED_OUTPUTS_AFTER_REASONING = "after_reasoning"
-STRUCTURED_OUTPUTS_FIRST_TOKEN = "first_token"
+CONSTRAINED_DECODING_AFTER_REASONING = "after_reasoning"
+CONSTRAINED_DECODING_FIRST_TOKEN = "first_token"
 
 # A server-args attribute that is not there at all, as opposed to one set to
 # None or "".
@@ -61,7 +61,7 @@ def engine_reasoning_parser(server_args: Any) -> str:
     return str(parser or "")
 
 
-def sglang_structured_outputs_start(server_args: Any) -> str:
+def sglang_constrained_decoding_start(server_args: Any) -> str:
     """Where SGLang starts a request's grammar on a thinking prompt. With
     ``--reasoning-parser`` the scheduler wraps its grammar backend in a reasoner
     that defers the grammar until the parser's thought-end sequence has been
@@ -76,11 +76,11 @@ def sglang_structured_outputs_start(server_args: Any) -> str:
     if parser is _UNKNOWN or parser == "auto":
         return ""
     if parser:
-        return STRUCTURED_OUTPUTS_AFTER_REASONING
-    return STRUCTURED_OUTPUTS_FIRST_TOKEN
+        return CONSTRAINED_DECODING_AFTER_REASONING
+    return CONSTRAINED_DECODING_FIRST_TOKEN
 
 
-def tokenspeed_structured_outputs_start() -> str:
+def tokenspeed_constrained_decoding_start() -> str:
     """Where TokenSpeed starts a request's grammar on a thinking prompt: from
     the first generated token, whatever the reasoning parser. Its grammar
     manager takes no reasoning flag and its backends start every compiled
@@ -89,7 +89,7 @@ def tokenspeed_structured_outputs_start() -> str:
     into a structural tag that lets the thought precede the JSON, which is
     still a grammar from the first token, and a structural tag from the Router
     is taken as it is. So: ``first_token``."""
-    return STRUCTURED_OUTPUTS_FIRST_TOKEN
+    return CONSTRAINED_DECODING_FIRST_TOKEN
 
 
 def grammar_start_labels(server_args: Any, start: str) -> dict[str, str]:
@@ -101,5 +101,5 @@ def grammar_start_labels(server_args: Any, start: str) -> dict[str, str]:
     if parser:
         labels[ENGINE_REASONING_PARSER_KEY] = parser
     if start:
-        labels[STRUCTURED_OUTPUTS_START_KEY] = start
+        labels[CONSTRAINED_DECODING_START_KEY] = start
     return labels

@@ -51,7 +51,7 @@ fn model_info() -> SglangModelInfo {
         pad_token_id: 0,
         bos_token_id: 1,
         default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
-        server_args_json: r#"{"model_path":"org/model","tp_size":2,"dp_size":1,"context_length":4096,"pairing_protocol":"p1","engine_reasoning_parser":"qwen3","structured_outputs_start":"after_reasoning"}"#.to_string(),
+        server_args_json: r#"{"model_path":"org/model","tp_size":2,"dp_size":1,"context_length":4096,"pairing_protocol":"p1","engine_reasoning_parser":"qwen3","constrained_decoding_start":"after_reasoning"}"#.to_string(),
         scheduler_info_json: r#"{"is_generation":true}"#.to_string(),
         sglang_version: "0.5.20".to_string(),
         max_running_requests: 64,
@@ -965,7 +965,7 @@ async fn info_rpcs_report_launcher_facts_and_handshake_figures() {
         Some(Kind::StringValue("qwen3".to_string()))
     );
     assert_eq!(
-        args.fields["structured_outputs_start"].kind,
+        args.fields["constrained_decoding_start"].kind,
         Some(Kind::StringValue("after_reasoning".to_string()))
     );
     let scheduler_info = server.scheduler_info.expect("scheduler_info");

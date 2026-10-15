@@ -327,17 +327,17 @@ def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
         rust.server_facts(_server_args(reasoning_parser="qwen3"))["server_args_json"]
     )
     assert gated["engine_reasoning_parser"] == "qwen3"
-    assert gated["structured_outputs_start"] == "after_reasoning"
+    assert gated["constrained_decoding_start"] == "after_reasoning"
     # The engine's own argument stays under its own name; the Router's label
     # readers never take it as the per-model parser override.
     assert gated["reasoning_parser"] == "qwen3"
 
     plain = json.loads(rust.server_facts(_server_args(reasoning_parser=None))["server_args_json"])
-    assert plain["structured_outputs_start"] == "first_token"
+    assert plain["constrained_decoding_start"] == "first_token"
     assert "engine_reasoning_parser" not in plain
 
     older = json.loads(rust.server_facts(_server_args())["server_args_json"])
-    assert "structured_outputs_start" not in older and "engine_reasoning_parser" not in older
+    assert "constrained_decoding_start" not in older and "engine_reasoning_parser" not in older
 
 
 def test_server_facts_carry_the_kv_events_publisher(monkeypatch):

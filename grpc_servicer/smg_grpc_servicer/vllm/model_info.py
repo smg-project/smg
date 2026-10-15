@@ -19,11 +19,11 @@ import logging
 from typing import Any
 
 from smg_grpc_servicer import mm_shm
-from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
-from smg_grpc_servicer.structured_outputs import (
-    STRUCTURED_OUTPUTS_AFTER_REASONING,
-    STRUCTURED_OUTPUTS_FIRST_TOKEN,
+from smg_grpc_servicer.constrained_decoding import (
+    CONSTRAINED_DECODING_AFTER_REASONING,
+    CONSTRAINED_DECODING_FIRST_TOKEN,
 )
+from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 from smg_grpc_servicer.vllm.config_view import EngineConfigView, ModelSection, token_ids
 from smg_grpc_servicer.vllm.config_view import hf_eos_token_ids as _hf_eos_token_ids
 from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
@@ -163,13 +163,13 @@ def engine_reasoning_parser(vllm_config: Any) -> str:
     return EngineConfigView(vllm_config).structured_outputs.reasoning_parser
 
 
-# The `structured_outputs_start` label's values (where the engine starts a
+# The `constrained_decoding_start` label's values (where the engine starts a
 # request's grammar on a prompt that ends inside the model's thinking block)
-# are `smg_grpc_servicer.structured_outputs`', shared with the servicers of
+# are `smg_grpc_servicer.constrained_decoding`', shared with the servicers of
 # the engines that carry them as server args.
-def structured_outputs_start(vllm_config: Any) -> str:
+def constrained_decoding_start(vllm_config: Any) -> str:
     """Where the engine starts a request's grammar on a thinking prompt, as the
-    ``structured_outputs_start`` label the Router shapes a forced tool call's
+    ``constrained_decoding_start`` label the Router shapes a forced tool call's
     grammar by. vLLM's structured-output manager holds a grammar back until
     its reasoning parser has seen the thought's end when a reasoning parser is
     set and ``enable_in_reasoning`` is off (``after_reasoning``); otherwise the
@@ -182,8 +182,8 @@ def structured_outputs_start(vllm_config: Any) -> str:
         # No section, or one that predates the reasoning parser: unknown.
         return ""
     if structured.reasoning_parser and not structured.enable_in_reasoning:
-        return STRUCTURED_OUTPUTS_AFTER_REASONING
-    return STRUCTURED_OUTPUTS_FIRST_TOKEN
+        return CONSTRAINED_DECODING_AFTER_REASONING
+    return CONSTRAINED_DECODING_FIRST_TOKEN
 
 
 def server_facts(vllm_config: Any) -> dict[str, Any]:

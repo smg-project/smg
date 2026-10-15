@@ -53,7 +53,7 @@ fn model_info() -> TokenSpeedModelInfo {
         bos_token_id: 1,
         default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
         server_args_json:
-            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","structured_outputs_start":"first_token"}"#
+            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","constrained_decoding_start":"first_token"}"#
                 .to_string(),
         scheduler_info_json: r#"{"shm_namespace_id":"boot:1"}"#.to_string(),
         tokenspeed_version: "0.1.0.post20261003".to_string(),
@@ -896,7 +896,7 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         Some(Kind::StringValue("kimi_k25".to_string()))
     );
     assert_eq!(
-        server_args.fields["structured_outputs_start"].kind,
+        server_args.fields["constrained_decoding_start"].kind,
         Some(Kind::StringValue("first_token".to_string()))
     );
     let scheduler_info = info.scheduler_info.expect("scheduler_info");

@@ -481,11 +481,11 @@ message GetServerInfoResponse {
   // reasoning parser has seen the thought's end (a reasoning parser is set and
   // `enable_in_reasoning` is off), "first_token" when the grammar runs from the
   // first generated token; "" when the engine's config does not say.
-  // Flattened into the `structured_outputs_start` worker label, which shapes
+  // Flattened into the `constrained_decoding_start` worker label, which shapes
   // the router's forced tool-call grammar: the bare calls behind a reasoning
   // parser's gate (the call is forced right there, as the engine's own server
   // does), the thought and then the calls from the first token.
-  string structured_outputs_start = 24;
+  string constrained_decoding_start = 24;
 }
 
 // =====================

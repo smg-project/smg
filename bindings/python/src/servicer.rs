@@ -619,7 +619,7 @@ impl PyVllmGrpcServer {
         mm_item_limits = String::new(),
         max_num_seqs = 0,
         engine_reasoning_parser = String::new(),
-        structured_outputs_start = String::new(),
+        constrained_decoding_start = String::new(),
         log_stats = None,
         media_processor = None,
         smg_media_processor = None,
@@ -667,7 +667,7 @@ impl PyVllmGrpcServer {
         mm_item_limits: String,
         max_num_seqs: i32,
         engine_reasoning_parser: String,
-        structured_outputs_start: String,
+        constrained_decoding_start: String,
         log_stats: Option<bool>,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
@@ -722,7 +722,7 @@ impl PyVllmGrpcServer {
             mm_item_limits,
             max_num_seqs,
             engine_reasoning_parser,
-            structured_outputs_start,
+            constrained_decoding_start,
             log_stats,
         };
         let mut config = VllmServicerConfig {

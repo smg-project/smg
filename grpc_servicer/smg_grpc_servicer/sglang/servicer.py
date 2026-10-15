@@ -67,9 +67,9 @@ from smg_grpc_servicer.sglang.utils import (
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
 
+from ..constrained_decoding import grammar_start_labels, sglang_constrained_decoding_start
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
-from ..structured_outputs import grammar_start_labels, sglang_structured_outputs_start
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
@@ -550,7 +550,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # grammar by.
         serializable_args.update(
             grammar_start_labels(
-                self.server_args, sglang_structured_outputs_start(self.server_args)
+                self.server_args, sglang_constrained_decoding_start(self.server_args)
             )
         )
         # The gateway reads this worker's running window (its PD admission

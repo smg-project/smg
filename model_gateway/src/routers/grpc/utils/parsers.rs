@@ -369,7 +369,7 @@ pub fn messages_reasoning_starts_in_prefill(
 
 /// Where the selected worker's engine starts a request's grammar on a prompt
 /// that ends inside the model's thinking block, from its
-/// `structured_outputs_start` label (the servicers advertise it off the
+/// `constrained_decoding_start` label (the servicers advertise it off the
 /// engine's config); under PD the decode worker's, whose engine generates the
 /// tokens the grammar constrains. Unknown without a selection or a label.
 pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
@@ -651,7 +651,7 @@ mod tests {
         }
     }
 
-    /// The worker's `structured_outputs_start` label names where its engine
+    /// The worker's `constrained_decoding_start` label names where its engine
     /// starts the grammar; no selection, no label or another value is unknown.
     #[test]
     fn grammar_start_comes_from_the_workers_label() {
@@ -659,20 +659,20 @@ mod tests {
         assert_eq!(grammar_start_for(Some(&worker(&[]))), GrammarStart::Unknown);
         assert_eq!(
             grammar_start_for(Some(&worker(&[(
-                "structured_outputs_start",
+                "constrained_decoding_start",
                 "after_reasoning"
             )]))),
             GrammarStart::AfterReasoning
         );
         assert_eq!(
             grammar_start_for(Some(&worker(&[(
-                "structured_outputs_start",
+                "constrained_decoding_start",
                 "first_token"
             )]))),
             GrammarStart::FirstToken
         );
         assert_eq!(
-            grammar_start_for(Some(&worker(&[("structured_outputs_start", "later")]))),
+            grammar_start_for(Some(&worker(&[("constrained_decoding_start", "later")]))),
             GrammarStart::Unknown
         );
     }
@@ -701,13 +701,13 @@ mod tests {
             assert_eq!(kind, "structural_tag");
             serde_json::from_str(&value).unwrap()
         };
-        let deferred = shape(&[("structured_outputs_start", "after_reasoning")]);
+        let deferred = shape(&[("constrained_decoding_start", "after_reasoning")]);
         assert_eq!(
             deferred["format"]["type"], "triggered_tags",
             "nothing precedes the calls: {deferred}"
         );
         assert_eq!(deferred["format"]["at_least_one"], true);
-        let first_token = shape(&[("structured_outputs_start", "first_token")]);
+        let first_token = shape(&[("constrained_decoding_start", "first_token")]);
         assert_eq!(first_token["format"]["type"], "sequence");
         assert_eq!(first_token["format"]["elements"][0]["type"], "tag");
         assert_eq!(first_token["format"]["elements"][0]["end"], "</think>");
@@ -732,7 +732,10 @@ mod tests {
                 &factory,
                 parser,
                 Some(schema.clone()),
-                Some(&worker(&[("structured_outputs_start", "after_reasoning")]))
+                Some(&worker(&[(
+                    "constrained_decoding_start",
+                    "after_reasoning"
+                )]))
             )
             .unwrap(),
             Some(schema)

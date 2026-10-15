@@ -564,7 +564,7 @@ def test_model_info_carries_where_the_engine_starts_a_grammar():
     # config without the structured-outputs section advertises neither.
     info = rust.model_info_from_config(_config())
     assert info["engine_reasoning_parser"] == ""
-    assert info["structured_outputs_start"] == ""
+    assert info["constrained_decoding_start"] == ""
     config = _config()
     config.structured_outputs_config = SimpleNamespace(
         backend="xgrammar", reasoning_parser="glm45", enable_in_reasoning=False
@@ -572,11 +572,11 @@ def test_model_info_carries_where_the_engine_starts_a_grammar():
     info = rust.model_info_from_config(config)
     assert info["structured_outputs_backend"] == "xgrammar"
     assert info["engine_reasoning_parser"] == "glm45"
-    assert info["structured_outputs_start"] == "after_reasoning"
+    assert info["constrained_decoding_start"] == "after_reasoning"
     config.structured_outputs_config = SimpleNamespace(backend="auto", reasoning_parser="")
     info = rust.model_info_from_config(config)
     assert info["engine_reasoning_parser"] == ""
-    assert info["structured_outputs_start"] == "first_token"
+    assert info["constrained_decoding_start"] == "first_token"
 
 
 def test_model_info_carries_the_stats_flag():
