@@ -343,7 +343,8 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(ChatChoice, u32), String> {
         let tools = original_request.tools.as_deref().unwrap_or(&[]);
-        let mut reader = Reader::new(assignment, tools)?;
+        let mut reader =
+            Reader::new(assignment, tools)?.first_call_only(original_request.first_tool_call_only);
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
         // Complete token decoding, including bytes and a partial stop match, as
         // on the older path; the text it releases is the last token's.
@@ -414,7 +415,8 @@ impl ResponseProcessor {
         request: &MessagesResponseSpec,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, String> {
-        let mut reader = Reader::new(assignment, &request.chat_tools)?;
+        let mut reader = Reader::new(assignment, &request.chat_tools)?
+            .first_call_only(request.first_tool_call_only);
         stop_decoder.reset();
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
         let tail = stop_decoder

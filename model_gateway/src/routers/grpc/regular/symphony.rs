@@ -550,6 +550,8 @@ pub(crate) struct Reader {
     /// The bytes of the output read so far.
     read: usize,
     ended: bool,
+    /// Drop the events of every call after the first.
+    first_call_only: bool,
 }
 
 impl Reader {
@@ -562,12 +564,42 @@ impl Reader {
             ends: Vec::new(),
             read: 0,
             ended: false,
+            first_call_only: false,
         };
         reader.feed(Input::Prompt {
             token_ids: &[],
             text: &assignment.prompt,
         })?;
         Ok(reader)
+    }
+
+    /// Under `parallel_tool_calls: false` or `disable_parallel_tool_use`, the
+    /// events of every call after the first are dropped: the table's grammar
+    /// limits a forced call, the reader limits a free one.
+    pub(crate) fn first_call_only(mut self, on: bool) -> Self {
+        self.first_call_only = on;
+        self
+    }
+
+    fn drained(&mut self) -> Vec<Event> {
+        let mut events = self.events.drain();
+        if self.first_call_only {
+            events.retain(|event| {
+                !matches!(
+                    event,
+                    Event::ToolCallStart { index, .. }
+                        | Event::ToolCallArguments { index, .. }
+                        | Event::ToolCallEnd { index, .. }
+                        if *index > 0
+                )
+            });
+            for event in &mut events {
+                if let Event::Finish { tool_calls, .. } = event {
+                    *tool_calls = (*tool_calls).min(1);
+                }
+            }
+        }
+        events
     }
 
     /// Reads `token_ids` through `decoder` as one delta: the text the decoder releases, with each
@@ -615,7 +647,7 @@ impl Reader {
             text: &text,
             spans: &spans,
         })?;
-        Ok((self.events.drain(), stopped))
+        Ok((self.drained(), stopped))
     }
 
     /// Where each token's text ends in the output read so far, for the logprobs filter the older
@@ -649,7 +681,7 @@ impl Reader {
             text,
             spans: &spans,
         })?;
-        Ok(self.events.drain())
+        Ok(self.drained())
     }
 
     /// Ends the output with the engine's finish, once: the events, the last of them the
@@ -660,7 +692,7 @@ impl Reader {
         }
         self.ended = true;
         self.feed(Input::End { finish })?;
-        Ok(self.events.drain())
+        Ok(self.drained())
     }
 
     /// Whether the output ended.
@@ -1532,6 +1564,35 @@ mod tests {
         let mut events = reader.tail(QWEN3_OUTPUT).expect("read");
         events.extend(reader.end(EngineFinish::Stop).expect("ended"));
         events
+    }
+
+    /// Limited to one call, the reader keeps the first call's events and
+    /// counts one call; unlimited, both calls come through.
+    #[test]
+    fn a_reader_limited_to_one_call_drops_the_calls_after_the_first() {
+        const TWO_CALLS: &str = "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>\
+                                 <tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2}}\n</tool_call>";
+        let assignment = Assignment {
+            format: qwen3(CallSyntax::Json),
+            prompt: "<|im_start|>assistant\n".to_string(),
+        };
+        let calls = |first_only: bool| {
+            let mut reader = Reader::new(&assignment, &tools())
+                .expect("a reader")
+                .first_call_only(first_only);
+            let mut events = reader.tail(TWO_CALLS).expect("read");
+            events.extend(reader.end(EngineFinish::Stop).expect("ended"));
+            let starts = events
+                .iter()
+                .filter(|event| matches!(event, Event::ToolCallStart { .. }))
+                .count();
+            let Some(Event::Finish { tool_calls, .. }) = events.last() else {
+                panic!("no finish event");
+            };
+            (starts, *tool_calls)
+        };
+        assert_eq!(calls(false), (2, 2));
+        assert_eq!(calls(true), (1, 1));
     }
 
     fn content_of(events: &[Event]) -> String {

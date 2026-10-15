@@ -634,10 +634,10 @@ impl StreamingProcessor {
                         Some(assignment) => {
                             let reader = match readers.entry(index) {
                                 Entry::Occupied(reader) => reader.into_mut(),
-                                Entry::Vacant(slot) => slot.insert(Reader::new(
-                                    assignment,
-                                    tools.as_deref().unwrap_or(&[]),
-                                )?),
+                                Entry::Vacant(slot) => slot.insert(
+                                    Reader::new(assignment, tools.as_deref().unwrap_or(&[]))?
+                                        .first_call_only(original_request.first_tool_call_only),
+                                ),
                             };
                             Some(reader.read(stop_decoder, chunk.token_ids())?)
                         }
@@ -2675,7 +2675,10 @@ impl StreamingProcessor {
         let mut symphony = original_request
             .symphony
             .as_ref()
-            .map(|assignment| Reader::new(assignment, chat_tools))
+            .map(|assignment| {
+                Reader::new(assignment, chat_tools)
+                    .map(|reader| reader.first_call_only(original_request.first_tool_call_only))
+            })
             .transpose()?
             .map(|reader| (reader, adapt::messages::Stream::new()));
         let mut symphony_stop: Option<messages::StopReason> = None;
