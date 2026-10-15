@@ -178,6 +178,13 @@ impl CreateMessageRequest {
             None
         }
     }
+
+    /// Whether the request's `tool_choice` turns parallel tool use off.
+    pub fn disables_parallel_tool_use(&self) -> bool {
+        self.tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::disables_parallel_tool_use)
+    }
 }
 
 impl GenerationRequest for CreateMessageRequest {
@@ -919,6 +926,23 @@ pub enum ToolChoice {
     },
     /// The model will not use tools
     None,
+}
+
+impl ToolChoice {
+    /// Whether the choice turns parallel tool use off (`disable_parallel_tool_use: true`).
+    pub fn disables_parallel_tool_use(&self) -> bool {
+        matches!(
+            self,
+            Self::Auto {
+                disable_parallel_tool_use: Some(true)
+            } | Self::Any {
+                disable_parallel_tool_use: Some(true)
+            } | Self::Tool {
+                disable_parallel_tool_use: Some(true),
+                ..
+            }
+        )
+    }
 }
 
 // ============================================================================
@@ -3094,5 +3118,40 @@ mod tests {
             v["data"][1]["display_name"], "m2",
             "the id stands in for a missing name"
         );
+    }
+
+    /// `disable_parallel_tool_use: true` turns parallel use off under
+    /// `auto`, `any` and a named tool; unset, `false`, `none` and no
+    /// `tool_choice` leave it on.
+    #[test]
+    fn a_tool_choice_says_whether_it_disables_parallel_tool_use() {
+        let request = |tool_choice: Value| -> CreateMessageRequest {
+            let mut body = json!({"model": "m", "max_tokens": 8, "messages": []});
+            if !tool_choice.is_null() {
+                body["tool_choice"] = tool_choice;
+            }
+            serde_json::from_value(body).expect("a Messages request")
+        };
+        for choice in [
+            json!({"type": "auto", "disable_parallel_tool_use": true}),
+            json!({"type": "any", "disable_parallel_tool_use": true}),
+            json!({"type": "tool", "name": "lookup", "disable_parallel_tool_use": true}),
+        ] {
+            assert!(
+                request(choice.clone()).disables_parallel_tool_use(),
+                "{choice}"
+            );
+        }
+        for choice in [
+            json!({"type": "any"}),
+            json!({"type": "any", "disable_parallel_tool_use": false}),
+            json!({"type": "none"}),
+            Value::Null,
+        ] {
+            assert!(
+                !request(choice.clone()).disables_parallel_tool_use(),
+                "{choice}"
+            );
+        }
     }
 }

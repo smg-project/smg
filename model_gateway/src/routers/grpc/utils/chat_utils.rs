@@ -946,8 +946,7 @@ pub(crate) fn keep_first_tool_call(calls: &mut Option<Vec<ToolCall>>) {
     }
 }
 
-/// The streamed form of [`keep_first_tool_call`]: keeps the parsed items of
-/// the first call (tool index 0) only.
+/// The streamed form of [`keep_first_tool_call`].
 pub(crate) fn keep_first_tool_call_items(items: &mut Vec<ToolCallItem>) {
     items.retain(|item| item.tool_index == 0);
 }

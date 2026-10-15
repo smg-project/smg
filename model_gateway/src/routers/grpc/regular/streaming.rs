@@ -2038,7 +2038,7 @@ impl StreamingProcessor {
         model: &str,
         history_tool_calls_count: usize,
         use_json_parser: bool,
-        first_call_only: bool,
+        first_tool_call_only: bool,
     ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
@@ -2063,7 +2063,7 @@ impl StreamingProcessor {
                     normal_text,
                     mut calls,
                 }) => {
-                    if first_call_only {
+                    if first_tool_call_only {
                         utils::keep_first_tool_call_items(&mut calls);
                     }
                     // Emit normal text if present

@@ -482,6 +482,11 @@ impl ChatCompletionRequest {
             && matches!(self.messages.last(), Some(ChatMessage::Assistant { .. }))
     }
 
+    /// Whether `parallel_tool_calls: false` asks for one tool call at most.
+    pub fn disables_parallel_tool_calls(&self) -> bool {
+        self.parallel_tool_calls == Some(false)
+    }
+
     /// `thinking.effort` when present, else the top-level `reasoning_effort`.
     pub fn effective_reasoning_effort(&self) -> Option<&str> {
         self.thinking
@@ -1090,6 +1095,22 @@ mod tests {
         thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest, ThinkingParam,
         ThinkingType,
     };
+
+    /// `parallel_tool_calls: false` asks for one call; `true` and absent do not.
+    #[test]
+    fn a_chat_request_says_whether_it_disables_parallel_tool_calls() {
+        let request = |body: Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("a chat request")
+        };
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert!(!request(base.clone()).disables_parallel_tool_calls());
+        let mut on = base.clone();
+        on["parallel_tool_calls"] = json!(true);
+        assert!(!request(on).disables_parallel_tool_calls());
+        let mut off = base;
+        off["parallel_tool_calls"] = json!(false);
+        assert!(request(off).disables_parallel_tool_calls());
+    }
 
     fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
         let mut value = json!({

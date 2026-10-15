@@ -455,24 +455,6 @@ pub(crate) async fn count_input_tokens(
     })
 }
 
-/// Whether `tool_choice` turns parallel tool use off
-/// (`disable_parallel_tool_use: true`).
-pub(crate) fn disables_parallel_tool_use(tool_choice: Option<&messages::ToolChoice>) -> bool {
-    matches!(
-        tool_choice,
-        Some(
-            messages::ToolChoice::Auto {
-                disable_parallel_tool_use: Some(true)
-            } | messages::ToolChoice::Any {
-                disable_parallel_tool_use: Some(true)
-            } | messages::ToolChoice::Tool {
-                disable_parallel_tool_use: Some(true),
-                ..
-            }
-        )
-    )
-}
-
 // ============================================================================
 // InputMessage → JSON conversion
 // ============================================================================

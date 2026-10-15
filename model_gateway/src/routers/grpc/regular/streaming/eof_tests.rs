@@ -3481,7 +3481,7 @@ async fn chat_stream_with_parallel_tool_calls_false_has_the_first_call() {
 
 /// The `tool_use` inputs of a Messages response to `texts` with
 /// `tool_choice`, unary or streamed.
-async fn messages_tool_inputs(tool_choice: Value, texts: &[&str], stream: bool) -> Vec<Value> {
+async fn messages_tool_inputs(tool_choice: &Value, texts: &[&str], stream: bool) -> Vec<Value> {
     let request = serde_json::from_value::<messages::CreateMessageRequest>(serde_json::json!({
         "model": "eof-test", "max_tokens": 16, "tool_choice": tool_choice,
         "messages": [{"role": "user", "content": "weather?"}],
@@ -3565,8 +3565,7 @@ async fn messages_tool_inputs(tool_choice: Value, texts: &[&str], stream: bool) 
 /// writes, unary and streamed; otherwise all of them.
 #[tokio::test]
 async fn messages_with_parallel_tool_use_disabled_have_the_first_call() {
-    let first = serde_json::json!({"q": 1});
-    let both = [first.clone(), serde_json::json!({"q": 2})];
+    let both = [serde_json::json!({"q": 1}), serde_json::json!({"q": 2})];
     for stream in [false, true] {
         for (tool_choice, texts, inputs) in [
             (serde_json::json!({"type": "auto"}), TWO_CALLS, &both[..]),
@@ -3592,7 +3591,7 @@ async fn messages_with_parallel_tool_use_disabled_have_the_first_call() {
             ),
         ] {
             assert_eq!(
-                messages_tool_inputs(tool_choice.clone(), &texts, stream).await,
+                messages_tool_inputs(&tool_choice, &texts, stream).await,
                 inputs,
                 "{tool_choice} stream={stream}"
             );

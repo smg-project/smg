@@ -335,7 +335,7 @@ pub(crate) fn constraint(
     let continues = request.continues_final_assistant();
     if !tools.is_empty() && request.tool_choice.as_ref().is_some_and(forces_call) {
         let one_call = matches!(request.tool_choice, Some(ToolChoice::Function { .. }))
-            || request.parallel_tool_calls == Some(false);
+            || request.disables_parallel_tool_calls();
         return calls_tag(
             &format,
             compiled,
@@ -372,9 +372,7 @@ pub(crate) fn constraint_messages(
     let one_call = match &request.tool_choice {
         _ if tools.is_empty() => return Ok(None),
         Some(MessagesToolChoice::Tool { .. }) => true,
-        Some(MessagesToolChoice::Any {
-            disable_parallel_tool_use,
-        }) => *disable_parallel_tool_use == Some(true),
+        Some(choice @ MessagesToolChoice::Any { .. }) => choice.disables_parallel_tool_use(),
         _ => return Ok(None),
     };
     calls_tag(
