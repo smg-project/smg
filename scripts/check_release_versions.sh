@@ -76,6 +76,8 @@ CRATES=(
     "smg-grpc-client|crates/grpc_client|smg-grpc-client"
     "smg-external-router|crates/external_router|smg-external-router"
     "smg-rl|crates/rl|smg-rl"
+    "engine-zmq-adapter|crates/engine_zmq_adapter|engine-zmq-adapter"
+    "engine-servicer|crates/engine_servicer|engine-servicer"
     "smg-client|clients/rust|-"
     "openapi-gen|clients/openapi-gen|-"
     "smg|model_gateway|-"
@@ -151,7 +153,7 @@ echo ""
 # Extract version from a Cargo.toml (first version = line in [package])
 get_crate_version() {
     local file="$1"
-    if grep -qE 'version\.workspace\s*=\s*true|version\s*=\s*\{\s*workspace\s*=\s*true' "$file"; then
+    if grep -qE '^version\.workspace\s*=\s*true|^version\s*=\s*\{\s*workspace\s*=\s*true' "$file"; then
         echo -e "${RED}ERROR: $file uses workspace versioning; this script expects explicit version strings.${NC}" >&2
         exit 1
     fi
@@ -172,7 +174,7 @@ get_crate_version_at_ref() {
             return 0
         fi
     }
-    if echo "$content" | grep -qE 'version\.workspace\s*=\s*true|version\s*=\s*\{\s*workspace\s*=\s*true'; then
+    if echo "$content" | grep -qE '^version\.workspace\s*=\s*true|^version\s*=\s*\{\s*workspace\s*=\s*true'; then
         echo -e "${RED}ERROR: $path/Cargo.toml at $ref uses workspace versioning; this script expects explicit version strings.${NC}" >&2
         exit 1
     fi

@@ -1,6 +1,6 @@
 [package]
 name = "engine-servicer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Rust gRPC servicers for inference engines: the engine's own proto, served over the same-host ZMQ wire"
 license = "Apache-2.0"

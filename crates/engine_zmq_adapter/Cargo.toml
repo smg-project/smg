@@ -1,6 +1,6 @@
 [package]
 name = "engine-zmq-adapter"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Each engine's own gRPC-proto surface over the same-host ZMQ engine wire"
 license = "Apache-2.0"

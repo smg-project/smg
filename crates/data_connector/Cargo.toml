@@ -1,6 +1,6 @@
 [package]
 name = "data-connector"
-version = "2.3.4"
+version = "2.4.0"
 edition = "2021"
 description = "Storage backends for conversations and responses"
 license = "Apache-2.0"

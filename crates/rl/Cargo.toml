@@ -1,6 +1,6 @@
 [package]
 name = "smg-rl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "RL control plane for SMG: worker discovery, engine-route passthrough, and fan-out"
 license = "Apache-2.0"
