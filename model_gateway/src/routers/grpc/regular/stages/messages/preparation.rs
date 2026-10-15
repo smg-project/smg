@@ -80,10 +80,7 @@ impl MessagePreparationStage {
             request.tool_choice.as_ref(),
             tokenizer.renderer_capabilities(),
         );
-        let chat_tool_choice = request
-            .tool_choice
-            .as_ref()
-            .map(message_utils::convert_message_tool_choice);
+        let chat_tool_choice = request.tool_choice.as_ref().map(ToolChoice::from);
         let tools_for_template = if filtered_tools.is_empty() {
             None
         } else {

@@ -527,7 +527,7 @@ impl HarmonyStreamingProcessor {
             // mode `prompt_tokens` can already be non-empty from the prefill
             // phase alone, which would otherwise mask a decode phase that
             // never actually finished.
-            let expected_choices = original_request.n.unwrap_or(1).max(1);
+            let expected_choices = original_request.choices();
             if (decode_completed_indices.len() as u32) < expected_choices {
                 handle.close_reserved_only().await;
             } else {

@@ -215,17 +215,6 @@ pub(crate) fn check_names(
     Ok(())
 }
 
-/// Whether `tool_choice` leaves the model no choice but a call: a named function, `required`,
-/// or allowed tools in `required` mode.
-fn forces_call(tool_choice: &ToolChoice) -> bool {
-    match tool_choice {
-        ToolChoice::Function { .. } => true,
-        ToolChoice::Value(ToolChoiceValue::Required) => true,
-        ToolChoice::AllowedTools { mode, .. } => mode == "required",
-        ToolChoice::Value(_) => false,
-    }
-}
-
 /// The schema a JSON `response_format` asks the answer to follow: any object for `json_object`.
 fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Value> {
     match response_format? {
@@ -333,7 +322,12 @@ pub(crate) fn constraint(
         ));
     }
     let continues = request.continues_final_assistant();
-    if !tools.is_empty() && request.tool_choice.as_ref().is_some_and(forces_call) {
+    if !tools.is_empty()
+        && request
+            .tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::forces_call)
+    {
         let one_call = matches!(request.tool_choice, Some(ToolChoice::Function { .. }))
             || request.disables_parallel_tool_calls();
         return calls_tag(

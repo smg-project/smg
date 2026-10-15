@@ -1029,22 +1029,6 @@ pub(crate) fn parse_json_schema_response(
     }
 }
 
-/// Count the number of tool calls in the request message history
-/// This is used for KimiK2 format which needs globally unique indices
-pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter_map(|msg| {
-            if let ChatMessage::Assistant { tool_calls, .. } = msg {
-                tool_calls.as_ref().map(|calls| calls.len())
-            } else {
-                None
-            }
-        })
-        .sum()
-}
-
 /// Generate a tool call ID based on model format
 ///
 /// # Arguments

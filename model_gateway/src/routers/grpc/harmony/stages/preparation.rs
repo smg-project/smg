@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, Tool, ToolChoice},
     responses::ResponsesRequest,
 };
 use serde_json::json;
@@ -307,29 +307,15 @@ impl HarmonyPreparationStage {
         tools: &[Tool],
         tool_choice: Option<&ToolChoice>,
     ) -> Result<Option<(String, String)>, Box<Response>> {
-        let Some(choice) = tool_choice else {
+        let Some(choice) = tool_choice.filter(|choice| choice.forces_call()) else {
             return Ok(None);
         };
-
-        match choice {
-            ToolChoice::Function { function, .. } => {
-                let tag = Self::build_tool_call_structural_tag(tools, Some(&function.name))?;
-                Ok(Some(("structural_tag".to_string(), tag)))
-            }
-            ToolChoice::Value(ToolChoiceValue::Required) => {
-                let tag = Self::build_tool_call_structural_tag(tools, None)?;
-                Ok(Some(("structural_tag".to_string(), tag)))
-            }
-            ToolChoice::AllowedTools { mode, .. } => {
-                if mode == "required" {
-                    let tag = Self::build_tool_call_structural_tag(tools, None)?;
-                    Ok(Some(("structural_tag".to_string(), tag)))
-                } else {
-                    Ok(None)
-                }
-            }
-            ToolChoice::Value(_) => Ok(None),
-        }
+        let function = match choice {
+            ToolChoice::Function { function, .. } => Some(function.name.as_str()),
+            _ => None,
+        };
+        let tag = Self::build_tool_call_structural_tag(tools, function)?;
+        Ok(Some(("structural_tag".to_string(), tag)))
     }
 
     /// Build Harmony structural tag for tool calling constraints

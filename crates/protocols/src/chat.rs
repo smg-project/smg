@@ -487,6 +487,25 @@ impl ChatCompletionRequest {
         self.parallel_tool_calls == Some(false)
     }
 
+    /// The choices the request asks for: `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.n.filter(|&n| n > 0).unwrap_or(1)
+    }
+
+    /// The tool calls the history already holds, across the assistant
+    /// messages: the index the next call continues from.
+    pub fn history_tool_calls_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Assistant { tool_calls, .. } => {
+                    tool_calls.as_ref().map(|calls| calls.len())
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
     /// `thinking.effort` when present, else the top-level `reasoning_effort`.
     pub fn effective_reasoning_effort(&self) -> Option<&str> {
         self.thinking
@@ -1550,6 +1569,46 @@ mod tests {
         .expect("parse");
         let value = serde_json::to_value(&message).expect("serialize");
         assert_eq!(value["annotations"], sent, "{value}");
+    }
+
+    /// `n` is the number of choices; absent and zero both mean one.
+    #[test]
+    fn a_chat_request_asks_for_at_least_one_choice() {
+        let request = |body: Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("a chat request")
+        };
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(request(base.clone()).choices(), 1);
+        let mut zero = base.clone();
+        zero["n"] = json!(0);
+        assert_eq!(request(zero).choices(), 1);
+        let mut three = base;
+        three["n"] = json!(3);
+        assert_eq!(request(three).choices(), 3);
+    }
+
+    /// The history's tool calls are the assistant messages' `tool_calls`,
+    /// summed in order; user, system and tool messages do not count.
+    #[test]
+    fn the_history_counts_the_assistant_tool_calls() {
+        let request = |messages: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({"model": "m", "messages": messages}))
+                .expect("a chat request")
+        };
+        assert_eq!(
+            request(json!([{"role": "user", "content": "hi"}])).history_tool_calls_count(),
+            0
+        );
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "calc", "arguments": "{}"}});
+        let history = json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [call("c1"), call("c2")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "2"},
+            {"role": "assistant", "content": "done"},
+            {"role": "assistant", "content": null, "tool_calls": [call("c3")]}
+        ]);
+        assert_eq!(request(history).history_tool_calls_count(), 3);
     }
 }
 

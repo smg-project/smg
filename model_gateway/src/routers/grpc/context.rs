@@ -136,13 +136,12 @@ impl RequestType {
     /// decode leg recomputes the prompt locally instead of pulling the
     /// prefill leg's KV.
     pub fn sampling_n(&self) -> u32 {
-        let n = match self {
-            Self::Chat(r) => r.n,
-            Self::Completion(r) => r.n,
-            Self::Generate(r) => r.sampling_params.as_ref().and_then(|p| p.n),
-            _ => None,
-        };
-        n.filter(|&n| n > 0).unwrap_or(1)
+        match self {
+            Self::Chat(r) => r.choices(),
+            Self::Completion(r) => r.choices(),
+            Self::Generate(r) => r.choices(),
+            _ => 1,
+        }
     }
 
     /// Client-supplied backend request id (`rid`), where the protocol carries

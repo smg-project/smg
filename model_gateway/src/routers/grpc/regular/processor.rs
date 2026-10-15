@@ -214,12 +214,10 @@ impl ResponseProcessor {
             let used_json_schema = if native_tool_format {
                 false
             } else {
-                match &original_request.tool_choice {
-                    Some(ToolChoice::Function { .. }) => true,
-                    Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-                    Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-                    _ => false,
-                }
+                original_request
+                    .tool_choice
+                    .as_ref()
+                    .is_some_and(ToolChoice::forces_call)
             };
 
             if used_json_schema {
@@ -976,10 +974,7 @@ impl ResponseProcessor {
 
             if used_json_schema {
                 // Bridge Messages ToolChoice to Chat ToolChoice for reuse
-                let chat_tool_choice = messages_request
-                    .tool_choice
-                    .as_ref()
-                    .map(utils::message_utils::convert_message_tool_choice);
+                let chat_tool_choice = messages_request.tool_choice.as_ref().map(ToolChoice::from);
 
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,

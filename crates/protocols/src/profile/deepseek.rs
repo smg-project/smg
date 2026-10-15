@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::{
     chat::{ChatCompletionRequest, ThinkingType},
-    common::{ToolChoice, ToolChoiceValue},
+    common::ToolChoice,
 };
 
 pub(super) fn matches_model(segment: &str) -> bool {
@@ -128,12 +128,12 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             ));
         }
     }
-    let forced = match req.tool_choice.as_ref() {
-        Some(ToolChoice::Value(ToolChoiceValue::Required) | ToolChoice::Function { .. }) => true,
-        Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-        _ => false,
-    };
-    if thinking_enabled(req) && forced {
+    if thinking_enabled(req)
+        && req
+            .tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::forces_call)
+    {
         return Err(error(
             "tool_choice_not_supported",
             "DeepSeek V4 requires thinking to be disabled for forced tool choice",

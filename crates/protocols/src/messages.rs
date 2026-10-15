@@ -11,7 +11,7 @@ use validator::Validate;
 
 use crate::{
     chat::deserialize_reasoning_effort,
-    common::{CachePartition, GenerationRequest},
+    common::{self, CachePartition, GenerationRequest},
     model_card::ModelCard,
     profile::ProviderProfile,
     validated::Normalizable,
@@ -184,6 +184,26 @@ impl CreateMessageRequest {
         self.tool_choice
             .as_ref()
             .is_some_and(ToolChoice::disables_parallel_tool_use)
+    }
+
+    /// The request's custom tools as chat tools, the shape the templates and
+    /// the parsers read (see [`chat_tools`]).
+    pub fn chat_tools(&self) -> Vec<common::Tool> {
+        self.tools.as_deref().map(chat_tools).unwrap_or_default()
+    }
+
+    /// The tool calls the history already holds, across the assistant
+    /// messages: the index the next call continues from.
+    pub fn history_tool_calls_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .flat_map(|message| match &message.content {
+                InputContent::Blocks(blocks) => blocks.as_slice(),
+                InputContent::String(_) => &[],
+            })
+            .filter(|block| matches!(block, InputContentBlock::ToolUse(_)))
+            .count()
     }
 }
 
@@ -841,6 +861,62 @@ pub struct InputSchema {
     pub additional: Map<String, Value>,
 }
 
+impl From<&InputSchema> for Value {
+    /// The schema as the JSON object a chat tool's `parameters` holds.
+    fn from(schema: &InputSchema) -> Self {
+        let mut object = Map::new();
+        object.insert(
+            "type".to_string(),
+            Value::String(schema.schema_type.clone()),
+        );
+        if let Some(properties) = &schema.properties {
+            object.insert("properties".to_string(), Value::Object(properties.clone()));
+        }
+        if let Some(required) = &schema.required {
+            object.insert(
+                "required".to_string(),
+                Value::Array(required.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        object.extend(
+            schema
+                .additional
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Value::Object(object)
+    }
+}
+
+impl From<&CustomTool> for common::Tool {
+    /// The chat tool a custom tool reads as: a function with the input
+    /// schema as its parameters.
+    fn from(tool: &CustomTool) -> Self {
+        Self {
+            tool_type: "function".to_string(),
+            function: common::Function {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: Value::from(&tool.input_schema),
+                strict: None,
+                extra: Default::default(),
+            },
+        }
+    }
+}
+
+/// The custom tools among `tools` as chat tools, in order; the other kinds
+/// render and parse through their own paths.
+pub fn chat_tools(tools: &[Tool]) -> Vec<common::Tool> {
+    tools
+        .iter()
+        .filter_map(|tool| match tool {
+            Tool::Custom(custom) => Some(common::Tool::from(custom)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Bash tool for computer use
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BashTool {
@@ -942,6 +1018,22 @@ impl ToolChoice {
                 ..
             }
         )
+    }
+}
+
+impl From<&ToolChoice> for common::ToolChoice {
+    /// The chat tool choice a Messages choice reads as: `auto`, `required` for
+    /// `any`, the named function, `none`.
+    fn from(choice: &ToolChoice) -> Self {
+        match choice {
+            ToolChoice::Auto { .. } => Self::Value(common::ToolChoiceValue::Auto),
+            ToolChoice::Any { .. } => Self::Value(common::ToolChoiceValue::Required),
+            ToolChoice::Tool { name, .. } => Self::Function {
+                tool_type: "function".to_string(),
+                function: common::FunctionChoice { name: name.clone() },
+            },
+            ToolChoice::None => Self::Value(common::ToolChoiceValue::None),
+        }
     }
 }
 
@@ -3153,5 +3245,120 @@ mod tests {
                 "{choice}"
             );
         }
+    }
+
+    /// A Messages tool choice reads as the chat choice the templates and
+    /// parsers know: `auto`, `required` for `any`, the named function, `none`.
+    #[test]
+    fn a_tool_choice_reads_as_a_chat_tool_choice() {
+        let choice = |body: Value| -> common::ToolChoice {
+            let choice: ToolChoice = serde_json::from_value(body).expect("a tool choice");
+            common::ToolChoice::from(&choice)
+        };
+        assert!(matches!(
+            choice(json!({"type": "auto"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::Auto)
+        ));
+        assert!(matches!(
+            choice(json!({"type": "any"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::Required)
+        ));
+        assert!(matches!(
+            choice(json!({"type": "none"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::None)
+        ));
+        match choice(json!({"type": "tool", "name": "calc"})) {
+            common::ToolChoice::Function {
+                tool_type,
+                function,
+            } => {
+                assert_eq!(tool_type, "function");
+                assert_eq!(function.name, "calc");
+            }
+            other => panic!("a named tool reads as a function choice, not {other:?}"),
+        }
+    }
+
+    /// A custom tool reads as a function tool whose parameters are the input
+    /// schema, keys in the order the client wrote them; the other tool kinds
+    /// are left out of the chat tools.
+    #[test]
+    fn custom_tools_read_as_chat_tools_in_order() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8, "messages": [],
+            "tools": [
+                {"name": "weather", "description": "Get weather", "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }},
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "calc", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .expect("a Messages request");
+        let tools = request.chat_tools();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["weather", "calc"]);
+        let weather = &tools[0];
+        assert_eq!(weather.tool_type, "function");
+        assert_eq!(weather.function.description.as_deref(), Some("Get weather"));
+        let keys: Vec<&str> = weather.function.parameters["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["city"]);
+        let keys: Vec<&str> = weather
+            .function
+            .parameters
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["type", "properties", "required", "additionalProperties"]
+        );
+        assert_eq!(tools[1].function.parameters, json!({"type": "object"}));
+        let none: CreateMessageRequest =
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": []}))
+                .expect("a Messages request");
+        assert!(none.chat_tools().is_empty());
+    }
+
+    /// The history's tool calls are the `tool_use` blocks of the assistant
+    /// turns; user turns and text blocks do not count.
+    #[test]
+    fn the_history_counts_the_assistant_tool_uses() {
+        let request = |messages: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": messages}))
+                .expect("a Messages request")
+        };
+        assert_eq!(
+            request(json!([{"role": "user", "content": "Hello"}])).history_tool_calls_count(),
+            0
+        );
+        let history = json!([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "tu_1", "name": "calc", "input": {"x": 1}},
+                {"type": "tool_use", "id": "tu_2", "name": "search", "input": {"q": "t"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "2"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_3", "name": "calc", "input": {}}
+            ]}
+        ]);
+        assert_eq!(request(history).history_tool_calls_count(), 3);
     }
 }

@@ -533,6 +533,17 @@ impl Default for ToolChoice {
 }
 
 impl ToolChoice {
+    /// Whether the choice leaves the model no choice but a call: a named
+    /// function, `required`, or allowed tools in `required` mode.
+    pub fn forces_call(&self) -> bool {
+        match self {
+            ToolChoice::Function { .. } => true,
+            ToolChoice::Value(ToolChoiceValue::Required) => true,
+            ToolChoice::AllowedTools { mode, .. } => mode == "required",
+            ToolChoice::Value(_) => false,
+        }
+    }
+
     /// Serialize tool_choice to string for ResponsesResponse
     ///
     /// Returns the JSON-serialized tool_choice or "auto" as default
@@ -1611,6 +1622,28 @@ mod tests {
                 }
                 None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
             }
+        }
+    }
+
+    /// A named function, `required`, and allowed tools in `required` mode
+    /// force a call; `auto`, `none`, and allowed tools in `auto` mode do not.
+    #[test]
+    fn a_tool_choice_says_whether_it_forces_a_call() {
+        let choice =
+            |body: Value| -> ToolChoice { serde_json::from_value(body).expect("a tool choice") };
+        for forcing in [
+            json!("required"),
+            json!({"type": "function", "function": {"name": "lookup"}}),
+            json!({"type": "allowed_tools", "mode": "required", "tools": []}),
+        ] {
+            assert!(choice(forcing.clone()).forces_call(), "{forcing}");
+        }
+        for free in [
+            json!("auto"),
+            json!("none"),
+            json!({"type": "allowed_tools", "mode": "auto", "tools": []}),
+        ] {
+            assert!(!choice(free.clone()).forces_call(), "{free}");
         }
     }
 }

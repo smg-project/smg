@@ -484,12 +484,7 @@ impl StreamingProcessor {
         let used_json_schema = if native_tool_format {
             false
         } else {
-            match tool_choice {
-                Some(ToolChoice::Function { .. }) => true,
-                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-                Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-                _ => false,
-            }
+            tool_choice.as_ref().is_some_and(ToolChoice::forces_call)
         };
 
         // Check if this is the specific function case (LLM generates parameters only, no name field).
@@ -4370,12 +4365,10 @@ fn opening_choice(index: u32, opens_tool_call: bool) -> OpeningChoice {
 /// call), so the stream's first delta is a tool call's, not text's.
 fn forces_tool_call(spec: &ChatResponseSpec) -> bool {
     spec.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-        && match &spec.tool_choice {
-            Some(ToolChoice::Function { .. }) => true,
-            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-            _ => false,
-        }
+        && spec
+            .tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::forces_call)
 }
 
 /// A streamed choice carrying whichever of `content`, `reasoning_content` and

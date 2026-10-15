@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
+use openai_protocol::common::{Tool, ToolChoice};
 use parking_lot::RwLock;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -371,12 +371,9 @@ impl ParserRegistry {
             return Ok(None);
         }
 
-        let at_least_one = match tool_choice {
-            ToolChoice::Value(ToolChoiceValue::Required) => true,
-            ToolChoice::Function { .. } => true,
-            ToolChoice::AllowedTools { mode, .. } if mode == "required" => true,
-            _ => return Ok(None),
-        };
+        if !tool_choice.forces_call() {
+            return Ok(None);
+        }
 
         // Like vLLM's Gemma4EngineToolParser.adjust_request, let Gemma4 emit
         // native calls even for required/named choices instead of forcing JSON.
@@ -389,7 +386,8 @@ impl ParserRegistry {
             let entries = self.entries.read();
             if let Some(entry) = entries.get(name) {
                 if let Some(build_fn) = entry.build_structural_tag.as_ref() {
-                    let mut tag = build_fn(tools, at_least_one);
+                    // A choice that forces a call asks the grammar for at least one.
+                    let mut tag = build_fn(tools, true);
                     if let (true, Some(prefix)) = (reasoning, entry.reasoning_prefix) {
                         if let Some(prefix) = prefix(GrammarStart::Unknown) {
                             tag = wrap_in_reasoning_prefix(tag, prefix)?;

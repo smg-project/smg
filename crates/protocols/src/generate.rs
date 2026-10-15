@@ -205,6 +205,17 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
     Ok(())
 }
 
+impl GenerateRequest {
+    /// The choices the request asks for: the sampling `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.sampling_params
+            .as_ref()
+            .and_then(|params| params.n)
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    }
+}
+
 impl GenerationRequest for GenerateRequest {
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
@@ -438,5 +449,17 @@ mod tests {
         .unwrap();
         assert_eq!(typed_path.cache_partition().lora_path, Some("adapter-path"));
         assert!(typed_path.cache_partition().cache_salt.is_none());
+    }
+
+    /// The sampling `n` is the number of choices; absent and zero both mean one.
+    #[test]
+    fn a_generate_request_asks_for_at_least_one_choice() {
+        assert_eq!(req().choices(), 1);
+        let with_n = |n: u32| -> GenerateRequest {
+            serde_json::from_value(serde_json::json!({"model": "m", "sampling_params": {"n": n}}))
+                .expect("a generate request")
+        };
+        assert_eq!(with_n(0).choices(), 1);
+        assert_eq!(with_n(4).choices(), 4);
     }
 }

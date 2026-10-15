@@ -20,9 +20,8 @@ use openai_protocol::{
     responses::ResponsesRequest,
 };
 
-use crate::routers::grpc::{
-    regular::{stages::decisions::scoring::DecisionScoring, symphony::Assignment},
-    utils,
+use crate::routers::grpc::regular::{
+    stages::decisions::scoring::DecisionScoring, symphony::Assignment,
 };
 
 /// Response-phase contract for one request, produced by request building.
@@ -121,10 +120,10 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
                     || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools();
                 scanned.then_some(tools)
             },
-            history_tool_calls_count: utils::get_history_tool_calls_count(request),
+            history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
-            expected_choices: request.n.unwrap_or(1).max(1),
+            expected_choices: request.choices(),
             logprobs: request.logprobs,
             top_logprobs: request.top_logprobs,
             stop: request.stop.clone(),
@@ -150,12 +149,7 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
     fn from(request: &GenerateRequest) -> Self {
         Self {
             return_logprob: request.return_logprob.unwrap_or(false),
-            expected_choices: request
-                .sampling_params
-                .as_ref()
-                .and_then(|p| p.n)
-                .unwrap_or(1)
-                .max(1),
+            expected_choices: request.choices(),
         }
     }
 }
@@ -187,14 +181,8 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             reasoning_in_prefill: false,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
-            history_tool_calls_count: utils::message_utils::get_history_tool_calls_count_messages(
-                request,
-            ),
-            chat_tools: request
-                .tools
-                .as_deref()
-                .map(utils::message_utils::extract_chat_tools)
-                .unwrap_or_default(),
+            history_tool_calls_count: request.history_tool_calls_count(),
+            chat_tools: request.chat_tools(),
             stop_sequences: request.stop_sequences.clone(),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
@@ -230,7 +218,7 @@ impl From<&CompletionRequest> for CompletionResponseSpec {
             Vec::new()
         };
         Self {
-            choices_per_prompt: request.n.unwrap_or(1).max(1),
+            choices_per_prompt: request.choices(),
             echo: request.echo,
             suffix: request.suffix.clone(),
             logprobs: request.logprobs.is_some(),

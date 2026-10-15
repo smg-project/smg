@@ -213,6 +213,13 @@ fn validate_completion_cross_parameters(
     Ok(())
 }
 
+impl CompletionRequest {
+    /// The choices per prompt the request asks for: `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.n.filter(|&n| n > 0).unwrap_or(1)
+    }
+}
+
 impl GenerationRequest for CompletionRequest {
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
@@ -405,5 +412,13 @@ mod tests {
         assert!(back.ignore_eos);
         assert!(back.return_hidden_states);
         assert!(!back.skip_special_tokens);
+    }
+
+    /// `n` is the number of choices per prompt; absent and zero both mean one.
+    #[test]
+    fn a_completion_request_asks_for_at_least_one_choice() {
+        assert_eq!(req(serde_json::json!({})).choices(), 1);
+        assert_eq!(req(serde_json::json!({"n": 0})).choices(), 1);
+        assert_eq!(req(serde_json::json!({"n": 2})).choices(), 2);
     }
 }
