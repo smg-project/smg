@@ -2313,6 +2313,82 @@ fn m3_null_properties_cost_no_element() {
     assert_eq!(members[1], expected_element("path", expected_text("path")));
 }
 
+/// The keys of an object's elements, in order: the key each opening tag spells, an optional
+/// element unwrapped.
+fn element_keys(members: &serde_json::Value) -> Vec<String> {
+    members["elements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|element| {
+            let element = if element["type"] == "optional" {
+                &element["content"]
+            } else {
+                element
+            };
+            let opener = element["elements"][0]["value"].as_str()?;
+            Some(
+                opener
+                    .trim_start_matches(NS)
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Exactly the properties that are not `null` have elements, whatever shape the schema takes: a
+/// reference chain, a pointer at nothing, a reference that recurs, `null` written out or behind
+/// a reference; and a nest past the depth cap keeps an element at every level, the innermost
+/// free text. One classification decides both the count the budget holds and the writing, so no
+/// property is dropped and none is charged without an element.
+#[test]
+fn m3_every_property_but_a_null_one_has_its_element() {
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {
+            "S": {"type": "string"},
+            "N": {"type": "null"},
+            "Chain1": {"$ref": "#/$defs/Chain2"},
+            "Chain2": {"$ref": "#/$defs/S"},
+            "Loop": {"$ref": "#/$defs/Loop"},
+        },
+        "properties": {
+            "a_string": {"type": "string"},
+            "b_chain": {"$ref": "#/$defs/Chain1"},
+            "c_missing": {"$ref": "#/$defs/Missing"},
+            "d_loop": {"$ref": "#/$defs/Loop"},
+            "e_null": {"type": "null"},
+            "f_null_ref": {"$ref": "#/$defs/N"},
+            "g_last": {"type": "boolean"},
+        },
+        "required": ["a_string", "b_chain", "c_missing", "d_loop", "e_null", "f_null_ref", "g_last"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let members = first_invoke(&tag);
+    assert_eq!(
+        element_keys(&members),
+        ["a_string", "b_chain", "c_missing", "d_loop", "g_last"]
+    );
+    assert_eq!(elements_written(&tag), 5, "each writer costs one element");
+    assert_eq!(
+        members["elements"][1],
+        expected_element("b_chain", expected_text("b_chain"))
+    );
+    assert_eq!(
+        free_text_runs(&tag),
+        2,
+        "the pointer at nothing and the reference that recurs are free text"
+    );
+
+    // Seventeen objects, each the one property of the one above: an element at every level, the
+    // innermost past the depth cap written as free text.
+    let tag = MinimaxM3Parser::build_structural_tag(&[schema_tool(fan_out(1, 17))], true);
+    assert_eq!(elements_written(&tag), 17);
+    assert_eq!(free_text_runs(&tag), 1);
+}
+
 /// A list's item element counts against the budget like a property's; a list reached once the
 /// budget is spent is free text.
 #[test]

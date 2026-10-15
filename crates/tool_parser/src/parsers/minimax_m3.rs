@@ -699,6 +699,27 @@ struct Elements<'a> {
     reserved: usize,
 }
 
+/// How a value's schema is written: as free text, at the depth cap or behind a reference that
+/// recurs; or by its type, its references followed and on the path, `pushed` of them, which the
+/// writer unwinds once the value is written. A schema typed `null` is written as nothing, and is
+/// neither ([`Elements::how`]).
+enum Writes<'a> {
+    FreeText,
+    Typed {
+        schema: &'a Value,
+        pushed: usize,
+        depth: usize,
+    },
+}
+
+/// What writing a property gives: nothing, for a property typed `null`; no element, once the
+/// invoke's budget is spent, when the caller writes the rest as free text; or the element.
+enum Element {
+    Nothing,
+    Spent,
+    Written(Value),
+}
+
 impl<'a> Elements<'a> {
     fn of(root: &'a Value) -> Self {
         Self {
@@ -709,14 +730,48 @@ impl<'a> Elements<'a> {
         }
     }
 
-    /// One element off the budget; `false` once it is spent, or once only the elements held for
-    /// later siblings are left, when the caller writes free text.
-    fn takes_an_element(&mut self) -> bool {
-        if self.nodes <= self.reserved {
-            return false;
+    /// Whether the budget has an element left beyond the ones held for later siblings.
+    fn has_an_element(&self) -> bool {
+        self.nodes > self.reserved
+    }
+
+    /// One element off the budget, which [`Self::has_an_element`] said was there.
+    fn take_an_element(&mut self) {
+        self.nodes = self.nodes.saturating_sub(1);
+    }
+
+    /// How `schema` is written at `depth`, or `None` for a schema typed `null`, written as
+    /// nothing: the one place that decides, for the count of an object's properties that write
+    /// and for the writing itself.
+    fn how(&mut self, schema: &'a Value, depth: usize) -> Option<Writes<'a>> {
+        let Some(depth) = depth.checked_sub(1) else {
+            return Some(Writes::FreeText);
+        };
+        let Some((schema, pushed)) = self.follow(schema) else {
+            return Some(Writes::FreeText);
+        };
+        if MinimaxM3Parser::schema_type(Some(schema)) == Some("null") {
+            self.unwind(pushed);
+            return None;
         }
-        self.nodes -= 1;
-        true
+        Some(Writes::Typed {
+            schema,
+            pushed,
+            depth,
+        })
+    }
+
+    /// Whether a property's schema writes an element: everything but `null`, as [`Self::how`]
+    /// has it.
+    fn writes_an_element(&mut self, schema: &'a Value, depth: usize) -> bool {
+        match self.how(schema, depth) {
+            None => false,
+            Some(Writes::FreeText) => true,
+            Some(Writes::Typed { pushed, .. }) => {
+                self.unwind(pushed);
+                true
+            }
+        }
     }
 
     /// One invoke: the separator and the opener with the tool's name, the
@@ -802,35 +857,31 @@ impl<'a> Elements<'a> {
             .and_then(Value::as_array)
             .map(|names| names.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        let written: Vec<bool> = properties
-            .values()
-            .map(|schema| self.writes_an_element(schema, depth))
-            .collect();
-        let mut later = written.iter().filter(|writes| **writes).count();
+        // The properties that write, counted first: while one is written, one element is held
+        // for each of them after it.
+        let mut later: usize = 0;
+        for schema in properties.values() {
+            if self.writes_an_element(schema, depth) {
+                later += 1;
+            }
+        }
         let mut elements: Vec<Value> = Vec::new();
-        for ((key, schema), writes) in properties.iter().zip(written) {
-            if !writes {
-                continue;
+        for (key, schema) in properties {
+            match self.element(key, schema, depth, later.saturating_sub(1)) {
+                Element::Nothing => {}
+                Element::Spent => {
+                    elements.push(Self::free_text(close));
+                    break;
+                }
+                Element::Written(element) => {
+                    later = later.saturating_sub(1);
+                    elements.push(if required.contains(&key.as_str()) {
+                        element
+                    } else {
+                        json!({ "type": "optional", "content": element })
+                    });
+                }
             }
-            later -= 1;
-            if !self.takes_an_element() {
-                elements.push(Self::free_text(close));
-                break;
-            }
-            self.reserved += later;
-            let element = self.element(key, schema, depth);
-            self.reserved -= later;
-            let Some(element) = element else {
-                // `value` decides as `writes_an_element` does, so this is not reached; the
-                // element goes back should the two ever differ.
-                self.nodes += 1;
-                continue;
-            };
-            elements.push(if required.contains(&key.as_str()) {
-                element
-            } else {
-                json!({ "type": "optional", "content": element })
-            });
         }
         if elements.is_empty() {
             return json!({ "type": "const_string", "value": "" });
@@ -838,26 +889,22 @@ impl<'a> Elements<'a> {
         json!({ "type": "sequence", "elements": elements })
     }
 
-    /// Whether a property's schema writes an element: every type but `null`,
-    /// which is written as nothing, its references followed as [`Self::value`]
-    /// follows them; a schema at the depth cap or behind a reference that
-    /// recurs is free text, an element too.
-    fn writes_an_element(&mut self, schema: &'a Value, depth: usize) -> bool {
-        if depth == 0 {
-            return true;
-        }
-        let Some((schema, pushed)) = self.follow(schema) else {
-            return true;
-        };
-        self.unwind(pushed);
-        MinimaxM3Parser::schema_type(Some(schema)) != Some("null")
-    }
-
     /// One element: the separator and `<key>`, the value, the separator and
-    /// `</key>`; nothing for a property typed `null`.
-    fn element(&mut self, key: &str, schema: &'a Value, depth: usize) -> Option<Value> {
-        let value = self.value(schema, &format!("</{key}>"), depth)?;
-        Some(json!({
+    /// `</key>`, one element off the budget, with `later` held for the
+    /// properties after it while its value is written; nothing for a property
+    /// typed `null`, at no cost; no element once the budget is spent.
+    fn element(&mut self, key: &str, schema: &'a Value, depth: usize, later: usize) -> Element {
+        if !self.has_an_element() {
+            return Element::Spent;
+        }
+        let Some(writes) = self.how(schema, depth) else {
+            return Element::Nothing;
+        };
+        self.take_an_element();
+        self.reserved += later;
+        let value = self.value(&format!("</{key}>"), writes);
+        self.reserved -= later;
+        Element::Written(json!({
             "type": "sequence",
             "elements": [
                 { "type": "const_string", "value": format!("{ELEMENT_START}{key}>") },
@@ -867,31 +914,35 @@ impl<'a> Elements<'a> {
         }))
     }
 
-    /// The value between an element's tags, by the type its schema pins, or
-    /// `None` for `null`, which is written as nothing.
-    fn value(&mut self, schema: &'a Value, close: &str, depth: usize) -> Option<Value> {
-        let Some(depth) = depth.checked_sub(1) else {
-            return Some(Self::free_text(close));
-        };
-        let Some((schema, pushed)) = self.follow(schema) else {
-            return Some(Self::free_text(close));
+    /// The value between an element's tags, as [`Self::how`] says it is
+    /// written: free text, or by the type its schema pins.
+    fn value(&mut self, close: &str, writes: Writes<'a>) -> Value {
+        let Writes::Typed {
+            schema,
+            pushed,
+            depth,
+        } = writes
+        else {
+            return Self::free_text(close);
         };
         let value = match MinimaxM3Parser::schema_type(Some(schema)) {
-            Some("null") => None,
-            Some("boolean") => Some(Self::one_of(["true", "false", "True", "False"])),
-            Some("object") => Some(self.members(schema, close, depth)),
-            Some("array") => Some(match schema.get("items") {
-                Some(items) if self.takes_an_element() => self.items(items, depth),
+            Some("boolean") => Self::one_of(["true", "false", "True", "False"]),
+            Some("object") => self.members(schema, close, depth),
+            Some("array") => match schema.get("items") {
+                Some(items) if self.has_an_element() => {
+                    self.take_an_element();
+                    self.items(items, depth)
+                }
                 _ => Self::free_text(close),
-            }),
-            Some("string") => Some(match schema.get("enum").and_then(Value::as_array) {
+            },
+            Some("string") => match schema.get("enum").and_then(Value::as_array) {
                 Some(values) if !values.is_empty() && values.iter().all(Value::is_string) => {
                     Self::one_of(values.iter().filter_map(Value::as_str))
                 }
                 _ => Self::text(close),
-            }),
-            Some("integer" | "number") => Some(self.fragment(schema)),
-            _ => Some(Self::free_text(close)),
+            },
+            Some("integer" | "number") => self.fragment(schema),
+            _ => Self::free_text(close),
         };
         self.unwind(pushed);
         value
@@ -902,15 +953,18 @@ impl<'a> Elements<'a> {
     fn items(&mut self, items: &'a Value, depth: usize) -> Value {
         let open = format!("{ELEMENT_START}{ITEM}>");
         let close = format!("{ELEMENT_END_START}{ITEM}>");
-        let item = match self.value(items, &format!("</{ITEM}>"), depth) {
-            Some(value) => json!({
-                "type": "sequence",
-                "elements": [
-                    { "type": "const_string", "value": open },
-                    value,
-                    { "type": "const_string", "value": close },
-                ],
-            }),
+        let item = match self.how(items, depth) {
+            Some(writes) => {
+                let value = self.value(&format!("</{ITEM}>"), writes);
+                json!({
+                    "type": "sequence",
+                    "elements": [
+                        { "type": "const_string", "value": open },
+                        value,
+                        { "type": "const_string", "value": close },
+                    ],
+                })
+            }
             None => json!({ "type": "const_string", "value": format!("{open}{close}") }),
         };
         json!({ "type": "star", "content": item })
