@@ -1519,6 +1519,16 @@ const GROUPS: &[Group] = &[
         status: Status::Pending,
     },
     Group {
+        slug: "muse-spark-open-816b-a42b",
+        model: "meta-models/Muse-Spark-Open-816B-A42B",
+        also: &["Muse-Spark-Open-816B-A42B-NVFP4"],
+        released: "2026-10-15",
+        smg: (None, None),
+        table: Some(Table::MuseSpark),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "nanbeige4.2-3b",
         model: "Nanbeige/Nanbeige4.2-3B",
         also: &[],

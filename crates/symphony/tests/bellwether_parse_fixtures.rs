@@ -82,7 +82,7 @@ use symphony::{
     formats::{
         deepseek_v4_1, dots3, for_model, function_gemma, gemma4, glm, glm4, groups, hy4, inkling,
         iquest, json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
-        minimax_m3, mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+        minimax_m3, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
     },
     tagged::{Placement, Spelling},
     CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError,
@@ -395,6 +395,13 @@ const MODELS: &[(&str, Family, GenerationPrompt)] = &[
         "kimi-k3",
         Family::KimiK3,
         GenerationPrompt::AlwaysOpensTheThought,
+    ),
+    // Muse Spark: the generation prompt ends at the turn's opener, and the model writes the
+    // thought's message itself.
+    (
+        "muse-spark-open-816b-a42b",
+        Family::MuseSpark,
+        GenerationPrompt::ModelDecides,
     ),
     // Other families that write Qwen's syntaxes, each as its own template spells the thought.
     (
@@ -1003,6 +1010,8 @@ enum Family {
     MinimaxM3,
     /// [`kimi_k3`]: XTML, whose argument tags name their own values' types.
     KimiK3,
+    /// [`muse_spark`]: a turn of messages, a call the message to the tool with its invoke.
+    MuseSpark,
     /// [`inkling`]: a turn of messages, a call as the tool's name, a marker and a JSON object.
     Inkling,
     /// [`minicpm5`]: `<function name="…">` calls of `<param name="…">` tags, no block, CDATA.
@@ -1026,6 +1035,7 @@ impl Family {
             Self::Hy4 => ("<think:opensource>", "</think:opensource>"),
             Self::MinimaxM3 => ("<mm:think>", "</mm:think>"),
             Self::KimiK3 => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+            Self::MuseSpark => (" to=self<|message|>", "<|eom|>"),
             Self::Inkling => ("<|content_thinking|>", "<|end_message|>"),
             Self::Gemma4 => ("<|channel>thought\n", "<channel|>"),
             Self::K2Horizon => ("<ifm|think>", "</ifm|think>"),
@@ -1080,6 +1090,7 @@ impl Family {
             Self::MinimaxM2 => minimax_m2(),
             Self::MinimaxM3 => minimax_m3(),
             Self::KimiK3 => kimi_k3(),
+            Self::MuseSpark => muse_spark(),
             Self::Inkling => inkling(),
             Self::MiniCpm5 => minicpm5(),
             Self::Dots3 => dots3(),
@@ -1096,16 +1107,17 @@ impl Family {
         let list = match self {
             Self::Qwen3 | Self::Qwen2_5 => KNOWN_DIFFERENCES,
             Self::Qwen3Tagged | Self::MiMo => KNOWN_TAGGED_DIFFERENCES,
-            // Seed-OSS, Hy4, Olmo 3, xLAM, the json table, Kimi K3, K2-Horizon, Inkling, Gemma 4
-            // and the plain table read neither of the probes' Qwen markers: `</think>` stays
-            // reasoning text and the fenced `<tool_call>` block stays content, as the reference
-            // says.
+            // Seed-OSS, Hy4, Olmo 3, xLAM, the json table, Kimi K3, Muse Spark, K2-Horizon,
+            // Inkling, Gemma 4 and the plain table read neither of the probes' Qwen markers:
+            // `</think>` stays reasoning text and the fenced `<tool_call>` block stays content,
+            // as the reference says.
             Self::SeedOss
             | Self::Hy4
             | Self::Olmo3
             | Self::Xlam
             | Self::Json
             | Self::KimiK3
+            | Self::MuseSpark
             | Self::K2Horizon
             | Self::Inkling
             | Self::Gemma4

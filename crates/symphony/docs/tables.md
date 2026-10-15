@@ -334,3 +334,48 @@ What the table leaves out, for want of fixtures: the template picks the thought'
 the calls as JSON objects or with a typed tag per argument (`tool_call_format`); the recorded sets
 hold the default thought and the default calls, read here. A thought under one of the other tags is
 content until a set shows it.
+
+## Muse Spark (`muse_spark`)
+
+The template opens the turn with `<|start|>assistant` and writes every message as
+` to=RECIPIENT<|message|>`, its body, and `<|eom|>` when another message follows or `<|eot|>` when
+the turn ends: the thought to `self`, the answer to `user`, an update before or between calls to
+`commentary`, and each call to the tool it names, its body `<atem:function_calls>`, a newline,
+`<atem:invoke name="NAME">`, each `<atem:parameter name="KEY">` tag on a line of its own, the
+invoke's close, a newline and the block's close. The checkpoint's `tokenizer_config.json` declares
+the same reading as a response template, and the table spells it the way a compiled one would.
+What the table says:
+
+- **The text between the messages is framing.** The turn's own state (`message`) holds the
+  headers, the block around a call, `<|start|>assistant` between messages, and whatever the model
+  writes outside a message; the template's reader drops all of it, and so does the table
+  (`Format::framing`): dropped as wrapping, never malformed, never content. An output with no
+  message at all is dropped whole, as the reader gives nothing for it.
+- **A call is the invoke, wherever its message put it.** `<atem:invoke` opens a call given as data
+  ([`CallSyntax::Shaped`]) from the turn's own state only: its header skips other attributes
+  (`id="1"`) and names the tool, and an invoke without a name is framing. Inside the thought or an
+  answer the same markup is text, so a call the model quotes to the user is prose, and only a
+  message addressed to a tool makes a call. The parameters are tags found as the reader's
+  `finditer` finds them, each value read as JSON where it is JSON and as text otherwise, then typed
+  by the request's tools. `<|eom|>` or `<|eot|>` before the invoke's close ends the call with what
+  arrived, and so does the model's stop (the stop row).
+- **Both channels of the answer are content.** `user` and `commentary` open the content state, in
+  the order the model writes them, so an update before a call and the answer after the tool's
+  result both reach the client as content; the thought is the `self` message. The bodies are the
+  model's bytes as written: the template puts nothing between `<|message|>` and the body, and the
+  reader's `strip` of a field's edges is bellwether #17's question here as for Qwen3.
+- **The prompt's replay starts after the last `<|start|>assistant`** (`Format::turn_anchor`), so
+  an earlier turn's call, or a tool result that quotes a header, moves nothing; a prompt that
+  continues an assistant message (`to=self<|message|>` or `to=user<|message|>` after the opener)
+  leaves the output inside that message.
+- **The tags write what the chat template renders** (`Format::with_layout`): a forced or required
+  call is the message to the tool, ` to=NAME<|message|><atem:function_calls>`, the invoke, and the
+  block's close; a second call is the next message. A JSON answer (`response_format`) is the
+  message to `user` with the schema as its body, ended by the turn's stop. The thought is the
+  model's to write before them, as gpt-oss's analysis channel is: the template renders a thought
+  only when the message has one, so the tags do not require it.
+
+What the table leaves open, for want of fixtures: the recorded sets, once bellwether has them;
+whether the model ever writes a message to a recipient the table has no row for (its text is
+framing today); and whether `commentary` should reach the client as content or as a channel of its
+own, which the API has no place for.
