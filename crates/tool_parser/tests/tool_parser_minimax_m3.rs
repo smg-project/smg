@@ -2190,6 +2190,70 @@ fn m3_a_wide_fan_out_stays_within_the_element_budget() {
     assert_eq!(free_text_runs(&tag), 0, "nothing fell back");
 }
 
+/// The budget is spent depth first, but a property written first cannot take the elements its
+/// later siblings need: each keeps one, so the top-level arguments stay typed and the nested
+/// object loses its structure from the inside out.
+#[test]
+fn m3_a_wide_property_leaves_each_later_sibling_its_element() {
+    let mut properties = serde_json::Map::new();
+    properties.insert("config".to_string(), fan_out(8, 4)); // 4680 elements unbounded
+    properties.insert("path".to_string(), json!({"type": "string"}));
+    properties.insert("count".to_string(), json!({"type": "integer"}));
+    let tool = schema_tool(json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["config", "path", "count"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    assert_eq!(elements_written(&tag), 1024, "the budget, not 4682");
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(
+        members.as_array().map(Vec::len),
+        Some(3),
+        "every top-level property has its element: {members}"
+    );
+    assert_eq!(members[1], expected_element("path", expected_text("path")));
+    assert_eq!(
+        members[2],
+        expected_element(
+            "count",
+            json!({"type": "json_schema", "json_schema": {"type": "integer"}})
+        )
+    );
+    assert!(
+        free_text_runs(&members[0]) >= 1,
+        "the wide object is where the budget ran out"
+    );
+
+    // An object whose budget is one element per property writes each property's tag and nothing
+    // inside the objects below: the structure goes from the inside out.
+    let mut thin = serde_json::Map::new();
+    for i in 0..1000 {
+        thin.insert(format!("s{i:04}"), json!({"type": "string"}));
+    }
+    thin.insert("znest".to_string(), fan_out(30, 2)); // 930 elements unbounded
+    thin.insert("zlast".to_string(), json!({"type": "boolean"}));
+    let required: Vec<String> = thin.keys().cloned().collect();
+    let tool = schema_tool(json!({"type": "object", "properties": thin, "required": required}));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(members.as_array().map(Vec::len), Some(1002));
+    assert_eq!(
+        members[1001],
+        expected_element(
+            "zlast",
+            json!({"type": "or", "elements": [
+                {"type": "const_string", "value": "true"},
+                {"type": "const_string", "value": "false"},
+                {"type": "const_string", "value": "True"},
+                {"type": "const_string", "value": "False"},
+            ]})
+        ),
+        "the last sibling keeps its element and its type"
+    );
+    assert_eq!(elements_written(&tag), 1024);
+}
+
 /// A list's item element counts against the budget like a property's; a list reached once the
 /// budget is spent is free text.
 #[test]

@@ -38,7 +38,11 @@ const CALL_EXITS: [&str; 3] = ["</invoke>", "<invoke name=\"", "</tool_call>"];
 const DEPTH: usize = 16;
 /// How many elements one invoke's grammar may hold; past that, the values still to write are
 /// free text. An acyclic schema unfolds as k^d elements for k properties over d levels, which the
-/// depth cap alone does not bound; ordinary tool schemas stay far below this.
+/// depth cap alone does not bound; ordinary tool schemas stay far below this. The budget is spent
+/// depth first, in the schema's order, but an object's later properties each keep one element
+/// while an earlier one is descended into, so what runs short loses its structure from the inside
+/// out: the nested objects first, the top-level arguments last. The budget counts elements, not
+/// bytes: a value's own spelling (an enum's words, a number's schema) is written as it is.
 const NODES: usize = 1024;
 
 /// MiniMax M3 format parser for tool calls.
@@ -675,17 +679,22 @@ impl MinimaxM3Parser {
 /// through another definition, is written as free text where it recurs, so a schema that refers
 /// to itself stays bounded, the depth cap the outer bound. The elements of one invoke are counted
 /// against [`NODES`]: once they are spent, the values still to write (the rest of an object, a
-/// list) are free text, so a wide fan-out stays bounded too.
+/// list) are free text, so a wide fan-out stays bounded too; before a property is descended into,
+/// one element is held for each of the properties after it, so an early object cannot take the
+/// elements its siblings need for their own tags.
 ///
-/// Kept in step with the `symphony` crate's `grammar/xml.rs`, which writes the same model's block
-/// from its table: the two spell the same output, and a change to one belongs in the other, until
-/// one builder serves both paths.
+/// The `symphony` crate's `grammar/xml.rs` writes the same model's block from its table, and
+/// spells the same output; it follows the references and the depth cap the same way, and takes
+/// the element budget in a change of its own.
 struct Elements<'a> {
     root: &'a Value,
     /// The pointers of the references on the path being written, outermost first.
     path: Vec<&'a str>,
     /// The elements this invoke may still write.
     nodes: usize,
+    /// How many of them are held for the properties after the one being written, at every level
+    /// of the descent together.
+    reserved: usize,
 }
 
 impl<'a> Elements<'a> {
@@ -694,12 +703,14 @@ impl<'a> Elements<'a> {
             root,
             path: Vec::new(),
             nodes: NODES,
+            reserved: 0,
         }
     }
 
-    /// One element off the budget; `false` once it is spent, when the caller writes free text.
+    /// One element off the budget; `false` once it is spent, or once only the elements held for
+    /// later siblings are left, when the caller writes free text.
     fn takes_an_element(&mut self) -> bool {
-        if self.nodes == 0 {
+        if self.nodes <= self.reserved {
             return false;
         }
         self.nodes -= 1;
@@ -772,7 +783,9 @@ impl<'a> Elements<'a> {
     /// An object's elements: one per property in the schema's order, each
     /// optional unless the schema requires it, a property typed `null` left
     /// out; free text up to `close` for a schema without properties, and for
-    /// the properties left once the invoke's element budget is spent.
+    /// the properties left once the invoke's element budget is spent. While
+    /// a property's value is written, one element is held for each property
+    /// after it, so each still gets its own tag.
     fn members(&mut self, schema: &'a Value, close: &str, depth: usize) -> Value {
         let properties = schema
             .get("properties")
@@ -787,12 +800,16 @@ impl<'a> Elements<'a> {
             .map(|names| names.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
         let mut elements: Vec<Value> = Vec::new();
-        for (key, schema) in properties {
+        for (at, (key, schema)) in properties.iter().enumerate() {
             if !self.takes_an_element() {
                 elements.push(Self::free_text(close));
                 break;
             }
-            let Some(element) = self.element(key, schema, depth) else {
+            let siblings = properties.len() - 1 - at;
+            self.reserved += siblings;
+            let element = self.element(key, schema, depth);
+            self.reserved -= siblings;
+            let Some(element) = element else {
                 continue;
             };
             elements.push(if required.contains(&key.as_str()) {
