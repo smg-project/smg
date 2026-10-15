@@ -3,8 +3,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use openai_protocol::{
-    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    messages::CreateMessageRequest, worker::WorkerLoadResponse,
+    chat::ChatCompletionRequest,
+    completion::CompletionRequest,
+    generate::GenerateRequest,
+    messages::CreateMessageRequest,
+    worker::{ConstrainedDecoding, WorkerLoadResponse},
 };
 use smg_grpc_client::{
     common_proto, tokenizer_bundle, tokenizer_bundle::StreamBundle, BoxedTraceInjector,
@@ -887,6 +890,15 @@ impl ServerInfo {
                 if !info.tokenspeed_version.is_empty() {
                     labels.insert("version".to_string(), info.tokenspeed_version.clone());
                 }
+                // The engine's declared constrained-decoding policy, a field of
+                // its own rather than a `server_args` key: the `constrained_decoding`
+                // label the gateway follows per worker. "" is no declaration.
+                if !info.constrained_decoding.is_empty() {
+                    labels.insert(
+                        ConstrainedDecoding::LABEL.to_string(),
+                        info.constrained_decoding.clone(),
+                    );
+                }
                 // Carry the worker's /dev/shm namespace identity (advertised in
                 // scheduler_info). The router compares it to its own to decide the
                 // SHM tensor transport by *verifying* a shared /dev/shm rather than
@@ -1146,6 +1158,26 @@ mod tests {
         let silent = ServerInfo::Vllm(Box::default()).to_labels();
         assert!(!silent.contains_key("engine_reasoning_parser"));
         assert!(!silent.contains_key("constrained_decoding_start"));
+    }
+
+    /// A TokenSpeed servicer's declared constrained-decoding policy travels as
+    /// a field of its own and becomes the `constrained_decoding` label the
+    /// gateway follows per worker; an engine that declares none (the proto
+    /// default) sets no such label.
+    #[test]
+    fn server_info_to_labels_carries_the_engines_constrained_decoding_policy() {
+        let info = ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+            constrained_decoding: "always".to_string(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            info.to_labels()
+                .get("constrained_decoding")
+                .map(String::as_str),
+            Some("always")
+        );
+        let silent = ServerInfo::TokenSpeed(Box::default()).to_labels();
+        assert!(!silent.contains_key("constrained_decoding"));
     }
 
     /// An SGLang servicer's own vision verdict travels in `server_args`,

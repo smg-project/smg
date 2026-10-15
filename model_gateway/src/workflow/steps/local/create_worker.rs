@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use openai_protocol::{
     model_card::ModelCard,
     model_type::ModelType,
-    worker::{HealthCheckConfig, WorkerSpec, WorkerType},
+    worker::{ConstrainedDecoding, HealthCheckConfig, WorkerSpec, WorkerType},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -68,6 +68,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             labels.insert(key.clone(), value.clone());
         }
 
+        validate_constrained_decoding_label(&labels, &config.url)?;
         let (kv_connector, kv_role, kv_engine_id) = take_kv_transfer_metadata(config, &mut labels);
 
         let model_id = resolve_model_id(config, &labels);
@@ -310,6 +311,26 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
+    }
+}
+
+/// A `constrained_decoding` label, configured or discovered, must name a
+/// policy; a worker that would silently fall back to `requested` on a typo
+/// fails registration instead. The typed spec field needs no such check.
+fn validate_constrained_decoding_label(
+    labels: &HashMap<String, String>,
+    url: &str,
+) -> WorkflowResult<()> {
+    match labels.get(ConstrainedDecoding::LABEL) {
+        Some(value) => {
+            ConstrainedDecoding::parse(value)
+                .map(drop)
+                .map_err(|why| WorkflowError::StepFailed {
+                    step_id: StepId::new("create_worker"),
+                    message: format!("Worker {url}: {why}"),
+                })
+        }
+        None => Ok(()),
     }
 }
 
@@ -1959,5 +1980,28 @@ mod rank_window_tests {
         ]);
         assert_eq!(discovered(&attention, None), attention);
         assert_eq!(discovered(&attention, Some((0, 1))), attention);
+    }
+}
+
+#[cfg(test)]
+mod constrained_decoding_label_tests {
+    use std::collections::HashMap;
+
+    use super::validate_constrained_decoding_label;
+
+    /// A configured or discovered `constrained_decoding` label must name a
+    /// policy; anything else fails the registration with the reason.
+    #[test]
+    fn a_constrained_decoding_label_must_name_a_policy() {
+        let mut labels = HashMap::new();
+        assert!(validate_constrained_decoding_label(&labels, "http://w:8000").is_ok());
+        labels.insert("constrained_decoding".to_string(), "always".to_string());
+        assert!(validate_constrained_decoding_label(&labels, "http://w:8000").is_ok());
+        labels.insert("constrained_decoding".to_string(), "sometimes".to_string());
+        let message = validate_constrained_decoding_label(&labels, "http://w:8000")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("http://w:8000"), "{message}");
+        assert!(message.contains("'requested' or 'always'"), "{message}");
     }
 }

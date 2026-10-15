@@ -666,7 +666,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         except Exception:  # noqa: BLE001 — fall back gracefully.
             version = "unknown"
 
-        return tokenspeed_scheduler_pb2.GetServerInfoResponse(
+        info = tokenspeed_scheduler_pb2.GetServerInfoResponse(
             server_args=server_args_struct,
             scheduler_info=scheduler_info_struct,
             active_requests=len(self.async_llm.rid_to_state),
@@ -676,6 +676,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             start_time=start_timestamp,
             max_total_num_tokens=int(self.scheduler_info.get("max_total_num_tokens", 0)),
         )
+        # The engine's declared constrained-decoding policy, a field of its own:
+        # the gateway follows it per worker as the `constrained_decoding` label
+        # (a grammar on every turn, or only when the request asks). An engine
+        # that declares none, and a proto package predating the field, leave
+        # it out.
+        constrained_decoding = self._config.constrained_decoding
+        if constrained_decoding and "constrained_decoding" in info.DESCRIPTOR.fields_by_name:
+            info.constrained_decoding = constrained_decoding
+        return info
 
     # The in-flight pause probe, kept across calls. TokenSpeed answers the query
     # through a queueing communicator that resets its result state only after a

@@ -83,3 +83,17 @@ def test_server_info_carries_where_the_engine_starts_a_grammar(servicer_mod, mon
     assert plain["constrained_decoding_start"] == "first_token"
     assert "engine_reasoning_parser" not in plain
     assert plain["model"] == "m", "the other server args are reported as before"
+
+
+def test_server_info_reports_the_engines_constrained_decoding_policy(servicer_mod, monkeypatch):
+    """The engine's declared policy (a grammar on every turn) reaches the
+    gateway as a field of its own, spelled as the `constrained_decoding` label
+    reads it; an engine that declares none leaves the field at its default."""
+    always = _server_info(servicer_mod, monkeypatch, constrained_decoding="ALWAYS")
+    assert always.constrained_decoding == "always"
+    requested = _server_info(servicer_mod, monkeypatch, constrained_decoding="requested")
+    assert requested.constrained_decoding == "requested"
+    silent = _server_info(servicer_mod, monkeypatch)
+    assert silent.constrained_decoding == ""
+    unknown = _server_info(servicer_mod, monkeypatch, constrained_decoding="sometimes")
+    assert unknown.constrained_decoding == ""

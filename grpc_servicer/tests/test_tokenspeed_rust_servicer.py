@@ -1103,3 +1103,14 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     with pytest.raises(RuntimeError, match="scheduler would not start"):
         asyncio.run(rust.serve_rust(FakeServerArgs(port=50123)))
     assert events == ["serving:False", "stop:5.0"]
+
+
+def test_server_facts_carry_the_engines_constrained_decoding_policy(monkeypatch):
+    """The Rust servicer reports the engine's declared constrained-decoding
+    policy as the Python servicer does, from a field of the launcher's facts;
+    args that declare none leave it empty."""
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    always = rust.server_facts(SimpleNamespace(model="org/m", constrained_decoding="ALWAYS"))
+    assert always["constrained_decoding"] == "always"
+    assert rust.server_facts(FakeServerArgs())["constrained_decoding"] == ""

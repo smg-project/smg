@@ -596,6 +596,69 @@ impl JsonSchema for WorkerModels {
     }
 }
 
+/// When the gateway hands a worker's engine a grammar: only when the request
+/// asks for one (a forced tool choice or a JSON response format), which every
+/// worker does unless told otherwise, or on every turn, for a model trained
+/// to be read through one. Set on the worker spec, as the `constrained_decoding`
+/// worker label, or reported by the engine's servicer in server info; the spec
+/// wins over the labels, and a configured label over a discovered one
+/// ([`ConstrainedDecoding::of`]).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ConstrainedDecoding {
+    /// A grammar only when the request asks for one.
+    #[default]
+    Requested,
+    /// A grammar on every turn.
+    Always,
+}
+
+impl ConstrainedDecoding {
+    /// The worker label that carries the policy when it is not on the spec.
+    pub const LABEL: &'static str = "constrained_decoding";
+    /// The label's value for [`Self::Requested`].
+    pub const REQUESTED: &'static str = "requested";
+    /// The label's value for [`Self::Always`].
+    pub const ALWAYS: &'static str = "always";
+
+    /// The policy a label value names, or why it names none.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            Self::REQUESTED => Ok(Self::Requested),
+            Self::ALWAYS => Ok(Self::Always),
+            other => Err(format!(
+                "constrained_decoding must be '{}' or '{}', not '{other}'",
+                Self::REQUESTED,
+                Self::ALWAYS
+            )),
+        }
+    }
+
+    /// The policy a worker's `constrained_decoding` label names; anything
+    /// else, the label's absence included, is [`Self::Requested`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        value
+            .and_then(|value| Self::parse(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// The label value for the policy.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Requested => Self::REQUESTED,
+            Self::Always => Self::ALWAYS,
+        }
+    }
+
+    /// A worker's policy: the spec's when set, else its label's.
+    pub fn of(spec: &WorkerSpec) -> Self {
+        spec.constrained_decoding
+            .unwrap_or_else(|| Self::from_label(spec.labels.get(Self::LABEL).map(String::as_str)))
+    }
+}
+
 // ── Core identity ────────────────────────────────────────────────────
 
 /// Core worker identity and configuration.
@@ -696,6 +759,13 @@ pub struct WorkerSpec {
     /// descriptor from the worker's discovered labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_protocol: Option<String>,
+    /// When the gateway hands this worker's engine a grammar: `always` for a
+    /// model read through one on every turn, `requested` (the default) for a
+    /// grammar only when the request asks. The same value can arrive as a
+    /// `constrained_decoding` worker label or from the engine's servicer in
+    /// server info; this field wins ([`ConstrainedDecoding::of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_decoding: Option<ConstrainedDecoding>,
 
     /// Per-worker health check overrides (partial — only `Some` fields override router defaults).
     #[serde(default, skip_serializing_if = "HealthCheckUpdate::is_empty")]
@@ -769,6 +839,7 @@ impl WorkerSpec {
             kv_engine_id: None,
             kv_block_size: None,
             pairing_protocol: None,
+            constrained_decoding: None,
             health: HealthCheckUpdate::default(),
             http_pool: HttpPoolConfig::default(),
             resilience: ResilienceUpdate::default(),
@@ -1922,5 +1993,78 @@ mod aggregate_rollup_tests {
 
         assert_eq!(aggregate.total_running_reqs, i32::MAX);
         assert_eq!(aggregate.total_reqs, i32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod constrained_decoding_tests {
+    use super::*;
+
+    /// A label names one of the two policies or nothing; the spec's typed
+    /// value wins over the label; absent everywhere, a worker is `requested`.
+    #[test]
+    fn constrained_decoding_resolves_spec_then_label() {
+        assert_eq!(
+            ConstrainedDecoding::parse("always"),
+            Ok(ConstrainedDecoding::Always)
+        );
+        assert_eq!(
+            ConstrainedDecoding::parse(" requested "),
+            Ok(ConstrainedDecoding::Requested)
+        );
+        assert!(ConstrainedDecoding::parse("sometimes")
+            .unwrap_err()
+            .contains("'requested' or 'always'"));
+        assert_eq!(
+            ConstrainedDecoding::from_label(None),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(
+            ConstrainedDecoding::from_label(Some("always")),
+            ConstrainedDecoding::Always
+        );
+        assert_eq!(
+            ConstrainedDecoding::from_label(Some("sometimes")),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(ConstrainedDecoding::Always.as_label(), "always");
+
+        let mut spec = WorkerSpec::new("http://w:8000");
+        assert_eq!(
+            ConstrainedDecoding::of(&spec),
+            ConstrainedDecoding::Requested
+        );
+        spec.labels
+            .insert(ConstrainedDecoding::LABEL.to_string(), "always".to_string());
+        assert_eq!(ConstrainedDecoding::of(&spec), ConstrainedDecoding::Always);
+        spec.constrained_decoding = Some(ConstrainedDecoding::Requested);
+        assert_eq!(
+            ConstrainedDecoding::of(&spec),
+            ConstrainedDecoding::Requested
+        );
+    }
+
+    /// The spec field round-trips through JSON in the label's spelling and is
+    /// left out when unset.
+    #[test]
+    fn constrained_decoding_serializes_as_its_label_value() {
+        let mut spec = WorkerSpec::new("http://w:8000");
+        assert!(!serde_json::to_string(&spec)
+            .unwrap()
+            .contains("constrained_decoding"));
+        spec.constrained_decoding = Some(ConstrainedDecoding::Always);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["constrained_decoding"], "always");
+        let parsed: WorkerSpec =
+            serde_json::from_str(r#"{"url":"http://w:8000","constrained_decoding":"requested"}"#)
+                .unwrap();
+        assert_eq!(
+            parsed.constrained_decoding,
+            Some(ConstrainedDecoding::Requested)
+        );
+        assert!(serde_json::from_str::<WorkerSpec>(
+            r#"{"url":"http://w:8000","constrained_decoding":"sometimes"}"#
+        )
+        .is_err());
     }
 }

@@ -379,6 +379,7 @@ impl TokenSpeedScheduler for MockScheduler {
             max_total_num_tokens: 1_000_000,
             tokenspeed_version: "mock".to_string(),
             start_time: None,
+            constrained_decoding: String::new(),
         }))
     }
 

@@ -210,6 +210,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         ),
         "scheduler_info_json": json.dumps({"shm_namespace_id": _shm_namespace_id()}),
         "tokenspeed_version": str(tokenspeed_version),
+        "constrained_decoding": EngineConfigView(server_args).constrained_decoding,
         "max_running_requests": running_window(server_args),
         "data_parallel_size": dp_size or 1,
         "kv_events_endpoint": kv_events.endpoint if kv_events else "",

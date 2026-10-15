@@ -6,7 +6,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView, ModelConfigSection
+from smg_grpc_servicer.tokenspeed.config_view import (
+    EngineConfigView,
+    ModelConfigSection,
+    constrained_decoding_policy,
+)
 
 
 def _server_args(**overrides):
@@ -164,3 +168,22 @@ def test_a_fresh_view_reads_a_weight_version_written_back_onto_the_args():
     args.weight_version = "v8"
     assert earlier.server_args.weight_version == "v7"
     assert EngineConfigView(args).server_args.weight_version == "v8"
+
+
+def test_constrained_decoding_policy_is_spelled_as_the_gateway_reads_it():
+    assert constrained_decoding_policy("always") == "always"
+    assert constrained_decoding_policy(" Always ") == "always"
+    assert constrained_decoding_policy("requested") == "requested"
+    assert constrained_decoding_policy(None) == ""
+    assert constrained_decoding_policy("") == ""
+    assert constrained_decoding_policy("sometimes") == ""
+
+
+def test_constrained_decoding_comes_off_the_server_args_then_the_model_config():
+    args = SimpleNamespace(model="org/m", constrained_decoding="always")
+    model = SimpleNamespace(constrained_decoding="requested")
+    assert EngineConfigView(args, model).constrained_decoding == "always"
+    assert EngineConfigView(SimpleNamespace(model="org/m"), model).constrained_decoding == (
+        "requested"
+    )
+    assert EngineConfigView(SimpleNamespace(model="org/m")).constrained_decoding == ""

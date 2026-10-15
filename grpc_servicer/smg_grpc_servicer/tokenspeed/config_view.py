@@ -28,6 +28,18 @@ def _positive_int(value: Any) -> int | None:
     return value
 
 
+CONSTRAINED_DECODING_POLICIES = ("requested", "always")
+
+
+def constrained_decoding_policy(value: Any) -> str:
+    """The engine's declared constrained-decoding policy as the gateway spells
+    it: ``always`` for a grammar on every turn, ``requested`` for one only when
+    the request asks; ``""`` when the engine declares none, or something the
+    gateway would not read (it then treats the worker as ``requested``)."""
+    text = str(value or "").strip().lower()
+    return text if text in CONSTRAINED_DECODING_POLICIES else ""
+
+
 @dataclasses.dataclass(frozen=True)
 class ServerArgsSection:
     """``ServerArgs``: the model's names and the knobs the servicers read."""
@@ -48,6 +60,8 @@ class ServerArgsSection:
     max_total_num_tokens: int
     kv_events_config: Any
     disaggregation_mode: str
+    # The engine's declared constrained-decoding policy, ``""`` when it declares none.
+    constrained_decoding: str
 
     @classmethod
     def read(cls, server_args: Any) -> ServerArgsSection:
@@ -78,6 +92,9 @@ class ServerArgsSection:
             max_total_num_tokens=int(getattr(server_args, "max_total_num_tokens", 0) or 0),
             kv_events_config=getattr(server_args, "kv_events_config", None),
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
+            constrained_decoding=constrained_decoding_policy(
+                getattr(server_args, "constrained_decoding", None)
+            ),
         )
 
 
@@ -137,6 +154,14 @@ class EngineConfigView:
     @cached_property
     def model(self) -> ModelConfigSection:
         return ModelConfigSection.read(self._model_config)
+
+    @cached_property
+    def constrained_decoding(self) -> str:
+        """The engine's declared policy (``constrained_decoding_policy``): the
+        server args' when they carry one, else the model config's."""
+        return self.server_args.constrained_decoding or constrained_decoding_policy(
+            getattr(self._model_config, "constrained_decoding", None)
+        )
 
     @cached_property
     def model_dtype(self) -> Any:

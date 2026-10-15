@@ -71,6 +71,11 @@ pub struct TokenSpeedModelInfo {
     /// `shm_namespace_id`); the handshake supplies the capacity figures.
     pub scheduler_info_json: String,
     pub tokenspeed_version: String,
+    /// The engine's declared constrained-decoding policy (`always`, `requested`,
+    /// or "" when it declares none), reported as
+    /// `GetServerInfo.constrained_decoding` for the Router's `constrained_decoding`
+    /// label.
+    pub constrained_decoding: String,
     /// The scheduler's admission window (`max_num_seqs`), reported as
     /// `max_running_requests`; the handshake's figure is the fallback.
     pub max_running_requests: i32,

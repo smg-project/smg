@@ -852,6 +852,29 @@ async fn requests_without_token_ids_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The launcher's constrained-decoding policy (the engine's declaration that
+/// it takes a grammar on every turn) reaches `GetServerInfo` as a field of its
+/// own, for the Router's `constrained_decoding` label.
+#[tokio::test]
+async fn server_info_reports_the_engines_constrained_decoding_policy() {
+    let mut h = harness(
+        TokenSpeedModelInfo {
+            constrained_decoding: "always".to_string(),
+            ..model_info()
+        },
+        None,
+    )
+    .await;
+    let info = h
+        .client
+        .get_server_info(ts::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.constrained_decoding, "always");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The info RPCs report the launcher's facts, with the handshake's capacity
 /// figures under `scheduler_info`, and the loads the scheduler piggybacks on
 /// its output (zero-filled per rank before any step).
@@ -879,6 +902,9 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         .await
         .unwrap()
         .into_inner();
+    // A launcher that reports no constrained-decoding policy leaves the field
+    // at its default; the Router then sets no `constrained_decoding` label.
+    assert_eq!(info.constrained_decoding, "");
     let server_args = info.server_args.expect("server_args");
     assert_eq!(
         server_args.fields["dp_size"].kind,

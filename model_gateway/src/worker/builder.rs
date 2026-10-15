@@ -3,7 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{
+        ConstrainedDecoding, HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec,
+        WorkerStatus,
+    },
 };
 use tokio::sync::mpsc;
 
@@ -252,6 +255,14 @@ impl BasicWorkerBuilder {
     /// Set KV transfer engine id (vLLM `kv_transfer_config.engine_id`)
     pub fn kv_engine_id(mut self, engine_id: impl Into<String>) -> Self {
         self.spec.kv_engine_id = Some(engine_id.into());
+        self
+    }
+
+    /// Set when the gateway hands this worker's engine a grammar: on every turn,
+    /// or only when the request asks ([`ConstrainedDecoding`]). Unset, the
+    /// worker's `constrained_decoding` label decides.
+    pub fn constrained_decoding(mut self, policy: ConstrainedDecoding) -> Self {
+        self.spec.constrained_decoding = Some(policy);
         self
     }
 
