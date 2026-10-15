@@ -2311,6 +2311,35 @@ fn m3_null_properties_cost_no_element() {
     let members = first_invoke(&tag)["elements"].clone();
     assert_eq!(members.as_array().map(Vec::len), Some(2));
     assert_eq!(members[1], expected_element("path", expected_text("path")));
+
+    // A null after the last writer of an object that spent the budget adds nothing: no free-text
+    // tail after the typed top-level arguments, whether the budget ran out below (the wide
+    // property) or exactly on the last writer (1,024 strings).
+    let mut properties = serde_json::Map::new();
+    properties.insert("config".to_string(), fan_out(8, 4));
+    properties.insert("path".to_string(), json!({"type": "string"}));
+    properties.insert("zz".to_string(), json!({"type": "null"}));
+    let tool = schema_tool(json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["config", "path", "zz"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(members.as_array().map(Vec::len), Some(2), "{members}");
+    assert_eq!(members[1], expected_element("path", expected_text("path")));
+    assert_eq!(elements_written(&tag), 1024);
+    let mut properties = serde_json::Map::new();
+    for i in 0..1024 {
+        properties.insert(format!("s{i:04}"), json!({"type": "string"}));
+    }
+    properties.insert("zz".to_string(), json!({"type": "null"}));
+    let required: Vec<String> = properties.keys().cloned().collect();
+    let tool =
+        schema_tool(json!({"type": "object", "properties": properties, "required": required}));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    assert_eq!(elements_written(&tag), 1024);
+    assert_eq!(free_text_runs(&tag), 0, "no tail after the last string");
 }
 
 /// The keys of an object's elements, in order: the key each opening tag spells, an optional

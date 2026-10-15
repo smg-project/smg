@@ -766,11 +766,18 @@ impl<'a> Elements<'a> {
     fn writes_an_element(&mut self, schema: &'a Value, depth: usize) -> bool {
         match self.how(schema, depth) {
             None => false,
-            Some(Writes::FreeText) => true,
-            Some(Writes::Typed { pushed, .. }) => {
-                self.unwind(pushed);
+            Some(writes) => {
+                self.leaves(writes);
                 true
             }
+        }
+    }
+
+    /// A value classified and not written: its references, if [`Self::how`] followed any, off
+    /// the path again.
+    fn leaves(&mut self, writes: Writes<'a>) {
+        if let Writes::Typed { pushed, .. } = writes {
+            self.unwind(pushed);
         }
     }
 
@@ -892,14 +899,16 @@ impl<'a> Elements<'a> {
     /// One element: the separator and `<key>`, the value, the separator and
     /// `</key>`, one element off the budget, with `later` held for the
     /// properties after it while its value is written; nothing for a property
-    /// typed `null`, at no cost; no element once the budget is spent.
+    /// typed `null`, at no cost and whatever the budget; no element once the
+    /// budget is spent.
     fn element(&mut self, key: &str, schema: &'a Value, depth: usize, later: usize) -> Element {
-        if !self.has_an_element() {
-            return Element::Spent;
-        }
         let Some(writes) = self.how(schema, depth) else {
             return Element::Nothing;
         };
+        if !self.has_an_element() {
+            self.leaves(writes);
+            return Element::Spent;
+        }
         self.take_an_element();
         self.reserved += later;
         let value = self.value(&format!("</{key}>"), writes);
