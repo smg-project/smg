@@ -19,6 +19,7 @@ use openai_protocol::common::Tool;
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
 
+pub use self::output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling};
 use crate::{
     format::{CallSyntax, Emits, Format},
     shape::{Layout, Message},
@@ -28,6 +29,7 @@ use crate::{
 mod attributed;
 mod gemma;
 mod keyed;
+mod output;
 mod pythonic;
 mod schema;
 mod shaped;
