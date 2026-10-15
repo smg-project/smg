@@ -255,6 +255,11 @@ message GenerateStreamChunk {
   // Weight version that produced these tokens, as the engine reports it.
   // Unset on engines that predate the field.
   optional string weight_version = 7;
+
+  // Prompt logprobs (requested with logprob_start_len >= 0): set on the one
+  // chunk that follows the prompt's scoring. Unset on engines that predate
+  // the field.
+  InputLogProbs input_logprobs = 8;
 }
 
 message GenerateComplete {
@@ -283,6 +288,10 @@ message GenerateComplete {
   // Weight version that produced this completion, as the engine reports it.
   // Unset on engines that predate the field.
   optional string weight_version = 12;
+
+  // Prompt logprobs (requested with logprob_start_len >= 0) of the whole
+  // scored prompt. Unset on engines that predate the field.
+  InputLogProbs input_logprobs = 13;
 }
 
 message OutputLogProbs {
@@ -294,6 +303,20 @@ message OutputLogProbs {
 message TopLogProbs {
   repeated float values = 1;
   repeated uint32 token_ids = 2;
+}
+
+// Prompt logprobs from logprob_start_len on: one entry per prompt token.
+message InputLogProbs {
+  repeated InputTokenLogProb token_logprobs = 1;
+  repeated uint32 token_ids = 2;
+  // The top alternatives at each position (empty where none were asked for,
+  // and at the first position).
+  repeated TopLogProbs top_logprobs = 3;
+}
+
+// Unset for the first scored position, which has no context to predict it.
+message InputTokenLogProb {
+  optional float value = 1;
 }
 
 // =====================

@@ -1861,6 +1861,7 @@ mod request_release_tests {
                     output_logprobs: None,
                     index: 0,
                     weight_version: None,
+                    input_logprobs: None,
                 })),
             }),
             Ok(ts::GenerateResponse {

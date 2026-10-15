@@ -138,6 +138,7 @@ pub fn to_tokenspeed_response(
             output_logprobs: logprobs(chunk.output_logprobs),
             weight_version: None,
             index: chunk.index,
+            input_logprobs: None,
         }),
         Response::Complete(complete) => {
             use tokenspeed_proto::generate_complete::MatchedStop as TsMatchedStop;

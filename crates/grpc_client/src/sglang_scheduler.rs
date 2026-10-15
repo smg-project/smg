@@ -653,7 +653,8 @@ impl SglangSchedulerClient {
             mm_inputs: None,
             sampling_params: Some(sampling_params),
             return_logprob: body.logprobs.is_some(),
-            logprob_start_len: -1,
+            // `echo` with `logprobs` scores the whole prompt.
+            logprob_start_len: if body.wants_prompt_logprobs() { 0 } else { -1 },
             top_logprobs_num: body.logprobs.unwrap_or(0) as i32,
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
@@ -933,6 +934,35 @@ mod tests {
         assert_eq!(params.repetition_penalty, 1.0);
         assert_eq!(params.n, 1);
         assert!(params.constraint.is_none() && params.logit_bias.is_empty());
+    }
+
+    #[test]
+    fn echo_with_logprobs_scores_the_prompt_from_its_start() {
+        for (echo, logprobs, start) in [
+            (true, Some(5_u32), 0),
+            (false, Some(5), -1),
+            (true, None, -1),
+        ] {
+            let body: CompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "prompt": "hi",
+                "echo": echo,
+                "logprobs": logprobs,
+            }))
+            .expect("completion request");
+            let request = SglangSchedulerClient::build_generate_request_from_completion_parts(
+                "r".to_string(),
+                &body,
+                String::new(),
+                vec![1, 2],
+            )
+            .expect("generate request");
+            assert_eq!(
+                request.logprob_start_len, start,
+                "echo={echo} logprobs={logprobs:?}"
+            );
+            assert_eq!(request.top_logprobs_num, logprobs.unwrap_or(0) as i32);
+        }
     }
 
     #[test]

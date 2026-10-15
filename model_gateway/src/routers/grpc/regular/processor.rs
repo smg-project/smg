@@ -12,7 +12,9 @@ use llm_tokenizer::{
 };
 use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionResponse},
-    common::{ChatLogProbs, FunctionCallResponse, Tool, ToolCall, ToolChoice, ToolChoiceValue},
+    common::{
+        ChatLogProbs, FunctionCallResponse, LogProbs, Tool, ToolCall, ToolChoice, ToolChoiceValue,
+    },
     completion::{CompletionChoice, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateResponse},
     messages::{self, Message},
@@ -1125,10 +1127,10 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         completion_req: CompletionResponseSpec,
         dispatch: DispatchMetadata,
-        _tokenizer: Arc<dyn Tokenizer>,
+        tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
-        let request_logprobs = completion_req.logprobs;
+        let request_logprobs = completion_req.logprobs.is_some();
         let per_prompt_results = match execution_result {
             ExecutionResult::Batch { results } => results,
             other => vec![other],
@@ -1266,10 +1268,23 @@ impl ResponseProcessor {
                     text.push_str(sfx);
                 }
 
+                let logprobs = completion_req
+                    .logprobs
+                    .map(|top_k| {
+                        completion_choice_logprobs(
+                            &complete,
+                            top_k,
+                            completion_req.echo.then_some(prompt_text),
+                            &tokenizer,
+                            completion_req.skip_special_tokens,
+                        )
+                    })
+                    .transpose()?;
+
                 choices.push(CompletionChoice {
                     text,
                     index: index_offset + i as u32,
-                    logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
+                    logprobs,
                     finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
                     matched_stop,
                 });
@@ -1332,6 +1347,33 @@ fn eager_token_ends(
         ends.push(observed.len().min(text.len()));
     }
     observed.starts_with(text).then_some(ends)
+}
+
+/// The legacy logprobs of one completion choice: with `echo` (the prompt's
+/// text as echoed) the prompt's tokens, then the generated ones. An echoed
+/// prompt the backend returned no logprobs for is refused rather than
+/// answered with positions missing.
+fn completion_choice_logprobs(
+    complete: &ProtoGenerateComplete,
+    top_k: u32,
+    echo: Option<&str>,
+    tokenizer: &Arc<dyn Tokenizer>,
+    skip_special_tokens: bool,
+) -> Result<LogProbs, axum::response::Response> {
+    let mut logprobs = utils::CompletionLogprobs::new(tokenizer, top_k, skip_special_tokens);
+    if let Some(prompt_text) = echo {
+        logprobs
+            .push_echo(
+                complete.input_logprobs(),
+                complete.prompt_tokens(),
+                prompt_text,
+            )
+            .map_err(utils::PromptLogprobsError::into_response)?;
+    }
+    if let Some(output) = complete.output_logprobs() {
+        logprobs.push_output(&output);
+    }
+    Ok(logprobs.finish())
 }
 
 /// Tokens of the output whose text overlaps the reasoning span, given the

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use serde_json::{Map, Value};
 use validator::Validate;
 
@@ -21,9 +24,10 @@ pub struct CompletionRequest {
     /// ID of the model to use (required for OpenAI, optional for some serving engines)
     pub model: String,
 
-    /// The prompt(s) to generate completions for
+    /// The prompt(s) to generate completions for: a string, an array of
+    /// strings, an array of token ids, or an array of token id arrays
     #[validate(custom(function = "validate_completion_prompt"))]
-    pub prompt: StringOrArray,
+    pub prompt: CompletionPrompt,
 
     /// Generates `best_of` completions server-side and returns the "best"
     #[validate(range(min = 0, max = 20))]
@@ -152,16 +156,36 @@ pub struct CompletionRequest {
 
 impl Normalizable for CompletionRequest {}
 
-fn validate_completion_prompt(prompt: &StringOrArray) -> Result<(), validator::ValidationError> {
-    match prompt {
-        StringOrArray::String(_) => {}
-        StringOrArray::Array(arr) => {
-            if arr.is_empty() {
-                let mut error = validator::ValidationError::new("prompt_empty");
-                error.message = Some("prompt array cannot be empty".into());
-                return Err(error);
+impl CompletionRequest {
+    /// Whether the response carries the prompt's logprobs: `echo` with
+    /// `logprobs` returns every prompt token with its logprob ahead of the
+    /// generated ones.
+    pub fn wants_prompt_logprobs(&self) -> bool {
+        self.echo && self.logprobs.is_some()
+    }
+}
+
+fn validate_completion_prompt(prompt: &CompletionPrompt) -> Result<(), validator::ValidationError> {
+    let message = match prompt {
+        CompletionPrompt::Text(_) => None,
+        CompletionPrompt::Texts(texts) => {
+            texts.is_empty().then_some("prompt array cannot be empty")
+        }
+        CompletionPrompt::TokenIds(ids) => ids.is_empty().then_some("prompt array cannot be empty"),
+        CompletionPrompt::TokenIdBatches(batches) => {
+            if batches.is_empty() {
+                Some("prompt array cannot be empty")
+            } else if batches.iter().any(Vec::is_empty) {
+                Some("a token id prompt cannot be empty")
+            } else {
+                None
             }
         }
+    };
+    if let Some(message) = message {
+        let mut error = validator::ValidationError::new("prompt_empty");
+        error.message = Some(message.into());
+        return Err(error);
     }
 
     Ok(())
@@ -237,10 +261,158 @@ impl GenerationRequest for CompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
+        // Token ids route on their decimal rendering, as `/generate`'s do.
         match &self.prompt {
-            StringOrArray::String(s) => s.clone(),
-            StringOrArray::Array(v) => v.join(" "),
+            CompletionPrompt::Text(s) => s.clone(),
+            CompletionPrompt::Texts(v) => v.join(" "),
+            CompletionPrompt::TokenIds(v) => join_ids(v.iter()),
+            CompletionPrompt::TokenIdBatches(v) => join_ids(v.iter().flatten()),
         }
+    }
+}
+
+// ============================================================================
+// Prompt
+// ============================================================================
+
+/// The `prompt` of a completion request: one text, a batch of texts, one
+/// prompt of token ids, or a batch of token-id prompts.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    Text(String),
+    Texts(Vec<String>),
+    TokenIds(Vec<u32>),
+    TokenIdBatches(Vec<Vec<u32>>),
+}
+
+impl CompletionPrompt {
+    /// The number of prompts: a batch counts its members, the others one.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Text(_) | Self::TokenIds(_) => 1,
+            Self::Texts(texts) => texts.len(),
+            Self::TokenIdBatches(batches) => batches.len(),
+        }
+    }
+
+    /// Whether the prompt is an empty batch.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Shape probe for the first element of an array `prompt`: it alone picks
+/// the variant, so a mixed array is refused with the element that breaks it.
+enum FirstPromptItem {
+    Text(String),
+    Id(u32),
+    Ids(Vec<u32>),
+}
+
+impl<'de> Deserialize<'de> for FirstPromptItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FirstPromptItemVisitor;
+
+        impl<'de> Visitor<'de> for FirstPromptItemVisitor {
+            type Value = FirstPromptItem;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string, a token id or an array of token ids")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(FirstPromptItem::Text(v.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(FirstPromptItem::Text(v))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u32::try_from(v)
+                    .map(FirstPromptItem::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(v), &"a token id"))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                u32::try_from(v)
+                    .map(FirstPromptItem::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Signed(v), &"a token id"))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(FirstPromptItem::Ids)
+            }
+        }
+
+        deserializer.deserialize_any(FirstPromptItemVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompletionPrompt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CompletionPromptVisitor;
+
+        impl<'de> Visitor<'de> for CompletionPromptVisitor {
+            type Value = CompletionPrompt;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a string, an array of strings, an array of token ids or an array of token id arrays",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CompletionPrompt::Text(v.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(CompletionPrompt::Text(v))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // An empty array parses; validation refuses it by name.
+                let Some(first) = seq.next_element::<FirstPromptItem>()? else {
+                    return Ok(CompletionPrompt::Texts(Vec::new()));
+                };
+                let capacity = seq.size_hint().unwrap_or(0).saturating_add(1);
+                match first {
+                    FirstPromptItem::Text(text) => {
+                        let mut texts = Vec::with_capacity(capacity);
+                        texts.push(text);
+                        while let Some(text) = seq.next_element()? {
+                            texts.push(text);
+                        }
+                        Ok(CompletionPrompt::Texts(texts))
+                    }
+                    FirstPromptItem::Id(id) => {
+                        let mut ids = Vec::with_capacity(capacity);
+                        ids.push(id);
+                        while let Some(id) = seq.next_element()? {
+                            ids.push(id);
+                        }
+                        Ok(CompletionPrompt::TokenIds(ids))
+                    }
+                    FirstPromptItem::Ids(head) => {
+                        let mut batches = Vec::with_capacity(capacity);
+                        batches.push(head);
+                        while let Some(ids) = seq.next_element()? {
+                            batches.push(ids);
+                        }
+                        Ok(CompletionPrompt::TokenIdBatches(batches))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_any(CompletionPromptVisitor)
     }
 }
 
@@ -405,5 +577,98 @@ mod tests {
         assert!(back.ignore_eos);
         assert!(back.return_hidden_states);
         assert!(!back.skip_special_tokens);
+    }
+
+    fn prompt(value: Value) -> Result<CompletionPrompt, String> {
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn every_prompt_shape_parses_and_round_trips() {
+        for (value, want) in [
+            (serde_json::json!("hi"), CompletionPrompt::Text("hi".into())),
+            (
+                serde_json::json!(["a", "b"]),
+                CompletionPrompt::Texts(vec!["a".into(), "b".into()]),
+            ),
+            (
+                serde_json::json!([1, 2, 3]),
+                CompletionPrompt::TokenIds(vec![1, 2, 3]),
+            ),
+            (
+                serde_json::json!([[1, 2], [3]]),
+                CompletionPrompt::TokenIdBatches(vec![vec![1, 2], vec![3]]),
+            ),
+        ] {
+            let parsed = prompt(value.clone()).expect("prompt must parse");
+            assert_eq!(parsed, want);
+            assert_eq!(serde_json::to_value(&parsed).expect("serialize"), value);
+        }
+        assert_eq!(
+            prompt(serde_json::json!([[1], [2], [3]])).map(|p| p.len()),
+            Ok(3)
+        );
+        assert_eq!(prompt(serde_json::json!([7, 8])).map(|p| p.len()), Ok(1));
+    }
+
+    #[test]
+    fn a_prompt_of_mixed_or_invalid_shape_is_refused_by_its_element() {
+        for (value, want) in [
+            (serde_json::json!(["a", 1]), "expected a string"),
+            (serde_json::json!([1, "a"]), "expected u32"),
+            (serde_json::json!([[1], "a"]), "expected a sequence"),
+            (serde_json::json!([[1], 2]), "expected a sequence"),
+            (serde_json::json!([-1]), "expected a token id"),
+            (serde_json::json!([1, -1]), "expected u32"),
+            (serde_json::json!([4294967296u64]), "expected a token id"),
+            (serde_json::json!([1.5]), "expected a string, a token id"),
+            (serde_json::json!(7), "expected a string, an array"),
+        ] {
+            let error = prompt(value.clone()).expect_err("prompt must be refused");
+            assert!(error.contains(want), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_empty_prompt_array_is_refused_by_validation() {
+        for (value, message) in [
+            (serde_json::json!([]), "prompt array cannot be empty"),
+            (
+                serde_json::json!([[1], []]),
+                "a token id prompt cannot be empty",
+            ),
+            (serde_json::json!([[]]), "a token id prompt cannot be empty"),
+        ] {
+            let request = req(serde_json::json!({"prompt": value}));
+            let error = request
+                .validate()
+                .expect_err("empty prompt must be refused");
+            assert!(error.to_string().contains(message), "{value}: {error}");
+        }
+        assert!(req(serde_json::json!({"prompt": [1, 2]}))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn a_token_id_prompt_with_echo_and_logprobs_parses() {
+        // A client that scores a fixed token sequence sends it as token ids.
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": [11, 22, 33, 44],
+            "echo": true,
+            "logprobs": 5,
+            "max_tokens": 1,
+            "temperature": 0
+        }))
+        .expect("request must deserialize");
+        assert_eq!(
+            request.prompt,
+            CompletionPrompt::TokenIds(vec![11, 22, 33, 44])
+        );
+        assert!(request.echo);
+        assert_eq!(request.logprobs, Some(5));
+        assert!(request.validate().is_ok());
+        assert_eq!(request.extract_text_for_routing(), "11 22 33 44");
     }
 }

@@ -745,7 +745,7 @@ mod tests {
     fn minimal_completion_request() -> CompletionRequest {
         CompletionRequest {
             model: String::new(),
-            prompt: StringOrArray::String(String::new()),
+            prompt: openai_protocol::completion::CompletionPrompt::Text(String::new()),
             best_of: None,
             echo: false,
             frequency_penalty: None,

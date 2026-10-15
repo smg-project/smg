@@ -18,8 +18,8 @@ use futures_util::StreamExt;
 use memchr::memmem;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{GenerationRequest, InputIds, StringOrArray},
-    completion::CompletionRequest,
+    common::{GenerationRequest, InputIds},
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
     rerank::RerankRequest,
@@ -359,12 +359,14 @@ impl PDRouter {
     }
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
-        if let StringOrArray::Array(arr) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
+        match &req.prompt {
+            CompletionPrompt::Texts(_) | CompletionPrompt::TokenIdBatches(_)
+                if !req.prompt.is_empty() =>
+            {
+                Some(req.prompt.len())
             }
+            _ => None,
         }
-        None
     }
 
     // Static key strings to avoid per-request allocations
@@ -2931,8 +2933,11 @@ impl RouterTrait for PDRouter {
 
         let request_text = if self.policies_need_request_text() {
             match &body.prompt {
-                StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
+                CompletionPrompt::Text(s) => Some(s.clone()),
+                CompletionPrompt::Texts(v) => v.first().map(|s| s.to_string()),
+                CompletionPrompt::TokenIds(_) | CompletionPrompt::TokenIdBatches(_) => {
+                    Some(body.extract_text_for_routing())
+                }
             }
         } else {
             None
