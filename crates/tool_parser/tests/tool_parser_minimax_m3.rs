@@ -1947,3 +1947,171 @@ async fn m3_outputs_the_grammar_admits_parse_back() {
         );
     }
 }
+
+/// The first invoke's content of a tag.
+fn first_invoke(tag: &serde_json::Value) -> serde_json::Value {
+    tag["format"]["elements"][1]["tags"][0]["content"]["tags"][0]["content"].clone()
+}
+
+/// Free text up to the element's closing tag: what an untyped or recurring value is written as.
+fn expected_free_text(key: &str) -> serde_json::Value {
+    let close = format!("</{key}>");
+    let mut excludes = vec![close.as_str()];
+    excludes.extend(exits());
+    json!({"type": "any_text", "excludes": excludes})
+}
+
+fn schema_tool(parameters: serde_json::Value) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "t".to_string(),
+            description: None,
+            parameters,
+            strict: None,
+            extra: Default::default(),
+        },
+    }
+}
+
+/// A reference back into a schema being written is written as free text where it recurs, so
+/// the tag stays bounded: the self-referencing root (a bare `#` is refused, as it would name
+/// the fragment's own document), a mutually recursive pair of definitions, a filter whose lists
+/// and negation hold filters, and a definition two sibling properties share, written twice.
+#[test]
+fn m3_references_that_recur_are_written_once_then_as_free_text() {
+    let size = |tag: &serde_json::Value| serde_json::to_string(tag).unwrap().len();
+
+    let root = schema_tool(json!({
+        "type": "object",
+        "properties": {"a": {"$ref": "#"}, "b": {"$ref": "#"}, "c": {"$ref": "#"}},
+        "required": ["a", "b", "c"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[root], true);
+    assert!(size(&tag) < 4096, "{} bytes", size(&tag));
+    let elements = first_invoke(&tag)["elements"].clone();
+    assert_eq!(elements.as_array().unwrap().len(), 3);
+    for key in ["a", "b", "c"] {
+        let element = elements
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|element| element["elements"][0]["value"] == format!("{NS}<{key}>"))
+            .unwrap();
+        assert_eq!(
+            element["elements"][1],
+            expected_free_text(key),
+            "a bare `#` is refused"
+        );
+    }
+
+    let pair = schema_tool(json!({
+        "type": "object",
+        "$defs": {
+            "A": {"type": "object", "properties": {"b": {"$ref": "#/$defs/B"}, "x": {"type": "string"}}, "required": ["b", "x"]},
+            "B": {"type": "object", "properties": {"a": {"$ref": "#/$defs/A"}, "y": {"type": "integer"}}, "required": ["a", "y"]},
+        },
+        "properties": {"start": {"$ref": "#/$defs/A"}},
+        "required": ["start"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[pair], true);
+    assert!(size(&tag) < 4096, "{} bytes", size(&tag));
+    let start = first_invoke(&tag)["elements"][0].clone();
+    let a_members = &start["elements"][1]["elements"];
+    assert_eq!(a_members[1], expected_element("x", expected_text("x")));
+    let b_members = &a_members[0]["elements"][1]["elements"];
+    assert_eq!(
+        b_members[0],
+        expected_element("a", expected_free_text("a")),
+        "A re-entered through B is free text"
+    );
+    assert_eq!(
+        b_members[1],
+        expected_element(
+            "y",
+            json!({"type": "json_schema", "json_schema": {"type": "integer"}})
+        )
+    );
+
+    let filter = schema_tool(json!({
+        "type": "object",
+        "$defs": {"Filter": {
+            "type": "object",
+            "properties": {
+                "field": {"type": "string"},
+                "and": {"type": "array", "items": {"$ref": "#/$defs/Filter"}},
+                "or": {"type": "array", "items": {"$ref": "#/$defs/Filter"}},
+                "not": {"$ref": "#/$defs/Filter"},
+            },
+        }},
+        "properties": {"filter": {"$ref": "#/$defs/Filter"}},
+        "required": ["filter"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[filter], true);
+    assert!(size(&tag) < 8192, "{} bytes", size(&tag));
+    let members = first_invoke(&tag)["elements"][0]["elements"][1]["elements"].clone();
+    assert_eq!(
+        members[1]["content"]["elements"][1],
+        json!({"type": "star", "content": expected_element("item", expected_free_text("item"))}),
+        "a list of filters inside a filter holds free-text items"
+    );
+    assert_eq!(
+        members[3]["content"],
+        expected_element("not", expected_free_text("not")),
+        "a filter inside a filter is free text"
+    );
+
+    let twice = schema_tool(json!({
+        "type": "object",
+        "$defs": {"Point": {"type": "object", "properties": {"x": {"type": "number"}}, "required": ["x"]}},
+        "properties": {"home": {"$ref": "#/$defs/Point"}, "work": {"$ref": "#/$defs/Point"}},
+        "required": ["home", "work"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[twice], true);
+    let point = json!({"type": "sequence", "elements": [
+        expected_element("x", json!({"type": "json_schema", "json_schema": {"type": "number"}})),
+    ]});
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(members[0], expected_element("home", point.clone()));
+    assert_eq!(
+        members[1],
+        expected_element("work", point),
+        "a shared definition is no cycle"
+    );
+}
+
+/// A number's schema that still holds a local reference travels with the root's definitions, so
+/// the engine, which compiles the fragment alone, can resolve the pointer.
+#[test]
+fn m3_number_fragments_carry_the_definitions_they_reference() {
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {"Count": {"type": "integer", "minimum": 1}},
+        "properties": {
+            "n": {"type": "integer", "anyOf": [{"$ref": "#/$defs/Count"}, {"type": "integer", "maximum": 0}]},
+            "m": {"$ref": "#/$defs/Count"},
+        },
+        "required": ["n", "m"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(
+        members[0],
+        expected_element(
+            "n",
+            json!({"type": "json_schema", "json_schema": {
+                "type": "integer",
+                "anyOf": [{"$ref": "#/$defs/Count"}, {"type": "integer", "maximum": 0}],
+                "$defs": {"Count": {"type": "integer", "minimum": 1}},
+            }})
+        )
+    );
+    assert_eq!(
+        members[1],
+        expected_element(
+            "m",
+            json!({"type": "json_schema", "json_schema": {"type": "integer", "minimum": 1}})
+        ),
+        "a reference followed to its target needs no definitions"
+    );
+}

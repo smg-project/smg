@@ -572,7 +572,7 @@ impl MinimaxM3Parser {
         let invokes: Vec<Value> = tools
             .iter()
             .filter(|tool| !tool.function.name.is_empty())
-            .map(|tool| Self::invoke_tag(&tool.function.name, &tool.function.parameters))
+            .map(|tool| Elements::of(&tool.function.parameters).invoke(&tool.function.name))
             .collect();
         // An empty list of invokes is unsatisfiable; with no named tool, admit
         // only an empty block.
@@ -661,24 +661,100 @@ impl MinimaxM3Parser {
             })),
         }
     }
+}
+
+/// The elements of one invoke, written from the tool's `parameters` schema.
+///
+/// Local references (`#/$defs/Name`, `#/definitions/Name`) are followed, the pointer's escapes
+/// undone; a bare `#` is not, since it would name the fragment's own document once the engine
+/// compiles a fragment alone; a reference back into a schema already being written, directly or
+/// through another definition, is written as free text where it recurs, so a schema that refers
+/// to itself stays bounded, the depth cap the outer bound.
+///
+/// Kept in step with the `symphony` crate's `grammar/xml.rs`, which writes the same model's block
+/// from its table: the two spell the same output, and a change to one belongs in the other, until
+/// one builder serves both paths.
+struct Elements<'a> {
+    root: &'a Value,
+    /// The pointers of the references on the path being written, outermost first.
+    path: Vec<&'a str>,
+}
+
+impl<'a> Elements<'a> {
+    fn of(root: &'a Value) -> Self {
+        Self {
+            root,
+            path: Vec::new(),
+        }
+    }
 
     /// One invoke: the separator and the opener with the tool's name, the
-    /// elements its `parameters` schema shapes, the separator, `</invoke>`
-    /// and a newline.
-    fn invoke_tag(name: &str, parameters: &Value) -> Value {
+    /// elements the schema shapes, the separator, `</invoke>` and a newline.
+    fn invoke(mut self, name: &str) -> Value {
+        let content = match self.follow(self.root) {
+            Some((schema, pushed)) => {
+                let content = self.members(schema, "</invoke>", DEPTH);
+                self.unwind(pushed);
+                content
+            }
+            None => Self::free_text("</invoke>"),
+        };
         json!({
             "type": "tag",
             "begin": format!("{INVOKE_START} name=\"{name}\">"),
-            "content": Self::members(parameters, parameters, "</invoke>", DEPTH),
+            "content": content,
             "end": format!("{INVOKE_END}\n"),
         })
+    }
+
+    /// The schema a local pointer names: an entry under `$defs` or `definitions`, the pointer's
+    /// escapes (`~1` for `/`, `~0` for `~`) undone; nothing for a bare `#`, a pointer elsewhere,
+    /// or a missing target.
+    fn definition(&self, pointer: &str) -> Option<&'a Value> {
+        let mut segments = pointer.strip_prefix("#/")?.split('/');
+        let block = match segments.next()? {
+            block @ ("$defs" | "definitions") => block,
+            _ => return None,
+        };
+        let mut node = self.root.get(block)?;
+        for segment in segments {
+            node = node.get(segment.replace("~1", "/").replace("~0", "~"))?;
+        }
+        Some(node)
+    }
+
+    /// `schema` with its references followed, and how many of them the path took on (the caller
+    /// unwinds them once the schema is written); `None` when a reference re-enters a schema on
+    /// the path, or the hops exceed the depth cap: that node is written as free text. A pointer
+    /// that names nothing stops the following, and the schema stays what it is: untyped.
+    fn follow(&mut self, schema: &'a Value) -> Option<(&'a Value, usize)> {
+        let mut schema = schema;
+        let mut pushed = 0;
+        while let Some(pointer) = schema.get("$ref").and_then(Value::as_str) {
+            let Some(target) = self.definition(pointer) else {
+                break;
+            };
+            if self.path.contains(&pointer) || pushed == DEPTH {
+                self.unwind(pushed);
+                return None;
+            }
+            self.path.push(pointer);
+            pushed += 1;
+            schema = target;
+        }
+        Some((schema, pushed))
+    }
+
+    /// The path without its last `pushed` references.
+    fn unwind(&mut self, pushed: usize) {
+        let keep = self.path.len().saturating_sub(pushed);
+        self.path.truncate(keep);
     }
 
     /// An object's elements: one per property in the schema's order, each
     /// optional unless the schema requires it, a property typed `null` left
     /// out; free text up to `close` for a schema without properties.
-    fn members(schema: &Value, root: &Value, close: &str, depth: usize) -> Value {
-        let schema = Self::resolve_ref(schema, root);
+    fn members(&mut self, schema: &'a Value, close: &str, depth: usize) -> Value {
         let properties = schema
             .get("properties")
             .and_then(Value::as_object)
@@ -694,7 +770,7 @@ impl MinimaxM3Parser {
         let elements: Vec<Value> = properties
             .iter()
             .filter_map(|(key, schema)| {
-                let element = Self::element(key, schema, root, depth)?;
+                let element = self.element(key, schema, depth)?;
                 Some(if required.contains(&key.as_str()) {
                     element
                 } else {
@@ -710,8 +786,8 @@ impl MinimaxM3Parser {
 
     /// One element: the separator and `<key>`, the value, the separator and
     /// `</key>`; nothing for a property typed `null`.
-    fn element(key: &str, schema: &Value, root: &Value, depth: usize) -> Option<Value> {
-        let value = Self::value(schema, root, &format!("</{key}>"), depth)?;
+    fn element(&mut self, key: &str, schema: &'a Value, depth: usize) -> Option<Value> {
+        let value = self.value(schema, &format!("</{key}>"), depth)?;
         Some(json!({
             "type": "sequence",
             "elements": [
@@ -724,39 +800,40 @@ impl MinimaxM3Parser {
 
     /// The value between an element's tags, by the type its schema pins, or
     /// `None` for `null`, which is written as nothing.
-    fn value(schema: &Value, root: &Value, close: &str, depth: usize) -> Option<Value> {
+    fn value(&mut self, schema: &'a Value, close: &str, depth: usize) -> Option<Value> {
         let Some(depth) = depth.checked_sub(1) else {
             return Some(Self::free_text(close));
         };
-        let schema = Self::resolve_ref(schema, root);
-        Some(match Self::schema_type(Some(schema)) {
-            Some("null") => return None,
-            Some("boolean") => Self::one_of(["true", "false", "True", "False"]),
-            Some("object") => Self::members(schema, root, close, depth),
-            Some("array") => match schema.get("items") {
-                Some(items) => Self::items(items, root, depth),
+        let Some((schema, pushed)) = self.follow(schema) else {
+            return Some(Self::free_text(close));
+        };
+        let value = match MinimaxM3Parser::schema_type(Some(schema)) {
+            Some("null") => None,
+            Some("boolean") => Some(Self::one_of(["true", "false", "True", "False"])),
+            Some("object") => Some(self.members(schema, close, depth)),
+            Some("array") => Some(match schema.get("items") {
+                Some(items) => self.items(items, depth),
                 None => Self::free_text(close),
-            },
-            Some("string") => match schema.get("enum").and_then(Value::as_array) {
+            }),
+            Some("string") => Some(match schema.get("enum").and_then(Value::as_array) {
                 Some(values) if !values.is_empty() && values.iter().all(Value::is_string) => {
                     Self::one_of(values.iter().filter_map(Value::as_str))
                 }
                 _ => Self::text(close),
-            },
-            Some("integer" | "number") => json!({
-                "type": "json_schema",
-                "json_schema": schema,
             }),
-            _ => Self::free_text(close),
-        })
+            Some("integer" | "number") => Some(self.fragment(schema)),
+            _ => Some(Self::free_text(close)),
+        };
+        self.unwind(pushed);
+        value
     }
 
     /// A list's items: any number of `<item>` elements, each a value of the
     /// items' type, an item typed `null` an empty element.
-    fn items(items: &Value, root: &Value, depth: usize) -> Value {
+    fn items(&mut self, items: &'a Value, depth: usize) -> Value {
         let open = format!("{ELEMENT_START}{ITEM}>");
         let close = format!("{ELEMENT_END_START}{ITEM}>");
-        let item = match Self::value(items, root, &format!("</{ITEM}>"), depth) {
+        let item = match self.value(items, &format!("</{ITEM}>"), depth) {
             Some(value) => json!({
                 "type": "sequence",
                 "elements": [
@@ -770,8 +847,38 @@ impl MinimaxM3Parser {
         json!({ "type": "star", "content": item })
     }
 
+    /// A number's schema as the engine gets it: with the root's definitions beside it when it
+    /// still holds a local reference, so the pointer resolves once the engine compiles the
+    /// fragment alone.
+    fn fragment(&self, schema: &'a Value) -> Value {
+        let mut fragment = schema.clone();
+        if Self::holds_reference(schema) {
+            if let Some(object) = fragment.as_object_mut() {
+                for name in ["$defs", "definitions"] {
+                    if let Some(block) = self.root.get(name) {
+                        object
+                            .entry(name.to_string())
+                            .or_insert_with(|| block.clone());
+                    }
+                }
+            }
+        }
+        json!({ "type": "json_schema", "json_schema": fragment })
+    }
+
+    /// Whether `schema` holds a `$ref` anywhere.
+    fn holds_reference(schema: &Value) -> bool {
+        match schema {
+            Value::Object(object) => {
+                object.contains_key("$ref") || object.values().any(Self::holds_reference)
+            }
+            Value::Array(items) => items.iter().any(Self::holds_reference),
+            _ => false,
+        }
+    }
+
     /// One of the words.
-    fn one_of<'a>(words: impl IntoIterator<Item = &'a str>) -> Value {
+    fn one_of(words: impl IntoIterator<Item = &'a str>) -> Value {
         let words: Vec<Value> = words
             .into_iter()
             .map(|word| json!({ "type": "const_string", "value": word }))
@@ -802,26 +909,6 @@ impl MinimaxM3Parser {
             }
         }
         json!({ "type": "any_text", "excludes": excludes })
-    }
-
-    /// The schema a local `$ref` names (`#/$defs/Name`, `#/definitions/Name`),
-    /// followed from `root`; `schema` itself when it is no reference or the
-    /// target is missing.
-    fn resolve_ref<'a>(schema: &'a Value, root: &'a Value) -> &'a Value {
-        let mut current = schema;
-        for _ in 0..DEPTH {
-            let Some(pointer) = current.get("$ref").and_then(Value::as_str) else {
-                break;
-            };
-            let Some(target) = pointer
-                .strip_prefix('#')
-                .and_then(|path| root.pointer(path))
-            else {
-                break;
-            };
-            current = target;
-        }
-        current
     }
 }
 
