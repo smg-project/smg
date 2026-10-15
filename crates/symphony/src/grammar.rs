@@ -2374,7 +2374,7 @@ mod tests {
         assert_eq!(hy4["format"]["stop_after_first"], true);
         assert_ne!(hy4["format"]["tags"][0]["content"]["type"], "plus");
         let m3 = one_call(&formats::minimax_m3(), &tools, true, false);
-        let block = &m3["format"]["elements"][1];
+        let block = &m3["format"]["elements"][1]["elements"][1];
         assert_eq!(
             block["stop_after_first"], true,
             "the block after the thought the tag admits"
@@ -2986,7 +2986,10 @@ mod tests {
             choices[1],
             value!({"type": "const_string", "value": "</mm:think>"})
         );
-        assert_eq!(closed["format"]["elements"][1]["at_least_one"], true);
+        assert_eq!(
+            closed["format"]["elements"][1]["elements"][1]["at_least_one"],
+            true
+        );
         let open = formats::minimax_m3()
             .grammar(&tools, true, true)
             .expect("a grammar")
@@ -3011,10 +3014,22 @@ mod tests {
         let block = "]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"get_weather\">\
                      ]<]minimax[>[<city>Paris]<]minimax[>[</city>]<]minimax[>[</invoke>\n\
                      ]<]minimax[>[</tool_call>";
-        for (before, reasoning) in [
-            ("<mm:think>Paris it is.</mm:think>", value!("Paris it is.")),
-            ("</mm:think>", Value::Null),
-            ("", Value::Null),
+        // The block without the separator before its opener, as the grammar forced it until now.
+        let bare = &block["]<]minimax[>[".len()..];
+        for (before, block, reasoning) in [
+            (
+                "<mm:think>Paris it is.</mm:think>",
+                block,
+                value!("Paris it is."),
+            ),
+            ("</mm:think>", block, Value::Null),
+            ("", block, Value::Null),
+            (
+                "<mm:think>Paris it is.</mm:think>",
+                bare,
+                value!("Paris it is."),
+            ),
+            ("", bare, Value::Null),
         ] {
             let read_back = read(
                 &formats::minimax_m3(),
