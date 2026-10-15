@@ -193,7 +193,7 @@ pub(crate) fn process_messages_prompt(
     // continues it natively keeps it; any other gets it popped and its text
     // appended after the generation prompt. Only the text survives that, so
     // a message that also has thinking stays a closed turn there.
-    let continues_final_assistant = continues_final_assistant(request.messages);
+    let continues_final_assistant = messages::continues_final_assistant(request.messages);
     let native_continuation = continues_final_assistant
         && tokenizer
             .renderer_capabilities()
@@ -450,27 +450,6 @@ pub(crate) async fn count_input_tokens(
         .map_err(CountError::Encode)?;
     u32::try_from(encoded.token_ids().len()).map_err(|_| {
         CountError::Render("the prompt has more tokens than a count can report".to_owned())
-    })
-}
-
-/// Whether the messages end with an assistant message that has text and no
-/// tool call: a prefill the response continues rather than a closed turn.
-/// A tool call ends the turn; continuing after the text would drop it, as
-/// transformers' `continue_final_message` cuts the prompt there.
-pub(crate) fn continues_final_assistant(messages: &[InputMessage]) -> bool {
-    messages.last().is_some_and(|message| {
-        message.role == messages::Role::Assistant
-            && match &message.content {
-                InputContent::String(_) => true,
-                InputContent::Blocks(blocks) => {
-                    blocks
-                        .iter()
-                        .any(|block| matches!(block, InputContentBlock::Text(_)))
-                        && !blocks
-                            .iter()
-                            .any(|block| matches!(block, InputContentBlock::ToolUse(_)))
-                }
-            }
     })
 }
 
@@ -1984,7 +1963,7 @@ mod tests {
         let request = ending_with(json!({"role": "assistant", "content": [
             {"type": "text", "text": "Sure"}
         ]}));
-        assert!(continues_final_assistant(&request.messages));
+        assert!(request.continues_final_assistant());
         assert_eq!(
             render(&request, &tokenizer),
             "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
@@ -2008,7 +1987,7 @@ mod tests {
         let request = ending_with(json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
         ]}));
-        assert!(!continues_final_assistant(&request.messages));
+        assert!(!request.continues_final_assistant());
         assert_eq!(
             render(&request, &tokenizer),
             "user: Hello\nassistant: \nassistant: "
@@ -2046,7 +2025,7 @@ mod tests {
             {"type": "text", "text": "Sure"},
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
         ]}));
-        assert!(!continues_final_assistant(&request.messages));
+        assert!(!request.continues_final_assistant());
         assert_eq!(
             render(&request, &jinja(REASONING_TEXT_CALLS)),
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n\
@@ -2062,7 +2041,7 @@ mod tests {
             {"type": "thinking", "thinking": "plan", "signature": "s"},
             {"type": "text", "text": "Sure"}
         ]}));
-        assert!(continues_final_assistant(&request.messages));
+        assert!(request.continues_final_assistant());
         assert_eq!(
             render(&request, &jinja(REASONING_TEXT_CALLS)),
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>plan</think>Sure"

@@ -116,6 +116,12 @@ impl CreateMessageRequest {
             .as_deref()
             .filter(|servers| !servers.is_empty())
     }
+
+    /// Whether the request's final message is an assistant prefill the
+    /// response continues (see [`continues_final_assistant`]).
+    pub fn continues_final_assistant(&self) -> bool {
+        continues_final_assistant(&self.messages)
+    }
 }
 
 impl GenerationRequest for CreateMessageRequest {
@@ -363,6 +369,27 @@ pub enum InputContentBlock {
     ToolSearchToolResult(ToolSearchToolResultBlock),
     /// Tool reference block
     ToolReference(ToolReferenceBlock),
+}
+
+/// Whether `messages` end with an assistant message that has text and no
+/// tool call: a prefill the response continues rather than a closed turn.
+/// A tool call ends the turn; continuing after the text would drop it, as
+/// transformers' `continue_final_message` cuts the prompt there.
+pub fn continues_final_assistant(messages: &[InputMessage]) -> bool {
+    messages.last().is_some_and(|message| {
+        message.role == Role::Assistant
+            && match &message.content {
+                InputContent::String(_) => true,
+                InputContent::Blocks(blocks) => {
+                    blocks
+                        .iter()
+                        .any(|block| matches!(block, InputContentBlock::Text(_)))
+                        && !blocks
+                            .iter()
+                            .any(|block| matches!(block, InputContentBlock::ToolUse(_)))
+                }
+            }
+    })
 }
 
 /// Text content block
@@ -1299,6 +1326,14 @@ impl Normalizable for CountMessageTokensRequest {
     // Use default no-op implementation
 }
 
+impl CountMessageTokensRequest {
+    /// Whether the request's final message is an assistant prefill the
+    /// response continues (see [`continues_final_assistant`]).
+    pub fn continues_final_assistant(&self) -> bool {
+        continues_final_assistant(&self.messages)
+    }
+}
+
 impl GenerationRequest for CountMessageTokensRequest {
     fn is_stream(&self) -> bool {
         false
@@ -2142,6 +2177,52 @@ mod tests {
     use serde_json::{self, json};
 
     use super::*;
+
+    /// A trailing assistant message is continued when it has text and no
+    /// tool call: as a string, as text blocks, with thinking before the
+    /// text. A tool call closes the turn, and so does a trailing user turn.
+    #[test]
+    fn a_trailing_assistant_message_with_text_and_no_tool_call_is_continued() {
+        let request = |last: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Hello"}, last]
+            }))
+            .expect("a Messages request")
+        };
+        let text = json!({"type": "text", "text": "Sure"});
+        let thinking = json!({"type": "thinking", "thinking": "hm", "signature": "s"});
+        let tool_use = json!({"type": "tool_use", "id": "t1", "name": "lookup", "input": {}});
+        assert!(
+            request(json!({"role": "assistant", "content": "Sure"})).continues_final_assistant()
+        );
+        assert!(
+            request(json!({"role": "assistant", "content": [text]})).continues_final_assistant()
+        );
+        assert!(
+            request(json!({"role": "assistant", "content": [thinking, text]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "assistant", "content": [text, tool_use]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "assistant", "content": [tool_use]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "user", "content": "Hello again"})).continues_final_assistant()
+        );
+
+        let count: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "Sure"}]
+        }))
+        .expect("a count_tokens request");
+        assert!(count.continues_final_assistant());
+    }
 
     #[test]
     fn tool_use_block_carries_the_caller_the_public_api_reports() {

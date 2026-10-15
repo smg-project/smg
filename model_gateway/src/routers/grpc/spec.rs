@@ -230,9 +230,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
             symphony: None,
-            continues_final_assistant: utils::message_utils::continues_final_assistant(
-                &request.messages,
-            ),
+            continues_final_assistant: request.continues_final_assistant(),
         }
     }
 }
