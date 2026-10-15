@@ -43,8 +43,8 @@ pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
 pub use format::{CallSyntax, Emits, Format};
 pub use formats::{
-    deepseek_v4_1, forced, function_gemma, glm, hy4, iquest, kimi_k3, lfm2_5, ling, llama_nemotron,
-    minimax_m3, mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    deepseek_v4, deepseek_v4_1, forced, function_gemma, glm, hy4, iquest, kimi_k3, lfm2_5, ling,
+    llama_nemotron, minimax_m3, mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 pub use grammar::{Grammar, Tag};
 pub use input::{EngineFinish, Input, TokenSpan};

@@ -210,6 +210,23 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
     };
+    /// DeepSeek's DSML as V4 spells it, before V4.1 put a space after the sentinel:
+    /// `<｜DSML｜parameter name="…" string="…">`, `</｜DSML｜parameter>` and `</｜DSML｜invoke>`,
+    /// otherwise [`Self::DSML`]: each tag on a line of its own, the value typed by its `string`
+    /// attribute, the calls block opened after the template's two newlines.
+    pub const DSML_V4: Self = Self {
+        parameter_open: "<｜DSML｜parameter name=\"",
+        parameter_close: "</｜DSML｜parameter>",
+        invoke_close: "</｜DSML｜invoke>",
+        cdata: false,
+        value_on_its_own_line: false,
+        tags_on_their_own_lines: true,
+        block_per_call: false,
+        typing: Typing::StringAttribute,
+        before_block: "\n\n",
+        tag_end: TagEnd::Angle,
+        indexed_calls: false,
+    };
     /// Kimi K3's XTML: `<|open|>argument key="…" type="…"<|sep|>`, `<|close|>argument<|sep|>` and
     /// `<|close|>call<|sep|>`, nothing between the tags, the value typed by its `type` attribute,
     /// the call tag carrying the model's index. The grammar is the `xtml` module's own.

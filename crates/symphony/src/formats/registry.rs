@@ -19,8 +19,8 @@
 //! older parsers for it until its group lists the name under `also`.
 
 use super::{
-    deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest, json,
-    k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
+    deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
+    json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
     mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
@@ -42,6 +42,8 @@ pub enum Table {
     Qwen3TaggedDirect,
     /// [`qwen2_5()`].
     Qwen2_5,
+    /// [`deepseek_v4()`].
+    DeepSeekV4,
     /// [`deepseek_v4_1()`].
     DeepSeekV4_1,
     /// [`seed_oss()`].
@@ -92,11 +94,12 @@ pub enum Table {
 
 impl Table {
     /// Every table, in this order.
-    pub const ALL: [Table; 27] = [
+    pub const ALL: [Table; 28] = [
         Self::Qwen3,
         Self::Qwen3Tagged,
         Self::Qwen3TaggedDirect,
         Self::Qwen2_5,
+        Self::DeepSeekV4,
         Self::DeepSeekV4_1,
         Self::SeedOss,
         Self::Hy4,
@@ -130,6 +133,7 @@ impl Table {
             Self::Qwen3Tagged => "qwen3_tagged",
             Self::Qwen3TaggedDirect => "qwen3_tagged_direct",
             Self::Qwen2_5 => "qwen2.5",
+            Self::DeepSeekV4 => "deepseek_v4",
             Self::DeepSeekV4_1 => "deepseek_v4.1",
             Self::SeedOss => "seed_oss",
             Self::Hy4 => "hy4",
@@ -198,6 +202,7 @@ impl Table {
             Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
             Self::Qwen3TaggedDirect => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
             Self::Qwen2_5 => qwen2_5(),
+            Self::DeepSeekV4 => deepseek_v4(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),
             Self::Hy4 => hy4(),
@@ -453,6 +458,12 @@ const GROUPS: &[Group] = &[
         model: "LiquidAI/d1-3B",
         also: &[],
         table: Table::Lfm2_5,
+        opener: None,
+    },
+    Group {
+        model: "deepseek-ai/DeepSeek-V4-Flash",
+        also: &[],
+        table: Table::DeepSeekV4,
         opener: None,
     },
     Group {

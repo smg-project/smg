@@ -41,6 +41,26 @@ What this table says beyond the Qwen ones:
   `</think>\n\n`; the engine's prompt replay puts the output inside the thought first. The
   turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
 
+## DeepSeek V4 (`deepseek_v4`)
+
+The DSML spelling before V4.1's: no space after the sentinel (`<｜DSML｜invoke name="…">`,
+`<｜DSML｜parameter name="…" string="…">`) and `tool_calls` for the block's name. The table is V4.1's
+with those terminals and `Tags::DSML_V4`; the V4.1 spelling is content under it, as this one is under
+V4.1's, and the registry reads each checkpoint with its own. Beyond that:
+
+- **A calls block ends the thought** (`reasoning + calls_open = calls`), as V4.1's table has it, and
+  as the forced-call tag this table writes allows when the prompt leaves the thought open: the free
+  text before the block may close the thought or not, so the engine may write the block before
+  `</think>`, and the table reads the call it forced. The family's reference encoder renders the close
+  first and its parser refuses a block inside the thought; the gateway's legacy reasoning parser for
+  this checkpoint ends the thought on `</think>` alone, so a block inside it stays in the thought
+  there; this table reads the call.
+- **The template writes two newlines before the block**, and its parser reads the block only after
+  them; they are the model's to write and reach the content stream (the legacy parser trims them;
+  bellwether #17's question, as for Qwen3). The prompt ends with `<think>` in thinking mode and with
+  `</think>` right after `<｜Assistant｜>` in chat mode, so the replay starts the output inside the
+  thought or in the content; bellwether has not recorded the group's set yet.
+
 ## GLM 4.5 and 4.6 (`glm4`)
 
 The template writes a newline before the thought, before the content and before every call, and

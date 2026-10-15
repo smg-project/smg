@@ -10,6 +10,7 @@
 //!
 //! [`Format`]: crate::Format
 //! [`Engine`]: crate::Engine
+pub mod deepseek_v4;
 pub mod deepseek_v4_1;
 pub mod dots3;
 pub mod forced;
@@ -38,6 +39,7 @@ pub mod registry;
 pub mod seed_oss;
 pub mod xlam;
 
+pub use deepseek_v4::deepseek_v4;
 pub use deepseek_v4_1::deepseek_v4_1;
 pub use dots3::dots3;
 pub use forced::forced;
