@@ -1449,6 +1449,17 @@ mod tests {
                 ]),
             ),
             (
+                formats::deepseek_v4(),
+                value!([
+                    "<｜DSML｜tool_calls>",
+                    "</｜DSML｜tool_calls>",
+                    "<｜DSML｜invoke name=\"",
+                    "</｜DSML｜invoke>",
+                    "<｜DSML｜parameter name=\"",
+                    "</｜DSML｜parameter>",
+                ]),
+            ),
+            (
                 formats::qwen3(CallSyntax::Json),
                 value!(["<tool_call>", "</tool_call>"]),
             ),
@@ -1884,6 +1895,88 @@ mod tests {
                     {"type": "const_string", "value": "</｜DSML｜ calls>"},
                 ],
             }})
+        );
+    }
+
+    #[test]
+    fn dsml_derives_the_v4_tag_with_the_unspaced_tags() {
+        // The spelling before V4.1's, for the fixture the gateway's older `deepseek_v4` parser
+        // reads: the same shape as the V4.1 tag, every tag without the space after the sentinel
+        // and the block named `tool_calls`.
+        let tools = vec![tool(
+            "get_weather",
+            None,
+            value!({"type": "object", "properties": {"location": {"type": "string"}}}),
+        )];
+        let grammar = formats::deepseek_v4()
+            .grammar(&tools, true, false)
+            .expect("a grammar");
+        let parameter = value!({
+            "type": "tag",
+            "begin": "<｜DSML｜parameter name=\"",
+            "content": {
+                "type": "sequence",
+                "elements": [
+                    {"type": "regex", "pattern": "[^\"]+"},
+                    {"type": "const_string", "value": "\" string=\""},
+                    {"type": "or", "elements": [
+                        {"type": "sequence", "elements": [
+                            {"type": "const_string", "value": "true\">"},
+                            {"type": "any_text", "excludes": [
+                                "</｜DSML｜parameter>",
+                                "</｜DSML｜invoke>",
+                                "</｜DSML｜tool_calls>",
+                            ]},
+                        ]},
+                        {"type": "sequence", "elements": [
+                            {"type": "const_string", "value": "false\">"},
+                            {"type": "json_schema", "json_schema": true},
+                        ]},
+                    ]},
+                ],
+            },
+            "end": "</｜DSML｜parameter>\n",
+        });
+        assert_eq!(
+            grammar.payload(),
+            value!({"format": {
+                "type": "sequence",
+                "elements": [
+                    {"type": "const_string", "value": "\n\n<｜DSML｜tool_calls>\n"},
+                    {
+                        "type": "tags_with_separator",
+                        "tags": [{
+                            "type": "tag",
+                            "begin": "<｜DSML｜invoke name=\"get_weather\">\n",
+                            "content": {"type": "star", "content": parameter},
+                            "end": "</｜DSML｜invoke>\n",
+                        }],
+                        "separator": "",
+                        "at_least_one": true,
+                    },
+                    {"type": "const_string", "value": "</｜DSML｜tool_calls>"},
+                ],
+            }})
+        );
+        // With the thought open, the lead is free text that may close it, then the same block.
+        let open = formats::deepseek_v4()
+            .grammar(&tools, true, true)
+            .expect("a grammar")
+            .payload();
+        assert_eq!(
+            open["format"]["elements"][0],
+            value!({"type": "any_text", "excludes": [
+                "<｜DSML｜tool_calls>",
+                "</｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"",
+                "</｜DSML｜invoke>",
+                "<｜DSML｜parameter name=\"",
+                "</｜DSML｜parameter>",
+            ]})
+        );
+        assert_eq!(
+            open["format"]["elements"][1]["elements"],
+            grammar.payload()["format"]["elements"]
         );
     }
 
@@ -2398,6 +2491,7 @@ mod tests {
             formats::Table::Qwen3,
             formats::Table::Qwen3Tagged,
             formats::Table::DeepSeekV4_1,
+            formats::Table::DeepSeekV4,
             formats::Table::Hy4,
             formats::Table::Xlam,
             formats::Table::MinimaxM3,
