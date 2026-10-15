@@ -404,6 +404,10 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
+        // SGLang's scheduling priority, read by an engine started with
+        // SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES. The other x-override-* headers stay
+        // blocked: the engine would apply them over the PD, DP-rank and rid fields.
+        || name.eq_ignore_ascii_case("x-override-priority")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
@@ -554,6 +558,8 @@ mod tests {
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
         assert!(should_forward_request_header("anthropic-version"));
         assert!(should_forward_request_header("Anthropic-Beta"));
+        assert!(should_forward_request_header("x-override-priority"));
+        assert!(should_forward_request_header("X-Override-Priority"));
     }
 
     #[test]
@@ -571,6 +577,16 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+        // Of the engine's x-override-* headers only the priority is forwarded.
+        assert!(!should_forward_request_header("x-override-rid"));
+        assert!(!should_forward_request_header("x-override-bootstrap-host"));
+        assert!(!should_forward_request_header("x-override-bootstrap-port"));
+        assert!(!should_forward_request_header("x-override-bootstrap-room"));
+        assert!(!should_forward_request_header("x-override-routed-dp-rank"));
+        assert!(!should_forward_request_header(
+            "x-override-disagg-prefill-dp-rank"
+        ));
+        assert!(!should_forward_request_header("x-override-conversation-id"));
     }
 
     #[test]

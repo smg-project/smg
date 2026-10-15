@@ -3860,6 +3860,50 @@ mod tests {
         assert!(seen_body.get("max_tokens").is_none());
     }
 
+    /// Of the engine's `x-override-*` headers only the priority reaches the
+    /// worker, on the typed and on the streamed path.
+    #[tokio::test]
+    async fn override_priority_header_reaches_the_worker_alone() {
+        let (url, captured) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Override-Priority", HeaderValue::from_static("7"));
+        headers.insert("x-override-rid", HeaderValue::from_static("client-rid"));
+        headers.insert(
+            "x-override-bootstrap-host",
+            HeaderValue::from_static("evil.invalid"),
+        );
+
+        let typed = router
+            .route_typed_request(
+                Some(&headers),
+                DropProbeRequest {
+                    text: "hello".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(typed.status(), StatusCode::OK);
+        let (seen, _) = captured.lock().await.take().unwrap();
+        assert_eq!(seen["x-override-priority"], "7");
+        assert!(seen.get("x-override-rid").is_none());
+        assert!(seen.get("x-override-bootstrap-host").is_none());
+
+        let mut request = streamed_request(&[b"{\"text\":\"hello\"}"]);
+        request.headers_mut().extend(headers);
+        let streamed = router
+            .route_streaming_request(request, "/generate", false)
+            .await
+            .unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let (seen, _) = captured.lock().await.take().unwrap();
+        assert_eq!(seen["x-override-priority"], "7");
+        assert!(seen.get("x-override-rid").is_none());
+        assert!(seen.get("x-override-bootstrap-host").is_none());
+    }
+
     #[tokio::test]
     async fn messages_count_tokens_without_workers_is_not_forwarded() {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
