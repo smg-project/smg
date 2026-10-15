@@ -175,6 +175,20 @@ def _finish_reason_to_dict(reason: Any) -> dict | None:
     )
 
 
+
+def _top_logprobs_proto(entries):
+    """One ``TopLogProbs`` per position: the ranked ``(value, token_id)``
+    pairs, or an empty message where the engine ranked none."""
+    return [
+        tokenspeed_scheduler_pb2.TopLogProbs(
+            values=[t[0] for t in entry],
+            token_ids=[t[1] for t in entry],
+        )
+        if entry
+        else tokenspeed_scheduler_pb2.TopLogProbs()
+        for entry in entries
+    ]
+
 class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedulerServicer):
     """gRPC servicer exposing TokenSpeed's AsyncLLM over the dedicated TokenSpeed proto."""
 
@@ -1816,22 +1830,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         Returns ``None`` when the frame carries no prompt logprobs.
         """
-        token = (meta or {}).get("input_token_logprobs") or []
+        token = meta.get("input_token_logprobs") or []
         if not token:
             return None
         top = meta.get("input_top_logprobs") or []
-        top_proto = []
-        for i in range(len(token)):
-            entry = top[i] if i < len(top) else None
-            if entry:
-                top_proto.append(
-                    tokenspeed_scheduler_pb2.TopLogProbs(
-                        values=[t[0] for t in entry],
-                        token_ids=[t[1] for t in entry],
-                    )
-                )
-            else:
-                top_proto.append(tokenspeed_scheduler_pb2.TopLogProbs())
+        top_proto = _top_logprobs_proto(
+            top[i] if i < len(top) else None for i in range(len(token))
+        )
         return tokenspeed_scheduler_pb2.InputLogProbs(
             token_logprobs=[
                 tokenspeed_scheduler_pb2.InputTokenLogProb()
@@ -1889,20 +1894,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # but the gateway expects one ``TopLogProbs`` per emitted token.
         delta_top = chunk_top[:n_keep] + [None] * max(0, len(delta_token) - len(chunk_top))
 
-        top_proto = []
-        for entry in delta_top:
-            if entry:
-                top_proto.append(
-                    tokenspeed_scheduler_pb2.TopLogProbs(
-                        values=[t[0] for t in entry],
-                        token_ids=[t[1] for t in entry],
-                    )
-                )
-            else:
-                # Position with no top-K data (e.g. ``--enable-top-logprobs``
-                # is not yet implemented in TokenSpeed; we still emit a
-                # placeholder per position so the gateway can align indices).
-                top_proto.append(tokenspeed_scheduler_pb2.TopLogProbs())
+        # A position with no top-K data still gets a placeholder so the
+        # gateway can align indices.
+        top_proto = _top_logprobs_proto(delta_top)
 
         return tokenspeed_scheduler_pb2.OutputLogProbs(
             token_logprobs=[t[0] for t in delta_token],

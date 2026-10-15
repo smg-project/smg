@@ -3823,12 +3823,13 @@ impl StreamingProcessor {
                             utils::CompletionLogprobs::new(&tokenizer, top_k, skip_special_tokens)
                         });
                         if *is_first && echo {
-                            let input = utils::echoed_prompt_logprobs(
-                                chunk.input_logprobs(),
-                                chunk.prompt_tokens(),
-                            )
-                            .map_err(|e| e.to_string())?;
-                            choice_logprobs.push_prompt(&input, prompt_text);
+                            choice_logprobs
+                                .push_echo(
+                                    chunk.input_logprobs(),
+                                    chunk.prompt_tokens(),
+                                    prompt_text,
+                                )
+                                .map_err(|e| e.to_string())?;
                         }
                         if let Some(output) = chunk.output_logprobs() {
                             if text.is_empty() {
@@ -3921,11 +3922,6 @@ impl StreamingProcessor {
                     let is_first = is_firsts.entry(index).or_insert(true);
                     if *is_first && echo {
                         if let Some(top_k) = completion_request.logprobs {
-                            let input = utils::echoed_prompt_logprobs(
-                                complete.input_logprobs(),
-                                complete.prompt_tokens(),
-                            )
-                            .map_err(|e| e.to_string())?;
                             logprobs
                                 .entry(index)
                                 .or_insert_with(|| {
@@ -3935,7 +3931,12 @@ impl StreamingProcessor {
                                         skip_special_tokens,
                                     )
                                 })
-                                .push_prompt(&input, prompt_text);
+                                .push_echo(
+                                    complete.input_logprobs(),
+                                    complete.prompt_tokens(),
+                                    prompt_text,
+                                )
+                                .map_err(|e| e.to_string())?;
                         }
                     }
                     if *is_first && echo && !prompt_text.is_empty() {

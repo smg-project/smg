@@ -1217,6 +1217,21 @@ impl ConversationRef {
     }
 }
 
+/// Token ids as their decimal rendering joined by spaces: the routing text
+/// of a prompt given as ids.
+pub(crate) fn join_ids<T: std::fmt::Display>(ids: impl IntoIterator<Item = T>) -> String {
+    use std::fmt::Write as _;
+    let ids = ids.into_iter();
+    let mut text = String::with_capacity(ids.size_hint().0 * 6);
+    for (i, id) in ids.enumerate() {
+        if i > 0 {
+            text.push(' ');
+        }
+        let _ = write!(text, "{id}");
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;

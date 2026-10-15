@@ -1362,10 +1362,13 @@ fn completion_choice_logprobs(
 ) -> Result<LogProbs, axum::response::Response> {
     let mut logprobs = utils::CompletionLogprobs::new(tokenizer, top_k, skip_special_tokens);
     if let Some(prompt_text) = echo {
-        let input =
-            utils::echoed_prompt_logprobs(complete.input_logprobs(), complete.prompt_tokens())
-                .map_err(utils::PromptLogprobsError::into_response)?;
-        logprobs.push_prompt(&input, prompt_text);
+        logprobs
+            .push_echo(
+                complete.input_logprobs(),
+                complete.prompt_tokens(),
+                prompt_text,
+            )
+            .map_err(utils::PromptLogprobsError::into_response)?;
     }
     if let Some(output) = complete.output_logprobs() {
         logprobs.push_output(&output);

@@ -237,16 +237,8 @@ impl GenerationRequest for GenerateRequest {
 
         if let Some(ref input_ids) = self.input_ids {
             return match input_ids {
-                InputIds::Single(ids) => ids
-                    .iter()
-                    .map(|&id| id.to_string())
-                    .collect::<Vec<String>>()
-                    .join(" "),
-                InputIds::Batch(batches) => batches
-                    .iter()
-                    .flat_map(|batch| batch.iter().map(|&id| id.to_string()))
-                    .collect::<Vec<String>>()
-                    .join(" "),
+                InputIds::Single(ids) => crate::common::join_ids(ids.iter()),
+                InputIds::Batch(batches) => crate::common::join_ids(batches.iter().flatten()),
             };
         }
 

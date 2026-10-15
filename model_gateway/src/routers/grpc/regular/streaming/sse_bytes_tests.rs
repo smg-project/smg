@@ -306,11 +306,7 @@ async fn completion_stream_bytes(scenario: &CompletionScenario) -> Vec<u8> {
     let (tx, mut rx) = sse_channel();
     let request: CompletionRequest =
         serde_json::from_value(scenario.request.clone()).expect("completion request");
-    let items = vec![context::CompletionItem {
-        text: scenario.prompt_text.to_string(),
-        token_ids: Vec::new(),
-    }];
-    let spec = CompletionResponseSpec::new(&request, &items);
+    let spec = CompletionResponseSpec::new(&request, vec![scenario.prompt_text.to_string()]);
     let dispatch = context::DispatchMetadata {
         request_id: "cmpl-fixture".to_string(),
         model: request.model.clone(),

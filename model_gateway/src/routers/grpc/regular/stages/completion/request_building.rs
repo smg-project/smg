@@ -19,8 +19,8 @@ use crate::routers::{
         backend_client::BackendClient,
         common::stages::{helpers, BuildStage},
         context::{
-            AttemptStamp, BuildOutput, ClientSelection, CompletionItem, ExecutionPlan,
-            ExecutionPlanKind, PreparationOutput, RequestContext, WorkerSelection,
+            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+            PreparationOutput, RequestContext, WorkerSelection,
         },
         proto_wrapper::ProtoGenerateRequest,
         spec::{CompletionResponseSpec, ResponseSpec},
@@ -47,7 +47,7 @@ impl CompletionRequestBuildingStage {
         &self,
         builder_client: &BackendClient,
         request_id: String,
-        item: &CompletionItem,
+        token_ids: Vec<u32>,
         completion_request: &CompletionRequest,
         sampling_mask: Option<helpers::SamplingDefaultsMask>,
         workers: Option<&WorkerSelection>,
@@ -55,12 +55,7 @@ impl CompletionRequestBuildingStage {
         // A completion carries no media: the ids are the prompt and the text
         // stays off the wire (see `helpers::wire_prompt_text`).
         let mut proto_request = builder_client
-            .build_completion_request(
-                request_id,
-                completion_request,
-                String::new(),
-                item.token_ids.clone(),
-            )
+            .build_completion_request(request_id, completion_request, String::new(), token_ids)
             .map_err(|e| {
                 error!(
                     function = "CompletionRequestBuildingStage::build",
@@ -96,7 +91,8 @@ impl CompletionRequestBuildingStage {
 #[async_trait]
 impl BuildStage for CompletionRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+        // The last reader of the preparation output: its prompts move on.
+        let prep = ctx.state.preparation.take().ok_or_else(|| {
             error!(
                 function = "CompletionRequestBuildingStage::build",
                 "Preparation not completed"
@@ -143,14 +139,18 @@ impl BuildStage for CompletionRequestBuildingStage {
         // residual trim obligation.
         let tokenizer = ctx.tokenizer_arc();
 
-        let (plan, id_stamp) = match items.as_slice() {
-            [] => {
+        let (texts, mut ids): (Vec<String>, Vec<Vec<u32>>) = items
+            .into_iter()
+            .map(|item| (item.text, item.token_ids))
+            .unzip();
+        let (plan, id_stamp) = match ids.len() {
+            0 => {
                 return Err(error::internal_error(
                     "preparation_not_completed",
                     "No prompts prepared",
                 ))
             }
-            [item] => {
+            1 => {
                 let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
                     request_type,
                     ctx.input.tenant_request_meta.as_ref(),
@@ -160,7 +160,7 @@ impl BuildStage for CompletionRequestBuildingStage {
                 let (mut proto_request, baseline) = self.build_proto_request(
                     builder_client,
                     request_id,
-                    item,
+                    ids.swap_remove(0),
                     &completion_request,
                     sampling_mask,
                     workers,
@@ -173,19 +173,19 @@ impl BuildStage for CompletionRequestBuildingStage {
                     id_stamp,
                 )
             }
-            batch_items => {
+            _ => {
                 let (shared_request_id, batch_stamp) = helpers::resolve_batch_id_stamp(
                     request_type,
                     ctx.input.tenant_request_meta.as_ref(),
                     "cmpl_",
                     disaggregated,
                 );
-                let mut requests = Vec::with_capacity(batch_items.len());
-                for (i, item) in batch_items.iter().enumerate() {
+                let mut requests = Vec::with_capacity(ids.len());
+                for (i, token_ids) in ids.into_iter().enumerate() {
                     let (mut proto_request, baseline) = self.build_proto_request(
                         builder_client,
                         helpers::batch_sub_id(&shared_request_id, i, batch_stamp.unique_subs),
-                        item,
+                        token_ids,
                         &completion_request,
                         sampling_mask,
                         workers,
@@ -216,7 +216,7 @@ impl BuildStage for CompletionRequestBuildingStage {
             plan,
             spec: ResponseSpec::Completion(CompletionResponseSpec::new(
                 completion_request.as_ref(),
-                items,
+                texts,
             )),
             stamp: AttemptStamp {
                 id: id_stamp,

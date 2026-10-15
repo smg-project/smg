@@ -94,26 +94,10 @@ fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
     }
 }
 
-/// Legacy `/v1/completions` logprobs of one choice, built token by token.
-///
-/// Every token is its own decode with special tokens kept, its logprob, the
-/// alternatives the engine ranked for its position (its first `logprobs`, in
-/// rank order; `null` where none were asked for and at the first prompt
-/// position, which has no logprob), and its character offset in the choice's
-/// text. Prompt tokens (`echo`) come before the generated ones. Two
-/// alternatives that decode to the same text share one entry, as a Python
-/// dict built in rank order holds them: at the first one's place, with the
-/// later (less likely) one's value. A client that builds the same map from
-/// the ranked ids with a Python dict gets the same entries, so per-text
-/// comparisons agree (byte-fallback pieces all decode to U+FFFD).
-///
-/// A token's own decode need not be what it adds to the text: a vocabulary
-/// can drop a word's leading space when the token is decoded alone, and a
-/// character split across byte tokens decodes to U+FFFD a token at a time.
-/// So the tokens are also decoded in order, as the choice's text is (the
-/// prompt with special tokens kept, the generated tokens as the request
-/// asks). When what a token adds ends with its own text, its offset is
-/// where that text starts; otherwise it is where what the token adds starts.
+/// Legacy `/v1/completions` logprobs of one choice, prompt tokens (`echo`)
+/// then generated ones: each token's own decode with special tokens kept,
+/// its logprob, the alternatives ranked for its position, and its character
+/// offset in the choice's text (see [`Self::push`]).
 pub(crate) struct CompletionLogprobs {
     tokenizer: Arc<dyn Tokenizer>,
     top_k: usize,
@@ -140,6 +124,18 @@ impl CompletionLogprobs {
 
     /// Append the prompt's tokens, the first one without a logprob; `text` is
     /// the prompt as the choice echoes it, which the generated text follows.
+    /// The echoed prompt's logprobs, once the engine's are checked against
+    /// the prompt (see [`echoed_prompt_logprobs`]).
+    pub fn push_echo(
+        &mut self,
+        input: Option<ProtoInputLogProbs>,
+        prompt_tokens: u32,
+        text: &str,
+    ) -> Result<(), PromptLogprobsError> {
+        self.push_prompt(&echoed_prompt_logprobs(input, prompt_tokens)?, text);
+        Ok(())
+    }
+
     pub fn push_prompt(&mut self, input: &ProtoInputLogProbs, text: &str) {
         let start = self.text_offset;
         let mut prompt = Sequence::new_with_options(self.tokenizer.clone(), false);
@@ -179,7 +175,13 @@ impl CompletionLogprobs {
         self.logprobs
     }
 
-    /// Append token `id`, which adds `added` to the choice's text.
+    /// Append token `id`, which adds `added` to the choice's text. Two
+    /// alternatives that decode to the same text share one entry, as a
+    /// Python dict built in rank order holds them: at the first one's place,
+    /// with the later one's value. A token's own decode need not be what it
+    /// adds (a dropped leading space, a character split across byte tokens),
+    /// so its offset is where its text starts when `added` ends with it, else
+    /// where `added` starts.
     fn push(
         &mut self,
         id: u32,
@@ -190,19 +192,13 @@ impl CompletionLogprobs {
         let token = self.text(id).to_owned();
         let top_k = self.top_k;
         let top = (logprob.is_some() && top_k > 0).then(|| {
-            let mut ranked: Vec<(String, f32)> = Vec::with_capacity(top_k);
-            let candidates = alternatives
+            // The map keeps a repeated text at its first place with the later value.
+            alternatives
                 .into_iter()
                 .flat_map(|top| top.token_ids.iter().zip(&top.values))
-                .take(top_k);
-            for (&alternative, &value) in candidates {
-                let text = self.text(alternative).to_owned();
-                match ranked.iter_mut().find(|(seen, _)| *seen == text) {
-                    Some(entry) => entry.1 = value,
-                    None => ranked.push((text, value)),
-                }
-            }
-            ranked.into_iter().collect()
+                .take(top_k)
+                .map(|(&alternative, &value)| (self.text(alternative).to_owned(), value))
+                .collect()
         });
         let added_length = added.chars().count() as u32;
         let own_text_at = if !token.is_empty() && added.ends_with(token.as_str()) {
@@ -280,7 +276,7 @@ impl PromptLogprobsError {
 /// The prompt logprobs an `echo` with `logprobs` lists: present, one value
 /// per token, and one token per prompt token (`prompt_tokens`, when the
 /// backend reports it).
-pub(crate) fn echoed_prompt_logprobs(
+fn echoed_prompt_logprobs(
     input: Option<ProtoInputLogProbs>,
     prompt_tokens: u32,
 ) -> Result<ProtoInputLogProbs, PromptLogprobsError> {

@@ -262,16 +262,11 @@ impl GenerationRequest for CompletionRequest {
 
     fn extract_text_for_routing(&self) -> String {
         // Token ids route on their decimal rendering, as `/generate`'s do.
-        let ids = |ids: &[u32]| ids.iter().map(u32::to_string).collect::<Vec<_>>();
         match &self.prompt {
             CompletionPrompt::Text(s) => s.clone(),
             CompletionPrompt::Texts(v) => v.join(" "),
-            CompletionPrompt::TokenIds(v) => ids(v).join(" "),
-            CompletionPrompt::TokenIdBatches(v) => v
-                .iter()
-                .flat_map(|batch| ids(batch))
-                .collect::<Vec<_>>()
-                .join(" "),
+            CompletionPrompt::TokenIds(v) => join_ids(v.iter()),
+            CompletionPrompt::TokenIdBatches(v) => join_ids(v.iter().flatten()),
         }
     }
 }

@@ -23,7 +23,6 @@ use openai_protocol::{
 use serde_json::Value;
 
 use crate::routers::grpc::{
-    context::CompletionItem,
     regular::{stages::decisions::scoring::DecisionScoring, symphony::Assignment},
     utils,
 };
@@ -279,10 +278,11 @@ pub(crate) struct CompletionResponseSpec {
 }
 
 impl CompletionResponseSpec {
-    /// The spec of `request` whose prompts were prepared as `items`.
-    pub fn new(request: &CompletionRequest, items: &[CompletionItem]) -> Self {
+    /// The spec of `request`, whose prepared prompts read `prompt_texts`;
+    /// they are kept for the echo only.
+    pub fn new(request: &CompletionRequest, prompt_texts: Vec<String>) -> Self {
         let prompt_texts = if request.echo {
-            items.iter().map(|item| item.text.clone()).collect()
+            prompt_texts
         } else {
             Vec::new()
         };
