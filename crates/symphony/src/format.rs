@@ -464,6 +464,11 @@ impl Format {
         self.stop_tokens.iter().any(|stop| stop == text)
     }
 
+    /// The stop tokens the table keeps ([`Self::stop_tokens`]), in the order given.
+    pub(crate) fn stop_token_texts(&self) -> &[String] {
+        &self.stop_tokens
+    }
+
     /// The table's shaped calls read their values with `reader`: a tagged value's text by the
     /// shape's parser, typed by the parameter's schema; a member of JSON arguments held and typed
     /// where the reader says; a key written twice as it says. Without the row they read as the
@@ -702,6 +707,32 @@ impl Format {
     /// The turn opener, if the table names one.
     pub(crate) fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
+    }
+
+    /// The texts that start the model's turn: the turn opener, or the turn anchors in the table's
+    /// order; none for a table that names neither.
+    pub(crate) fn turn_texts(&self) -> Vec<&str> {
+        match self.turn_opener() {
+            Some(opener) => vec![opener],
+            None => self
+                .anchors
+                .iter()
+                .map(|anchor| anchor.text.as_str())
+                .collect(),
+        }
+    }
+
+    /// Where the model's turn starts in `prompt`: where the last turn anchor found
+    /// ([`Self::last_anchor`]), or else the last turn opener, starts, the text after it, and the
+    /// state the output starts in after it. `None` when the prompt holds neither.
+    pub(crate) fn turn_start<'p>(&self, prompt: &'p str) -> Option<(usize, &'p str, usize)> {
+        if !self.anchors.is_empty() {
+            let (at, anchor) = self.last_anchor(prompt)?;
+            return Some((at, &prompt[at + anchor.text.len()..], anchor.state));
+        }
+        let opener = self.turn_opener()?;
+        let at = prompt.rfind(opener)?;
+        Some((at, &prompt[at + opener.len()..], 0))
     }
 
     /// The part of `prompt` the engine replays to find the state the generation starts in: from

@@ -171,6 +171,7 @@ pub(super) fn shape(
     let json = |schema: Value| Grammar::JsonSchema {
         schema,
         style: None,
+        excludes: Vec::new(),
     };
     match keyword("type").and_then(Value::as_str)? {
         "string" => Some(("string", text())),
@@ -365,7 +366,7 @@ const LISTED_SCHEMAS: [&str; 4] = ["anyOf", "oneOf", "allOf", "prefixItems"];
 
 /// `schema` with its annotations dropped at every schema position (a property named
 /// `description` is a name, not an annotation, and stays), as the engine gets it.
-fn without_annotations(schema: &Value) -> Value {
+pub(super) fn without_annotations(schema: &Value) -> Value {
     let Value::Object(map) = schema else {
         return schema.clone();
     };
