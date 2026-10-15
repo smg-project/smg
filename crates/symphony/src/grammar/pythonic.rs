@@ -182,6 +182,7 @@ fn json_string() -> Grammar {
     Grammar::JsonSchema {
         schema: json!({"type": "string"}),
         style: None,
+        excludes: Vec::new(),
     }
 }
 

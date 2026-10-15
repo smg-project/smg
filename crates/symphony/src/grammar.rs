@@ -4,8 +4,9 @@
 //!
 //! [`Grammar`] is Symphony's own tree, in the shape the engines' structural-tag format takes
 //! (xgrammar's, which the serving engines accept): a `triggered_tags` of per-tool `tag`s, each a
-//! `begin`, a content grammar and an `end`; `sequence`, `or`, `star`, `plus` and `optional` to
-//! compose; `const_string`, `any_text`, `regex`, `json_schema` and `token` as leaves.
+//! `begin`, a content grammar and an `end` (one text, or any of several texts); `sequence`, `or`,
+//! `star`, `plus` and `optional` to compose; `const_string`, `any_text`, `regex`, `json_schema`
+//! (whose strings may leave words out), an EBNF `grammar` and `token` as leaves.
 //! [`Grammar::to_json`] writes it as the engine reads it, and [`Grammar::payload`] wraps it as the
 //! request carries it.
 //!
@@ -43,11 +44,16 @@ pub enum Grammar {
     /// Text the regular expression accepts.
     Regex(String),
     /// A JSON value the schema accepts, written in the engine's `style` when one is named
-    /// (`glm_xml` writes it as `<arg_key>`/`<arg_value>` pairs).
+    /// (`glm_xml` writes it as `<arg_key>`/`<arg_value>` pairs). Its strings and keys hold none of
+    /// `excludes`, a list xgrammar enforces from 0.2.8 on and an older xgrammar ignores; an empty
+    /// list is not written.
     JsonSchema {
         schema: Value,
         style: Option<String>,
+        excludes: Vec<String>,
     },
+    /// Text an EBNF grammar in xgrammar's own syntax (`root ::= ...`) accepts.
+    Ebnf(String),
     /// The elements one after another.
     Sequence(Vec<Grammar>),
     /// One of the elements.
@@ -86,7 +92,31 @@ pub enum Grammar {
 pub struct Tag {
     pub begin: String,
     pub content: Box<Grammar>,
-    pub end: String,
+    pub end: Bound,
+}
+
+/// Where a tag ends: a text, or whichever of several texts comes first.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Bound {
+    Text(String),
+    Texts(Vec<String>),
+}
+
+impl Bound {
+    /// The bound with `f` applied to each of its texts.
+    fn map(self, f: impl Fn(String) -> String) -> Self {
+        match self {
+            Self::Text(text) => Self::Text(f(text)),
+            Self::Texts(texts) => Self::Texts(texts.into_iter().map(f).collect()),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Text(text) => Value::String(text.clone()),
+            Self::Texts(texts) => json!(texts),
+        }
+    }
 }
 
 impl Tag {
@@ -94,7 +124,7 @@ impl Tag {
         Self {
             begin: begin.into(),
             content: Box::new(content),
-            end: end.into(),
+            end: Bound::Text(end.into()),
         }
     }
 
@@ -103,7 +133,7 @@ impl Tag {
             "type": "tag",
             "begin": self.begin,
             "content": self.content.to_json(),
-            "end": self.end,
+            "end": self.end.to_json(),
         })
     }
 }
@@ -115,13 +145,21 @@ impl Grammar {
             Self::ConstString(value) => json!({"type": "const_string", "value": value}),
             Self::AnyText { excludes } => json!({"type": "any_text", "excludes": excludes}),
             Self::Regex(pattern) => json!({"type": "regex", "pattern": pattern}),
-            Self::JsonSchema { schema, style } => {
+            Self::JsonSchema {
+                schema,
+                style,
+                excludes,
+            } => {
                 let mut written = json!({"type": "json_schema", "json_schema": schema});
                 if let Some(style) = style {
                     written["style"] = Value::String(style.clone());
                 }
+                if !excludes.is_empty() {
+                    written["excludes"] = json!(excludes);
+                }
                 written
             }
+            Self::Ebnf(grammar) => json!({"type": "grammar", "grammar": grammar}),
             Self::Sequence(elements) => json!({
                 "type": "sequence",
                 "elements": elements.iter().map(Self::to_json).collect::<Vec<_>>(),
@@ -176,7 +214,11 @@ impl Grammar {
     /// long string weighing its length), since the definitions attached to it are copied with it.
     pub(crate) fn nodes(&self) -> usize {
         1 + match self {
-            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) | Self::Token(_) => 0,
+            Self::ConstString(_)
+            | Self::AnyText { .. }
+            | Self::Regex(_)
+            | Self::Ebnf(_)
+            | Self::Token(_) => 0,
             Self::JsonSchema { schema, .. } => json_nodes(schema) / 4,
             Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
             Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
@@ -235,6 +277,7 @@ fn bound(grammar: Grammar, tokens: &[String]) -> Grammar {
         leaf @ (Grammar::AnyText { .. }
         | Grammar::Regex(_)
         | Grammar::JsonSchema { .. }
+        | Grammar::Ebnf(_)
         | Grammar::Token(_)) => leaf,
     }
 }
@@ -412,7 +455,7 @@ impl Count<'_> {
         let tags = tags
             .into_iter()
             .map(|tag| Tag {
-                end: self.end(tag.end),
+                end: tag.end.map(|end| self.end(end)),
                 ..tag
             })
             .collect();
@@ -585,6 +628,7 @@ impl Format {
         let answer = Grammar::JsonSchema {
             schema: schema.clone(),
             style: None,
+            excludes: Vec::new(),
         };
         let content = self.answer_state()?;
         let (before, after) = self.around(|layout| layout.answer.as_ref());
@@ -765,6 +809,7 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
                     },
                     format!("}}\n{}", markers.call_close),
                 )
@@ -801,6 +846,7 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
                     },
                     format!("}}{close}"),
                 )
@@ -833,6 +879,7 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
                     },
                     "",
                 )
@@ -864,6 +911,7 @@ impl Format {
                         Grammar::JsonSchema {
                             schema: tool.function.parameters.clone(),
                             style: None,
+                            excludes: Vec::new(),
                         },
                         Grammar::ConstString("}".to_string()),
                     ])
@@ -928,6 +976,7 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: Some("glm_xml".to_string()),
+                        excludes: Vec::new(),
                     },
                     markers.call_close,
                 )
@@ -3414,6 +3463,37 @@ mod tests {
                     {"type": "star", "content": {"type": "const_string", "value": "c"}},
                     {"type": "plus", "content": {"type": "const_string", "value": "d"}},
                 ]},
+            ]})
+        );
+    }
+
+    #[test]
+    fn an_end_list_json_excludes_and_ebnf_write_the_engines_keys() {
+        // A tag that ends at whichever of several texts comes first, JSON whose strings leave
+        // words out (written only when there are words to leave out), and an EBNF grammar.
+        let excluding = |excludes: &[&str]| Grammar::JsonSchema {
+            schema: value!({"type": "string"}),
+            style: None,
+            excludes: excludes.iter().map(|word| word.to_string()).collect(),
+        };
+        let grammar = Grammar::Sequence(vec![
+            Grammar::Tag(Tag {
+                begin: "<a>".to_string(),
+                content: Box::new(excluding(&["</a>"])),
+                end: Bound::Texts(vec!["</a>".to_string(), "</b>".to_string()]),
+            }),
+            excluding(&[]),
+            Grammar::Ebnf("root ::= \"yes\"".to_string()),
+        ]);
+        assert_eq!(
+            grammar.to_json(),
+            value!({"type": "sequence", "elements": [
+                {"type": "tag", "begin": "<a>",
+                 "content": {"type": "json_schema", "json_schema": {"type": "string"},
+                             "excludes": ["</a>"]},
+                 "end": ["</a>", "</b>"]},
+                {"type": "json_schema", "json_schema": {"type": "string"}},
+                {"type": "grammar", "grammar": "root ::= \"yes\""},
             ]})
         );
     }

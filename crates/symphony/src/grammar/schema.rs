@@ -171,6 +171,7 @@ pub(super) fn shape(
     let json = |schema: Value| Grammar::JsonSchema {
         schema,
         style: None,
+        excludes: Vec::new(),
     };
     match keyword("type").and_then(Value::as_str)? {
         "string" => Some(("string", text())),
