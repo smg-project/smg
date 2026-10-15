@@ -36,6 +36,10 @@ const ITEM: &str = "item";
 const CALL_EXITS: [&str; 3] = ["</invoke>", "<invoke name=\"", "</tool_call>"];
 /// How deep the structural tag follows a schema's nesting; below that, a value is any text.
 const DEPTH: usize = 16;
+/// How many elements one invoke's grammar may hold; past that, the values still to write are
+/// free text. An acyclic schema unfolds as k^d elements for k properties over d levels, which the
+/// depth cap alone does not bound; ordinary tool schemas stay far below this.
+const NODES: usize = 1024;
 
 /// MiniMax M3 format parser for tool calls.
 ///
@@ -669,7 +673,9 @@ impl MinimaxM3Parser {
 /// undone; a bare `#` is not, since it would name the fragment's own document once the engine
 /// compiles a fragment alone; a reference back into a schema already being written, directly or
 /// through another definition, is written as free text where it recurs, so a schema that refers
-/// to itself stays bounded, the depth cap the outer bound.
+/// to itself stays bounded, the depth cap the outer bound. The elements of one invoke are counted
+/// against [`NODES`]: once they are spent, the values still to write (the rest of an object, a
+/// list) are free text, so a wide fan-out stays bounded too.
 ///
 /// Kept in step with the `symphony` crate's `grammar/xml.rs`, which writes the same model's block
 /// from its table: the two spell the same output, and a change to one belongs in the other, until
@@ -678,6 +684,8 @@ struct Elements<'a> {
     root: &'a Value,
     /// The pointers of the references on the path being written, outermost first.
     path: Vec<&'a str>,
+    /// The elements this invoke may still write.
+    nodes: usize,
 }
 
 impl<'a> Elements<'a> {
@@ -685,7 +693,17 @@ impl<'a> Elements<'a> {
         Self {
             root,
             path: Vec::new(),
+            nodes: NODES,
         }
+    }
+
+    /// One element off the budget; `false` once it is spent, when the caller writes free text.
+    fn takes_an_element(&mut self) -> bool {
+        if self.nodes == 0 {
+            return false;
+        }
+        self.nodes -= 1;
+        true
     }
 
     /// One invoke: the separator and the opener with the tool's name, the
@@ -753,7 +771,8 @@ impl<'a> Elements<'a> {
 
     /// An object's elements: one per property in the schema's order, each
     /// optional unless the schema requires it, a property typed `null` left
-    /// out; free text up to `close` for a schema without properties.
+    /// out; free text up to `close` for a schema without properties, and for
+    /// the properties left once the invoke's element budget is spent.
     fn members(&mut self, schema: &'a Value, close: &str, depth: usize) -> Value {
         let properties = schema
             .get("properties")
@@ -767,17 +786,21 @@ impl<'a> Elements<'a> {
             .and_then(Value::as_array)
             .map(|names| names.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
-        let elements: Vec<Value> = properties
-            .iter()
-            .filter_map(|(key, schema)| {
-                let element = self.element(key, schema, depth)?;
-                Some(if required.contains(&key.as_str()) {
-                    element
-                } else {
-                    json!({ "type": "optional", "content": element })
-                })
-            })
-            .collect();
+        let mut elements: Vec<Value> = Vec::new();
+        for (key, schema) in properties {
+            if !self.takes_an_element() {
+                elements.push(Self::free_text(close));
+                break;
+            }
+            let Some(element) = self.element(key, schema, depth) else {
+                continue;
+            };
+            elements.push(if required.contains(&key.as_str()) {
+                element
+            } else {
+                json!({ "type": "optional", "content": element })
+            });
+        }
         if elements.is_empty() {
             return json!({ "type": "const_string", "value": "" });
         }
@@ -812,8 +835,8 @@ impl<'a> Elements<'a> {
             Some("boolean") => Some(Self::one_of(["true", "false", "True", "False"])),
             Some("object") => Some(self.members(schema, close, depth)),
             Some("array") => Some(match schema.get("items") {
-                Some(items) => self.items(items, depth),
-                None => Self::free_text(close),
+                Some(items) if self.takes_an_element() => self.items(items, depth),
+                _ => Self::free_text(close),
             }),
             Some("string") => Some(match schema.get("enum").and_then(Value::as_array) {
                 Some(values) if !values.is_empty() && values.iter().all(Value::is_string) => {

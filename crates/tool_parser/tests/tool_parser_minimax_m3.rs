@@ -2115,3 +2115,120 @@ fn m3_number_fragments_carry_the_definitions_they_reference() {
         "a reference followed to its target needs no definitions"
     );
 }
+
+/// A schema of `k` properties per object over `d` levels, the leaves strings: k^d leaves.
+fn fan_out(k: usize, d: usize) -> serde_json::Value {
+    if d == 0 {
+        return json!({"type": "string"});
+    }
+    let properties: serde_json::Map<String, serde_json::Value> = (0..k)
+        .map(|i| (format!("p{i}"), fan_out(k, d - 1)))
+        .collect();
+    let required: Vec<String> = (0..k).map(|i| format!("p{i}")).collect();
+    json!({"type": "object", "properties": properties, "required": required})
+}
+
+/// The elements a tag writes: one per opening tag the writer spells.
+fn elements_written(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(object) => {
+            let opener = object.get("type").and_then(serde_json::Value::as_str)
+                == Some("const_string")
+                && object
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| {
+                        text.starts_with(&format!("{NS}<")) && !text.starts_with(&format!("{NS}</"))
+                    });
+            usize::from(opener) + object.values().map(elements_written).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(elements_written).sum(),
+        _ => 0,
+    }
+}
+
+/// The free-text runs a tag holds: any text whose excludes do not name the separator (a typed
+/// string's text excludes it; an untyped value's, a recurring reference's and the rest of an
+/// object past the budget do not).
+fn free_text_runs(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(object) => {
+            let free = object.get("type").and_then(serde_json::Value::as_str) == Some("any_text")
+                && object
+                    .get("excludes")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|excludes| !excludes.iter().any(|e| e == NS));
+            usize::from(free) + object.values().map(free_text_runs).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(free_text_runs).sum(),
+        _ => 0,
+    }
+}
+
+/// An acyclic schema with a wide fan-out unfolds as k^d elements; the invoke's element budget
+/// bounds it: 1024 elements are written, the rest of each object past the budget is free text,
+/// and the tag stays small. A schema just under the budget is written in full, nothing falling
+/// back.
+#[test]
+fn m3_a_wide_fan_out_stays_within_the_element_budget() {
+    let wide = schema_tool(fan_out(8, 4)); // 8 + 64 + 512 + 4096 = 4680 elements unbounded
+    let tag = MinimaxM3Parser::build_structural_tag(&[wide], true);
+    let text = serde_json::to_string(&tag).unwrap();
+    assert_eq!(elements_written(&tag), 1024, "the budget, not 4680");
+    assert!(text.len() < 320_000, "{} bytes", text.len());
+    assert!(
+        free_text_runs(&tag) >= 1,
+        "the rest of an object past the budget is free text"
+    );
+    let deep = schema_tool(fan_out(4, 5)); // 1364 elements unbounded
+    let tag = MinimaxM3Parser::build_structural_tag(&[deep], true);
+    assert_eq!(elements_written(&tag), 1024);
+
+    let under = schema_tool(fan_out(31, 2)); // 31 + 961 = 992 elements
+    let tag = MinimaxM3Parser::build_structural_tag(&[under], true);
+    assert_eq!(elements_written(&tag), 992, "written in full");
+    assert_eq!(free_text_runs(&tag), 0, "nothing fell back");
+}
+
+/// A list's item element counts against the budget like a property's; a list reached once the
+/// budget is spent is free text.
+#[test]
+fn m3_lists_count_against_the_element_budget() {
+    let lists = schema_tool(json!({
+        "type": "object",
+        "properties": {
+            "a": {"type": "array", "items": {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}},
+        },
+        "required": ["a"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[lists], true);
+    assert_eq!(
+        elements_written(&tag),
+        3,
+        "the property, its item, the item's property"
+    );
+    assert_eq!(free_text_runs(&tag), 0);
+
+    // 1023 string properties, then a list: the list is the 1024th element, its item is past the
+    // budget and free text.
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for i in 0..1023 {
+        properties.insert(format!("s{i:04}"), json!({"type": "string"}));
+        required.push(json!(format!("s{i:04}")));
+    }
+    properties.insert(
+        "zlist".to_string(),
+        json!({"type": "array", "items": {"type": "string"}}),
+    );
+    required.push(json!("zlist"));
+    let edge =
+        schema_tool(json!({"type": "object", "properties": properties, "required": required}));
+    let tag = MinimaxM3Parser::build_structural_tag(&[edge], true);
+    assert_eq!(elements_written(&tag), 1024);
+    assert_eq!(
+        free_text_runs(&tag),
+        1,
+        "the list's content is free text once the budget is spent"
+    );
+}
