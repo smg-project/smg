@@ -1987,7 +1987,14 @@ class TestConstrainedDecodingAlways:
         )
         choice = response.choices[0]
         if choice.message.tool_calls:
-            helpers._assert_auto_tool_calls_valid(choice.message.tool_calls, tools)
+            # The grammar is what keeps every call to a declared tool with
+            # JSON-object arguments, so the name check is the property that
+            # shows it took effect (the unconstrained helper skips names).
+            declared = {tool["function"]["name"] for tool in tools}
+            for call in choice.message.tool_calls:
+                assert call.function.name in declared, call.function.name
+                arguments = json.loads(call.function.arguments)
+                assert isinstance(arguments, dict), call.function.arguments
             assert choice.finish_reason == "tool_calls"
         else:
             # The grammar lets free text through; the model may answer instead.
