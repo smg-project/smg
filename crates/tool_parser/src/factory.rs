@@ -542,7 +542,12 @@ impl ParserFactory {
             InklingParser::build_structural_tag,
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
-        registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
+        registry.register_parser_with_structural_tag(
+            "minimax_m3",
+            || Box::new(MinimaxM3Parser::new()),
+            MinimaxM3Parser::build_structural_tag,
+        );
+        registry.register_reasoning_prefix("minimax_m3", MinimaxM3Parser::reasoning_prefix);
         registry.register_parser_with_structural_tag(
             "hy_v4",
             || Box::new(HyV4Parser::new()),

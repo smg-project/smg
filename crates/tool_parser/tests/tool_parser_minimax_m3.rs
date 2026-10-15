@@ -2,9 +2,9 @@
 mod common;
 
 use common::create_test_tools;
-use openai_protocol::common::{Function, Tool};
+use openai_protocol::common::{Function, Tool, ToolChoice, ToolChoiceValue};
 use serde_json::json;
-use tool_parser::{MinimaxM3Parser, ToolParser};
+use tool_parser::{GrammarStart, MinimaxM3Parser, ParserFactory, ToolConstraint, ToolParser};
 
 const NS: &str = "]<]minimax[>[";
 
@@ -1502,4 +1502,448 @@ async fn test_m3_undeclared_tool_parses_without_a_tool_inventory() {
         .map(|call| call.parameters.as_str())
         .collect();
     assert_eq!(arguments, "{}");
+}
+
+// ---------------------------------------------------------------------------
+// Forced tool choices: the structural tag and the reasoning prefix
+// ---------------------------------------------------------------------------
+
+/// One tool with a shaped schema and one without parameters.
+fn constraint_tools() -> Vec<Tool> {
+    let tool = |name: &str, parameters: serde_json::Value| Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters,
+            strict: None,
+            extra: Default::default(),
+        },
+    };
+    vec![
+        tool(
+            "get_weather",
+            json!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer", "minimum": 1},
+                    "units": {"type": "string", "enum": ["c", "f"]},
+                    "verbose": {"type": "boolean"},
+                    "where": {
+                        "type": "object",
+                        "properties": {"x": {"type": "number"}, "label": {"type": "string"}},
+                        "required": ["x"],
+                    },
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "nothing": {"type": "null"},
+                    "any": {},
+                },
+                "required": ["city", "days", "verbose", "where", "tags", "nothing", "any"],
+            }),
+        ),
+        tool("ping", json!({"type": "object"})),
+    ]
+}
+
+/// The markers that end a call, which no value may hold.
+fn exits() -> Vec<&'static str> {
+    vec!["</invoke>", "<invoke name=\"", "</tool_call>"]
+}
+
+/// The expected element: the separator and the key's tag, the value, the separator and the
+/// closing tag.
+fn expected_element(key: &str, value: serde_json::Value) -> serde_json::Value {
+    json!({"type": "sequence", "elements": [
+        {"type": "const_string", "value": format!("{NS}<{key}>")},
+        value,
+        {"type": "const_string", "value": format!("{NS}</{key}>")},
+    ]})
+}
+
+/// The expected text of a string inside the element `key`.
+fn expected_text(key: &str) -> serde_json::Value {
+    let close = format!("</{key}>");
+    let mut excludes = vec![NS, close.as_str()];
+    excludes.extend(exits());
+    json!({"type": "any_text", "excludes": excludes})
+}
+
+/// What the tag admits before the block: the thought, the bare close of an empty one, or nothing.
+fn expected_before_the_block() -> serde_json::Value {
+    json!({"type": "optional", "content": {"type": "or", "elements": [
+        {
+            "type": "tag",
+            "begin": "<mm:think>",
+            "content": {"type": "any_text", "excludes": ["<mm:think>", "</mm:think>", NS]},
+            "end": "</mm:think>",
+        },
+        {"type": "const_string", "value": "</mm:think>"},
+    ]}})
+}
+
+#[test]
+fn m3_structural_tag_spells_the_block_in_the_models_syntax() {
+    let mut tools = constraint_tools();
+    let mut nameless = tools[0].clone();
+    nameless.function.name.clear();
+    tools.push(nameless);
+
+    for at_least_one in [false, true] {
+        let tag = MinimaxM3Parser::build_structural_tag(&tools, at_least_one);
+        let format = &tag["format"];
+        assert_eq!(format["type"], "sequence");
+        let elements = format["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2, "what precedes the block, then the block");
+        assert_eq!(elements[0], expected_before_the_block());
+
+        let calls = &elements[1];
+        assert_eq!(calls["type"], "triggered_tags");
+        assert_eq!(calls["triggers"], json!([format!("{NS}<tool_call>")]));
+        assert_eq!(calls["at_least_one"], at_least_one);
+        let blocks = calls["tags"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tag");
+        assert_eq!(blocks[0]["begin"], format!("{NS}<tool_call>\n"));
+        assert_eq!(blocks[0]["end"], format!("{NS}</tool_call>"));
+        let invokes = &blocks[0]["content"];
+        assert_eq!(invokes["type"], "tags_with_separator");
+        assert_eq!(invokes["separator"], "");
+        assert_eq!(
+            invokes["at_least_one"], true,
+            "a block holds at least one invoke"
+        );
+        let invokes = invokes["tags"].as_array().unwrap();
+        assert_eq!(invokes.len(), 2, "the nameless tool is excluded");
+
+        let weather = &invokes[0];
+        assert_eq!(weather["type"], "tag");
+        assert_eq!(
+            weather["begin"],
+            format!("{NS}<invoke name=\"get_weather\">")
+        );
+        assert_eq!(weather["end"], format!("{NS}</invoke>\n"));
+        assert_eq!(
+            weather["content"],
+            json!({"type": "sequence", "elements": [
+                expected_element("city", expected_text("city")),
+                expected_element(
+                    "days",
+                    json!({"type": "json_schema", "json_schema": {"type": "integer", "minimum": 1}}),
+                ),
+                {"type": "optional", "content": expected_element(
+                    "units",
+                    json!({"type": "or", "elements": [
+                        {"type": "const_string", "value": "c"},
+                        {"type": "const_string", "value": "f"},
+                    ]}),
+                )},
+                expected_element(
+                    "verbose",
+                    json!({"type": "or", "elements": [
+                        {"type": "const_string", "value": "true"},
+                        {"type": "const_string", "value": "false"},
+                        {"type": "const_string", "value": "True"},
+                        {"type": "const_string", "value": "False"},
+                    ]}),
+                ),
+                expected_element(
+                    "where",
+                    json!({"type": "sequence", "elements": [
+                        expected_element(
+                            "x",
+                            json!({"type": "json_schema", "json_schema": {"type": "number"}}),
+                        ),
+                        {"type": "optional", "content": expected_element("label", expected_text("label"))},
+                    ]}),
+                ),
+                expected_element(
+                    "tags",
+                    json!({"type": "star", "content": expected_element("item", expected_text("item"))}),
+                ),
+                expected_element(
+                    "any",
+                    json!({"type": "any_text", "excludes": ["</any>", "</invoke>", "<invoke name=\"", "</tool_call>"]}),
+                ),
+            ]}),
+            "one element per property in the schema's order, the null left out"
+        );
+
+        let ping = &invokes[1];
+        assert_eq!(ping["begin"], format!("{NS}<invoke name=\"ping\">"));
+        assert_eq!(
+            ping["content"],
+            json!({"type": "any_text", "excludes": exits()}),
+            "a schema without properties takes any text"
+        );
+    }
+
+    let unnamed = vec![tools.pop().unwrap()];
+    let tag = MinimaxM3Parser::build_structural_tag(&unnamed, true);
+    assert_eq!(
+        tag["format"]["elements"][1]["tags"][0]["content"],
+        json!({"type": "const_string", "value": ""}),
+        "with no named tool the block is empty"
+    );
+}
+
+#[test]
+fn m3_references_and_nulls_in_lists_follow_the_schema() {
+    let tool = Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "t".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "$defs": {
+                    "Point": {"type": "object", "properties": {"x": {"type": "integer"}}},
+                    "Count": {"type": "integer"},
+                },
+                "properties": {
+                    "at": {"$ref": "#/$defs/Point"},
+                    "count": {"$ref": "#/$defs/Count"},
+                    "holes": {"type": "array", "items": {"type": "null"}},
+                },
+                "required": ["at", "count", "holes"],
+            }),
+            strict: None,
+            extra: Default::default(),
+        },
+    };
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let elements = tag["format"]["elements"][1]["tags"][0]["content"]["tags"][0]["content"]
+        ["elements"]
+        .clone();
+    assert_eq!(
+        elements[0],
+        expected_element(
+            "at",
+            json!({"type": "sequence", "elements": [
+                {"type": "optional", "content": expected_element(
+                    "x",
+                    json!({"type": "json_schema", "json_schema": {"type": "integer"}}),
+                )},
+            ]}),
+        ),
+        "a reference lends its target's properties"
+    );
+    assert_eq!(
+        elements[1]["elements"][1],
+        json!({"type": "json_schema", "json_schema": {"type": "integer"}}),
+        "a referenced number is its target's schema"
+    );
+    assert_eq!(
+        elements[2],
+        expected_element(
+            "holes",
+            json!({"type": "star", "content": {
+                "type": "const_string",
+                "value": format!("{NS}<item>{NS}</item>"),
+            }}),
+        ),
+        "a list of nulls holds empty items"
+    );
+}
+
+#[test]
+fn m3_constrains_only_forced_tool_choices() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("minimax_m3");
+    let tools = constraint_tools();
+    assert!(registry.has_structural_tag("minimax_m3"));
+    assert!(registry.has_reasoning_prefix(parser));
+    let structural_tag = |constraint: Option<ToolConstraint>| -> serde_json::Value {
+        match constraint {
+            Some(ToolConstraint::StructuralTag(tag)) => serde_json::from_str(&tag).unwrap(),
+            other => panic!("expected a structural tag, got {other:?}"),
+        }
+    };
+
+    for choice in [
+        json!("auto"),
+        json!("none"),
+        json!({"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "get_weather"}]}),
+    ] {
+        let choice: ToolChoice = serde_json::from_value(choice).unwrap();
+        for reasoning in [false, true] {
+            assert!(registry
+                .generate_tool_constraint(parser, &tools, &choice, reasoning)
+                .unwrap()
+                .is_none());
+        }
+    }
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    assert!(registry
+        .generate_tool_constraint(parser, &[], &required, false)
+        .unwrap()
+        .is_none());
+
+    for (choice, selected) in [
+        (json!("required"), tools.as_slice()),
+        (
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            &tools[..1],
+        ),
+        (
+            json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "get_weather"}]}),
+            &tools[..1],
+        ),
+    ] {
+        // The gateway filters named/allowed tools before invoking the registry.
+        let choice: ToolChoice = serde_json::from_value(choice).unwrap();
+        let plain = MinimaxM3Parser::build_structural_tag(selected, true);
+        let thinking = json!({
+            "format": {
+                "type": "sequence",
+                "elements": [
+                    MinimaxM3Parser::reasoning_prefix(GrammarStart::Unknown).unwrap(),
+                    plain["format"]
+                ],
+            },
+        });
+        for (reasoning, expected) in [(false, &plain), (true, &thinking)] {
+            let constraint = registry
+                .generate_tool_constraint(parser, selected, &choice, reasoning)
+                .unwrap();
+            assert!(
+                !matches!(constraint, Some(ToolConstraint::JsonSchema(_))),
+                "no JSON-schema fallback for a parser with a structural tag"
+            );
+            assert_eq!(&structural_tag(constraint), expected);
+        }
+    }
+}
+
+/// On a prompt that ends inside the thought the forced call follows free text
+/// with nothing owed at its end; with the worker known, an engine that starts
+/// the grammar after its reasoning parser's gate gets the bare tag, one that
+/// starts at the first token the `</mm:think>`-closed thought in front of it.
+/// A tag built for a prompt outside the thought is never re-shaped: what it
+/// admits before the block is its own, not the prefix.
+#[test]
+fn m3_forced_call_grammar_follows_where_the_engine_starts_it() {
+    let factory = ParserFactory::new();
+    let registry = factory.registry();
+    let parser = Some("minimax_m3");
+    let tools = constraint_tools();
+    let required = ToolChoice::Value(ToolChoiceValue::Required);
+    let tag = |reasoning: bool| -> String {
+        match registry
+            .generate_tool_constraint(parser, &tools, &required, reasoning)
+            .unwrap()
+        {
+            Some(ToolConstraint::StructuralTag(tag)) => tag,
+            other => panic!("expected a structural tag, got {other:?}"),
+        }
+    };
+    let plain = MinimaxM3Parser::build_structural_tag(&tools, true);
+    let thinking = tag(true);
+    let thinking_value: serde_json::Value = serde_json::from_str(&thinking).unwrap();
+    let prefix = &thinking_value["format"]["elements"][0];
+    assert_eq!(prefix["type"], "any_text");
+    assert!(
+        prefix.get("end").is_none(),
+        "nothing owed at the text's end"
+    );
+    assert_eq!(prefix["excludes"], json!([NS]));
+
+    assert!(registry
+        .structural_tag_for_grammar_start(parser, &thinking, GrammarStart::Unknown)
+        .unwrap()
+        .is_none());
+
+    let deferred = registry
+        .structural_tag_for_grammar_start(parser, &thinking, GrammarStart::AfterReasoning)
+        .unwrap()
+        .expect("re-shaped");
+    let deferred: serde_json::Value = serde_json::from_str(&deferred).unwrap();
+    assert_eq!(deferred, plain, "nothing precedes the tag");
+
+    let first_token = registry
+        .structural_tag_for_grammar_start(parser, &thinking, GrammarStart::FirstToken)
+        .unwrap()
+        .expect("re-shaped");
+    let first_token: serde_json::Value = serde_json::from_str(&first_token).unwrap();
+    assert_eq!(
+        first_token,
+        json!({
+            "format": {
+                "type": "sequence",
+                "elements": [
+                    MinimaxM3Parser::reasoning_prefix(GrammarStart::FirstToken).unwrap(),
+                    plain["format"]
+                ],
+            },
+        })
+    );
+    let thought = &first_token["format"]["elements"][0];
+    assert_eq!(thought["begin"], "");
+    assert_eq!(thought["end"], "</mm:think>");
+    assert_eq!(
+        thought["content"]["excludes"],
+        json!(["<mm:think>", "</mm:think>", NS]),
+        "neither a think marker nor a call marker inside the thought"
+    );
+
+    for start in [GrammarStart::AfterReasoning, GrammarStart::FirstToken] {
+        assert!(
+            registry
+                .structural_tag_for_grammar_start(parser, &tag(false), start)
+                .unwrap()
+                .is_none(),
+            "a tag for a prompt outside the thought carries no prefix"
+        );
+    }
+}
+
+/// What the tag admits is what this parser reads: the thought and the block,
+/// the bare close and the block, and the block alone, with every value kind
+/// the elements spell.
+#[tokio::test]
+async fn m3_outputs_the_grammar_admits_parse_back() {
+    let tools = constraint_tools();
+    let block = tool_block(&[(
+        "get_weather",
+        format!(
+            "{}{}{}{}{}{}{}",
+            element("city", "Beijing"),
+            element("days", "3"),
+            element("units", "c"),
+            element("verbose", "True"),
+            element(
+                "where",
+                &format!("{}{}", element("x", "1.5"), element("label", "home"))
+            ),
+            element(
+                "tags",
+                &format!("{}{}", element("item", "a"), element("item", "b"))
+            ),
+            element("any", "free text"),
+        ),
+    )]);
+    for before in ["<mm:think>Beijing it is.</mm:think>", "</mm:think>", ""] {
+        let parser = MinimaxM3Parser::new();
+        let (_, calls) = parser
+            .parse_complete_with_tools(&format!("{before}{block}"), &tools)
+            .await
+            .unwrap();
+        assert_eq!(calls.len(), 1, "{before:?}");
+        assert_eq!(calls[0].function.name, "get_weather");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(
+            args,
+            json!({
+                "city": "Beijing",
+                "days": 3,
+                "units": "c",
+                "verbose": true,
+                "where": {"x": 1.5, "label": "home"},
+                "tags": ["a", "b"],
+                "any": "free text",
+            }),
+            "{before:?}"
+        );
+    }
 }

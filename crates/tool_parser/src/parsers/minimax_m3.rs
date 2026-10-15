@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     errors::ParserResult,
+    factory::GrammarStart,
     parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -25,6 +26,16 @@ const ELEMENT_START: &str = "]<]minimax[>[<";
 const ELEMENT_END_START: &str = "]<]minimax[>[</";
 /// Reserved field name used to preserve mixed text within an object element.
 const MIXED_TEXT_FIELD: &str = "$text";
+/// Opening marker of the model's thought.
+const THINK_START: &str = "<mm:think>";
+/// Closing marker of the model's thought.
+const THINK_END: &str = "</mm:think>";
+/// The element tag of a list's items, as the model writes an array.
+const ITEM: &str = "item";
+/// The markers that end a call wherever they stand; no argument value may hold one.
+const CALL_EXITS: [&str; 3] = ["</invoke>", "<invoke name=\"", "</tool_call>"];
+/// How deep the structural tag follows a schema's nesting; below that, a value is any text.
+const DEPTH: usize = 16;
 
 /// MiniMax M3 format parser for tool calls.
 ///
@@ -533,6 +544,284 @@ impl MinimaxM3Parser {
             None => text.to_string(),
         };
         (normal_text, calls)
+    }
+
+    /// Constrain the forced calls in the model's own syntax: one block,
+    /// `]<]minimax[>[<tool_call>` and a newline, one invoke or more, the
+    /// separator and `</tool_call>`; an invoke is the separator,
+    /// `<invoke name="NAME">`, one element per schema property in the
+    /// schema's order (optional unless the schema requires it), the
+    /// separator, `</invoke>` and a newline; an element is the separator and
+    /// `<key>`, the value, the separator and `</key>`. A value follows the
+    /// type its schema pins: a string as text free of the separator, a string
+    /// `enum` as one of its values, a number as the JSON its schema accepts, a
+    /// boolean as one of the words the parser reads, an object as nested
+    /// elements, an array as `<item>` elements, `null` as nothing (the
+    /// template leaves such an argument out), anything untyped as free text
+    /// up to the closing tag. A nameless tool is skipped; with no named tool
+    /// the block is empty, which parses to no calls. The separator stays in
+    /// the trigger: this parser reads the block only with it.
+    ///
+    /// The forced block is written at once, so the tag opens with what the
+    /// model writes before a call when the template leaves the thought to it
+    /// (its default): the thought block, or the bare `</mm:think>` the model
+    /// writes for an empty one, or nothing. A prompt that ends inside the
+    /// thought gets the registry's [`Self::reasoning_prefix`] in front as
+    /// well (see `ParserRegistry::generate_tool_constraint`).
+    pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
+        let invokes: Vec<Value> = tools
+            .iter()
+            .filter(|tool| !tool.function.name.is_empty())
+            .map(|tool| Self::invoke_tag(&tool.function.name, &tool.function.parameters))
+            .collect();
+        // An empty list of invokes is unsatisfiable; with no named tool, admit
+        // only an empty block.
+        let invokes = if invokes.is_empty() {
+            json!({ "type": "const_string", "value": "" })
+        } else {
+            json!({
+                "type": "tags_with_separator",
+                "tags": invokes,
+                "separator": "",
+                "at_least_one": true,
+            })
+        };
+        json!({
+            "format": {
+                "type": "sequence",
+                "elements": [
+                    Self::before_the_block(),
+                    {
+                        "type": "triggered_tags",
+                        "triggers": [TOOL_CALL_START],
+                        "tags": [{
+                            "type": "tag",
+                            "begin": format!("{TOOL_CALL_START}\n"),
+                            "content": invokes,
+                            "end": TOOL_CALL_END,
+                        }],
+                        "at_least_one": at_least_one,
+                    },
+                ],
+            }
+        })
+    }
+
+    /// What the model writes before the block when the template leaves the
+    /// thought to it: its thought between `<mm:think>` and `</mm:think>`,
+    /// free of the markers and the separator, or the bare close it writes
+    /// for an empty thought, or nothing at all.
+    fn before_the_block() -> Value {
+        json!({
+            "type": "optional",
+            "content": {
+                "type": "or",
+                "elements": [
+                    {
+                        "type": "tag",
+                        "begin": THINK_START,
+                        "content": {
+                            "type": "any_text",
+                            "excludes": [THINK_START, THINK_END, NAMESPACE],
+                        },
+                        "end": THINK_END,
+                    },
+                    { "type": "const_string", "value": THINK_END },
+                ],
+            },
+        })
+    }
+
+    /// What precedes a forced call on a prompt that ends inside the thought,
+    /// by where the engine starts the grammar; the registry emits
+    /// `sequence[prefix, calls]`. Where the engine applies the grammar only
+    /// after its reasoning parser has seen the model's own `</mm:think>`,
+    /// nothing precedes the calls. Where it applies the grammar from the
+    /// first token, the prefix is the thought, free of the think markers and
+    /// the separator, closed by `</mm:think>`, so the call follows the
+    /// thought. Where the worker does not say, the prefix is free text that
+    /// writes no separator, so no call marker, with nothing owed at its end:
+    /// the thought and its close on the one kind of engine, nothing on the
+    /// other.
+    pub fn reasoning_prefix(start: GrammarStart) -> Option<Value> {
+        match start {
+            GrammarStart::AfterReasoning => None,
+            GrammarStart::Unknown => Some(json!({
+                "type": "any_text",
+                "excludes": [NAMESPACE],
+            })),
+            GrammarStart::FirstToken => Some(json!({
+                "type": "tag",
+                "begin": "",
+                "content": {
+                    "type": "any_text",
+                    "excludes": [THINK_START, THINK_END, NAMESPACE],
+                },
+                "end": THINK_END,
+            })),
+        }
+    }
+
+    /// One invoke: the separator and the opener with the tool's name, the
+    /// elements its `parameters` schema shapes, the separator, `</invoke>`
+    /// and a newline.
+    fn invoke_tag(name: &str, parameters: &Value) -> Value {
+        json!({
+            "type": "tag",
+            "begin": format!("{INVOKE_START} name=\"{name}\">"),
+            "content": Self::members(parameters, parameters, "</invoke>", DEPTH),
+            "end": format!("{INVOKE_END}\n"),
+        })
+    }
+
+    /// An object's elements: one per property in the schema's order, each
+    /// optional unless the schema requires it, a property typed `null` left
+    /// out; free text up to `close` for a schema without properties.
+    fn members(schema: &Value, root: &Value, close: &str, depth: usize) -> Value {
+        let schema = Self::resolve_ref(schema, root);
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .filter(|properties| !properties.is_empty());
+        let Some(properties) = properties else {
+            return Self::free_text(close);
+        };
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|names| names.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let elements: Vec<Value> = properties
+            .iter()
+            .filter_map(|(key, schema)| {
+                let element = Self::element(key, schema, root, depth)?;
+                Some(if required.contains(&key.as_str()) {
+                    element
+                } else {
+                    json!({ "type": "optional", "content": element })
+                })
+            })
+            .collect();
+        if elements.is_empty() {
+            return json!({ "type": "const_string", "value": "" });
+        }
+        json!({ "type": "sequence", "elements": elements })
+    }
+
+    /// One element: the separator and `<key>`, the value, the separator and
+    /// `</key>`; nothing for a property typed `null`.
+    fn element(key: &str, schema: &Value, root: &Value, depth: usize) -> Option<Value> {
+        let value = Self::value(schema, root, &format!("</{key}>"), depth)?;
+        Some(json!({
+            "type": "sequence",
+            "elements": [
+                { "type": "const_string", "value": format!("{ELEMENT_START}{key}>") },
+                value,
+                { "type": "const_string", "value": format!("{ELEMENT_END_START}{key}>") },
+            ],
+        }))
+    }
+
+    /// The value between an element's tags, by the type its schema pins, or
+    /// `None` for `null`, which is written as nothing.
+    fn value(schema: &Value, root: &Value, close: &str, depth: usize) -> Option<Value> {
+        let Some(depth) = depth.checked_sub(1) else {
+            return Some(Self::free_text(close));
+        };
+        let schema = Self::resolve_ref(schema, root);
+        Some(match Self::schema_type(Some(schema)) {
+            Some("null") => return None,
+            Some("boolean") => Self::one_of(["true", "false", "True", "False"]),
+            Some("object") => Self::members(schema, root, close, depth),
+            Some("array") => match schema.get("items") {
+                Some(items) => Self::items(items, root, depth),
+                None => Self::free_text(close),
+            },
+            Some("string") => match schema.get("enum").and_then(Value::as_array) {
+                Some(values) if !values.is_empty() && values.iter().all(Value::is_string) => {
+                    Self::one_of(values.iter().filter_map(Value::as_str))
+                }
+                _ => Self::text(close),
+            },
+            Some("integer" | "number") => json!({
+                "type": "json_schema",
+                "json_schema": schema,
+            }),
+            _ => Self::free_text(close),
+        })
+    }
+
+    /// A list's items: any number of `<item>` elements, each a value of the
+    /// items' type, an item typed `null` an empty element.
+    fn items(items: &Value, root: &Value, depth: usize) -> Value {
+        let open = format!("{ELEMENT_START}{ITEM}>");
+        let close = format!("{ELEMENT_END_START}{ITEM}>");
+        let item = match Self::value(items, root, &format!("</{ITEM}>"), depth) {
+            Some(value) => json!({
+                "type": "sequence",
+                "elements": [
+                    { "type": "const_string", "value": open },
+                    value,
+                    { "type": "const_string", "value": close },
+                ],
+            }),
+            None => json!({ "type": "const_string", "value": format!("{open}{close}") }),
+        };
+        json!({ "type": "star", "content": item })
+    }
+
+    /// One of the words.
+    fn one_of<'a>(words: impl IntoIterator<Item = &'a str>) -> Value {
+        let words: Vec<Value> = words
+            .into_iter()
+            .map(|word| json!({ "type": "const_string", "value": word }))
+            .collect();
+        json!({ "type": "or", "elements": words })
+    }
+
+    /// A string as it is: text that holds neither the separator, nor `close`,
+    /// nor a marker that ends the call.
+    fn text(close: &str) -> Value {
+        Self::excluding(&[NAMESPACE, close])
+    }
+
+    /// A value the schema does not shape: text that holds neither `close` nor
+    /// a marker that ends the call, separators and nested tags included,
+    /// which the parser reads as it infers.
+    fn free_text(close: &str) -> Value {
+        Self::excluding(&[close])
+    }
+
+    /// Any text that holds none of `first` and none of the markers that end
+    /// the call, each listed once.
+    fn excluding(first: &[&str]) -> Value {
+        let mut excludes: Vec<&str> = Vec::new();
+        for text in first.iter().chain(CALL_EXITS.iter()) {
+            if !excludes.contains(text) {
+                excludes.push(text);
+            }
+        }
+        json!({ "type": "any_text", "excludes": excludes })
+    }
+
+    /// The schema a local `$ref` names (`#/$defs/Name`, `#/definitions/Name`),
+    /// followed from `root`; `schema` itself when it is no reference or the
+    /// target is missing.
+    fn resolve_ref<'a>(schema: &'a Value, root: &'a Value) -> &'a Value {
+        let mut current = schema;
+        for _ in 0..DEPTH {
+            let Some(pointer) = current.get("$ref").and_then(Value::as_str) else {
+                break;
+            };
+            let Some(target) = pointer
+                .strip_prefix('#')
+                .and_then(|path| root.pointer(path))
+            else {
+                break;
+            };
+            current = target;
+        }
+        current
     }
 }
 
