@@ -54,7 +54,7 @@ use tracing::debug;
 use self::template::Templates;
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
-    routers::grpc::utils::{continues_final_assistant, Names},
+    routers::grpc::utils::Names,
 };
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
@@ -332,7 +332,7 @@ pub(crate) fn constraint(
             request.model
         ));
     }
-    let continues = continues_final_assistant(request);
+    let continues = request.continues_final_assistant();
     if !tools.is_empty() && request.tool_choice.as_ref().is_some_and(forces_call) {
         let one_call = matches!(request.tool_choice, Some(ToolChoice::Function { .. }))
             || request.parallel_tool_calls == Some(false);
@@ -1429,7 +1429,7 @@ mod tests {
             "continue_final_message": true, "add_generation_prompt": false,
         });
         assert!(
-            continues_final_assistant(&request(continued.clone())),
+            request(continued.clone()).continues_final_assistant(),
             "the request continues"
         );
         let why = constrain(&with_layout, continued).expect_err("refused");

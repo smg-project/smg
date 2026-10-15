@@ -3,7 +3,7 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{borrow::Cow, collections::HashMap, fs, io, sync::OnceLock};
+use std::{borrow::Cow, collections::HashMap, fs, io, iter, sync::OnceLock};
 
 use anyhow::{anyhow, Result};
 use chrono::{
@@ -1520,16 +1520,17 @@ fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_js
         }
     }
     let merged = serde_json::json!({"role": "system", "content": system_texts.join("\n\n")});
-    std::iter::once(merged).chain(others).collect()
+    iter::once(merged).chain(others).collect()
 }
 
 /// The marker transformers appends to the continued text before rendering;
 /// the prompt is cut where it lands.
 const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
 
-/// Python's `str.isspace`, which transformers' `strip`/`rstrip` use: Rust's
-/// whitespace plus the separators U+001C..=U+001F.
-fn is_python_space(c: char) -> bool {
+/// Python's `str.isspace`, which transformers' `strip`/`rstrip` and the
+/// checkpoints' whitespace runs go by: Unicode white space plus the
+/// separators U+001C..=U+001F.
+pub(crate) fn python_isspace(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
@@ -1537,44 +1538,67 @@ fn is_python_space(c: char) -> bool {
 /// carries its words (in a message, a tool, a document or a template kwarg);
 /// then the words followed by one more underscore than ever follows them
 /// there. Either way only the final message carries the marker.
-fn continuation_marker(messages: &[JsonValue], params: &ChatTemplateParams) -> String {
+fn continuation_marker(messages: &[JsonValue], params: &ChatTemplateParams) -> Cow<'static, str> {
     let words = CONTINUE_FINAL_MESSAGE_TAG.trim_end();
-    let given = serde_json::to_string(&(
-        messages,
-        params.tools,
-        params.documents,
-        params.template_kwargs,
-    ))
-    .unwrap_or_default();
-    let underscores = given
-        .match_indices(words)
-        .map(|(at, _)| {
-            given[at + words.len()..]
+    fn longest_run(text: &str, words: &str, longest: &mut Option<usize>) {
+        for (at, _) in text.match_indices(words) {
+            let run = text[at + words.len()..]
                 .bytes()
                 .take_while(|&b| b == b'_')
-                .count()
-        })
-        .max();
-    match underscores {
-        Some(n) => format!("{words}{} ", "_".repeat(n + 1)),
-        None => CONTINUE_FINAL_MESSAGE_TAG.to_string(),
+                .count();
+            *longest = Some(longest.map_or(run, |n| n.max(run)));
+        }
+    }
+    fn walk(value: &JsonValue, words: &str, longest: &mut Option<usize>) {
+        match value {
+            JsonValue::String(text) => longest_run(text, words, longest),
+            JsonValue::Array(items) => items.iter().for_each(|item| walk(item, words, longest)),
+            JsonValue::Object(fields) => fields.iter().for_each(|(key, item)| {
+                longest_run(key, words, longest);
+                walk(item, words, longest);
+            }),
+            _ => {}
+        }
+    }
+    let mut longest = None;
+    for value in messages
+        .iter()
+        .chain(params.tools.into_iter().flatten())
+        .chain(params.documents.into_iter().flatten())
+    {
+        walk(value, words, &mut longest);
+    }
+    for (key, value) in params.template_kwargs.into_iter().flatten() {
+        longest_run(key, words, &mut longest);
+        walk(value, words, &mut longest);
+    }
+    match longest {
+        Some(n) => Cow::Owned(format!("{words}{} ", "_".repeat(n + 1))),
+        None => Cow::Borrowed(CONTINUE_FINAL_MESSAGE_TAG),
     }
 }
 
-/// Append `marker` to the text the final message is continued from (its
-/// string content, or the text of its last part that has one) and return
-/// that text as it was.
-fn tag_final_message(messages: &mut [JsonValue], marker: &str) -> Result<String> {
-    let text = match messages.last_mut().and_then(|m| m.get_mut("content")) {
+/// The text the final message is continued from: its string content, or
+/// the text of its last part that has one.
+fn final_text(message: &JsonValue) -> Option<&str> {
+    match message.get("content")? {
+        JsonValue::Array(parts) => parts.iter().rev().find_map(|part| part.get("text")),
+        content => Some(content),
+    }?
+    .as_str()
+}
+
+/// Append `marker` to the text the final message is continued from.
+fn tag_final_message(message: &mut JsonValue, marker: &str) -> Result<()> {
+    let text = match message.get_mut("content") {
         Some(JsonValue::Array(parts)) => parts.iter_mut().rev().find_map(|p| p.get_mut("text")),
         content => content,
     };
     let Some(JsonValue::String(text)) = text else {
         return Err(anyhow!("the final message has no text to continue"));
     };
-    let original = text.clone();
     text.push_str(marker);
-    Ok(original)
+    Ok(())
 }
 
 /// Cut a rendering of the tagged conversation right after the continued
@@ -1582,22 +1606,22 @@ fn tag_final_message(messages: &mut [JsonValue], marker: &str) -> Result<String>
 /// template trimmed the marker's trailing space. The text must end right
 /// there (whitespace aside), so the cut belongs to the final message;
 /// transformers only checks that the text appears somewhere in the prompt.
-fn cut_at_final_message(rendered: &str, text: &str, marker: &str) -> Result<String> {
+fn cut_at_final_message(mut rendered: String, text: &str, marker: &str) -> Result<String> {
     let tag_at = rendered
         .rfind(marker.trim_end())
         .filter(|&at| {
             rendered[..at]
-                .trim_end_matches(is_python_space)
-                .ends_with(text.trim_matches(is_python_space))
+                .trim_end_matches(python_isspace)
+                .ends_with(text.trim_matches(python_isspace))
         })
         .ok_or_else(|| anyhow!("the final message does not appear in the rendered chat"))?;
-    let head = &rendered[..tag_at];
-    let head = if rendered[tag_at..].starts_with(marker) {
-        head
+    let cut = if rendered[tag_at..].starts_with(marker) {
+        tag_at
     } else {
-        head.trim_end_matches(is_python_space)
+        rendered[..tag_at].trim_end_matches(python_isspace).len()
     };
-    Ok(head.to_string())
+    rendered.truncate(cut);
+    Ok(rendered)
 }
 
 /// Render with the final message left open, following transformers'
@@ -1625,22 +1649,25 @@ fn render_continuing_final_message(
             "continue_final_message and add_generation_prompt are not compatible"
         ));
     }
+    let Some((last, head)) = messages.split_last() else {
+        return Err(anyhow!("no final message to continue"));
+    };
     let marker = continuation_marker(messages, &params);
-    let mut tagged = messages.to_vec();
-    let continued = tag_final_message(&mut tagged, &marker).and_then(|text| {
+    let continued = (|| {
+        let text =
+            final_text(last).ok_or_else(|| anyhow!("the final message has no text to continue"))?;
+        let mut tagged = last.clone();
+        tag_final_message(&mut tagged, &marker)?;
         let params = ChatTemplateParams {
             continue_final_message: false,
             ..params
         };
-        let (rendered, _) = render_chat_template(env, &tagged, params)?;
-        cut_at_final_message(&rendered, &text, &marker)
-    });
+        let (rendered, _) = render_messages(env, head.iter().chain(iter::once(&tagged)), params)?;
+        cut_at_final_message(rendered, text, &marker)
+    })();
     let reason = match continued {
         Ok(prompt) => return Ok((prompt, true)),
         Err(reason) => reason,
-    };
-    let Some((last, head)) = messages.split_last() else {
-        return Err(reason);
     };
     if last
         .get("reasoning_content")
@@ -1683,7 +1710,16 @@ fn render_chat_template(
     if params.continue_final_message {
         return render_continuing_final_message(env, messages, params);
     }
+    render_messages(env, messages.iter(), params)
+}
 
+/// Render `messages` through the template with the generation prompt the
+/// params ask for; the flag says the prompt does not continue a message.
+fn render_messages<'a>(
+    env: &Environment<'_>,
+    messages: impl Iterator<Item = &'a JsonValue>,
+    params: ChatTemplateParams,
+) -> Result<(String, bool)> {
     let tmpl = env
         .get_template("chat")
         .map_err(|e| anyhow!("Failed to get template: {e}"))?;
@@ -1694,7 +1730,7 @@ fn render_chat_template(
     let strftime_now = Value::from_function(move |format: String| strftime(&now, &format));
 
     // Convert messages to minijinja::Value (messages already processed by router)
-    let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
+    let minijinja_messages: Vec<Value> = messages.map(Value::from_serialize).collect();
 
     // transformers renders with `tools=None` and `documents=None` when the
     // request carries none: the names are defined and hold none. A template

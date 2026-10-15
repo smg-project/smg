@@ -106,8 +106,7 @@ mod tests {
     }
 
     /// A user turn, then `assistant` as the message to continue.
-    fn chat(assistant: Value) -> Vec<Value> {
-        let mut assistant = assistant;
+    fn chat(mut assistant: Value) -> Vec<Value> {
         assistant["role"] = json!("assistant");
         vec![json!({"role": "user", "content": "Hi"}), assistant]
     }

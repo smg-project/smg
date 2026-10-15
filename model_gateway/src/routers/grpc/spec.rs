@@ -135,7 +135,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             chat_template_kwargs: request.chat_template_kwargs.clone(),
             reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
             thinking: request.effective_thinking_toggle(),
-            continues_final_assistant: utils::continues_final_assistant(request),
+            continues_final_assistant: request.continues_final_assistant(),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
             top_logprobs: request.top_logprobs,
@@ -240,14 +240,10 @@ impl MessagesResponseSpec {
         if let Some(in_prefill) = self.reasoning_in_prefill {
             return in_prefill;
         }
-        let user_thinking = match &self.thinking {
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                | messages::ThinkingConfig::Adaptive { .. },
-            ) => Some(true),
-            Some(messages::ThinkingConfig::Disabled) => Some(false),
-            None => None,
-        };
+        let user_thinking = self
+            .thinking
+            .as_ref()
+            .map(messages::ThinkingConfig::enabled);
         utils::reasoning_starts_in_prefill(
             None,
             None,

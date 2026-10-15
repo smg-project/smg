@@ -122,6 +122,11 @@ impl CreateMessageRequest {
     pub fn continues_final_assistant(&self) -> bool {
         continues_final_assistant(&self.messages)
     }
+
+    /// The thinking preference the `thinking` block states, none without one.
+    pub fn thinking_toggle(&self) -> Option<bool> {
+        self.thinking.as_ref().map(ThinkingConfig::enabled)
+    }
 }
 
 impl GenerationRequest for CreateMessageRequest {
@@ -889,6 +894,13 @@ pub enum ThinkingConfig {
         /// Defaults vary by model (Opus 4.7 / Mythos default to `Omitted`; others to `Summarized`).
         display: Option<ThinkingDisplay>,
     },
+}
+
+impl ThinkingConfig {
+    /// `enabled` and `adaptive` ask for thinking, `disabled` turns it off.
+    pub fn enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
+    }
 }
 
 /// How thinking content is returned in API responses

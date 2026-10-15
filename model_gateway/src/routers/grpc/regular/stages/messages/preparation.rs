@@ -249,7 +249,7 @@ impl MessagePreparationStage {
             request,
             &filtered_tools,
             reasoning,
-            message_utils::continues_assistant(request),
+            request.continues_final_assistant(),
             &ctx.components.templates,
         )
         .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;

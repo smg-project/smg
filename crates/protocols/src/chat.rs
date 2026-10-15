@@ -475,6 +475,13 @@ impl ChatCompletionRequest {
         })
     }
 
+    /// Whether `continue_final_message` applies: it is set and the request
+    /// ends with an assistant message.
+    pub fn continues_final_assistant(&self) -> bool {
+        self.continue_final_message
+            && matches!(self.messages.last(), Some(ChatMessage::Assistant { .. }))
+    }
+
     /// `thinking.effort` when present, else the top-level `reasoning_effort`.
     pub fn effective_reasoning_effort(&self) -> Option<&str> {
         self.thinking

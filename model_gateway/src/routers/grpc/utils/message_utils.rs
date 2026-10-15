@@ -170,11 +170,7 @@ pub(crate) fn process_messages_prompt(
     // preference. Adaptive is treated as "thinking on"; the model decides
     // whether to actually emit it. The tokenizer applies this under the model's
     // own toggle key (`enable_thinking`/`thinking`) in `apply`.
-    let thinking = match request.thinking {
-        Some(ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. }) => Some(true),
-        Some(ThinkingConfig::Disabled) => Some(false),
-        None => None, // Let template use its default behavior
-    };
+    let thinking = request.thinking.map(ThinkingConfig::enabled);
 
     // Step 6: Apply chat template. The template learns the tool choice the
     // way the chat path tells it (the chat value under the same kwarg): a
@@ -203,9 +199,12 @@ pub(crate) fn process_messages_prompt(
         .and_then(Value::as_object)
         .is_some_and(|message| message.keys().all(|key| key == "role" || key == "content"));
     let assistant_prefix = if continues_final_assistant && !native_continuation && text_only {
-        transformed_messages
-            .pop()
-            .and_then(|message| message.get("content")?.as_str().map(str::to_string))
+        transformed_messages.pop().and_then(|mut message| {
+            match message.get_mut("content").map(Value::take) {
+                Some(Value::String(text)) => Some(text),
+                _ => None,
+            }
+        })
     } else {
         None
     };
@@ -241,15 +240,6 @@ pub(crate) fn process_messages_prompt(
         },
         rendered.encoding,
     ))
-}
-
-/// Whether the request's last input message is the assistant's: the model continues it, so
-/// the response is no new turn.
-pub(crate) fn continues_assistant(request: &CreateMessageRequest) -> bool {
-    request
-        .messages
-        .last()
-        .is_some_and(|message| message.role == messages::Role::Assistant)
 }
 
 /// The tools the template renders for a request: the custom tools as chat
@@ -1963,7 +1953,6 @@ mod tests {
         let request = ending_with(json!({"role": "assistant", "content": [
             {"type": "text", "text": "Sure"}
         ]}));
-        assert!(request.continues_final_assistant());
         assert_eq!(
             render(&request, &tokenizer),
             "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
@@ -1987,7 +1976,6 @@ mod tests {
         let request = ending_with(json!({"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
         ]}));
-        assert!(!request.continues_final_assistant());
         assert_eq!(
             render(&request, &tokenizer),
             "user: Hello\nassistant: \nassistant: "
@@ -2025,7 +2013,6 @@ mod tests {
             {"type": "text", "text": "Sure"},
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
         ]}));
-        assert!(!request.continues_final_assistant());
         assert_eq!(
             render(&request, &jinja(REASONING_TEXT_CALLS)),
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n\
@@ -2041,7 +2028,6 @@ mod tests {
             {"type": "thinking", "thinking": "plan", "signature": "s"},
             {"type": "text", "text": "Sure"}
         ]}));
-        assert!(request.continues_final_assistant());
         assert_eq!(
             render(&request, &jinja(REASONING_TEXT_CALLS)),
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>plan</think>Sure"

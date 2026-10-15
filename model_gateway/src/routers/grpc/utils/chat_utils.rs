@@ -628,9 +628,9 @@ fn transform_content_field(
 }
 
 /// A popped assistant message's prefill: its string content, or its text parts joined in order.
-fn prefill_text(content: &Value) -> Option<String> {
+fn prefill_text(content: Value) -> Option<String> {
     match content {
-        Value::String(text) => Some(text.clone()),
+        Value::String(text) => Some(text),
         Value::Array(parts) => Some(
             parts
                 .iter()
@@ -810,12 +810,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             Some(&combined_template_kwargs)
         };
 
-        let continues_final_assistant = request.continue_final_message
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant");
+        let continues_final_assistant = request.continues_final_assistant();
         // Renderers that continue a trailing assistant message natively
         // (Jinja templates, cut right after the message as transformers
         // does; DeepSeek-V4.1: rendered without EOS and without a generation
@@ -842,7 +837,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             // Pop the last message to render it as the prefix. A trailing
             // assistant role implies a non-empty list, so the `else` arm is
             // only defensive.
-            let Some(last_msg) = transformed_messages.pop() else {
+            let Some(mut last_msg) = transformed_messages.pop() else {
                 return Ok((
                     ProcessedMessages {
                         text: String::new(),
@@ -853,7 +848,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
                     PromptEncoding::FromText,
                 ));
             };
-            last_msg.get("content").and_then(prefill_text)
+            last_msg
+                .get_mut("content")
+                .map(Value::take)
+                .and_then(prefill_text)
         } else {
             None
         };

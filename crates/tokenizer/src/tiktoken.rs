@@ -16,8 +16,8 @@ use tiktoken_rs::{
 use crate::{
     byte_level::{ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId},
     chat_template::{
-        load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
-        ChatTemplateState, ThinkingKeyName, ThinkingToggle,
+        load_chat_template_from_file, python_isspace, ChatTemplateContentFormat,
+        ChatTemplateParams, ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
     encoders::{
         kimi_k25_tools::apply_kimi_k25_tools,
@@ -680,12 +680,6 @@ fn cut_runs<'a>(window: &'a str, pieces: &mut Vec<&'a str>) {
         }
     }
     pieces.push(&window[piece_start..]);
-}
-
-/// Python's `str.isspace`, which the checkpoint classifies the runs with:
-/// Unicode white space plus the ASCII separators U+001C..U+001F.
-fn python_isspace(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
 /// Piecewise encode for a segmented prompt: control pieces with special

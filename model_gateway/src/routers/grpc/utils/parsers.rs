@@ -7,7 +7,7 @@ use llm_tokenizer::{
     traits::Tokenizer,
 };
 use openai_protocol::{
-    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
     profile::ProviderProfile,
 };
@@ -313,13 +313,6 @@ pub fn reasoning_starts_in_prefill(
     )
 }
 
-/// Whether `continue_final_message` applies to the request: it asks to
-/// continue the trailing assistant message, and the request ends with one.
-pub fn continues_final_assistant(request: &ChatCompletionRequest) -> bool {
-    request.continue_final_message
-        && matches!(request.messages.last(), Some(ChatMessage::Assistant { .. }))
-}
-
 /// [`reasoning_starts_in_prefill`] for a chat request, without its rendered
 /// prompt (the Go binding): a trailing assistant message is taken to be
 /// continued whenever the request asks for it. The gateway decides from the
@@ -330,7 +323,7 @@ pub fn chat_reasoning_starts_in_prefill(
 ) -> bool {
     chat_reasoning_starts_in_rendered_prefill(
         request,
-        continues_final_assistant(request),
+        request.continues_final_assistant(),
         tokenizer,
     )
 }
@@ -362,12 +355,7 @@ pub fn messages_reasoning_starts_in_prefill(
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
-    use openai_protocol::messages::ThinkingConfig;
-    let user_thinking = match &request.thinking {
-        Some(ThinkingConfig::Enabled { .. }) | Some(ThinkingConfig::Adaptive { .. }) => Some(true),
-        Some(ThinkingConfig::Disabled) => Some(false),
-        None => None,
-    };
+    let user_thinking = request.thinking_toggle();
     reasoning_starts_in_prefill(
         None,
         None,
