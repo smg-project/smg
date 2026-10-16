@@ -386,12 +386,17 @@ pub(super) fn resolve_model_id<'a>(
 /// registered worker serving the same model. Resolution stays deterministic
 /// (lexicographically smallest name wins), but only one format parses
 /// correctly — operators should see the conflict at deploy time.
-fn warn_on_conflicting_parser_overrides(
+pub(super) fn warn_on_conflicting_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
     registry: &WorkerRegistry,
 ) {
     for existing in registry.get_by_model(&card.id).iter() {
+        // The worker itself (every rank of it), replaced at its address: its
+        // old card is still registered while the new one is checked.
+        if existing.base_url() == worker_url {
+            continue;
+        }
         let Some(existing_card) = existing.metadata().spec.models.find(&card.id) else {
             continue;
         };
@@ -425,7 +430,7 @@ fn warn_on_conflicting_parser_overrides(
 /// Reject parser-override names the registries don't know: the legacy parsers', and, under
 /// `--parser symphony`, Symphony's tables (`regular::symphony::check_names`). A name whose
 /// factory is absent is not checked (parsers unused in that configuration).
-fn validate_parser_overrides(
+pub(super) fn validate_parser_overrides(
     card: &ModelCard,
     worker_url: &str,
     parser: ParserChoice,
@@ -451,16 +456,77 @@ fn validate_parser_overrides(
     })
 }
 
-fn build_model_card(
+/// The card a worker is registered with: the operator's card for `model_id`,
+/// if the spec has one, completed from the labels, else one built from the
+/// labels alone; with the router's aliases for the model attached.
+pub(super) fn build_model_card(
     model_id: &str,
     config: &WorkerSpec,
     labels: &HashMap<String, String>,
     model_aliases: &HashMap<String, String>,
 ) -> ModelCard {
-    let user_provided = config.models.find(model_id).is_some();
-    let mut card = config
-        .models
-        .find(model_id)
+    let mut card = card_from_labels(config.models.find(model_id), model_id, labels);
+
+    // Router-level alias map (`--model-alias alias=canonical`): attach every
+    // alias that names this canonical model. This is the only alias entry
+    // point for automatically registered workers (startup URLs, Kubernetes
+    // service discovery) — the backend reports a single served model name, so
+    // it can never declare aliases itself. A user-provided card keeps its own
+    // aliases; duplicates are skipped so re-registration stays idempotent.
+    for (alias, canonical) in model_aliases {
+        if canonical == &card.id && alias != &card.id && !card.aliases.contains(alias) {
+            card.aliases.push(alias.clone());
+        }
+    }
+
+    card
+}
+
+/// The fields of a worker's model card that come from its labels, derived
+/// again for the labels it has now. A field whose value is what the labels
+/// before gave it (or that no label gave) follows the labels now, the way
+/// registration derived it; one the operator set by hand, on the card or over
+/// a label, stands. The id is the worker's identity in the registry and
+/// stays. Also the names of the fields that changed.
+pub(super) fn model_card_for_labels(
+    card: &ModelCard,
+    labels_before: &HashMap<String, String>,
+    labels_now: &HashMap<String, String>,
+) -> (ModelCard, Vec<&'static str>) {
+    let before = card_from_labels(None, &card.id, labels_before);
+    let now = card_from_labels(None, &card.id, labels_now);
+    let mut next = card.clone();
+    let mut changed = Vec::new();
+    macro_rules! follow {
+        ($($field:ident),+ $(,)?) => {$(
+            if next.$field == before.$field && next.$field != now.$field {
+                next.$field = now.$field;
+                changed.push(stringify!($field));
+            }
+        )+};
+    }
+    follow!(
+        model_type,
+        hf_model_type,
+        architectures,
+        id2label,
+        num_labels,
+        context_length,
+        tokenizer_path,
+        tool_parser,
+        reasoning_parser,
+    );
+    (next, changed)
+}
+
+/// `operator_card` completed from the labels, or a card from the labels alone.
+fn card_from_labels(
+    operator_card: Option<&ModelCard>,
+    model_id: &str,
+    labels: &HashMap<String, String>,
+) -> ModelCard {
+    let user_provided = operator_card.is_some();
+    let mut card = operator_card
         .cloned()
         .unwrap_or_else(|| ModelCard::new(model_id));
 
@@ -549,18 +615,6 @@ fn build_model_card(
         }
     } else if has_vision && !card.model_type.supports_vision() {
         card.model_type |= ModelType::VISION;
-    }
-
-    // Router-level alias map (`--model-alias alias=canonical`): attach every
-    // alias that names this canonical model. This is the only alias entry
-    // point for automatically registered workers (startup URLs, Kubernetes
-    // service discovery) — the backend reports a single served model name, so
-    // it can never declare aliases itself. A user-provided card keeps its own
-    // aliases; duplicates are skipped so re-registration stays idempotent.
-    for (alias, canonical) in model_aliases {
-        if canonical == &card.id && alias != &card.id && !card.aliases.contains(alias) {
-            card.aliases.push(alias.clone());
-        }
     }
 
     card
