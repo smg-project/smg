@@ -25,9 +25,10 @@ What the engine decides for every format, and what it leaves open:
   state (the kept row: a response template's `strip: false` field) holds nothing: whitespace
   alone there is content, as the template's reader gives it. The whole answer's message still
   shows no content for whitespace alone, so for such a table a Chat Completions stream can carry
-  content deltas, and their logprobs, that the whole answer does not (the Responses and Messages
-  streams hold whitespace alone as their whole answers do); the template's reader, which keeps
-  the whitespace, is the reference there.
+  content deltas, and their logprobs, that the whole answer does not; the template's reader,
+  which keeps the whitespace, is the reference there. The Responses and Messages streams hold
+  whitespace alone until text with substance follows and let it go if none does, as their whole
+  answers leave it out.
 - A terminal with no transition from the current state is text, as the model wrote it:
   `</think>` in content is content. A terminal inside a code fence, or inside a string in a
   call's arguments, is a terminal, as for every parser that reads markers: `</tool_call>` in an
