@@ -292,6 +292,8 @@ pub(crate) struct ProcessingState {
 /// Worker-selection inputs that outlive the parsed request.
 #[derive(Default)]
 pub(crate) struct RoutingSnapshot {
+    /// Exact context checks retained for initial selection and retries.
+    pub context_requirements: super::common::stages::ContextRequirements,
     /// Captured only when a configured policy actually consumes request text.
     pub routing_text: Option<String>,
     /// Routing-affinity token proxy (first prompt for batched completions).

@@ -12,7 +12,7 @@ use axum::{
 };
 use tracing::{debug, error, warn};
 
-use super::{helpers, PipelineStage};
+use super::{context_length::pair_context_length, helpers, ContextRequirements, PipelineStage};
 #[cfg(test)]
 use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
@@ -73,6 +73,7 @@ impl PrefillCandidateError for EpdSelectionFailure {
 enum PdSelectionFailure {
     Placement(Box<PairFailure>),
     NoVisionCapablePrefill,
+    Context(Box<Response>),
 }
 
 impl From<Box<PairFailure>> for PdSelectionFailure {
@@ -316,14 +317,20 @@ impl WorkerSelectionStage {
         let media_refs = ctx.state.multimodal_refs.is_some();
         // Pixel media (an image or a video) only goes to workers that accept
         // vision input: regular mode's single worker takes the whole request,
-        // and the disaggregated legs their shares of it (see `VisionDemand`).
+        // and the disaggregated legs their shares of it (see `PairDemands`).
         let needs_vision =
             multimodal::request_needs_vision(intermediate, ctx.state.multimodal_refs.as_ref());
-        let demand = VisionDemand::new(
+        let context_requirements = if self.mode == WorkerSelectionMode::EncodePrefillDecode {
+            ContextRequirements::default()
+        } else {
+            ContextRequirements::new(prep, &ctx.input.request_type)
+        };
+        let demand = PairDemands::new(
             self.prefill_leg_needs_vision(needs_vision),
             self.decode_leg_needs_vision(&ctx.input.request_type, intermediate, media_refs),
         )
-        .with_media_refs(media_refs);
+        .with_media_refs(media_refs)
+        .with_context(context_requirements);
 
         let text = prep.routing_text();
 
@@ -355,6 +362,7 @@ impl WorkerSelectionStage {
         // `GenerationRequest::cache_partition`) without touching selection.
         let cache_namespace: Option<CacheNamespace> = None;
         ctx.state.routing_snapshot = Some(RoutingSnapshot {
+            context_requirements,
             routing_text: keep_text.then(|| text.map(str::to_string)).flatten(),
             token_ids: ids.to_vec(),
             rid_key: rid_key.clone(),
@@ -386,14 +394,16 @@ impl WorkerSelectionStage {
         // The single worker takes the whole request, so it must meet every
         // demand of the request's media. The disaggregated legs take the
         // media-refs predicate from here and their vision demands from
-        // `VisionDemand` in the pair selection: the prefill leg's for any
+        // `PairDemands` in the pair selection: the prefill leg's for any
         // pixel media, the decode leg's for what a stripped leg cannot serve.
         let media = MediaDemands {
             media_refs,
             vision: needs_vision,
         };
-        let accepts_media = |worker: &dyn Worker| media.accepts(worker);
-        let media_filter: Option<CandidateFilter<'_>> = media.any().then_some(&accepts_media);
+        let accepts_media = |worker: &dyn Worker| {
+            media.accepts(worker) && context_requirements.admits(worker, model_id)
+        };
+        let media_filter: Option<CandidateFilter<'_>> = Some(&accepts_media);
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(
@@ -408,11 +418,11 @@ impl WorkerSelectionStage {
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
-                        return Err(self.selection_failure(
+                        return Err(self.context_selection_failure(
                             model_id,
-                            &[WorkerType::Regular],
                             wire,
                             media,
+                            context_requirements,
                         ))
                     }
                 }
@@ -539,6 +549,7 @@ impl WorkerSelectionStage {
         let cache_namespace = ctx.routing.cache_namespace;
         let headers = ctx.headers.as_ref();
         let model_id = ctx.model_id.as_str();
+        let context_requirements = ctx.routing.context_requirements;
         // The retained wire carries the media-refs pin (the helpers derive it)
         // and the routing snapshot the pixel-media fact.
         let wire = Some(ctx.wire);
@@ -561,7 +572,11 @@ impl WorkerSelectionStage {
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                let admits_media = |worker: &dyn Worker| admits(worker) && media.accepts(worker);
+                let admits_media = |worker: &dyn Worker| {
+                    admits(worker)
+                        && media.accepts(worker)
+                        && context_requirements.admits(worker, model_id)
+                };
                 match self.select_single_worker_for_attempt(
                     model_id,
                     text,
@@ -575,11 +590,11 @@ impl WorkerSelectionStage {
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
-                        return Err(self.selection_failure(
+                        return Err(self.context_selection_failure(
                             model_id,
-                            &[WorkerType::Regular],
                             wire,
                             media,
+                            context_requirements,
                         ))
                     }
                 }
@@ -604,11 +619,12 @@ impl WorkerSelectionStage {
                         ctx.sticky_key.as_deref(),
                         wire,
                         media_refs,
-                        VisionDemand::new(
+                        PairDemands::new(
                             self.prefill_leg_needs_vision(ctx.routing.needs_vision),
                             ctx.routing.decode_needs_vision,
                         )
-                        .with_media_refs(media_refs),
+                        .with_media_refs(media_refs)
+                        .with_context(context_requirements),
                     )
                     .await?;
                 ctx.pd_prefill_guard = Some(guard);
@@ -657,7 +673,7 @@ impl WorkerSelectionStage {
         sticky_key: Option<&str>,
         wire: Option<WireConstraint>,
         media_refs: bool,
-        demand: VisionDemand,
+        demand: PairDemands,
     ) -> Result<(PdWorkerPair, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
@@ -763,7 +779,7 @@ fn decode_needs_vision(
             .is_some_and(|intermediate| request.sampling_n() > 1 || intermediate.has_mrope_grids())
 }
 
-/// Which legs of a disaggregated request need a worker with a vision
+/// Context bounds for both token-processing legs, and which legs need a vision
 /// encoder. The prefill leg takes the request's media whole (the processed
 /// pixel tensors, or the references it expands itself), so any image or
 /// video is a demand on it: a prefill worker without the encoder admits
@@ -772,7 +788,8 @@ fn decode_needs_vision(
 /// on the prefill leg too (neither leg runs those shapes without the
 /// encoder).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct VisionDemand {
+struct PairDemands {
+    context: ContextRequirements,
     prefill: bool,
     decode: bool,
     /// The request forwards media references, which only a worker that
@@ -782,12 +799,13 @@ struct VisionDemand {
     refs: bool,
 }
 
-impl VisionDemand {
+impl PairDemands {
     /// The demand of a request that carries pixel media (`pixel_media`, see
     /// [`multimodal::request_needs_vision`]) and whose decode leg needs the encoder
     /// (`decode`, see [`decode_needs_vision`]).
     fn new(pixel_media: bool, decode: bool) -> Self {
         Self {
+            context: ContextRequirements::default(),
             prefill: pixel_media || decode,
             decode,
             refs: false,
@@ -799,6 +817,11 @@ impl VisionDemand {
     /// is judged among the workers that take them.
     fn with_media_refs(self, refs: bool) -> Self {
         Self { refs, ..self }
+    }
+
+    /// Context bounds shared by both token-processing legs, never the encoder.
+    fn with_context(self, context: ContextRequirements) -> Self {
+        Self { context, ..self }
     }
 
     /// The demand on the leg `worker` serves.
@@ -934,6 +957,57 @@ fn selection_runtime(workers: &WorkerSelection) -> RuntimeType {
 }
 
 impl WorkerSelectionStage {
+    /// Judge capacity over the same wire and media candidates, before health.
+    /// A sufficiently large but unavailable worker yields 503, never a false 400.
+    fn context_selection_failure(
+        &self,
+        model_id: &str,
+        wire: Option<WireConstraint>,
+        media: MediaDemands,
+        context: ContextRequirements,
+    ) -> Response {
+        let candidates = placement::candidates(
+            &self.worker_registry,
+            model_id,
+            RoutingPool::GrpcPipelineRegular,
+            wire,
+        );
+        let media = media.with_wire(wire);
+        let capable: Vec<_> = candidates
+            .as_slice()
+            .iter()
+            .filter(|worker| media.accepts(worker.as_ref()))
+            .cloned()
+            .collect();
+        if capable.is_empty() {
+            return self.selection_failure(model_id, &[WorkerType::Regular], wire, media);
+        }
+        let fitting: Vec<_> = capable
+            .iter()
+            .filter(|worker| context.admits(worker.as_ref(), model_id))
+            .cloned()
+            .collect();
+        if fitting.is_empty() {
+            if let Some(limit) = capable
+                .iter()
+                .filter_map(|worker| worker.context_length(model_id))
+                .max()
+            {
+                if let Err(response) = context.enforce(limit, model_id) {
+                    return response;
+                }
+            }
+        }
+        match placement::failure_from(
+            &fitting,
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            PlacementFailure::AllOverloaded(shed) => shed,
+            _ => Self::workers_unavailable(model_id),
+        }
+    }
+
     /// Response for a selection that produced nothing: a 503 shed when a leg's
     /// whole candidate pool is vetoed, the existing 404 otherwise.
     ///
@@ -1187,6 +1261,7 @@ impl WorkerSelectionStage {
             PdSelectionFailure::Placement(failure) => {
                 self.pd_pair_failure(model_id, *failure, media_refs)
             }
+            PdSelectionFailure::Context(response) => *response,
             PdSelectionFailure::NoVisionCapablePrefill => {
                 self.vision_refusal(model_id, "prefill workers")
             }
@@ -1418,13 +1493,15 @@ impl WorkerSelectionStage {
         self.pair_failure(model_id, failure)
     }
 
+    /// Apply media and context constraints within the existing compatible-pair
+    /// index, then let the configured policies and admission choose the legs.
     fn select_pd_pair(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         wire: Option<WireConstraint>,
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-        demand: VisionDemand,
+        demand: PairDemands,
     ) -> Result<PdWorkerPair, PdSelectionFailure> {
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
@@ -1435,7 +1512,7 @@ impl WorkerSelectionStage {
         // pins both to the retained plan's runtime.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
-        // A leg that needs a vision encoder (see `VisionDemand`) is kept off
+        // A leg that needs a vision encoder (see `PairDemands`) is kept off
         // the workers without one. The prefill leg must find one: a request
         // carrying pixel media is refused when the index pairs no prefill
         // worker with the encoder (a leg nobody serves and a fleet without a
@@ -1446,7 +1523,7 @@ impl WorkerSelectionStage {
         // admits too; with none the decode pool is used as it is, and
         // dispatch refuses the leg naming the gap, as it does for a pool
         // with no such worker at all. With media references the worker must
-        // take them too (`VisionDemand::refs`): a pool whose referencing
+        // take them too (`PairDemands::refs`): a pool whose referencing
         // prefill worker lacks the encoder and whose encoder-bearing one
         // takes no references can never pair the request, and the verdict
         // of the unfiltered pool would be a retryable 503 over healthy
@@ -1472,16 +1549,55 @@ impl WorkerSelectionStage {
         };
         let prefill_with_vision =
             move |worker: &dyn Worker| prefill_vision_capable(worker) && admitted(worker);
-        let candidate_filter: Option<CandidateFilter<'_>> =
-            if demand.decode && pair_admitted_by(&pairs, wire, &with_vision) {
-                Some(&with_vision)
-            } else if demand.prefill {
-                Some(&prefill_with_vision)
-            } else {
-                inputs.candidate_filter
-            };
+        let require_decode_vision = demand.decode && pair_admitted_by(&pairs, wire, &with_vision);
+        let candidate_filter: Option<CandidateFilter<'_>> = if require_decode_vision {
+            Some(&with_vision)
+        } else if demand.prefill {
+            Some(&prefill_with_vision)
+        } else {
+            inputs.candidate_filter
+        };
+        // Capacity refusal ignores attempt-local exclusions (the ledger):
+        // a failed large worker does not make the client's prompt oversized.
+        let takes_media = |worker: &dyn Worker| {
+            takes_refs(worker)
+                && (!demand.prefill || prefill_vision_capable(worker))
+                && (!require_decode_vision || !demand.on(worker) || vision_capable(worker))
+        };
+        let fits = |worker: &dyn Worker| {
+            candidate_filter.is_none_or(|accepts| accepts(worker))
+                && demand.context.admits(worker, model_id)
+        };
+        // Membership, not health, decides whether a request can ever fit.
+        // Inspect actual partners: independently large legs need not pair.
+        if !pair_admitted_by(&pairs, wire, &|worker: &dyn Worker| {
+            takes_media(worker) && demand.context.admits(worker, model_id)
+        }) {
+            let mut largest = None;
+            for (prefill, partners) in pairs.prefill.iter().zip(&pairs.partners) {
+                if !WireConstraint::admits(wire, prefill.as_ref()) || !takes_media(prefill.as_ref())
+                {
+                    continue;
+                }
+                for decode in partners.iter().filter(|decode| {
+                    WireConstraint::admits(wire, decode.as_ref())
+                        && takes_media(decode.as_ref())
+                        && decode.metadata().spec.runtime_type
+                            == prefill.metadata().spec.runtime_type
+                }) {
+                    let limit = pair_context_length(prefill.as_ref(), decode.as_ref(), model_id);
+                    largest = largest.max(limit);
+                }
+            }
+            if let Some(limit) = largest {
+                demand
+                    .context
+                    .enforce(limit, model_id)
+                    .map_err(|response| PdSelectionFailure::Context(Box::new(response)))?;
+            }
+        }
         let inputs = PlacementInputs {
-            candidate_filter,
+            candidate_filter: Some(&fits),
             ..inputs
         };
         let pair = placement::select_pair(
@@ -1941,7 +2057,7 @@ mod tests {
                 None,
                 None,
                 false,
-                VisionDemand::default(),
+                PairDemands::default(),
             )
             .await
             .unwrap_or_else(|_| panic!("admission should select the non-full prefill worker"));
@@ -1995,7 +2111,7 @@ mod tests {
                     ..PlacementInputs::default()
                 };
                 stage
-                    .admit_pd_pair(model_id, inputs, None, None, false, VisionDemand::default())
+                    .admit_pd_pair(model_id, inputs, None, None, false, PairDemands::default())
                     .await
             }
         });
@@ -2053,7 +2169,7 @@ mod tests {
         };
 
         let response = stage
-            .admit_pd_pair(model_id, inputs, None, None, false, VisionDemand::default())
+            .admit_pd_pair(model_id, inputs, None, None, false, PairDemands::default())
             .await
             .err()
             .expect("full explicit target must wait or reject, not reassign");
@@ -2111,7 +2227,7 @@ mod tests {
                     PlacementInputs::default(),
                     None,
                     None,
-                    VisionDemand::default(),
+                    PairDemands::default(),
                 )
                 .expect("select_pd_pair should return a pair");
             *prefill_hits.entry(prefill.url().to_string()).or_default() += 1;
@@ -2145,7 +2261,7 @@ mod tests {
                 PlacementInputs::default(),
                 None,
                 None,
-                VisionDemand::default()
+                PairDemands::default()
             )
             .is_ok());
 
@@ -2161,7 +2277,7 @@ mod tests {
                     PlacementInputs::default(),
                     None,
                     None,
-                    VisionDemand::default()
+                    PairDemands::default()
                 )
                 .is_err(),
             "the veto empties the prefill pool"
@@ -2356,7 +2472,7 @@ mod tests {
                     PlacementInputs::default(),
                     None,
                     None,
-                    VisionDemand::default()
+                    PairDemands::default()
                 )
                 .is_err(),
             "ZMQ-only PD pools must not yield a pair"
@@ -2370,7 +2486,7 @@ mod tests {
                 PlacementInputs::default(),
                 None,
                 None,
-                VisionDemand::default(),
+                PairDemands::default(),
             )
             .expect("gRPC PD pair should be selected");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
@@ -2633,6 +2749,7 @@ mod tests {
         );
     }
 
+    /// A retry context with a retained wire and no extra request constraints.
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
             root_request_id: None,
@@ -2648,6 +2765,7 @@ mod tests {
             headers: None,
             rate_limit_cell: None,
             routing: RoutingSnapshot {
+                context_requirements: ContextRequirements::default(),
                 routing_text: None,
                 token_ids: vec![1, 2, 3],
                 rid_key: None,
@@ -2813,6 +2931,194 @@ mod tests {
             seen.insert(selected(&ctx));
         }
         assert_eq!(seen.len(), 3, "{seen:?}");
+    }
+
+    /// Capacity and the retained grammar decision are intersected on retry.
+    /// Under PD, grammar compatibility constrains D alone; capacity constrains
+    /// both legs. A large incompatible D cannot replace a failed eligible D.
+    #[tokio::test]
+    async fn context_and_grammar_constraints_compose_on_retry() {
+        for mode in [
+            WorkerSelectionMode::Regular,
+            WorkerSelectionMode::PrefillDecode,
+        ] {
+            let model_id = "context-and-grammar";
+            let registry = Arc::new(WorkerRegistry::new());
+            let role = if mode == WorkerSelectionMode::Regular {
+                WorkerType::Regular
+            } else {
+                WorkerType::Decode
+            };
+            let mut workers: Vec<Arc<dyn Worker>> = Vec::new();
+            for (port, window, start) in [
+                (9950, 16, "first_token"),
+                (9951, 64, "after_reasoning"),
+                (9952, 64, "first_token"),
+            ] {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(ModelCard::new(model_id).with_context_length(window))
+                        .worker_type(role)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .label("constrained_decoding", "always")
+                        .label("constrained_decoding_start", start)
+                        .health_config(no_health_check())
+                        .build(),
+                );
+                registry.register(Arc::clone(&worker)).unwrap();
+                workers.push(worker);
+            }
+            if mode == WorkerSelectionMode::PrefillDecode {
+                registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new("grpc://127.0.0.1:9953")
+                            .model(ModelCard::new(model_id).with_context_length(64))
+                            .worker_type(WorkerType::Prefill)
+                            .connection_mode(ConnectionMode::Grpc)
+                            .runtime_type(RuntimeType::TokenSpeed)
+                            .label("constrained_decoding", "requested")
+                            .health_config(no_health_check())
+                            .build(),
+                    ))
+                    .unwrap();
+            }
+            let stage = WorkerSelectionStage::new(
+                registry,
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                mode,
+                None,
+            );
+            let mut ctx = dispatch_ctx(
+                model_id,
+                WireConstraint {
+                    runtime: RuntimeType::TokenSpeed,
+                    connection: ConnectionMode::Grpc,
+                    requires_media_refs: false,
+                },
+            );
+            ctx.constraint_decided_on =
+                Some(utils::WorkerDecoding::of(Some(&WorkerSelection::Single {
+                    worker: Arc::clone(&workers[2]),
+                })));
+            let request = RequestType::Generate(Arc::new(
+                serde_json::from_value(serde_json::json!({"text":"Hello"})).unwrap(),
+            ));
+            ctx.routing.context_requirements = ContextRequirements::new(
+                &PreparationOutput::Generate {
+                    original_text: None,
+                    token_ids: vec![1; 24],
+                },
+                &request,
+            );
+            for _ in 0..8 {
+                stage.reselect(&mut ctx).await.unwrap();
+                let selected = match ctx.workers.as_ref().unwrap() {
+                    WorkerSelection::Single { worker } => worker,
+                    WorkerSelection::Disaggregated { decode, .. } => decode,
+                };
+                assert_eq!(selected.url(), workers[2].url());
+            }
+            workers[2].set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            let refusal = stage
+                .reselect(&mut ctx)
+                .await
+                .expect_err("eligible grammar worker is unavailable");
+            assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    /// The request has been dropped on retry; its longest batched input,
+    /// rather than the first prompt's affinity tokens, must still constrain
+    /// regular selection and both PD legs.
+    #[tokio::test]
+    async fn context_requirements_survive_retry_selection() {
+        for mode in [
+            WorkerSelectionMode::Regular,
+            WorkerSelectionMode::PrefillDecode,
+        ] {
+            let model_id = "context-retry";
+            let registry = Arc::new(WorkerRegistry::new());
+            let roles = if mode == WorkerSelectionMode::Regular {
+                vec![WorkerType::Regular]
+            } else {
+                vec![WorkerType::Prefill, WorkerType::Decode]
+            };
+            let mut port = 9900;
+            for role in roles {
+                for window in [16, 64] {
+                    port += 1;
+                    registry
+                        .register(Arc::new(
+                            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                                .model(ModelCard::new(model_id).with_context_length(window))
+                                .worker_type(role)
+                                .connection_mode(ConnectionMode::Grpc)
+                                .runtime_type(RuntimeType::TokenSpeed)
+                                .health_config(HealthCheckConfig {
+                                    disable_health_check: true,
+                                    ..Default::default()
+                                })
+                                .build(),
+                        ))
+                        .unwrap();
+                }
+            }
+            let stage = WorkerSelectionStage::new(
+                registry,
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                mode,
+                None,
+            );
+            let mut ctx = dispatch_ctx(
+                model_id,
+                WireConstraint {
+                    runtime: RuntimeType::TokenSpeed,
+                    connection: ConnectionMode::Grpc,
+                    requires_media_refs: false,
+                },
+            );
+            let prep = PreparationOutput::Generate {
+                original_text: None,
+                token_ids: vec![7; 24],
+            };
+            let request = RequestType::Generate(Arc::new(
+                serde_json::from_value(serde_json::json!({
+                    "text":"Hello", "sampling_params":{"max_new_tokens":1}
+                }))
+                .unwrap(),
+            ));
+            ctx.routing.context_requirements = ContextRequirements::new(&prep, &request);
+            for _ in 0..8 {
+                stage.reselect(&mut ctx).await.unwrap();
+                match ctx.workers.as_ref().unwrap() {
+                    WorkerSelection::Single { worker } => {
+                        assert_eq!(worker.context_length(model_id), Some(64))
+                    }
+                    WorkerSelection::Disaggregated {
+                        prefill, decode, ..
+                    } => {
+                        assert_eq!(prefill.context_length(model_id), Some(64));
+                        assert_eq!(decode.context_length(model_id), Some(64));
+                    }
+                }
+            }
+            // Excluding the large worker after an engine answer must not
+            // turn this same input into a permanent context-length error.
+            let mut failure = error::internal_error("engine_failure", "engine failure");
+            crate::routers::common::attempt_ledger::mark_upstream_answer(&mut failure);
+            let pool = stage.worker_registry.get_by_model(model_id);
+            ctx.ledger.settle(
+                &mut failure,
+                ctx.workers.as_ref().unwrap().workers(),
+                pool.iter(),
+            );
+            let refusal = stage
+                .reselect(&mut ctx)
+                .await
+                .expect_err("no fitting untried worker");
+            assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
 
     /// A keyed request's retry re-selects away from the engine its failed
@@ -3668,7 +3974,7 @@ mod tests {
                 PlacementInputs::default(),
                 None,
                 None,
-                VisionDemand::default(),
+                PairDemands::default(),
             )
             .expect("both legs over the thresholds still pair");
         assert!(prefill_urls.contains(&prefill.url().to_string()));
@@ -3762,7 +4068,7 @@ mod tests {
                 },
                 None,
                 None,
-                VisionDemand::default(),
+                PairDemands::default(),
             )
             .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
             .expect_err("no prefill worker at all");
@@ -3815,7 +4121,7 @@ mod tests {
                 },
                 None,
                 None,
-                VisionDemand::new(true, true).with_media_refs(true),
+                PairDemands::new(true, true).with_media_refs(true),
             )
             .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
             .expect_err("no pair takes the references");
@@ -3875,7 +4181,7 @@ mod tests {
                 },
                 None,
                 None,
-                VisionDemand::default(),
+                PairDemands::default(),
             )
             .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
             .expect_err("no advertising decode worker yet");
@@ -3903,7 +4209,7 @@ mod tests {
                     },
                     None,
                     None,
-                    VisionDemand::default(),
+                    PairDemands::default(),
                 )
                 .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
                 .expect("advertising pair");
@@ -3917,7 +4223,7 @@ mod tests {
     fn prefill_legs(
         stage: &WorkerSelectionStage,
         model_id: &str,
-        demand: VisionDemand,
+        demand: PairDemands,
     ) -> Vec<String> {
         let mut seen = HashMap::new();
         for _ in 0..12 {
@@ -3958,22 +4264,24 @@ mod tests {
             "an empty plan"
         );
 
-        assert_eq!(VisionDemand::new(false, false), VisionDemand::default());
+        assert_eq!(PairDemands::new(false, false), PairDemands::default());
         assert_eq!(
-            VisionDemand::new(true, false),
-            VisionDemand {
+            PairDemands::new(true, false),
+            PairDemands {
                 prefill: true,
                 decode: false,
-                refs: false
+                refs: false,
+                context: ContextRequirements::default(),
             },
             "a single-sample image: the prefill leg takes the pixels, the decode leg is stripped"
         );
         assert_eq!(
-            VisionDemand::new(false, true),
-            VisionDemand {
+            PairDemands::new(false, true),
+            PairDemands {
                 prefill: true,
                 decode: true,
-                refs: false
+                refs: false,
+                context: ContextRequirements::default(),
             },
             "what the decode leg cannot run without the encoder, the prefill leg cannot either"
         );
@@ -3995,7 +4303,7 @@ mod tests {
 
         let prefill = labeled_worker("grpc://127.0.0.1:9000", "m", WorkerType::Prefill, UNLABELED);
         let decode = labeled_worker("grpc://127.0.0.1:9001", "m", WorkerType::Decode, UNLABELED);
-        let image = VisionDemand::new(true, false);
+        let image = PairDemands::new(true, false);
         assert!(image.on(prefill.as_ref()));
         assert!(!image.on(decode.as_ref()));
         assert!(prefill_vision_capable(decode.as_ref()));
@@ -4036,7 +4344,7 @@ mod tests {
                 .unwrap();
         }
         let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
-        let image = VisionDemand::new(true, false);
+        let image = PairDemands::new(true, false);
 
         assert_eq!(
             prefill_legs(&stage, model_id, image),
@@ -4044,7 +4352,7 @@ mod tests {
             "the leg goes to a prefill worker with the encoder or without a verdict"
         );
         assert_eq!(
-            prefill_legs(&stage, model_id, VisionDemand::default()),
+            prefill_legs(&stage, model_id, PairDemands::default()),
             [
                 "grpc://127.0.0.1:9010",
                 "grpc://127.0.0.1:9011",
@@ -4082,7 +4390,7 @@ mod tests {
             "multimodal_not_supported"
         );
         assert_eq!(
-            prefill_legs(&stage, uniform, VisionDemand::default()),
+            prefill_legs(&stage, uniform, PairDemands::default()),
             ["grpc://127.0.0.1:9030"]
         );
 
@@ -4163,7 +4471,7 @@ mod tests {
                     },
                     None,
                     None,
-                    VisionDemand::new(true, true),
+                    PairDemands::new(true, true),
                 )
                 .expect("a pair that processes references with the encoder");
             assert_eq!(prefill.url(), "grpc://127.0.0.1:9060");
@@ -4220,7 +4528,7 @@ mod tests {
                 },
                 None,
                 None,
-                VisionDemand::new(true, true).with_media_refs(true),
+                PairDemands::new(true, true).with_media_refs(true),
             )
             .expect_err("no prefill worker that takes references has the encoder");
         assert!(
@@ -4234,7 +4542,7 @@ mod tests {
                 PlacementInputs::default(),
                 None,
                 None,
-                VisionDemand::new(true, true),
+                PairDemands::new(true, true),
             )
             .expect("without references the prefill leg pairs with the encoder");
         assert_eq!(prefill.url(), "grpc://127.0.0.1:9091");
@@ -4434,7 +4742,7 @@ mod tests {
             .get_by_url("grpc://127.0.0.1:9210")
             .expect("registered");
         worker_registry.set_worker_overloaded(&d1, true);
-        let demand = VisionDemand::new(false, true);
+        let demand = PairDemands::new(false, true);
 
         let (_, decode, _) = stage
             .select_pd_pair(model_id, PlacementInputs::default(), None, None, demand)
@@ -4446,7 +4754,7 @@ mod tests {
                 PlacementInputs::default(),
                 None,
                 None,
-                VisionDemand::default(),
+                PairDemands::default(),
             )
             .expect("a text request pairs with the idle decode worker");
         assert_eq!(decode.url(), "grpc://127.0.0.1:9211");
@@ -4622,7 +4930,7 @@ mod tests {
                     PlacementInputs::default(),
                     None,
                     None,
-                    VisionDemand::new(false, needs_vision),
+                    PairDemands::new(false, needs_vision),
                 )
                 .expect("a pair");
             *seen.entry(decode.url().to_string()).or_insert(0) += 1;
@@ -4834,7 +5142,7 @@ mod tests {
                     },
                     None,
                     None,
-                    VisionDemand::new(false, true),
+                    PairDemands::new(false, true),
                 )
                 .expect("a pair that processes references with the encoder");
             assert_eq!(decode.url(), "grpc://127.0.0.1:8950");

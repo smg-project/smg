@@ -508,9 +508,9 @@ impl RequestPipeline {
                 "Worker selection not completed",
             )
         })?;
-        // The window is a property of the selected worker's model card, so
-        // this has to follow selection; it precedes client acquisition so a
-        // request no engine could accept never reaches one (#2380).
+        // Keep the post-selection guard for paths without pre-filtering
+        // (EPD and direct ZMQ), and for a model card updated during selection.
+        // No rejected request acquires a client or reaches an engine (#2380).
         let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
             error!(function = "run_ingress", "Preparation stage not completed");
             error::internal_error(
@@ -760,6 +760,10 @@ impl RequestPipeline {
                         .filter(|worker| {
                             decided_on
                                 .is_none_or(|decoding| decoding.decides_alike(worker.as_ref()))
+                                && dctx
+                                    .routing
+                                    .context_requirements
+                                    .admits(worker.as_ref(), &dctx.model_id)
                         }),
                 );
             }
@@ -3319,6 +3323,49 @@ mod request_release_tests {
         );
         assert!(!is_retryable_response(&response));
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A smaller engine is not an alternative to the engine that returned a
+    /// definitive error: keep its 500, without a futile retry or a false 400.
+    #[tokio::test]
+    async fn context_ineligible_worker_does_not_extend_the_retry_window() {
+        let seen_small = Arc::new(Mutex::new(Vec::new()));
+        let seen_large = Arc::new(Mutex::new(Vec::new()));
+        let small_port = spawn_stub(GatedScheduler {
+            seen_request_ids: Arc::clone(&seen_small),
+            ..Default::default()
+        })
+        .await;
+        let large_port = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&seen_large),
+            ..Default::default()
+        })
+        .await;
+        let registry = Arc::new(WorkerRegistry::new());
+        for (port, window) in [(small_port, 1), (large_port, 64)] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .model(ModelCard::new(MODEL).with_context_length(window))
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("register context-bound worker");
+        }
+        let pipeline = completion_pipeline(&registry, Mode::Regular);
+        let response =
+            run_completion(pipeline, components(registry).await, &fast_retry_config(5)).await;
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!is_retryable_response(&response));
+        assert_eq!(calls_seen(&seen_small), 0);
+        assert_eq!(calls_seen(&seen_large), 1);
     }
 
     /// With two workers the request moves to the other one once; a second
