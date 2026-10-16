@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::responses::{
-    generate_id, normalize_input_item, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-    ResponsesRequest,
+    generate_id, normalize_input_item, McpToolCallError, ResponseContentPart, ResponseInput,
+    ResponseInputOutputItem, ResponsesRequest,
 };
 use serde_json::Value;
 use smg_data_connector::{
@@ -130,7 +130,75 @@ pub(crate) fn stored_response_items(stored: &StoredResponse) -> Vec<ResponseInpu
         .flatten()
         .chain(output.into_iter().flatten())
         .filter_map(stored_item_as_input)
+        .filter(replays)
         .collect()
+}
+
+/// Whether a stored item is one the history replays. The kinds neither
+/// conversion takes as input (a hosted image generation, an approval the
+/// client sent, the computer, shell, patch and local-shell tools, a
+/// compaction) are left out here rather than refused later: the gateway
+/// wrote those rows itself (a hosted tool's output, the client's approval
+/// turn), and a continuation that fails on them until the client deletes
+/// the row is a conversation the client cannot carry on. A request's own
+/// input items are not filtered here and keep their refusal.
+pub(crate) fn replays(item: &ResponseInputOutputItem) -> bool {
+    let replayable = !matches!(
+        item,
+        ResponseInputOutputItem::ImageGenerationCall { .. }
+            | ResponseInputOutputItem::McpApprovalResponse { .. }
+            | ResponseInputOutputItem::ComputerCall { .. }
+            | ResponseInputOutputItem::ComputerCallOutput { .. }
+            | ResponseInputOutputItem::Compaction { .. }
+            | ResponseInputOutputItem::ShellCall { .. }
+            | ResponseInputOutputItem::ShellCallOutput { .. }
+            | ResponseInputOutputItem::ApplyPatchCall { .. }
+            | ResponseInputOutputItem::ApplyPatchCallOutput { .. }
+            | ResponseInputOutputItem::LocalShellCall { .. }
+            | ResponseInputOutputItem::LocalShellCallOutput { .. }
+    );
+    if !replayable {
+        let kind = serde_json::to_value(item)
+            .ok()
+            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_default();
+        debug!(
+            item_type = %kind,
+            "Stored item of a kind the history does not replay; left out"
+        );
+    }
+    replayable
+}
+
+/// What a stored hosted tool call replays as its result: its output when it
+/// has one, else its error's text when it failed (a failed call stores an
+/// empty output and the failure under `error`; replaying it as an empty
+/// result would tell the model the call succeeded and said nothing), else
+/// nothing (a call that has not run).
+pub(crate) fn hosted_call_result(
+    output: Option<&str>,
+    error: Option<&McpToolCallError>,
+    status: Option<&str>,
+) -> Option<String> {
+    if let Some(output) = output.filter(|output| !output.is_empty()) {
+        return Some(output.to_owned());
+    }
+    match error {
+        Some(McpToolCallError::ProtocolError { code, message }) => Some(format!(
+            "The tool call failed (protocol error {code}): {message}"
+        )),
+        Some(McpToolCallError::HttpError { code, message }) => {
+            Some(format!("The tool call failed (HTTP {code}): {message}"))
+        }
+        Some(McpToolCallError::ToolExecutionError { content }) => Some(format!(
+            "The tool call failed: {}",
+            content
+                .as_str()
+                .map_or_else(|| content.to_string(), str::to_owned)
+        )),
+        None if status == Some("failed") => Some("The tool call failed.".to_owned()),
+        None => output.map(str::to_owned),
+    }
 }
 
 /// The input item a conversation row replays as: a message row from its
@@ -246,6 +314,7 @@ async fn conversation_items(
     Ok(stored
         .iter()
         .filter_map(conversation_item_as_input)
+        .filter(replays)
         .collect())
 }
 
@@ -517,6 +586,121 @@ pub(crate) mod tests {
             ResponseInputOutputItem::FunctionToolCall { name, arguments, .. }
                 if name == "calc" && arguments == "{\"expr\":\"6*7\"}"
         ));
+    }
+
+    /// A stored row of a kind no conversion replays (a hosted image
+    /// generation the gateway wrote, the client's approval turn) is left out
+    /// when the history loads, through `conversation` and through
+    /// `previous_response_id` alike, so the continuation goes on instead of
+    /// failing on the row until the client deletes it.
+    #[tokio::test]
+    async fn stored_kinds_no_conversion_replays_are_left_out_of_the_history() {
+        let stores = Stores::with_conversation().await;
+        stores
+            .store_turn(
+                "resp_1",
+                &turn_1_in_conversation(),
+                json!([
+                    {"type": "image_generation_call", "id": "ig_1", "status": "completed",
+                     "result": "aGVsbG8="},
+                    {"type": "message", "id": "msg_1", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "Drawn.", "annotations": []}]}
+                ]),
+            )
+            .await;
+        let approval: ResponseInputOutputItem = serde_json::from_value(json!({
+            "type": "mcp_approval_response", "approval_request_id": "mcpr_1", "approve": true
+        }))
+        .expect("an approval response item");
+        // Turn 2 continues the conversation and the chain alike, so both
+        // loaders walk past the rows they do not replay.
+        let turn_2 = ResponsesRequest {
+            input: ResponseInput::Items(vec![approval]),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            previous_response_id: Some("resp_1".to_string()),
+            ..Default::default()
+        };
+        stores
+            .store_turn(
+                "resp_2",
+                &turn_2,
+                json!([
+                    {"type": "message", "id": "msg_2", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "Approved.", "annotations": []}]}
+                ]),
+            )
+            .await;
+        let expected = [
+            "message:user",
+            "message:assistant",
+            "message:assistant",
+            "message:user",
+        ];
+
+        let turn_3 = ResponsesRequest {
+            input: ResponseInput::Text("And now?".to_string()),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
+        };
+        let loaded = load_history(stores.history(), &turn_3, None)
+            .await
+            .expect("the conversation loads past the rows it does not replay");
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded input is an item list");
+        };
+        assert_eq!(shape(items), expected);
+
+        let turn_3 = ResponsesRequest {
+            input: ResponseInput::Text("And now?".to_string()),
+            previous_response_id: Some("resp_2".to_string()),
+            ..Default::default()
+        };
+        let loaded = load_history(stores.history(), &turn_3, None)
+            .await
+            .expect("the chain loads past the items it does not replay");
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded input is an item list");
+        };
+        assert_eq!(shape(items), expected);
+    }
+
+    /// A stored hosted call replays its output; failing that, its failure
+    /// as text (never a successful empty result for a call that failed); a
+    /// call that has not run replays no result.
+    #[test]
+    fn a_stored_hosted_call_replays_its_output_else_its_failure() {
+        let execution = McpToolCallError::execution("wiki is down");
+        let http = McpToolCallError::HttpError {
+            code: 503,
+            message: "unavailable".to_string(),
+        };
+        assert_eq!(
+            hosted_call_result(Some("found"), None, Some("completed")).as_deref(),
+            Some("found")
+        );
+        assert_eq!(
+            hosted_call_result(Some("found"), Some(&execution), Some("failed")).as_deref(),
+            Some("found"),
+            "an output that is there is the result"
+        );
+        assert_eq!(
+            hosted_call_result(Some(""), Some(&execution), Some("failed")).as_deref(),
+            Some("The tool call failed: wiki is down")
+        );
+        assert_eq!(
+            hosted_call_result(None, Some(&http), None).as_deref(),
+            Some("The tool call failed (HTTP 503): unavailable")
+        );
+        assert_eq!(
+            hosted_call_result(None, None, Some("failed")).as_deref(),
+            Some("The tool call failed.")
+        );
+        assert_eq!(hosted_call_result(None, None, Some("in_progress")), None);
+        assert_eq!(
+            hosted_call_result(Some(""), None, Some("completed")).as_deref(),
+            Some(""),
+            "a completed call with an empty output keeps it"
+        );
     }
 
     #[tokio::test]

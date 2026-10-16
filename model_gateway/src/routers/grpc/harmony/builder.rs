@@ -29,8 +29,9 @@ use tracing::{debug, trace, warn};
 
 use super::types::HarmonyBuildOutput;
 use crate::routers::grpc::{
-    common::responses::utils::extract_tools_from_response_tools,
-    proto_wrapper::ProtoOutputLogProbs, utils,
+    common::responses::{history::hosted_call_result, utils::extract_tools_from_response_tools},
+    proto_wrapper::ProtoOutputLogProbs,
+    utils,
 };
 
 /// Global Harmony encoding (lazy-initialized)
@@ -793,11 +794,13 @@ impl HarmonyBuilder {
                 name,
                 arguments,
                 output,
+                error,
+                status,
                 ..
             } => Ok(tool_call_message(
                 name.clone(),
                 arguments,
-                output.as_deref(),
+                hosted_call_result(output.as_deref(), error.as_ref(), status.as_deref()).as_deref(),
             )),
 
             // Function call output (separate from call) - requires looking up the original call
@@ -1357,6 +1360,33 @@ mod tests {
         assert_eq!(tool.author.name.as_deref(), Some("functions.search"));
         assert_eq!(tool.recipient.as_deref(), Some("assistant"));
         assert!(matches!(&tool.content[..], [Content::Text(text)] if text.text == "found"));
+    }
+
+    /// A hosted tool call that failed replays as a result that says so, not
+    /// as a successful empty result.
+    #[test]
+    fn a_failed_stored_hosted_tool_call_replays_its_error_as_the_result() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "search it"},
+                {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                 "arguments": "{}", "output": "", "status": "failed",
+                 "error": {"type": "mcp_protocol_error", "code": -32000, "message": "no such tool"}}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("a failed hosted tool call converts");
+        let tool = messages.last().unwrap();
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.search"));
+        assert!(
+            matches!(&tool.content[..], [Content::Text(text)]
+                if text.text == "The tool call failed (protocol error -32000): no such tool"),
+            "{tool:?}"
+        );
     }
 
     #[test]

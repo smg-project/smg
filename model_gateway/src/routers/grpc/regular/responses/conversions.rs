@@ -25,10 +25,13 @@ use openai_protocol::{
 };
 use tracing::warn;
 
-use crate::routers::grpc::common::responses::utils::{
-    custom_tool_input, custom_tool_names, decode_reasoning_content, encode_reasoning_content,
-    extract_tools_from_response_tools, function_call_status, generation_failure_error,
-    resolve_function_identity,
+use crate::routers::grpc::common::responses::{
+    history::hosted_call_result,
+    utils::{
+        custom_tool_input, custom_tool_names, decode_reasoning_content, encode_reasoning_content,
+        extract_tools_from_response_tools, function_call_status, generation_failure_error,
+        resolve_function_identity,
+    },
 };
 
 /// Convert a ResponsesRequest to ChatCompletionRequest for processing through the chat pipeline
@@ -161,15 +164,19 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                         name,
                         arguments,
                         output,
+                        error,
+                        status,
                         ..
                     } => {
                         push_chat_message(
                             &mut messages,
                             assistant_tool_call(id, name, None, arguments.clone()),
                         );
-                        if let Some(output_text) = output {
+                        if let Some(result) =
+                            hosted_call_result(output.as_deref(), error.as_ref(), status.as_deref())
+                        {
                             messages.push(ChatMessage::Tool {
-                                content: MessageContent::Text(output_text.clone()),
+                                content: MessageContent::Text(result),
                                 tool_call_id: id.clone(),
                             });
                         }
@@ -1074,6 +1081,68 @@ mod tests {
             }
             other => panic!("expected the call's result, got {other:?}"),
         }
+    }
+
+    /// A hosted tool call that failed stores an empty output and the failure
+    /// under `error`: it replays as the call and a result that says the call
+    /// failed, not as a successful empty result.
+    #[test]
+    fn a_failed_stored_hosted_tool_call_replays_its_error_as_the_result() {
+        for (error, expected) in [
+            (
+                serde_json::json!({"type": "mcp_tool_execution_error", "content": "wiki is down"}),
+                "The tool call failed: wiki is down",
+            ),
+            (
+                serde_json::json!({"type": "http_error", "code": 503, "message": "unavailable"}),
+                "The tool call failed (HTTP 503): unavailable",
+            ),
+            (
+                serde_json::json!("legacy text"),
+                "The tool call failed: legacy text",
+            ),
+        ] {
+            let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "input": [
+                    {"role": "user", "content": "search it"},
+                    {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                     "arguments": "{}", "output": "", "status": "failed", "error": error}
+                ]
+            }))
+            .unwrap();
+            let chat_req = responses_to_chat(&req).unwrap();
+            assert_eq!(chat_req.messages.len(), 3, "{:?}", chat_req.messages);
+            match &chat_req.messages[2] {
+                ChatMessage::Tool {
+                    tool_call_id,
+                    content,
+                } => {
+                    assert_eq!(tool_call_id, "mcp_1");
+                    assert!(
+                        matches!(content, MessageContent::Text(text) if text == expected),
+                        "{content:?}"
+                    );
+                }
+                other => panic!("expected the failure as the result, got {other:?}"),
+            }
+        }
+        // A failed call with no error text still says it failed.
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "search it"},
+                {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                 "arguments": "{}", "status": "failed"}
+            ]
+        }))
+        .unwrap();
+        let chat_req = responses_to_chat(&req).unwrap();
+        assert!(
+            matches!(&chat_req.messages[2], ChatMessage::Tool { content: MessageContent::Text(text), .. } if text == "The tool call failed."),
+            "{:?}",
+            chat_req.messages
+        );
     }
 
     #[test]
