@@ -38,6 +38,19 @@ impl Outline {
     pub fn complete(&self) -> bool {
         self.close.is_some()
     }
+
+    /// Which of the call's members `key` names: the name while no name has come, the arguments
+    /// while no arguments have, so the first member of each kind counts; anything else another
+    /// member.
+    fn member_named(&self, key: &str) -> Member {
+        if NAME_KEYS.contains(&key) && self.name.is_none() {
+            Member::Name
+        } else if ARGUMENTS_KEYS.contains(&key) && self.arguments.is_none() {
+            Member::Arguments
+        } else {
+            Member::Other
+        }
+    }
 }
 
 /// A value's place in the text the outline was taken from: byte offsets, the end exclusive and
@@ -142,6 +155,94 @@ enum Shape {
     Scalar,
 }
 
+/// What a byte is to the value being read.
+enum Read {
+    /// The value's, and the value goes on.
+    Inside,
+    /// The value's last: the value ends after it.
+    Last,
+    /// Not the value's: the value ended before it, and the byte is the next stage's to read.
+    Past,
+}
+
+impl Shape {
+    /// The shape of a value whose first byte is `c`.
+    fn opened_by(c: char) -> Self {
+        match c {
+            '"' => Self::String { escaped: false },
+            '{' | '[' => Self::Container {
+                depth: 1,
+                in_string: false,
+                escaped: false,
+            },
+            _ => Self::Scalar,
+        }
+    }
+
+    /// Read the value's next byte: a string ends at its closing quote, a container where its
+    /// last bracket closes, brackets and quotes inside a string not counting, and a scalar before
+    /// a delimiter or whitespace.
+    fn read(&mut self, c: char) -> Read {
+        match self {
+            Self::String { escaped } => match (*escaped, c) {
+                (true, _) => {
+                    *escaped = false;
+                    Read::Inside
+                }
+                (false, '\\') => {
+                    *escaped = true;
+                    Read::Inside
+                }
+                (false, '"') => Read::Last,
+                _ => Read::Inside,
+            },
+            Self::Container {
+                depth,
+                in_string,
+                escaped,
+            } => match (*in_string, *escaped, c) {
+                (true, true, _) => {
+                    *escaped = false;
+                    Read::Inside
+                }
+                (true, false, '\\') => {
+                    *escaped = true;
+                    Read::Inside
+                }
+                (true, false, '"') => {
+                    *in_string = false;
+                    Read::Inside
+                }
+                (true, false, _) => Read::Inside,
+                (false, _, '"') => {
+                    *in_string = true;
+                    Read::Inside
+                }
+                (false, _, '{' | '[') => {
+                    *depth += 1;
+                    Read::Inside
+                }
+                (false, _, '}' | ']') => {
+                    *depth -= 1;
+                    if *depth == 0 {
+                        Read::Last
+                    } else {
+                        Read::Inside
+                    }
+                }
+                _ => Read::Inside,
+            },
+            Self::Scalar => {
+                if matches!(c, ',' | '}' | ']') || c.is_whitespace() {
+                    Read::Past
+                } else {
+                    Read::Inside
+                }
+            }
+        }
+    }
+}
+
 impl Scanner {
     /// What the text so far reveals.
     pub fn found(&self) -> &Outline {
@@ -226,18 +327,8 @@ impl Scanner {
                     (true, _) => *escaped = false,
                     (false, '\\') => *escaped = true,
                     (false, '"') => {
-                        let key = match decode_string(&text[*start..=at]).as_deref() {
-                            Some(key) if NAME_KEYS.contains(&key) && self.found.name.is_none() => {
-                                Member::Name
-                            }
-                            Some(key)
-                                if ARGUMENTS_KEYS.contains(&key)
-                                    && self.found.arguments.is_none() =>
-                            {
-                                Member::Arguments
-                            }
-                            _ => Member::Other,
-                        };
+                        let key = decode_string(&text[*start..=at])
+                            .map_or(Member::Other, |key| self.found.member_named(&key));
                         self.stage = Stage::Colon { key };
                     }
                     _ => {}
@@ -280,75 +371,21 @@ impl Scanner {
                     self.stage = Stage::Done;
                     return false;
                 }
-                let shape = match c {
-                    '"' => Shape::String { escaped: false },
-                    '{' | '[' => Shape::Container {
-                        depth: 1,
-                        in_string: false,
-                        escaped: false,
-                    },
-                    _ => Shape::Scalar,
-                };
                 self.stage = Stage::Value {
                     key,
                     start: at,
-                    shape,
+                    shape: Shape::opened_by(c),
                 };
                 true
             }
             Stage::Value { key, start, shape } => {
                 let (key, start) = (*key, *start);
-                let end = match shape {
-                    Shape::String { escaped } => match (*escaped, c) {
-                        (true, _) => {
-                            *escaped = false;
-                            None
-                        }
-                        (false, '\\') => {
-                            *escaped = true;
-                            None
-                        }
-                        (false, '"') => Some(at + 1),
-                        _ => None,
-                    },
-                    Shape::Container {
-                        depth,
-                        in_string,
-                        escaped,
-                    } => match (*in_string, *escaped, c) {
-                        (true, true, _) => {
-                            *escaped = false;
-                            None
-                        }
-                        (true, false, '\\') => {
-                            *escaped = true;
-                            None
-                        }
-                        (true, false, '"') => {
-                            *in_string = false;
-                            None
-                        }
-                        (true, false, _) => None,
-                        (false, _, '"') => {
-                            *in_string = true;
-                            None
-                        }
-                        (false, _, '{' | '[') => {
-                            *depth += 1;
-                            None
-                        }
-                        (false, _, '}' | ']') => {
-                            *depth -= 1;
-                            (*depth == 0).then_some(at + c.len_utf8())
-                        }
-                        _ => None,
-                    },
-                    Shape::Scalar => {
-                        if matches!(c, ',' | '}' | ']') || c.is_whitespace() {
-                            self.value_ends(text, key, start, at);
-                            return false;
-                        }
-                        None
+                let end = match shape.read(c) {
+                    Read::Inside => None,
+                    Read::Last => Some(at + c.len_utf8()),
+                    Read::Past => {
+                        self.value_ends(text, key, start, at);
+                        return false;
                     }
                 };
                 // The byte is the value's. A judged value stops the outline where it stops being
@@ -436,6 +473,41 @@ mod tests {
                 );
             }
             assert_eq!(found.complete(), cut == CALL.len(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_scanner_fed_piece_by_piece_finds_what_the_whole_texts_outline_finds() {
+        let texts = [
+            CALL,
+            r#"{"name": "f", "arguments": "{\"a\": 1}", "n": 42, "x": [1, {"y": "]"}]}"#,
+            r#"{"name": "f", "arguments": {"a": 1}, "strict": true</f>"#,
+            r#"{"name": "f", "arguments": {"a": 1}, "meta": {"x": 1</f>"#,
+            r#"{"name": "f", "arguments": {"a": 1}, "flag": nux}"#,
+            r#"{"arguments": {"a": [1, 2]}, "name": "f", junk}"#,
+            r#"{"name": "météo", "arguments": {"ville": "Zürich 🌍"}}  after"#,
+        ];
+        for text in texts {
+            for judging in [false, true] {
+                let scanner = || {
+                    let scanner = Scanner::default();
+                    if judging {
+                        scanner.judging_values()
+                    } else {
+                        scanner
+                    }
+                };
+                let mut whole = scanner();
+                whole.advance(text);
+                for cut in (0..=text.len()).filter(|&cut| text.is_char_boundary(cut)) {
+                    let mut pieces = scanner();
+                    pieces.advance(&text[..cut]);
+                    pieces.advance(text);
+                    let place = format!("{text:?} cut at {cut}, judging {judging}");
+                    assert_eq!(pieces.found(), whole.found(), "{place}");
+                    assert_eq!(pieces.stopped_at(), whole.stopped_at(), "{place}");
+                }
+            }
         }
     }
 
