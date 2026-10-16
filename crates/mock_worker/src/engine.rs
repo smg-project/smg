@@ -541,6 +541,8 @@ struct EngineShared {
     output_clock: Instant,
     last_output_ms: AtomicU64,
     in_flight: AtomicUsize,
+    /// Requests the gateway's aborts found and dropped.
+    aborted_total: AtomicU64,
 }
 
 impl EngineShared {
@@ -590,6 +592,9 @@ struct Faults {
     /// new shape, during which the engine produces nothing while its load
     /// record keeps flowing and its silence grows.
     cold_shape_ms: AtomicU64,
+    /// Streams held by the fault's hang, counted by the worker paths where
+    /// the hold begins (`Engine::hang_for`).
+    hung_total: Arc<AtomicU64>,
 }
 
 /// A request fault the admin API arms: what the worker answers instead of
@@ -608,6 +613,11 @@ pub(crate) struct RequestFault {
     /// `Complete` whose finish reason is `error` after `after_tokens` tokens,
     /// instead of a status.
     pub finish_error: bool,
+    /// How long the stream is held, delivering nothing, once `after_tokens`
+    /// tokens are out (none when unset): a backend that wedged mid-stream.
+    /// The hold ends early when the engine ends the request (an abort).
+    /// Zero holds nothing.
+    pub hang: Duration,
     /// How long the fault stays armed.
     pub scope: FaultScope,
 }
@@ -630,6 +640,7 @@ pub(crate) struct Injected {
     pub stall: Duration,
     pub after_tokens: Option<u32>,
     pub finish_error: bool,
+    pub hang: Duration,
 }
 
 /// The hooks' current state.
@@ -649,6 +660,7 @@ pub(crate) struct FaultStatus {
     pub cut_total: u64,
     pub stalled_total: u64,
     pub cold_shape_ms: u64,
+    pub hung_total: u64,
 }
 
 /// What the engine itself would serve from cache for a prompt right now.
@@ -672,6 +684,8 @@ pub(crate) struct Published {
 /// Messages into the engine actor.
 enum EngineMsg {
     Request(NewRequest),
+    /// Drop the request with this id, running or queued (the gateway's
+    /// abort).
     Abort(String),
     /// Drop every cached block and announce `AllBlocksCleared` (an engine
     /// restart, as far as the gateway's index is concerned).
@@ -696,6 +710,51 @@ pub(crate) struct RequestRecord {
     pub running_at_admit: u32,
     pub waiting_at_admit: u32,
     pub admitted_unix_ms: u64,
+}
+
+/// The fault hook's hang on one request (`hang_ms`): once `after_tokens`
+/// tokens are out, the stream delivers nothing for `hold`.
+pub(crate) struct Hang {
+    pub after_tokens: u32,
+    pub hold: Duration,
+    /// Counted when the hold begins.
+    pub hung_total: Arc<AtomicU64>,
+}
+
+/// The next event of a request's stream, through the fault hook's hang: when
+/// `delivered` tokens are out and the hang is armed for that many, the stream
+/// delivers nothing for the hold, keeping the events the engine produces
+/// meanwhile (a backend that wedged, then recovered, delivers them late). An
+/// engine that ends the request during the hold (the gateway's abort, a
+/// completion) ends the hold early, with the end of its events.
+pub(crate) async fn next_event(
+    rx: &mut mpsc::UnboundedReceiver<GenEvent>,
+    held: &mut VecDeque<GenEvent>,
+    hang: &mut Option<Hang>,
+    delivered: u32,
+) -> Option<GenEvent> {
+    if let Some(ev) = held.pop_front() {
+        return Some(ev);
+    }
+    let ev = rx.recv().await?;
+    let holds_now = matches!(ev, GenEvent::Token { .. })
+        && hang
+            .as_ref()
+            .is_some_and(|hang| hang.after_tokens == delivered);
+    if !holds_now {
+        return Some(ev);
+    }
+    let Hang {
+        hold, hung_total, ..
+    } = hang.take()?;
+    hung_total.fetch_add(1, Ordering::Relaxed);
+    held.push_back(ev);
+    let deadline = tokio::time::Instant::now() + hold;
+    // Until the hold ends, or the engine ends the request (its events end).
+    while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        held.push_back(ev);
+    }
+    held.pop_front()
 }
 
 /// Every engine in this process, for the fleet oracle and the admin API.
@@ -799,6 +858,7 @@ impl Engine {
             output_clock: Instant::now(),
             last_output_ms: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
+            aborted_total: AtomicU64::new(0),
         });
         // The publisher task releases batches in order at their release time
         // (the delay hook) and ends with the actor, which owns its sender.
@@ -821,10 +881,6 @@ impl Engine {
     }
 
     /// Abort a queued or running request. Unknown or completed IDs are harmless.
-    pub(crate) fn abort(&self, request_id: String) {
-        let _ = self.tx.send(EngineMsg::Abort(request_id));
-    }
-
     /// Clear the prefix cache and announce it (`AllBlocksCleared`).
     pub fn reset(&self) {
         let _ = self.tx.send(EngineMsg::Reset);
@@ -973,6 +1029,7 @@ impl Engine {
             stall: fault.stall,
             after_tokens: fault.after_tokens,
             finish_error: fault.finish_error,
+            hang: fault.hang,
         })
     }
 
@@ -980,6 +1037,30 @@ impl Engine {
     /// bump it at the point where they end a stream with the fault's status.
     pub(crate) fn cut_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.shared.faults.cut_total)
+    }
+
+    /// The hang an injected fault puts on one request (`None` when it holds
+    /// nothing): the worker paths hand it to the stream they build, which
+    /// counts the hold where it begins (see [`next_event`]).
+    pub(crate) fn hang_for(&self, fault: &Injected) -> Option<Hang> {
+        (!fault.hang.is_zero()).then(|| Hang {
+            after_tokens: fault.after_tokens.unwrap_or(0),
+            hold: fault.hang,
+            hung_total: Arc::clone(&self.shared.faults.hung_total),
+        })
+    }
+
+    /// Abort a request by id, as the gateway's `Abort` asks: the engine drops
+    /// it, running or queued, releasing its blocks and ending its stream. An
+    /// id the engine no longer holds (a finished request) is ignored; the
+    /// aborts that found one are counted ([`Engine::aborted_total`]).
+    pub fn abort(&self, request_id: &str) {
+        let _ = self.tx.send(EngineMsg::Abort(request_id.to_string()));
+    }
+
+    /// Requests the gateway's aborts found and dropped.
+    pub(crate) fn aborted_total(&self) -> u64 {
+        self.shared.aborted_total.load(Ordering::Relaxed)
     }
 
     /// One request answered with the fault's status before admission; the
@@ -1022,6 +1103,7 @@ impl Engine {
             cut_total: f.cut_total.load(Ordering::Relaxed),
             stalled_total: f.stalled_total.load(Ordering::Relaxed),
             cold_shape_ms: f.cold_shape_ms.load(Ordering::Relaxed),
+            hung_total: f.hung_total.load(Ordering::Relaxed),
         }
     }
 
@@ -1322,6 +1404,7 @@ fn handle_msg(
         }
         EngineMsg::Abort(request_id) => {
             if let Some((tx, event)) = state.abort(&request_id, params) {
+                shared.aborted_total.fetch_add(1, Ordering::Relaxed);
                 shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
                 *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) =
                     state.snapshot(params);
@@ -3355,6 +3438,112 @@ mod tests {
         rx
     }
 
+    fn token() -> GenEvent {
+        GenEvent::Token {
+            token_id: 1,
+            prompt_tokens: 1,
+            cached_tokens: 0,
+        }
+    }
+
+    /// The fault hook's hang holds a stream once the given tokens are out:
+    /// nothing is delivered for the hold, the events the engine produced
+    /// meanwhile follow it at once, and a hang holds once.
+    #[tokio::test]
+    async fn next_event_holds_the_stream_at_the_hang_and_delivers_late() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..3 {
+            tx.send(token()).unwrap();
+        }
+        let hung = Arc::new(AtomicU64::new(0));
+        let mut hang = Some(Hang {
+            after_tokens: 1,
+            hold: Duration::from_millis(200),
+            hung_total: Arc::clone(&hung),
+        });
+        let mut held = VecDeque::new();
+        let started = Instant::now();
+        assert!(
+            next_event(&mut rx, &mut held, &mut hang, 0).await.is_some(),
+            "the first token is delivered at once"
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(hung.load(Ordering::Relaxed), 0, "nothing held yet");
+        // The second token is held; the engine's further events pile up
+        // behind it.
+        assert!(next_event(&mut rx, &mut held, &mut hang, 1).await.is_some());
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the hold ran its course"
+        );
+        assert_eq!(hung.load(Ordering::Relaxed), 1, "the hold is counted once");
+        assert!(hang.is_none(), "a hang holds once");
+        let after = Instant::now();
+        assert!(next_event(&mut rx, &mut held, &mut hang, 2).await.is_some());
+        assert!(
+            after.elapsed() < Duration::from_millis(100),
+            "the token produced during the hold follows at once"
+        );
+        drop(tx);
+        assert!(next_event(&mut rx, &mut held, &mut hang, 3).await.is_none());
+    }
+
+    /// An engine that ends the request during the hold (the gateway's abort)
+    /// ends the hold: the stream delivers what the engine produced and ends,
+    /// long before the hold would have.
+    #[tokio::test]
+    async fn the_engines_end_cuts_the_hold_short() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(token()).unwrap();
+        let mut hang = Some(Hang {
+            after_tokens: 0,
+            hold: Duration::from_secs(30),
+            hung_total: Arc::new(AtomicU64::new(0)),
+        });
+        let mut held = VecDeque::new();
+        let started = Instant::now();
+        let (item, ()) = tokio::join!(next_event(&mut rx, &mut held, &mut hang, 0), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(tx);
+        });
+        assert!(
+            item.is_some(),
+            "the held token is delivered once the engine let go"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hold ended with the engine, not at 30 s"
+        );
+        assert!(next_event(&mut rx, &mut held, &mut hang, 1).await.is_none());
+    }
+
+    /// The gateway's abort drops the request on the engine: its stream ends
+    /// with the engine's events, the abort is counted, and an id the engine
+    /// does not hold is ignored.
+    #[tokio::test]
+    async fn abort_drops_the_request_and_ends_its_stream() {
+        let engine = live();
+        let (r, mut rx) = req("r-abort", vec![1, 2, 3], 100_000);
+        engine.submit(r);
+        // The request is in the engine, running by now or still queued.
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the engine serves the request");
+        assert!(first.is_some());
+        engine.abort("r-abort");
+        engine.abort("r-unknown");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await
+        .expect("the aborted request's stream ends with the engine's events");
+        assert_eq!(engine.aborted_total(), 1, "one abort found its request");
+        // The engine holds nothing for it any more.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(engine.load().num_running_reqs, 0);
+        assert_eq!(engine.output_silence(), None, "nothing in flight");
+    }
+
     async fn next_batch(
         stream: &mut KvEventStream,
         within: Duration,
@@ -3411,6 +3600,7 @@ mod tests {
             stall: Duration::ZERO,
             after_tokens: None,
             finish_error: false,
+            hang: Duration::ZERO,
             scope: FaultScope::Requests(2),
         }));
         let injected = Injected {
@@ -3418,6 +3608,7 @@ mod tests {
             stall: Duration::ZERO,
             after_tokens: None,
             finish_error: false,
+            hang: Duration::ZERO,
         };
         assert_eq!(engine.inject(), Some(injected));
         assert_eq!(
@@ -3447,6 +3638,7 @@ mod tests {
             stall: Duration::from_millis(5),
             after_tokens: Some(3),
             finish_error: false,
+            hang: Duration::ZERO,
             scope: FaultScope::Until(Instant::now() + Duration::from_millis(100)),
         }));
         let injected = engine.inject().expect("armed");
@@ -3477,6 +3669,7 @@ mod tests {
             stall: Duration::ZERO,
             after_tokens: None,
             finish_error: false,
+            hang: Duration::ZERO,
             scope: FaultScope::Open,
         }));
         assert!(engine.inject().is_some());

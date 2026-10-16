@@ -142,6 +142,11 @@ impl GrpcRouter {
         // The admission queue's timeout also bounds how long an accepted
         // request may sit ahead of worker selection.
         let queue_timeout = Duration::from_secs(ctx.router_config.queue_timeout_secs);
+        // `--constrained-no-progress-secs`: how long a grammar-constrained
+        // stream may go without a token, once it has one, before it is cut
+        // (zero: no bound).
+        let constrained_no_progress =
+            Duration::from_secs(ctx.router_config.constrained_no_progress_secs);
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -153,7 +158,8 @@ impl GrpcRouter {
             ctx.configured_reasoning_parser.clone(),
             ctx.rate_limit_manager.clone(),
             queue_timeout,
-        );
+        )
+        .with_constrained_no_progress(constrained_no_progress);
         // Deps for the parser-free endpoints (completion/embeddings/classify).
         // Only completion's stage list actually reads `rate_limit_manager`;
         // embeddings/classify never insert `RateLimitReserveStage`.
@@ -163,7 +169,8 @@ impl GrpcRouter {
             ctx.prefill_admission.clone(),
             ctx.rate_limit_manager.clone(),
             queue_timeout,
-        );
+        )
+        .with_constrained_no_progress(constrained_no_progress);
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)

@@ -1314,6 +1314,22 @@ impl ConfigValidator {
             ));
         }
 
+        // The no-progress budget of a constrained stream is a bound inside
+        // the request: at or above the request timeout it would never fire
+        // first, so a value there is a mistake rather than a setting.
+        if config.constrained_no_progress_secs != 0
+            && config.constrained_no_progress_secs >= config.request_timeout_secs
+        {
+            return Err(ConfigError::invalid_value(
+                "constrained_no_progress_secs",
+                config.constrained_no_progress_secs,
+                format!(
+                    "Must be below request_timeout_secs ({}) when set; 0 disables the budget",
+                    config.request_timeout_secs
+                ),
+            ));
+        }
+
         if config.queue_size > 0 && config.queue_timeout_secs == 0 {
             return Err(ConfigError::invalid_value(
                 "queue_timeout_secs",
@@ -4133,6 +4149,29 @@ mod tests {
             Err(ConfigError::InvalidValue { ref field, .. })
                 if field == "prefill_queue_timeout_secs"
         ));
+    }
+
+    /// The no-progress budget of a constrained stream is a bound inside the
+    /// request: off (zero), or below the request timeout.
+    #[test]
+    fn constrained_no_progress_budget_must_stay_below_the_request_timeout() {
+        let mut config = RouterConfig::default();
+        assert_eq!(config.constrained_no_progress_secs, 0, "off by default");
+        assert!(ConfigValidator::validate(&config).is_ok());
+        config.request_timeout_secs = 600;
+        config.constrained_no_progress_secs = 45;
+        assert!(ConfigValidator::validate(&config).is_ok());
+        for at_or_above in [600, 601] {
+            config.constrained_no_progress_secs = at_or_above;
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "constrained_no_progress_secs"
+                ),
+                "a budget of {at_or_above} s under a 600 s request timeout is refused"
+            );
+        }
     }
 
     #[test]

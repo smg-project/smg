@@ -4,7 +4,10 @@
 //! request building is its last reader and [`RequestContext::into_dispatch`]
 //! yields the request-free [`DispatchContext`] the dispatch phase runs on.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::http::HeaderMap;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
@@ -627,6 +630,26 @@ impl ExecutionPlan {
             Self::Single(ProtoRequest::Embed(_)) => [].iter_mut(),
             Self::Batch { requests, .. } => requests.iter_mut(),
         }
+    }
+
+    /// The constraint kind the no-progress budget applies to
+    /// (`--constrained-no-progress-secs`): that of a grammar-constrained
+    /// generation the engine streams. A non-streamed generation shows no
+    /// progress before its one answer, so the budget has nothing to read on
+    /// it; an embedding has no generation. A batch's prompts share one set of
+    /// sampling params, so its first request speaks for all.
+    pub(crate) fn no_progress_subject(&self) -> Option<&'static str> {
+        let request = match self {
+            Self::Single(ProtoRequest::Generate(request))
+            | Self::PrefillDecode(request)
+            | Self::EncodePrefillDecode { request } => request,
+            Self::Single(ProtoRequest::Embed(_)) => return None,
+            Self::Batch { requests, .. } => requests.first()?,
+        };
+        if !request.stream() {
+            return None;
+        }
+        request.grammar_constraint()
     }
 }
 
@@ -1564,6 +1587,51 @@ pub(crate) enum ExecutionResult {
     },
 }
 
+impl ExecutionResult {
+    /// The answer stream(s) under the no-progress budget of a
+    /// grammar-constrained generation (see
+    /// [`ProtoStream::with_no_progress_budget`]): the one worker's stream, a
+    /// disaggregated pair's decode leg (the prefill leg answers once, with
+    /// no tokens to pace), each result of a batch. An embedding has no stream.
+    #[must_use]
+    pub(crate) fn with_no_progress_budget(
+        self,
+        budget: Duration,
+        constraint: &'static str,
+        request_id: &str,
+    ) -> Self {
+        match self {
+            Self::Single { stream } => Self::Single {
+                stream: stream.with_no_progress_budget(budget, constraint, request_id.to_string()),
+            },
+            Self::PrefillDecode {
+                prefill,
+                decode,
+                prefill_guards,
+                pd_timing,
+                prefill_input_logprobs,
+            } => Self::PrefillDecode {
+                prefill,
+                decode: Box::new(decode.with_no_progress_budget(
+                    budget,
+                    constraint,
+                    request_id.to_string(),
+                )),
+                prefill_guards,
+                pd_timing,
+                prefill_input_logprobs,
+            },
+            Self::Embedding { .. } => self,
+            Self::Batch { results } => Self::Batch {
+                results: results
+                    .into_iter()
+                    .map(|result| result.with_no_progress_budget(budget, constraint, request_id))
+                    .collect(),
+            },
+        }
+    }
+}
+
 /// Timing context threaded from PD execution into the streaming layer so the
 /// first decode token can be measured against the prefill and decode dispatch
 /// instants.
@@ -1626,7 +1694,7 @@ pub(crate) enum FinalResponse {
 
 #[cfg(test)]
 mod tests {
-    use smg_grpc_client::VllmEngineClient;
+    use smg_grpc_client::{tokenspeed_proto as tokenspeed, VllmEngineClient};
 
     use super::*;
     use crate::routers::grpc::{client::GrpcClient, test_engine::mock_engine};
@@ -1731,6 +1799,71 @@ mod tests {
         }
     }
 
+    /// The no-progress budget's subject is a grammar-constrained generation
+    /// the engine streams: a non-streamed one shows no progress to read, a
+    /// free one has no grammar, and a batch speaks through its first request.
+    #[test]
+    fn no_progress_subject_is_a_streamed_constrained_generation() {
+        let request = |stream: bool, constraint| {
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed::GenerateRequest {
+                stream,
+                sampling_params: Some(tokenspeed::SamplingParams {
+                    constraint,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        };
+        let schema = || {
+            Some(tokenspeed::sampling_params::Constraint::JsonSchema(
+                "{}".to_string(),
+            ))
+        };
+        let single = |stream, constraint| {
+            ExecutionPlan::Single(ProtoRequest::Generate(request(stream, constraint)))
+        };
+        assert_eq!(
+            single(true, schema()).no_progress_subject(),
+            Some("json_schema")
+        );
+        assert_eq!(
+            single(false, schema()).no_progress_subject(),
+            None,
+            "a non-streamed generation shows no progress before its one answer"
+        );
+        assert_eq!(single(true, None).no_progress_subject(), None, "no grammar");
+        assert_eq!(
+            ExecutionPlan::PrefillDecode(request(true, schema())).no_progress_subject(),
+            Some("json_schema")
+        );
+        assert_eq!(
+            ExecutionPlan::EncodePrefillDecode {
+                request: request(true, schema()),
+            }
+            .no_progress_subject(),
+            Some("json_schema")
+        );
+        assert_eq!(
+            ExecutionPlan::Batch {
+                kind: ExecutionPlanKind::Single,
+                shared_request_id: "shared".to_string(),
+                requests: vec![request(true, schema()), request(true, schema())],
+            }
+            .no_progress_subject(),
+            Some("json_schema")
+        );
+        assert_eq!(
+            ExecutionPlan::Batch {
+                kind: ExecutionPlanKind::Single,
+                shared_request_id: "shared".to_string(),
+                requests: Vec::new(),
+            }
+            .no_progress_subject(),
+            None,
+            "an empty batch has no subject"
+        );
+    }
+
     fn completion_prep(texts: &[&str], joined: Option<&str>) -> PreparationOutput {
         PreparationOutput::Completion {
             items: texts
@@ -1798,7 +1931,7 @@ mod tests {
         );
         let routing_key = "batch-key";
 
-        let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+        let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
         let admitted = match admission
             .admit(Some(routing_key), {
                 let prefill = Arc::clone(&prefill);

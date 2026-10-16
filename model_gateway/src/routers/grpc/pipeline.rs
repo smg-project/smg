@@ -127,6 +127,10 @@ pub(crate) struct PipelineDeps {
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
     queue_timeout: Duration,
+    /// `--constrained-no-progress-secs`: the token gap that cuts a
+    /// grammar-constrained stream once it has started; `None` leaves it
+    /// unbounded.
+    constrained_no_progress: Option<Duration>,
 }
 
 impl PipelineDeps {
@@ -157,6 +161,7 @@ impl PipelineDeps {
             configured_reasoning_parser,
             rate_limit_manager,
             queue_timeout,
+            constrained_no_progress: None,
         }
     }
 
@@ -179,7 +184,16 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager,
             queue_timeout,
+            constrained_no_progress: None,
         }
+    }
+
+    /// Bound the token gap of a grammar-constrained stream by `budget`
+    /// (`--constrained-no-progress-secs`); zero leaves it unbounded.
+    #[must_use]
+    pub(crate) fn with_constrained_no_progress(mut self, budget: Duration) -> Self {
+        self.constrained_no_progress = (!budget.is_zero()).then_some(budget);
+        self
     }
 
     /// Build the chat/messages response processor pair from the configured
@@ -247,6 +261,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
+            constrained_no_progress: None,
         }
     }
 }
@@ -278,6 +293,8 @@ pub(crate) struct RequestPipeline {
     worker_registry: Arc<WorkerRegistry>,
     /// Shapes a forced tool call's constraint for each attempt's worker.
     tool_parser_factory: ToolParserFactory,
+    /// The no-progress budget of a grammar-constrained stream, when set.
+    constrained_no_progress: Option<Duration>,
 }
 
 /// Outcome of one full pipeline run.
@@ -465,6 +482,7 @@ impl RequestPipeline {
             mode,
             worker_registry: deps.worker_registry.clone(),
             tool_parser_factory: deps.tool_parser_factory.clone(),
+            constrained_no_progress: deps.constrained_no_progress,
         })
     }
 
@@ -602,7 +620,13 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt).await?;
+        execute_plan(
+            dctx,
+            attempt_plan,
+            last_attempt,
+            self.constrained_no_progress,
+        )
+        .await?;
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
@@ -1995,7 +2019,7 @@ mod request_release_tests {
                 MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
                 SUPPORTS_VISION_LABEL,
             },
-            proto_wrapper::ENGINE_ERROR_MESSAGE,
+            proto_wrapper::{ENGINE_ERROR_MESSAGE, NO_PROGRESS_ERROR_CODE},
             regular::symphony::template::Templates,
             utils::tonic_ext::TonicStatusExt,
         },
@@ -2064,6 +2088,9 @@ mod request_release_tests {
         fail_mid_stream: bool,
         fail_constraint: bool,
         fail_engine_report: bool,
+        /// Send the first frame, then hold the stream open with nothing on
+        /// it: an engine whose generation wedged after its first token.
+        hold_after_first: bool,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -2205,6 +2232,7 @@ mod request_release_tests {
             let released = Arc::clone(&self.released);
             let frame_gap = self.frame_gap;
             let fail_mid_stream = self.fail_mid_stream;
+            let hold_after_first = self.hold_after_first;
             tokio::spawn(async move {
                 if let Some(probe) = probe {
                     Self::await_probe(&probe, &released).await;
@@ -2219,6 +2247,12 @@ mod request_release_tests {
                         frame
                     };
                     if tx.send(frame).await.is_err() {
+                        return;
+                    }
+                    if hold_after_first && index == 0 {
+                        // The stream stays open, with nothing more on it,
+                        // for longer than any budget a test sets.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
                         return;
                     }
                 }
@@ -4214,6 +4248,114 @@ mod request_release_tests {
         assert_eq!(spy.wait_for(1).await, [worker.url().to_string()]);
         assert_eq!(worker.load(), 0);
         drop(hold);
+    }
+
+    /// A grammar-constrained stream whose engine stops producing after the
+    /// first token is cut at the no-progress budget: the client reads the
+    /// error event naming the code and the stream's end, the engine receives
+    /// the abort for that request, the cut is counted under the constraint's
+    /// kind, and the worker's load goes with the response body.
+    #[tokio::test]
+    async fn a_constrained_stream_that_stops_is_cut_at_the_budget_and_aborted() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let aborted = Arc::clone(&scheduler.aborted_request_ids);
+        let seen = Arc::clone(&scheduler.seen_request_ids);
+        let port = spawn_stub(scheduler).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .with_constrained_no_progress(Duration::from_millis(300));
+        let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline");
+        let components = components(Arc::clone(&worker_registry)).await;
+        let request: Arc<CompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "stream": true,
+                "regex": "[a-z]+",
+            }))
+            .expect("completion request"),
+        );
+
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = tokio::time::timeout(
+            Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the budget ends the body")
+        .expect("drain body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "the budget ran before the cut"
+        );
+        assert!(body.contains(NO_PROGRESS_ERROR_CODE), "{body}");
+        assert!(
+            body.contains("after 1 responses"),
+            "the budget ran from the first response: {body}"
+        );
+        assert!(body.contains("\"type\":\"stream_error\""), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+
+        // The abort reached the engine for this request.
+        let request_id = seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("the stub saw the request");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !aborted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&request_id)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the stub never received the abort for {request_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The slot goes with the response body.
+        while worker.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker's load stayed at {} after the body ended",
+                worker.load()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("smg_constrained_no_progress_total{constraint=\"regex\"} 1"),
+            "{rendered}"
+        );
     }
 
     /// gRPC PD path: the prefill side answers on its own and reports when its

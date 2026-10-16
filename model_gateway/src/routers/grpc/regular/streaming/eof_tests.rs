@@ -98,7 +98,7 @@ impl Tokenizer for CharacterTokenizer {
     }
 }
 
-pub(super) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
+pub(crate) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     let token_ids: Vec<_> = text.chars().map(u32::from).collect();
     proto::GenerateResponse {
         response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
@@ -123,7 +123,7 @@ pub(super) fn chunk_with_logprobs(index: u32, text: &str) -> proto::GenerateResp
     response
 }
 
-pub(super) fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
+pub(crate) fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
     complete_with_prompt(index, reason, 1)
 }
 
@@ -161,7 +161,7 @@ pub(crate) async fn scripted_stream(
 
 /// [`scripted_stream`] with the frames after `first` held back until `gate`
 /// fires: the processor sees the first engine output on its own.
-pub(super) async fn gated_stream(
+pub(crate) async fn gated_stream(
     first: Vec<proto::GenerateResponse>,
     gate: oneshot::Receiver<()>,
     rest: Vec<proto::GenerateResponse>,

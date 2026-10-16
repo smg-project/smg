@@ -14,8 +14,8 @@ use crate::{
         grpc::{
             context::ExecutionResult,
             proto_wrapper::{
-                FanoutChild, PrefillCachedTokens, ProtoGenerateComplete, ProtoResponseVariant,
-                ProtoStream,
+                is_no_progress_cut, FanoutChild, PrefillCachedTokens, ProtoGenerateComplete,
+                ProtoResponseVariant, ProtoStream, NO_PROGRESS_ERROR_CODE,
             },
             utils::{
                 account_pd_side_failure, dead_rendezvous_of, stream_failure::UpstreamClass,
@@ -216,10 +216,17 @@ fn stream_failed(
             "pd_rendezvous_failed",
             format!("{side} stream failed: {}; {rendezvous}", status.message()),
         ),
-        None => status.to_http_error(
-            "worker_stream_failed",
-            format!("{side} stream failed: {}", status.message()),
-        ),
+        None => {
+            // A stream the gateway itself cut at the no-progress budget of a
+            // constrained generation answers under that code, so the client can
+            // tell the budget from a stream the worker failed.
+            let code = if is_no_progress_cut(status) {
+                NO_PROGRESS_ERROR_CODE
+            } else {
+                "worker_stream_failed"
+            };
+            status.to_http_error(code, format!("{side} stream failed: {}", status.message()))
+        }
     }
 }
 

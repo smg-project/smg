@@ -186,6 +186,10 @@ Called from the router Deployment template.
 - {{ .Values.router.queueSize | quote }}
 - "--queue-timeout-secs"
 - {{ .Values.router.queueTimeoutSecs | quote }}
+{{- if .Values.router.constrainedNoProgressSecs }}
+- "--constrained-no-progress-secs"
+- {{ .Values.router.constrainedNoProgressSecs | quote }}
+{{- end }}
 {{- if not .Values.router.retry.enabled }}
 - "--disable-retries"
 {{- else }}
