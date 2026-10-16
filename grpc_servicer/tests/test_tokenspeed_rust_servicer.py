@@ -1143,6 +1143,12 @@ def test_mrope_positions_are_read_off_the_text_rope_config():
         text_config={"rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"}},
     )
     assert rust.mrope_positions(plain) is False
+    # A plain rope on the text config does not hide an MRoPE section at the top level.
+    both = SimpleNamespace(
+        rope_scaling={"type": "mrope", "mrope_section": [16, 24, 24]},
+        text_config={"rope_parameters": {"rope_type": "default", "rope_theta": 1e6}},
+    )
+    assert rust.mrope_positions(both) is True
     # Dict-shaped configs read the same way; no rope section at all says nothing.
     assert rust.mrope_positions({"text_config": {"rope_scaling": {"mrope_section": [1]}}}) is True
     assert rust.mrope_positions(SimpleNamespace(model_type="x")) is None

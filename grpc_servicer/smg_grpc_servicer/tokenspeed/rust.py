@@ -157,25 +157,32 @@ def _config_section(config: Any, name: str) -> Any:
 def mrope_positions(hf_config: Any) -> bool | None:
     """Whether the language model's rotary positions are MRoPE, read off the
     checkpoint's text rope config: ``rope_scaling`` / ``rope_parameters`` (on the
-    text config when the checkpoint nests one, else the top level) with an
+    text config when the checkpoint nests one, and the top level) with an
     ``mrope_section``, or a rope type named ``mrope``. A checkpoint whose rope
     config is plain (``rope_type: default`` with no section) uses 1-D positions,
     so its vision grid tensors only lay out the patches. ``None`` when the
     config carries no rope section at all."""
     if hf_config is None:
         return None
-    text = _config_section(hf_config, "text_config") or hf_config
+    # Both the nested text config and the top level are read: a config class
+    # may fill a plain rope default on one while the checkpoint declares its
+    # MRoPE section on the other, and either declaration means MRoPE.
+    sections = [hf_config]
+    text = _config_section(hf_config, "text_config")
+    if text is not None:
+        sections.insert(0, text)
     found = False
-    for key in ("rope_scaling", "rope_parameters"):
-        rope = _config_section(text, key)
-        if rope is None:
-            continue
-        found = True
-        if _config_section(rope, "mrope_section") is not None:
-            return True
-        kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
-        if isinstance(kind, str) and "mrope" in kind:
-            return True
+    for section in sections:
+        for key in ("rope_scaling", "rope_parameters"):
+            rope = _config_section(section, key)
+            if rope is None:
+                continue
+            found = True
+            if _config_section(rope, "mrope_section") is not None:
+                return True
+            kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
+            if isinstance(kind, str) and "mrope" in kind:
+                return True
     return False if found else None
 
 

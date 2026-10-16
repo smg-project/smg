@@ -661,6 +661,10 @@ impl ZmqEngineClient {
     /// fan-out submitted to the engine, each sub tagged with its proto
     /// `index`, left unmerged so a caller can end one choice without the
     /// others (the gRPC servicer matches string stops per choice).
+    /// Grid tensors keep the conservative reading here ([`GridTensors::Positions`]):
+    /// the router's direct-ZMQ path, which calls this, carries no model facts, so
+    /// an item with a vision grid is refused there as before; the Rust servicer,
+    /// which knows the model, calls [`Self::generate_tokenspeed_streams_for_model`].
     pub async fn generate_tokenspeed_streams(
         &self,
         req: tokenspeed_proto::GenerateRequest,
