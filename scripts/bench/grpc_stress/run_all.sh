@@ -129,8 +129,10 @@ for fam in "${families[@]}"; do
       [ -f "$GS_DIR/images/noise-3.png" ] || python3 "$HERE/gen_images.py" --out "$GS_DIR/images" --count 4 --bytes 4000000 | tee -a "$GS_DIR/run_all.log"
       imgs="--image $GS_DIR/images/noise-0.png --image $GS_DIR/images/noise-1.png --image $GS_DIR/images/noise-2.png --image $GS_DIR/images/noise-3.png"
       for mode in router worker; do
-        run_family "image-$mode" MODEL=mock-llava "TOKENIZER=$LLAVA_TOKENIZER" "GW_ARGS=--mm-processing $mode" -- \
-          "img4mb=--mode image $imgs --rate 100 --distinct 16 --prompt-tokens 32 --max-tokens 8 --model mock-llava ${common[*]}"
+        # The served id carries a vision-processor pattern ("llava-1.5"): the router picks the image
+        # processor by substring of the model id (or of config.json's model_type).
+        run_family "image-$mode" MODEL=mock-llava-1.5 "TOKENIZER=$LLAVA_TOKENIZER" "GW_ARGS=--mm-processing $mode" -- \
+          "img4mb=--mode image $imgs --rate 100 --distinct 16 --prompt-tokens 32 --max-tokens 8 --model mock-llava-1.5 ${common[*]}"
       done ;;
     tenants)
       python3 "$HERE/gen_tenants.py" --out "$GS_DIR/tenants.yaml" --count 200 | tee -a "$GS_DIR/run_all.log"

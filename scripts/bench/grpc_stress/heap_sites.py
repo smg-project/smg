@@ -14,13 +14,16 @@ import subprocess
 import sys
 
 SKIP = re.compile(
-    r"_rjem_|^je_|^(malloc|free|calloc|realloc|posix_memalign|sdallocx|mallocx|rallocx)$|"
-    r"__rust_(alloc|realloc)|^alloc::alloc::|alloc::raw_vec|RawVec|<alloc::alloc::Global|"
-    r"alloc::vec::Vec<.*>::(reserve|push|extend|with_capacity|from_iter)|"
-    r"alloc::string::String::(push|reserve|from|with_capacity)|"
-    r"<alloc::vec::Vec<.*> as (alloc::vec::spec|core::clone|core::iter)|<T as alloc::slice::|"
-    r"hashbrown::raw::|^std::thread|^core::|"
-    r"<alloc::boxed::Box<.*>::new|alloc::sync::Arc<.*>::new|alloc::collections|Bytes(Mut)?::|bytes::"
+    r"^(prof_|_rjem_|je_|imalloc|ifree|do_rallocx|arena_|tcache|large_|extent_|sz_|malloc_default|"
+    r"malloc$|calloc$|realloc$|posix_memalign$|aligned_alloc$|__rust_|__rg_|__rdl_|rust_alloc)|"
+    r"^alloc::alloc::|alloc::raw_vec|RawVec|<alloc::alloc::Global|box_new_uninit|finish_grow|"
+    r"alloc::vec::Vec<.*>::(reserve|push|extend|with_capacity|from_iter|insert)|"
+    r"alloc::string::String::(push|reserve|from|with_capacity)|<alloc::string::String as core::clone|"
+    r"<alloc::vec::Vec<.*> as (alloc::vec::spec|core::clone|core::iter|alloc::vec::in_place)|<T as alloc::slice::|"
+    r"<\[T\]>::to_vec|<str as alloc::str::|<str>::to_owned|<str>::to_string|<alloc::boxed::Box<.*>::new|"
+    r"<alloc::sync::Arc<.*>::new|alloc::collections|hashbrown::|<hashbrown::|^std::thread|^core::|"
+    r"<core::|BytesMut::|<bytes::|bytes::|indexmap::|<indexmap::|serde_json::value::ser|"
+    r"<serde_json::|serde_json::de|serde_core::"
 )
 
 
@@ -68,27 +71,27 @@ def unbias(objs, bytes_, interval):
 
 
 def symbolize(binary, addrs):
+    """Function names for the addresses, from the binary's symbol table (`nm -C -n`, read once; a
+    bisect per address). Function granularity is what the site attribution needs, and it stays fast
+    on a large binary with full debug info, which addr2line reads again for every batch."""
+    import bisect
+
+    proc = subprocess.run(
+        ["nm", "-C", "-n", "--defined-only", binary], capture_output=True, text=True, check=False
+    )
+    starts, names = [], []
+    for line in proc.stdout.splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) == 3 and parts[1].lower() in ("t", "w", "i"):
+            try:
+                starts.append(int(parts[0], 16))
+            except ValueError:
+                continue
+            names.append(parts[2])
     out = {}
-    addrs = sorted(addrs)
-    for k in range(0, len(addrs), 2000):
-        batch = addrs[k : k + 2000]
-        proc = subprocess.run(
-            ["addr2line", "-e", binary, "-f", "-C", "-i", "-a"] + [hex(a) for a in batch],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        cur = None
-        for line in proc.stdout.splitlines():
-            if line.startswith("0x"):
-                cur = int(line, 16)
-                out[cur] = []
-            elif (
-                cur is not None
-                and not line.startswith(("/", "?"))
-                and ":" not in line.split(" ")[0]
-            ):
-                out[cur].append(line.strip())
+    for addr in addrs:
+        i = bisect.bisect_right(starts, addr) - 1
+        out[addr] = [names[i]] if i >= 0 else [hex(addr)]
     return out
 
 
