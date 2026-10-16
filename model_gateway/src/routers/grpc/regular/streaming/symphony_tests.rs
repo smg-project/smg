@@ -1,9 +1,9 @@
 //! Symphony reading the chat stream: the assignment on the response spec switches the drivers
 //! from the tool and reasoning parsers to one engine per choice, with the same chunks on the wire.
 
-use llm_tokenizer::StopSequenceConfig;
+use llm_tokenizer::{registry::TokenizerRegistry, StopSequenceConfig};
 use openai_protocol::{
-    chat::ChatChoice,
+    chat::{ChatChoice, ChatCompletionRequest},
     common::{ChatLogProbs, StringOrArray},
 };
 use serde_json::{json, Value};
@@ -20,9 +20,16 @@ use super::{
     },
     *,
 };
-use crate::routers::grpc::{
-    proto_wrapper::ProtoGenerateComplete,
-    regular::{processor::ResponseProcessor, symphony::Assignment},
+use crate::{
+    config::ParserChoice,
+    routers::grpc::{
+        proto_wrapper::ProtoGenerateComplete,
+        regular::{
+            processor::ResponseProcessor,
+            symphony::{assign, template::Templates, Assignment},
+        },
+        utils::Names,
+    },
 };
 
 /// The spec with Symphony assigned `format`, replaying `prompt`.
@@ -117,6 +124,114 @@ async fn symphony_streams_reasoning_content_and_a_tool_call_from_a_qwen3_output(
     assert!(events[1..]
         .iter()
         .all(|event| event["choices"][0]["delta"]["role"].is_null()));
+}
+
+/// A chat request with the conversation of a retry and no tools: the user asked for
+/// `list_skills`, the assistant called it, the tool was unavailable, the user asks again.
+fn retry_request() -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": "MiniMax-M3", "stream": true, "separate_reasoning": true,
+        "messages": [
+            {"role": "user", "content": "Call the `list_skills` tool once to see what we can do, \
+                                         and reply with nothing else."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_0", "type": "function",
+                "function": {"name": "list_skills", "arguments": "{}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_0",
+             "content": "`list_skills` is unavailable for now; call it again later."},
+            {"role": "user", "content": "The cooldown is over. Try again."}
+        ]
+    }))
+    .expect("chat request")
+}
+
+/// The prompt the model's public chat template renders for the retry conversation
+/// ([`retry_request`], thinking adaptive, no `tools`): the earlier call in the history is
+/// written as an invoke with no parameters, and the generation prompt ends at the turn
+/// opener, so the replay starts the output in the content with the thought the model's to
+/// open.
+const RETRY_PROMPT: &str = concat!(
+    "]~!b[]~b]system\n",
+    "Your model version is MiniMax-M3, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.\n",
+    "\n",
+    "<thinking_instructions>\n",
+    "You have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\n",
+    "Current thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n",
+    "</thinking_instructions>[e~[\n",
+    "]~b]developer\n",
+    "You are a helpful assistant.[e~[\n",
+    "]~b]user\n",
+    "Call the `list_skills` tool once to see what we can do, and reply with nothing else.[e~[\n",
+    "]~b]ai\n",
+    "</mm:think>]<]minimax[>[<tool_call>\n",
+    "]<]minimax[>[<invoke name=\"list_skills\">]<]minimax[>[</invoke>\n",
+    "]<]minimax[>[</tool_call>[e~[\n",
+    "]~b]tool\n",
+    "<response>Tool `list_skills` unavailable for now. Please call it later.</response>[e~[\n",
+    "]~b]user\n",
+    "<system-reminder>The cooldown is over, try again.</system-reminder>[e~[\n",
+    "]~b]ai\n"
+);
+
+#[tokio::test]
+async fn a_call_the_conversation_established_is_a_call_without_a_tool_inventory() {
+    // The request declares no tools and the model's provider reads calls without them, so the
+    // older path runs its tool parser; the assignment keeps the table's calls the same way, and
+    // the block the model writes for the retry comes back as a call, not as content.
+    let request = retry_request();
+    let assignment = assign(
+        ParserChoice::Symphony,
+        &Names::default(),
+        &request,
+        None,
+        RETRY_PROMPT,
+        &Templates::new(Arc::new(TokenizerRegistry::new())),
+    )
+    .expect("no template named")
+    .expect("the registry's table");
+    assert_eq!(
+        assignment.prompt, "]~b]ai\n",
+        "the replay starts at the turn opener"
+    );
+    let mut spec = ChatResponseSpec::from(&request);
+    assert!(
+        spec.tools.as_ref().is_some_and(Vec::is_empty),
+        "scanned for calls, with no inventory"
+    );
+    spec.symphony = Some(assignment);
+    let output = "<mm:think>The user asks for the tool again.</mm:think>\
+                  <tool_call>\n<invoke name=\"list_skills\"></invoke>\n</tool_call>";
+    let responses = vec![
+        chunk(0, &output[..30]),
+        chunk(0, &output[30..]),
+        complete(0, "stop"),
+    ];
+    let (result, events) = stream_events(responses, false, spec).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        chat_text(&events, 0, "reasoning_content"),
+        "The user asks for the tool again."
+    );
+    assert_eq!(
+        chat_text(&events, 0, "content").trim(),
+        "",
+        "the block is no content"
+    );
+    let calls = tool_call_deltas(&events);
+    assert!(!calls.is_empty(), "{events:#?}");
+    assert_eq!(calls[0]["function"]["name"], "list_skills");
+    let arguments: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    let arguments: Value = serde_json::from_str(&arguments).expect("the arguments as JSON");
+    assert_eq!(arguments, json!({}));
+    let finish = events
+        .iter()
+        .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .expect("a finish chunk");
+    assert_eq!(finish, "tool_calls");
 }
 
 /// [`stream_events`] with tools and a stop sequence the decoder matches.

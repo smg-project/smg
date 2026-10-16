@@ -20,8 +20,9 @@
 //! ([`check_names`]). Every request read with `legacy` keeps the older parsers. The response names
 //! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
 //! took the request, so a client comparing the two can tell which one read each answer. What a
-//! request asks of the channels takes a variant of the table rather than another reader: with no
-//! tools declared, or `tool_choice: none`, the table without its calls; with
+//! request asks of the channels takes a variant of the table rather than another reader: where the
+//! legacy path would run no tool parser (`tool_choice: none`; no tools declared, for a provider
+//! that reads calls only with them), the table without its calls; with
 //! `separate_reasoning: false`, the table without its thought ([`assign`]).
 //!
 //! Request building assigns Symphony to a request ([`assign`], [`assign_messages`]) and stores
@@ -64,7 +65,10 @@ use tracing::debug;
 use self::template::Templates;
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
-    routers::grpc::utils::{Names, WorkerDecoding},
+    routers::grpc::{
+        spec::scans_for_tool_calls,
+        utils::{Names, WorkerDecoding},
+    },
 };
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
@@ -758,10 +762,11 @@ fn assignment(
     Some(Assignment { format, prompt })
 }
 
-/// The table as the request's asks make it: without its calls when the request declares no tools
-/// or asks for none, as the legacy path runs no tool parser then, and a table that reads calls
-/// from the output's first byte (`json`, `xlam`) is content from it; without its thought when the
-/// request keeps the reasoning in the content, as the legacy path runs no reasoning parser then.
+/// The table as the request's asks make it: without its calls when the legacy path would run no
+/// tool parser (the request asks for none, or its response is not scanned for calls:
+/// [`scans_for_tool_calls`]), so a table that reads calls from the output's first byte (`json`,
+/// `xlam`) is content from it; without its thought when the request keeps the reasoning in the
+/// content, as the legacy path runs no reasoning parser then.
 fn asked(format: Format, no_calls: bool, no_reasoning: bool) -> Format {
     let format = if no_calls {
         format.without_calls()
@@ -776,8 +781,11 @@ fn asked(format: Format, no_calls: bool, no_reasoning: bool) -> Format {
 }
 
 /// Symphony's assignment to a chat `request`, if a table reads the response ([`reads`]) and the
-/// constraint is not a JSON schema ([`assignment`]): the table without its calls for no tools or
-/// a `tool_choice` of `none`, without its thought for `separate_reasoning: false` ([`asked`]).
+/// constraint is not a JSON schema ([`assignment`]): the table without its calls for a
+/// `tool_choice` of `none` or a response the legacy path would not scan for calls (no tools
+/// declared anywhere, for a provider that reads calls only with them: [`scans_for_tool_calls`]),
+/// without its thought for `separate_reasoning: false` ([`asked`]). A call the conversation
+/// established without a tool inventory comes back as a call under either parser.
 pub(crate) fn assign(
     parser: ParserChoice,
     names: &Names,
@@ -790,13 +798,14 @@ pub(crate) fn assign(
     let no_calls = matches!(
         request.tool_choice,
         Some(ToolChoice::Value(ToolChoiceValue::None))
-    ) || request.effective_tools().next().is_none();
+    ) || !scans_for_tool_calls(request);
     let format = format.map(|format| asked(format, no_calls, !request.separate_reasoning));
     Ok(assignment(format, &request.model, constraint, prompt))
 }
 
 /// [`assign`] for a Messages request: its thinking blocks are always its own, so only the
-/// calls' ask takes a variant.
+/// calls' ask takes a variant; the legacy path runs its tool parser for a Messages request that
+/// declares tools, an empty list included, and for no other, so the calls stay exactly then.
 pub(crate) fn assign_messages(
     parser: ParserChoice,
     names: &Names,
@@ -806,8 +815,8 @@ pub(crate) fn assign_messages(
     templates: &Templates,
 ) -> Result<Option<Assignment>, String> {
     let format = reads(parser, names, &request.model, templates)?;
-    let no_calls = matches!(request.tool_choice, Some(MessagesToolChoice::None))
-        || request.tools.as_deref().is_none_or(<[_]>::is_empty);
+    let no_calls =
+        matches!(request.tool_choice, Some(MessagesToolChoice::None)) || request.tools.is_none();
     let format = format.map(|format| asked(format, no_calls, false));
     Ok(assignment(format, &request.model, constraint, prompt))
 }
@@ -1598,6 +1607,93 @@ mod tests {
         );
         let both = request(json!({"tools": declared}));
         assert_eq!(assigned(&both), table(&both));
+    }
+
+    /// The conversation of a retry: the user asked for `list_skills`, the assistant called it,
+    /// the tool was unavailable, the user asks again.
+    fn retry_messages() -> Value {
+        json!([
+            {"role": "user", "content": "Call the `list_skills` tool once to see what we can do, \
+                                         and reply with nothing else."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_0", "type": "function",
+                "function": {"name": "list_skills", "arguments": "{}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_0",
+             "content": "`list_skills` is unavailable for now; call it again later."},
+            {"role": "user", "content": "The cooldown is over. Try again."}
+        ])
+    }
+
+    #[test]
+    fn the_calls_stay_wherever_the_legacy_path_runs_a_tool_parser() {
+        // The legacy path scans a response for calls when the request declares tools, an empty
+        // list included, or when the model's provider reads calls without any; the table keeps
+        // its calls exactly then, so a call the conversation established comes back as a call
+        // under either parser, and a `tool_choice` of `none` drops them under either.
+        let table = |request: &ChatCompletionRequest| {
+            reads(
+                ParserChoice::Symphony,
+                &Names::default(),
+                &request.model,
+                &templates(),
+            )
+            .expect("read")
+            .expect("a table")
+        };
+        let assigned = |request: &ChatCompletionRequest| {
+            assign(
+                ParserChoice::Symphony,
+                &Names::default(),
+                request,
+                None,
+                PROMPT,
+            )
+            .expect("assigned")
+            .format
+        };
+        let retry = request(json!({"model": "MiniMax-M3", "messages": retry_messages()}));
+        assert!(scans_for_tool_calls(&retry));
+        assert_eq!(
+            assigned(&retry),
+            table(&retry),
+            "the provider reads calls without tools"
+        );
+        let refused = request(json!({
+            "model": "MiniMax-M3", "messages": retry_messages(), "tool_choice": "none"
+        }));
+        assert_eq!(assigned(&refused), table(&refused).without_calls());
+        let declared_none = request(json!({"tools": []}));
+        assert!(scans_for_tool_calls(&declared_none));
+        assert_eq!(
+            assigned(&declared_none),
+            table(&declared_none),
+            "an empty list is a declaration"
+        );
+        let undeclared = request(json!({"messages": retry_messages()}));
+        assert!(!scans_for_tool_calls(&undeclared));
+        assert_eq!(
+            assigned(&undeclared),
+            table(&undeclared).without_calls(),
+            "a provider that reads calls only with tools"
+        );
+        // A Messages request: declared tools, an empty list included, keep the calls; none
+        // declared drops them, as the legacy path runs its tool parser on `tools` alone.
+        let messages = |extra: Value| {
+            assign_messages(
+                ParserChoice::Symphony,
+                &Names::default(),
+                &message_request(extra),
+                None,
+                PROMPT,
+                &templates(),
+            )
+            .expect("read")
+            .expect("assigned")
+            .format
+        };
+        assert!(messages(json!({"tools": []})).call_syntax().is_some());
+        assert_eq!(messages(json!({})).call_syntax(), None);
     }
 
     #[test]

@@ -104,6 +104,19 @@ pub(crate) struct ChatResponseSpec {
     pub symphony: Option<Assignment>,
 }
 
+/// Whether the response to a chat `request` is scanned for tool calls: the
+/// request declares tools (an empty list included), a message declares one,
+/// or the model's provider reads tool calls without any
+/// ([`ProviderProfile::parses_tool_calls_without_tools`]). A `tool_choice`
+/// of `none` is the drivers' to check. [`ChatResponseSpec::tools`] is `Some`
+/// exactly then, and Symphony keeps a table's calls exactly then
+/// (`regular::symphony::assign`), so a call the conversation established
+/// without a tool inventory comes back as a call under either parser.
+pub(crate) fn scans_for_tool_calls(request: &ChatCompletionRequest) -> bool {
+    request.declares_tools()
+        || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools()
+}
+
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
         let provider = ProviderProfile::for_model(&request.model);
@@ -116,8 +129,8 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             // the request declares no tools anywhere
             // (`ChatCompletionRequest::declares_tools`, the one answer every
             // gate reads) and the provider does not parse tool calls without
-            // them.
-            tools: (request.declares_tools() || provider.parses_tool_calls_without_tools())
+            // them (`scans_for_tool_calls`).
+            tools: scans_for_tool_calls(request)
                 .then(|| request.effective_tools().cloned().collect()),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
