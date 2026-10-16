@@ -40,8 +40,10 @@ use super::symphony::{
     engine_finish, finished, reasoning_text_tokens, telemetry::Who, Delta, Reader,
 };
 use crate::{
-    middleware::TenantKey,
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::{
+        metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+        tenant_usage::StreamUsage,
+    },
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
         common::{
@@ -192,8 +194,9 @@ struct GenerateStreamContext {
     return_logprob: bool,
     backend_type: &'static str,
     model: String,
-    /// The caller's tenant key, for the usage row the stream is booked to.
-    tenant_key: Option<TenantKey>,
+    /// The stream's usage guard: books the stream at its end, whichever way
+    /// it ends (a prefill leg that fails before the decode began included).
+    usage: StreamUsage,
     /// Number of choices (`sampling_params.n`) this request expects to
     /// complete -- a clean EOF with fewer `Complete` messages than this has
     /// only partial usage, not authoritative usage for the whole request.
@@ -369,6 +372,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
+        let stream_usage = dispatch.begin_usage();
         self.process_streaming_chunks_inner(
             grpc_stream,
             dispatch,
@@ -378,13 +382,17 @@ impl StreamingProcessor {
             tx,
             None,
             reservation,
+            stream_usage,
         )
         .await
     }
 
     /// Inner implementation shared by single-mode and PD prefill/decode streaming.
     /// `pd_timing` is `Some` only in PD mode and yields honest PD TTFT
-    /// (prefill start to first decode token).
+    /// (prefill start to first decode token). `stream_usage` is the stream's
+    /// usage guard, begun by the caller (before the prefill leg in PD mode)
+    /// and finished at the stream's end here, or dropped booked on the way
+    /// out of any earlier return.
     ///
     /// The stream is a [`ChatStream`]: its set-up, the loop over the engine's
     /// messages, the parser flush, the finish chunks, the usage chunk and the
@@ -400,6 +408,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        stream_usage: StreamUsage,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = ChatStream::open(
             self,
@@ -409,6 +418,7 @@ impl StreamingProcessor {
             &original_request,
             tx,
             pd_timing,
+            stream_usage,
         );
         stream.read_engine(&mut grpc_stream).await?;
         let usage = stream.usage_snapshot();
@@ -441,6 +451,10 @@ impl StreamingProcessor {
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
+        // The stream's usage guard begins before the prefill leg: a leg that
+        // fails before the first token books the prompt it was dispatched with.
+        let stream_usage = dispatch.begin_usage();
+
         // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
         // logprobs, but the Prefill reservation must end with this phase, and
         // the client's prompt-side usage is the prefill side's.
@@ -463,6 +477,7 @@ impl StreamingProcessor {
                 tx,
                 Some(pd_timing),
                 reservation,
+                stream_usage,
             )
             .await;
 
@@ -508,7 +523,7 @@ impl StreamingProcessor {
             return_logprob: generate_request.return_logprob,
             backend_type: self.backend_type,
             model: dispatch.model.clone(),
-            tenant_key: dispatch.tenant_key.clone(),
+            usage: dispatch.begin_usage(),
             expected_choices: generate_request.expected_choices,
         };
 
@@ -637,6 +652,8 @@ impl StreamingProcessor {
                     let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
                     *completion_tokens += chunk.token_ids().len() as u32;
                     let current_completion_tokens = *completion_tokens;
+                    ctx.usage
+                        .add_completion_tokens(chunk.token_ids().len() as u64);
 
                     // Decode tokens to text (skip_special_tokens=true to handle newlines correctly)
                     let chunk_text = tokenizer
@@ -740,7 +757,7 @@ impl StreamingProcessor {
             prompt_tokens,
             total_completion,
             None,
-            &ctx,
+            ctx,
         );
 
         Ok(())
@@ -861,6 +878,8 @@ impl StreamingProcessor {
                     let completion_tokens = completion_tokens_map.entry(index).or_insert(0);
                     *completion_tokens += chunk.token_ids().len() as u32;
                     let current_completion_tokens = *completion_tokens;
+                    ctx.usage
+                        .add_completion_tokens(chunk.token_ids().len() as u64);
 
                     // Decode tokens to text
                     let chunk_text = tokenizer
@@ -1003,7 +1022,7 @@ impl StreamingProcessor {
             prompt_tokens,
             total_completion,
             pd_timing.as_ref(),
-            &ctx,
+            ctx,
         );
 
         Ok(())
@@ -1013,16 +1032,17 @@ impl StreamingProcessor {
     // Helper Methods
     // ========================================================================
 
-    /// Record streaming metrics for generate endpoint. `prompt_tokens` is the
-    /// count the `Complete` message carried (0 when the stream ended without
-    /// one), the same count the client reads in `meta_info.prompt_tokens`.
+    /// Record streaming metrics for generate endpoint, and finish the
+    /// stream's usage guard with them. `prompt_tokens` is the count the
+    /// `Complete` message carried (0 when the stream ended without one), the
+    /// same count the client reads in `meta_info.prompt_tokens`.
     fn record_generate_metrics(
         start_time: Instant,
         first_token_time: Option<Instant>,
         prompt_tokens: u32,
         total_completion: u32,
         pd_timing: Option<&context::PdTiming>,
-        ctx: &GenerateStreamContext,
+        ctx: GenerateStreamContext,
     ) {
         // PD mode: the stream task starts after the prefill side was dispatched
         // (sequential PD: after it completes, with the first decode chunk
@@ -1040,7 +1060,7 @@ impl StreamingProcessor {
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(u64::from(prompt_tokens)),
             output_tokens: total_completion as u64,
-            tenant: context::usage_tenant(ctx.tenant_key.as_ref()),
+            usage: ctx.usage,
         });
     }
 
@@ -1776,6 +1796,33 @@ impl StreamingProcessor {
     #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_chunks(
         &self,
+        grpc_stream: ProtoStream,
+        dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        original_request: MessagesResponseSpec,
+        tx: &SseSender,
+        reservation: Option<Arc<SharedReservationHandle>>,
+    ) -> Result<(), utils::StreamFailure> {
+        let stream_usage = dispatch.begin_usage();
+        self.process_messages_streaming_chunks_inner(
+            grpc_stream,
+            dispatch,
+            tokenizer,
+            stop_params,
+            original_request,
+            tx,
+            reservation,
+            stream_usage,
+        )
+        .await
+    }
+
+    /// [`Self::process_messages_streaming_chunks`] with the stream's usage
+    /// guard, which the disaggregated mode begins before its prefill leg.
+    #[expect(clippy::too_many_arguments)]
+    async fn process_messages_streaming_chunks_inner(
+        &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -1783,6 +1830,7 @@ impl StreamingProcessor {
         original_request: MessagesResponseSpec,
         tx: &SseSender,
         reservation: Option<Arc<SharedReservationHandle>>,
+        stream_usage: StreamUsage,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = MessagesStream::open(
             self,
@@ -1791,6 +1839,7 @@ impl StreamingProcessor {
             stop_params,
             &original_request,
             tx,
+            stream_usage,
         )?;
         stream.send_message_start().await?;
         stream.read_engine(&mut grpc_stream).await?;
@@ -1823,6 +1872,10 @@ impl StreamingProcessor {
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
+        // The stream's usage guard begins before the prefill leg: a leg that
+        // fails before the first token books the prompt it was dispatched with.
+        let stream_usage = dispatch.begin_usage();
+
         // Consume prefill stream (Messages API does not expose prompt logprobs);
         // the client's prompt-side usage is the prefill side's.
         let prefill_cached_tokens =
@@ -1832,7 +1885,7 @@ impl StreamingProcessor {
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
-            .process_messages_streaming_chunks(
+            .process_messages_streaming_chunks_inner(
                 decode_stream,
                 dispatch,
                 tokenizer,
@@ -1840,6 +1893,7 @@ impl StreamingProcessor {
                 original_request,
                 tx,
                 reservation,
+                stream_usage,
             )
             .await;
 
@@ -1895,6 +1949,10 @@ impl StreamingProcessor {
             let choices_per_prompt = completion_request.choices_per_prompt;
             let echo = completion_request.echo;
             let include_usage = completion_request.include_usage;
+            // The request's usage guard: every prompt's unit counts into it,
+            // the aggregate end finishes it, and any other way out of this
+            // task drops it booked with what the units streamed.
+            let stream_usage = dispatch.begin_usage();
 
             // Fail-fast: the first stream error cancels the remaining units
             // (their streams abort on drop) and fails the whole request.
@@ -1928,6 +1986,7 @@ impl StreamingProcessor {
                     let index_offset = prompt_index as u32 * choices_per_prompt;
                     let processor = &processor;
                     let tx = &tx;
+                    let stream_usage = &stream_usage;
                     async move {
                         match unit {
                             CompletionStreamUnit::Single(stream) => {
@@ -1941,6 +2000,7 @@ impl StreamingProcessor {
                                         prompt_text,
                                         index_offset,
                                         tx,
+                                        stream_usage,
                                     )
                                     .await
                             }
@@ -1961,6 +2021,7 @@ impl StreamingProcessor {
                                         index_offset,
                                         tx,
                                         prefill_guards,
+                                        stream_usage,
                                     )
                                     .await
                             }
@@ -1970,6 +2031,8 @@ impl StreamingProcessor {
                 .await;
 
             match outcomes {
+                // `stream_usage` drops at the end of the task: the prompt as
+                // dispatched and what the units streamed, booked once.
                 Err(failure) => {
                     utils::send_stream_failure(&tx, &failure, &source).await;
                 }
@@ -2051,7 +2114,7 @@ impl StreamingProcessor {
                         generation_duration: start_time.elapsed(),
                         input_tokens: Some(total_prompt as u64),
                         output_tokens: total_completion as u64,
-                        tenant: dispatch.usage_tenant(),
+                        usage: stream_usage,
                     });
                 }
             }
@@ -2125,6 +2188,7 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
+        stream_usage: &StreamUsage,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         let mut stream = CompletionStream::open(
             &dispatch,
@@ -2134,6 +2198,7 @@ impl StreamingProcessor {
             prompt_text,
             index_offset,
             tx,
+            stream_usage,
         );
         stream.read_engine(&mut grpc_stream).await?;
         stream.finish_open_choices().await?;
@@ -2158,6 +2223,7 @@ impl StreamingProcessor {
         index_offset: u32,
         tx: &SseSender,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
+        stream_usage: &StreamUsage,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         // The client's prompt-side usage is the prefill side's.
         let prefill_cached_tokens =
@@ -2176,6 +2242,7 @@ impl StreamingProcessor {
                 prompt_text,
                 index_offset,
                 tx,
+                stream_usage,
             )
             .await;
 
@@ -2347,6 +2414,9 @@ struct ChatStream<'a> {
     stopped_indices: HashSet<u32>,
     prompt_tokens: HashMap<u32, u32>,
     completion_tokens: CompletionTokenTracker,
+    /// The stream's usage guard: counts the tokens as they stream and books
+    /// the stream at its end, whichever way it ends.
+    usage: StreamUsage,
     cached_tokens: HashMap<u32, u32>,
     reasoning_tokens: HashMap<u32, u32>,
     /// Tokens the gateway's reasoning parser routed to reasoning, and tokens
@@ -2394,7 +2464,9 @@ struct ChatStream<'a> {
 
 impl<'a> ChatStream<'a> {
     /// Phase 1: what the spec, the dispatch and the tokenizer decide for the
-    /// whole stream, and the empty per-choice state.
+    /// whole stream, and the empty per-choice state. `usage` is the stream's
+    /// usage guard, begun by the caller.
+    #[expect(clippy::too_many_arguments)]
     fn open(
         processor: &'a StreamingProcessor,
         dispatch: &'a context::DispatchMetadata,
@@ -2403,6 +2475,7 @@ impl<'a> ChatStream<'a> {
         spec: &'a ChatResponseSpec,
         tx: &'a SseSender,
         pd_timing: Option<context::PdTiming>,
+        usage: StreamUsage,
     ) -> Self {
         let start_time = Instant::now();
         let model = &dispatch.model;
@@ -2511,6 +2584,7 @@ impl<'a> ChatStream<'a> {
             stopped_indices: HashSet::new(),
             prompt_tokens: HashMap::new(),
             completion_tokens: CompletionTokenTracker::new(),
+            usage,
             cached_tokens: HashMap::new(),
             reasoning_tokens: HashMap::new(),
             parsed_reasoning_tokens: HashMap::new(),
@@ -2662,7 +2736,8 @@ impl<'a> ChatStream<'a> {
             return Ok(None);
         }
 
-        self.completion_tokens.record_chunk(&chunk);
+        self.usage
+            .add_completion_tokens(u64::from(self.completion_tokens.record_chunk(&chunk)));
         if let Some(usage) = &mut self.continuous_usage {
             usage.record_chunk(&chunk);
         }
@@ -3417,7 +3492,7 @@ impl<'a> ChatStream<'a> {
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
-            tenant: self.dispatch.usage_tenant(),
+            usage: self.usage,
         });
     }
 }
@@ -3604,6 +3679,9 @@ struct MessagesStream<'a> {
     /// keeps them; the prompt's events wait in the buffer for the first step's.
     delta: Delta,
     spare: Events<'static>,
+    /// The stream's usage guard: books the stream at its end, whichever way
+    /// it ends (a return before the first token included).
+    usage: StreamUsage,
 
     // Token tracking
     completion_tokens: CompletionTokenTracker,
@@ -3659,6 +3737,7 @@ impl<'a> MessagesStream<'a> {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         spec: &'a MessagesResponseSpec,
         tx: &'a SseSender,
+        stream_usage: StreamUsage,
     ) -> Result<Self, utils::StreamFailure> {
         let start_time = Instant::now();
         let model = &dispatch.model;
@@ -3761,6 +3840,7 @@ impl<'a> MessagesStream<'a> {
             spec,
             dispatch,
             tx,
+            usage: stream_usage,
             start_time,
             first_token_time: None,
             sse_buffer: Vec::with_capacity(512),
@@ -3887,7 +3967,8 @@ impl<'a> MessagesStream<'a> {
             return Ok(None);
         }
 
-        self.completion_tokens.record_chunk(&chunk);
+        self.usage
+            .add_completion_tokens(u64::from(self.completion_tokens.record_chunk(&chunk)));
         let mut chunk_tokens = chunk.token_ids().len() as u32;
 
         if let Some((reader, machine)) = self.symphony.as_mut() {
@@ -4434,7 +4515,7 @@ impl<'a> MessagesStream<'a> {
             generation_duration: self.start_time.elapsed(),
             input_tokens: Some(u64::from(self.prompt_tokens)),
             output_tokens: u64::from(self.completion_tokens.total()),
-            tenant: self.dispatch.usage_tenant(),
+            usage: self.usage,
         });
     }
 }
@@ -4455,6 +4536,10 @@ struct CompletionStream<'a> {
     prompt_text: &'a str,
     index_offset: u32,
     tx: &'a SseSender,
+    /// The request's usage guard, the coordinator's, shared by reference with
+    /// every unit of a batched request: the chunks count into it as they
+    /// stream; the coordinator settles and finishes it once, at the request's end.
+    usage: &'a StreamUsage,
 
     first_token_time: Option<Instant>,
 
@@ -4505,7 +4590,9 @@ fn completion_choice(
 
 impl<'a> CompletionStream<'a> {
     /// What the spec and the dispatch decide for the whole unit, the frame,
-    /// and the empty per-choice state and totals.
+    /// and the empty per-choice state and totals. `usage` is the request's
+    /// guard, the coordinator's.
+    #[expect(clippy::too_many_arguments)]
     fn open(
         dispatch: &'a context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -4514,6 +4601,7 @@ impl<'a> CompletionStream<'a> {
         prompt_text: &'a str,
         index_offset: u32,
         tx: &'a SseSender,
+        usage: &'a StreamUsage,
     ) -> Self {
         let frame = CompletionChunkFrame::new(
             &dispatch.request_id,
@@ -4529,6 +4617,7 @@ impl<'a> CompletionStream<'a> {
             prompt_text,
             index_offset,
             tx,
+            usage,
             first_token_time: None,
             stop_decoders: HashMap::new(),
             is_firsts: HashMap::new(),
@@ -4583,7 +4672,8 @@ impl<'a> CompletionStream<'a> {
         }
 
         let is_first = self.is_firsts.entry(index).or_insert(true);
-        self.total_completion.record_chunk(&chunk);
+        self.usage
+            .add_completion_tokens(u64::from(self.total_completion.record_chunk(&chunk)));
 
         let stop_decoder = self.stop_decoders.entry(index).or_insert_with(|| {
             let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim, ignore_eos) =
@@ -5020,6 +5110,8 @@ mod usage_chunk_tests;
 mod delta_slicing_tests;
 #[cfg(test)]
 mod sse_bytes_tests;
+#[cfg(test)]
+mod usage_row_tests;
 #[cfg(test)]
 mod usage_tests;
 

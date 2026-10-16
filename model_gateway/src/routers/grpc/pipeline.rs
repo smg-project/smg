@@ -5364,6 +5364,7 @@ mod usage_booking_tests {
             weight_version: None,
             tenant_key: None,
             dispatched_at: Instant::now(),
+            prompt_tokens: 0,
         };
         let usage = dispatch.usage(120, 30);
         assert_eq!((usage.prompt_tokens, usage.completion_tokens), (120, 30));

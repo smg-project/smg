@@ -37,6 +37,7 @@ async fn streamed_payloads(spec: ChatResponseSpec) -> Vec<String> {
         weight_version: None,
         tenant_key: None,
         dispatched_at: Instant::now(),
+        prompt_tokens: 0,
     };
     let source = utils::StreamSource::new(None, &dispatch, metrics_labels::ENDPOINT_CHAT);
     let response = Arc::new(processor(false))

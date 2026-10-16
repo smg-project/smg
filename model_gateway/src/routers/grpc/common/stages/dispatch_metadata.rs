@@ -41,5 +41,6 @@ pub(crate) fn prepare_dispatch_metadata(
         weight_version: Some(weight_version),
         tenant_key,
         dispatched_at: Instant::now(),
+        prompt_tokens: u32::try_from(plan.prompt_len()).unwrap_or(u32::MAX),
     }
 }

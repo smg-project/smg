@@ -267,6 +267,7 @@ pub(super) fn dispatch() -> context::DispatchMetadata {
         weight_version: None,
         tenant_key: None,
         dispatched_at: Instant::now(),
+        prompt_tokens: 0,
     }
 }
 
@@ -933,6 +934,7 @@ async fn byte_fallback_completion_transport_eof_preserves_text_without_complete(
                 "",
                 0,
                 &tx,
+                &dispatch().begin_usage(),
             )
             .await
             .unwrap();
@@ -985,6 +987,7 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
                     "",
                     0,
                     &tx,
+                    &dispatch().begin_usage(),
                 )
                 .await;
             drop(tx);
@@ -3253,7 +3256,7 @@ async fn messages_tool_arguments_need_an_open_block() {
 
 /// A stream the engine ends with `status` after `responses`: what a worker
 /// that goes away mid-stream looks like from the gateway's side.
-async fn cut_stream(
+pub(super) async fn cut_stream(
     responses: Vec<proto::GenerateResponse>,
     status: tonic::Status,
 ) -> (ProtoStream, JoinHandle<()>) {

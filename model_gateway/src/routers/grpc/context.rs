@@ -49,7 +49,7 @@ use crate::{
     observability::{
         cache_trace,
         metrics::Metrics,
-        tenant_usage::{RequestUsage, UNRESOLVED_TENANT},
+        tenant_usage::{RequestUsage, StreamUsage, UNRESOLVED_TENANT},
     },
     policies::CacheNamespace,
     routers::{
@@ -555,6 +555,22 @@ impl ExecutionPlan {
         }
     }
 
+    /// Prompt tokens the plan dispatches: the tokenized input's length, summed
+    /// over a batch's prompts; zero for an input the engine tokenizes itself.
+    /// An embedding request never streams, and its buffered end books the
+    /// response's own count.
+    pub(crate) fn prompt_len(&self) -> usize {
+        match self {
+            Self::Single(ProtoRequest::Generate(request))
+            | Self::PrefillDecode(request)
+            | Self::EncodePrefillDecode { request } => request.prompt_len(),
+            Self::Single(ProtoRequest::Embed(_)) => 0,
+            Self::Batch { requests, .. } => {
+                requests.iter().map(ProtoGenerateRequest::prompt_len).sum()
+            }
+        }
+    }
+
     pub(crate) fn request_type(&self) -> &'static str {
         match self {
             Self::Single(ProtoRequest::Generate(_))
@@ -836,6 +852,10 @@ pub(crate) struct DispatchMetadata {
     /// last token; what came before, admission and worker selection, is the
     /// router's time, which the router's duration metric keeps.
     pub dispatched_at: Instant,
+    /// The prompt's length as tokenized at dispatch (summed over a batch's
+    /// prompts; zero for an input the engine tokenizes itself): what a stream
+    /// that ends before the engine reports its count is booked with.
+    pub prompt_tokens: u32,
 }
 
 impl DispatchMetadata {
@@ -858,6 +878,16 @@ impl DispatchMetadata {
             completion_tokens: u64::from(completion_tokens),
             elapsed: self.dispatched_at.elapsed(),
         }
+    }
+
+    /// The usage guard of a stream of this dispatch: it books the stream at
+    /// its end, whichever way it ends ([`StreamUsage`]).
+    pub fn begin_usage(&self) -> StreamUsage {
+        StreamUsage::begin(
+            self.usage_tenant(),
+            &self.model,
+            u64::from(self.prompt_tokens),
+        )
     }
 }
 

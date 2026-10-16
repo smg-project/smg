@@ -34,6 +34,7 @@ fn dispatch() -> context::DispatchMetadata {
         weight_version: None,
         tenant_key: None,
         dispatched_at: std::time::Instant::now(),
+        prompt_tokens: 0,
     }
 }
 

@@ -195,6 +195,7 @@ async fn stream_bytes(scenario: &Scenario) -> Vec<u8> {
         weight_version: scenario.weight_version.map(str::to_string),
         tenant_key: None,
         dispatched_at: Instant::now(),
+        prompt_tokens: 0,
     };
     let stop = scenario
         .stop
@@ -316,10 +317,12 @@ async fn completion_stream_bytes(scenario: &CompletionScenario) -> Vec<u8> {
         weight_version: scenario.weight_version.map(str::to_string),
         tenant_key: None,
         dispatched_at: Instant::now(),
+        prompt_tokens: 0,
     };
     let stop = scenario
         .stop
         .map(|sequence| StringOrArray::String(sequence.to_string()));
+    let stream_usage = dispatch.begin_usage();
     let result = processor(false)
         .process_completion_streaming_chunks(
             stream,
@@ -330,6 +333,7 @@ async fn completion_stream_bytes(scenario: &CompletionScenario) -> Vec<u8> {
             scenario.prompt_text,
             0,
             &tx,
+            &stream_usage,
         )
         .await;
     drop(tx);
@@ -386,6 +390,7 @@ async fn each_engine_message_leaves_as_its_own_frame() {
         weight_version: None,
         tenant_key: None,
         dispatched_at: Instant::now(),
+        prompt_tokens: 0,
     };
     let result = processor(false)
         .process_streaming_chunks(

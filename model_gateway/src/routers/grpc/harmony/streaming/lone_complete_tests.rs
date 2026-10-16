@@ -67,6 +67,7 @@ async fn streamed_events(frames: Vec<proto::GenerateResponse>, choices: u32) -> 
         weight_version: None,
         tenant_key: None,
         dispatched_at: std::time::Instant::now(),
+        prompt_tokens: 0,
     };
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "harmony-test", "messages": [], "n": choices, "stream": true,

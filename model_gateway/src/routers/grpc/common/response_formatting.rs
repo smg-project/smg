@@ -152,16 +152,20 @@ impl CompletionTokenTracker {
         }
     }
 
-    /// Record tokens from a streaming chunk.
-    /// Delta streams accumulate the chunk's token count; cumulative streams
-    /// report it in Complete instead, so a chunk of theirs only notes the
-    /// running count it carries.
-    pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
+    /// Record tokens from a streaming chunk, and return the tokens the chunk
+    /// delivered. Delta streams accumulate the chunk's token count, which is
+    /// what it delivered; cumulative streams report the count in Complete
+    /// instead, so a chunk of theirs only notes the running count it carries,
+    /// and delivered how far that count moved past the index's last one.
+    pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) -> u32 {
         if chunk.chunk_semantics().is_delta() {
-            *self.tokens.entry(chunk.index()).or_insert(0) += chunk.token_ids().len() as u32;
+            let delivered = chunk.token_ids().len() as u32;
+            *self.tokens.entry(chunk.index()).or_insert(0) += delivered;
+            delivered
         } else {
-            self.reported
-                .insert(chunk.index(), chunk.completion_tokens());
+            let reported = chunk.completion_tokens();
+            let last = self.reported.insert(chunk.index(), reported).unwrap_or(0);
+            reported.saturating_sub(last)
         }
     }
 
@@ -417,6 +421,42 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!((tracker.total(), tracker.delivered()), (3, 3));
+    }
+
+    #[test]
+    fn record_chunk_returns_the_tokens_the_chunk_delivered() {
+        // Delta stream: the chunk's own tokens.
+        let mut tracker = CompletionTokenTracker::new();
+        let delivered =
+            tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+                token_ids: vec![1, 2, 3],
+                ..Default::default()
+            }));
+        assert_eq!(delivered, 3);
+
+        // Cumulative stream: how far the running count moved, per index.
+        let mut tracker = CompletionTokenTracker::new();
+        let running = |index: u32, completion_tokens: u32| {
+            ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+                index,
+                token_ids: vec![5],
+                completion_tokens,
+                ..Default::default()
+            })
+        };
+        assert_eq!(tracker.record_chunk(&running(0, 4)), 4);
+        assert_eq!(tracker.record_chunk(&running(0, 6)), 2);
+        assert_eq!(
+            tracker.record_chunk(&running(1, 3)),
+            3,
+            "its own index's count"
+        );
+        assert_eq!(
+            tracker.record_chunk(&running(0, 6)),
+            0,
+            "a repeated count delivers nothing"
+        );
+        assert_eq!(tracker.delivered(), 9);
     }
 
     #[test]
