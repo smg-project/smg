@@ -21,6 +21,7 @@ async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoRespo
     super::metrics::record_tokenizer_encode_activity();
     let mut body = state.handle.render();
     super::worker_metrics::render_into(&mut body);
+    super::tenant_usage::render_into(&mut body);
     (
         [(
             http::header::CONTENT_TYPE,

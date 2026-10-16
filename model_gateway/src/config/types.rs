@@ -494,6 +494,17 @@ pub struct RouterConfig {
     /// `tenant_rate_limit_enabled` is true.
     #[serde(default)]
     pub tenant_rate_limit_config: Option<String>,
+    /// Account requests, prompt and completion tokens and dispatch-to-last-
+    /// token time by tenant and model: the `smg_tenant_usage_*` families on
+    /// `/metrics` and the snapshot at `GET /v1/usage/tenants`. Off by
+    /// default: no table, no families, nothing on the request path.
+    #[serde(default)]
+    pub tenant_usage_accounting_enabled: bool,
+    /// Distinct tenants with usage rows of their own; every later tenant is
+    /// booked under `other`, so the table and the scrape stay bounded
+    /// whatever the number of callers.
+    #[serde(default = "default_tenant_usage_accounting_max_tenants")]
+    pub tenant_usage_accounting_max_tenants: u32,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -891,6 +902,10 @@ fn default_priority_scheduler_max_class() -> String {
 
 fn default_priority_scheduler_tenant_metric_top_n() -> u32 {
     32
+}
+
+fn default_tenant_usage_accounting_max_tenants() -> u32 {
+    128
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -1958,6 +1973,8 @@ impl Default for RouterConfig {
             ),
             tenant_rate_limit_enabled: false,
             tenant_rate_limit_config: None,
+            tenant_usage_accounting_enabled: false,
+            tenant_usage_accounting_max_tenants: default_tenant_usage_accounting_max_tenants(),
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),

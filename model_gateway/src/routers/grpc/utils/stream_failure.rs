@@ -505,6 +505,7 @@ mod tests {
             model: "stream-failure-test".to_string(),
             created: 1,
             weight_version: None,
+            tenant_key: None,
         }
     }
 

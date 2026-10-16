@@ -45,8 +45,8 @@ use super::{
 };
 use crate::{
     config::ParserChoice,
-    middleware::TenantRequestMeta,
-    observability::{cache_trace, metrics::Metrics},
+    middleware::{TenantKey, TenantRequestMeta},
+    observability::{cache_trace, metrics::Metrics, tenant_usage::UNRESOLVED_TENANT},
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
@@ -379,6 +379,8 @@ pub(crate) struct DispatchContext {
     pub streaming: bool,
     pub headers: Option<HeaderMap>,
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
+    /// The caller's tenant key, for the usage row the request is booked to.
+    pub tenant_key: Option<TenantKey>,
     pub routing: RoutingSnapshot,
     pub wire: WireConstraint,
     /// The selected worker's constrained decoding, when its policy chose the
@@ -820,6 +822,22 @@ pub(crate) struct DispatchMetadata {
     pub model: String,
     pub created: u64,
     pub weight_version: Option<String>,
+    /// The caller's tenant key, carried to the end of the response (the last
+    /// token of a stream) for the usage row the request is booked to.
+    pub tenant_key: Option<TenantKey>,
+}
+
+impl DispatchMetadata {
+    /// The tenant the request's usage is booked to.
+    pub fn usage_tenant(&self) -> &str {
+        usage_tenant(self.tenant_key.as_ref())
+    }
+}
+
+/// The usage row a request with `tenant_key` is booked to: the key, or the
+/// resolver's catch-all for a request that reached the pipeline without one.
+pub(crate) fn usage_tenant(tenant_key: Option<&TenantKey>) -> &str {
+    tenant_key.map_or(UNRESOLVED_TENANT, TenantKey::as_str)
 }
 
 /// Load guards for worker load tracking
@@ -1063,6 +1081,9 @@ impl RequestContext {
         let request_id =
             super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
                 .map(str::to_owned);
+        let tenant_key = tenant_request_meta
+            .as_ref()
+            .map(|meta| meta.tenant_key().clone());
         Ok(DispatchContext {
             root_request_id: if cache_trace::enabled() {
                 request_id.clone()
@@ -1080,6 +1101,7 @@ impl RequestContext {
             streaming,
             headers,
             rate_limit_cell,
+            tenant_key,
             routing,
             wire,
             constraint_decided_on: state.constraint_decided_on,

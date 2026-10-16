@@ -1413,6 +1413,18 @@ struct ServingArgs {
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
 
+    // ==================== Usage Accounting ====================
+    /// Account requests, prompt and completion tokens and dispatch-to-last-
+    /// token time by tenant and model: the smg_tenant_usage_* families on
+    /// /metrics and the snapshot at GET /v1/usage/tenants. Off by default.
+    #[arg(long, help_heading = "Usage Accounting")]
+    tenant_usage_accounting_enabled: bool,
+
+    /// Distinct tenants with usage rows of their own; every later tenant is
+    /// booked under "other".
+    #[arg(long, default_value_t = 128, help_heading = "Usage Accounting")]
+    tenant_usage_accounting_max_tenants: u32,
+
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
@@ -3344,6 +3356,8 @@ impl CliArgs {
             )
             .tenant_rate_limit_enabled(self.serving.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.serving.tenant_rate_limit_config.clone())
+            .tenant_usage_accounting_enabled(self.serving.tenant_usage_accounting_enabled)
+            .tenant_usage_accounting_max_tenants(self.serving.tenant_usage_accounting_max_tenants)
             .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.serving.retry_max_retries,
@@ -3718,6 +3732,23 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// Usage accounting is off unless asked for; the maximum of tracked
+    /// tenants has a default and takes a number.
+    #[test]
+    fn tenant_usage_accounting_flags_parse_with_their_defaults() {
+        let defaults = cli_args_from(&[]);
+        assert!(!defaults.serving.tenant_usage_accounting_enabled);
+        assert_eq!(defaults.serving.tenant_usage_accounting_max_tenants, 128);
+
+        let args = cli_args_from(&[
+            "--tenant-usage-accounting-enabled",
+            "--tenant-usage-accounting-max-tenants",
+            "8",
+        ]);
+        assert!(args.serving.tenant_usage_accounting_enabled);
+        assert_eq!(args.serving.tenant_usage_accounting_max_tenants, 8);
     }
 
     /// `--prefill` / `--encode` take an optional trailing bootstrap port (a

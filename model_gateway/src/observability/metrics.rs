@@ -19,7 +19,10 @@ pub use smg_external_router::metrics::{
     STREAMING_TRUE,
 };
 
-use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
+use super::{
+    tenant_usage::{self, RequestUsage},
+    worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder},
+};
 use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
@@ -1370,6 +1373,8 @@ pub struct StreamingMetricsParams<'a> {
     pub input_tokens: Option<u64>,
     /// Output token count
     pub output_tokens: u64,
+    /// The tenant the request's usage is booked to (`DispatchMetadata::usage_tenant`).
+    pub tenant: &'a str,
 }
 
 impl Metrics {
@@ -1745,7 +1750,20 @@ impl Metrics {
             generation_duration,
             input_tokens,
             output_tokens,
+            tenant,
         } = params;
+
+        // The tenant's usage row, when accounting is on: before the metrics
+        // handles, so a stream is booked whether the handles are kept or not.
+        tenant_usage::record(
+            tenant,
+            model_id,
+            RequestUsage {
+                prompt_tokens: input_tokens.unwrap_or(0),
+                completion_tokens: output_tokens,
+                elapsed: generation_duration,
+            },
+        );
 
         // TPOT is only meaningful past the first token.
         let tpot = ttft.and_then(|ttft| {
@@ -3853,6 +3871,7 @@ mod tests {
                     generation_duration: Duration::from_millis(50),
                     input_tokens,
                     output_tokens,
+                    tenant: tenant_usage::UNRESOLVED_TENANT,
                 });
             }
             Metrics::record_streaming_metrics(StreamingMetricsParams {
@@ -3864,6 +3883,7 @@ mod tests {
                 generation_duration: Duration::from_millis(20),
                 input_tokens: None,
                 output_tokens: 1,
+                tenant: tenant_usage::UNRESOLVED_TENANT,
             });
         };
         let built = render_with_recorder(records);
@@ -4029,6 +4049,7 @@ mod tests {
                 generation_duration: Duration::from_secs(1),
                 input_tokens: Some(128),
                 output_tokens: 128,
+                tenant: tenant_usage::UNRESOLVED_TENANT,
             });
             duration();
         };
