@@ -31,6 +31,7 @@
 //! timeout, by the graceful drain, or at the end of an upgraded stream.
 
 use std::{
+    fmt,
     future::Future,
     io,
     pin::Pin,
@@ -39,7 +40,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use axum_server::accept::Accept;
@@ -49,7 +50,7 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-use crate::observability::metrics::Metrics;
+use crate::observability::{log_throttle::LogThrottle, metrics::Metrics};
 
 /// The bound, as a semaphore with one permit per connection.
 #[derive(Debug)]
@@ -65,15 +66,22 @@ const WARN_INTERVAL: Duration = Duration::from_secs(60);
 /// The bound and what became of the connections it saw, readable in
 /// process: how many are open under it now, how many it refused. The
 /// counter `smg_http_connections_rejected_total` carries the refusals.
-#[derive(Debug)]
 pub struct ConnectionLimitStats {
     bound: Option<Bound>,
     rejected: AtomicU64,
-    /// When the stats were made: the clock of `warned_at`.
-    started: Instant,
-    /// Milliseconds after `started` of the last WARN, plus one; 0 is none
-    /// yet.
-    warned_at: AtomicU64,
+    /// One WARN per [`WARN_INTERVAL`] while refusals go on, the shared
+    /// throttle the routing refusals use too; the refusals between two
+    /// lines are counted and reported as `suppressed` on the next one.
+    warn_log: LogThrottle,
+}
+
+impl fmt::Debug for ConnectionLimitStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectionLimitStats")
+            .field("bound", &self.bound)
+            .field("rejected", &self.rejected())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for ConnectionLimitStats {
@@ -93,24 +101,8 @@ impl ConnectionLimitStats {
                 permits: Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS))),
             }),
             rejected: AtomicU64::new(0),
-            started: Instant::now(),
-            warned_at: AtomicU64::new(0),
+            warn_log: LogThrottle::new(1, WARN_INTERVAL),
         }
-    }
-
-    /// Whether a refusal `elapsed` after the start is the one to log at
-    /// WARN: the first, or the first after [`WARN_INTERVAL`] of the last one.
-    /// Claims the slot, so concurrent refusals log it once.
-    fn warn_due(&self, elapsed: Duration) -> bool {
-        let now = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX - 1) + 1;
-        let last = self.warned_at.load(Ordering::Relaxed);
-        let due = last == 0
-            || now.saturating_sub(last)
-                >= u64::try_from(WARN_INTERVAL.as_millis()).unwrap_or(u64::MAX);
-        due && self
-            .warned_at
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
     }
 
     /// The bound; `None` without one.
@@ -144,14 +136,15 @@ impl ConnectionLimitStats {
             Err(_) => {
                 let max_connections = bound.max_connections;
                 let rejected = self.rejected.fetch_add(1, Ordering::Relaxed) + 1;
-                if self.warn_due(self.started.elapsed()) {
+                if let Some(admitted) = self.warn_log.admit() {
                     warn!(
                         max_connections,
                         rejected,
+                        suppressed = admitted.suppressed,
                         "The HTTP connection limit is reached: a connection beyond it is closed \
                          at once without a response; refusals are counted in \
                          smg_http_connections_rejected_total and logged here at most once a \
-                         minute"
+                         minute (suppressed: the refusals since the last line)"
                     );
                 } else {
                     debug!(
@@ -442,20 +435,28 @@ mod tests {
         assert_eq!(stats.max_connections(), Some(2));
     }
 
-    /// The WARN is due for the first refusal and then once per interval;
-    /// the refusals in between are not its business.
+    /// The WARN is admitted for the first refusal and then once per
+    /// [`WARN_INTERVAL`], the refusals in between counted as suppressed on
+    /// the next line: the stats' throttle is wired with that limit and
+    /// window (its boundaries are the throttle's own tests' business).
     #[test]
     fn a_refusal_is_logged_at_warn_once_per_interval() {
         let stats = ConnectionLimitStats::new(1);
-        assert!(stats.warn_due(Duration::ZERO), "the first refusal");
-        assert!(!stats.warn_due(Duration::from_secs(1)));
-        assert!(!stats.warn_due(WARN_INTERVAL - Duration::from_millis(1)));
-        assert!(
-            stats.warn_due(WARN_INTERVAL),
-            "the first after the interval"
+        let start = std::time::Instant::now();
+        let admitted = |at: Duration| stats.warn_log.admit_at(start + at).map(|a| a.suppressed);
+        assert_eq!(admitted(Duration::ZERO), Some(0), "the first refusal");
+        assert_eq!(admitted(Duration::from_secs(1)), None);
+        assert_eq!(admitted(WARN_INTERVAL - Duration::from_millis(1)), None);
+        assert_eq!(
+            admitted(WARN_INTERVAL),
+            Some(2),
+            "the first after the interval, with the two in between"
         );
-        assert!(!stats.warn_due(WARN_INTERVAL + Duration::from_secs(1)));
-        assert!(stats.warn_due(WARN_INTERVAL * 2 + Duration::from_secs(1)));
+        assert_eq!(admitted(WARN_INTERVAL + Duration::from_secs(1)), None);
+        assert_eq!(
+            admitted(WARN_INTERVAL * 2 + Duration::from_secs(1)),
+            Some(1)
+        );
     }
 
     #[tokio::test]
