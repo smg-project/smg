@@ -387,6 +387,10 @@ impl Assembler {
         if self.done {
             return;
         }
+        // The value's held bytes (a trailing newline that may be the template's framing) came
+        // before the start of a tag the scanner holds: they leave in that order.
+        let held = self.take_held();
+        self.carried.push_str(&held);
         let held = self.scanner.held().to_string();
         self.carried.push_str(&held);
         if !self.started() {
@@ -426,9 +430,9 @@ impl Assembler {
         if self.done {
             return;
         }
-        let held = self.scanner.held().to_string();
-        self.carried.push_str(&held);
         let held = self.take_held();
+        self.carried.push_str(&held);
+        let held = self.scanner.held().to_string();
         self.carried.push_str(&held);
         if !self.carried.is_empty() {
             out.push(Event::Malformed {

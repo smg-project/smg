@@ -198,6 +198,34 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_cut_inside_a_closing_tag_keeps_the_values_newline_in_its_place() {
+        // The template's newline before a parameter's closing tag is held until the tag says it
+        // was framing; a stream cut inside the tag, or a terminal arriving behind the cut tag,
+        // leaves it before the tag's bytes, in the output's order, whole and in pieces.
+        for output in [
+            "<dots_function_call>\n<invoke name=\"f\">\n<parameter name=\"a\">\nv\n</parame",
+            "<dots_function_call>\n<invoke name=\"f\">\n<parameter name=\"a\">\nv\n</",
+            concat!(
+                "<dots_function_call>\n<invoke name=\"f\">\n<parameter name=\"a\">\nv\n",
+                "</parameter>\n</inv"
+            ),
+            concat!(
+                "<dots_function_call>\n<invoke name=\"f\">\n<parameter name=\"a\">\nv\n",
+                "</parame</invoke>\n</dots_function_call>"
+            ),
+        ] {
+            let events = run(PROMPT, &[output]);
+            assert_eq!(bytes(&events), output, "{output:?} whole");
+            let per_char: Vec<&str> = output
+                .char_indices()
+                .map(|(i, c)| &output[i..i + c.len_utf8()])
+                .collect();
+            let events = run(PROMPT, &per_char);
+            assert_eq!(bytes(&events), output, "{output:?} per character");
+        }
+    }
+
+    #[test]
     fn a_rendered_turn_gives_its_thought_its_content_and_two_calls_and_every_byte() {
         let events = run(PROMPT, &[OUTPUT]);
         assert_eq!(bytes(&events), OUTPUT);
