@@ -15,6 +15,7 @@ use openai_protocol::responses::{
     generate_id, normalize_input_item, McpToolCallError, ResponseContentPart, ResponseInput,
     ResponseInputOutputItem, ResponsesRequest,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use smg_data_connector::{
     self as data_connector, ConversationId, ConversationItem, ConversationItemStorage,
@@ -64,7 +65,11 @@ pub(crate) async fn load_history(
 
     if let Some(prev_id) = request.previous_response_id.as_deref() {
         let chain = previous_response_chain(stores.responses, prev_id, tenant).await?;
-        history.extend(chain.iter().flat_map(stored_response_items));
+        history.extend(
+            chain
+                .iter()
+                .flat_map(|stored| stored_response_items(stored)),
+        );
         continues = true;
     }
 
@@ -255,10 +260,11 @@ pub(crate) fn conversation_item_as_input(
     }
 }
 
-/// The input item a stored item replays as; `None` for one with no input form
-/// (a built-in tool call, an older schema), which is left out.
+/// The input item a stored item replays as, read from the stored value in
+/// place; `None` for one with no input form (a built-in tool call, an older
+/// schema), which is left out.
 fn stored_item_as_input(item: &Value) -> Option<ResponseInputOutputItem> {
-    serde_json::from_value::<ResponseInputOutputItem>(item.clone())
+    ResponseInputOutputItem::deserialize(item)
         .map_err(|e| warn!("Failed to deserialize stored item: {}. Item: {}", e, item))
         .ok()
 }

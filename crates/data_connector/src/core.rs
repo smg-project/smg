@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Display, Formatter, Write},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -149,9 +150,9 @@ pub fn tenant_scope_allows(record: Option<&str>, caller: Option<&str>) -> bool {
 /// would at a missing record. Empty when the chain's head itself is not
 /// visible.
 pub fn visible_chain(
-    mut responses: Vec<StoredResponse>,
+    mut responses: Vec<Arc<StoredResponse>>,
     tenant: Option<&str>,
-) -> Vec<StoredResponse> {
+) -> Vec<Arc<StoredResponse>> {
     let hidden_up_to = responses
         .iter()
         .rposition(|response| !response.is_visible_to(tenant))
@@ -584,11 +585,14 @@ pub enum ConditionalStore {
     Missing,
 }
 
-/// Response chain - a sequence of related responses
+/// Response chain - a sequence of related responses. The records are shared
+/// (`Arc`): a backend that holds them in memory hands out the ones it holds,
+/// and a caller that rebuilds a conversation from a chain reads them in place
+/// rather than taking a copy of every record, with its items, on every turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseChain {
     /// The responses in chronological order
-    pub responses: Vec<StoredResponse>,
+    pub responses: Vec<Arc<StoredResponse>>,
 
     /// Metadata about the chain
     pub metadata: HashMap<String, Value>,
@@ -610,6 +614,11 @@ impl ResponseChain {
 
     /// Add a response to the chain
     pub fn add_response(&mut self, response: StoredResponse) {
+        self.responses.push(Arc::new(response));
+    }
+
+    /// Add a response the backend holds shared, without copying it.
+    pub fn add_shared(&mut self, response: Arc<StoredResponse>) {
         self.responses.push(response);
     }
 }
@@ -949,7 +958,7 @@ pub trait ResponseStorage: Send + Sync {
             match fetched {
                 Some(response) => {
                     current_id.clone_from(&response.previous_response_id);
-                    chain.responses.push(response);
+                    chain.add_response(response);
                 }
                 None => break,
             }
@@ -1356,12 +1365,12 @@ mod tests {
             let mut stored = StoredResponse::new(None);
             stored.id = ResponseId::from(id);
             stored.tenant = tenant.map(str::to_string);
-            stored
+            Arc::new(stored)
         };
-        let ids = |chain: Vec<StoredResponse>| {
+        let ids = |chain: Vec<Arc<StoredResponse>>| {
             chain
-                .into_iter()
-                .map(|stored| stored.id.0)
+                .iter()
+                .map(|stored| stored.id.0.clone())
                 .collect::<Vec<_>>()
         };
         let a = Some("header:a");

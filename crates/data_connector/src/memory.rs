@@ -649,8 +649,9 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
 /// Internal store structure holding the maps together
 #[derive(Default)]
 struct InnerStore {
-    /// All stored responses indexed by ID
-    responses: HashMap<ResponseId, StoredResponse>,
+    /// All stored responses indexed by ID, shared with the chains handed out:
+    /// a reader of a chain of ten takes ten references, not ten copies.
+    responses: HashMap<ResponseId, Arc<StoredResponse>>,
     /// Index of response IDs by safety identifier
     identifier_index: HashMap<String, Vec<ResponseId>>,
     /// The responses in insertion order (a record replaced under its id keeps
@@ -792,7 +793,7 @@ impl InnerStore {
         }
         if self
             .responses
-            .insert(response_id.clone(), response)
+            .insert(response_id.clone(), Arc::new(response))
             .is_none()
         {
             self.order.push(now, response_id.clone());
@@ -832,9 +833,9 @@ impl ResponseStorage for MemoryResponseStorage {
         let mut store = self.store.write();
         match store.responses.get(&response.id) {
             None => Ok(ConditionalStore::Missing),
-            Some(current) if current.is_closed() => {
-                Ok(ConditionalStore::Closed(Box::new(current.clone())))
-            }
+            Some(current) if current.is_closed() => Ok(ConditionalStore::Closed(Box::new(
+                StoredResponse::clone(current),
+            ))),
             Some(_) => {
                 let now = Utc::now();
                 store.insert(response, now);
@@ -854,11 +855,13 @@ impl ResponseStorage for MemoryResponseStorage {
         let mut store = self.store.write();
         match store.responses.get_mut(id) {
             None => Ok(ConditionalStore::Missing),
-            Some(current) if current.is_closed() => {
-                Ok(ConditionalStore::Closed(Box::new(current.clone())))
-            }
+            Some(current) if current.is_closed() => Ok(ConditionalStore::Closed(Box::new(
+                StoredResponse::clone(current),
+            ))),
             Some(current) => {
-                current.raw_response = raw_response;
+                // In place unless a chain handed out earlier still reads the
+                // record, which then keeps the object it was given.
+                Arc::make_mut(current).raw_response = raw_response;
                 Ok(ConditionalStore::Stored)
             }
         }
@@ -869,7 +872,10 @@ impl ResponseStorage for MemoryResponseStorage {
         response_id: &ResponseId,
     ) -> ResponseResult<Option<StoredResponse>> {
         let store = self.store.read();
-        let result = store.responses.get(response_id).cloned();
+        let result = store
+            .responses
+            .get(response_id)
+            .map(|response| StoredResponse::clone(response));
         tracing::debug!(response_id = %response_id.0, found = result.is_some(), "Memory response lookup");
         Ok(result)
     }
@@ -906,7 +912,7 @@ impl ResponseStorage for MemoryResponseStorage {
                 {
                     current_id = response.previous_response_id.clone();
                 }
-                chain.add_response(response.clone());
+                chain.add_shared(Arc::clone(response));
                 depth += 1;
             } else {
                 break;
@@ -939,7 +945,7 @@ impl ResponseStorage for MemoryResponseStorage {
                         })
                     })
             })
-            .cloned();
+            .map(|response| StoredResponse::clone(response));
         Ok(found)
     }
 
@@ -968,7 +974,7 @@ impl ResponseStorage for MemoryResponseStorage {
             let user_responses: Vec<StoredResponse> = responses_with_time
                 .into_iter()
                 .take(limit)
-                .map(|(_, r)| r.clone())
+                .map(|(_, r)| StoredResponse::clone(r))
                 .collect();
 
             Ok(user_responses)
@@ -1521,6 +1527,42 @@ mod tests {
         assert_eq!(limited_chain.responses.len(), 2);
         assert_eq!(limited_chain.responses[0].input, json!("Second"));
         assert_eq!(limited_chain.responses[1].input, json!("Third"));
+    }
+
+    #[tokio::test]
+    async fn a_chain_walk_shares_the_stored_records_and_a_status_write_leaves_them_as_read() {
+        let store = MemoryResponseStorage::new();
+        let mut first = StoredResponse::new(None);
+        first.input = json!("First");
+        first.raw_response = json!({"status": "completed", "output": []});
+        let id1 = store.store_response(first).await.unwrap();
+        let mut second = StoredResponse::new(Some(id1.clone()));
+        second.raw_response = json!({"status": "in_progress", "output": []});
+        let id2 = store.store_response(second).await.unwrap();
+
+        let chain = store.get_response_chain(&id2, None).await.unwrap();
+        assert_eq!(chain.responses.len(), 2);
+        // The chain holds the store's own records: a second reference each, no copy.
+        assert_eq!(Arc::strong_count(&chain.responses[0]), 2);
+        assert_eq!(Arc::strong_count(&chain.responses[1]), 2);
+
+        // A status write on a record the chain is reading: the store moves on, the chain keeps
+        // the object it was given, as it did when it held a copy.
+        let written = store
+            .update_response_object_if_open(
+                &id2,
+                json!({"status": "completed", "output": [{"id": "msg_1"}]}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(written, ConditionalStore::Stored));
+        assert_eq!(chain.responses[1].raw_response["status"], "in_progress");
+        let stored = store.get_response(&id2).await.unwrap().unwrap();
+        assert_eq!(stored.raw_response["status"], "completed");
+        drop(chain);
+        let chain = store.get_response_chain(&id2, None).await.unwrap();
+        assert_eq!(chain.responses[1].raw_response["output"][0]["id"], "msg_1");
+        assert_eq!(Arc::strong_count(&chain.responses[1]), 2);
     }
 
     #[tokio::test]

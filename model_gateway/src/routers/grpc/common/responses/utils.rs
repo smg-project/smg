@@ -385,8 +385,8 @@ impl NotStored {
     }
 }
 
-/// The responses behind a `previous_response_id`, oldest first, or the
-/// refusal every loader answers: `previous_response_not_found` for an id the
+/// The responses behind a `previous_response_id`, oldest first, as the store
+/// holds them (shared, read in place), or the refusal every loader answers: `previous_response_not_found` for an id the
 /// store does not know, an empty chain, or a chain ending in a record its
 /// client asked not to store (a background run's record, kept for its
 /// polling window only: a chain built on it would break when it goes, so it
@@ -399,11 +399,15 @@ pub(crate) async fn previous_response_chain(
     storage: &Arc<dyn ResponseStorage>,
     prev_id_str: &str,
     tenant: Option<&str>,
-) -> Result<Vec<StoredResponse>, Response> {
+) -> Result<Vec<Arc<StoredResponse>>, Response> {
     let prev_id = ResponseId::from(prev_id_str);
     match storage.get_response_chain(&prev_id, None).await {
         Ok(chain)
-            if !chain.responses.is_empty() && !chain.responses.last().is_some_and(is_unstored) =>
+            if !chain.responses.is_empty()
+                && !chain
+                    .responses
+                    .last()
+                    .is_some_and(|response| is_unstored(response)) =>
         {
             let responses = visible_chain(chain.responses, tenant);
             if responses.is_empty() {
