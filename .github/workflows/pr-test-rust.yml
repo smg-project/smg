@@ -469,10 +469,12 @@ jobs:
   # already keys by the runner's architecture, but this job's target
   # directory holds another crate set and profile than the unit-tests job's,
   # and the entry fills from the runs on main (the action saves on main
-  # only). sccache's GitHub cache is off for this job: the repository's
-  # Actions cache is over its budget, and with `incremental = true` sccache
-  # would only add this architecture's dependency objects on every cold run,
-  # which rust-cache restores anyway. The gateway binary's own AArch64 check
+  # only). sccache is off for this job (the wrapper unset, its GitHub cache
+  # disabled): the repository's Actions cache is over its budget, with
+  # `incremental = true` sccache would only add this architecture's
+  # dependency objects on every cold run, which rust-cache restores anyway,
+  # and a local sccache disk cache never outlives a hosted runner. The
+  # gateway binary's own AArch64 check
   # (model_gateway/tests/allocator_artifact_test.rs: jemalloc's 64 KiB page
   # setting) is not run here: it builds the smg binary, which the hosted
   # runner cannot afford on every pull request; it stays with the nightly
@@ -493,6 +495,7 @@ jobs:
       contents: read
     env:
       SCCACHE_GHA_ENABLED: "false"
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v7
 
