@@ -457,10 +457,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
-            return Err(TransformError::InvalidShape {
-                expected: "non-empty image batch".to_string(),
-                actual: vec![0],
-            });
+            return Err(TransformError::EmptyBatch);
         }
 
         let processor = if config.dynamic_hd.is_some() || config.image_mean.is_some() {
@@ -741,5 +738,12 @@ mod tests {
 
         // Phi4 default dynamic_hd is 36 (vs 16 num_crops in Phi3)
         assert_eq!(processor.dynamic_hd(), 36);
+    }
+
+    #[test]
+    fn an_empty_batch_is_refused_as_empty_batch() {
+        let processor = Phi4VisionProcessor::new();
+        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

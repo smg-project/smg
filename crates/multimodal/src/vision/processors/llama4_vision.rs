@@ -432,10 +432,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
-            return Err(TransformError::InvalidShape {
-                expected: "non-empty image batch".to_string(),
-                actual: vec![0],
-            });
+            return Err(TransformError::EmptyBatch);
         }
 
         let owned_processor;
@@ -728,5 +725,12 @@ mod tests {
             processor.calculate_num_tokens_for_aspect_ratio((1, 2)),
             1728
         );
+    }
+
+    #[test]
+    fn an_empty_batch_is_refused_as_empty_batch() {
+        let processor = Llama4VisionProcessor::new();
+        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

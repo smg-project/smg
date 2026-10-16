@@ -177,10 +177,7 @@ impl VisionPreProcessor for PixtralProcessor {
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
-            return Err(TransformError::InvalidShape {
-                expected: "non-empty image batch".to_string(),
-                actual: vec![0],
-            });
+            return Err(TransformError::EmptyBatch);
         }
 
         // Apply config overrides if present
@@ -413,5 +410,12 @@ mod tests {
         // 200x150 -> 208x160 -> 13*10 = 130 patches
         let tokens = processor.calculate_num_tokens(200, 150, &config).unwrap();
         assert_eq!(tokens, 130);
+    }
+
+    #[test]
+    fn an_empty_batch_is_refused_as_empty_batch() {
+        let processor = PixtralProcessor::new();
+        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }
