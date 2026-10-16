@@ -722,6 +722,21 @@ impl PromptReplacement {
         }
     }
 
+    /// One repeated replacement per media item, in batch order, each as long as the item's
+    /// feature-token count: the shape of a spec whose placeholder is one token repeated, which
+    /// most vision specs are.
+    pub fn repeated_per_item(
+        modality: Modality,
+        placeholder_token: &str,
+        token_id: TokenId,
+        counts: &[usize],
+    ) -> Vec<Self> {
+        counts
+            .iter()
+            .map(|&count| Self::repeated(modality, placeholder_token, token_id, count))
+            .collect()
+    }
+
     pub fn sequence(modality: Modality, placeholder_token: &str, sequence: Vec<TokenId>) -> Self {
         Self {
             modality,
@@ -783,6 +798,30 @@ mod tests {
                 offset: 1,
                 length: 2
             }])
+        );
+    }
+
+    #[test]
+    fn repeated_per_item_gives_one_replacement_per_count_in_order() {
+        let replacements =
+            PromptReplacement::repeated_per_item(Modality::Image, "<image>", 100, &[3, 0, 2]);
+        assert_eq!(
+            replacements
+                .iter()
+                .map(|replacement| replacement.tokens.len())
+                .collect::<Vec<_>>(),
+            vec![3, 0, 2],
+            "one replacement per item, as long as its count, a zero count kept"
+        );
+        for replacement in &replacements {
+            assert_eq!(replacement.modality, Modality::Image);
+            assert_eq!(replacement.placeholder_token, "<image>");
+            assert!(replacement.tokens.iter().all(|&token| token == 100));
+            assert!(replacement.feature_ranges.is_none());
+            assert_eq!(replacement.structural_prefix, 0);
+        }
+        assert!(
+            PromptReplacement::repeated_per_item(Modality::Image, "<image>", 100, &[]).is_empty()
         );
     }
 

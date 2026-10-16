@@ -58,11 +58,12 @@ impl ModelProcessorSpec for LlavaSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let token_id = self.placeholder_token_id(metadata)?;
         let token = self.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| PromptReplacement::repeated(Modality::Image, &token, token_id, count))
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &token,
+            token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 }
 
@@ -107,11 +108,12 @@ impl ModelProcessorSpec for LlavaNextSpec {
         // and stored in preprocessed.feature_token_counts.
         let token_id = LlavaSpec.placeholder_token_id(metadata)?;
         let token = LlavaSpec.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| PromptReplacement::repeated(Modality::Image, &token, token_id, count))
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &token,
+            token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {

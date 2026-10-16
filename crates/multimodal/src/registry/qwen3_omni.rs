@@ -45,11 +45,12 @@ impl Qwen3OmniSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let token_id = Self::token_id(metadata, field)?;
         let token = Self::token(metadata, field, fallback)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| PromptReplacement::repeated(modality, &token, token_id, count))
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            modality,
+            &token,
+            token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 }
 
