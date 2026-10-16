@@ -64,7 +64,12 @@ const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// every time.
 const LONG_PIECE_MAX_BYTES: usize = 256;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
-/// at most; see `PIECE_CACHE_TOTAL_CAPACITY`.
+/// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
+/// repeated document: one with fewer distinct pieces is encoded again at the
+/// cost of its lookups, one with more at first-pass cost on every pass, since
+/// the clear takes the pieces that recur with the rest (the crate bench
+/// `encode_volume` shows both, and that the cost of text no pass has seen
+/// does not depend on how much a thread encoded before).
 const PIECE_CACHE_CAPACITY: usize = 16_384;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
