@@ -1305,6 +1305,9 @@ mod tests {
         stores_landed: AtomicUsize,
         /// Answers every read with no record, as a store without history does.
         hides_records: AtomicBool,
+        /// Fails every read while the writes go through, as a read that
+        /// times out does.
+        reads_fail: AtomicBool,
     }
 
     impl FlakyStorage {
@@ -1315,11 +1318,16 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 stores_landed: AtomicUsize::new(0),
                 hides_records: AtomicBool::new(false),
+                reads_fail: AtomicBool::new(false),
             }
         }
 
         fn hide_records(&self) {
             self.hides_records.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_reads(&self) {
+            self.reads_fail.store(true, Ordering::SeqCst);
         }
 
         fn fail_next(&self, failures: usize) {
@@ -1363,6 +1371,9 @@ mod tests {
             response_id: &ResponseId,
         ) -> Result<Option<StoredResponse>, ResponseStorageError> {
             self.unreachable()?;
+            if self.reads_fail.load(Ordering::SeqCst) {
+                return Err(ResponseStorageError::Timeout("read timed out".to_string()));
+            }
             if self.hides_records.load(Ordering::SeqCst) {
                 return Ok(None);
             }
@@ -2620,5 +2631,181 @@ mod tests {
         );
         assert_eq!(stored_status(&storage, "resp_1").await, "completed");
         assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// [`CountingStorage`] behind a read path that is down: every read fails
+    /// while the writes, the conditional ones included, go through.
+    struct ReadFailingStorage(Arc<CountingStorage>);
+
+    #[async_trait]
+    impl ResponseStorage for ReadFailingStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.0.store_response(response).await
+        }
+
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.0.store_response_if_open(response).await
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.0
+                .update_response_object_if_open(id, raw_response)
+                .await
+        }
+
+        async fn get_response(
+            &self,
+            _response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            Err(ResponseStorageError::Timeout("read timed out".to_string()))
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.0.delete_response(response_id).await
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.0
+                .list_identifier_responses(identifier, tenant, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+        ) -> Result<usize, ResponseStorageError> {
+            self.0.delete_identifier_responses(identifier, tenant).await
+        }
+    }
+
+    /// A store whose reads fail while its writes go through (a read that
+    /// times out, a read path that is down): the guard of the terminal
+    /// persist is the store's own conditional write, so a result that arrives
+    /// after a cancel or a delete is refused by the store, and no failed read
+    /// on the gateway's side passes for an open record.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_result_is_refused_by_the_store_while_the_record_cannot_be_read() {
+        let counting = Arc::new(CountingStorage::new());
+        let direct: Arc<dyn ResponseStorage> = counting.clone();
+        let storage: Arc<dyn ResponseStorage> = Arc::new(ReadFailingStorage(counting.clone()));
+        let request = store_queued(&direct, "resp_1").await;
+        let response = completed_after_queued("resp_1", &request);
+        // Cancelled through another gateway; this gateway's reads fail from
+        // here on.
+        set_stored_status(&direct, "resp_1", "cancelled", None, None)
+            .await
+            .unwrap();
+        let writes = counting.stores();
+        super::super::utils::persist_response_if_needed(
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            storage.clone(),
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+        assert_eq!(
+            stored_status(&direct, "resp_1").await,
+            "cancelled",
+            "the cancel wins"
+        );
+        assert_eq!(counting.stores(), writes, "no late result was written");
+
+        // The record is deleted while the work runs: the result does not
+        // re-create it.
+        direct
+            .delete_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap();
+        super::super::utils::persist_response_if_needed(
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            storage,
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+        assert_eq!(
+            stored_raw(&direct, "resp_1").await,
+            Value::Null,
+            "the delete holds"
+        );
+        assert_eq!(
+            counting.stores(),
+            writes,
+            "nothing was written under the deleted id"
+        );
+    }
+
+    /// A store without an atomic conditional write of its own (the trait's
+    /// default reads the record, then writes) whose reads fail while its
+    /// writes go through: the failed read is an error the persist retries
+    /// for the terminal write window and then gives up on, never an open
+    /// record; nothing is written while the record's state is unknown.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_that_cannot_be_read_takes_no_late_result_without_an_atomic_check() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        let request = store_queued(&storage, "resp_1").await;
+        let response = completed_after_queued("resp_1", &request);
+        set_stored_status(&storage, "resp_1", "cancelled", None, None)
+            .await
+            .unwrap();
+        let landed_before = flaky.stores_landed();
+        let calls_before = flaky.calls();
+        flaky.fail_reads();
+        super::super::utils::persist_response_if_needed(
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            storage,
+            &response,
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+        assert_eq!(
+            flaky.stores_landed(),
+            landed_before,
+            "no late result was written over the record that could not be read"
+        );
+        assert!(
+            flaky.calls() - calls_before > TERMINAL_WRITE_RETRIES as usize,
+            "the read was retried for the terminal write window: {} calls",
+            flaky.calls() - calls_before
+        );
+        let stored = flaky
+            .inner
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .expect("the record is still there");
+        assert_eq!(stored.raw_response["status"], "cancelled");
     }
 }

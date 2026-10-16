@@ -1527,4 +1527,140 @@ mod tests {
         let second = stamps.next_added_at();
         assert!(second - first >= chrono::TimeDelta::milliseconds(1));
     }
+
+    /// A store that overrides neither conditional write runs the trait's
+    /// read-then-write defaults: a record that cannot be read is an error to
+    /// the caller, never an open record, and nothing is written; a closed
+    /// record is handed back and left as it is; a missing one takes nothing;
+    /// an open one takes the write.
+    #[tokio::test]
+    async fn the_default_conditional_writes_write_nothing_over_a_record_they_cannot_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use parking_lot::Mutex;
+
+        enum Read {
+            Fails,
+            Answers(Option<Box<StoredResponse>>),
+        }
+
+        struct PlainStore {
+            read: Mutex<Read>,
+            stores: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ResponseStorage for PlainStore {
+            async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId> {
+                self.stores.fetch_add(1, Ordering::SeqCst);
+                Ok(response.id)
+            }
+
+            async fn get_response(
+                &self,
+                _response_id: &ResponseId,
+            ) -> ResponseResult<Option<StoredResponse>> {
+                match &*self.read.lock() {
+                    Read::Fails => Err(ResponseStorageError::Timeout("read timed out".to_string())),
+                    Read::Answers(record) => Ok(record.as_deref().cloned()),
+                }
+            }
+
+            async fn delete_response(&self, _response_id: &ResponseId) -> ResponseResult<()> {
+                Ok(())
+            }
+
+            async fn list_identifier_responses(
+                &self,
+                _identifier: &str,
+                _tenant: Option<&str>,
+                _limit: Option<usize>,
+            ) -> ResponseResult<Vec<StoredResponse>> {
+                Ok(Vec::new())
+            }
+
+            async fn delete_identifier_responses(
+                &self,
+                _identifier: &str,
+                _tenant: Option<&str>,
+            ) -> ResponseResult<usize> {
+                Ok(0)
+            }
+        }
+
+        let record = |status: &str| {
+            let mut response = StoredResponse::new(None);
+            response.id = ResponseId::from("resp_1");
+            response.raw_response = serde_json::json!({"id": "resp_1", "status": status});
+            response
+        };
+        let moved = serde_json::json!({"id": "resp_1", "status": "in_progress"});
+        let store = PlainStore {
+            read: Mutex::new(Read::Fails),
+            stores: AtomicUsize::new(0),
+        };
+        let stores = || store.stores.load(Ordering::SeqCst);
+
+        assert!(
+            store
+                .store_response_if_open(record("completed"))
+                .await
+                .is_err(),
+            "a failed read is the caller's error, not an open record"
+        );
+        assert!(store
+            .update_response_object_if_open(&ResponseId::from("resp_1"), moved.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            stores(),
+            0,
+            "nothing is written while the record's state is unknown"
+        );
+
+        *store.read.lock() = Read::Answers(Some(Box::new(record("cancelled"))));
+        let ConditionalStore::Closed(current) = store
+            .store_response_if_open(record("completed"))
+            .await
+            .unwrap()
+        else {
+            panic!("a cancelled record is closed");
+        };
+        assert_eq!(current.raw_response["status"], "cancelled");
+        assert!(matches!(
+            store
+                .update_response_object_if_open(&ResponseId::from("resp_1"), moved.clone())
+                .await
+                .unwrap(),
+            ConditionalStore::Closed(_)
+        ));
+        assert_eq!(stores(), 0, "a closed record is left as it is");
+
+        *store.read.lock() = Read::Answers(None);
+        assert!(matches!(
+            store
+                .store_response_if_open(record("completed"))
+                .await
+                .unwrap(),
+            ConditionalStore::Missing
+        ));
+        assert_eq!(stores(), 0, "nothing is written under a missing id");
+
+        *store.read.lock() = Read::Answers(Some(Box::new(record("queued"))));
+        assert!(matches!(
+            store
+                .store_response_if_open(record("completed"))
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert!(matches!(
+            store
+                .update_response_object_if_open(&ResponseId::from("resp_1"), moved)
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert_eq!(stores(), 2, "an open record takes both writes");
+    }
 }
