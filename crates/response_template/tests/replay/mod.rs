@@ -10,7 +10,10 @@
     reason = "test helpers shared by the compile's tests; a bad fixture or table should panic"
 )]
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde_json::Value;
 use smg_response_template::{
@@ -18,8 +21,8 @@ use smg_response_template::{
     to_symphony::{compile, Compiled, Refusals},
 };
 use symphony::{
-    json::PartialJson, Declared, DropReason, Engine, EngineFinish, Event, Events, FinishReason,
-    Format, Input, MalformedReason, Parser,
+    json::PartialJson, CallIds, Declared, DropReason, Engine, EngineFinish, Event, Events,
+    FinishReason, Format, Input, MalformedReason, Parser,
 };
 
 use crate::common::{chunk_lengths, read_jsonl, untag};
@@ -91,6 +94,10 @@ pub fn pinned(name: &str, seen: &str) {
     }
 }
 
+/// The nonce every replay mints its call ids from: two replays of one output name the same
+/// calls, as the comparisons here need, where an engine of its own would draw a fresh one.
+const REPLAY_NONCE: &str = "0123456789abcdef00000000";
+
 /// Feed `pieces` of the output after `prompt` (none when empty), then the end.
 pub fn run(
     format: &Format,
@@ -100,7 +107,8 @@ pub fn run(
     cuts: &[usize],
     end: &EngineFinish,
 ) -> Vec<Event> {
-    let mut parser = Engine::new(format.clone(), declared.clone());
+    let ids = CallIds::from_nonce(REPLAY_NONCE).unwrap();
+    let mut parser = Engine::with_call_ids(Arc::new(format.clone()), declared.clone(), ids);
     let mut out = Events::new();
     if !prompt.is_empty() {
         let prompt = Input::Prompt {
