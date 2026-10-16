@@ -36,11 +36,7 @@ use smg::{
         TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
-    observability::{
-        logging::close_logging,
-        metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
-        otel_trace::{is_otel_enabled, shutdown_otel},
-    },
+    observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
@@ -2956,9 +2952,9 @@ fn parse_cli_args(clap_args: Vec<String>) -> (CliArgs, bool) {
 
 /// Phase 4, serve: the async runtime (tokio's container-aware default size
 /// unless `--runtime-worker-threads` pins one; the size is logged by
-/// `startup` once the log subscriber is up), the server until it stops,
-/// then the log writers flushed; the tracer is shut down after a clean stop
-/// (a failed start-up returns before it, as it always did). The runtime is
+/// `startup` once the log subscriber is up), then [`server::run`]: the
+/// server until it stops, the log writers flushed and the tracer shut down
+/// on every exit, a clean stop and a failed start-up alike. The runtime is
 /// built only now: a refusal before this point costs no threads.
 fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = match server_config.runtime_worker_threads {
@@ -2968,15 +2964,7 @@ fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> 
             .build()?,
         None => tokio::runtime::Runtime::new()?,
     };
-    let served = runtime.block_on(Box::pin(server::startup(server_config)));
-    // The writer threads outlive `startup` (a process may start more than one
-    // router); flush and stop them now that this process is done logging.
-    close_logging();
-    served?;
-    if is_otel_enabled() {
-        shutdown_otel();
-    }
-    Ok(())
+    server::run(&runtime, server_config)
 }
 
 /// The start-up sequence: parse, announce, configure, serve. The version

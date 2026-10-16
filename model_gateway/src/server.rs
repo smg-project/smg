@@ -1409,6 +1409,30 @@ fn supervise_discovery(
     abort
 }
 
+/// [`startup`] on `runtime` to its end, then the process-wide observability
+/// closed behind it, on every exit alike: the log writers are flushed and
+/// stopped, then the tracer is flushed and shut down (a bounded wait, see
+/// [`otel_trace::shutdown_otel`]), and only then is the result read. A
+/// failed start-up used to return before the tracer's shutdown, and the
+/// spans the batch exporter still held were lost with the process. The
+/// result is `startup`'s own: the error line and the exit code are the
+/// caller's, as before. The runtime stays up throughout: the exporter's
+/// connection lives on it.
+///
+/// For a caller whose process goes on after the server (a language
+/// binding), [`startup`] alone is the entry point.
+pub fn run(
+    runtime: &tokio::runtime::Runtime,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let served = runtime.block_on(Box::pin(startup(config)));
+    // The writer threads outlive `startup` (a process may start more than one
+    // router); flush and stop them now that this process is done logging.
+    logging::close_logging();
+    otel_trace::shutdown_otel();
+    served
+}
+
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     crate::tls::install_crypto_provider();
 
