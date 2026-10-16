@@ -275,7 +275,17 @@ impl TokenSpeedScheduler for MockScheduler {
         if !self.cfg.gen_delay.is_zero() {
             tokio::time::sleep(self.cfg.gen_delay).await;
         }
-        let ids: Vec<u32> = (0..self.cfg.output_tokens).map(|i| 100 + i).collect();
+        // The configured prefix first, then synthetic ids.
+        let ids: Vec<u32> = (0..self.cfg.output_tokens)
+            .map(|i| {
+                self.cfg
+                    .engine
+                    .output_prefix
+                    .get(i as usize)
+                    .copied()
+                    .unwrap_or(100 + i)
+            })
+            .collect();
 
         let mut items: Vec<Result<ts::GenerateResponse, Status>> = Vec::new();
         for id in &ids {
