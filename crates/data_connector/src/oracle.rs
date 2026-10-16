@@ -25,7 +25,8 @@ use crate::{
     oracle_migrations::ORACLE_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
     versioning::{
-        bootstrap_oracle_schema, oracle_recorded_version, run_oracle_migrations, OracleSchemaSteps,
+        bootstrap_oracle_schema, oracle_recorded_version, run_oracle_migrations, Migration,
+        OracleSchemaSteps,
     },
 };
 
@@ -155,15 +156,16 @@ impl OracleSchemaSteps for OracleSchemaSetup<'_> {
         Ok(())
     }
 
-    /// Re-running the initializers after an applied migration is what creates
-    /// the indexes on the columns it added (e.g. the safety identifier's, v1)
-    /// in this start rather than the next.
-    fn migrate(&self) -> Result<Vec<u32>, String> {
+    fn migrate(
+        &self,
+        migrations: &[Migration],
+        config_version: Option<u32>,
+    ) -> Result<Vec<u32>, String> {
         run_oracle_migrations(
             self.conn,
             self.schema,
-            &ORACLE_HISTORY_MIGRATIONS,
-            self.schema.version,
+            migrations,
+            config_version,
             self.schema.auto_migrate,
         )
     }
