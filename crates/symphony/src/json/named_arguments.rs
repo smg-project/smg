@@ -26,6 +26,7 @@
 //!
 //! [`formats::mistral_v13`]: crate::formats::mistral_v13()
 
+use super::header::{Found, Header};
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::{outline::Scanner, prefix::Prefix},
@@ -38,9 +39,8 @@ const NAME_WITHOUT_ARGUMENTS: &str = "a call that names a tool and writes no arg
 pub struct Assembler {
     index: u32,
     id: String,
-    marker: &'static str,
     /// The bytes before the marker, held until it arrives or the region ends.
-    header: String,
+    header: Header,
     /// The arguments, once the marker has arrived.
     arguments: Option<Arguments>,
 }
@@ -70,8 +70,7 @@ impl Assembler {
         Self {
             index,
             id: id.into(),
-            marker,
-            header: String::new(),
+            header: Header::new(marker),
             arguments: None,
         }
     }
@@ -88,21 +87,9 @@ impl Assembler {
         if let Some(arguments) = &mut self.arguments {
             return arguments.feed(bytes, out);
         }
-        // The marker can only end inside the new bytes, so the search starts `marker.len() - 1`
-        // bytes before them (at a character boundary).
-        let before = self.header.len();
-        self.header.push_str(bytes);
-        let from = before.saturating_sub(self.marker.len() - 1);
-        let from = (0..=from)
-            .rev()
-            .find(|&at| self.header.is_char_boundary(at))
-            .unwrap_or(0);
-        let Some(at) = self.header[from..].find(self.marker).map(|at| from + at) else {
+        let Some(Found { framing, at, after }) = self.header.push(bytes) else {
             return bytes.len();
         };
-        // The marker ends inside this piece, so what follows it is this piece's too.
-        let after = self.header.split_off(at + self.marker.len());
-        let framing = std::mem::take(&mut self.header);
         out.push(Event::ToolCallStart {
             index: self.index,
             id: self.id.clone(),
@@ -121,11 +108,10 @@ impl Assembler {
     pub fn close(self, out: &mut Events) {
         match self.arguments {
             Some(arguments) => arguments.finish(out),
-            None if !self.header.is_empty() => out.push(Event::Malformed {
-                text: Text::uncounted(self.header),
-                why: MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.to_string()),
-            }),
-            None => {}
+            None => self.header.ended(
+                MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.to_string()),
+                out,
+            ),
         }
     }
 
@@ -134,11 +120,7 @@ impl Assembler {
     pub fn finish(self, out: &mut Events) {
         match self.arguments {
             Some(arguments) => arguments.finish(out),
-            None if !self.header.is_empty() => out.push(Event::Malformed {
-                text: Text::uncounted(self.header),
-                why: MalformedReason::UnterminatedRegion,
-            }),
-            None => {}
+            None => self.header.ended(MalformedReason::UnterminatedRegion, out),
         }
     }
 }
