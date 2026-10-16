@@ -1195,6 +1195,41 @@ pub fn resize_bicubic_torch_aa_rgb(
     })
 }
 
+/// The torchvision `uint8` LANCZOS resize (`interpolate(.., mode="lanczos",
+/// antialias=True)` on a `uint8` tensor, what torchvision 0.27 and later
+/// run for `InterpolationMode.LANCZOS` on the CPU): Pillow's Lanczos-3
+/// kernel in the torch `uint8` quantization of [`resize_bicubic_torch_aa_rgb`],
+/// interleaved RGB bytes in and out.
+pub fn resize_lanczos_torch_aa_rgb_bytes(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    out_w: u32,
+    out_h: u32,
+) -> Result<Vec<u8>> {
+    let (in_w, in_h) = (width as usize, height as usize);
+    let expected = in_w.saturating_mul(in_h).saturating_mul(3);
+    if data.len() != expected {
+        return Err(TransformError::ShapeError(format!(
+            "torch lanczos RGB source has {} bytes, expected {expected} for {width}x{height}",
+            data.len()
+        )));
+    }
+    if width == 0 || height == 0 || out_w == 0 || out_h == 0 {
+        return Err(TransformError::ShapeError(format!(
+            "torch lanczos RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
+        )));
+    }
+    Ok(super::torch_resample::resize_rgb(
+        data,
+        in_w,
+        in_h,
+        out_w as usize,
+        out_h as usize,
+        PilResizeFilter::Lanczos,
+    ))
+}
+
 /// The torchvision `uint8` BICUBIC resize of [`resize_bicubic_torch_aa_rgb`]
 /// for a decoded image.
 pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {

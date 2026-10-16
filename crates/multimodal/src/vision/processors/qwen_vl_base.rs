@@ -121,7 +121,7 @@ struct QwenVideoPlan {
 /// subtraction and one division, which rounds differently from scaling the
 /// byte first. Both off leaves the raw 0..255 values, what an engine that
 /// normalizes on device takes.
-fn pixel_norm(
+pub(super) fn pixel_norm(
     config: &PreProcessorConfig,
     default_mean: [f64; 3],
     default_std: [f64; 3],

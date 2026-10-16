@@ -18,7 +18,7 @@
 //! |---|---|---|
 //! | `--list <file>` | `SMG_DUMP_LIST` | the image files, one path per line |
 //! | `--out <path>` | `SMG_DUMP_OUT` | in `hash` mode the JSON Lines file written; in `raw` mode the directory the artifacts go to |
-//! | `--processor <name>` | `SMG_DUMP_PROCESSOR` | `qwen2_vl`, `qwen3_vl` or `minimax_m3`: the processor family |
+//! | `--processor <name>` | `SMG_DUMP_PROCESSOR` | `qwen2_vl`, `qwen3_vl`, `minimax_m3` or `muse_spark`: the processor family |
 //! | `--config <file>` | `SMG_DUMP_CONFIG` | the family's `preprocessor_config.json` |
 //! | `--mode <hash\|raw>` | `SMG_DUMP_MODE` | `hash` unless given |
 //!
@@ -66,7 +66,9 @@ use llm_multimodal::{
     encoder_inputs::{EncoderDtype, EncoderInput, ModelSpecificValue},
     types::{ImageDetail, ImageFrame, ImageSize, ImageSource},
     vision::{
-        processors::{MiniMaxM3VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor},
+        processors::{
+            MiniMaxM3VisionProcessor, MuseSparkVisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
+        },
         PreProcessorConfig, VisionPreProcessor,
     },
 };
@@ -76,14 +78,14 @@ use sha2::{Digest, Sha256};
 /// A fault in the run's setup, reported on standard error with a non-zero exit status.
 type Fault = Box<dyn Error>;
 
-const PROCESSORS: &str = "qwen2_vl, qwen3_vl, minimax_m3";
+const PROCESSORS: &str = "qwen2_vl, qwen3_vl, minimax_m3, muse_spark";
 
 const USAGE: &str = "bellwether_dump: SMG's media pipeline over a list of image files, one JSON line per image\n\
     \n\
     Options (each has an environment variable of the same meaning; the flag wins):\n\
     \x20 --list <file>        SMG_DUMP_LIST       the image files, one path per line\n\
     \x20 --out <path>         SMG_DUMP_OUT        hash: the JSON Lines file; raw: the output directory\n\
-    \x20 --processor <name>   SMG_DUMP_PROCESSOR  qwen2_vl, qwen3_vl or minimax_m3\n\
+    \x20 --processor <name>   SMG_DUMP_PROCESSOR  qwen2_vl, qwen3_vl, minimax_m3 or muse_spark\n\
     \x20 --config <file>      SMG_DUMP_CONFIG     the family's preprocessor_config.json\n\
     \x20 --mode <hash|raw>    SMG_DUMP_MODE       hash unless given\n\
     \x20 --help               this text";
@@ -180,6 +182,8 @@ fn build_processor(
         "qwen2_vl" => Box::new(Qwen2VLProcessor::from_preprocessor_config(config)),
         "qwen3_vl" => Box::new(Qwen3VLProcessor::from_preprocessor_config(config)),
         "minimax_m3" => Box::new(MiniMaxM3VisionProcessor::from_preprocessor_config(config)?),
+        // Reads its settings from the config at every call.
+        "muse_spark" => Box::new(MuseSparkVisionProcessor::new()),
         other => return Err(format!("unknown processor {other:?}: one of {PROCESSORS}").into()),
     })
 }

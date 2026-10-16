@@ -327,6 +327,14 @@ impl VisionProcessorRegistry {
             Box::new(super::processors::LlavaProcessor::new()),
         );
 
+        // Muse Spark (the HF model_type and the released ids' spelling).
+        for pattern in ["muse_spark", "muse-spark"] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::MuseSparkVisionProcessor::new()),
+            );
+        }
+
         // Register Qwen3-VL first (more specific pattern - must match before qwen2)
         registry.register(
             "qwen3-vl",
