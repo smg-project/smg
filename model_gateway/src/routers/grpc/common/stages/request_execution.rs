@@ -293,11 +293,13 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 ///
 /// `last_attempt` says whether a plan is still retained for a replay, which
 /// is what decides when the media bytes stop counting against the in-flight
-/// budget.
+/// budget. `no_progress_budget` is `--constrained-no-progress-secs`: the
+/// token gap that cuts a grammar-constrained stream once it has started.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
+    no_progress_budget: Option<Duration>,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -369,6 +371,14 @@ pub(crate) async fn execute_plan(
         );
     }
 
+    // The no-progress budget applies to a grammar-constrained generation the
+    // engine streams; read off the plan before the dispatch consumes it.
+    let no_progress = no_progress_budget.and_then(|budget| {
+        execution_plan
+            .no_progress_subject()
+            .map(|constraint| (budget, constraint))
+    });
+
     // The upstream span: the dispatch, then the response stream (it closes
     // with the load guards, which the response body holds to its last frame;
     // see `LoadGuards::traced`). A failed dispatch sets its status to ERROR;
@@ -439,6 +449,15 @@ pub(crate) async fn execute_plan(
             span.record("otel.status_code", "ERROR");
             return Err(response);
         }
+    };
+    // A grammar-constrained stream under the budget is cut, and aborted on
+    // the engine, when a token gap outlasts it (see
+    // `ProtoStream::with_no_progress_budget`).
+    let result = match no_progress {
+        Some((budget, constraint)) => {
+            result.with_no_progress_budget(budget, constraint, request_id)
+        }
+        None => result,
     };
     if let Some(guards) = ctx.load_guards.take() {
         ctx.load_guards = Some(LoadGuards::traced(span, guards));

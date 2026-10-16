@@ -202,6 +202,11 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         // An HTTP worker has no engine-failure frame on its wire: an armed
         // `finish=error` cuts with a 500 here.
         let cut = injected.and_then(|fault| {
+            // A fault with no status and no error (a plain stall or hang)
+            // cuts nothing.
+            if fault.status == 0 && !fault.finish_error {
+                return None;
+            }
             let status = if fault.finish_error {
                 500
             } else {
@@ -211,6 +216,7 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
                 .after_tokens
                 .map(|after| (after, status, engine.cut_counter()))
         });
+        let hang = injected.and_then(|fault| engine.hang_for(&fault));
         let parsed = parsed.unwrap_or(Value::Null);
         let prompt_ids = synth_token_ids(&extract_prompt_text(&parsed));
         let prompt_tokens = prompt_ids.len() as u32;
@@ -225,9 +231,9 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         });
         let model = state.cfg.model_id.clone();
         return if stream_requested {
-            realistic_sse(rx, model, endpoint, cut, in_flight).into_response()
+            realistic_sse(rx, model, endpoint, cut, hang, in_flight).into_response()
         } else {
-            realistic_completion(rx, model, prompt_tokens, endpoint, cut).await
+            realistic_completion(rx, model, prompt_tokens, endpoint, cut, hang).await
         };
     }
 
@@ -305,17 +311,22 @@ fn injected_error(status: u16) -> Response {
 
 /// Non-streaming: drain the engine's events and assemble one completion JSON.
 /// With `cut`, the answer is that status instead once the engine has produced
-/// more than the given number of tokens (the fault hook's `after_tokens`).
+/// more than the given number of tokens (the fault hook's `after_tokens`);
+/// with `hang`, the answer waits out the hold (the fault hook's `hang_ms`;
+/// see [`engine::next_event`]).
 async fn realistic_completion(
     mut rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     model: String,
     prompt_tokens: u32,
     endpoint: Endpoint,
     cut: Option<(u32, u16, Arc<AtomicU64>)>,
+    mut hang: Option<engine::Hang>,
 ) -> Response {
     let mut completion_tokens = 0u32;
     let mut cached_tokens = 0u32;
-    while let Some(ev) = rx.recv().await {
+    let mut held = std::collections::VecDeque::new();
+    while let Some(ev) = engine::next_event(&mut rx, &mut held, &mut hang, completion_tokens).await
+    {
         match ev {
             engine::GenEvent::Token { .. } => {
                 completion_tokens += 1;
@@ -376,15 +387,18 @@ async fn realistic_completion(
 /// and `[DONE]`. Frame shape follows `endpoint` (chat delta vs completion text).
 /// With `cut`, the body ends in an error instead (no finish frame, no `[DONE]`:
 /// the connection is cut) once the engine has produced more than the given
-/// number of tokens (the fault hook's `after_tokens`).
+/// number of tokens (the fault hook's `after_tokens`); with `hang`, the body
+/// delivers nothing for the hold once that many tokens are out (the fault
+/// hook's `hang_ms`; see [`engine::next_event`]).
 fn realistic_sse(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     model: String,
     endpoint: Endpoint,
     cut: Option<(u32, u16, Arc<AtomicU64>)>,
+    hang: Option<engine::Hang>,
     in_flight: InFlight,
 ) -> Sse<impl Stream<Item = Result<Event, io::Error>>> {
-    Sse::new(in_flight.until_done(realistic_frames(rx, model, endpoint, cut)))
+    Sse::new(in_flight.until_done(realistic_frames(rx, model, endpoint, cut, hang)))
 }
 
 /// The frames of [`realistic_sse`].
@@ -393,6 +407,7 @@ fn realistic_frames(
     model: String,
     endpoint: Endpoint,
     cut: Option<(u32, u16, Arc<AtomicU64>)>,
+    hang: Option<engine::Hang>,
 ) -> impl Stream<Item = Result<Event, io::Error>> {
     enum St {
         Active {
@@ -401,6 +416,8 @@ fn realistic_frames(
             endpoint: Endpoint,
             served: u32,
             cut: Option<(u32, u16, Arc<AtomicU64>)>,
+            hang: Option<engine::Hang>,
+            held: std::collections::VecDeque<engine::GenEvent>,
         },
         Closing,
         Ended,
@@ -413,6 +430,8 @@ fn realistic_frames(
             endpoint,
             served: 0,
             cut,
+            hang,
+            held: std::collections::VecDeque::new(),
         },
         |st| async move {
             match st {
@@ -422,7 +441,9 @@ fn realistic_frames(
                     endpoint,
                     served,
                     cut,
-                } => match rx.recv().await {
+                    mut hang,
+                    mut held,
+                } => match engine::next_event(&mut rx, &mut held, &mut hang, served).await {
                     Some(engine::GenEvent::Token { .. }) => {
                         if let Some((after, status, cut_total)) = &cut {
                             if served >= *after {
@@ -440,6 +461,8 @@ fn realistic_frames(
                                 endpoint,
                                 served: served + 1,
                                 cut,
+                                hang,
+                                held,
                             },
                         ))
                     }
@@ -578,6 +601,7 @@ mod tests {
             "m".to_string(),
             Endpoint::Chat,
             Some((1, 502, Arc::clone(&cuts))),
+            None,
         )
         .collect()
         .await;
@@ -603,6 +627,7 @@ mod tests {
             "m".to_string(),
             Endpoint::Chat,
             Some((5, 502, Arc::clone(&cuts))),
+            None,
         )
         .collect()
         .await;
@@ -626,6 +651,7 @@ mod tests {
             3,
             Endpoint::Chat,
             Some((1, 502, Arc::clone(&cuts))),
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);

@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures::future::select_all;
@@ -44,6 +44,7 @@ use smg_mm_rdma::RdmaExporter;
 use tokio::time::error::Elapsed;
 
 use crate::{
+    observability::metrics::Metrics,
     routers::grpc::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
         zmq_client::ZmqGenerateStream,
@@ -495,7 +496,6 @@ fn tokenspeed_tensor_to_proto(
     shm_min_bytes: usize,
     rdma: Option<MmRdmaExport<'_>>,
 ) -> tokenspeed::TensorData {
-    use crate::observability::metrics::Metrics;
     let TokenSpeedTensor {
         storage,
         shape,
@@ -611,7 +611,6 @@ fn resolve_mm_tensor_payload(
     engine: &'static str,
     rdma: Option<MmRdmaExport<'_>>,
 ) -> MmTensorPayload {
-    use crate::observability::metrics::Metrics;
     let log_timing = log_tokenspeed_mm_timing_enabled();
 
     // RDMA first; on export failure the bytes are handed back so we fall through to
@@ -1767,6 +1766,52 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// The kind of grammar the generation is constrained by, when it is
+    /// (see [`constraint_kind`]); `None` for a free generation (MLX never
+    /// carries a constraint: its builder refuses them).
+    pub fn grammar_constraint(&self) -> Option<&'static str> {
+        use constraint_kind as kind;
+        match self {
+            Self::Sglang(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                sglang::sampling_params::Constraint::Regex(_) => Some(kind::REGEX),
+                sglang::sampling_params::Constraint::JsonSchema(_) => Some(kind::JSON_SCHEMA),
+                sglang::sampling_params::Constraint::EbnfGrammar(_) => Some(kind::GRAMMAR),
+                sglang::sampling_params::Constraint::StructuralTag(_) => Some(kind::STRUCTURAL_TAG),
+            },
+            Self::Vllm(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                vllm::sampling_params::Constraint::JsonSchema(_) => Some(kind::JSON_SCHEMA),
+                vllm::sampling_params::Constraint::Regex(_) => Some(kind::REGEX),
+                vllm::sampling_params::Constraint::Grammar(_) => Some(kind::GRAMMAR),
+                vllm::sampling_params::Constraint::StructuralTag(_) => Some(kind::STRUCTURAL_TAG),
+                vllm::sampling_params::Constraint::JsonObject(forced) => {
+                    forced.then_some(kind::JSON)
+                }
+                vllm::sampling_params::Constraint::Choice(_) => Some(kind::CHOICE),
+            },
+            Self::TokenSpeed(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                tokenspeed::sampling_params::Constraint::Regex(_) => Some(kind::REGEX),
+                tokenspeed::sampling_params::Constraint::JsonSchema(_) => Some(kind::JSON_SCHEMA),
+                tokenspeed::sampling_params::Constraint::EbnfGrammar(_) => Some(kind::GRAMMAR),
+                tokenspeed::sampling_params::Constraint::StructuralTag(_) => {
+                    Some(kind::STRUCTURAL_TAG)
+                }
+            },
+            Self::Trtllm(req) => {
+                use trtllm::guided_decoding_params::GuideType;
+                let guided = req.guided_decoding.as_ref()?;
+                match GuideType::try_from(guided.guide_type).ok()? {
+                    GuideType::Unspecified => None,
+                    GuideType::Json => Some(kind::JSON),
+                    GuideType::JsonSchema => Some(kind::JSON_SCHEMA),
+                    GuideType::Regex => Some(kind::REGEX),
+                    GuideType::EbnfGrammar => Some(kind::GRAMMAR),
+                    GuideType::StructuralTag => Some(kind::STRUCTURAL_TAG),
+                }
+            }
+            Self::Mlx(_) => None,
+        }
+    }
+
     /// The structural tag the request's constraint carries, when that is its
     /// constraint (TRT-LLM: a structural-tag guide; MLX: never, its builder
     /// refuses constraints).
@@ -2851,6 +2896,89 @@ pub enum ProtoStream {
     /// The decode leg of a disaggregated request: every response restamped
     /// with the prefill leg's prefix-cache hit (see [`PrefillCachedTokens`]).
     DecodeLeg(Box<DecodeLegStream>),
+    /// Any of the above under the no-progress budget of a grammar-constrained
+    /// generation (see [`BudgetedStream`]).
+    Budgeted(Box<BudgetedStream>),
+}
+
+/// The kinds of grammar a generation can be constrained by, as
+/// [`ProtoGenerateRequest::grammar_constraint`] names them and the
+/// `constraint` label of `smg_constrained_no_progress_total` carries them.
+pub(crate) mod constraint_kind {
+    pub const JSON_SCHEMA: &str = "json_schema";
+    pub const REGEX: &str = "regex";
+    /// An EBNF grammar.
+    pub const GRAMMAR: &str = "grammar";
+    pub const STRUCTURAL_TAG: &str = "structural_tag";
+    /// Any valid JSON, with no schema.
+    pub const JSON: &str = "json";
+    /// One of a list of allowed strings.
+    pub const CHOICE: &str = "choice";
+}
+
+/// The error code of a stream cut at the no-progress budget, as the client
+/// reads it: the `code` of a collected answer's 504, the first words of a
+/// streamed answer's error event.
+pub(crate) const NO_PROGRESS_ERROR_CODE: &str = "constrained_no_progress";
+
+/// The metadata key the status of a no-progress cut carries (its value the
+/// constraint kind), by which a collector tells the gateway's own cut from a
+/// status the worker answered.
+const NO_PROGRESS_METADATA_KEY: &str = "smg-constrained-no-progress";
+
+/// Whether `status` is a no-progress cut of this gateway's own (see
+/// [`BudgetedStream`]).
+pub(crate) fn is_no_progress_cut(status: &tonic::Status) -> bool {
+    status.metadata().contains_key(NO_PROGRESS_METADATA_KEY)
+}
+
+/// A [`ProtoStream`] under the no-progress budget of a grammar-constrained
+/// generation (`--constrained-no-progress-secs`). Once the stream has
+/// produced its first response, a gap of `budget` without another ends it:
+/// the inner stream is dropped, which sends its abort to the engine and
+/// gives back its tracking tickets, the cut is counted under the
+/// constraint's kind, and the reader meets one `DEADLINE_EXCEEDED` status
+/// naming [`NO_PROGRESS_ERROR_CODE`], then the end. The wait for the first
+/// response is not bounded here: it is the engine's queue and prefill, which
+/// say nothing about the grammar.
+pub struct BudgetedStream {
+    /// `None` once the budget fired: the stream was dropped there.
+    inner: Option<ProtoStream>,
+    budget: Duration,
+    constraint: &'static str,
+    request_id: String,
+    /// Responses seen so far; the budget runs from the first.
+    responses: u32,
+}
+
+impl BudgetedStream {
+    /// End the stream at the budget: drop the inner stream (its abort-on-drop
+    /// reaches the engine, its tickets go back to the worker), count the cut,
+    /// and shape the status the reader meets.
+    fn cut(&mut self) -> tonic::Status {
+        self.inner = None;
+        Metrics::record_constrained_no_progress(self.constraint);
+        tracing::warn!(
+            request_id = %self.request_id,
+            constraint = self.constraint,
+            budget_secs = self.budget.as_secs_f64(),
+            responses = self.responses,
+            "Grammar-constrained stream produced no token within the no-progress budget; \
+             the request was aborted on the engine"
+        );
+        let mut status = tonic::Status::deadline_exceeded(format!(
+            "{NO_PROGRESS_ERROR_CODE}: no token for {}s from a {}-constrained generation after \
+             {} responses; the request was aborted on the engine",
+            self.budget.as_secs_f64(),
+            self.constraint,
+            self.responses
+        ));
+        status.metadata_mut().insert(
+            NO_PROGRESS_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(self.constraint),
+        );
+        status
+    }
 }
 
 /// A disaggregated request's decode leg. Its engine loads the prompt's KV
@@ -3484,6 +3612,12 @@ impl ProtoStream {
     /// returns at once as if a response had come (the dispatch paths wrap a
     /// leg before they bound it).
     pub async fn first_response_within(&mut self, deadline: Instant) -> Result<FirstItem, Elapsed> {
+        if let Self::Budgeted(budgeted) = self {
+            return match budgeted.inner.as_mut() {
+                Some(inner) => Box::pin(inner.first_response_within(deadline)).await,
+                None => Ok(FirstItem::End),
+            };
+        }
         let Self::Tracked(tracked) = self else {
             return Ok(FirstItem::Response);
         };
@@ -3503,8 +3637,29 @@ impl ProtoStream {
         match self {
             Self::Tracked(tracked) => Some(&tracked.worker),
             Self::DecodeLeg(leg) => leg.inner.worker(),
+            Self::Budgeted(budgeted) => budgeted.inner.as_ref().and_then(ProtoStream::worker),
             _ => None,
         }
+    }
+
+    /// This stream under the no-progress budget of a grammar-constrained
+    /// generation (see [`BudgetedStream`]): `constraint` names the kind for
+    /// the count and the client's message, `request_id` the request for the
+    /// log line.
+    #[must_use]
+    pub fn with_no_progress_budget(
+        self,
+        budget: Duration,
+        constraint: &'static str,
+        request_id: String,
+    ) -> Self {
+        Self::Budgeted(Box::new(BudgetedStream {
+            inner: Some(self),
+            budget,
+            constraint,
+            request_id,
+            responses: 0,
+        }))
     }
 
     /// This stream as a disaggregated request's decode leg: its responses
@@ -3524,6 +3679,24 @@ impl ProtoStream {
 
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        if let Self::Budgeted(budgeted) = self {
+            // Nothing after the cut: the inner stream went with it.
+            let inner = budgeted.inner.as_mut()?;
+            // The inner stream is a wrapper of its own, polled through one
+            // boxed future as a tracked stream inside a tracked stream is.
+            let item = if budgeted.responses == 0 {
+                Box::pin(inner.next()).await
+            } else {
+                match tokio::time::timeout(budgeted.budget, Box::pin(inner.next())).await {
+                    Ok(item) => item,
+                    Err(_) => return Some(Err(budgeted.cut())),
+                }
+            };
+            if matches!(item, Some(Ok(_))) {
+                budgeted.responses = budgeted.responses.saturating_add(1);
+            }
+            return item;
+        }
         if let Self::DecodeLeg(leg) = self {
             // A decode leg's messages are polled in place as a tracked
             // stream's are, without a boxed future per message; a wrapper
@@ -3614,7 +3787,7 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
-            Self::Tracked(_) => return Box::pin(self.next()).await,
+            Self::Tracked(_) | Self::Budgeted(_) => return Box::pin(self.next()).await,
             // Reached only with one wrapper inside another: [`Self::next`]
             // polls a decode leg in place.
             Self::DecodeLeg(_) => return Box::pin(self.next()).await,
@@ -3634,6 +3807,11 @@ impl ProtoStream {
             Self::Fanout(stream) => stream.mark_completed(),
             Self::Tracked(stream) => stream.inner.mark_completed(),
             Self::DecodeLeg(leg) => leg.inner.mark_completed(),
+            Self::Budgeted(budgeted) => {
+                if let Some(inner) = budgeted.inner.as_mut() {
+                    inner.mark_completed();
+                }
+            }
         }
     }
 
@@ -3680,6 +3858,22 @@ impl ProtoStream {
                 Self::DecodeLeg(Box::new(DecodeLegStream {
                     inner: inner.defer_abort_until_first_item(),
                     prefill,
+                }))
+            }
+            Self::Budgeted(budgeted) => {
+                let BudgetedStream {
+                    inner,
+                    budget,
+                    constraint,
+                    request_id,
+                    responses,
+                } = *budgeted;
+                Self::Budgeted(Box::new(BudgetedStream {
+                    inner: inner.map(ProtoStream::defer_abort_until_first_item),
+                    budget,
+                    constraint,
+                    request_id,
+                    responses,
                 }))
             }
         }
@@ -4080,7 +4274,7 @@ mod fanout_tests {
                         .worker_type(WorkerType::Prefill)
                         .build(),
                 );
-                let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+                let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
                 let guard = if bounded {
                     let admitted = admission
                         .admit(None, |capacity| capacity.select(Arc::clone(&worker), ()))
@@ -4663,6 +4857,264 @@ mod tests {
             sglang.weight_version(),
             None,
             "no other proto carries the field"
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_progress_tests {
+    use std::time::{Duration, Instant};
+
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use smg_grpc_client::{
+        sglang_proto as sglang, tokenspeed_proto as tokenspeed, trtllm_proto as trtllm,
+        vllm_proto as vllm,
+    };
+    use tokio::sync::oneshot;
+
+    use super::{
+        constraint_kind, is_no_progress_cut, ProtoGenerateRequest, ProtoStream,
+        NO_PROGRESS_ERROR_CODE,
+    };
+    use crate::routers::grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream};
+
+    /// A stream whose `first` frames come at once and whose `rest` wait for
+    /// the returned gate, under a no-progress budget of `millis`.
+    async fn budgeted(
+        first: Vec<vllm::GenerateResponse>,
+        rest: Vec<vllm::GenerateResponse>,
+        millis: u64,
+    ) -> (ProtoStream, oneshot::Sender<()>) {
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (stream, _server) = gated_stream(first, gate_rx, rest, "0").await;
+        let stream = stream.with_no_progress_budget(
+            Duration::from_millis(millis),
+            constraint_kind::JSON_SCHEMA,
+            "req-budget".to_string(),
+        );
+        (stream, gate_tx)
+    }
+
+    /// A constrained stream that produces nothing for the budget after its
+    /// first response is cut: one `DEADLINE_EXCEEDED` naming the code, the
+    /// end after it, and the cut counted under the constraint's kind.
+    #[tokio::test]
+    async fn a_stream_that_stops_after_its_first_response_is_cut_at_the_budget() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (mut stream, _gate) =
+            budgeted(vec![chunk(0, "a")], vec![complete(0, "stop")], 150).await;
+        let started = Instant::now();
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first response is read at once"
+        );
+        let cut = match stream.next().await {
+            Some(Err(status)) => status,
+            Some(Ok(_)) => panic!("a response after the gap, not the cut"),
+            None => panic!("the end instead of the cut"),
+        };
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(cut.code(), tonic::Code::DeadlineExceeded);
+        assert!(is_no_progress_cut(&cut));
+        assert!(
+            cut.message().starts_with(NO_PROGRESS_ERROR_CODE),
+            "{}",
+            cut.message()
+        );
+        assert!(
+            cut.message().contains("json_schema-constrained"),
+            "{}",
+            cut.message()
+        );
+        assert!(stream.next().await.is_none(), "nothing after the cut");
+        assert!(stream.worker().is_none());
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("smg_constrained_no_progress_total{constraint=\"json_schema\"} 1"),
+            "{rendered}"
+        );
+    }
+
+    /// The budget runs from the first response: a first response that takes
+    /// three times the budget is read, and a stream that then keeps pace is
+    /// never cut.
+    #[tokio::test]
+    async fn the_budget_runs_from_the_first_response() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (mut stream, gate) =
+            budgeted(vec![], vec![chunk(0, "a"), complete(0, "stop")], 100).await;
+        let (first, ()) = tokio::join!(stream.next(), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = gate.send(());
+        });
+        assert!(
+            matches!(first, Some(Ok(_))),
+            "the first response, however late, is read"
+        );
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(stream.next().await.is_none());
+        assert!(
+            !handle
+                .render()
+                .contains("smg_constrained_no_progress_total"),
+            "nothing was cut"
+        );
+    }
+
+    /// A gap after the first response that fits inside the budget is no cut.
+    #[tokio::test]
+    async fn a_gap_inside_the_budget_is_not_a_cut() {
+        let (mut stream, gate) = budgeted(
+            vec![chunk(0, "a")],
+            vec![chunk(0, "b"), complete(0, "stop")],
+            500,
+        )
+        .await;
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        let (second, ()) = tokio::join!(stream.next(), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = gate.send(());
+        });
+        assert!(matches!(second, Some(Ok(_))));
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(stream.next().await.is_none());
+    }
+
+    /// Each engine's constraint is named by its kind; a free generation has
+    /// none.
+    #[test]
+    fn grammar_constraint_names_each_engines_constraint() {
+        let ts = |constraint| {
+            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed::GenerateRequest {
+                sampling_params: Some(tokenspeed::SamplingParams {
+                    constraint,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        };
+        assert_eq!(ts(None).grammar_constraint(), None);
+        assert_eq!(
+            ts(Some(tokenspeed::sampling_params::Constraint::JsonSchema(
+                "{}".into()
+            )))
+            .grammar_constraint(),
+            Some(constraint_kind::JSON_SCHEMA)
+        );
+        assert_eq!(
+            ts(Some(tokenspeed::sampling_params::Constraint::Regex(
+                "[a-z]+".into()
+            )))
+            .grammar_constraint(),
+            Some(constraint_kind::REGEX)
+        );
+        assert_eq!(
+            ts(Some(tokenspeed::sampling_params::Constraint::EbnfGrammar(
+                "root ::= \"a\"".into()
+            )))
+            .grammar_constraint(),
+            Some(constraint_kind::GRAMMAR)
+        );
+        assert_eq!(
+            ts(Some(
+                tokenspeed::sampling_params::Constraint::StructuralTag("{}".into())
+            ))
+            .grammar_constraint(),
+            Some(constraint_kind::STRUCTURAL_TAG)
+        );
+
+        let sg = |constraint| {
+            ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+                sampling_params: Some(sglang::SamplingParams {
+                    constraint,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        };
+        assert_eq!(sg(None).grammar_constraint(), None);
+        assert_eq!(
+            sg(Some(sglang::sampling_params::Constraint::EbnfGrammar(
+                "root ::= \"a\"".into()
+            )))
+            .grammar_constraint(),
+            Some(constraint_kind::GRAMMAR)
+        );
+        assert_eq!(
+            sg(Some(sglang::sampling_params::Constraint::StructuralTag(
+                "{}".into()
+            )))
+            .grammar_constraint(),
+            Some(constraint_kind::STRUCTURAL_TAG)
+        );
+
+        let vl = |constraint| {
+            ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+                sampling_params: Some(vllm::SamplingParams {
+                    constraint,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        };
+        assert_eq!(vl(None).grammar_constraint(), None);
+        assert_eq!(
+            vl(Some(vllm::sampling_params::Constraint::Grammar(
+                "root ::= \"a\"".into()
+            )))
+            .grammar_constraint(),
+            Some(constraint_kind::GRAMMAR)
+        );
+        assert_eq!(
+            vl(Some(vllm::sampling_params::Constraint::JsonObject(true))).grammar_constraint(),
+            Some(constraint_kind::JSON)
+        );
+        assert_eq!(
+            vl(Some(vllm::sampling_params::Constraint::JsonObject(false))).grammar_constraint(),
+            None,
+            "a JSON-object constraint switched off constrains nothing"
+        );
+        assert_eq!(
+            vl(Some(vllm::sampling_params::Constraint::Choice(
+                vllm::ChoiceConstraint {
+                    choices: vec!["yes".into(), "no".into()],
+                }
+            )))
+            .grammar_constraint(),
+            Some(constraint_kind::CHOICE)
+        );
+
+        use trtllm::guided_decoding_params::GuideType;
+        let tr = |guide_type: i32| {
+            ProtoGenerateRequest::Trtllm(Box::new(trtllm::GenerateRequest {
+                guided_decoding: Some(trtllm::GuidedDecodingParams {
+                    guide_type,
+                    guide: String::new(),
+                }),
+                ..Default::default()
+            }))
+        };
+        assert_eq!(
+            tr(GuideType::Regex as i32).grammar_constraint(),
+            Some(constraint_kind::REGEX)
+        );
+        assert_eq!(
+            tr(GuideType::Json as i32).grammar_constraint(),
+            Some(constraint_kind::JSON)
+        );
+        assert_eq!(tr(GuideType::Unspecified as i32).grammar_constraint(), None);
+        assert_eq!(tr(99).grammar_constraint(), None, "an unknown guide type");
+        assert_eq!(
+            ProtoGenerateRequest::Trtllm(Box::default()).grammar_constraint(),
+            None
+        );
+        assert_eq!(
+            ProtoGenerateRequest::Mlx(Box::default()).grammar_constraint(),
+            None
         );
     }
 }

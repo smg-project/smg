@@ -12,8 +12,8 @@ use crate::{
         grpc::{
             context::ExecutionResult,
             proto_wrapper::{
-                FanoutChild, PrefillCachedTokens, ProtoGenerateComplete, ProtoResponseVariant,
-                ProtoStream,
+                is_no_progress_cut, FanoutChild, PrefillCachedTokens, ProtoGenerateComplete,
+                ProtoResponseVariant, ProtoStream, NO_PROGRESS_ERROR_CODE,
             },
             utils::{
                 account_pd_leg_failure, stream_failure::UpstreamClass, tonic_ext::TonicStatusExt,
@@ -192,10 +192,15 @@ fn merge_prefill_logprobs(
 /// The client's answer when `leg`'s stream ended with `status` before its
 /// `Complete`: the status's own HTTP class with the wording clients know.
 fn stream_failed(leg: &str, status: &tonic::Status) -> Response {
-    status.to_http_error(
-        "worker_stream_failed",
-        format!("{leg} stream failed: {}", status.message()),
-    )
+    // A stream the gateway itself cut at the no-progress budget of a
+    // constrained generation answers under that code, so the client can
+    // tell the budget from a stream the worker failed.
+    let code = if is_no_progress_cut(status) {
+        NO_PROGRESS_ERROR_CODE
+    } else {
+        "worker_stream_failed"
+    };
+    status.to_http_error(code, format!("{leg} stream failed: {}", status.message()))
 }
 
 /// Collect all `Complete` frames of a gRPC stream; chunks carry nothing a

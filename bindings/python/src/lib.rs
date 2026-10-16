@@ -457,6 +457,7 @@ struct Router {
     chat_template: Option<String>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
+    constrained_no_progress_secs: u64,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
     cors_allowed_origins: Vec<String>,
     decode_policy: Option<PolicyType>,
@@ -1203,6 +1204,7 @@ impl Router {
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .constrained_no_progress_secs(self.constrained_no_progress_secs)
             .header_read_timeout_secs(self.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .max_connections(self.max_connections)
@@ -1284,6 +1286,7 @@ impl Router {
         chat_template = None,
         client_cert_path = None,
         client_key_path = None,
+        constrained_no_progress_secs = 0,
         control_plane_auth = None,
         cors_allowed_origins = vec![],
         decode_policy = None,
@@ -1491,6 +1494,7 @@ impl Router {
         chat_template: Option<String>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
+        constrained_no_progress_secs: u64,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         cors_allowed_origins: Vec<String>,
         decode_policy: Option<PolicyType>,
@@ -1728,6 +1732,7 @@ impl Router {
             chat_template,
             client_cert_path,
             client_key_path,
+            constrained_no_progress_secs,
             control_plane_auth,
             cors_allowed_origins,
             decode_policy,

@@ -1144,6 +1144,23 @@ struct ServingArgs {
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
 
+    /// Cut a grammar-constrained streamed generation (JSON schema, regex,
+    /// grammar, structural tag, forced tool call) that produces no token for
+    /// this many seconds after its first one: the request is aborted on the
+    /// engine, its slot freed, the client gets a constrained_no_progress
+    /// error (an SSE error event on a streamed response, a 504 on a
+    /// collected one), and smg_constrained_no_progress_total counts it by
+    /// constraint kind. The budget runs between the engine's responses once
+    /// the stream has started; the wait for the first token (the engine's
+    /// queue and prefill) stays under the request timeout, and a
+    /// non-streamed generation, which shows no progress before its one
+    /// answer, is not bounded by it. Set it well above the engine's longest
+    /// legitimate pause between tokens (a preemption, a long prefill batch);
+    /// the cut counts against the worker as a timeout. Must stay below
+    /// --request-timeout-secs. 0 disables
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    constrained_no_progress_secs: u64,
+
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment on the OpenAI-shaped endpoints, the
     /// `ping` event on /v1/messages), so an idle-timeout proxy does not cut
@@ -3125,6 +3142,7 @@ impl CliArgs {
             .worker_stall_secs(self.workers.worker_stall_secs)
             .worker_wedge_secs(self.workers.worker_wedge_secs)
             .worker_stale_secs(self.workers.worker_stale_secs)
+            .constrained_no_progress_secs(self.serving.constrained_no_progress_secs)
             .worker_warmup(
                 self.routing.worker_warmup_secs,
                 self.routing.worker_warmup_share,
@@ -4430,6 +4448,18 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
+    }
+
+    /// The no-progress budget of a constrained stream is a router-only
+    /// setting and must flow into `RouterConfig`, off by default.
+    #[test]
+    fn constrained_no_progress_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--constrained-no-progress-secs", "45"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.constrained_no_progress_secs, 45);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.constrained_no_progress_secs, 0);
     }
 
     /// The connection-level timeouts of the HTTP edge are router settings

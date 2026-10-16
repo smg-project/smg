@@ -229,16 +229,8 @@ impl TokenSpeedScheduler for MockScheduler {
                     return Err(injected_status(fault.status));
                 }
             }
-            let cut = injected.and_then(|fault| {
-                let end = if fault.finish_error {
-                    CutEnd::EngineError
-                } else {
-                    CutEnd::Status(injected_status(fault.status))
-                };
-                fault
-                    .after_tokens
-                    .map(|after| (after, end, engine.cut_counter()))
-            });
+            let cut = injected.and_then(|fault| cut_for(&fault, engine.cut_counter()));
+            let hang = injected.and_then(|fault| engine.hang_for(&fault));
             let request_id = req.request_id;
             let prompt_token_ids = req.tokenized.map(|t| t.input_ids).unwrap_or_default();
             // Omitted limit falls back to the worker default, matching the HTTP
@@ -272,6 +264,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 request_id,
                 Some(pending),
                 cut,
+                hang,
                 weight_version,
             );
             return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
@@ -330,12 +323,15 @@ impl TokenSpeedScheduler for MockScheduler {
         }))
     }
 
+    /// The gateway's abort: the realistic engine drops the request, running
+    /// or queued, and its stream ends with the engine's events; the canned
+    /// path has nothing to drop.
     async fn abort(
         &self,
         request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
         if let Some(engine) = &self.engine {
-            engine.abort(request.into_inner().request_id);
+            engine.abort(&request.into_inner().request_id);
         }
         Ok(Response::new(ts::AbortResponse {
             success: true,
@@ -534,6 +530,25 @@ enum CutEnd {
     EngineError,
 }
 
+/// The fault hook's cut for one request: once `after_tokens` tokens are out,
+/// the stream ends with the fault's status, or as the engine's own error
+/// (`finish=error`); the counter records the cut. A fault with no status and
+/// no error (a plain stall or hang) cuts nothing.
+fn cut_for(
+    fault: &engine::Injected,
+    cut_total: Arc<AtomicU64>,
+) -> Option<(u32, CutEnd, Arc<AtomicU64>)> {
+    if fault.status == 0 && !fault.finish_error {
+        return None;
+    }
+    let end = if fault.finish_error {
+        CutEnd::EngineError
+    } else {
+        CutEnd::Status(injected_status(fault.status))
+    };
+    fault.after_tokens.map(|after| (after, end, cut_total))
+}
+
 /// The generate stream's state between items.
 struct Generating {
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
@@ -544,6 +559,10 @@ struct Generating {
     /// engine has produced more than this many tokens; the counter records
     /// the cut.
     cut: Option<(u32, CutEnd, Arc<AtomicU64>)>,
+    /// The fault hook's hang, while armed, and the events it holds back
+    /// (see [`engine::next_event`]).
+    hang: Option<engine::Hang>,
+    held: std::collections::VecDeque<engine::GenEvent>,
     /// The worker's pending-prefill counter and this request's share of it,
     /// settled at the first token (or at the end, if none came).
     pending: Option<(Arc<AtomicU64>, u64)>,
@@ -576,7 +595,9 @@ impl Drop for Generating {
 /// stream ends. With `cut`, the stream ends with the given status or
 /// engine-failure `Complete` instead once the engine has produced more than
 /// the given number of tokens (the fault hook's `after_tokens`); an output no
-/// longer than that completes as usual. Every chunk and completion carries
+/// longer than that completes as usual. With `hang`, the stream delivers
+/// nothing for the hold once that many tokens are out (the fault hook's
+/// `hang_ms`; see [`engine::next_event`]). Every chunk and completion carries
 /// `weight_version`, as an engine stamps them.
 fn generate_stream(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
@@ -584,6 +605,7 @@ fn generate_stream(
     request_id: String,
     pending: Option<(Arc<AtomicU64>, u64)>,
     cut: Option<(u32, CutEnd, Arc<AtomicU64>)>,
+    hang: Option<engine::Hang>,
     weight_version: Option<String>,
 ) -> GenStream {
     let init = Generating {
@@ -593,6 +615,8 @@ fn generate_stream(
         request_id,
         pending,
         cut,
+        hang,
+        held: std::collections::VecDeque::new(),
         weight_version,
         ended: false,
     };
@@ -601,7 +625,8 @@ fn generate_stream(
             return None;
         }
         loop {
-            match st.rx.recv().await {
+            let delivered = st.output_ids.len() as u32;
+            match engine::next_event(&mut st.rx, &mut st.held, &mut st.hang, delivered).await {
                 Some(engine::GenEvent::Token {
                     token_id,
                     prompt_tokens,
@@ -926,6 +951,32 @@ fn snapshot_to_scheduler_load(s: &engine::LoadSnapshot) -> ts::SchedulerLoad {
 mod tests {
     use super::*;
 
+    /// A fault with a status cuts after its tokens; one that only stalls or
+    /// hangs (no status, no engine error) cuts nothing, whatever its
+    /// `after_tokens`; `finish=error` cuts as the engine's own error.
+    #[test]
+    fn a_fault_without_a_status_or_an_error_cuts_nothing() {
+        let fault = |status: u16, after_tokens: Option<u32>, finish_error: bool| engine::Injected {
+            status,
+            stall: Duration::ZERO,
+            after_tokens,
+            finish_error,
+            hang: Duration::from_secs(1),
+        };
+        let counter = || Arc::new(AtomicU64::new(0));
+        assert!(cut_for(&fault(0, Some(3), false), counter()).is_none());
+        assert!(cut_for(&fault(0, None, false), counter()).is_none());
+        assert!(cut_for(&fault(503, None, false), counter()).is_none());
+        assert!(matches!(
+            cut_for(&fault(503, Some(3), false), counter()),
+            Some((3, CutEnd::Status(status), _)) if status.code() == tonic::Code::Unavailable
+        ));
+        assert!(matches!(
+            cut_for(&fault(0, Some(2), true), counter()),
+            Some((2, CutEnd::EngineError, _))
+        ));
+    }
+
     /// The sockets the gRPC worker serves carry `TCP_NODELAY`, so a token
     /// frame is never held back for the acknowledgement of the frame before.
     #[tokio::test]
@@ -1049,7 +1100,7 @@ mod tests {
             CutEnd::Status(Status::unavailable("injected")),
             Arc::clone(&cuts),
         ));
-        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
@@ -1068,7 +1119,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((2, CutEnd::EngineError, Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let item = stream
@@ -1104,7 +1155,7 @@ mod tests {
             CutEnd::Status(Status::internal("injected")),
             Arc::clone(&cuts),
         ));
-        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         let complete = stream.next().await.expect("complete").expect("ok");
         assert!(matches!(complete.response, Some(GenResp::Complete(_))));

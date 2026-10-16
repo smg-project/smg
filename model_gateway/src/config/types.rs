@@ -165,6 +165,19 @@ pub struct RouterConfig {
     #[serde(default)]
     pub max_connections: usize,
     pub request_timeout_secs: u64,
+    /// Cut a grammar-constrained streamed generation (a JSON schema, a
+    /// regex, a grammar, a structural tag, a forced tool call) that produces
+    /// no token for this many seconds after its first one: the request is
+    /// aborted on the engine, its slot freed, the client answered a
+    /// `constrained_no_progress` error, and the cut counted under
+    /// `smg_constrained_no_progress_total`. The budget runs between the
+    /// engine's responses once the stream has started; the wait for the
+    /// first token is the engine's queue and prefill, left to
+    /// `request_timeout_secs`. Independent of the request timeout (the whole
+    /// request) and of `stream_body_stall_timeout_secs` (the request body).
+    /// Must stay below `request_timeout_secs`. `0` disables it.
+    #[serde(default)]
+    pub constrained_no_progress_secs: u64,
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment; the `ping` event on the Messages
     /// API), so an idle-timeout proxy does not cut a stream that is waiting
@@ -1763,6 +1776,7 @@ impl Default for RouterConfig {
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
+            constrained_no_progress_secs: 0,
             sse_keepalive_secs: default_sse_keepalive_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -2321,6 +2335,27 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.stream_body_stall_timeout_secs, 0);
+    }
+
+    #[test]
+    fn test_constrained_no_progress_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to the budget being off.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("constrained_no_progress_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.constrained_no_progress_secs, 0);
+
+        // A set budget round-trips.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .constrained_no_progress_secs(45)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.constrained_no_progress_secs, 45);
     }
 
     #[test]

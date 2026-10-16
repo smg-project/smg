@@ -267,6 +267,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn constrained_no_progress_secs(mut self, secs: u64) -> Self {
+        self.config.constrained_no_progress_secs = secs;
+        self
+    }
+
     pub fn sse_keepalive_secs(mut self, secs: u64) -> Self {
         self.config.sse_keepalive_secs = secs;
         self

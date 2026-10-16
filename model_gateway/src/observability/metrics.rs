@@ -607,6 +607,10 @@ pub(crate) fn init_metrics() {
         "Worker-level errors by worker_type, connection_mode, error_type"
     );
     describe_counter!(
+        "smg_constrained_no_progress_total",
+        "Grammar-constrained streams the gateway cut, and aborted on the engine, for producing no token within --constrained-no-progress-secs after their first one, by constraint kind (json_schema, regex, grammar, structural_tag, json, choice)"
+    );
+    describe_counter!(
         "smg_kv_event_subscription_failures_total",
         "KV event subscription task failures by worker and reason \
          (panic, join_error, intern_failed)"
@@ -2179,6 +2183,16 @@ impl Metrics {
             "worker_type" => worker_type,
             "connection_mode" => connection_mode,
             "error_type" => error_type
+        )
+        .increment(1);
+    }
+
+    /// Record a grammar-constrained stream cut at the no-progress budget
+    /// (`--constrained-no-progress-secs`), under its constraint kind.
+    pub fn record_constrained_no_progress(constraint: &'static str) {
+        counter!(
+            "smg_constrained_no_progress_total",
+            "constraint" => constraint
         )
         .increment(1);
     }
