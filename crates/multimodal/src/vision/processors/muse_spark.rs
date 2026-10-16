@@ -311,10 +311,34 @@ fn resized_frame<'a>(
     })
 }
 
-/// Lay `frames` (one temporal group, `temporal_patch_size` frames, the last
-/// repeated when fewer arrive) out as patch rows into `out`, which must hold
-/// `grid_h * grid_w * patch_features` bytes: for every patch its temporal
-/// slots, each slot its channels, each channel the patch's rows.
+/// The three channel planes of `width` x `height` interleaved RGB bytes.
+fn planes(data: &[u8], width: usize, height: usize) -> [Vec<u8>; 3] {
+    let pixels = width * height;
+    let mut planes = [vec![0u8; pixels], vec![0u8; pixels], vec![0u8; pixels]];
+    let [red, green, blue] = &mut planes;
+    for (((pixel, r), g), b) in data
+        .as_chunks::<CHANNELS>()
+        .0
+        .iter()
+        .zip(red.iter_mut())
+        .zip(green.iter_mut())
+        .zip(blue.iter_mut())
+    {
+        *r = pixel[0];
+        *g = pixel[1];
+        *b = pixel[2];
+    }
+    planes
+}
+
+/// Lay `frames` (one temporal group, up to `temporal_patch_size` frames of
+/// `plan.width` x `plan.height` interleaved RGB; the last repeated for the
+/// slots the group did not fill) out as patch rows into `out`, which must
+/// hold `grid_h * grid_w * patch_features` bytes: for every patch its
+/// temporal slots, each slot its channels, each channel the patch's rows.
+/// Each frame is split into channel planes once, so every patch row is a
+/// handful of contiguous copies; a frame that fills several slots is copied
+/// into the first and the row duplicated from there.
 fn patchify_group(
     frames: &[&[u8]],
     plan: ResizePlan,
@@ -322,29 +346,42 @@ fn patchify_group(
     out: &mut [u8],
 ) {
     let patch = settings.patch_size;
-    let row_stride = plan.width * CHANNELS;
-    let patch_values = patch * patch;
-    let channel_block = patch_values;
+    let channel_block = patch * patch;
     let slot_block = CHANNELS * channel_block;
     let features = settings.patch_features();
     debug_assert_eq!(out.len(), plan.grid_h * plan.grid_w * features);
-    let last = frames.len() - 1;
-    for patch_row in 0..plan.grid_h {
-        for patch_col in 0..plan.grid_w {
-            let row_base = (patch_row * plan.grid_w + patch_col) * features;
-            for temporal in 0..settings.temporal_patch_size {
-                let frame = frames[temporal.min(last)];
-                let slot_base = row_base + temporal * slot_block;
-                for y in 0..patch {
-                    let src_row =
-                        (patch_row * patch + y) * row_stride + patch_col * patch * CHANNELS;
-                    let pixels = &frame[src_row..src_row + patch * CHANNELS];
-                    let dst_row = slot_base + y * patch;
-                    for (x, pixel) in pixels.as_chunks::<CHANNELS>().0.iter().enumerate() {
-                        for (channel, &value) in pixel.iter().enumerate() {
-                            out[dst_row + channel * channel_block + x] = value;
+    debug_assert!(!frames.is_empty());
+    let frame_planes: Vec<[Vec<u8>; 3]> = frames
+        .iter()
+        .map(|frame| planes(frame, plan.width, plan.height))
+        .collect();
+    let width = plan.width;
+    for (row_index, row) in out.chunks_exact_mut(features).enumerate() {
+        let patch_row = row_index / plan.grid_w;
+        let patch_col = row_index % plan.grid_w;
+        let top = patch_row * patch;
+        let left = patch_col * patch;
+        for temporal in 0..settings.temporal_patch_size {
+            let slot = &mut row[temporal * slot_block..(temporal + 1) * slot_block];
+            match frame_planes.get(temporal) {
+                Some(planes) => {
+                    for (channel, plane) in planes.iter().enumerate() {
+                        let block =
+                            &mut slot[channel * channel_block..(channel + 1) * channel_block];
+                        for (y, line) in block.chunks_exact_mut(patch).enumerate() {
+                            let start = (top + y) * width + left;
+                            line.copy_from_slice(&plane[start..start + patch]);
                         }
                     }
+                }
+                None => {
+                    // The last frame fills the remaining slots: the slot just
+                    // written is the one to repeat.
+                    let previous = temporal - 1;
+                    let (before, rest) = row.split_at_mut(temporal * slot_block);
+                    rest[..slot_block].copy_from_slice(
+                        &before[previous * slot_block..(previous + 1) * slot_block],
+                    );
                 }
             }
         }
