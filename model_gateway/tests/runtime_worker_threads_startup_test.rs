@@ -92,10 +92,25 @@ fn a_runtime_worker_thread_count_above_the_ceiling_refuses_to_start() {
 /// veto). The child reads the same CPUs as this process: it inherits the
 /// affinity mask and the cgroup.
 #[test]
+#[expect(
+    clippy::print_stderr,
+    reason = "a host the case cannot run on is told so, instead of a silent pass"
+)]
 fn a_runtime_worker_thread_count_above_four_per_cpu_serves_with_a_warning() {
     let cpus = std::thread::available_parallelism().map_or(1, usize::from);
     let advised = cpus * 4;
     let threads = advised + 1;
+    if threads > smg::config::RUNTIME_WORKER_THREADS_CEILING {
+        // On a host with more CPUs than the ceiling allows for, no count above
+        // the advised one is accepted; there is nothing to warn about short of
+        // a refusal, which the ceiling test covers.
+        eprintln!(
+            "skipped: {cpus} CPUs advise {advised} worker threads, and one more is above the \
+             ceiling of {}",
+            smg::config::RUNTIME_WORKER_THREADS_CEILING
+        );
+        return;
+    }
     let dir = tempfile::tempdir().expect("a temp dir");
     let launch = launch(
         &[

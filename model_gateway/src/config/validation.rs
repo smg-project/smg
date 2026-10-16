@@ -2552,10 +2552,13 @@ mod tests {
             runtime_worker_threads: Some(threads),
             ..Default::default()
         };
+        // The host's counts clamped to the ceiling: the test passes on a host
+        // with more CPUs than the ceiling allows for, as the rule does.
         for ok in [
             1,
-            cpus,
-            cpus.saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU + 4),
+            cpus.min(RUNTIME_WORKER_THREADS_CEILING),
+            cpus.saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU + 4)
+                .min(RUNTIME_WORKER_THREADS_CEILING),
             RUNTIME_WORKER_THREADS_CEILING,
         ] {
             assert!(
