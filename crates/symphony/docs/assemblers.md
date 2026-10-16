@@ -66,9 +66,10 @@ What the syntax says, and what the assembler does with it:
 - **The name is the text before the first `<arg_key>`**, or before the call's end when the call
   has no arguments, less the whitespace around it, which is the template's and goes into the
   next event's source. The name is known only when that tag arrives, so `ToolCallStart` waits
-  for it; names are short. A name holds no whitespace, quote, brace or angle bracket: any
-  other text there (the JSON of a `<tool_call>` block quoted inside a code fence, prose) is
-  reported, and no call starts, so a block that names no call writes no arguments either.
+  for it; names are short. A name holds no whitespace, quote, brace, bracket, parenthesis or
+  angle bracket: any other text there (the JSON of a `<tool_call>` block quoted inside a code
+  fence, prose, a call written as Python) is reported, and no call starts, so a block that names
+  no call writes no arguments either.
 - **A value's type comes from the request's tools**, as in the Qwen assembler: a declared string
   is its text, streamed as it arrives; every other value is written whole at `</arg_value>`
   through `json`, which reads the JSON the templates write for a number, a boolean, a list,

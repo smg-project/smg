@@ -42,11 +42,16 @@ const EMPTY_KEY: &str = "a key with no text";
 const WITHOUT_A_NAME: &str = "a call block without a name";
 const NOT_A_NAME: &str = "text where the call's name should be";
 
-/// Whether `text` can be a function's name: no whitespace, quote, brace or angle bracket.
+/// Whether `text` can be a function's name: no whitespace, quote, brace, bracket, parenthesis or
+/// angle bracket, the delimiters of prose, a string, JSON, a list, a pythonic call and a tag.
 fn is_name(text: &str) -> bool {
-    !text
-        .chars()
-        .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '{' | '}' | '<' | '>'))
+    !text.chars().any(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '{' | '}' | '[' | ']' | '(' | ')' | '<' | '>'
+            )
+    })
 }
 
 /// The four tags a family spells its keyed arguments with, and where its template writes a newline
@@ -781,10 +786,14 @@ mod tests {
 
     #[test]
     fn text_that_is_not_a_name_starts_no_call() {
-        // A JSON call quoted in a code fence (bellwether's probe), and prose.
+        // A JSON call quoted in a code fence (bellwether's probe), prose, a pythonic call written
+        // where the name goes (whole, or cut by the first tag), and a subscript.
         for text in [
             "\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n",
             "get weather<arg_key>n</arg_key><arg_value>1</arg_value>",
+            "f(s=\"x\")",
+            "f(s</arg_key><arg_value>x</arg_value>",
+            "f[0]<arg_key>n</arg_key><arg_value>1</arg_value>",
         ] {
             let events = run(&[text], false);
             assert_eq!(starts(&events), 0, "{text:?}");
