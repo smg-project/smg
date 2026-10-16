@@ -34,6 +34,8 @@ futures.workspace = true
 # Only used by tokenizer
 aho-corasick = "1.1"
 base64 = "0.23"
+# The exact-match cache's key hash: keyed, and one pass at memory speed over the whole text.
+foldhash = "0.2"
 rustc-hash = "2"
 hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"] }
 # Pinned: 2.22.0 changed boolean rendering to Python style ("False"), which

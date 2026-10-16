@@ -17,7 +17,7 @@
 )]
 
 use std::{
-    hash::{DefaultHasher, Hasher},
+    hash::{BuildHasher, DefaultHasher, Hasher},
     hint::black_box,
     sync::Arc,
     time::{Duration, Instant},
@@ -533,6 +533,14 @@ fn main() {
                     black_box(h.finish());
                 });
                 rows.push(("hash_siphash_text".into(), stat, [0; 4]));
+                let keys = foldhash::fast::RandomState::default();
+                let stat = timed(usize::MAX, budget, |_| {
+                    let mut h = keys.build_hasher();
+                    h.write(text_bytes);
+                    h.write_u8(0);
+                    black_box(h.finish());
+                });
+                rows.push(("hash_foldhash_text".into(), stat, [0; 4]));
                 let copy = text0.clone();
                 let stat = timed(usize::MAX, budget, |_| {
                     black_box(text_bytes == copy.as_bytes());

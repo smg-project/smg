@@ -4089,6 +4089,7 @@ dependencies = [
  "chrono",
  "criterion",
  "dashmap",
+ "foldhash 0.2.0",
  "futures",
  "hf-hub",
  "minijinja",
