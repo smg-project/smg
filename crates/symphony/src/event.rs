@@ -42,6 +42,24 @@ impl Text {
     }
 }
 
+/// The runs of `text` in order, each all whitespace or none of it as `char::is_whitespace` says,
+/// with whether it is whitespace. Every run ends on a character boundary, and the runs join back
+/// into `text`. The parsers read the text between a format's structure by it: whitespace is the
+/// template's wrapping, anything else is reported.
+pub(crate) fn runs(text: &str) -> impl Iterator<Item = (&str, bool)> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let space = rest.chars().next()?.is_whitespace();
+        let length = rest
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() != space)
+            .map_or(rest.len(), |(at, _)| at);
+        let (run, after) = rest.split_at(length);
+        rest = after;
+        Some((run, space))
+    })
+}
+
 /// Why text was dropped rather than shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -356,5 +374,37 @@ mod tests {
         let other = serde_json::to_string(&FinishReason::Other("content_filter".into()))
             .expect("serializes");
         assert_eq!(other, r#"{"other":"content_filter"}"#);
+    }
+
+    #[test]
+    fn runs_alternate_whitespace_and_the_rest_on_character_boundaries_and_join_back() {
+        assert_eq!(runs("").count(), 0);
+        assert_eq!(runs(" \n\t").collect::<Vec<_>>(), vec![(" \n\t", true)]);
+        assert_eq!(runs("ab").collect::<Vec<_>>(), vec![("ab", false)]);
+        assert_eq!(
+            runs(" a  bc\n").collect::<Vec<_>>(),
+            vec![
+                (" ", true),
+                ("a", false),
+                ("  ", true),
+                ("bc", false),
+                ("\n", true)
+            ]
+        );
+        // A no-break space and an ideographic space are whitespace; the letters around them are
+        // two, three and four bytes long.
+        assert_eq!(
+            runs("\u{e9}\u{a0}\u{65e5}\u{672c}\u{3000}\u{1f327}").collect::<Vec<_>>(),
+            vec![
+                ("\u{e9}", false),
+                ("\u{a0}", true),
+                ("\u{65e5}\u{672c}", false),
+                ("\u{3000}", true),
+                ("\u{1f327}", false)
+            ]
+        );
+        for text in ["", " ", "a", " a b ", "\u{e9}\u{a0}\u{65e5} \u{1f327}"] {
+            assert_eq!(runs(text).map(|(run, _)| run).collect::<String>(), text);
+        }
     }
 }

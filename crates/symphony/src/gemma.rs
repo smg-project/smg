@@ -28,7 +28,7 @@
 //! [`formats::gemma4`]: crate::formats::gemma4()
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, MalformedReason, Text},
     tagged::assembler::{push_escaped, push_quoted},
 };
 
@@ -497,25 +497,18 @@ impl Assembler {
 /// Text after the arguments closed, run by run: whitespace is dropped as the template's wrapping,
 /// anything else reported, so the events are the same however the bytes are cut.
 fn after_the_object(text: &str, out: &mut Events) -> usize {
-    let mut rest = text;
-    while let Some(first) = rest.chars().next() {
-        let space = first.is_whitespace();
-        let length = rest
-            .char_indices()
-            .find(|(_, c)| c.is_whitespace() != space)
-            .map_or(rest.len(), |(i, _)| i);
+    for (run, space) in runs(text) {
         out.push(if space {
             Event::Dropped {
-                text: Text::uncounted(&rest[..length]),
+                text: Text::uncounted(run),
                 why: DropReason::Wrapper,
             }
         } else {
             Event::Malformed {
-                text: Text::uncounted(&rest[..length]),
+                text: Text::uncounted(run),
                 why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
             }
         });
-        rest = &rest[length..];
     }
     text.len()
 }

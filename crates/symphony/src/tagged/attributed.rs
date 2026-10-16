@@ -55,7 +55,7 @@
 //! [`formats::kimi_k3`]: crate::formats::kimi_k3()
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
     tagged::{
         assembler::{push_escaped, push_quoted},
@@ -600,23 +600,16 @@ impl Assembler {
 
     /// Text where the syntax has tags: whitespace is the template's, anything else is reported.
     fn text_between(&mut self, text: &str, out: &mut Events) {
-        let mut rest = text;
-        while let Some(first) = rest.chars().next() {
-            let space = first.is_whitespace();
-            let length = rest
-                .char_indices()
-                .find(|(_, c)| c.is_whitespace() != space)
-                .map_or(rest.len(), |(at, _)| at);
+        for (run, space) in runs(text) {
             if space {
-                self.carried.push_str(&rest[..length]);
+                self.carried.push_str(run);
             } else {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
-                    text: Text::uncounted(&rest[..length]),
+                    text: Text::uncounted(run),
                     why: MalformedReason::Other(TEXT_BETWEEN_TAGS.to_string()),
                 });
             }
-            rest = &rest[length..];
         }
     }
 

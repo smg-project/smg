@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 
 use crate::{
-    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallSyntax, Emits, Format, Replay},
     gemma,
     input::{EngineFinish, Input},
@@ -645,14 +645,8 @@ impl Engine {
     /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
     /// wherever the chunks were cut.
     fn wrapping(&mut self, surplus: &str, why: &str, out: &mut Events) {
-        let mut rest = surplus;
-        while let Some(first) = rest.chars().next() {
-            let space = first.is_whitespace();
-            let length = rest
-                .char_indices()
-                .find(|(_, c)| c.is_whitespace() != space)
-                .map_or(rest.len(), |(at, _)| at);
-            let run = self.tokens.text(&rest[..length]);
+        for (run, space) in runs(surplus) {
+            let run = self.tokens.text(run);
             out.push(if space {
                 Event::Dropped {
                     text: run,
@@ -664,7 +658,6 @@ impl Engine {
                     why: MalformedReason::Other(why.to_string()),
                 }
             });
-            rest = &rest[length..];
         }
     }
 

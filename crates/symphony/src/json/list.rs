@@ -34,7 +34,7 @@
 //! row into the arguments state.
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, MalformedReason, Text},
     json,
 };
 
@@ -258,21 +258,15 @@ impl Assembler {
             }
             Stage::After => {
                 // As the engine's wrapping: whitespace is the template's, anything else malformed.
-                let mut rest = text;
-                while let Some(first) = rest.chars().next() {
-                    let space = first.is_whitespace();
-                    let length = rest
-                        .char_indices()
-                        .find(|(_, c)| c.is_whitespace() != space)
-                        .map_or(rest.len(), |(i, _)| i);
+                for (run, space) in runs(text) {
                     out.push(if space {
                         Event::Dropped {
-                            text: Text::uncounted(&rest[..length]),
+                            text: Text::uncounted(run),
                             why: DropReason::Wrapper,
                         }
                     } else {
                         Event::Malformed {
-                            text: Text::uncounted(&rest[..length]),
+                            text: Text::uncounted(run),
                             why: MalformedReason::Other(
                                 if self.listed {
                                     TEXT_AFTER_THE_LIST
@@ -283,7 +277,6 @@ impl Assembler {
                             ),
                         }
                     });
-                    rest = &rest[length..];
                 }
                 ""
             }
