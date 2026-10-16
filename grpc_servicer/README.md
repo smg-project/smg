@@ -95,7 +95,7 @@ by default) overrides the model's per-modality reference limits;
 `--mm-max-item-bytes` (`SMG_VLLM_MM_MAX_ITEM_BYTES`, default 32 MiB) caps inline
 `data:` payloads; `SMG_VLLM_MM_MAX_VIDEO_FRAMES` (env only for now; default 0,
 meaning vLLM's own `--media-io-kwargs` decide) caps the frames a video is
-sampled to, so long clips stay bounded. All eight flag-backed settings are
+sampled to, so long clips stay bounded. All nine flag-backed settings are
 validated when the servicer starts, whatever the processor mode, so a stale
 unreadable value fails loudly. Two layers bound an inline item: the router
 refuses a `data:` item above its own per-kind input bound
@@ -130,6 +130,22 @@ the worker will schedule the full placeholder run. The `E2E_MM_PROCESSING=worker
 e2e lanes run the multimodal suites in this mode, and
 `crates/multimodal/scripts/check_worker_anchor_parity.py` checks that a spec's
 anchor is the token vLLM expands.
+
+Both pipelines (the router's own and `--mm-processor smg` on the worker)
+decode JPEGs through libjpeg-turbo's TurboJPEG library when `libturbojpeg.so.0`
+loads, so their pixels are the ones an engine that decodes with Pillow sees.
+Without the library they fall back to a pure-Rust decoder whose pixels differ
+by a few levels on up to a fifth of a JPEG's bytes (no JPEG of the parity
+corpus decodes identically), and the only marks of that state are the start-up
+line `libturbojpeg not found: JPEGs decode with the pure-Rust decoder ...` and
+the gauge `smg_mm_turbojpeg_available` at 0. The TurboJPEG policy makes the
+state fatal instead: `--mm-turbojpeg require` on the router (`SMG_MM_TURBOJPEG`
+for a process without the flag, `mm_turbojpeg` in a config file) stops the
+router at start-up, and `--mm-turbojpeg require` on the worker
+(`SMG_VLLM_MM_TURBOJPEG`) refuses to build smg's pipeline at launch, each with
+an error naming the library and the gauge. The default, `prefer`, keeps the
+fallback; an unreadable value stops start-up as an unreadable
+`SMG_MM_PROCESSING` does.
 
 To move fetching and processing out of the vLLM process, run the GPU-free
 sidecar next to a private Redis and point the worker at it

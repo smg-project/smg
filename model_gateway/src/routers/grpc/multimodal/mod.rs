@@ -339,7 +339,8 @@ pub(crate) fn report_jpeg_decoder() {
             tracing::warn!(
                 "libturbojpeg not found: JPEGs decode with the pure-Rust decoder, whose pixels \
                  differ from PIL's by a few levels; install libjpeg-turbo for exact parity with \
-                 an engine that decodes with PIL"
+                 an engine that decodes with PIL, or start with `--mm-turbojpeg require` to \
+                 refuse to serve without it"
             );
         }
         let webp = llm_multimodal::webp_native::webp_available();
@@ -352,6 +353,22 @@ pub(crate) fn report_jpeg_decoder() {
             ),
         }
     });
+}
+
+/// Apply the operator's TurboJPEG policy to this process. Under `require` a
+/// process whose loader did not find the library does not come up, with the
+/// library and the gauge named, instead of serving the fallback decoder's
+/// pixels behind the one warning above; under `prefer` nothing changes.
+pub(crate) fn enforce_jpeg_decoder_policy(
+    policy: llm_multimodal::jpeg_turbo::TurboJpegPolicy,
+) -> anyhow::Result<()> {
+    llm_multimodal::jpeg_turbo::enforce_policy(policy).map_err(|error| {
+        anyhow::anyhow!("{error} (the gauge smg_mm_turbojpeg_available reads 0 for this process)")
+    })?;
+    if policy == llm_multimodal::jpeg_turbo::TurboJpegPolicy::Require {
+        tracing::info!("libjpeg-turbo is required by the TurboJPEG policy and was loaded");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -12,11 +12,11 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_multimodal::{
-    configure_parallelism, data_url::data_url_payload_bytes, registry::modality_limit_override,
-    vision::PreProcessorConfig, FrameSampling, MediaConnector, MediaConnectorConfig,
-    MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault, Modality, ModelMetadata,
-    ModelRegistry, MultiModalError, Parallelism, TransparencyPolicy, VisionProcessorRegistry,
-    POOL_THREADS_ENV,
+    configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
+    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
+    MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
+    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, TransparencyPolicy,
+    VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -108,6 +108,12 @@ pub struct WorkerMediaSettings {
     /// item above it is refused before it reaches the engine, which would
     /// never schedule it (see `super::encoder_budget`).
     pub encoder_budget: Option<usize>,
+    /// What the pipeline does when libjpeg-turbo cannot be loaded, as the
+    /// launcher resolved it: `Require` refuses to construct the pipeline, so
+    /// the servicer does not start, rather than serve the fallback decoder's
+    /// pixels. `None` leaves it to `SMG_MM_TURBOJPEG`, as the router's own
+    /// pipeline reads it, for a launcher without the setting.
+    pub turbojpeg: Option<TurboJpegPolicy>,
 }
 
 /// Whether the engine's loader rule the launcher reported (`video.fps`, a
@@ -380,6 +386,11 @@ impl WorkerMediaPipeline {
             }
         }
         super::report_jpeg_decoder();
+        super::enforce_jpeg_decoder_policy(
+            settings
+                .turbojpeg
+                .unwrap_or_else(|| mm_settings().turbojpeg.value),
+        )?;
         let config_registry = Arc::new(MultimodalConfigRegistry::new());
         let loaded = config_registry
             .get_or_load(CONFIG_KEY, &settings.model_dir)
@@ -878,6 +889,7 @@ mod tests {
             video_frame_budget: None,
             video_loader_rule: None,
             encoder_budget: Some(192_000),
+            turbojpeg: None,
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -947,6 +959,7 @@ mod tests {
             video_frame_budget: None,
             video_loader_rule: None,
             encoder_budget,
+            turbojpeg: None,
         };
         let tokenizer = || Arc::new(MockTokenizer::new().with_tokens(&[("<image>", 32000)]));
         let items = vec![WorkerMediaItem {
@@ -1023,6 +1036,7 @@ mod tests {
             video_frame_budget: None,
             video_loader_rule: None,
             encoder_budget: None,
+            turbojpeg: None,
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -1242,6 +1256,7 @@ mod unsupported_model_tests {
             video_frame_budget: None,
             video_loader_rule: None,
             encoder_budget: None,
+            turbojpeg: None,
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -1281,6 +1296,7 @@ mod unsupported_model_tests {
             video_frame_budget: None,
             video_loader_rule: None,
             encoder_budget: None,
+            turbojpeg: None,
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -1322,6 +1338,7 @@ mod unsupported_model_tests {
             video_frame_budget: None,
             video_loader_rule: None,
             encoder_budget: None,
+            turbojpeg: None,
         };
         let message = unsupported_model_message(
             &settings,

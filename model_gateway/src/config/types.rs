@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
+pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use serde::{de, Deserialize, Deserializer, Serialize};
@@ -357,6 +358,13 @@ pub struct RouterConfig {
     /// When unset, falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
     #[serde(default)]
     pub mm_allow_private_media_hosts: bool,
+    /// What the router's own media pipeline does when libjpeg-turbo cannot be
+    /// loaded (`prefer` | `require`): `prefer` decodes JPEGs with the
+    /// pure-Rust decoder, whose pixels differ from the reference decoder's by
+    /// a few levels, behind one warning at start-up; `require` stops start-up
+    /// instead. When unset, falls back to `SMG_MM_TURBOJPEG`, then `prefer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_turbojpeg: Option<TurboJpegPolicy>,
     /// Listener IP for the RDMA metadata exchange, a plain IPv4 or IPv6 address
     /// (the workers connect to it as written, so `ConfigValidator` refuses
     /// anything else); when unset, falls back to `SMG_RDMA_LISTEN_IP`, and
@@ -1821,6 +1829,7 @@ impl Default for RouterConfig {
             mm_pixel_rdma: false,
             mm_allowed_media_domains: None,
             mm_allow_private_media_hosts: false,
+            mm_turbojpeg: None,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -2148,6 +2157,7 @@ mod tests {
             "mm_processing",
             "mm_pixel_cache_mb",
             "mm_allowed_media_domains",
+            "mm_turbojpeg",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -2166,6 +2176,7 @@ mod tests {
         assert!(!without.mm_pixel_rdma);
         assert_eq!(without.mm_allowed_media_domains, None);
         assert!(!without.mm_allow_private_media_hosts);
+        assert_eq!(without.mm_turbojpeg, None);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -2178,12 +2189,14 @@ mod tests {
             .mm_pixel_rdma(true)
             .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
             .mm_allow_private_media_hosts(true)
+            .mm_turbojpeg(Some(TurboJpegPolicy::Require))
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
             .build_unchecked();
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains(r#""mm_processing":"worker""#));
+        assert!(json.contains(r#""mm_turbojpeg":"require""#));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(with.mm_pixel_cache_mb, Some(512));
@@ -2193,6 +2206,7 @@ mod tests {
             Some(&["media.example".to_string()][..])
         );
         assert!(with.mm_allow_private_media_hosts);
+        assert_eq!(with.mm_turbojpeg, Some(TurboJpegPolicy::Require));
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);
