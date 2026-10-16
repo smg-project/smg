@@ -178,7 +178,8 @@ pub struct RouterConfig {
     /// first token is the engine's queue and prefill, left to
     /// `request_timeout_secs`. Independent of the request timeout (the whole
     /// request) and of `stream_body_stall_timeout_secs` (the request body).
-    /// Must stay below `request_timeout_secs`. `0` disables it.
+    /// gRPC workers only: the HTTP router does not apply it. Must stay below
+    /// `request_timeout_secs`. `0` disables it.
     #[serde(default)]
     pub constrained_no_progress_secs: u64,
     /// Seconds of upstream silence after which an open SSE stream carries a
