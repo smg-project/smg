@@ -247,18 +247,10 @@ Called from the router Deployment template.
 - {{ .Values.history.backend | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "postgres" }}
-{{- if .Values.history.postgres.url }}
-- "--postgres-db-url"
-- {{ .Values.history.postgres.url | quote }}
-{{- end }}
 - "--postgres-pool-max"
 - {{ .Values.history.postgres.poolMax | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "redis" }}
-{{- if .Values.history.redis.url }}
-- "--redis-url"
-- {{ .Values.history.redis.url | quote }}
-{{- end }}
 - "--redis-pool-max"
 - {{ .Values.history.redis.poolMax | quote }}
 {{- end }}
@@ -330,6 +322,69 @@ Auth secret key -- the key within the auth Secret that holds the API key.
 */}}
 {{- define "smg.authSecretKey" -}}
 {{- .Values.auth.apiKeySecretKey | default "api-key" -}}
+{{- end }}
+
+{{/*
+History store -- the store the history backend uses, postgres or redis (its
+values are .Values.history.<store>); empty for the other backends.
+*/}}
+{{- define "smg.historyStore" -}}
+{{- if or (eq .Values.history.backend "postgres") (eq .Values.history.backend "redis") -}}
+{{- .Values.history.backend -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret -- the Secret holding the history store's connection URL,
+which carries the database password. The URL reaches the router pod as the
+environment variable the gateway reads (SMG_POSTGRES_DB_URL or
+SMG_REDIS_URL); it is never in the pod's arguments. The store's
+`existingSecret` names a Secret the operator manages; otherwise its `url`,
+when set, is written into the chart-managed Secret <fullname>-history.
+Empty when no URL is configured or the backend has no store.
+*/}}
+{{- define "smg.historySecretName" -}}
+{{- with include "smg.historyStore" . -}}
+{{- $store := index $.Values.history . -}}
+{{- if $store.existingSecret -}}
+{{- $store.existingSecret -}}
+{{- else if $store.url -}}
+{{- printf "%s-history" (include "smg.fullname" $) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret key -- the key within the history Secret that holds the URL:
+the store's `secretKey`, else "<store>-url".
+*/}}
+{{- define "smg.historySecretKey" -}}
+{{- with include "smg.historyStore" . -}}
+{{- (index $.Values.history .).secretKey | default (printf "%s-url" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History URL variable -- the environment variable the gateway reads the
+history store's connection URL from.
+*/}}
+{{- define "smg.historyUrlEnv" -}}
+{{- with include "smg.historyStore" . -}}
+{{- if eq . "postgres" }}SMG_POSTGRES_DB_URL{{ else }}SMG_REDIS_URL{{ end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret managed -- "true" when the chart writes the history Secret
+itself (the store's `url` is set and no `existingSecret` replaces it). The
+router pod template carries a checksum of that Secret, so a changed URL
+rolls the pods.
+*/}}
+{{- define "smg.historySecretManaged" -}}
+{{- with include "smg.historyStore" . -}}
+{{- $store := index $.Values.history . -}}
+{{- if and $store.url (not $store.existingSecret) -}}true{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{/*

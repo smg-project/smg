@@ -34,6 +34,9 @@ spec:
         {{- if and .Values.auth.apiKey (not .Values.auth.existingSecret) }}
         checksum/auth: {{ .Values.auth.apiKey | sha256sum }}
         {{- end }}
+        {{- if include "smg.historySecretManaged" . }}
+        checksum/history-secret: {{ include (print $.Template.BasePath "/secret-history.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.router.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -107,6 +110,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "smg.fullname" . }}-hf-token
                   key: token
+            {{- end }}
+            {{- with include "smg.historySecretName" . }}
+            - name: {{ include "smg.historyUrlEnv" $ }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ include "smg.historySecretKey" $ }}
             {{- end }}
             {{- with .Values.router.extraEnv }}
             {{- toYaml . | nindent 12 }}
