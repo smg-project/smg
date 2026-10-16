@@ -21,7 +21,7 @@ use super::{
     error::{set_error_message, SglErrorCode},
     memory::{sgl_free_string, sgl_free_token_ids},
     tokenizer::TokenizerHandle,
-    tool_constraint::{effective_tools_json, tool_constraint_for},
+    tool_constraint::{effective_tools_json, tool_constraint_for, tools_keep_special_tokens},
     utils::chat_requires_reasoning,
 };
 
@@ -32,6 +32,10 @@ struct PreprocessResult {
     tool_constraints: Option<CString>,
     tools_json: Option<CString>,
     prompt_tokens: i32,
+    /// Whether the engine and the response converter skip special tokens:
+    /// the request's own setting, unless the response parser needs the
+    /// engine's markers kept (see `tools_keep_special_tokens`).
+    skip_special_tokens: bool,
 }
 
 /// Internal helper to preprocess a chat request with a given tokenizer
@@ -61,9 +65,27 @@ fn preprocess_impl(
     let prompt_tokens = token_ids.len() as i32;
 
     // Generate tool constraints if tools are present
-    let tool_constraints = match tool_constraint_for(chat_request) {
-        Ok(Some(c)) => {
-            let json_str = serde_json::to_string(&c.to_tuple()).map_err(|e| {
+    let tool_constraint = match tool_constraint_for(chat_request) {
+        Ok(constraint) => constraint.map(|c| c.to_tuple()),
+        Err(e) => {
+            return Err((
+                SglErrorCode::ParsingError,
+                format!("Failed to generate tool constraints: {e}"),
+            ))
+        }
+    };
+
+    // The engine keeps its special tokens when a parser will read them: tools
+    // at either level, a choice that allows calls, no JSON schema. Otherwise
+    // the request's own setting stands. The in-library request paths derive
+    // the flag the same way; the caller sets the engine's sampling parameter
+    // and its response converter from it.
+    let skip_special_tokens = chat_request.skip_special_tokens
+        && !tools_keep_special_tokens(chat_request, tool_constraint.as_ref());
+
+    let tool_constraints = match tool_constraint {
+        Some(constraint) => {
+            let json_str = serde_json::to_string(&constraint).map_err(|e| {
                 (
                     SglErrorCode::ParsingError,
                     format!("Failed to serialize tool constraints: {e}"),
@@ -76,13 +98,7 @@ fn preprocess_impl(
                 )
             })?)
         }
-        Ok(None) => None,
-        Err(e) => {
-            return Err((
-                SglErrorCode::ParsingError,
-                format!("Failed to generate tool constraints: {e}"),
-            ))
-        }
+        None => None,
     };
 
     // The tools the response parser resolves calls against (request-level and
@@ -111,42 +127,54 @@ fn preprocess_impl(
         tool_constraints,
         tools_json,
         prompt_tokens,
+        skip_special_tokens,
     })
+}
+
+/// The out-parameters of a preprocess entry point, as the caller passed them.
+struct PreprocessOutputs {
+    prompt_text: *mut *mut c_char,
+    token_ids: *mut *mut c_uint,
+    token_ids_len: *mut usize,
+    /// May be null.
+    tool_constraints_json: *mut *mut c_char,
+    /// May be null.
+    tools_json: *mut *mut c_char,
+    /// May be null.
+    skip_special_tokens: *mut c_int,
+    prompt_tokens: *mut c_int,
 }
 
 /// Write preprocess results to FFI output pointers
 ///
 /// # Safety
-/// All output pointers must be valid and writable
-unsafe fn write_preprocess_outputs(
-    result: PreprocessResult,
-    prompt_text_out: *mut *mut c_char,
-    token_ids_out: *mut *mut c_uint,
-    token_ids_len_out: *mut usize,
-    tool_constraints_json_out: *mut *mut c_char,
-    tools_json_out: *mut *mut c_char,
-    prompt_tokens_out: *mut c_int,
-) {
-    *prompt_text_out = result.prompt_text.into_raw();
-    *token_ids_len_out = result.token_ids.len();
-    *prompt_tokens_out = result.prompt_tokens;
+/// Every output pointer must be valid and writable, except those documented
+/// as nullable, which may be null.
+unsafe fn write_preprocess_outputs(result: PreprocessResult, outputs: PreprocessOutputs) {
+    *outputs.prompt_text = result.prompt_text.into_raw();
+    *outputs.token_ids_len = result.token_ids.len();
+    *outputs.prompt_tokens = result.prompt_tokens;
 
-    *token_ids_out = if result.token_ids.is_empty() {
+    if !outputs.skip_special_tokens.is_null() {
+        *outputs.skip_special_tokens = c_int::from(result.skip_special_tokens);
+    }
+
+    *outputs.token_ids = if result.token_ids.is_empty() {
         ptr::null_mut()
     } else {
         let boxed = result.token_ids.into_boxed_slice();
         Box::into_raw(boxed) as *mut c_uint
     };
 
-    if !tool_constraints_json_out.is_null() {
-        *tool_constraints_json_out = result
+    if !outputs.tool_constraints_json.is_null() {
+        *outputs.tool_constraints_json = result
             .tool_constraints
             .map(|c| c.into_raw())
             .unwrap_or(ptr::null_mut());
     }
 
-    if !tools_json_out.is_null() {
-        *tools_json_out = result
+    if !outputs.tools_json.is_null() {
+        *outputs.tools_json = result
             .tools_json
             .map(|t| t.into_raw())
             .unwrap_or(ptr::null_mut());
@@ -168,6 +196,7 @@ unsafe fn write_preprocess_outputs(
 /// * `token_ids_len_out` - Pointer to receive token IDs array length
 /// * `tool_constraints_json_out` - Optional pointer to receive tool constraints JSON (must be freed with sgl_free_string)
 /// * `tools_json_out` - Optional pointer to receive the tools the response parser resolves calls against, request-level and message-declared, as JSON (freed by sgl_preprocessed_request_free)
+/// * `skip_special_tokens_out` - Optional pointer to receive whether the engine and the response converter skip special tokens (1) or keep them for the response parser (0): the request's setting, unless tools are declared under a choice that allows calls and no JSON schema constrains the output
 /// * `prompt_tokens_out` - Pointer to receive prompt token count
 /// * `error_out` - Optional pointer to receive error message
 ///
@@ -179,6 +208,7 @@ unsafe fn write_preprocess_outputs(
 /// - `prompt_text_out`, `token_ids_out`, `token_ids_len_out`, `prompt_tokens_out` must be valid pointers
 /// - `tool_constraints_json_out` may be null; if non-null, must point to writable memory
 /// - `tools_json_out` may be null; if non-null, must point to writable memory
+/// - `skip_special_tokens_out` may be null; if non-null, must point to writable memory
 /// - `error_out` may be null; if non-null, must point to writable memory
 /// - Caller must free allocated strings with `sgl_free_string` and token IDs with `sgl_free_token_ids`
 #[no_mangle]
@@ -190,6 +220,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
     token_ids_len_out: *mut usize,
     tool_constraints_json_out: *mut *mut c_char,
     tools_json_out: *mut *mut c_char,
+    skip_special_tokens_out: *mut c_int,
     prompt_tokens_out: *mut c_int,
     error_out: *mut *mut c_char,
 ) -> SglErrorCode {
@@ -240,12 +271,15 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
         Ok(result) => {
             write_preprocess_outputs(
                 result,
-                prompt_text_out,
-                token_ids_out,
-                token_ids_len_out,
-                tool_constraints_json_out,
-                tools_json_out,
-                prompt_tokens_out,
+                PreprocessOutputs {
+                    prompt_text: prompt_text_out,
+                    token_ids: token_ids_out,
+                    token_ids_len: token_ids_len_out,
+                    tool_constraints_json: tool_constraints_json_out,
+                    tools_json: tools_json_out,
+                    skip_special_tokens: skip_special_tokens_out,
+                    prompt_tokens: prompt_tokens_out,
+                },
             );
             SglErrorCode::Success
         }
@@ -270,6 +304,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
 /// * `token_ids_len_out` - Pointer to receive token IDs array length
 /// * `tool_constraints_json_out` - Optional pointer to receive tool constraints JSON (must be freed with sgl_free_string)
 /// * `tools_json_out` - Optional pointer to receive the tools the response parser resolves calls against, request-level and message-declared, as JSON (freed by sgl_preprocessed_request_free)
+/// * `skip_special_tokens_out` - Optional pointer to receive whether the engine and the response converter skip special tokens (1) or keep them for the response parser (0): the request's setting, unless tools are declared under a choice that allows calls and no JSON schema constrains the output
 /// * `prompt_tokens_out` - Pointer to receive prompt token count
 /// * `error_out` - Optional pointer to receive error message
 ///
@@ -282,6 +317,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
 /// - `prompt_text_out`, `token_ids_out`, `token_ids_len_out`, `prompt_tokens_out` must be valid pointers
 /// - `tool_constraints_json_out` may be null; if non-null, must point to writable memory
 /// - `tools_json_out` may be null; if non-null, must point to writable memory
+/// - `skip_special_tokens_out` may be null; if non-null, must point to writable memory
 /// - `error_out` may be null; if non-null, must point to writable memory
 /// - Caller must free allocated strings with `sgl_free_string` and token IDs with `sgl_free_token_ids`
 #[no_mangle]
@@ -293,6 +329,7 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request_with_tokenizer(
     token_ids_len_out: *mut usize,
     tool_constraints_json_out: *mut *mut c_char,
     tools_json_out: *mut *mut c_char,
+    skip_special_tokens_out: *mut c_int,
     prompt_tokens_out: *mut c_int,
     error_out: *mut *mut c_char,
 ) -> SglErrorCode {
@@ -329,12 +366,15 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request_with_tokenizer(
         Ok(result) => {
             write_preprocess_outputs(
                 result,
-                prompt_text_out,
-                token_ids_out,
-                token_ids_len_out,
-                tool_constraints_json_out,
-                tools_json_out,
-                prompt_tokens_out,
+                PreprocessOutputs {
+                    prompt_text: prompt_text_out,
+                    token_ids: token_ids_out,
+                    token_ids_len: token_ids_len_out,
+                    tool_constraints_json: tool_constraints_json_out,
+                    tools_json: tools_json_out,
+                    skip_special_tokens: skip_special_tokens_out,
+                    prompt_tokens: prompt_tokens_out,
+                },
             );
             SglErrorCode::Success
         }
@@ -424,4 +464,163 @@ pub unsafe extern "C" fn sgl_chat_requires_reasoning_with_tokenizer(
     ));
 
     SglErrorCode::Success
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    /// The test tokenizer: the renderer that writes one `role: content` line
+    /// per message, with no checkpoint behind it.
+    fn tokenizer() -> Arc<dyn Tokenizer> {
+        create_tokenizer_from_file("mock").unwrap()
+    }
+
+    fn weather_tool() -> Value {
+        json!([{"type": "function", "function": {"name": "get_weather", "parameters":
+            {"type": "object", "properties": {"city": {"type": "string"}}}}}])
+    }
+
+    /// A request for an unmapped model; `tools`, `tool_choice` and
+    /// `skip_special_tokens` are left out when null.
+    fn request_json(tools: Value, tool_choice: Value, skip_special_tokens: Value) -> Value {
+        let mut request = json!({
+            "model": "unmapped-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        for (key, value) in [
+            ("tools", tools),
+            ("tool_choice", tool_choice),
+            ("skip_special_tokens", skip_special_tokens),
+        ] {
+            if !value.is_null() {
+                request[key] = value;
+            }
+        }
+        request
+    }
+
+    fn preprocess(request: Value) -> PreprocessResult {
+        let request: ChatCompletionRequest = serde_json::from_value(request).unwrap();
+        preprocess_impl(&request, tokenizer().as_ref()).unwrap()
+    }
+
+    /// Tools under a choice that allows calls keep the engine's special tokens
+    /// for the response parser; a choice that forces none, a choice that
+    /// constrains the output to a JSON schema, or no tools at all leave the
+    /// request's setting, which skips them.
+    #[test]
+    fn special_tokens_are_kept_when_a_parser_reads_the_tools() {
+        for (tool_choice, skip) in [
+            (Value::Null, false),
+            (json!("auto"), false),
+            (json!("none"), true),
+            (json!("required"), true),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                true,
+            ),
+        ] {
+            let result = preprocess(request_json(
+                weather_tool(),
+                tool_choice.clone(),
+                Value::Null,
+            ));
+            assert_eq!(
+                result.skip_special_tokens, skip,
+                "tool_choice {tool_choice}"
+            );
+            assert!(result.tools_json.is_some());
+        }
+        for tools in [Value::Null, json!([])] {
+            let result = preprocess(request_json(tools.clone(), Value::Null, Value::Null));
+            assert!(result.skip_special_tokens, "tools {tools}");
+            assert!(result.tools_json.is_none());
+        }
+    }
+
+    /// A request that asks for its special tokens keeps them whatever its
+    /// tools say.
+    #[test]
+    fn a_request_that_keeps_its_special_tokens_is_honoured() {
+        let plain = preprocess(request_json(Value::Null, Value::Null, json!(false)));
+        assert!(!plain.skip_special_tokens);
+        let none_choice = preprocess(request_json(weather_tool(), json!("none"), json!(false)));
+        assert!(!none_choice.skip_special_tokens);
+    }
+
+    /// A tool declared on a message (a provider profile that defines them)
+    /// counts as the request-level ones do.
+    #[test]
+    fn a_message_declared_tool_keeps_the_special_tokens() {
+        let result = preprocess(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": weather_tool()},
+                {"role": "user", "content": "hi"}
+            ]
+        }));
+        assert!(!result.skip_special_tokens);
+        assert!(result.tools_json.is_some());
+    }
+
+    /// The FFI entry point hands the flag out through its out-parameter, next
+    /// to the parser's tool list, and tolerates a caller that passes none.
+    #[test]
+    fn the_ffi_entry_point_returns_the_flag() {
+        let request =
+            CString::new(request_json(weather_tool(), Value::Null, Value::Null).to_string())
+                .unwrap();
+        let tokenizer_path = CString::new("mock").unwrap();
+        for read_flag in [true, false] {
+            let mut prompt_text: *mut c_char = ptr::null_mut();
+            let mut token_ids: *mut c_uint = ptr::null_mut();
+            let mut token_ids_len: usize = 0;
+            let mut tool_constraints: *mut c_char = ptr::null_mut();
+            let mut tools_json: *mut c_char = ptr::null_mut();
+            let mut skip_special_tokens: c_int = -1;
+            let mut prompt_tokens: c_int = -1;
+            let mut error: *mut c_char = ptr::null_mut();
+            // SAFETY: every pointer is a live local or null where the
+            // function allows null; the strings are null-terminated.
+            let code = unsafe {
+                sgl_preprocess_chat_request(
+                    request.as_ptr(),
+                    tokenizer_path.as_ptr(),
+                    &mut prompt_text,
+                    &mut token_ids,
+                    &mut token_ids_len,
+                    &mut tool_constraints,
+                    &mut tools_json,
+                    if read_flag {
+                        &mut skip_special_tokens
+                    } else {
+                        ptr::null_mut()
+                    },
+                    &mut prompt_tokens,
+                    &mut error,
+                )
+            };
+            assert_eq!(code, SglErrorCode::Success);
+            assert_eq!(skip_special_tokens, if read_flag { 0 } else { -1 });
+            assert!(prompt_tokens >= 0);
+            assert!(tool_constraints.is_null());
+            assert!(!tools_json.is_null());
+            // SAFETY: the pointers were written by the call above and are
+            // freed once.
+            unsafe {
+                sgl_preprocessed_request_free(
+                    prompt_text,
+                    token_ids,
+                    token_ids_len,
+                    tool_constraints,
+                    tools_json,
+                );
+            }
+        }
+    }
 }

@@ -152,13 +152,17 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		RequireReasoning: requireReasoning,
 	}
 
-	// Set sampling parameters
+	// Set sampling parameters. Special tokens are skipped as the request
+	// asks, unless the response parser needs the engine's tool-call markers
+	// kept (tools under a choice that allows calls, no JSON-schema
+	// constraint): the preprocessor derives the flag the way the in-library
+	// request paths do, and the converter below decodes with the same one.
 	samplingParams := &proto.SamplingParams{
 		Temperature:                1.0,
 		TopP:                       1.0,
 		TopK:                       -1,
 		RepetitionPenalty:          1.0,
-		SkipSpecialTokens:          true,
+		SkipSpecialTokens:          preprocessed.SkipSpecialTokens,
 		SpacesBetweenSpecialTokens: true,
 	}
 
@@ -246,11 +250,6 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		}
 	}
 
-	skipSpecialTokens := true
-	if skipSpecialTokensVal, ok := reqMap["skip_special_tokens"].(bool); ok {
-		skipSpecialTokens = skipSpecialTokensVal
-	}
-
 	if c.tokenizerHandle == nil {
 		stream.CloseSend()
 		return nil, fmt.Errorf("tokenizer handle is nil (should be created at startup)")
@@ -264,7 +263,7 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		toolChoiceJSON,
 		stopJSON,
 		stopTokenIDs,
-		skipSpecialTokens,
+		preprocessed.SkipSpecialTokens,
 		preprocessed.PromptTokens, // Pass initial prompt tokens from preprocessing
 	)
 	if err != nil {
