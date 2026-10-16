@@ -133,6 +133,7 @@ def build_control_plane_auth_config(
             audience=jwt_audience,
             jwks_uri=args_dict.get("jwt_jwks_uri"),
             role_mapping=args_dict.get("jwt_role_mapping", {}),
+            role_claim=args_dict.get("jwt_role_claim", "roles"),
         )
 
     return PyControlPlaneAuthConfig(
@@ -487,6 +488,7 @@ class Router:
             "jwt_audience",
             "jwt_jwks_uri",
             "jwt_role_mapping",
+            "jwt_role_claim",
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)

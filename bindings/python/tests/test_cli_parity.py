@@ -24,14 +24,8 @@ MAIN_RS = Path(__file__).resolve().parents[3] / "model_gateway" / "src" / "main.
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
-    "--engine-metrics": "the binding's Router has no parameter for it yet",
-    "--jwt-role-claim": "the binding's JWT config has no role-claim field yet",
     "--kv-indexer-max-entries": "deprecated and ignored by the CLI; the launcher never had it",
     "--kv-indexer-ttl-secs": "deprecated and ignored by the CLI; the launcher never had it",
-    "--pd-pairing-mode": "the binding's Router has no parameter for it yet",
-    "--runtime-worker-threads": "the binding's Router has no parameter for it yet",
-    "--webrtc-bind-addr": "the binding's Router has no parameter for it yet",
-    "--webrtc-stun-server": "the binding's Router has no parameter for it yet",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.

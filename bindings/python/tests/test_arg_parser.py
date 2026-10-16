@@ -2221,3 +2221,143 @@ class TestSecretSources:
         ):
             assert named in help_text, named
         assert "hunter2" not in help_text
+
+
+def _prefixed(argv: list[str]) -> RouterArgs:
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser, use_router_prefix=True)
+    return RouterArgs.from_cli_args(parser.parse_args(argv), use_router_prefix=True)
+
+
+def _rust_router_kwargs(**fields) -> dict:
+    with patch("smg.router._Router") as rust_router:
+        Router.from_args(RouterArgs(worker_urls=["http://w:8000"], **fields))
+    return dict(rust_router.call_args.kwargs)
+
+
+class TestEngineMetrics:
+    """--engine-metrics is a launcher option, off by default as on the Rust CLI, and
+    reaches the Rust router; the launcher had no way to ask for the engine gauges
+    without a load-aware policy."""
+
+    def test_off_by_default(self):
+        assert RouterArgs().engine_metrics is False
+        assert parse_router_args([]).engine_metrics is False
+
+    def test_flag_turns_it_on(self):
+        assert parse_router_args(["--engine-metrics"]).engine_metrics is True
+
+    def test_router_prefixed_spelling(self):
+        assert _prefixed(["--router-engine-metrics"]).engine_metrics is True
+
+    def test_reaches_the_rust_router(self):
+        assert _rust_router_kwargs(engine_metrics=True)["engine_metrics"] is True
+        assert _rust_router_kwargs()["engine_metrics"] is False
+
+
+class TestPdPairingMode:
+    """--pd-pairing-mode takes the Rust CLI's choices with its default (lenient) and
+    reaches the Rust router; a launcher-started router always paired leniently."""
+
+    def test_default_is_the_rust_cli_default(self):
+        assert RouterArgs().pd_pairing_mode == "lenient"
+        assert parse_router_args([]).pd_pairing_mode == "lenient"
+
+    @pytest.mark.parametrize("mode", ["off", "lenient", "strict"])
+    def test_each_choice_parses(self, mode):
+        assert parse_router_args(["--pd-pairing-mode", mode]).pd_pairing_mode == mode
+        assert _prefixed(["--router-pd-pairing-mode", mode]).pd_pairing_mode == mode
+
+    def test_an_unknown_mode_is_refused_at_parse_time(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--pd-pairing-mode", "sideways"])
+
+    def test_reaches_the_rust_router(self):
+        assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
+
+
+class TestRuntimeWorkerThreads:
+    """--runtime-worker-threads is a launcher option, unset by default as on the Rust
+    CLI (the runtime's own size), and reaches the Rust router; a negative count is
+    refused at parse time, zero by the router's validation as on the CLI."""
+
+    def test_unset_by_default(self):
+        assert RouterArgs().runtime_worker_threads is None
+        assert parse_router_args([]).runtime_worker_threads is None
+
+    def test_value_lands_on_the_dataclass(self):
+        assert parse_router_args(["--runtime-worker-threads", "4"]).runtime_worker_threads == 4
+
+    def test_negative_is_refused_at_parse_time(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--runtime-worker-threads", "-1"])
+
+    def test_router_prefixed_spelling(self):
+        assert _prefixed(["--router-runtime-worker-threads", "3"]).runtime_worker_threads == 3
+
+    def test_reaches_the_rust_router(self):
+        assert _rust_router_kwargs(runtime_worker_threads=2)["runtime_worker_threads"] == 2
+        assert _rust_router_kwargs()["runtime_worker_threads"] is None
+
+
+class TestWebrtcOptions:
+    """--webrtc-bind-addr (an IP address) and --webrtc-stun-server (host:port or
+    none) are launcher options, unset by default as on the Rust CLI, and reach the
+    Rust router."""
+
+    def test_unset_by_default(self):
+        router_args = parse_router_args([])
+        assert router_args.webrtc_bind_addr is None
+        assert router_args.webrtc_stun_server is None
+
+    @pytest.mark.parametrize("address", ["127.0.0.1", "0.0.0.0", "::1", "::"])
+    def test_bind_addr_takes_an_ip_address(self, address):
+        assert parse_router_args(["--webrtc-bind-addr", address]).webrtc_bind_addr == address
+
+    @pytest.mark.parametrize("value", ["localhost", "127.0.0.1:3478", "[::1]"])
+    def test_bind_addr_refuses_what_is_not_an_ip_address(self, value):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--webrtc-bind-addr", value])
+
+    @pytest.mark.parametrize("server", ["stun.example.net:3478", "none"])
+    def test_stun_server_value(self, server):
+        assert parse_router_args(["--webrtc-stun-server", server]).webrtc_stun_server == server
+
+    def test_router_prefixed_spellings(self):
+        router_args = _prefixed(
+            ["--router-webrtc-bind-addr", "::1", "--router-webrtc-stun-server", "none"]
+        )
+        assert router_args.webrtc_bind_addr == "::1"
+        assert router_args.webrtc_stun_server == "none"
+
+    def test_reach_the_rust_router(self):
+        kwargs = _rust_router_kwargs(webrtc_bind_addr="127.0.0.1", webrtc_stun_server="none")
+        assert kwargs["webrtc_bind_addr"] == "127.0.0.1"
+        assert kwargs["webrtc_stun_server"] == "none"
+
+
+class TestJwtRoleClaim:
+    """--jwt-role-claim is a launcher option with the Rust CLI's default (roles) and
+    reaches the JWT configuration, not the router's own arguments; a
+    launcher-started router always read the role from the roles claim."""
+
+    def test_default_is_the_rust_cli_default(self):
+        assert RouterArgs().jwt_role_claim == "roles"
+        assert parse_router_args([]).jwt_role_claim == "roles"
+
+    def test_value_lands_on_the_dataclass(self):
+        assert parse_router_args(["--jwt-role-claim", "groups"]).jwt_role_claim == "groups"
+
+    def test_router_prefixed_spelling(self):
+        assert _prefixed(["--router-jwt-role-claim", "groups"]).jwt_role_claim == "groups"
+
+    def test_reaches_the_jwt_configuration(self):
+        kwargs = _rust_router_kwargs(
+            jwt_issuer="https://issuer.example", jwt_audience="aud", jwt_role_claim="groups"
+        )
+        assert "jwt_role_claim" not in kwargs
+        assert kwargs["control_plane_auth"].jwt.role_claim == "groups"
+
+    def test_default_reaches_the_jwt_configuration(self):
+        kwargs = _rust_router_kwargs(jwt_issuer="https://issuer.example", jwt_audience="aud")
+        assert kwargs["control_plane_auth"].jwt.role_claim == "roles"

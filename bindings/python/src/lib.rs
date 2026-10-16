@@ -131,6 +131,10 @@ pub struct PyJwtConfig {
     pub jwks_uri: Option<String>,
     #[pyo3(get, set)]
     pub role_mapping: HashMap<String, String>,
+    /// The claim that carries the role (the CLI's `--jwt-role-claim`, default
+    /// `roles`); appended last so positional callers keep their binding.
+    #[pyo3(get, set)]
+    pub role_claim: String,
 }
 
 #[pymethods]
@@ -141,18 +145,21 @@ impl PyJwtConfig {
         audience,
         jwks_uri = None,
         role_mapping = HashMap::new(),
+        role_claim = String::from("roles"),
     ))]
     fn new(
         issuer: String,
         audience: String,
         jwks_uri: Option<String>,
         role_mapping: HashMap<String, String>,
+        role_claim: String,
     ) -> Self {
         PyJwtConfig {
             issuer,
             audience,
             jwks_uri,
             role_mapping,
+            role_claim,
         }
     }
 }
@@ -160,6 +167,7 @@ impl PyJwtConfig {
 impl PyJwtConfig {
     pub fn to_auth_jwt_config(&self) -> auth::JwtConfig {
         let mut config = auth::JwtConfig::new(&self.issuer, &self.audience);
+        config.role_claim.clone_from(&self.role_claim);
 
         // Conditionally set JWKS URI
         if let Some(ref uri) = self.jwks_uri {
@@ -473,6 +481,7 @@ struct Router {
     encode_policy: Option<PolicyType>,
     encode_selector: HashMap<String, String>,
     encode_urls: Option<Vec<(String, Option<u16>)>>,
+    engine_metrics: bool,
     epd_disaggregation: bool,
     eviction_interval_secs: u64,
     header_read_timeout_secs: u64,
@@ -539,6 +548,7 @@ struct Router {
     parser: String,
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
+    pd_pairing_mode: String,
     postgres_config: Option<PyPostgresConfig>,
     power_of_two_load_metric: String,
     prefill_max_inflight_requests_per_worker: i32,
@@ -577,6 +587,7 @@ struct Router {
     router_selector: HashMap<String, String>,
     routing_key_headers: Vec<String>,
     routing_key_override: bool,
+    runtime_worker_threads: Option<usize>,
     schema_config: Option<String>,
     selection_accounting_ttl_ms: u64,
     selection_policy: String,
@@ -608,6 +619,8 @@ struct Router {
     trust_tenant_header: bool,
     upstream_http2: bool,
     upstream_pool_idle_timeout_secs: u64,
+    webrtc_bind_addr: Option<String>,
+    webrtc_stun_server: Option<String>,
     worker_overload_protection: bool,
     worker_overload_shed: bool,
     worker_overload_token_usage: Option<f64>,
@@ -724,6 +737,19 @@ impl Router {
                 reason: "expected 'tree' or 'hash'".to_string(),
             }),
         }
+    }
+
+    /// The pairing rule by its CLI spelling (`off`, `lenient`, `strict`; any
+    /// case, trimmed); anything else is refused by name, as the CLI's choices
+    /// refuse it.
+    fn parse_pd_pairing_mode(&self) -> Result<config::PdPairingMode, config::ConfigError> {
+        config::PdPairingMode::parse(&self.pd_pairing_mode).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "pd_pairing_mode".to_string(),
+                value: self.pd_pairing_mode.clone(),
+                reason: "expected 'off', 'lenient', or 'strict'".to_string(),
+            }
+        })
     }
 
     fn parse_assignment_mode(
@@ -1033,6 +1059,8 @@ impl Router {
                 None
             };
 
+        let pd_pairing_mode = self.parse_pd_pairing_mode()?;
+
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -1167,6 +1195,9 @@ impl Router {
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
+            .engine_metrics(self.engine_metrics)
+            .pd_pairing_mode(pd_pairing_mode)
+            .runtime_worker_threads(self.runtime_worker_threads)
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
@@ -1273,6 +1304,7 @@ impl Router {
         encode_policy = None,
         encode_selector = HashMap::new(),
         encode_urls = None,
+        engine_metrics = false,
         epd_disaggregation = false,
         eviction_interval_secs = 120,
         header_read_timeout_secs = 30,
@@ -1336,6 +1368,7 @@ impl Router {
         parser = String::from("legacy"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
+        pd_pairing_mode = String::from("lenient"),
         postgres_config = None,
         power_of_two_load_metric = String::from("expected_wait"),
         prefill_max_inflight_requests_per_worker = -1,
@@ -1374,6 +1407,7 @@ impl Router {
         router_selector = HashMap::new(),
         routing_key_headers = vec![String::from("x-smg-routing-key")],
         routing_key_override = false,
+        runtime_worker_threads = None,
         schema_config = None,
         selection_accounting_ttl_ms = 0,
         selection_policy = String::from("cache-aware-default"),
@@ -1403,6 +1437,8 @@ impl Router {
         trust_tenant_header = false,
         upstream_http2 = false,
         upstream_pool_idle_timeout_secs = 3,
+        webrtc_bind_addr = None,
+        webrtc_stun_server = None,
         worker_overload_protection = true,
         worker_overload_shed = false,
         worker_overload_token_usage = Some(0.8),
@@ -1474,6 +1510,7 @@ impl Router {
         encode_policy: Option<PolicyType>,
         encode_selector: HashMap<String, String>,
         encode_urls: Option<Vec<(String, Option<u16>)>>,
+        engine_metrics: bool,
         epd_disaggregation: bool,
         eviction_interval_secs: u64,
         header_read_timeout_secs: u64,
@@ -1537,6 +1574,7 @@ impl Router {
         parser: String,
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
+        pd_pairing_mode: String,
         postgres_config: Option<PyPostgresConfig>,
         power_of_two_load_metric: String,
         prefill_max_inflight_requests_per_worker: i32,
@@ -1575,6 +1613,7 @@ impl Router {
         router_selector: HashMap<String, String>,
         routing_key_headers: Vec<String>,
         routing_key_override: bool,
+        runtime_worker_threads: Option<usize>,
         schema_config: Option<String>,
         selection_accounting_ttl_ms: u64,
         selection_policy: String,
@@ -1604,6 +1643,8 @@ impl Router {
         trust_tenant_header: bool,
         upstream_http2: bool,
         upstream_pool_idle_timeout_secs: u64,
+        webrtc_bind_addr: Option<String>,
+        webrtc_stun_server: Option<String>,
         worker_overload_protection: bool,
         worker_overload_shed: bool,
         worker_overload_token_usage: Option<f64>,
@@ -1705,6 +1746,7 @@ impl Router {
             encode_policy,
             encode_selector,
             encode_urls,
+            engine_metrics,
             epd_disaggregation,
             eviction_interval_secs,
             header_read_timeout_secs,
@@ -1768,6 +1810,7 @@ impl Router {
             parser,
             pd_admission_wait_secs,
             pd_disaggregation,
+            pd_pairing_mode,
             postgres_config,
             power_of_two_load_metric,
             prefill_max_inflight_requests_per_worker,
@@ -1806,6 +1849,7 @@ impl Router {
             router_selector,
             routing_key_headers,
             routing_key_override,
+            runtime_worker_threads,
             schema_config,
             selection_accounting_ttl_ms,
             selection_policy,
@@ -1835,6 +1879,8 @@ impl Router {
             trust_tenant_header,
             upstream_http2,
             upstream_pool_idle_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
             worker_overload_protection,
             worker_overload_shed,
             worker_overload_token_usage,
@@ -1891,8 +1937,29 @@ impl Router {
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Refused before the runtime exists, as the CLI refuses it at parse time.
+        let webrtc_bind_addr = self
+            .webrtc_bind_addr
+            .as_deref()
+            .map(|addr| {
+                addr.parse::<std::net::IpAddr>().map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid value for webrtc_bind_addr='{addr}': {e}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        // The runtime's default size unless a thread count is given (the
+        // validation above refused 0), as the CLI's `serve` builds it.
+        let runtime = match self.runtime_worker_threads {
+            Some(threads) => tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .enable_all()
+                .build(),
+            None => tokio::runtime::Runtime::new(),
+        }
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Release the GIL while the server runs so Python threads can make progress.
         py.detach(|| {
@@ -1901,7 +1968,7 @@ impl Router {
                 host: self.host.clone(),
                 port: self.port,
                 health_check_port: self.health_check_port,
-                runtime_worker_threads: None,
+                runtime_worker_threads: self.runtime_worker_threads,
                 router_config,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
@@ -1974,8 +2041,8 @@ impl Router {
                 } else {
                     None
                 },
-                webrtc_bind_addr: None,
-                webrtc_stun_server: None,
+                webrtc_bind_addr,
+                webrtc_stun_server: self.webrtc_stun_server.clone(),
                 // The launcher resolved the secrets' sources in Python; the
                 // record is the CLI's.
                 secret_sources: Default::default(),

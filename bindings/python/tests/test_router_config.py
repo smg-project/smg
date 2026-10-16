@@ -534,3 +534,58 @@ class TestControlPlaneAuthHalfJwt:
         with pytest.raises(ValueError, match="jwt-issuer"):
             build_control_plane_auth_config({"jwt_audience": "aud"})
         assert build_control_plane_auth_config({}) is None
+
+
+class TestKeywordOnlyParametersOfTheCliFlags:
+    """The parameters behind the CLI's --engine-metrics, --pd-pairing-mode,
+    --runtime-worker-threads, --webrtc-bind-addr and --webrtc-stun-server are
+    keyword-only (no positional slot to keep) with the CLI's defaults, and a value
+    the CLI refuses is refused before anything starts."""
+
+    def test_keyword_only_with_the_cli_defaults(self):
+        import inspect
+
+        params = inspect.signature(_Router).parameters
+        for name in (
+            "engine_metrics",
+            "pd_pairing_mode",
+            "runtime_worker_threads",
+            "webrtc_bind_addr",
+            "webrtc_stun_server",
+        ):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert params["engine_metrics"].default is False
+        assert params["runtime_worker_threads"].default is None
+        assert params["webrtc_bind_addr"].default is None
+        assert params["webrtc_stun_server"].default is None
+
+    def test_an_unknown_pairing_mode_is_refused(self):
+        with pytest.raises(ValueError, match="pd_pairing_mode"):
+            _Router(worker_urls=["http://w:8000"], pd_pairing_mode="sideways").start()
+
+    def test_zero_runtime_threads_is_refused(self):
+        with pytest.raises(ValueError, match="runtime_worker_threads"):
+            _Router(worker_urls=["http://w:8000"], runtime_worker_threads=0).start()
+
+    def test_a_bind_address_that_is_not_an_ip_is_refused(self):
+        with pytest.raises(ValueError, match="webrtc_bind_addr"):
+            _Router(worker_urls=["http://w:8000"], webrtc_bind_addr="not-an-ip").start()
+
+
+class TestJwtConfigRoleClaim:
+    """The JWT configuration carries the role claim's name (default roles, as the
+    CLI's --jwt-role-claim); appended last, so positional callers bind as before."""
+
+    def test_default_and_positional_value(self):
+        from smg.smg_rs import PyJwtConfig
+
+        assert PyJwtConfig("https://issuer.example", "aud").role_claim == "roles"
+        assert (
+            PyJwtConfig("https://issuer.example", "aud", None, {}, "groups").role_claim == "groups"
+        )
+
+    def test_build_passes_it_on(self):
+        issuer = {"jwt_issuer": "https://issuer.example", "jwt_audience": "aud"}
+        assert build_control_plane_auth_config(issuer).jwt.role_claim == "roles"
+        auth = build_control_plane_auth_config({**issuer, "jwt_role_claim": "groups"})
+        assert auth.jwt.role_claim == "groups"

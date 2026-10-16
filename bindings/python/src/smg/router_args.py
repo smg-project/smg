@@ -347,6 +347,9 @@ class RouterArgs:
     encode_urls: list[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
+    # Poll worker loads for the engine gauges even without a load-aware
+    # policy (--engine-metrics)
+    engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
     eviction_interval_secs: int = 60
     # HTTP edge: seconds to receive a complete request head
@@ -382,6 +385,8 @@ class RouterArgs:
     jwt_audience: str | None = None
     jwt_issuer: str | None = None
     jwt_jwks_uri: str | None = None
+    # The JWT claim that carries the role
+    jwt_role_claim: str = "roles"
     jwt_role_mapping: dict[str, str] = dataclasses.field(default_factory=dict)
     kv_connector_annotation: str = "smg.ai/kv-connector"
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
@@ -466,6 +471,9 @@ class RouterArgs:
     pd_admission_wait_secs: int = 30
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
     # Routing policy
+    # How strictly a prefill is paired with a decode on their KV transfer
+    # protocol: off, lenient or strict
+    pd_pairing_mode: str = "lenient"
     policy: str = "cache_aware"
     postgres_db_url: str | None = None
     # The bound on one Postgres history-store call (pool wait, connect and the
@@ -532,6 +540,8 @@ class RouterArgs:
         default_factory=lambda: ["x-smg-routing-key"]
     )
     routing_key_override: bool = False
+    # Threads of the async runtime, at least 1; None = the runtime's default
+    runtime_worker_threads: int | None = None
     schema_config: str | None = None
     # The optimistic accounting TTL (ms) of the cache-aware selection
     selection_accounting_ttl_ms: int = 0
@@ -581,6 +591,11 @@ class RouterArgs:
     upstream_pool_idle_timeout_secs: int = 3
     # Worker overload protection is on by default; False switches both
     # thresholds off (--disable-worker-overload-protection)
+    # WebRTC: the UDP bind address (an IP; None = the unspecified address of
+    # the host's family)
+    webrtc_bind_addr: str | None = None
+    # WebRTC: the STUN server (host:port; "none" disables it)
+    webrtc_stun_server: str | None = None
     worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
     # instead of routing it to the least-loaded one
@@ -920,6 +935,19 @@ class RouterArgs:
             choices=["expected_wait", "requests", "least_requests"],
             default=RouterArgs.power_of_two_load_metric,
             help="What power_of_two compares: expected_wait, requests or least_requests",
+        )
+        routing_group.add_argument(
+            f"--{prefix}pd-pairing-mode",
+            type=str,
+            choices=["off", "lenient", "strict"],
+            default=RouterArgs.pd_pairing_mode,
+            help=(
+                "How strictly PD placement pairs a prefill with a decode on their KV"
+                " transfer protocol. lenient refuses only a known difference in runtime,"
+                " transport or KV layout (unknown components and engine versions pair"
+                " with anything); strict also refuses unknown components and version"
+                " differences; off pairs on nothing"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
@@ -1488,6 +1516,16 @@ class RouterArgs:
                 " data. By default every worker group is polled from"
                 " registration onward; this restores the old conditional gate"
                 " (a load-aware policy is always fed regardless)."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}engine-metrics",
+            action="store_true",
+            help=(
+                "Force load polling for the engine Prometheus gauges even without a"
+                " load-aware routing policy. Routing-owned polls are always re-exported."
+                " A worker whose KV-event stream pushes its load feeds the gauges from"
+                " those records and is not polled while they flow (polling is the fallback)."
             ),
         )
 
@@ -2641,6 +2679,12 @@ class RouterArgs:
             ),
         )
         auth_group.add_argument(
+            f"--{prefix}jwt-role-claim",
+            type=str,
+            default=RouterArgs.jwt_role_claim,
+            help="JWT claim name containing the role",
+        )
+        auth_group.add_argument(
             f"--{prefix}jwt-role-mapping",
             type=str,
             nargs="*",
@@ -2717,6 +2761,43 @@ class RouterArgs:
             type=str,
             default=None,
             help="This mesh node's private key (PKCS#8 PEM)",
+        )
+
+        # WebRTC
+        webrtc_group = parser.add_argument_group("WebRTC", "WebRTC transport settings")
+        webrtc_group.add_argument(
+            f"--{prefix}webrtc-bind-addr",
+            type=_ip_address,
+            default=RouterArgs.webrtc_bind_addr,
+            help=(
+                "Bind address for WebRTC UDP sockets (client-facing ICE candidate IP)."
+                " Default: the unspecified address of the host's family (:: for an IPv6"
+                " host, 0.0.0.0 otherwise), the candidate IP auto-detected via the routing"
+                " table. Set to 127.0.0.1 (or ::1) for local development on the same machine"
+            ),
+        )
+        webrtc_group.add_argument(
+            f"--{prefix}webrtc-stun-server",
+            type=str,
+            default=RouterArgs.webrtc_stun_server,
+            help=(
+                "STUN server for ICE candidate gathering (host:port). Set to your own STUN"
+                " server for deployments that restrict outbound traffic to external STUN"
+                " servers. Defaults to stun.l.google.com:19302; 'none' disables it"
+            ),
+        )
+
+        # Runtime
+        runtime_group = parser.add_argument_group("Runtime", "The async runtime")
+        runtime_group.add_argument(
+            f"--{prefix}runtime-worker-threads",
+            type=_non_negative_int,
+            default=RouterArgs.runtime_worker_threads,
+            help=(
+                "Explicit async runtime worker-thread count, at least 1. Leave unset to"
+                " use the runtime's default (the available parallelism, which honors the"
+                " cgroup CPU quota and is therefore container-aware)"
+            ),
         )
 
     @classmethod
