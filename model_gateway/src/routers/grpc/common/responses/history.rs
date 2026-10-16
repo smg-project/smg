@@ -134,40 +134,55 @@ pub(crate) fn stored_response_items(stored: &StoredResponse) -> Vec<ResponseInpu
         .collect()
 }
 
-/// Whether a stored item is one the history replays. The kinds neither
-/// conversion takes as input (a hosted image generation, an approval the
-/// client sent, the computer, shell, patch and local-shell tools, a
-/// compaction) are left out here rather than refused later: the gateway
-/// wrote those rows itself (a hosted tool's output, the client's approval
-/// turn), and a continuation that fails on them until the client deletes
-/// the row is a conversation the client cannot carry on. A request's own
-/// input items are not filtered here and keep their refusal.
-pub(crate) fn replays(item: &ResponseInputOutputItem) -> bool {
-    let replayable = !matches!(
-        item,
-        ResponseInputOutputItem::ImageGenerationCall { .. }
-            | ResponseInputOutputItem::McpApprovalResponse { .. }
-            | ResponseInputOutputItem::ComputerCall { .. }
-            | ResponseInputOutputItem::ComputerCallOutput { .. }
-            | ResponseInputOutputItem::Compaction { .. }
-            | ResponseInputOutputItem::ShellCall { .. }
-            | ResponseInputOutputItem::ShellCallOutput { .. }
-            | ResponseInputOutputItem::ApplyPatchCall { .. }
-            | ResponseInputOutputItem::ApplyPatchCallOutput { .. }
-            | ResponseInputOutputItem::LocalShellCall { .. }
-            | ResponseInputOutputItem::LocalShellCallOutput { .. }
-    );
-    if !replayable {
-        let kind = serde_json::to_value(item)
-            .ok()
-            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
-            .unwrap_or_default();
-        debug!(
-            item_type = %kind,
-            "Stored item of a kind the history does not replay; left out"
-        );
+/// Whether a stored item is one the history replays: see [`unreplayed_kind`].
+fn replays(item: &ResponseInputOutputItem) -> bool {
+    match unreplayed_kind(item) {
+        Some(kind) => {
+            debug!(
+                item_type = kind,
+                "Stored item of a kind the history does not replay; left out"
+            );
+            false
+        }
+        None => true,
     }
-    replayable
+}
+
+/// The name of a stored item's kind when neither conversion takes it as
+/// input (a hosted image generation, an approval the client sent, the
+/// computer, shell, patch and local-shell tools, a compaction), `None` for a
+/// kind the history replays. Such rows are left out when the history loads
+/// rather than refused later: the gateway wrote them itself (a hosted tool's
+/// output, the client's approval turn), and a continuation that fails on
+/// them until the client deletes the row is a conversation the client cannot
+/// carry on. A request's own input items are not filtered and keep their
+/// refusal. Every variant is named, so a new one has to say whether the
+/// history replays it.
+fn unreplayed_kind(item: &ResponseInputOutputItem) -> Option<&'static str> {
+    match item {
+        ResponseInputOutputItem::ImageGenerationCall { .. } => Some("image_generation_call"),
+        ResponseInputOutputItem::McpApprovalResponse { .. } => Some("mcp_approval_response"),
+        ResponseInputOutputItem::ComputerCall { .. } => Some("computer_call"),
+        ResponseInputOutputItem::ComputerCallOutput { .. } => Some("computer_call_output"),
+        ResponseInputOutputItem::Compaction { .. } => Some("compaction"),
+        ResponseInputOutputItem::ShellCall { .. } => Some("shell_call"),
+        ResponseInputOutputItem::ShellCallOutput { .. } => Some("shell_call_output"),
+        ResponseInputOutputItem::ApplyPatchCall { .. } => Some("apply_patch_call"),
+        ResponseInputOutputItem::ApplyPatchCallOutput { .. } => Some("apply_patch_call_output"),
+        ResponseInputOutputItem::LocalShellCall { .. } => Some("local_shell_call"),
+        ResponseInputOutputItem::LocalShellCallOutput { .. } => Some("local_shell_call_output"),
+        ResponseInputOutputItem::Message { .. }
+        | ResponseInputOutputItem::SimpleInputMessage { .. }
+        | ResponseInputOutputItem::Reasoning { .. }
+        | ResponseInputOutputItem::FunctionToolCall { .. }
+        | ResponseInputOutputItem::FunctionCallOutput { .. }
+        | ResponseInputOutputItem::McpApprovalRequest { .. }
+        | ResponseInputOutputItem::McpCall { .. }
+        | ResponseInputOutputItem::McpListTools { .. }
+        | ResponseInputOutputItem::CustomToolCall { .. }
+        | ResponseInputOutputItem::CustomToolCallOutput { .. }
+        | ResponseInputOutputItem::ItemReference { .. } => None,
+    }
 }
 
 /// What a stored hosted tool call replays as its result: its output when it
