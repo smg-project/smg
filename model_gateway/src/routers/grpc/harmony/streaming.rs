@@ -49,7 +49,8 @@ use crate::{
             },
             context,
             proto_wrapper::{
-                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
+                ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
+                ProtoResponseVariant, ProtoStream,
             },
             utils,
         },
@@ -80,6 +81,42 @@ fn streams_arguments(response_format: Option<&ResponseFormat>) -> bool {
 /// Returns an SSE stream that parses Harmony tokens incrementally and
 /// emits ChatCompletionChunk events for streaming responses.
 pub(crate) struct HarmonyStreamingProcessor;
+
+/// The error a Responses iteration ends with when its client left (see
+/// [`next_response`]): its callers end the stream on their error path, the
+/// one they take today when the client's leaving is met at a send.
+const CLIENT_LEFT: &str = "Client disconnected";
+
+/// One read of the engine stream for the client of a Responses iteration
+/// (see [`next_response`]).
+enum EngineRead {
+    /// A response of the stream, or the error the read met.
+    Response(Result<ProtoGenerateResponse, tonic::Status>),
+    /// The stream ended.
+    End,
+    /// The client left before the stream yielded.
+    ClientLeft,
+}
+
+/// The next response of the engine `stream`, read for the client at the
+/// receiving end of `tx`'s channel. A Responses iteration reads the engine
+/// stream itself and sends its events best-effort: parked on a generation
+/// that stalled mid-stream, it would learn that its client left only when
+/// the engine next spoke, and a generation nobody reads would run to its end
+/// and be stored as completed. Here every read races the engine against the
+/// client's leaving, looked at first so a busy engine cannot outrun it; on
+/// [`EngineRead::ClientLeft`] the caller returns, the stream is dropped
+/// unmarked with it, and its abort-on-drop ends the generation on the
+/// engine. A background response's `tx` is the sender of its relay, which
+/// closes with the work and not with the client: its reads are the engine's
+/// own, and the work outlives the client as it is meant to.
+async fn next_response(stream: &mut ProtoStream, tx: &SseSender) -> EngineRead {
+    tokio::select! {
+        biased;
+        () = tx.closed() => EngineRead::ClientLeft,
+        item = stream.next() => item.map_or(EngineRead::End, EngineRead::Response),
+    }
+}
 
 impl HarmonyStreamingProcessor {
     /// Create a new Harmony streaming processor
@@ -554,14 +591,30 @@ impl HarmonyStreamingProcessor {
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<ResponsesIterationResult, String> {
-        // Phase 1: Drain prefill stream. The client's prompt-side usage is the
-        // prefill side's prefix-cache hit: the decode side counts the KV it was
-        // handed as cached, so its responses are restamped with the prefill
-        // side's number before the decode phase reads them.
+        // Phase 1: Drain prefill stream, for the client (see `next_response`):
+        // a client that leaves during the prefill ends both sides at once. The
+        // client's prompt-side usage is the prefill side's prefix-cache hit:
+        // the decode side counts the KV it was handed as cached, so its
+        // responses are restamped with the prefill side's number before the
+        // decode phase reads them.
+        let drained = tokio::select! {
+            biased;
+            () = tx.closed() => None,
+            drained = drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {}) => {
+                Some(drained)
+            }
+        };
+        let Some(drained) = drained else {
+            // Both sides go with this return, unmarked: their abort-on-drop
+            // ends the request on the engines.
+            debug!(
+                response_id = %emitter.response_id,
+                "Client left during the prefill of the Responses stream; the request is aborted on the engines"
+            );
+            return Err(CLIENT_LEFT.to_string());
+        };
         let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {})
-                .await
-                .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            drained.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Phase 2: Process decode stream. Pass pd_timing so the first decode
@@ -592,7 +645,23 @@ impl HarmonyStreamingProcessor {
         pd_timing: Option<context::PdTiming>,
     ) -> Result<ResponsesIterationResult, String> {
         let mut decode = ResponsesDecode::new(pd_timing)?;
-        while let Some(result) = decode_stream.next().await {
+        // Each read races the engine against the client's leaving (see `next_response`).
+        loop {
+            let result = match next_response(&mut decode_stream, tx).await {
+                EngineRead::Response(result) => result,
+                EngineRead::End => break,
+                // The decode stream goes with this return, unmarked: its
+                // abort-on-drop ends the generation on the engine. The
+                // iteration ends as it does when the client's leaving is met
+                // at a send, and nothing of it is stored.
+                EngineRead::ClientLeft => {
+                    debug!(
+                        response_id = %emitter.response_id,
+                        "Client left during the Responses stream; the request is aborted on the engine"
+                    );
+                    return Err(CLIENT_LEFT.to_string());
+                }
+            };
             decode.frames += 1;
             let response = result.map_err(|e| format!("Decode stream error: {}", e.message()))?;
             match response.into_response() {
@@ -1601,6 +1670,8 @@ impl Default for HarmonyStreamingProcessor {
     }
 }
 
+#[cfg(test)]
+mod client_leave_tests;
 #[cfg(test)]
 mod local_stop_tests;
 #[cfg(test)]

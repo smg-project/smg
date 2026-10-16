@@ -435,6 +435,10 @@ pub struct EngineParams {
     pub kv_broadcast_capacity: usize,
     /// How many recent KV-event batches to retain for subscriber replay.
     pub kv_replay_capacity: usize,
+    /// The token ids every output starts with, before the synthetic ids: a
+    /// stream shaped for a gateway that parses the engine's tokens (a channel
+    /// header, say). Empty by default.
+    pub output_prefix: Vec<u32>,
 }
 
 impl Default for EngineParams {
@@ -454,6 +458,7 @@ impl Default for EngineParams {
             request_overhead_ms: 0.0,
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
+            output_prefix: Vec::new(),
         }
     }
 }
@@ -2216,7 +2221,11 @@ impl SchedulerState {
         let bs = p.block_size.max(1) as usize;
         let mut stored = Vec::new();
         let r = &mut self.running[idx];
-        let token_id = next_token(r);
+        let token_id = p
+            .output_prefix
+            .get(r.generated as usize)
+            .copied()
+            .unwrap_or_else(|| next_token(r));
         r.generated += 1;
         r.output_ids.push(token_id);
         r.rolling_hash = fnv_step(r.rolling_hash, token_id);
@@ -2609,6 +2618,39 @@ mod tests {
         ));
         assert!(st.is_idle());
         assert_eq!(st.pool.allocated, st.pool.free_lru.len() as u64);
+    }
+
+    /// Every output starts with the configured prefix; the synthetic ids
+    /// follow it.
+    #[test]
+    fn the_output_starts_with_the_configured_prefix() {
+        let p = EngineParams {
+            output_prefix: vec![200_005, 17_196, 200_008],
+            ..EngineParams::default()
+        };
+        let mut st = SchedulerState::new();
+        let (r, mut rx) = req("shaped", vec![7; 4], 5);
+        st.enqueue(r, &p);
+        let mut tokens = Vec::new();
+        for _ in 0..100_000 {
+            let step = st.step(&p);
+            for (tx, ev) in step.sends {
+                let _ = tx.send(ev);
+            }
+            while let Ok(ev) = rx.try_recv() {
+                if let GenEvent::Token { token_id, .. } = ev {
+                    tokens.push(token_id);
+                }
+            }
+            if tokens.len() == 5 {
+                break;
+            }
+        }
+        assert_eq!(&tokens[..3], &[200_005, 17_196, 200_008], "{tokens:?}");
+        assert!(
+            tokens[3..].iter().all(|id| (100..30_100).contains(id)),
+            "the synthetic ids follow the prefix: {tokens:?}"
+        );
     }
 
     /// Run passes until the given request emits its first Token, returning the
