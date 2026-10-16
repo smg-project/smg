@@ -149,29 +149,28 @@ single_match_else = "allow"
 doc_lazy_continuation = "allow"
 
 [profile.release]
-opt-level = "z"     # Optimize for size
-lto = "fat"         # Full LTO for smaller binaries
+# Speed over size. Built for size (opt-level "z") the gateway spent a
+# quarter to a third of its cycles under load in MachineOutliner stubs and
+# size-first call chains on AArch64; at opt-level 3 the same source costs
+# half the CPU per request and 40 % less per streamed frame on the gRPC
+# router path, for a stripped binary half again as large (53 to 80 MB).
+# opt-level 2 measured the same CPU and a 2 MB smaller binary.
+opt-level = 3
+lto = "fat"         # Full LTO: cross-crate inlining, dead code removed
 codegen-units = 1   # Better optimization, slower compile
 strip = false       # Keep symbols so production CPU profiles/flamegraphs are readable (#1575)
-
-# Optimize hot dependencies in the tiktoken encode path.
-[profile.release.package.tiktoken-rs]
-opt-level = 2
-
-[profile.release.package.fancy-regex]
-opt-level = 2
-
-[profile.release.package.regex-automata]
-opt-level = 2
 
 # The compute-heavy crates: image preprocessing (resize kernels, patch
 # gather, wire serialization, base64 and hashing of inline images), the
 # tokenizer path (encode, per-token decode, stop-sequence scan) and the
-# cache-aware routing trees. Built for size they run 25-50% slower; the
-# binary grows by about 1.5 MB (measured in #2768). Note that generic
-# functions are compiled in the crate that instantiates them, at that
-# crate's opt-level: a kv-index entry point generic over a caller closure
-# only benefits once it hands the work to a non-generic inner function.
+# cache-aware routing trees. Built for size they ran 25-50% slower; the
+# binary grew by about 1.5 MB (measured in #2768). With the profile itself
+# at opt-level 3 these entries change nothing; they stay so that the crates
+# keep their speed if the profile's level is lowered for size again. Note
+# that generic functions are compiled in the crate that instantiates them,
+# at that crate's opt-level: a kv-index entry point generic over a caller
+# closure only benefits once it hands the work to a non-generic inner
+# function.
 [profile.release.package.llm-multimodal]
 opt-level = 3
 
@@ -218,8 +217,8 @@ opt-level = 3
 opt-level = 3
 
 # The response-template parser runs on every streamed chunk, so it is built
-# like the other hot crates (#2768): 0.36 to 0.76 of the time it takes at
-# the profile's opt-level "z", 15 KB larger.
+# like the other hot crates (#2768): 0.36 to 0.76 of the time it took at
+# opt-level "z", 15 KB larger.
 [profile.release.package.smg-response-template]
 opt-level = 3
 
@@ -251,6 +250,6 @@ inherits = "dev"
 opt-level = 1
 
 [profile.bench]
-opt-level = 3       # Max speed for benchmarks (release uses "z" for size)
+opt-level = 3       # Max speed for benchmarks (as the release profile)
 lto = "thin"        # Good balance of speed and compile time
 codegen-units = 1   # Better optimization
