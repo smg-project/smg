@@ -3952,15 +3952,21 @@ mod tests {
         );
     }
 
-    /// Three files for the mesh TLS flags (their content is not read here).
-    fn mesh_tls_files(tag: &str) -> [String; 3] {
-        let dir = std::env::temp_dir().join(format!("smg-mesh-tls-{}-{tag}", std::process::id()));
+    /// Three files for a set of TLS flags (their content is not read here:
+    /// the validator checks that the paths are given, nothing parses the PEM).
+    fn tls_files(kind: &str, names: [&str; 3], tag: &str) -> [String; 3] {
+        let dir = std::env::temp_dir().join(format!("smg-{kind}-tls-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        ["ca.pem", "node.pem", "node-key.pem"].map(|name| {
+        names.map(|name| {
             let path = dir.join(name);
             std::fs::write(&path, b"test").unwrap();
             path.to_string_lossy().into_owned()
         })
+    }
+
+    /// Three files for the mesh TLS flags.
+    fn mesh_tls_files(tag: &str) -> [String; 3] {
+        tls_files("mesh", ["ca.pem", "node.pem", "node-key.pem"], tag)
     }
 
     /// `--bucket-adjust-interval-secs` reaches the bucket policy, which only
@@ -3995,14 +4001,9 @@ mod tests {
         assert!(Cli::try_parse_from(["smg", "--bucket-adjust-interval-secs", "-1"]).is_err());
     }
 
+    /// Three files for the worker mTLS flags.
     fn worker_tls_files(tag: &str) -> [String; 3] {
-        let dir = std::env::temp_dir().join(format!("smg-worker-tls-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        ["ca.pem", "client.pem", "client-key.pem"].map(|name| {
-            let path = dir.join(name);
-            std::fs::write(&path, b"test").unwrap();
-            path.to_string_lossy().into_owned()
-        })
+        tls_files("worker", ["ca.pem", "client.pem", "client-key.pem"], tag)
     }
 
     /// The worker mTLS flags reach the config as the launcher's options of the
