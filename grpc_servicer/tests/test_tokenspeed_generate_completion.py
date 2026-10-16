@@ -14,10 +14,7 @@ Run with: pytest grpc_servicer/tests/test_tokenspeed_generate_completion.py
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -27,38 +24,7 @@ pytest.importorskip("numpy")
 pytest.importorskip("smg_grpc_proto")
 from smg_grpc_proto.generated import tokenspeed_scheduler_pb2  # noqa: E402
 
-_ROOT = Path(__file__).parents[1] / "smg_grpc_servicer" / "tokenspeed"
 STOP_TOKEN_ID = 200_008
-
-
-@pytest.fixture
-def servicer_mod(monkeypatch):
-    # Importing the engine (and torch) loads the runtime's dependencies; these
-    # stand-ins cover the servicer module's imports and nothing of Generate.
-    symbols = {
-        "torch": "",
-        "tokenspeed.runtime.multimodal.inputs": "Modality MultimodalDataItem MultimodalInputs",
-        "tokenspeed.runtime.multimodal.shm_transport": "ShmTensorHandle",
-        "tokenspeed.runtime.pd.kv_events": "KVEventBatch",
-    }
-    for name, attrs in symbols.items():
-        parts = name.split(".")
-        for end in range(1, len(parts)):
-            parent = ".".join(parts[:end])
-            if parent not in sys.modules:
-                module = ModuleType(parent)
-                module.__path__ = []
-                monkeypatch.setitem(sys.modules, parent, module)
-        module = ModuleType(name)
-        for attr in attrs.split():
-            setattr(module, attr, object)
-        monkeypatch.setitem(sys.modules, name, module)
-    name = "smg_grpc_servicer.tokenspeed.servicer"
-    spec = importlib.util.spec_from_file_location(name, _ROOT / "servicer.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    return module
 
 
 class _AsyncLlm:
@@ -132,9 +98,9 @@ def _stop_only_output(index: int):
     }
 
 
-def _servicer(servicer_mod, outputs, expanded_rid, open_rids=()):
-    servicer = servicer_mod.TokenSpeedSchedulerServicer.__new__(
-        servicer_mod.TokenSpeedSchedulerServicer
+def _servicer(tokenspeed_servicer_mod, outputs, expanded_rid, open_rids=()):
+    servicer = tokenspeed_servicer_mod.TokenSpeedSchedulerServicer.__new__(
+        tokenspeed_servicer_mod.TokenSpeedSchedulerServicer
     )
     servicer.async_llm = _AsyncLlm(outputs, open_rids)
     servicer._build_generate_req = lambda request: SimpleNamespace(rid=expanded_rid)
@@ -149,23 +115,25 @@ def _kinds(responses):
     return [response.WhichOneof("response") for response in responses]
 
 
-def test_non_streaming_single_choice_closes_after_complete(servicer_mod):
-    servicer = _servicer(servicer_mod, [_output(0)], "engine-rid")
+def test_non_streaming_single_choice_closes_after_complete(tokenspeed_servicer_mod):
+    servicer = _servicer(tokenspeed_servicer_mod, [_output(0)], "engine-rid")
     responses = asyncio.run(_collect(servicer, _request(False)))
 
     assert len(responses) == 1
     assert responses[0].HasField("complete")
 
 
-def test_streaming_waits_for_every_choice_then_closes(servicer_mod):
-    servicer = _servicer(servicer_mod, [_output(0), _output(1)], ["rid-n0", "rid-n1"])
+def test_streaming_waits_for_every_choice_then_closes(tokenspeed_servicer_mod):
+    servicer = _servicer(tokenspeed_servicer_mod, [_output(0), _output(1)], ["rid-n0", "rid-n1"])
     responses = asyncio.run(_collect(servicer, _request(True)))
 
     assert _kinds(responses) == ["chunk", "complete", "chunk", "complete"]
 
 
-def test_streaming_skips_an_empty_stop_only_terminal_chunk(servicer_mod):
-    servicer = _servicer(servicer_mod, [_partial_output(0), _stop_only_output(0)], "engine-rid")
+def test_streaming_skips_an_empty_stop_only_terminal_chunk(tokenspeed_servicer_mod):
+    servicer = _servicer(
+        tokenspeed_servicer_mod, [_partial_output(0), _stop_only_output(0)], "engine-rid"
+    )
     responses = asyncio.run(_collect(servicer, _request(True)))
 
     assert _kinds(responses) == ["chunk", "complete"]
@@ -174,8 +142,8 @@ def test_streaming_skips_an_empty_stop_only_terminal_chunk(servicer_mod):
     assert responses[1].complete.matched_token_id == STOP_TOKEN_ID
 
 
-def test_streaming_opens_a_choice_whose_only_output_is_the_stop_token(servicer_mod):
-    servicer = _servicer(servicer_mod, [_stop_only_output(0)], "engine-rid")
+def test_streaming_opens_a_choice_whose_only_output_is_the_stop_token(tokenspeed_servicer_mod):
+    servicer = _servicer(tokenspeed_servicer_mod, [_stop_only_output(0)], "engine-rid")
     responses = asyncio.run(_collect(servicer, _request(True)))
 
     assert _kinds(responses) == ["chunk", "complete"]
@@ -184,8 +152,10 @@ def test_streaming_opens_a_choice_whose_only_output_is_the_stop_token(servicer_m
     assert responses[1].complete.matched_token_id == STOP_TOKEN_ID
 
 
-def test_streaming_opens_each_choice_even_one_that_is_only_the_stop_token(servicer_mod):
-    servicer = _servicer(servicer_mod, [_output(0), _stop_only_output(1)], ["rid-n0", "rid-n1"])
+def test_streaming_opens_each_choice_even_one_that_is_only_the_stop_token(tokenspeed_servicer_mod):
+    servicer = _servicer(
+        tokenspeed_servicer_mod, [_output(0), _stop_only_output(1)], ["rid-n0", "rid-n1"]
+    )
     responses = asyncio.run(_collect(servicer, _request(True)))
 
     assert _kinds(responses) == ["chunk", "complete", "chunk", "complete"]
@@ -193,8 +163,8 @@ def test_streaming_opens_each_choice_even_one_that_is_only_the_stop_token(servic
     assert list(responses[2].chunk.token_ids) == []
 
 
-def test_streaming_keeps_the_stop_token_when_the_client_asked_for_it(servicer_mod):
-    servicer = _servicer(servicer_mod, [_stop_only_output(0)], "engine-rid")
+def test_streaming_keeps_the_stop_token_when_the_client_asked_for_it(tokenspeed_servicer_mod):
+    servicer = _servicer(tokenspeed_servicer_mod, [_stop_only_output(0)], "engine-rid")
     request = tokenspeed_scheduler_pb2.GenerateRequest(
         request_id="request-1",
         stream=True,
@@ -206,8 +176,8 @@ def test_streaming_keeps_the_stop_token_when_the_client_asked_for_it(servicer_mo
     assert list(responses[0].chunk.token_ids) == [STOP_TOKEN_ID]
 
 
-def test_non_streaming_choice_list_closes_after_the_batch(servicer_mod):
-    servicer = _servicer(servicer_mod, [[_output(0), _output(1)]], ["rid-n0", "rid-n1"])
+def test_non_streaming_choice_list_closes_after_the_batch(tokenspeed_servicer_mod):
+    servicer = _servicer(tokenspeed_servicer_mod, [[_output(0), _output(1)]], ["rid-n0", "rid-n1"])
     responses = asyncio.run(_collect(servicer, _request(False)))
 
     assert len(responses) == 2
@@ -228,10 +198,10 @@ def test_non_streaming_choice_list_closes_after_the_batch(servicer_mod):
     ],
 )
 def test_the_engine_iterator_is_closed_before_its_request_table_is_checked(
-    servicer_mod, outputs, expanded_rid, stream, expected
+    tokenspeed_servicer_mod, outputs, expanded_rid, stream, expected
 ):
     open_rids = expanded_rid if isinstance(expanded_rid, list) else [expanded_rid]
-    servicer = _servicer(servicer_mod, outputs, expanded_rid, open_rids=open_rids)
+    servicer = _servicer(tokenspeed_servicer_mod, outputs, expanded_rid, open_rids=open_rids)
     responses = asyncio.run(_collect(servicer, _request(stream)))
 
     assert _kinds(responses) == expected

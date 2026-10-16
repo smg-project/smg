@@ -12,11 +12,8 @@ request's ``timeout_s`` and never less than a short retirement grace."""
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
 import time
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import grpc
 import pytest
@@ -27,39 +24,6 @@ pytest.importorskip("numpy")
 pytest.importorskip("smg_grpc_proto")
 from smg_grpc_proto.generated import common_pb2  # noqa: E402
 
-_ROOT = Path(__file__).parents[1] / "smg_grpc_servicer" / "tokenspeed"
-
-
-@pytest.fixture
-def servicer_mod(monkeypatch):
-    # Importing the engine (and torch) loads the runtime's dependencies; these
-    # stand-ins cover the servicer module's imports and nothing of
-    # FlushCache's body.
-    symbols = {
-        "torch": "",
-        "tokenspeed.runtime.multimodal.inputs": "Modality MultimodalDataItem MultimodalInputs",
-        "tokenspeed.runtime.multimodal.shm_transport": "ShmTensorHandle",
-        "tokenspeed.runtime.pd.kv_events": "KVEventBatch",
-    }
-    for name, attrs in symbols.items():
-        parts = name.split(".")
-        for end in range(1, len(parts)):
-            parent = ".".join(parts[:end])
-            if parent not in sys.modules:
-                module = ModuleType(parent)
-                module.__path__ = []
-                monkeypatch.setitem(sys.modules, parent, module)
-        module = ModuleType(name)
-        for attr in attrs.split():
-            setattr(module, attr, object)
-        monkeypatch.setitem(sys.modules, name, module)
-    name = "smg_grpc_servicer.tokenspeed.servicer"
-    spec = importlib.util.spec_from_file_location(name, _ROOT / "servicer.py")
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, name, module)
-    spec.loader.exec_module(module)
-    return module
-
 
 class _Context:
     """A servicer context whose ``abort`` is a test failure: these cases end
@@ -69,10 +33,10 @@ class _Context:
         raise AssertionError(f"FlushCache aborted: {code} {details}")
 
 
-def _servicer(servicer_mod, outcomes):
+def _servicer(tokenspeed_servicer_mod, outcomes):
     """A servicer whose engine answers ``flush_cache`` with ``outcomes`` in
     turn (the last one repeats); returns it with the list of attempts made."""
-    cls = servicer_mod.TokenSpeedSchedulerServicer
+    cls = tokenspeed_servicer_mod.TokenSpeedSchedulerServicer
     servicer = cls.__new__(cls)
     attempts = []
 
@@ -89,21 +53,21 @@ def _flush(servicer, timeout_s=0.0):
     return asyncio.run(servicer.FlushCache(request, _Context()))
 
 
-def _fast(servicer_mod, monkeypatch, *, grace_s):
+def _fast(tokenspeed_servicer_mod, monkeypatch, *, grace_s):
     # Never-defined before the retry existed: ``raising=False`` lets the
     # fails-before run reach the assertions instead of erroring on setattr.
-    monkeypatch.setattr(servicer_mod, "FLUSH_RETRY_INTERVAL_S", 0.0, raising=False)
-    monkeypatch.setattr(servicer_mod, "FLUSH_RETIRE_GRACE_S", grace_s, raising=False)
+    monkeypatch.setattr(tokenspeed_servicer_mod, "FLUSH_RETRY_INTERVAL_S", 0.0, raising=False)
+    monkeypatch.setattr(tokenspeed_servicer_mod, "FLUSH_RETIRE_GRACE_S", grace_s, raising=False)
 
 
 def test_an_immediate_flush_waits_for_the_engine_to_retire_a_finished_request(
-    servicer_mod, monkeypatch
+    tokenspeed_servicer_mod, monkeypatch
 ):
     """The gateway's shape: ``timeout_s=0`` right after a completion. The
     engine still pins the finished request's blocks on the first two attempts
     and accepts the third; the caller sees one successful flush."""
-    _fast(servicer_mod, monkeypatch, grace_s=5.0)
-    servicer, attempts = _servicer(servicer_mod, [False, False, True])
+    _fast(tokenspeed_servicer_mod, monkeypatch, grace_s=5.0)
+    servicer, attempts = _servicer(tokenspeed_servicer_mod, [False, False, True])
 
     response = _flush(servicer)
 
@@ -113,12 +77,12 @@ def test_an_immediate_flush_waits_for_the_engine_to_retire_a_finished_request(
 
 
 def test_a_request_still_in_flight_fails_the_flush_once_the_grace_is_spent(
-    servicer_mod, monkeypatch
+    tokenspeed_servicer_mod, monkeypatch
 ):
     """An engine that keeps refusing (a request really in flight) still fails
     the immediate flush, after the grace instead of at once."""
-    _fast(servicer_mod, monkeypatch, grace_s=0.02)
-    servicer, attempts = _servicer(servicer_mod, [False])
+    _fast(tokenspeed_servicer_mod, monkeypatch, grace_s=0.02)
+    servicer, attempts = _servicer(tokenspeed_servicer_mod, [False])
 
     response = _flush(servicer)
 
@@ -127,11 +91,11 @@ def test_a_request_still_in_flight_fails_the_flush_once_the_grace_is_spent(
     assert len(attempts) >= 2
 
 
-def test_a_positive_timeout_extends_the_wait_beyond_the_grace(servicer_mod, monkeypatch):
+def test_a_positive_timeout_extends_the_wait_beyond_the_grace(tokenspeed_servicer_mod, monkeypatch):
     """``timeout_s`` is the request's wait-for-idle budget: with no grace at
     all the servicer keeps trying for it and returns the engine's acceptance."""
-    _fast(servicer_mod, monkeypatch, grace_s=0.0)
-    servicer, attempts = _servicer(servicer_mod, [False, False, False, True])
+    _fast(tokenspeed_servicer_mod, monkeypatch, grace_s=0.0)
+    servicer, attempts = _servicer(tokenspeed_servicer_mod, [False, False, False, True])
 
     response = _flush(servicer, timeout_s=5.0)
 
@@ -139,10 +103,10 @@ def test_a_positive_timeout_extends_the_wait_beyond_the_grace(servicer_mod, monk
     assert attempts == [1, 2, 3, 4]
 
 
-def test_the_engines_own_message_is_reported(servicer_mod, monkeypatch):
+def test_the_engines_own_message_is_reported(tokenspeed_servicer_mod, monkeypatch):
     """A ``FlushCacheReqOutput`` that carries a message keeps it."""
-    _fast(servicer_mod, monkeypatch, grace_s=0.0)
-    servicer, _ = _servicer(servicer_mod, [True])
+    _fast(tokenspeed_servicer_mod, monkeypatch, grace_s=0.0)
+    servicer, _ = _servicer(tokenspeed_servicer_mod, [True])
 
     async def flush_cache():
         return SimpleNamespace(success=True, message="cleared 12 pages")
@@ -170,12 +134,12 @@ class _RecordingContext:
 
 @pytest.mark.parametrize("timeout_s", [-1.0, float("inf"), float("nan")])
 def test_a_non_finite_or_negative_timeout_is_refused_before_any_attempt(
-    servicer_mod, monkeypatch, timeout_s
+    tokenspeed_servicer_mod, monkeypatch, timeout_s
 ):
     """``timeout_s`` sizes the wait and the RPC bound; a value that cannot is
     an INVALID_ARGUMENT, as the vLLM servicer answers it."""
-    _fast(servicer_mod, monkeypatch, grace_s=0.0)
-    servicer, attempts = _servicer(servicer_mod, [True])
+    _fast(tokenspeed_servicer_mod, monkeypatch, grace_s=0.0)
+    servicer, attempts = _servicer(tokenspeed_servicer_mod, [True])
     context = _RecordingContext()
 
     with pytest.raises(_Abort):
@@ -185,13 +149,13 @@ def test_a_non_finite_or_negative_timeout_is_refused_before_any_attempt(
     assert attempts == []
 
 
-def test_the_whole_rpc_stays_within_the_scheduler_bound(servicer_mod, monkeypatch):
+def test_the_whole_rpc_stays_within_the_scheduler_bound(tokenspeed_servicer_mod, monkeypatch):
     """The retry window never outlives the scheduler round-trip bound: an
     attempt that hangs is cut at what is left of it."""
-    _fast(servicer_mod, monkeypatch, grace_s=60.0)
-    monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_TIMEOUT_S", 0.05, raising=False)
-    monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_MARGIN_S", 0.05, raising=False)
-    servicer, _ = _servicer(servicer_mod, [False])
+    _fast(tokenspeed_servicer_mod, monkeypatch, grace_s=60.0)
+    monkeypatch.setattr(tokenspeed_servicer_mod, "FLUSH_SCHEDULER_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setattr(tokenspeed_servicer_mod, "FLUSH_SCHEDULER_MARGIN_S", 0.05, raising=False)
+    servicer, _ = _servicer(tokenspeed_servicer_mod, [False])
 
     async def flush_cache():
         await asyncio.Event().wait()
@@ -207,15 +171,17 @@ def test_the_whole_rpc_stays_within_the_scheduler_bound(servicer_mod, monkeypatc
     assert [code for code, _ in context.aborts] == [grpc.StatusCode.DEADLINE_EXCEEDED]
 
 
-def test_a_refusing_engine_is_cut_at_the_scheduler_bound_not_the_grace(servicer_mod, monkeypatch):
+def test_a_refusing_engine_is_cut_at_the_scheduler_bound_not_the_grace(
+    tokenspeed_servicer_mod, monkeypatch
+):
     """The attempts share one deadline: an engine that refuses every attempt
     is cut at the scheduler bound with ``DEADLINE_EXCEEDED`` while the grace
     would still allow attempts (a per-attempt timeout would retry for the whole
     grace and answer a refusal instead)."""
-    _fast(servicer_mod, monkeypatch, grace_s=3.0)
-    monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_TIMEOUT_S", 0.05, raising=False)
-    monkeypatch.setattr(servicer_mod, "FLUSH_SCHEDULER_MARGIN_S", 0.05, raising=False)
-    servicer, attempts = _servicer(servicer_mod, [False])
+    _fast(tokenspeed_servicer_mod, monkeypatch, grace_s=3.0)
+    monkeypatch.setattr(tokenspeed_servicer_mod, "FLUSH_SCHEDULER_TIMEOUT_S", 0.05, raising=False)
+    monkeypatch.setattr(tokenspeed_servicer_mod, "FLUSH_SCHEDULER_MARGIN_S", 0.05, raising=False)
+    servicer, attempts = _servicer(tokenspeed_servicer_mod, [False])
     context = _RecordingContext()
 
     started = time.monotonic()
