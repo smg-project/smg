@@ -75,6 +75,15 @@ def _non_negative_int(value: str) -> int:
     return number
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for a count that must be at least 1: refused here, before
+    anything starts, rather than by the router's validation once it runs."""
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return number
+
+
 def _ip_address(value: str) -> str | None:
     """argparse type for a listener address the router validates as an IP address:
     a plain IPv4 or IPv6 literal, surrounding whitespace aside (blank is unset, as
@@ -95,6 +104,19 @@ def _ip_address(value: str) -> str | None:
         raise argparse.ArgumentTypeError(
             f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
         )
+    return address
+
+
+def _strict_ip_address(value: str) -> str:
+    """argparse type for an address the CLI parses as an IP address and nothing
+    else: blank and surrounding whitespace are refused here as clap refuses them,
+    so an unset variable never falls back to the default without a word."""
+    if not value or value != value.strip():
+        raise argparse.ArgumentTypeError(
+            f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
+        )
+    address = _ip_address(value)
+    assert address is not None
     return address
 
 
@@ -589,13 +611,13 @@ class RouterArgs:
     trust_tenant_header: bool = False
     upstream_http2: bool = False
     upstream_pool_idle_timeout_secs: int = 3
-    # Worker overload protection is on by default; False switches both
-    # thresholds off (--disable-worker-overload-protection)
     # WebRTC: the UDP bind address (an IP; None = the unspecified address of
     # the host's family)
     webrtc_bind_addr: str | None = None
     # WebRTC: the STUN server (host:port; "none" disables it)
     webrtc_stun_server: str | None = None
+    # Worker overload protection is on by default; False switches both
+    # thresholds off (--disable-worker-overload-protection)
     worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
     # instead of routing it to the least-loaded one
@@ -2767,7 +2789,7 @@ class RouterArgs:
         webrtc_group = parser.add_argument_group("WebRTC", "WebRTC transport settings")
         webrtc_group.add_argument(
             f"--{prefix}webrtc-bind-addr",
-            type=_ip_address,
+            type=_strict_ip_address,
             default=RouterArgs.webrtc_bind_addr,
             help=(
                 "Bind address for WebRTC UDP sockets (client-facing ICE candidate IP)."
@@ -2791,7 +2813,7 @@ class RouterArgs:
         runtime_group = parser.add_argument_group("Runtime", "The async runtime")
         runtime_group.add_argument(
             f"--{prefix}runtime-worker-threads",
-            type=_non_negative_int,
+            type=_positive_int,
             default=RouterArgs.runtime_worker_threads,
             help=(
                 "Explicit async runtime worker-thread count, at least 1. Leave unset to"

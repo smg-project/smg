@@ -2314,10 +2314,21 @@ class TestWebrtcOptions:
     def test_bind_addr_takes_an_ip_address(self, address):
         assert parse_router_args(["--webrtc-bind-addr", address]).webrtc_bind_addr == address
 
-    @pytest.mark.parametrize("value", ["localhost", "127.0.0.1:3478", "[::1]"])
+    @pytest.mark.parametrize(
+        "value", ["localhost", "127.0.0.1:3478", "[::1]", "", " 127.0.0.1 ", " "]
+    )
     def test_bind_addr_refuses_what_is_not_an_ip_address(self, value):
+        # Blank and padded values are refused too, as the CLI refuses them: an
+        # unset variable must not fall back to the default without a word.
         with pytest.raises(SystemExit):
             parse_router_args(["--webrtc-bind-addr", value])
+
+    def test_runtime_worker_threads_must_be_at_least_one(self):
+        assert parse_router_args(["--runtime-worker-threads", "1"]).runtime_worker_threads == 1
+        assert parse_router_args(["--runtime-worker-threads", "8"]).runtime_worker_threads == 8
+        for value in ["0", "-1"]:
+            with pytest.raises(SystemExit):
+                parse_router_args(["--runtime-worker-threads", value])
 
     @pytest.mark.parametrize("server", ["stun.example.net:3478", "none"])
     def test_stun_server_value(self, server):
