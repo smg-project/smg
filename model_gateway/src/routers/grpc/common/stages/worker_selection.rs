@@ -343,9 +343,14 @@ impl WorkerSelectionStage {
 
         // Selection inputs that survive the request drop: retry attempts
         // re-select from these. Text is copied only when a configured policy
-        // would actually read it (tokens win otherwise).
-        let keep_text =
-            tokens.is_none() || self.policy_registry.any_policy_needs_request_text(headers);
+        // would actually read it: always without token ids, and with them
+        // only for a policy that reads text next to the ids (cache_aware
+        // routes on the ids and would copy the whole rendered prompt for
+        // nothing).
+        let keep_text = tokens.is_none()
+            || self
+                .policy_registry
+                .any_policy_needs_request_text_with_tokens(headers);
         // The typed engine wires (gRPC servicers, direct ZMQ) do not carry the
         // request's cache-partition fields yet, so the engine's prefix cache
         // is unpartitioned on this path and the router must not split

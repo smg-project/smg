@@ -77,6 +77,16 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
+    /// Whether this policy reads the request text when the request's token
+    /// ids are available as well. A policy that routes on the ids and falls
+    /// back to the text only without them answers `false`, so a tokenized
+    /// request's selection snapshot carries the ids alone instead of a copy
+    /// of the whole rendered prompt next to them. Defaults to
+    /// [`Self::needs_request_text`].
+    fn needs_request_text_with_tokens(&self) -> bool {
+        self.needs_request_text()
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.

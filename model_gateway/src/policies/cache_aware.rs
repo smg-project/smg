@@ -1411,6 +1411,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         true // Cache-aware policy needs request text for cache affinity
     }
 
+    /// With token ids the selection never reads the text (`select_worker`
+    /// takes the ids first and the text only without them), so a tokenized
+    /// request keeps no copy of its prompt for a retry's re-selection.
+    fn needs_request_text_with_tokens(&self) -> bool {
+        false
+    }
+
     fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
         // WorkerMonitor invokes this immediately before publishing its complete
         // immutable snapshot (with no await between the two operations). Advance
@@ -3298,6 +3305,13 @@ impl Default for CacheAwarePolicy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_is_wanted_only_without_token_ids() {
+        let policy = CacheAwarePolicy::new();
+        assert!(policy.needs_request_text());
+        assert!(!policy.needs_request_text_with_tokens());
+    }
+
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
     use openai_protocol::worker::{
