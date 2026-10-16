@@ -97,10 +97,15 @@ impl HarmonyPreparationStage {
         // Step 1: Filter tools if needed
         let mut body_ref = utils::filter_chat_request_by_tool_choice(request);
 
-        // Step 2: Build structural tag constraint
-        let tool_constraint = if let Some(tools) = body_ref.tools.as_ref() {
-            Self::generate_tool_call_constraint(tools, body_ref.tool_choice.as_ref())
-                .map_err(|e| *e)?
+        // Step 2: Build structural tag constraint over the tools the choice may
+        // force, wherever the request declares them (`callable_tools`; the
+        // request declares some when `declares_tools` says so).
+        let tool_constraint = if request.declares_tools() {
+            Self::generate_tool_call_constraint(
+                &request.callable_tools(),
+                body_ref.tool_choice.as_ref(),
+            )
+            .map_err(|e| *e)?
         } else {
             None
         };

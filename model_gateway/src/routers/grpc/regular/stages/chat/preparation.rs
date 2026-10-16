@@ -444,26 +444,13 @@ pub(crate) async fn prepare_chat_like(
                 tokenizer.as_ref(),
             );
 
-        // Derive skip_special_tokens from parser and constraint type:
-        // - typed reasoning parsers need their control tokens preserved
-        // - json_schema: backend forces JSON, no trigger tokens to preserve
-        // - structural_tag or no constraint (auto): parser needs trigger tokens
-        let skip_special_tokens = if preserve_reasoning_special_tokens {
-            false
-        } else {
-            match &tool_call_constraint {
-                Some(c) if c.is_json_schema() => request.skip_special_tokens,
-                _ if request.tools.is_some()
-                    && !matches!(
-                        request.tool_choice,
-                        Some(ToolChoice::Value(ToolChoiceValue::None))
-                    ) =>
-                {
-                    false
-                }
-                _ => request.skip_special_tokens,
-            }
-        };
+        let skip_special_tokens = skips_special_tokens(
+            request,
+            tool_call_constraint
+                .as_ref()
+                .is_some_and(|constraint| constraint.is_json_schema()),
+            preserve_reasoning_special_tokens,
+        );
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
         let stop_decoder = utils::create_stop_decoder(
@@ -489,5 +476,149 @@ pub(crate) async fn prepare_chat_like(
             tool_call_constraint.map(|c| c.to_tuple()),
             has_output_grammar,
         ))
+    }
+}
+
+/// Whether the engine drops its special tokens from the response. A reasoning
+/// parser or a table whose markers are special tokens needs them kept, whatever
+/// the request says; a JSON-schema constraint forces the call's JSON, so there
+/// are no markers to keep and the request's own setting stands; a request that
+/// offers tools the model may call (declared at the request level or on a
+/// message, see `ChatCompletionRequest::declares_tools`, the calls not switched
+/// off by `tool_choice: none`) keeps them for the tool parser's markers; any
+/// other request keeps its own setting.
+fn skips_special_tokens(
+    request: &ChatCompletionRequest,
+    json_schema_constraint: bool,
+    preserve_reasoning_special_tokens: bool,
+) -> bool {
+    if preserve_reasoning_special_tokens {
+        return false;
+    }
+    if json_schema_constraint {
+        return request.skip_special_tokens;
+    }
+    let calls_off = matches!(
+        request.tool_choice,
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+    );
+    if request.declares_tools() && !calls_off {
+        false
+    } else {
+        request.skip_special_tokens
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::validated::Normalizable;
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+        })
+    }
+
+    /// A system message declaring `tools`, as the profiles that read such
+    /// declarations take it.
+    fn declaring(tools: &[Value]) -> Value {
+        json!({"role": "system", "content": "", "tools": tools})
+    }
+
+    fn user() -> Value {
+        json!({"role": "user", "content": "weather?"})
+    }
+
+    /// A request as the HTTP layer hands it on: normalized, so an empty `tools`
+    /// list has become `tool_choice: none`.
+    fn request(value: Value) -> ChatCompletionRequest {
+        let mut request: ChatCompletionRequest =
+            serde_json::from_value(value).expect("request deserializes");
+        request.normalize();
+        request
+    }
+
+    fn message_level_only() -> ChatCompletionRequest {
+        request(json!({
+            "model": "kimi-k3",
+            "messages": [declaring(&[tool("get_weather")]), user()]
+        }))
+    }
+
+    #[test]
+    fn tools_keep_the_special_tokens_wherever_they_are_declared() {
+        let request_level_only = request(json!({
+            "model": "kimi-k3",
+            "messages": [user()],
+            "tools": [tool("get_time")]
+        }));
+        assert!(!skips_special_tokens(&request_level_only, false, false));
+
+        assert!(!skips_special_tokens(&message_level_only(), false, false));
+
+        let both = request(json!({
+            "model": "kimi-k3",
+            "messages": [declaring(&[tool("get_weather")]), user()],
+            "tools": [tool("get_time")]
+        }));
+        assert!(!skips_special_tokens(&both, false, false));
+
+        // No tools anywhere: the request's own setting, whichever way it goes.
+        let none = request(json!({"model": "kimi-k3", "messages": [user()]}));
+        assert!(skips_special_tokens(&none, false, false));
+        let kept = request(json!({
+            "model": "kimi-k3",
+            "messages": [user()],
+            "skip_special_tokens": false
+        }));
+        assert!(!skips_special_tokens(&kept, false, false));
+    }
+
+    #[test]
+    fn conflicting_declarations_resolve_as_the_other_gates_resolve_them() {
+        // An empty request-level list beside a message's declaration: the
+        // normalizer's `tool_choice: none` switches the calls off, as it does
+        // without the message, so the parser is off too and nothing is kept.
+        let empty_list = request(json!({
+            "model": "kimi-k3",
+            "messages": [declaring(&[tool("get_weather")]), user()],
+            "tools": []
+        }));
+        assert!(matches!(
+            empty_list.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        ));
+        assert!(skips_special_tokens(&empty_list, false, false));
+
+        // `tool_choice: none` written by the client, over a message's declaration.
+        let switched_off = request(json!({
+            "model": "kimi-k3",
+            "messages": [declaring(&[tool("get_weather")]), user()],
+            "tool_choice": "none"
+        }));
+        assert!(skips_special_tokens(&switched_off, false, false));
+
+        // A message's declaration under a profile that reads none widens nothing.
+        let unread = request(json!({
+            "model": "self-hosted-model",
+            "messages": [declaring(&[tool("get_weather")]), user()]
+        }));
+        assert!(skips_special_tokens(&unread, false, false));
+    }
+
+    #[test]
+    fn the_constraint_and_the_reasoning_markers_decide_before_the_tools() {
+        // A JSON-schema constraint forces the call's JSON: nothing to keep, the
+        // request's setting stands even with a message-declared tool.
+        assert!(skips_special_tokens(&message_level_only(), true, false));
+
+        // Reasoning markers the decoder would drop are kept whatever the request says.
+        let none = request(json!({"model": "kimi-k3", "messages": [user()]}));
+        assert!(!skips_special_tokens(&none, false, true));
+        assert!(!skips_special_tokens(&none, true, true));
     }
 }

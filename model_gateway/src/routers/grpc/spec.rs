@@ -106,21 +106,19 @@ pub(crate) struct ChatResponseSpec {
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
+        let provider = ProviderProfile::for_model(&request.model);
         Self {
-            provider: ProviderProfile::for_model(&request.model),
+            provider,
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included. `None` when the response is not scanned for tool calls:
-            // the request declares no tools anywhere and the provider does not
-            // parse tool calls without them.
-            tools: {
-                let tools: Vec<Tool> = request.effective_tools().cloned().collect();
-                let scanned = request.tools.is_some()
-                    || !tools.is_empty()
-                    || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools();
-                scanned.then_some(tools)
-            },
+            // the request declares no tools anywhere
+            // (`ChatCompletionRequest::declares_tools`, the one answer every
+            // gate reads) and the provider does not parse tool calls without
+            // them.
+            tools: (request.declares_tools() || provider.parses_tool_calls_without_tools())
+                .then(|| request.effective_tools().cloned().collect()),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
@@ -310,6 +308,39 @@ mod tests {
         let spec = ChatResponseSpec::from(&request);
 
         assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_follow_an_empty_request_list_beside_a_message_declaration() {
+        // The empty request-level list is a declaration (the normalizer answers
+        // it with `tool_choice: none`, which switches the calls off); the
+        // message's tool is the set.
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": []
+        }));
+
+        assert_eq!(
+            tool_names(&ChatResponseSpec::from(&request)),
+            ["get_weather"]
+        );
+    }
+
+    #[test]
+    fn chat_spec_tools_none_for_a_message_declaration_the_profile_does_not_read() {
+        let request = chat_request(json!({
+            "model": "self-hosted-model",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "hi"}
+            ]
+        }));
+
+        assert!(ChatResponseSpec::from(&request).tools.is_none());
     }
 
     #[test]

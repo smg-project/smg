@@ -811,6 +811,21 @@ impl ChatCompletionRequest {
         ProviderProfile::for_model(&self.model).dynamic_tools(self)
     }
 
+    /// Whether the request offers the model any tool: a request-level `tools`
+    /// field, an empty list included (the normalizer answers an empty list
+    /// with `tool_choice: none`, which switches the calls off), or a tool a
+    /// message declares. Every gate on the serving path that asks "does this
+    /// request have tools" (whether the response is scanned for calls, whether
+    /// the engine keeps the special tokens the call markers are made of,
+    /// whether a prompt opens its tool channel) reads this one answer: a gate
+    /// that read `tools` alone took a request whose tools are all declared on
+    /// messages for a request without tools, and its calls came back as text.
+    /// Whether a call can be forced is a question for the narrowed set,
+    /// [`Self::callable_tools`].
+    pub fn declares_tools(&self) -> bool {
+        self.tools.is_some() || self.dynamic_tools().next().is_some()
+    }
+
     /// Every tool the model will see: the request-level `tools` followed by
     /// the dynamic tools. Anything that resolves a tool name in the response,
     /// tool-call parsing first of all, must work from this set rather than

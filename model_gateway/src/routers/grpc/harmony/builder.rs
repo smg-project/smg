@@ -300,6 +300,15 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
     !tool_types.iter().all(|t| BUILTIN_TOOLS.contains(t))
 }
 
+/// The tools a chat request offers, wherever it declares them (at the request
+/// level or on a message: `ChatCompletionRequest::declares_tools`), in the order
+/// the model sees them; `None` when it declares none.
+fn chat_tools(request: &ChatCompletionRequest) -> Option<Vec<Tool>> {
+    request
+        .declares_tools()
+        .then(|| request.effective_tools().cloned().collect())
+}
+
 /// Harmony request builder
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
@@ -356,7 +365,7 @@ impl HarmonyBuilder {
         let sys_msg = self.build_system_message_from_chat(request);
         all_messages.push(sys_msg);
 
-        let dev_msg = self.build_developer_message_from_chat(request.tools.as_ref());
+        let dev_msg = self.build_developer_message_from_chat(chat_tools(request).as_ref());
         all_messages.push(dev_msg);
 
         let mut user_messages = self.convert_chat_messages(&request.messages);
@@ -489,8 +498,7 @@ impl HarmonyBuilder {
             .as_deref()
             .map(harmony_reasoning_effort_from_str);
 
-        let has_tools = request.tools.is_some();
-        self.build_system_message(reasoning_effort, has_tools)
+        self.build_system_message(reasoning_effort, request.declares_tools())
     }
 
     /// Build system message from ResponsesRequest
@@ -1589,5 +1597,84 @@ mod tests {
             .unwrap();
         assert!(decoded.contains("type weather.lookup = ("), "{decoded}");
         assert!(decoded.contains("type travel.lookup = ("), "{decoded}");
+    }
+
+    #[test]
+    fn chat_tools_are_read_wherever_the_request_declares_them() {
+        let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+        let user = json!({"role": "user", "content": "weather?"});
+        let declaring = json!({"role": "system", "content": "", "tools": [tool("get_weather")]});
+        let request = |body: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("request deserializes")
+        };
+        let cases = [
+            (
+                "request-level only",
+                request(
+                    json!({"model": "kimi-k3", "messages": [user], "tools": [tool("get_time")]}),
+                ),
+                vec!["get_time"],
+            ),
+            (
+                "message-level only",
+                request(json!({"model": "kimi-k3", "messages": [declaring, user]})),
+                vec!["get_weather"],
+            ),
+            (
+                "both",
+                request(json!({
+                    "model": "kimi-k3",
+                    "messages": [declaring, user],
+                    "tools": [tool("get_time")]
+                })),
+                vec!["get_time", "get_weather"],
+            ),
+            (
+                "a declaration the profile does not read",
+                request(json!({"model": "gpt-oss-120b", "messages": [declaring, user]})),
+                vec![],
+            ),
+        ];
+        let builder = HarmonyBuilder::new();
+        for (case, request, expected) in cases {
+            assert_eq!(request.declares_tools(), !expected.is_empty(), "{case}");
+            let tools = chat_tools(&request);
+            let names: Vec<&str> = tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.function.name.as_str())
+                .collect();
+            assert_eq!(names, expected, "{case}");
+            // The system message opens the commentary channel for a request with tools.
+            let system = builder.build_system_message_from_chat(&request);
+            let commentary = system.content.iter().any(|content| match content {
+                Content::SystemContent(content) => {
+                    content.channel_config.as_ref().is_some_and(|channels| {
+                        channels.valid_channels.iter().any(|c| c == "commentary")
+                    })
+                }
+                _ => false,
+            });
+            assert_eq!(commentary, !expected.is_empty(), "{case}");
+            // The developer message describes the same tools.
+            let developer = builder.build_developer_message_from_chat(tools.as_ref());
+            assert_eq!(developer.content.len(), 1, "{case}");
+            let described: Vec<String> = developer
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::DeveloperContent(content) => Some(content),
+                    _ => None,
+                })
+                .flat_map(|content| {
+                    content
+                        .tools
+                        .iter()
+                        .flat_map(|namespaces| namespaces.values())
+                })
+                .flat_map(|namespace| namespace.tools.iter().map(|tool| tool.name.clone()))
+                .collect();
+            assert_eq!(described, expected, "{case}");
+        }
     }
 }

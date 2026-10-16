@@ -1642,3 +1642,96 @@ fn callable_tools_follow_tool_choice_across_request_and_dynamic_tools() {
     }));
     assert!(none.is_empty());
 }
+
+/// `declares_tools` on a request as the HTTP layer hands it on (normalized).
+#[expect(clippy::expect_used, reason = "test helper")]
+fn declares_tools(value: Value) -> bool {
+    let mut req: ChatCompletionRequest =
+        serde_json::from_value(value).expect("request deserializes");
+    req.normalize();
+    req.declares_tools()
+}
+
+#[test]
+fn declares_tools_reads_request_and_message_declarations_alike() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+    let user = json!({"role": "user", "content": "hi"});
+
+    // Request-level only.
+    assert!(declares_tools(json!({
+        "model": "kimi-k3",
+        "messages": [user],
+        "tools": [tool("get_time")]
+    })));
+
+    // Message-level only: not a request without tools.
+    assert!(declares_tools(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            user
+        ]
+    })));
+
+    // Both.
+    assert!(declares_tools(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "developer", "content": "", "tools": [tool("get_weather")]},
+            user
+        ],
+        "tools": [tool("get_time")]
+    })));
+
+    // No declaration anywhere.
+    assert!(!declares_tools(
+        json!({"model": "kimi-k3", "messages": [user]})
+    ));
+}
+
+#[test]
+fn declares_tools_resolves_conflicting_declarations_as_effective_tools_does() {
+    let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+    let user = json!({"role": "user", "content": "hi"});
+
+    // An empty request-level list beside a message's declaration still declares
+    // tools, and the message's tool is the effective set; the empty list
+    // switches the calls off through the normalizer's `tool_choice: none`, as
+    // it does without the message.
+    let mut empty_list: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "kimi-k3",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            user
+        ],
+        "tools": []
+    }))
+    .expect("request deserializes");
+    empty_list.normalize();
+    assert!(empty_list.declares_tools());
+    assert_eq!(empty_list.effective_tools().count(), 1);
+    assert!(matches!(
+        empty_list.tool_choice,
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+    ));
+
+    // A message's declaration under a profile that reads none widens nothing,
+    // with or without the normalizer's pass over foreign extensions.
+    let unread: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "self-hosted-model",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            user
+        ]
+    }))
+    .expect("request deserializes");
+    assert!(!unread.declares_tools());
+    assert_eq!(unread.effective_tools().count(), 0);
+    assert!(!declares_tools(json!({
+        "model": "self-hosted-model",
+        "messages": [
+            {"role": "system", "content": "", "tools": [tool("get_weather")]},
+            user
+        ]
+    })));
+}
