@@ -1,0 +1,20 @@
+# Regression gate for `cargo bench -p smg --bench request_processing`, run by
+# .github/workflows/benchmark-request-processing.yml on pull requests through scripts/bench_gate.py.
+#
+# The gate runs the four criterion groups behind the push-to-main job's `benchmark_summary` lines
+# (json_serialization, json_deserialization, bootstrap_injection, full_round_trip: 17 ids), that
+# is criterion's warmed-up sample medians where the summary is one 1,000-iteration average without
+# warm-up. direct_json_routing and throughput_by_size stay out of the gate for the time budget.
+#
+# Threshold (the method is described in tokenizer.toml): the identical-build spread of the 17 ids
+# is 1.5 - 6.4 % (ten pinned runs of one build of main on a busy shared build host; the null case
+# through this gate passed), and the summary lines moved 3.6 - 8.0 % across three builds on a quiet
+# machine. 15 % is the smallest multiple of 5 % at least twice the first and 1.5 x the second.
+
+repeats = 3
+filter = "^(json_serialization|json_deserialization|bootstrap_injection|full_round_trip)/"
+
+[[gate]]
+pattern = "^(json_serialization|json_deserialization|bootstrap_injection|full_round_trip)/"
+threshold = 0.15
+note = "identical build 1.5 - 6.4 %, across builds (summary lines) 3.6 - 8.0 %"
