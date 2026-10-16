@@ -28,6 +28,14 @@ def test_a_full_queue_is_an_abort_the_worker_answers_for():
     assert abort_code_from_output(output) == grpc.StatusCode.UNAVAILABLE
 
 
+def test_a_full_queue_refused_with_429_and_a_timeout_carry_their_own_codes():
+    # The shared table: the same engine condition is the same status behind every engine.
+    busy = _output({"type": "abort", "message": "Too many requests", "status_code": 429})
+    assert abort_code_from_output(busy) == grpc.StatusCode.RESOURCE_EXHAUSTED
+    late = _output({"type": "abort", "message": "Request timed out", "status_code": 408})
+    assert abort_code_from_output(late) == grpc.StatusCode.DEADLINE_EXCEEDED
+
+
 def test_an_unknown_status_maps_to_internal():
     output = _output({"type": "abort", "message": "scheduler failure", "status_code": 500})
     assert scheduler_abort(output) is not None
