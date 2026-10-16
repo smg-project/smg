@@ -1446,12 +1446,23 @@ impl WorkerSelectionStage {
             };
         // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
         // accepts either transport (not HTTP). A retry pins the retained wire.
-        placement::select_single(
+        let candidates = placement::candidates(
             &self.worker_registry,
-            &self.policy_registry,
             model_id,
             RoutingPool::GrpcPipelineRegular,
             wire,
+        );
+        let candidates = candidates.as_slice();
+        // Preserve the borrowed-snapshot path when every worker qualifies.
+        // Use this same snapshot for selection so membership cannot change
+        // between deciding whether a filter is needed and applying it.
+        let candidate_filter = candidate_filter
+            .filter(|accepts| candidates.iter().any(|worker| !accepts(worker.as_ref())));
+        placement::select_from(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            candidates,
             PlacementInputs {
                 text,
                 tokens,
