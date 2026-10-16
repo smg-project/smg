@@ -83,6 +83,9 @@ struct ToolCallStreamItem {
     item_id: String,
     call_id: String,
     name: String,
+    /// Whether `name` is one of the request's custom tools; decided when the
+    /// name arrives, so no later delta builds the request's custom-tool set.
+    custom: bool,
     arguments: String,
     added_emitted: bool,
 }
@@ -1088,7 +1091,7 @@ impl ResponseStreamEventEmitter {
     /// output, so they must be closed and collected here.
     async fn close_tool_call_items(&mut self, tx: &SseSender) -> Result<(), String> {
         for item in std::mem::take(&mut self.tool_call_items) {
-            let full = if self.is_custom_tool(&item.name) {
+            let full = if item.custom {
                 let input = super::utils::custom_tool_input(&item.arguments);
                 for (event_type, field) in [
                     ("response.custom_tool_call_input.delta", "delta"),
@@ -1290,6 +1293,7 @@ impl ResponseStreamEventEmitter {
                         .clone()
                         .unwrap_or_else(|| format!("call_{}", Uuid::now_v7())),
                     name: String::new(),
+                    custom: false,
                     arguments: String::new(),
                     added_emitted: false,
                 });
@@ -1304,9 +1308,14 @@ impl ResponseStreamEventEmitter {
             .and_then(|f| f.arguments.as_deref())
             .filter(|a| !a.is_empty());
 
+        // The name arrives once; whether it names a custom tool is decided
+        // then and kept on the item.
+        let arriving_name = name_delta.filter(|_| self.tool_call_items[pos].name.is_empty());
+        let arriving_custom = arriving_name.is_some_and(|name| self.is_custom_tool(name));
         let item = &mut self.tool_call_items[pos];
-        if let (true, Some(name)) = (item.name.is_empty(), name_delta) {
+        if let Some(name) = arriving_name {
             item.name = name.to_string();
+            item.custom = arriving_custom;
         }
         if let Some(args) = args_delta {
             item.arguments.push_str(args);
@@ -1314,10 +1323,10 @@ impl ResponseStreamEventEmitter {
         let emit_added =
             !item.added_emitted && (!item.name.is_empty() || !item.arguments.is_empty());
         item.added_emitted |= emit_added;
-        let (output_index, item_id) = (item.output_index, item.item_id.clone());
-        // Decided once the `&mut` borrow above is over; the call id and the
-        // name are copied only for the announcement, not on every delta.
-        let custom = self.is_custom_tool(&self.tool_call_items[pos].name);
+        // The call id and the name are copied only for the announcement, not
+        // on every delta.
+        let (output_index, item_id, custom) =
+            (item.output_index, item.item_id.clone(), item.custom);
 
         if emit_added {
             let announced = &self.tool_call_items[pos];
