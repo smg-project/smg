@@ -253,7 +253,38 @@ impl HuggingFaceTokenizer {
         self.encode_path() == EncodePath::V1
     }
 
-    /// Create a tokenizer from a HuggingFace tokenizer JSON file
+    /// The `tokenizers` pipeline behind this tokenizer, as loaded: the
+    /// vocabulary and stages of `tokenizer.json`, with the post-processor
+    /// the configuration prescribes when `tokenizer_config.json` sets
+    /// `add_bos_token` or `add_eos_token` (the rule is on
+    /// [`Self::from_file`]). A cross-check of the crate's ids against the
+    /// `tokenizers` crate compares with this pipeline, which adds the same
+    /// special tokens on request, or with `add_special_tokens` off, where it
+    /// and `tokenizer.json` read alone agree.
+    pub fn tokenizers_pipeline(&self) -> &HfTokenizer {
+        &self.tokenizer
+    }
+
+    /// Create a tokenizer from a HuggingFace tokenizer JSON file.
+    ///
+    /// Special tokens on request: an encode with `add_special_tokens` set
+    /// adds what the checkpoint's configuration prescribes, not only what
+    /// `tokenizer.json` holds. When the sibling `tokenizer_config.json` sets
+    /// `add_bos_token` or `add_eos_token` to `true`, the loader replaces the
+    /// file's post-processor with the template `{bos} $A {eos}` (each end as
+    /// configured, when its token is in the vocabulary), the one the
+    /// `transformers` Llama-style fast tokenizer classes install at load
+    /// (`update_post_processor`), so the ids are those the serving engine's
+    /// tokenizer produces. A checkpoint whose `tokenizer.json` carries a
+    /// plain `ByteLevel` post-processor while its configuration says
+    /// `add_bos_token: true` therefore gets the configured BOS prepended on
+    /// request, where the `tokenizers` crate reading `tokenizer.json` alone
+    /// adds nothing; without the flag the ids are the file's in both.
+    /// Nothing changes unless one of the two is an explicit `true` (with
+    /// `add_bos_token` unset and `add_eos_token: true`, the BOS stays when
+    /// the file's post-processor already adds tokens). A cross-check against
+    /// the `tokenizers` crate compares with [`Self::tokenizers_pipeline`],
+    /// the same post-processor, or with the flag off.
     pub fn from_file(file_path: &str) -> Result<Self> {
         // Try to auto-discover chat template if not explicitly provided
         let path = Path::new(file_path);
@@ -263,7 +294,9 @@ impl HuggingFaceTokenizer {
         Self::from_file_with_chat_template(file_path, chat_template_path.as_deref())
     }
 
-    /// Create a tokenizer from a HuggingFace tokenizer JSON file with an optional chat template
+    /// Create a tokenizer from a HuggingFace tokenizer JSON file with an
+    /// optional chat template; the special-token rule of [`Self::from_file`]
+    /// applies.
     pub fn from_file_with_chat_template(
         file_path: &str,
         chat_template_path: Option<&str>,
@@ -275,7 +308,8 @@ impl HuggingFaceTokenizer {
 
     /// Create a Qwen2-compatible byte-level BPE tokenizer from a Hugging Face
     /// directory containing `vocab.json`, `merges.txt`, and
-    /// `tokenizer_config.json` but no `tokenizer.json`.
+    /// `tokenizer_config.json` but no `tokenizer.json`. The special-token
+    /// rule of [`Self::from_file`] applies to the configuration here too.
     pub fn from_vocab_and_merges_dir(dir: &Path) -> Result<Self> {
         let chat_template_path = crate::factory::discover_chat_template_in_dir(dir);
         Self::from_vocab_and_merges_dir_with_chat_template(dir, chat_template_path.as_deref())
@@ -433,8 +467,11 @@ impl HuggingFaceTokenizer {
             chat_template_str = load_chat_template_from_file(template_path)?;
         }
 
-        // Configure post_processor based on tokenizer_config.json (matches Python transformers)
-        // Only modify when at least one setting is explicitly true
+        // The configuration's special tokens on request (the rule is on
+        // `from_file`): an explicit `add_bos_token` / `add_eos_token` of
+        // true replaces the file's post-processor with the template the
+        // `transformers` Llama-style fast classes install at load
+        // (`update_post_processor`); nothing changes unless one is true.
         let needs_eos = add_eos_token == Some(true);
         let needs_bos = match add_bos_token {
             Some(true) => true,

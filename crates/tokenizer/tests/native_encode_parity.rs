@@ -3,15 +3,17 @@
 //! Opt-in: `SMG_NATIVE_ENCODE_TOKENIZER_DIRS` lists tokenizer directories
 //! (comma-separated, each with a `tokenizer.json`). For each, the crate's
 //! tokenizer must take the native path and give the same ids as the
-//! `tokenizers` pipeline on the same file, over mixed-script random text,
-//! texts with the tokenizer's own special tokens, and long prompts. Without
-//! the variable the test prints a notice and passes; the in-repo unit tests
-//! cover the same comparison on synthetic vocabularies, and the bellwether
-//! fixture test covers recorded prompts.
+//! `tokenizers` pipeline the crate configures from the same files (the file
+//! with the special-token rule of `tokenizer_config.json`, see
+//! [`HuggingFaceTokenizer::tokenizers_pipeline`]; the file read alone would
+//! show a configured BOS as a difference with special tokens on), over
+//! mixed-script random text, texts with the tokenizer's own special tokens,
+//! and long prompts. Without the variable the test prints a notice and
+//! passes; the in-repo unit tests cover the same comparison on synthetic
+//! vocabularies, and the bellwether fixture test covers recorded prompts.
 #![expect(clippy::print_stdout, reason = "the test reports what it compared")]
 
-use llm_tokenizer::{create_tokenizer, traits::Encoding};
-use tokenizers::Tokenizer as HfTokenizer;
+use llm_tokenizer::{create_tokenizer, traits::Encoding, HuggingFaceTokenizer};
 
 const DIRS_ENV: &str = "SMG_NATIVE_ENCODE_TOKENIZER_DIRS";
 
@@ -187,8 +189,11 @@ fn native_encode_matches_tokenizers_on_real_vocabularies() {
             );
             continue;
         }
-        let reference =
-            HfTokenizer::from_file(format!("{dir}/tokenizer.json")).expect("tokenizers loads it");
+        let reference = ours
+            .as_any()
+            .downcast_ref::<HuggingFaceTokenizer>()
+            .expect("a tokenizer.json loads as the Hugging Face backend")
+            .tokenizers_pipeline();
         let specials: Vec<String> = reference
             .get_added_vocabulary()
             .get_added_tokens_decoder()
