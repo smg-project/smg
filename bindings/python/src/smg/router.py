@@ -80,10 +80,12 @@ def _discovery_arguments(args: RouterArgs) -> dict[str, object]:
     """The `_Router` arguments for the discovery provider `args` selects.
 
     Kubernetes, by either spelling, is `service_discovery=True`, its settings
-    being `_Router`'s own arguments; the other providers are the tagged
-    `discovery` mapping. Refused: a provider's fields without that provider,
-    a provider without a field it needs, and a provider this cannot pass on,
-    which must not start the router without discovery.
+    (the interval included) being `_Router`'s own arguments; the other
+    providers are the tagged `discovery` mapping, which carries their
+    interval. Refused: a provider's fields without that provider, the
+    interval without any provider, a provider without a field it needs, and a
+    provider this cannot pass on, which must not start the router without
+    discovery.
     """
     provider = args.selected_discovery_provider()
     for other in _MAPPED_PROVIDERS.values():
@@ -92,20 +94,23 @@ def _discovery_arguments(args: RouterArgs) -> dict[str, object]:
             verb = "applies" if len(given) == 1 else "apply"
             raise ValueError(f"{', '.join(given)} {verb} only to discovery_provider={other.name!r}")
     interval = args.discovery_check_interval_secs
-    if interval is not None and provider not in _MAPPED_PROVIDERS:
-        names = " or ".join(repr(name) for name in _MAPPED_PROVIDERS)
-        raise ValueError(
-            f"discovery_check_interval_secs applies only to discovery_provider={names}"
-        )
+    if interval is not None and provider is None:
+        raise ValueError("discovery_check_interval_secs needs a discovery provider")
 
+    arguments: dict[str, object] = {
+        "service_discovery": provider == "kubernetes",
+        # Kubernetes takes its interval as a constructor argument, as it does
+        # its other settings; a mapping carries its own.
+        "discovery_check_interval_secs": interval if provider == "kubernetes" else None,
+    }
     if provider in (None, "kubernetes"):
-        return {"service_discovery": provider == "kubernetes"}
+        return arguments
     if provider not in _MAPPED_PROVIDERS:
         raise ValueError(f"Router.from_args cannot pass discovery provider {provider!r} to Rust")
     mapping = _MAPPED_PROVIDERS[provider].mapping(args)
     if interval is not None:
         mapping["check_interval_secs"] = interval
-    return {"service_discovery": False, "discovery": mapping}
+    return {**arguments, "discovery": mapping}
 
 
 def policy_from_str(policy_str: str | None) -> PolicyType:

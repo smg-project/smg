@@ -331,8 +331,11 @@ class TestRouterInitialization:
         assert kwargs["discovery"] == {"provider": "file", "path": "/run/smg/workers.json"}
         assert kwargs["service_discovery"] is False
         assert kwargs["worker_urls"] == []
-        for key in ("discovery_provider", "discovery_file", "discovery_check_interval_secs"):
+        for key in ("discovery_provider", "discovery_file"):
             assert key not in kwargs
+        # The mapping carries the file provider's interval; the constructor's
+        # own interval argument is Kubernetes'.
+        assert kwargs["discovery_check_interval_secs"] is None
 
         args.discovery_check_interval_secs = 5
         with patch("smg.router._Router") as rust_router:
@@ -344,7 +347,7 @@ class TestRouterInitialization:
         [
             (RouterArgs(discovery_provider="file"), "needs discovery_file"),
             (RouterArgs(discovery_file="/run/smg/workers.json"), "only to discovery_provider"),
-            (RouterArgs(discovery_check_interval_secs=5), "only to discovery_provider"),
+            (RouterArgs(discovery_check_interval_secs=5), "needs a discovery provider"),
             (
                 RouterArgs(service_discovery=True, discovery_file="/run/smg/workers.json"),
                 "only to discovery_provider",
@@ -408,10 +411,6 @@ class TestRouterInitialization:
                 ),
                 "only to discovery_provider='slurm'",
             ),
-            (
-                RouterArgs(service_discovery=True, discovery_check_interval_secs=5),
-                "only to discovery_provider='file' or 'slurm'",
-            ),
         ],
     )
     def test_from_args_rejects_misplaced_slurm_settings(self, args, message):
@@ -434,6 +433,26 @@ class TestRouterInitialization:
         fields = {f.name for f in dataclasses.fields(RouterArgs)}
         discovery = {f for f in fields if f.startswith(("slurm_", "discovery_"))}
         assert discovery == set(_DISCOVERY_FIELDS)
+
+    @pytest.mark.parametrize(
+        "selection",
+        [{"service_discovery": True}, {"discovery_provider": "kubernetes"}],
+    )
+    def test_from_args_passes_the_kubernetes_interval(self, selection):
+        """Kubernetes discovery takes the interval too, beside service_discovery."""
+        args = RouterArgs(**selection, discovery_check_interval_secs=15)
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["service_discovery"] is True
+        assert kwargs["discovery_check_interval_secs"] == 15
+        assert "discovery" not in kwargs
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(RouterArgs(**selection))
+        assert rust_router.call_args.kwargs["discovery_check_interval_secs"] is None
 
     def test_discovery_provider_file_enables_igw(self):
         """IGW follows the file provider the same way it follows Kubernetes."""

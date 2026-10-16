@@ -1634,12 +1634,15 @@ impl Default for KubernetesDiscoveryConfig {
     }
 }
 
-/// How often the file-discovery manifest is reread, changed or not, when no
-/// interval is given.
-pub const DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
+/// The interval of a discovery provider's periodic pass when none is given,
+/// the same for every provider. Kubernetes and file discovery apply a change
+/// as it happens and use the pass to retry what earlier ones left undone;
+/// Slurm discovery polls on it. ([`KubernetesDiscoveryConfig`] keeps its own
+/// default, 120, for programmatic and serialized configuration.)
+pub const DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
 
-fn default_file_discovery_check_interval_secs() -> u64 {
-    DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS
+fn default_discovery_check_interval_secs() -> u64 {
+    DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS
 }
 
 /// File worker discovery: the workers listed in a JSON manifest on disk.
@@ -1650,15 +1653,8 @@ fn default_file_discovery_check_interval_secs() -> u64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDiscoveryConfig {
     pub path: PathBuf,
-    #[serde(default = "default_file_discovery_check_interval_secs")]
+    #[serde(default = "default_discovery_check_interval_secs")]
     pub check_interval_secs: u64,
-}
-
-/// How often Slurm is polled when no interval is given.
-pub const DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
-
-fn default_slurm_discovery_check_interval_secs() -> u64 {
-    DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS
 }
 
 /// Slurm worker discovery: one worker on every node of each running job whose
@@ -1695,7 +1691,7 @@ pub struct SlurmDiscoveryConfig {
     pub account: Option<String>,
     #[serde(default)]
     pub partition: Option<String>,
-    #[serde(default = "default_slurm_discovery_check_interval_secs")]
+    #[serde(default = "default_discovery_check_interval_secs")]
     pub check_interval_secs: u64,
 }
 
@@ -3078,7 +3074,7 @@ discovery:
             discovery,
             Some(DiscoveryConfig::File(FileDiscoveryConfig {
                 path: "/run/smg/workers.json".into(),
-                check_interval_secs: DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+                check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
             }))
         );
         let written = serde_json::to_value(discovery.unwrap()).unwrap();
@@ -3106,7 +3102,7 @@ discovery:
                 user: None,
                 account: None,
                 partition: None,
-                check_interval_secs: DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS,
+                check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
             }))
         );
         let written = serde_json::to_value(discovery.unwrap()).unwrap();

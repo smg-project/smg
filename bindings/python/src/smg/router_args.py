@@ -343,9 +343,9 @@ class RouterArgs:
     disable_retries: bool = False
     # Disable automatic tokenizer loading at startup and worker registration
     disable_tokenizer_autoload: bool = False
-    # The selected provider's periodic pass: how often the file provider's
-    # JSON manifest is reread besides on every change, or Slurm is polled
-    # (None = 30s); and the file provider's manifest path.
+    # The selected provider's periodic pass (None = 30s): Kubernetes and file
+    # discovery apply a change as it happens and retry on it, Slurm discovery
+    # polls on it; and the file provider's manifest path.
     discovery_check_interval_secs: int | None = None
     discovery_file: str | None = None
     # The worker discovery provider. service_discovery=True is the legacy
@@ -1783,9 +1783,10 @@ class RouterArgs:
             type=int,
             default=None,
             help=(
-                "Seconds between periodic rereads of the --discovery-file manifest"
-                " (which is also reread as soon as it changes), or between Slurm"
-                " polls (default: 30)"
+                "Seconds between periodic discovery passes. Kubernetes and file"
+                " discovery apply a change as it happens and use the pass to retry"
+                " and to catch what went unreported; Slurm discovery polls at this"
+                " interval (default: 30)"
             ),
         )
         for role, workers in [

@@ -469,6 +469,24 @@ class TestDiscoveryMapping:
         with pytest.raises(ValueError, match="path"):
             _Router(worker_urls=[], discovery={"provider": "file"})
 
+    def test_kubernetes_interval_is_accepted_with_service_discovery(self):
+        _Router(
+            worker_urls=[],
+            service_discovery=True,
+            selector={"app": "worker"},
+            discovery_check_interval_secs=15,
+        )
+
+    def test_kubernetes_interval_needs_service_discovery(self):
+        with pytest.raises(ValueError, match="check_interval_secs"):
+            _Router(worker_urls=[], discovery_check_interval_secs=15)
+        with pytest.raises(ValueError, match="check_interval_secs"):
+            _Router(
+                worker_urls=[],
+                discovery={"provider": "file", "path": "/run/smg/workers.json"},
+                discovery_check_interval_secs=15,
+            )
+
     def test_slurm_mapping_is_accepted(self):
         _Router(
             worker_urls=[],

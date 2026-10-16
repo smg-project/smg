@@ -37,8 +37,7 @@ use smg::{
         PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
         RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
         SlurmDiscoveryConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
-        TurboJpegPolicy, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
-        DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -1093,8 +1092,9 @@ struct DiscoveryArgs {
     #[arg(long, help_heading = "Service Discovery (File)")]
     discovery_file: Option<PathBuf>,
 
-    /// Seconds between periodic rereads of the `--discovery-file` manifest
-    /// (which is also reread as soon as it changes), or between Slurm polls
+    /// Seconds between periodic discovery passes. Kubernetes and file
+    /// discovery apply a change as it happens and use the pass to retry and
+    /// to catch what went unreported; Slurm discovery polls at this interval
     /// (default: 30)
     #[arg(long, help_heading = "Service Discovery")]
     discovery_check_interval_secs: Option<u64>,
@@ -3011,7 +3011,8 @@ impl CliArgs {
     /// Kubernetes flags are ignored under another provider, as they always
     /// were without discovery; the file and Slurm flags have no other use, so
     /// giving them without their provider is an error, as is either provider
-    /// without what it cannot run without.
+    /// without what it cannot run without. The interval applies to whichever
+    /// provider is selected.
     fn discovery_config(&self) -> ConfigResult<Option<DiscoveryConfig>> {
         let provider = self.selected_discovery_provider();
         let incompatible = |reason: &str| {
@@ -3022,25 +3023,23 @@ impl CliArgs {
         if provider != Some(DiscoveryProvider::File) && self.discovery.discovery_file.is_some() {
             return incompatible("--discovery-file applies only to --discovery-provider file");
         }
-        if !matches!(
-            provider,
-            Some(DiscoveryProvider::File | DiscoveryProvider::Slurm)
-        ) && self.discovery.discovery_check_interval_secs.is_some()
-        {
-            return incompatible(
-                "--discovery-check-interval-secs applies only to --discovery-provider file or slurm",
-            );
+        if provider.is_none() && self.discovery.discovery_check_interval_secs.is_some() {
+            return incompatible("--discovery-check-interval-secs needs a discovery provider");
         }
         if provider != Some(DiscoveryProvider::Slurm) && self.has_slurm_flags() {
             return incompatible("The --slurm-* flags apply only to --discovery-provider slurm");
         }
+        let interval = self
+            .discovery
+            .discovery_check_interval_secs
+            .unwrap_or(DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS);
         Ok(match provider {
             None => None,
             Some(DiscoveryProvider::Kubernetes) => {
                 Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
                     namespace: self.discovery.service_discovery_namespace.clone(),
                     port: self.discovery.service_discovery_port,
-                    check_interval_secs: 60,
+                    check_interval_secs: interval,
                     selector: Self::parse_selector(&self.discovery.selector),
                     encode_selector: Self::parse_selector(&self.discovery.encode_selector),
                     prefill_selector: Self::parse_selector(&self.discovery.prefill_selector),
@@ -3060,10 +3059,7 @@ impl CliArgs {
                         field: "--discovery-file".to_string(),
                     }
                 })?,
-                check_interval_secs: self
-                    .discovery
-                    .discovery_check_interval_secs
-                    .unwrap_or(DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS),
+                check_interval_secs: interval,
             })),
             Some(DiscoveryProvider::Slurm) => Some(DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
                 job_names: self.discovery.slurm_job_name.clone(),
@@ -3080,10 +3076,7 @@ impl CliArgs {
                 user: self.discovery.slurm_user.clone(),
                 account: self.discovery.slurm_account.clone(),
                 partition: self.discovery.slurm_partition.clone(),
-                check_interval_secs: self
-                    .discovery
-                    .discovery_check_interval_secs
-                    .unwrap_or(DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS),
+                check_interval_secs: interval,
             })),
         })
     }
@@ -4914,7 +4907,7 @@ mod tests {
             router.discovery,
             Some(DiscoveryConfig::File(FileDiscoveryConfig {
                 path: "/run/smg/workers.json".into(),
-                check_interval_secs: DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+                check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
             }))
         );
         // Recovery by removal works here too: the next reread re-adds the worker.
@@ -5070,7 +5063,7 @@ mod tests {
         assert!(matches!(
             defaults.discovery,
             Some(DiscoveryConfig::Slurm(SlurmDiscoveryConfig {
-                check_interval_secs: DEFAULT_SLURM_DISCOVERY_CHECK_INTERVAL_SECS,
+                check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
                 user: None,
                 ..
             }))
@@ -5088,8 +5081,8 @@ mod tests {
         );
     }
 
-    /// The Slurm flags configure nothing else, and the interval applies to the
-    /// file and Slurm providers only, so either given elsewhere is an error.
+    /// The Slurm flags configure nothing else, and the interval needs a
+    /// provider to apply to, so either given elsewhere is an error.
     #[test]
     fn slurm_flags_need_the_slurm_provider() {
         for args in [
@@ -5104,13 +5097,7 @@ mod tests {
                 "--slurm-job-name",
                 "w",
             ][..],
-            &[
-                "--service-discovery",
-                "--selector",
-                "app=w",
-                "--discovery-check-interval-secs",
-                "5",
-            ][..],
+            &["--discovery-check-interval-secs", "5"][..],
         ] {
             let err = cli_args_from(args)
                 .to_router_config(vec![], vec![])
@@ -5119,6 +5106,34 @@ mod tests {
                 matches!(err, ConfigError::IncompatibleConfig { .. }),
                 "{args:?}: {err}"
             );
+        }
+    }
+
+    /// The interval applies to Kubernetes discovery too, by either spelling,
+    /// with the default every provider has.
+    #[test]
+    fn the_interval_applies_to_kubernetes_discovery() {
+        for selection in [
+            &["--service-discovery"][..],
+            &["--discovery-provider", "kubernetes"][..],
+        ] {
+            let interval = |extra: &[&str]| {
+                let args: Vec<&str> = selection
+                    .iter()
+                    .chain(["--selector", "app=w"].iter())
+                    .chain(extra.iter())
+                    .copied()
+                    .collect();
+                let router = cli_args_from(&args)
+                    .to_router_config(vec![], vec![])
+                    .unwrap();
+                let Some(DiscoveryConfig::Kubernetes(kubernetes)) = router.discovery else {
+                    panic!("expected Kubernetes discovery for {args:?}");
+                };
+                kubernetes.check_interval_secs
+            };
+            assert_eq!(interval(&[]), DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS);
+            assert_eq!(interval(&["--discovery-check-interval-secs", "15"]), 15);
         }
     }
 
