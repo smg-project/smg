@@ -139,7 +139,7 @@ impl BuildStage for MessageRequestBuildingStage {
             .components
             .parser_resolver
             .names(&messages_request.model);
-        let parser = ctx.state.parser.unwrap_or_default();
+        let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
         // What constrains the output is decided here, on the worker selected
         // for the request (`regular::symphony::worker_constraint`): the whole
         // turn's grammar on a worker whose engine takes one on every turn from

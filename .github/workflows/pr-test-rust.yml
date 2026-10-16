@@ -847,11 +847,12 @@ jobs:
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
     secrets: inherit
 
-  # The chat cases with the gateway reading through Symphony (--parser symphony):
-  # the same workers and suite as e2e-1gpu-chat, the Symphony path for every
-  # model its registry knows. Runs for a chat or common change as the chat lane
-  # does, and for a Symphony-only change too, since this is the one lane that
-  # exercises a table against a real engine.
+  # The chat cases with the gateway pinned to Symphony (--parser symphony, the
+  # default; e2e-1gpu-chat leaves the flag unset and reads with it too): the
+  # same workers and suite as e2e-1gpu-chat, the Symphony path for every model
+  # its registry knows. Runs for a chat or common change as the chat lane does,
+  # and for a Symphony-only change too, since this is the one lane that
+  # exercises a table against a real engine for such a change.
   e2e-1gpu-chat-symphony:
     name: e2e-1gpu-chat-symphony (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]

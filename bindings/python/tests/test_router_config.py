@@ -525,6 +525,19 @@ class TestRouterConstructorSignature:
         assert tail == sorted(tail), out_of_place(tail)
 
 
+class TestRouterParserChoice:
+    """The launcher reads with Symphony unless ``--parser legacy`` is given: ``RouterArgs.parser``
+    is what ``Router.from_args`` hands to ``_Router(...)`` explicitly. The binding's constructor
+    takes either name (its own default is the same, applied by the binding and checked, like
+    every other name, when the router starts; ``inspect`` renders it as ``...``)."""
+
+    def test_the_launcher_defaults_to_symphony_and_the_binding_takes_either_name(self):
+        assert RouterArgs().parser == "symphony"
+        _Router(worker_urls=[])
+        _Router(worker_urls=[], parser="legacy")
+        _Router(worker_urls=[], parser="symphony")
+
+
 class TestControlPlaneAuthHalfJwt:
     """An issuer without an audience (or the reverse) is refused, not a silently open control plane."""
 

@@ -1368,7 +1368,7 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         overlap_decay = 0.0,
         overload_token_usage_threshold = 1.0,
-        parser = String::from("legacy"),
+        parser = String::from("symphony"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
