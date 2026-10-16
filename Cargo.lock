@@ -4064,6 +4064,7 @@ dependencies = [
  "rayon",
  "reqwest 0.13.4",
  "rustfft",
+ "rustix",
  "rustls",
  "serde",
  "serde_bytes",

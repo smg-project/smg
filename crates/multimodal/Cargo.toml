@@ -59,6 +59,8 @@ npyz = { version = "0.9", features = ["npz"] }
 # The dump example for bellwether's multimodal fixtures digests its artifacts with SHA-256, as the fixtures do.
 sha2 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# The wire benchmark measures the process's CPU time.
+rustix = { version = "1", default-features = false, features = ["time"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]
