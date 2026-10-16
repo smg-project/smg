@@ -111,6 +111,7 @@ fn a_refused_startup_flushes_the_spans_the_exporter_holds() {
         port,
         health_check_port: None,
         runtime_worker_threads: None,
+        secret_sources: Default::default(),
         router_config: RouterConfig::builder()
             .regular_mode(vec![])
             .host("127.0.0.1")

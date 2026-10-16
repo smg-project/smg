@@ -149,14 +149,19 @@ def _given_twice(sources: _SecretSources) -> ValueError:
     )
 
 
-def _value_from_environment(args_dict: dict, name: str, *env_names: str) -> None:
+def _value_from_environment(
+    args_dict: dict, name: str, *env_names: str, strip: bool = False
+) -> None:
     """Sets ``name`` from the first of ``env_names`` that is set, if any; a
     variable set to the empty string counts as set (the value is refused
-    where it is validated, as an empty flag value is)."""
+    where it is validated, as an empty flag value is). With ``strip`` the
+    surrounding whitespace is dropped, as it is off a secret file's content:
+    a Secret made from a file usually carries the editor's trailing newline,
+    and no header could carry such a key."""
     for env_name in env_names:
         value = os.environ.get(env_name)
         if value is not None:
-            args_dict[name] = value
+            args_dict[name] = value.strip() if strip else value
             return
 
 
@@ -2749,7 +2754,7 @@ class RouterArgs:
             _value_from_environment(args_dict, "oracle_password", "ATP_PASSWORD")
 
         if args_dict.get("api_key") is None:
-            _value_from_environment(args_dict, "api_key", _API_KEY_SOURCES.env)
+            _value_from_environment(args_dict, "api_key", _API_KEY_SOURCES.env, strip=True)
         api_key_file = file_option(_API_KEY_SOURCES)
         if api_key_file is not None:
             if args_dict.get("api_key") is not None:
@@ -2762,7 +2767,7 @@ class RouterArgs:
             ("redis_url", _REDIS_URL_SOURCES, "REDIS_URL"),
         ):
             if args_dict.get(name) is None:
-                _value_from_environment(args_dict, name, sources.env, older_env)
+                _value_from_environment(args_dict, name, sources.env, older_env, strip=True)
             url_file = file_option(sources)
             if url_file is None or backend != sources.backend:
                 continue

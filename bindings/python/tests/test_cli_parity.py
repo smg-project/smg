@@ -116,6 +116,11 @@ def parse_rust_cli(text: str) -> RustCli:
             i += 1
         declared = re.match(r"\s*(?:pub\s+)?([a-z0-9_]+)\s*:", lines[i])
         assert declared is not None, f"no field after the attribute ending at line {i}"
+        if re.fullmatch(r"#\[arg\(\s*skip\s*(=.*)?\)\]", attribute):
+            # A field clap never reads from the command line (a record filled
+            # after parsing): no flag to mirror.
+            i += 1
+            continue
         name = declared.group(1)
         explicit = re.search(r'\blong\s*=\s*"([^"]+)"', attribute)
         flag = "--" + (explicit.group(1) if explicit else name.replace("_", "-"))

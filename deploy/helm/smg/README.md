@@ -121,6 +121,8 @@ helm install smg deploy/helm/smg \
 
 The gateway also reads its other secrets from the environment or from files, which `router.extraEnv` can feed from Secrets: `SMG_TENANT_API_KEYS` (or `SMG_TENANT_API_KEYS_FILE`) for per-tenant keys, `SMG_POSTGRES_DB_URL` / `SMG_REDIS_URL` (or the `_FILE` variants) for the store URLs. On the command line a flag beats the environment, and a value together with a file for the same secret is refused at start-up. The launcher's reference in [the Python package's README](../../../bindings/python/README.md#secrets-from-the-environment-or-files) lists every name.
 
+The gateway reads the key file once, at start-up, so a rotated key reaches a pod when the pod restarts. A rotated `auth.apiKey` rolls the router pods by itself: the pod template carries a `checksum/auth` annotation over the chart-managed Secret, so `helm upgrade` with a new key is a rolling update. A rotated `auth.existingSecret` is not seen by the chart; roll the pods by hand after updating it (`kubectl rollout restart deployment/<release>-router`; `statefulset/<release>-router` when `router.mesh.enabled` makes the router a StatefulSet), or the running pods keep accepting the old key until they restart.
+
 An older gateway image does not know `--api-key-file`; a chart of this version with such an image refuses to start rather than starting without the key.
 
 #### Router Probes and Shutdown

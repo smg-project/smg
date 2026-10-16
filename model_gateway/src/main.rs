@@ -1886,16 +1886,37 @@ const REDIS_URL_SETTING: SecretSetting = SecretSetting {
 };
 
 /// An environment lookup: the value of a variable, `None` when it is not
-/// set. A parameter rather than `std::env::var` so a test need not touch
-/// the process environment.
-type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+/// set, and a refusal when it is set to bytes that are not UTF-8 (a source
+/// that is set but unusable is refused, not passed over as unset). A
+/// parameter rather than `std::env::var` so a test need not touch the
+/// process environment.
+type EnvLookup<'a> = &'a dyn Fn(&str) -> ConfigResult<Option<String>>;
+
+/// The process environment as an [`EnvLookup`].
+fn process_env(name: &str) -> ConfigResult<Option<String>> {
+    env_value(name, std::env::var_os(name))
+}
+
+/// A variable's raw value as a string: `None` when the variable is unset,
+/// a refusal naming the variable when its bytes are not UTF-8.
+fn env_value(name: &str, raw: Option<std::ffi::OsString>) -> ConfigResult<Option<String>> {
+    raw.map(|value| {
+        value.into_string().map_err(|_| ConfigError::InvalidValue {
+            field: name.to_string(),
+            value: "<not UTF-8>".to_string(),
+            reason: "set, but its value is not UTF-8".to_string(),
+        })
+    })
+    .transpose()
+}
 
 impl SecretSetting {
     /// The file the flag or, failing that, the environment names.
-    fn file(&self, flag_value: Option<&Path>, env: EnvLookup<'_>) -> Option<PathBuf> {
-        flag_value
-            .map(Path::to_path_buf)
-            .or_else(|| env(self.file_env).map(PathBuf::from))
+    fn file(&self, flag_value: Option<&Path>, env: EnvLookup<'_>) -> ConfigResult<Option<PathBuf>> {
+        Ok(match flag_value {
+            Some(path) => Some(path.to_path_buf()),
+            None => env(self.file_env)?.map(PathBuf::from),
+        })
     }
 
     /// The refusal for a value and a file given together: ranking them
@@ -1926,10 +1947,12 @@ impl SecretSetting {
 
     /// The value of a single-valued secret and its source: the flag's,
     /// else the environment's, else the content of the file the flag or the
-    /// environment names, with the surrounding whitespace (a trailing
-    /// newline) dropped. A value and a file together are refused, as is a
-    /// file that is empty or holds more than one line (a tenant key file or
-    /// a concatenated pair in the place of one value is a mistake, not a
+    /// environment names; the environment's value and the file's content
+    /// have their surrounding whitespace (a trailing newline) dropped, since
+    /// a Secret made from a file usually carries the editor's newline into
+    /// both. A value and a file together are refused, as is a file that is
+    /// empty or holds more than one line (a tenant key file or a
+    /// concatenated pair in the place of one value is a mistake, not a
     /// value). An empty value from the flag or the environment passes here
     /// and is refused where the value is validated.
     fn resolve_value(
@@ -1940,9 +1963,11 @@ impl SecretSetting {
     ) -> ConfigResult<Option<(String, SecretSource)>> {
         let value = match flag_value {
             Some(value) => Some((value.to_string(), SecretSource::Flag)),
-            None => env(self.env).map(|value| (value, SecretSource::Environment)),
+            None => {
+                env(self.env)?.map(|value| (value.trim().to_string(), SecretSource::Environment))
+            }
         };
-        match (value, self.file(file_flag_value, env)) {
+        match (value, self.file(file_flag_value, env)?) {
             (Some(_), Some(_)) => Err(self.given_twice()),
             (Some(value), None) => Ok(Some(value)),
             (None, None) => Ok(None),
@@ -1984,7 +2009,7 @@ impl SecretSetting {
                 .collect()
         };
         let value = if flag_values.is_empty() {
-            match env(self.env) {
+            match env(self.env)? {
                 Some(text) => {
                     let entries = entries_of(&text, &[',', '\n']);
                     if entries.is_empty() {
@@ -2004,7 +2029,7 @@ impl SecretSetting {
         } else {
             Some((flag_values.to_vec(), SecretSource::Flag))
         };
-        match (value, self.file(file_flag_value, env)) {
+        match (value, self.file(file_flag_value, env)?) {
             (Some(_), Some(_)) => Err(self.given_twice()),
             (Some(value), None) => Ok(Some(value)),
             (None, None) => Ok(None),
@@ -3279,7 +3304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let command_line = CommandLine::split(&args);
     let (mut cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
-    cli_args.resolve_secret_sources(&|name| std::env::var(name).ok())?;
+    cli_args.resolve_secret_sources(&process_env)?;
     cli_args.announce(
         igw_enabled_for_discovery,
         &command_line.prefill_urls,
@@ -5211,11 +5236,14 @@ mod tests {
 
     /// An environment lookup over a table: no test here touches the
     /// process environment.
-    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    fn env_of<'a>(
+        vars: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> ConfigResult<Option<String>> + 'a {
         move |name| {
-            vars.iter()
+            Ok(vars
+                .iter()
                 .find(|(var, _)| *var == name)
-                .map(|(_, value)| (*value).to_string())
+                .map(|(_, value)| (*value).to_string()))
         }
     }
 
@@ -5302,6 +5330,67 @@ mod tests {
             config.redis.expect("a redis store").url,
             "redis://:env-redis-pass@cache.example:6379/0"
         );
+    }
+
+    /// A value from the environment is trimmed as a file's content is: a
+    /// Secret made from a file carries the editor's trailing newline into
+    /// the variable, and no header could carry such a key.
+    #[test]
+    fn a_value_from_the_environment_is_trimmed_like_a_file() {
+        let vars = [
+            ("SMG_API_KEY", "env-shared-key\n"),
+            (
+                "SMG_POSTGRES_DB_URL",
+                " postgresql://u:env-pg-pass@db.example:5432/smg\n",
+            ),
+        ];
+        let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
+        assert_eq!(cli.api_key.as_deref(), Some("env-shared-key"));
+        assert_eq!(
+            cli.postgres_db_url.as_deref(),
+            Some("postgresql://u:env-pg-pass@db.example:5432/smg")
+        );
+    }
+
+    /// A variable set to bytes that are not UTF-8 is refused by name, not
+    /// read as unset: the gateway would otherwise start with no serving key
+    /// where the operator set one.
+    #[test]
+    fn a_variable_that_is_not_utf8_is_refused_not_passed_over() {
+        assert_eq!(env_value("SMG_API_KEY", None).expect("unset"), None);
+        assert_eq!(
+            env_value("SMG_API_KEY", Some("k".into())).expect("set"),
+            Some("k".to_string())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![b'k', 0xff, b'y']);
+            let err = env_value("SMG_API_KEY", Some(raw)).expect_err("not UTF-8");
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { field, value, .. }
+                    if field == "SMG_API_KEY" && value == "<not UTF-8>"),
+                "{err}"
+            );
+        }
+        let refusing = |name: &str| -> ConfigResult<Option<String>> {
+            if name == "SMG_API_KEY" {
+                Err(ConfigError::InvalidValue {
+                    field: name.to_string(),
+                    value: "<not UTF-8>".to_string(),
+                    reason: "set, but its value is not UTF-8".to_string(),
+                })
+            } else {
+                Ok(None)
+            }
+        };
+        let mut cli = cli_args_from(&[]);
+        let err = cli.resolve_secret_sources(&refusing).expect_err("refused");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "SMG_API_KEY"),
+            "{err}"
+        );
+        assert_eq!(cli.api_key, None);
     }
 
     /// The command line beats the environment for every secret, and the
@@ -5710,18 +5799,26 @@ mod tests {
     }
 
     /// `--help` names the environment variables and the file flags of the
-    /// secrets, and shows no value of an environment variable clap reads
-    /// itself, set or not.
+    /// secrets, and the variables clap reads itself are declared with their
+    /// values hidden, so a set one never shows. Asserted on the command's
+    /// arguments rather than by setting the variables: the other tests of
+    /// this module parse through clap in parallel and would read them.
     #[test]
-    #[serial_test::serial]
     fn the_help_names_the_sources_and_hides_the_values() {
         use clap::CommandFactory;
 
-        std::env::set_var("ATP_PASSWORD", "hunter2-oracle-password");
-        std::env::set_var("CONTROL_PLANE_API_KEYS", "i:n:admin:hunter2-control-plane");
-        let help = Cli::command().render_long_help().to_string();
-        std::env::remove_var("ATP_PASSWORD");
-        std::env::remove_var("CONTROL_PLANE_API_KEYS");
+        let mut command = Cli::command();
+        for id in ["oracle_password", "control_plane_api_keys"] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .unwrap_or_else(|| panic!("{id} is an argument"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "{id} would show its environment value in the help"
+            );
+        }
+        let help = command.render_long_help().to_string();
 
         for named in [
             "SMG_API_KEY",

@@ -2130,6 +2130,8 @@ class TestRustCliSecondSpellings:
         namespace = parser.parse_args([f"--router-{cli_spelling[2:]}", value])
         router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
         assert getattr(router_args, field) == expected
+
+
 SECRET_ENV_NAMES = (
     "SMG_API_KEY",
     "SMG_API_KEY_FILE",
@@ -2174,6 +2176,17 @@ class TestSecretSources:
         assert args.postgres_db_url == "postgresql://u:env-pg@db.example:5432/smg"
         assert args.redis_url == "redis://:env-redis@cache.example:6379/0"
         assert args.oracle_password == "env-oracle-password"
+
+    def test_a_value_from_the_environment_is_trimmed_like_a_file(self, monkeypatch):
+        """A Secret made from a file carries the editor's trailing newline into
+        the variable; the key and the URLs come out bare, as off a file."""
+        monkeypatch.setenv("SMG_API_KEY", "env-shared-key\n")
+        monkeypatch.setenv("SMG_POSTGRES_DB_URL", " postgresql://u:env-pg@db.example:5432/smg\n")
+
+        args = parse_router_args(["--history-backend", "postgres"])
+
+        assert args.api_key == "env-shared-key"
+        assert args.postgres_db_url == "postgresql://u:env-pg@db.example:5432/smg"
 
     def test_the_command_line_beats_the_environment(self, monkeypatch):
         monkeypatch.setenv("SMG_API_KEY", "env-shared-key")
