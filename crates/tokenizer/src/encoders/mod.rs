@@ -68,6 +68,7 @@ impl RendererProfile {
         native_assistant_continuation: false,
         raw_tool_call_arguments: false,
         declares_tools_under_tool_choice_none: false,
+        leading_system_only: false,
     };
 
     /// The behaviours of a renderer without a profile: the Jinja template,

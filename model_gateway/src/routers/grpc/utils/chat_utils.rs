@@ -2247,6 +2247,7 @@ mod tests {
         native_assistant_continuation: true,
         raw_tool_call_arguments: false,
         declares_tools_under_tool_choice_none: false,
+        leading_system_only: false,
     };
     const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
         media_handling: llm_tokenizer::traits::MediaHandling::Preprocess,
@@ -2254,6 +2255,7 @@ mod tests {
         native_assistant_continuation: false,
         raw_tool_call_arguments: true,
         declares_tools_under_tool_choice_none: false,
+        leading_system_only: false,
     };
 
     /// Without the capability the trailing assistant message is popped and its

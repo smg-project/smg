@@ -408,7 +408,11 @@ pub enum Role {
     /// forwarded to the chat template **in place**, so backends that render
     /// `system` inline (e.g. GLM-4.5+/5.x) keep its position, while backends
     /// that only read a leading system (e.g. MiniMax-M2) handle it per their
-    /// own template. See https://github.com/smg-project/smg/issues/1795
+    /// own template. See https://github.com/smg-project/smg/issues/1795. A
+    /// renderer whose reference writes no turn for a system message after
+    /// the first (`RendererCapabilities::leading_system_only`) gets such a
+    /// message as a user turn at its position instead, so the prompt keeps
+    /// its assistant header.
     System,
 }
 

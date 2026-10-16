@@ -75,9 +75,15 @@ impl EffortEncoding {
             native_effort_off_values: &["none"],
             // `<｜Assistant｜><think>` ends the prompt when thinking is on.
             think_in_prefill: true,
-            // The shim reads the engine's `enable_thinking` alias too.
+            // The shim reads the engine's `enable_thinking` alias too. The
+            // encoder writes a system message after the first as bare text
+            // and the assistant header after user and developer turns only
+            // (`render_message`), so the gateway renders a system message
+            // sent after the first as a user turn, which the encoder merges
+            // into the turn before it and follows with the header.
             capabilities: RendererCapabilities {
                 enable_thinking_alias: true,
+                leading_system_only: true,
                 ..RendererProfile::NO_CAPABILITIES
             },
             thinking_mode: None,
@@ -689,6 +695,66 @@ mod tests {
             "<{DSML_TOKEN}parameter name=\"limit\" string=\"false\">5</{DSML_TOKEN}parameter>"
         )));
     }
+    /// A system message after the first renders as the reference renders
+    /// it: bare text with no role marker, and no assistant header after one
+    /// that ends the conversation (the header follows user and developer
+    /// turns only), which is why the profile declares `leading_system_only`.
+    /// The same messages as user turns, what the gateway renders for such a
+    /// renderer, merge into the turn before them and take the header.
+    #[test]
+    fn a_system_message_after_the_first_has_no_turn_of_its_own() {
+        let system = |text: &str| json!({ "role": "system", "content": text });
+        let assistant = json!({ "role": "assistant", "content": "A" });
+        let in_place = [
+            system("S"),
+            user("Task"),
+            system("Env"),
+            assistant.clone(),
+            user("Q2"),
+            system("Note"),
+        ];
+        let out =
+            encode_messages(&in_place, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            format!("{BOS_TOKEN}S{USER_SP_TOKEN}TaskEnvA{EOS_TOKEN}{USER_SP_TOKEN}Q2Note")
+        );
+        assert!(
+            EffortEncoding::Original
+                .profile()
+                .capabilities
+                .leading_system_only
+        );
+        assert!(
+            EffortEncoding::V0731
+                .profile()
+                .capabilities
+                .leading_system_only
+        );
+
+        let as_user_turns = [
+            system("S"),
+            user("Task"),
+            user("Env"),
+            assistant,
+            user("Q2"),
+            user("Note"),
+        ];
+        let out = encode_messages(
+            &as_user_turns,
+            ThinkingMode::Thinking,
+            &EncodeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}S{USER_SP_TOKEN}Task\n\nEnv{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}A{EOS_TOKEN}\
+                 {USER_SP_TOKEN}Q2\n\nNote{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
+        );
+    }
+
     #[test]
     fn unknown_role_errors() {
         let msgs = [json!({ "role": "moderator", "content": "hi" })];

@@ -73,6 +73,16 @@ pub struct RendererCapabilities {
     /// the gateway keeps the tools for it. Without it the gateway renders no
     /// tool under `none`, so the model is not offered a call it may not make.
     pub declares_tools_under_tool_choice_none: bool,
+    /// The renderer's reference writes a turn of its own, and the assistant
+    /// header after the last one, for user and developer messages only: a
+    /// `system` message after the first renders as bare text with no role
+    /// marker, and one that ends the conversation leaves the prompt without
+    /// the header, so the model answers an empty turn. On the Messages path
+    /// the gateway renders a `system`-role message sent inside `messages[]`
+    /// after the first as a user turn at its position for such a renderer;
+    /// elsewhere the message is forwarded in place, for the templates that
+    /// render a system turn anywhere.
+    pub leading_system_only: bool,
 }
 
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
