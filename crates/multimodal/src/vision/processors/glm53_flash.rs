@@ -82,31 +82,22 @@ impl RgbSource for RgbFrameRef<'_> {
     }
 }
 
-/// Read a `usize` extra key strictly: absent falls back to `default`, but a
-/// present-yet-unusable value is a config error. `get_extra` swallows type
-/// mismatches into `None`, and a silent default here changes the alignment
-/// factor and token geometry — the gateway's placeholder count would then
-/// disagree with the serving engine with no trace. Integral JSON floats
-/// (`2.0`) are accepted for interop with float-serializing toolchains.
+/// A `usize` extra key under [`PreProcessorConfig::extra_usize`]'s rule (absent -> `default`,
+/// a present-yet-unusable value a config error, since a silent default would change the
+/// alignment factor and the token geometry).
 fn extra_usize(
     config: &PreProcessorConfig,
     key: &str,
     default: usize,
 ) -> Result<usize, TransformError> {
-    let Some(value) = config.extra.get(key) else {
-        return Ok(default);
-    };
-    if let Some(n) = value.as_u64() {
-        return Ok(n as usize);
-    }
-    if let Some(f) = value.as_f64() {
-        if f >= 0.0 && f.fract() == 0.0 && f <= u32::MAX as f64 {
-            return Ok(f as usize);
-        }
-    }
-    Err(shape(format!(
-        "GLM preprocessor key {key} must be a non-negative integer, got {value}"
-    )))
+    config
+        .extra_usize(key)
+        .map(|value| value.unwrap_or(default))
+        .map_err(|value| {
+            shape(format!(
+                "GLM preprocessor key {key} must be a non-negative integer, got {value}"
+            ))
+        })
 }
 
 /// `extra_usize`'s float sibling: absent -> default, wrong type -> error.

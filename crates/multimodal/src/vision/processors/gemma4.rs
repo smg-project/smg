@@ -390,25 +390,20 @@ fn preprocess_video_frames<F: RgbSource>(
     )
 }
 
+/// A `usize` extra key under [`PreProcessorConfig::extra_usize`]'s rule, absent -> `default`.
 fn extra_usize(
     config: &PreProcessorConfig,
     key: &str,
     default: usize,
 ) -> Result<usize, TransformError> {
-    let Some(value) = config.extra.get(key) else {
-        return Ok(default);
-    };
-    if let Some(n) = value.as_u64() {
-        return Ok(n as usize);
-    }
-    if let Some(f) = value.as_f64() {
-        if f >= 0.0 && f.fract() == 0.0 && f <= f64::from(u32::MAX) {
-            return Ok(f as usize);
-        }
-    }
-    Err(shape(format!(
-        "Gemma 4 preprocessor key {key} must be a non-negative integer, got {value}"
-    )))
+    config
+        .extra_usize(key)
+        .map(|value| value.unwrap_or(default))
+        .map_err(|value| {
+            shape(format!(
+                "Gemma 4 preprocessor key {key} must be a non-negative integer, got {value}"
+            ))
+        })
 }
 
 fn shape(message: impl Into<String>) -> TransformError {
