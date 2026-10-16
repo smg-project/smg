@@ -122,13 +122,13 @@ pub trait MediaProcessor: Send + Sync + 'static {
     /// How many requests it processes at once; as many again may wait.
     fn max_inflight(&self) -> usize;
     /// The modalities it takes references of, as `media_refs` names them
-    /// (`image`, `video`, `audio`); a reference of another modality is
-    /// refused before any work, naming the modes that take it. The engine's
-    /// own processors take whatever the model takes, audio included; a
-    /// pipeline of pixels takes images and video.
-    fn modalities(&self) -> &'static [&'static str] {
-        PIXEL_MODALITIES
-    }
+    /// ([`ALL_MODALITIES`] for the engine's own processors, which take
+    /// whatever the model takes, audio included; [`PIXEL_MODALITIES`] for a
+    /// pipeline of pixels); a reference of another modality is refused
+    /// before any work, naming the modes that take it. Every processor
+    /// states its set: a default would let the next bridge refuse audio
+    /// without a word.
+    fn modalities(&self) -> &'static [&'static str];
     /// Whether it can take requests now (a sidecar's liveness); the backend
     /// is advertised only while this holds.
     fn probe(&self) -> BoxFuture<bool>;

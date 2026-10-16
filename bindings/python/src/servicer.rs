@@ -25,7 +25,7 @@ use engine_servicer::{
     ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
     TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
     VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_STARTUP_CEILING,
-    DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
 };
 use llm_multimodal::Modality;
 use prost::Message;
@@ -431,6 +431,12 @@ impl MediaProcessor for SmgMediaProcessor {
 
     fn max_inflight(&self) -> usize {
         self.max_inflight
+    }
+
+    /// The set `process` maps below: image and video, no audio (the
+    /// pipeline preprocesses no audio for this engine).
+    fn modalities(&self) -> &'static [&'static str] {
+        PIXEL_MODALITIES
     }
 
     fn probe(&self) -> BoxFuture<bool> {
