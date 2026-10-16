@@ -103,8 +103,8 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
     cli = RustCli(pre_clap=set(re.findall(r'args\[i\] == "(--[a-z-]+)"', text)))
     i = start + 1
     while i < end:
-        flattened = re.match(r"#\[(?:command|clap)\(\s*flatten\b", lines[i].strip()) is not None
-        if not flattened and not lines[i].lstrip().startswith("#[arg("):
+        command = re.match(r"#\[(?:command|clap)\(", lines[i].strip()) is not None
+        if not command and not lines[i].lstrip().startswith("#[arg("):
             i += 1
             continue
         attribute = lines[i].strip()
@@ -114,6 +114,9 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
             attribute += " " + lines[i].strip()
             depth += lines[i].count("(") - lines[i].count(")")
         i += 1
+        flattened = command and re.search(r"[(,]\s*flatten\s*[,)]", attribute) is not None
+        if command and not flattened:
+            continue
         while not lines[i].strip() or lines[i].lstrip().startswith(("#", "/")):
             i += 1
         declared = re.match(r"\s*(?:pub\s+)?([a-z0-9_]+)\s*:\s*([A-Za-z0-9_]+)", lines[i])
@@ -145,6 +148,8 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
         "#[command(flatten)]",
         '#[command(flatten, next_help_heading = "Worker")]',
         "#[clap(flatten)]",
+        '#[command(\n        flatten,\n        next_help_heading = "Worker"\n    )]',
+        '#[command(next_help_heading = "Worker", flatten)]',
         '#[command(flatten,\n        next_help_heading = "Worker"\n    )]',
     ],
 )
