@@ -796,30 +796,52 @@ fn is_the_stated_exception(text: &str, whole: &Said, cut: &Said) -> bool {
         return false;
     }
     // Entry by entry (one per reason, in order): the pieces' text with the moved bytes put
-    // back, in stream order, is the whole's text. A cursor per entry starts where the last
-    // put-back ended, so a later call's bytes are never put back too early, and a byte that
-    // crossed a reason is a difference.
+    // back, in stream order, is the whole's text. Where each call's bytes go back is searched
+    // with backtracking over the (entry, place) choices, last place first: an earlier region
+    // both sides refused may start with the same bytes, and an entry may be missing a later
+    // call's bytes too, so no single greedy choice is right. The moved calls are few.
+    let whole_texts: Vec<&str> = whole
+        .malformed
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect();
     let mut rest: Vec<String> = cut.malformed.iter().map(|(_, text)| text.clone()).collect();
-    let mut cursors = vec![0usize; rest.len()];
-    'moved: for bytes in moved {
-        for (entry, (_, whole_text)) in whole.malformed.iter().enumerate() {
-            let text = &mut rest[entry];
-            let found = (cursors[entry]..=text.len()).find(|&at| {
-                at <= whole_text.len()
-                    && text.is_char_boundary(at)
-                    && whole_text.is_char_boundary(at)
-                    && whole_text[..at] == text[..at]
-                    && whole_text[at..].starts_with(bytes)
-            });
-            if let Some(at) = found {
-                text.insert_str(at, bytes);
-                cursors[entry] = at + bytes.len();
-                continue 'moved;
-            }
+    let mut floors = vec![0; rest.len()];
+    put_back(&moved, &whole_texts, &mut rest, &mut floors)
+}
+
+/// Whether `rest`, with `moved` put back in stream order (each call's bytes into one entry,
+/// after the previous call's in that entry: `floors` holds where each entry's last put-back
+/// ended), can become `whole`: tried with backtracking.
+fn put_back(moved: &[&str], whole: &[&str], rest: &mut [String], floors: &mut [usize]) -> bool {
+    let [bytes, later @ ..] = moved else {
+        return rest.iter().map(String::as_str).eq(whole.iter().copied());
+    };
+    for entry in 0..rest.len() {
+        if rest[entry].len() + bytes.len() > whole[entry].len() {
+            continue;
         }
-        return false;
+        let places: Vec<usize> = (floors[entry]..=rest[entry].len())
+            .rev()
+            .filter(|&at| {
+                rest[entry].is_char_boundary(at)
+                    && whole[entry].is_char_boundary(at)
+                    && whole[entry][..at] == rest[entry][..at]
+                    && whole[entry][at..].starts_with(bytes)
+            })
+            .collect();
+        for at in places {
+            let floor = floors[entry];
+            rest[entry].insert_str(at, bytes);
+            floors[entry] = at + bytes.len();
+            if put_back(later, whole, rest, floors) {
+                return true;
+            }
+            rest[entry].replace_range(at..at + bytes.len(), "");
+            floors[entry] = floor;
+        }
     }
-    rest.iter().eq(whole.malformed.iter().map(|(_, text)| text))
+    false
 }
 
 #[test]
@@ -903,6 +925,68 @@ fn the_stated_exception_is_told_from_any_other_difference() {
     assert!(
         is_the_stated_exception(text_two, &whole_two, &cut_two),
         "two calls cut alike"
+    );
+    // An earlier region both sides refused starts with the same bytes, in the same entry.
+    let mut whole_two = whole.clone();
+    whole_two.malformed[0].1 = r#""ab\udc00""ab\udc00""#.to_string();
+    let mut cut_two = whole_two.clone();
+    cut_two.arguments[0].1 = r#""ab\udc0"#.to_string();
+    cut_two.malformed[0].1 = r#""ab\udc00"0""#.to_string();
+    assert!(
+        is_the_stated_exception(text_two, &whole_two, &cut_two),
+        "an earlier refused region with the same bytes, the same entry"
+    );
+    // The same, in an earlier entry of another reason.
+    let mut whole_two = whole.clone();
+    whole_two.malformed.insert(
+        0,
+        (
+            MalformedReason::InvalidArguments,
+            r#""ab\udc00""#.to_string(),
+        ),
+    );
+    let mut cut_two = whole_two.clone();
+    cut_two.arguments[0].1 = r#""ab\udc0"#.to_string();
+    cut_two.malformed[1].1 = r#"0""#.to_string();
+    assert!(
+        is_the_stated_exception(text_two, &whole_two, &cut_two),
+        "an earlier refused region with the same bytes, another entry"
+    );
+    // Two calls cut alike, the earlier entry holding an earlier refused region and the second
+    // call's region, the later entry the first call's.
+    let text_three = concat!(
+        r#"{"name": "f", "arguments": "ab\udc00"}"#,
+        r#"{"name": "f", "arguments": "cd\udc00"}"#
+    );
+    let mut whole_two = whole.clone();
+    whole_two
+        .calls
+        .push((1, "call_2".to_string(), "f".to_string()));
+    whole_two.arguments.push((1, String::new()));
+    whole_two.ended.push(1);
+    whole_two.malformed = vec![
+        (
+            MalformedReason::InvalidArguments,
+            r#""ab\udc00""cd\udc00""#.to_string(),
+        ),
+        (
+            MalformedReason::UnterminatedRegion,
+            r#""ab\udc00""#.to_string(),
+        ),
+    ];
+    let mut cut_two = whole_two.clone();
+    cut_two.arguments[0].1 = r#""ab\udc0"#.to_string();
+    cut_two.arguments[1].1 = r#""cd\udc0"#.to_string();
+    cut_two.malformed = vec![
+        (
+            MalformedReason::InvalidArguments,
+            r#""ab\udc00"0""#.to_string(),
+        ),
+        (MalformedReason::UnterminatedRegion, r#"0""#.to_string()),
+    ];
+    assert!(
+        is_the_stated_exception(text_three, &whole_two, &cut_two),
+        "two calls, the earlier entry missing a later call's bytes"
     );
     assert!(
         !is_the_stated_exception(text, &whole, &whole),
