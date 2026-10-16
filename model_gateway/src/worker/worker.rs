@@ -35,7 +35,7 @@ use super::{
 };
 pub use super::{
     load::{WorkerLoadGuard, WorkerRoutingKeyLoad},
-    runtime::{RoutingState, StallReason, WorkerRuntime},
+    runtime::{RoutingState, StallReason, WedgeDrain, WorkerRuntime},
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -570,6 +570,42 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn set_stall(&self, _reason: Option<StallReason>) -> bool {
         false
     }
+
+    /// How long the current liveness veto has stood; zero without one, or
+    /// for a worker that does not track it.
+    fn stall_age(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Where the worker stands in the wedge drain (see [`super::liveness`]).
+    fn wedge_drain(&self) -> WedgeDrain {
+        WedgeDrain::Off
+    }
+
+    /// Move the worker through the wedge drain, returning `true` when the
+    /// state changed. Route writes through [`super::liveness`], which logs
+    /// and counts the transition.
+    fn set_wedge_drain(&self, _state: WedgeDrain) -> bool {
+        false
+    }
+
+    /// Whether a probing worker has taken its one probe: a tracked request
+    /// was dispatched to it since it began probing. The worker reads as
+    /// vetoed from then until the drain moves it on, so a probe that ends
+    /// without completing is not followed by the next within the sweep's
+    /// interval.
+    fn probe_taken(&self) -> bool {
+        false
+    }
+
+    /// The gateway clock (`liveness::now_ms`) at which the drain's hold is
+    /// over; zero for a worker that does not track it.
+    fn wedge_drain_until_ms(&self) -> u64 {
+        0
+    }
+
+    /// Set the clock at which the drain's hold is over.
+    fn set_wedge_drain_until_ms(&self, _until_ms: u64) {}
 
     /// Record a successful interaction with the worker (a poll answered, a
     /// probe passed, an event batch, a response).
@@ -1899,6 +1935,30 @@ impl Worker for BasicWorker {
         self.runtime.load().set_stall(reason)
     }
 
+    fn stall_age(&self) -> Duration {
+        self.runtime.load().stall_age()
+    }
+
+    fn wedge_drain(&self) -> WedgeDrain {
+        self.runtime.load().wedge_drain()
+    }
+
+    fn set_wedge_drain(&self, state: WedgeDrain) -> bool {
+        self.runtime.load().set_wedge_drain(state)
+    }
+
+    fn probe_taken(&self) -> bool {
+        self.runtime.load().probe_taken()
+    }
+
+    fn wedge_drain_until_ms(&self) -> u64 {
+        self.runtime.load().wedge_drain_until_ms()
+    }
+
+    fn set_wedge_drain_until_ms(&self, until_ms: u64) {
+        self.runtime.load().set_wedge_drain_until_ms(until_ms);
+    }
+
     fn note_contact(&self) {
         self.runtime.load().note_contact();
     }
@@ -2396,6 +2456,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         stalled: worker
             .stall_reason()
             .map(|reason| reason.as_str().to_string()),
+        wedge_drain: Some(worker.wedge_drain())
+            .filter(|state| *state != WedgeDrain::Off)
+            .map(|state| state.as_str().to_string()),
         engine_load: None,
         job_status: None,
     }

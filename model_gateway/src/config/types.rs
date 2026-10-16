@@ -230,6 +230,21 @@ pub struct RouterConfig {
     /// not judged by it. 0 disables the rule.
     #[serde(default = "default_worker_stale_secs")]
     pub worker_stale_secs: u64,
+    /// Opt-in wedge drain. Seconds a worker may stand vetoed as wedged (no
+    /// token or completion with requests in flight, see `worker_wedge_secs`)
+    /// before it drains: out of selection while its in-flight requests
+    /// finish or hit their budgets, held out for
+    /// `worker_wedge_drain_hold_secs` once nothing is in flight on it, then
+    /// routable one request per hold until one completes. While the drain
+    /// is on, neither an emptied pile nor a load record re-admits a wedged
+    /// worker; a token or a completion does before the drain, a completion
+    /// alone inside it. 0 (the default) keeps today's steering veto.
+    #[serde(default)]
+    pub worker_wedge_drain_secs: u64,
+    /// How long a drained worker with nothing in flight is held out of
+    /// routing before it may take a probe request.
+    #[serde(default = "default_worker_wedge_drain_hold_secs")]
+    pub worker_wedge_drain_hold_secs: u64,
     /// Warm-up slice for cache-aware routing: for this many seconds after a
     /// worker becomes routable, until its index has grown by
     /// `worker_warmup_blocks` blocks, one cache miss in `1 / share` goes to it.
@@ -796,6 +811,10 @@ fn default_worker_wedge_secs() -> u64 {
 
 fn default_worker_stale_secs() -> u64 {
     15
+}
+
+fn default_worker_wedge_drain_hold_secs() -> u64 {
+    30
 }
 
 fn default_worker_warmup_secs() -> u64 {
@@ -1901,6 +1920,8 @@ impl Default for RouterConfig {
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
             worker_stale_secs: default_worker_stale_secs(),
+            worker_wedge_drain_secs: 0,
+            worker_wedge_drain_hold_secs: default_worker_wedge_drain_hold_secs(),
             worker_warmup_secs: default_worker_warmup_secs(),
             worker_warmup_share: default_worker_warmup_share(),
             worker_warmup_blocks: default_worker_warmup_blocks(),
@@ -2093,6 +2114,11 @@ mod tests {
         assert_eq!(config.zmq_startup_timeout_secs, 3600);
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert_eq!(config.load_monitor_interval_secs, 10);
+        assert_eq!(
+            config.worker_wedge_drain_secs, 0,
+            "the wedge drain is opt-in"
+        );
+        assert_eq!(config.worker_wedge_drain_hold_secs, 30);
         assert!(config.discovery.is_none());
         assert!(config.metrics.is_none());
         assert!(config.trace_config.is_none());

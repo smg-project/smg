@@ -53,6 +53,50 @@ impl StallReason {
     }
 }
 
+/// Where a worker stands in the opt-in wedge drain (see
+/// [`super::liveness`]): the escalation of a wedged veto that has stood for
+/// the drain bound, from which only a completed request (or an operator)
+/// brings the worker back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WedgeDrain {
+    /// Not draining: the veto, if any, steers as usual.
+    #[default]
+    Off = 0,
+    /// Out of selection; its in-flight requests finish or hit their budgets.
+    Draining = 1,
+    /// Nothing left in flight; held out until the hold is over.
+    Held = 2,
+    /// Routable one tracked request at a time, until one completes.
+    Probing = 3,
+}
+
+impl WedgeDrain {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Draining => "draining",
+            Self::Held => "held",
+            Self::Probing => "probing",
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Draining,
+            2 => Self::Held,
+            3 => Self::Probing,
+            _ => Self::Off,
+        }
+    }
+
+    /// Whether the drain holds the worker out of routing on its own: while
+    /// it drains or is held. A probing worker is routable between probes.
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Draining | Self::Held)
+    }
+}
+
 /// One-shot routing snapshot — see [`Worker::routing_state`].
 #[derive(Clone, Copy, Debug)]
 pub struct RoutingState {
@@ -118,6 +162,16 @@ pub struct WorkerRuntime {
     overloaded: AtomicBool,
     /// Liveness veto, a [`StallReason`] as `u8` (0 = none).
     stall: AtomicU8,
+    /// When the current veto was set, in [`super::liveness::now_ms`]
+    /// milliseconds; zero without one. The wedge drain's clock.
+    stall_since_ms: AtomicU64,
+    /// Where the worker stands in the wedge drain, a [`WedgeDrain`] as `u8`.
+    wedge_drain: AtomicU8,
+    /// A probing worker's one probe was dispatched (see
+    /// [`Worker::probe_taken`]); cleared with every move of the drain.
+    probe_taken: AtomicBool,
+    /// The gateway clock at which the drain's hold is over.
+    wedge_drain_until_ms: AtomicU64,
     /// Last successful contact and last token or completion, in
     /// [`super::liveness::now_ms`] milliseconds.
     last_contact_ms: AtomicU64,
@@ -480,6 +534,10 @@ impl WorkerRuntime {
             revision: AtomicU64::new(0),
             overloaded: AtomicBool::new(false),
             stall: AtomicU8::new(0),
+            stall_since_ms: AtomicU64::new(0),
+            wedge_drain: AtomicU8::new(0),
+            probe_taken: AtomicBool::new(false),
+            wedge_drain_until_ms: AtomicU64::new(0),
             last_contact_ms: AtomicU64::new(super::liveness::now_ms()),
             last_token_ms: AtomicU64::new(super::liveness::now_ms()),
             last_waiting_reqs: AtomicI64::new(0),
@@ -551,14 +609,65 @@ impl WorkerRuntime {
         self.transport_failed.load(Ordering::Relaxed)
     }
 
+    /// The veto, or, for a worker probing its way out of the wedge drain, a
+    /// veto from the dispatch of its one probe on: a probing worker takes
+    /// one tracked request per hold.
     pub fn stall_reason(&self) -> Option<StallReason> {
-        StallReason::from_u8(self.stall.load(Ordering::Acquire))
+        match StallReason::from_u8(self.stall.load(Ordering::Acquire)) {
+            Some(reason) => Some(reason),
+            None => (self.wedge_drain() == WedgeDrain::Probing
+                && (self.probe_taken() || self.tracked_load() > 0))
+                .then_some(StallReason::Wedged),
+        }
     }
 
-    /// Set or clear the veto; `true` when it changed.
+    pub fn probe_taken(&self) -> bool {
+        self.probe_taken.load(Ordering::Relaxed)
+    }
+
+    /// Set or clear the veto; `true` when it changed. A veto set (or
+    /// changed) restarts the clock [`Self::stall_age`] reads.
     pub fn set_stall(&self, reason: Option<StallReason>) -> bool {
         let next = reason.map_or(0, |reason| reason as u8);
-        self.stall.swap(next, Ordering::AcqRel) != next
+        let changed = self.stall.swap(next, Ordering::AcqRel) != next;
+        if changed {
+            let since = if next == 0 {
+                0
+            } else {
+                super::liveness::now_ms().max(1)
+            };
+            self.stall_since_ms.store(since, Ordering::Relaxed);
+        }
+        changed
+    }
+
+    pub fn stall_age(&self) -> Duration {
+        match self.stall_since_ms.load(Ordering::Relaxed) {
+            0 => Duration::ZERO,
+            since => Self::age_of(since),
+        }
+    }
+
+    pub fn wedge_drain(&self) -> WedgeDrain {
+        WedgeDrain::from_u8(self.wedge_drain.load(Ordering::Acquire))
+    }
+
+    /// Move through the wedge drain; `true` when the state changed. Every
+    /// move gives the worker a fresh probe.
+    pub fn set_wedge_drain(&self, state: WedgeDrain) -> bool {
+        let changed = self.wedge_drain.swap(state as u8, Ordering::AcqRel) != state as u8;
+        if changed {
+            self.probe_taken.store(false, Ordering::Relaxed);
+        }
+        changed
+    }
+
+    pub fn wedge_drain_until_ms(&self) -> u64 {
+        self.wedge_drain_until_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_wedge_drain_until_ms(&self, until_ms: u64) {
+        self.wedge_drain_until_ms.store(until_ms, Ordering::Relaxed);
     }
 
     pub fn note_contact(&self) {
@@ -792,6 +901,11 @@ impl WorkerRuntime {
     pub fn note_tracked_started(&self) {
         if self.tracked_in_flight.fetch_add(1, Ordering::Relaxed) == 0 {
             self.note_busy_started();
+        }
+        // A probing worker's one probe: from here it reads as vetoed until
+        // the drain moves it on (see [`Worker::probe_taken`]).
+        if self.wedge_drain() == WedgeDrain::Probing {
+            self.probe_taken.store(true, Ordering::Relaxed);
         }
     }
     pub fn note_tracked_ended(&self) {

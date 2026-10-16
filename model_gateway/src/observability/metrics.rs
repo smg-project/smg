@@ -760,6 +760,15 @@ pub(crate) fn init_metrics() {
         "smg_worker_stall_transitions_total",
         "Times the liveness veto was set on a worker, by worker and reason"
     );
+    describe_gauge!(
+        "smg_worker_wedge_drain",
+        "Wedge drain on a worker: 1 while it is in the named state (draining, held, \
+         probing), by worker and state"
+    );
+    describe_counter!(
+        "smg_worker_wedge_drains_total",
+        "Times the wedge drain took a worker out of routing, by worker"
+    );
     describe_counter!(
         "smg_worker_overload_shed_total",
         "Requests shed because every worker for the model is overloaded, by stage \
@@ -2306,6 +2315,23 @@ impl Metrics {
             )
             .increment(1);
         }
+    }
+
+    /// Flip the wedge drain gauge for one of a worker's states.
+    pub fn set_worker_wedge_drain(worker_url: &str, state: &'static str, on: bool) {
+        let worker = intern_string(worker_url);
+        gauge!(
+            "smg_worker_wedge_drain",
+            "worker" => worker,
+            "state" => state
+        )
+        .set(if on { 1.0 } else { 0.0 });
+    }
+
+    /// Count a worker entering the wedge drain.
+    pub fn record_worker_wedge_drain(worker_url: &str) {
+        let worker = intern_string(worker_url);
+        counter!("smg_worker_wedge_drains_total", "worker" => worker).increment(1);
     }
 
     /// Set worker health status

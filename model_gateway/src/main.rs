@@ -917,6 +917,29 @@ struct WorkerArgs {
     #[arg(long, default_value_t = 15, help_heading = "Load Monitoring")]
     worker_stale_secs: u64,
 
+    /// Opt-in wedge drain. Seconds a worker may stand vetoed as wedged (see
+    /// --worker-wedge-secs) before it drains instead of steering: it leaves
+    /// selection while its in-flight requests finish or hit their budgets,
+    /// is held out for --worker-wedge-drain-hold-secs once nothing is in
+    /// flight on it, and then takes one request per hold until one
+    /// completes, which re-admits it. While the drain is on, neither an
+    /// emptied pile nor a load record re-admits a wedged worker (a token or
+    /// a completion does before the drain, a completion alone inside it), so
+    /// a worker that completes nothing stops receiving new requests instead
+    /// of being vetoed and re-admitted for the whole stall. The state is in
+    /// the worker's `wedge_drain` field and the smg_worker_wedge_drain
+    /// gauge; PATCH /workers/{id} with {"readmit": true} ends it by hand.
+    /// Needs --worker-wedge-secs above 0. 0 (the default) keeps the drain
+    /// off.
+    #[arg(long, default_value_t = 0, help_heading = "Load Monitoring")]
+    worker_wedge_drain_secs: u64,
+
+    /// How long a drained worker with nothing in flight is held out of
+    /// routing before it may take a probe request (see
+    /// --worker-wedge-drain-secs).
+    #[arg(long, default_value_t = 30, help_heading = "Load Monitoring")]
+    worker_wedge_drain_hold_secs: u64,
+
     /// Only poll worker loads when a load-aware routing policy,
     /// --engine-metrics, or worker overload protection needs the data. By
     /// default every worker group is polled from registration onward; this
@@ -3293,6 +3316,10 @@ impl CliArgs {
             .worker_stall_secs(self.workers.worker_stall_secs)
             .worker_wedge_secs(self.workers.worker_wedge_secs)
             .worker_stale_secs(self.workers.worker_stale_secs)
+            .worker_wedge_drain(
+                self.workers.worker_wedge_drain_secs,
+                self.workers.worker_wedge_drain_hold_secs,
+            )
             .worker_warmup(
                 self.routing.worker_warmup_secs,
                 self.routing.worker_warmup_share,

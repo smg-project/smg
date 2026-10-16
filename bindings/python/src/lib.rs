@@ -643,6 +643,8 @@ struct Router {
     worker_warmup_secs: u64,
     worker_warmup_share: f32,
     worker_warmup_thin_ratio: f32,
+    worker_wedge_drain_hold_secs: u64,
+    worker_wedge_drain_secs: u64,
     worker_wedge_secs: u64,
     /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
     zmq_engine_count: Option<usize>,
@@ -1113,6 +1115,10 @@ impl Router {
             .worker_stall_secs(self.worker_stall_secs)
             .worker_wedge_secs(self.worker_wedge_secs)
             .worker_stale_secs(self.worker_stale_secs)
+            .worker_wedge_drain(
+                self.worker_wedge_drain_secs,
+                self.worker_wedge_drain_hold_secs,
+            )
             .worker_warmup(
                 self.worker_warmup_secs,
                 self.worker_warmup_share,
@@ -1487,6 +1493,8 @@ impl Router {
         worker_warmup_secs = 60,
         worker_warmup_share = 0.25,
         worker_warmup_thin_ratio = 0.5,
+        worker_wedge_drain_hold_secs = 30,
+        worker_wedge_drain_secs = 0,
         worker_wedge_secs = 3,
         zmq_engine_count = None,
         zmq_startup_timeout_secs = 3600,
@@ -1699,6 +1707,8 @@ impl Router {
         worker_warmup_secs: u64,
         worker_warmup_share: f32,
         worker_warmup_thin_ratio: f32,
+        worker_wedge_drain_hold_secs: u64,
+        worker_wedge_drain_secs: u64,
         worker_wedge_secs: u64,
         zmq_engine_count: Option<usize>,
         zmq_startup_timeout_secs: u64,
@@ -1948,6 +1958,8 @@ impl Router {
             worker_warmup_secs,
             worker_warmup_share,
             worker_warmup_thin_ratio,
+            worker_wedge_drain_hold_secs,
+            worker_wedge_drain_secs,
             worker_wedge_secs,
             zmq_engine_count,
             zmq_startup_timeout_secs,
