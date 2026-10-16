@@ -134,6 +134,7 @@ impl Assembler {
         text.push_str(bytes);
         let mut rest = text.as_str();
         while !rest.is_empty() {
+            let stage = self.stage;
             let taken = match self.stage {
                 Stage::Header => self.header(rest, out),
                 Stage::Key => self.key(rest, out),
@@ -142,9 +143,10 @@ impl Assembler {
                 Stage::AfterValue => self.after_value(rest, out),
                 Stage::Closed => after_the_object(rest, out),
             };
-            if taken == 0 {
+            if taken == 0 && self.stage == stage {
                 // What is left is held: a header, key or bare value still arriving, or a start of
-                // the string token.
+                // the string token. A reader that moved on without taking a byte (an empty value
+                // before a comma) has the next one read the same bytes.
                 self.carried.push_str(rest);
                 return;
             }
@@ -249,10 +251,15 @@ impl Assembler {
         };
         let key = rest[space..colon].trim_end();
         if key.is_empty() {
+            // The colon is reported; the member keeps its place with an empty key, so that the
+            // value that follows it stays inside a valid object.
             out.push(Event::Malformed {
                 text: Text::uncounted(&rest[..=colon]),
                 why: MalformedReason::Other(EMPTY_KEY.to_string()),
             });
+            let mut json = self.separator();
+            json.push_str("\"\": ");
+            self.push_fragment(json, Text::default(), out);
         } else {
             let mut json = self.separator();
             push_quoted(&mut json, key);
@@ -615,14 +622,26 @@ mod tests {
     #[test]
     fn a_member_that_follows_a_value_without_a_separator_keeps_its_first_byte() {
         // A value followed by the next member where a comma should be: the member is read from
-        // its first byte, so every byte of the output lands in an event, whole and in pieces.
-        for text in [
-            "call:f{a:<|\"|>x<|\"|>coconut<|\"|>,b:1}",
-            "call:f{a:<|\"|>x<|\"|>  coconut}",
-            "call:f{a:[<|\"|>x<|\"|>y]}",
-        ] {
+        // its first byte, so every byte of the output lands in an event, whole and in pieces,
+        // and the arguments stay a valid object; an empty key keeps its member's place as `""`.
+        let cases = [
+            (
+                "call:f{a:<|\"|>x<|\"|>coconut<|\"|>,b:1}",
+                r#"{"a": "x", "coconut<|\"|>,b": 1}"#,
+            ),
+            ("call:f{a:<|\"|>x<|\"|>  coconut}", r#"{"a": "x"}"#),
+            ("call:f{a:<|\"|>x<|\"|>:2}", r#"{"a": "x", "": 2}"#),
+            ("call:f{:2}", r#"{"": 2}"#),
+            ("call:f{a:[<|\"|>x<|\"|>y]}", r#"{"a": ["x", "y"]}"#),
+        ];
+        for (text, expected) in cases {
             let whole = run(&[text], false);
             assert_eq!(bytes(&whole), format!("{text}{CLOSE}"), "{text:?}: whole");
+            assert_eq!(arguments(&whole), expected, "{text:?}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&arguments(&whole)).is_ok(),
+                "{text:?}: a valid object"
+            );
             let per_char: Vec<&str> = text
                 .char_indices()
                 .map(|(i, c)| &text[i..i + c.len_utf8()])
@@ -633,14 +652,32 @@ mod tests {
                 format!("{text}{CLOSE}"),
                 "{text:?}: in pieces"
             );
-            assert_eq!(arguments(&in_pieces), arguments(&whole), "{text:?}");
+            assert_eq!(arguments(&in_pieces), expected, "{text:?}: in pieces");
+            assert_eq!(
+                malformed(&in_pieces),
+                malformed(&whole),
+                "{text:?}: in pieces"
+            );
         }
-        let whole = run(&["call:f{a:<|\"|>x<|\"|>coconut<|\"|>,b:1}"], false);
-        assert!(
-            arguments(&whole).contains("coconut"),
-            "the next member starts at its first byte: {}",
-            arguments(&whole)
-        );
+    }
+
+    #[test]
+    fn an_empty_value_before_a_comma_reads_on_however_the_bytes_are_cut() {
+        // The reader of an empty bare value moves on without taking a byte; the next reader
+        // takes the same bytes, whole and in pieces alike, instead of the rest being held.
+        let text = "call:f{a:,<|\"|>X<|\"|>}";
+        let whole = run(&[text], false);
+        let per_char: Vec<&str> = text
+            .char_indices()
+            .map(|(i, c)| &text[i..i + c.len_utf8()])
+            .collect();
+        let in_pieces = run(&per_char, false);
+        assert_eq!(bytes(&whole), format!("{text}{CLOSE}"));
+        assert_eq!(bytes(&in_pieces), format!("{text}{CLOSE}"));
+        assert_eq!(arguments(&whole), r#"{"a": ""}"#);
+        assert_eq!(arguments(&in_pieces), arguments(&whole));
+        assert_eq!(malformed(&in_pieces), malformed(&whole));
+        assert_eq!(whole, in_pieces, "the same events");
     }
 
     #[test]
