@@ -197,25 +197,18 @@ impl Prefix {
         }
     }
 
-    /// The start of the value, while the top-level value is a string that has not closed: a
-    /// surrogate escape that breaks inside it has the parser refuse the whole value, so nothing
-    /// of it is certain before its closing quote. `None` inside a container, where a broken
-    /// string ends where it broke and the parent judges what follows.
-    pub fn string_start(&self) -> Option<usize> {
-        match self.token {
-            Token::Str { .. } if self.open.is_empty() && self.invalid.is_none() => Some(0),
-            _ => None,
-        }
-    }
-
     /// Where the judge may still go back to, if anywhere: the earliest of the word's start
-    /// ([`Self::word_start`]), the escape's ([`Self::escape_start`]) and, when `strings` is
-    /// asked, a top-level string's ([`Self::string_start`]); and the value's start while
-    /// nothing but whitespace has come at the top, since a word may yet come and have the whole
-    /// value refused, whitespace included. An assembler that passes bytes on as fragments holds
-    /// from there, since a fragment passed on cannot be taken back; one that streams a top-level
-    /// string whatever comes leaves `strings` out, and says so.
-    pub fn held_from(&self, strings: bool) -> Option<usize> {
+    /// ([`Self::word_start`]) and the escape's ([`Self::escape_start`]), and the value's start
+    /// while nothing but whitespace has come at the top, since a word may yet come and have the
+    /// whole value refused, whitespace included. An assembler that passes bytes on as fragments
+    /// holds from there, since a fragment passed on cannot be taken back.
+    ///
+    /// A top-level string is not held, though the parser refuses it whole when a surrogate
+    /// escape breaks inside it: a string-valued arguments (a stringified call object) streams
+    /// as written, and a surrogate that breaks inside one is the one shape where the pieces have
+    /// said the string's bytes before the break and the whole says nothing. The assemblers say
+    /// so where they choose it.
+    pub fn held_from(&self) -> Option<usize> {
         let before_the_value = self.open.is_empty()
             && self.expect == Expect::Value
             && matches!(self.token, Token::None)
@@ -223,7 +216,6 @@ impl Prefix {
         [
             self.word_start(),
             self.escape_start(),
-            if strings { self.string_start() } else { None },
             if before_the_value { Some(0) } else { None },
         ]
         .into_iter()
@@ -636,26 +628,23 @@ mod tests {
         };
         // A word: its first letter inside a container, the value's start at the top; and the
         // value's start while nothing but whitespace has come at the top.
-        assert_eq!(after(r#"{"a": nu"#).held_from(false), Some(6));
-        assert_eq!(after("  nu").held_from(false), Some(0));
-        assert_eq!(after("  ").held_from(false), Some(0));
-        assert_eq!(after("").held_from(false), Some(0));
-        assert_eq!(after("  {").held_from(false), None);
-        assert_eq!(after("  1").held_from(false), None);
-        assert_eq!(after("null").held_from(false), Some(0));
-        assert_eq!(after("[null, ").held_from(false), None);
+        assert_eq!(after(r#"{"a": nu"#).held_from(), Some(6));
+        assert_eq!(after("  nu").held_from(), Some(0));
+        assert_eq!(after("  ").held_from(), Some(0));
+        assert_eq!(after("").held_from(), Some(0));
+        assert_eq!(after("  {").held_from(), None);
+        assert_eq!(after("  1").held_from(), None);
+        assert_eq!(after("null").held_from(), Some(0));
+        assert_eq!(after("[null, ").held_from(), None);
         // A surrogate escape awaiting its low half behind a backslash: the backslash.
-        assert_eq!(after(r#"{"e": "\ud83c\"#).held_from(false), Some(13));
-        assert_eq!(after(r#"{"e": "\ud83c\u"#).held_from(false), None);
-        assert_eq!(after(r#"{"e": "\ud83c"#).held_from(false), None);
-        // A top-level string, only when asked.
-        assert_eq!(after(r#""ab\ud83c"#).held_from(true), Some(0));
-        assert_eq!(after(r#""ab"#).held_from(true), Some(0));
-        assert_eq!(after(r#""ab"#).held_from(false), None);
-        assert_eq!(after(r#""ab""#).held_from(true), None);
-        // A number and a container: nothing to go back to.
-        assert_eq!(after("12.").held_from(true), None);
-        assert_eq!(after(r#"{"a": [1, "#).held_from(true), None);
+        assert_eq!(after(r#"{"e": "\ud83c\"#).held_from(), Some(13));
+        assert_eq!(after(r#"{"e": "\ud83c\u"#).held_from(), None);
+        assert_eq!(after(r#"{"e": "\ud83c"#).held_from(), None);
+        // A string streams on, at the top too; a number and a container: nothing to go back to.
+        assert_eq!(after(r#""ab\ud83c"#).held_from(), None);
+        assert_eq!(after(r#""ab"#).held_from(), None);
+        assert_eq!(after("12.").held_from(), None);
+        assert_eq!(after(r#"{"a": [1, "#).held_from(), None);
     }
 
     #[test]

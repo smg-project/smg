@@ -211,11 +211,12 @@ impl Arguments {
     /// The bytes that arrived since the last call: a fragment for the part that keeps the
     /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken.
     /// While the object is `open`, bytes the judge may still go back to (a word being spelled,
-    /// `nu`; a surrogate escape awaiting its low half; a top-level string, which the parser
-    /// refuses whole when a surrogate inside it breaks) are held: a fragment passed on cannot be
-    /// taken back, so the pieces would say `n` where the whole says nothing. They are sent once
-    /// the next bytes settle them, with the object's close, or when no more bytes can come
-    /// ([`Self::finish`]).
+    /// `nu`; a surrogate escape awaiting its low half; the whitespace before the value, which a
+    /// refused word at the top takes with it) are held: a fragment passed on cannot be taken
+    /// back, so the pieces would say `n` where the whole says nothing. They are sent once the
+    /// next bytes settle them, with the object's close, or when no more bytes can come
+    /// ([`Self::finish`]). A string where the object should be streams as written, the one shape
+    /// where the pieces may say more than the whole (`Prefix::held_from`).
     fn emit_new_bytes(&mut self, open: bool, out: &mut Events) {
         if self.text.len() <= self.emitted {
             return;
@@ -230,7 +231,7 @@ impl Arguments {
                 Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
             },
         };
-        let valid_end = match self.prefix.held_from(true) {
+        let valid_end = match self.prefix.held_from() {
             Some(start) if open && self.invalid_from.is_none() => {
                 valid_end.min(start).max(self.emitted)
             }
@@ -345,7 +346,6 @@ mod tests {
             ("{\"a\": nosuch}", "{\"a\": ", "nosuch}"),
             ("{\"a\": null}", "{\"a\": null}", ""),
             ("{\"e\": \"\\ud83c\\x\"}", "{\"e\": \"\\ud83c", "\\x\"}"),
-            ("\"\\udc00\"", "", "\"\\udc00\""),
             ("\"ab\\ud83c\\ude00 c\"", "\"ab\\ud83c\\ude00 c\"", ""),
             ("\tnosuch", "", "\tnosuch"),
             (" null", " null", ""),

@@ -291,12 +291,13 @@ impl Assembler {
             },
         };
         // Bytes the judge may still go back to (a word being spelled, `nu`; a surrogate escape
-        // awaiting its low half; a top-level string, which the parser refuses whole when a
-        // surrogate inside it breaks) are held while the value is still open: a fragment passed
-        // on cannot be taken back, so the pieces would say `n` where the whole says nothing. They
-        // are sent once the next bytes settle them, with the value's end, or when no more bytes
-        // can come ([`Self::send_held`]), as the prefix they are then.
-        let valid_end = match self.prefix.held_from(true) {
+        // awaiting its low half; the whitespace before a value at the top) are held while the
+        // value is still open: a fragment passed on cannot be taken back, so the pieces would say
+        // `n` where the whole says nothing. They are sent once the next bytes settle them, with
+        // the value's end, or when no more bytes can come ([`Self::send_held`]), as the prefix
+        // they are then. A string-valued arguments streams as written, the one shape where the
+        // pieces may say more than the whole (`Prefix::held_from`).
+        let valid_end = match self.prefix.held_from() {
             Some(start) if span.end.is_none() && self.invalid_from.is_none() => {
                 valid_end.min(start).max(self.emitted)
             }
@@ -408,13 +409,34 @@ mod tests {
     }
 
     #[test]
+    fn a_top_level_string_a_surrogate_breaks_is_the_one_shape_the_pieces_say_more_of() {
+        // A string-valued arguments streams as written (a stringified call object is one), and
+        // the parser refuses the whole value when a surrogate escape breaks inside it: the pieces
+        // have said the string's bytes before the break where the whole says nothing. Every
+        // byte is accounted for either way, and nothing a piece said is taken back.
+        let object = r#"{"name": "f", "arguments": "ab\udc00"}"#;
+        let whole = run(&[object]);
+        assert_eq!(arguments(&whole), "");
+        assert_eq!(malformed(&whole), r#""ab\udc00""#);
+        let per_char: Vec<&str> = object
+            .char_indices()
+            .map(|(i, c)| &object[i..i + c.len_utf8()])
+            .collect();
+        let streamed = run(&per_char);
+        assert_eq!(arguments(&streamed), r#""ab\udc0"#);
+        assert_eq!(malformed(&streamed), r#"0""#);
+        for events in [&whole, &streamed] {
+            assert_eq!(sources(events), object);
+        }
+    }
+
+    #[test]
     fn a_word_under_way_is_held_so_the_pieces_say_of_it_what_the_whole_says() {
         // A word that is no literal is refused from its first letter, and nothing of it is
         // passed on as arguments however the bytes were cut; a literal, whole or cut short at
         // the end, is sent once it is spelled or once nothing more can come; a number is sent as
         // far as it is one. A surrogate escape that breaks behind its backslash takes the
-        // backslash with it, and a top-level string that breaks is refused whole, the pieces
-        // saying the same. Open values end with the stream, closed ones at their object's brace.
+        // backslash with it. Open values end with the stream, closed ones at their object's brace.
         let cases = [
             ("nosuch", "", "nosuch"),
             ("trash", "", "trash"),
@@ -427,7 +449,6 @@ mod tests {
             ("[true, trash]", "[true, ", "trash]"),
             (r#"{"e": "\ud83c\x"}"#, r#"{"e": "\ud83c"#, r#"\x"}"#),
             (r#"{"e": "\ud83c\ude00"}"#, r#"{"e": "\ud83c\ude00"}"#, ""),
-            (r#""\udc00""#, "", r#""\udc00""#),
             (r#""ab\ud83c\ude00 c""#, r#""ab\ud83c\ude00 c""#, ""),
             // The outline keeps the whitespace before the value out of the arguments' span.
             ("\tnosuch", "", "nosuch"),
@@ -739,10 +760,6 @@ mod tests {
         assert_eq!(sources(&events), text);
     }
 
-    /// With `ending_where_refused`, an object whose outline stops short of its closing brace (the
-    /// brace left off, text where a member should be) ends there, as one whose arguments break
-    /// does: the call ends with what the outline read after the arguments, and the bytes from the
-    /// stop on are handed back. Stopped before its name, the object named no call, and its bytes
     #[test]
     fn a_word_refused_hands_the_same_tail_back_whole_and_in_pieces() {
         // The shaped calls' assembler ends where its arguments stop being a value and hands the
@@ -789,6 +806,10 @@ mod tests {
         }
     }
 
+    /// With `ending_where_refused`, an object whose outline stops short of its closing brace (the
+    /// brace left off, text where a member should be) ends there, as one whose arguments break
+    /// does: the call ends with what the outline read after the arguments, and the bytes from the
+    /// stop on are handed back. Stopped before its name, the object named no call, and its bytes
     /// come back malformed.
     #[test]
     fn an_object_ending_where_refused_ends_where_its_outline_stops() {
