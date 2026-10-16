@@ -525,6 +525,7 @@ struct Router {
     mm_pixel_cache_mb: Option<usize>,
     mm_pixel_rdma: bool,
     mm_processing: Option<String>,
+    mm_turbojpeg: Option<String>,
     model_aliases: HashMap<String, String>,
     model_id_from: Option<String>,
     model_path: Option<String>,
@@ -777,6 +778,19 @@ impl Router {
                         field: "mm_processing".to_string(),
                         value: value.to_string(),
                         reason: "expected 'auto', 'router', or 'worker'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        let mm_turbojpeg = self
+            .mm_turbojpeg
+            .as_deref()
+            .map(|value| {
+                config::TurboJpegPolicy::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "mm_turbojpeg".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'prefer' or 'require'".to_string(),
                     }
                 })
             })
@@ -1182,6 +1196,7 @@ impl Router {
             .mm_pixel_rdma(self.mm_pixel_rdma)
             .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
             .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
+            .mm_turbojpeg(mm_turbojpeg)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
@@ -1323,6 +1338,7 @@ impl Router {
         mm_pixel_cache_mb = None,
         mm_pixel_rdma = false,
         mm_processing = None,
+        mm_turbojpeg = None,
         model_aliases = HashMap::new(),
         model_id_from = None,
         model_path = None,
@@ -1524,6 +1540,7 @@ impl Router {
         mm_pixel_cache_mb: Option<usize>,
         mm_pixel_rdma: bool,
         mm_processing: Option<String>,
+        mm_turbojpeg: Option<String>,
         model_aliases: HashMap<String, String>,
         model_id_from: Option<String>,
         model_path: Option<String>,
@@ -1755,6 +1772,7 @@ impl Router {
             mm_pixel_cache_mb,
             mm_pixel_rdma,
             mm_processing,
+            mm_turbojpeg,
             model_aliases,
             model_id_from,
             model_path,

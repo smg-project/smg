@@ -307,6 +307,7 @@ class TestMmSettings:
         assert resolved.sidecar_timeout_ms == 30_000
         assert resolved.sidecar_max_queue == 256
         assert resolved.sidecar_namespace is None
+        assert resolved.turbojpeg == "prefer"
         assert resolved.source == "default"
         assert set(resolved.sources.values()) == {"default"}
         assert resolved.resolved
@@ -409,6 +410,7 @@ class TestMmSettings:
             mm_sidecar_timeout_ms=None,
             mm_sidecar_max_queue=None,
             mm_sidecar_namespace="ns",
+            mm_turbojpeg=None,
             model="m",
         )
         settings = mm_processor.MmSettings.from_args(args)
@@ -429,6 +431,26 @@ class TestMmSettings:
             mm_processor.MmSettings(max_item_bytes=0).resolve(env={})
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_INFLIGHT"):
             mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_MAX_INFLIGHT": "0"})
+
+    def test_turbojpeg_policy_reads_prefer_or_require_and_refuses_the_rest(self):
+        """The TurboJPEG policy: `prefer` by default, either value in any case
+        from the flag or the variable, anything else refused at start."""
+        assert mm_processor.MmSettings().resolve(env={}).turbojpeg == "prefer"
+        resolved = mm_processor.MmSettings(turbojpeg=" Require ").resolve(env={})
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "flag")
+        resolved = mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "REQUIRE"})
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "env")
+        blank = mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "  "})
+        assert (blank.turbojpeg, blank.sources["turbojpeg"]) == ("prefer", "default")
+        with pytest.raises(ValueError, match="--mm-turbojpeg='required' is not one of"):
+            mm_processor.MmSettings(turbojpeg="required").resolve(env={})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_TURBOJPEG='required' is not one of"):
+            mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "required"})
+        parser = argparse.ArgumentParser()
+        assert "--mm-turbojpeg" in mm_processor.add_mm_arguments(parser)
+        assert parser.parse_args(["--mm-turbojpeg", "require"]).mm_turbojpeg == "require"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--mm-turbojpeg", "required"])
 
     def test_a_subset_resolves_only_itself_under_its_own_flag_names(self, caplog):
         env = {

@@ -232,6 +232,7 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         "max_item_bytes": settings.max_item_bytes,
         "video_frame_budget": video_frame_budget(model_config),
         "video_loader_rule": video_loader_rule(model_config),
+        "turbojpeg": settings.turbojpeg,
         "source": settings.source,
     }
 

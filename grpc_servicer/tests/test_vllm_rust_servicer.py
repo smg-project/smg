@@ -451,6 +451,7 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
         "max_item_bytes": 10,
         "video_frame_budget": None,
         "video_loader_rule": None,
+        "turbojpeg": "prefer",
         "source": "flag",
     }
     # The engine's own per-prompt limits ride along for the pipeline to enforce.
@@ -601,6 +602,7 @@ def test_smg_media_options_carry_the_processor_kwargs_from_where_the_engine_keep
         "max_item_bytes": 10,
         "video_frame_budget": None,
         "video_loader_rule": None,
+        "turbojpeg": "prefer",
         "source": "flag",
     }
     assert json.loads(options["processor_kwargs_json"]) == {

@@ -27,7 +27,7 @@ use engine_servicer::{
     VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_STARTUP_CEILING,
     DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
 };
-use llm_multimodal::Modality;
+use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
@@ -556,6 +556,15 @@ fn native_media_options(
             Some((modality, limit))
         })
         .collect();
+    // The TurboJPEG policy as the launcher resolved it (flag > env >
+    // `prefer`); a launcher without the setting leaves it to the pipeline's
+    // own fallback (`SMG_MM_TURBOJPEG`).
+    let turbojpeg = string("turbojpeg")?
+        .map(|raw| {
+            raw.parse::<TurboJpegPolicy>()
+                .map_err(PyValueError::new_err)
+        })
+        .transpose()?;
     Ok(NativeMediaOptions {
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
@@ -576,6 +585,7 @@ fn native_media_options(
             video_fetch_timeout: Duration::from_millis(video_fetch_timeout_ms),
             video_frame_budget,
             video_loader_rule: string("video_loader_rule")?,
+            turbojpeg,
         },
         source: string("source")?.unwrap_or_else(|| "default".to_string()),
         max_inflight: count("max_inflight")?.unwrap_or(4).max(1),
