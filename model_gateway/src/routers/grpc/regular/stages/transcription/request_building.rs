@@ -64,6 +64,7 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             processed_messages.continued_final_message,
             token_ids,
             None,
+            None,
             "transcription-",
             /* inject_pd_metadata */ false,
             ExecutionPlanKind::Single,

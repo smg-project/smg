@@ -1,5 +1,7 @@
 //! Chat request building stage: Build proto GenerateRequest for chat requests
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
@@ -10,7 +12,10 @@ use crate::{
         error,
         grpc::{
             client::GenerateRequestBuildOptions,
-            common::stages::{helpers, BuildStage},
+            common::stages::{
+                helpers::{self, TagForStart},
+                BuildStage,
+            },
             context::{
                 AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
                 PreparationOutput, RequestContext,
@@ -81,7 +86,9 @@ fn reasoning_decision(
 /// and injects PD/EPD metadata — returning the plan, attempt stamp and rendered
 /// reasoning state. The caller supplies the `ResponseSpec`.
 /// `continued_final_message` is the rendered prompt's
-/// (`ProcessedMessages::continued_final_message`).
+/// (`ProcessedMessages::continued_final_message`). `auto_tag` derives the
+/// table's `auto` tag for a worker's grammar start when `tool_constraints` is
+/// that tag (`regular::symphony::WorkerConstraint::auto`).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
@@ -90,6 +97,7 @@ pub(crate) async fn build_chat_backed_plan(
     continued_final_message: bool,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
+    auto_tag: Option<Arc<dyn TagForStart>>,
     id_prefix: &'static str,
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
@@ -161,8 +169,9 @@ pub(crate) async fn build_chat_backed_plan(
     // its engine needs: the bare calls behind a reasoning parser's gate, the
     // thought and then the calls from the first token (the worker's
     // `constrained_decoding_start` label; see `utils::tool_constraints_for_worker`).
-    // The unshaped constraint stays on the attempt stamp: a retry gives the
-    // worker it selects the same shaping (`helpers::ToolConstraintStamp`).
+    // The unshaped constraint stays on the attempt stamp, or what derives the
+    // table's `auto` tag for a start: a retry gives the worker it selects the
+    // same shaping (`helpers::ToolConstraintStamp`).
     let tool_parser = ctx
         .components
         .parser_resolver
@@ -249,11 +258,14 @@ pub(crate) async fn build_chat_backed_plan(
         ctx.state.media_refs_forwarded = true;
     }
 
-    let tool_constraint = helpers::ToolConstraintStamp::capture(
-        unshaped_tool_constraints,
-        tool_parser.as_deref(),
-        &proto_request,
-    );
+    let tool_constraint = match auto_tag {
+        Some(auto_tag) => helpers::ToolConstraintStamp::capture_table(auto_tag, &proto_request),
+        None => helpers::ToolConstraintStamp::capture(
+            unshaped_tool_constraints,
+            tool_parser.as_deref(),
+            &proto_request,
+        ),
+    };
     Ok((
         ExecutionPlan::generate(plan_kind, proto_request),
         AttemptStamp {
@@ -311,9 +323,9 @@ impl BuildStage for ChatRequestBuildingStage {
         // takes (`reasoning_decision`). When the worker's policy chose the
         // constraint, a retry re-selects only workers that decide alike
         // (`utils::WorkerDecoding::decides_alike`); what the request asked for
-        // suits any worker. The attempt stamp carries the tag unshaped like a
-        // forced call's, so the retry's worker shapes it for where its engine
-        // starts the grammar.
+        // suits any worker. The attempt stamp carries what derives the `auto`
+        // tag for a worker's start, so the retry's worker gets it shaped for
+        // where its own engine starts the grammar.
         let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
         let decided = symphony::worker_constraint(
             decoding,
@@ -327,28 +339,24 @@ impl BuildStage for ChatRequestBuildingStage {
                     &ctx.components.templates,
                 )
             },
-            || {
-                let reasoning = reasoning_decision(
+            || symphony::AutoTag::Chat {
+                parser,
+                names: names.clone(),
+                request: Arc::clone(&chat_request),
+                reasoning_open: reasoning_decision(
                     ctx,
                     &chat_request,
                     &processed_messages.text,
                     processed_messages.continued_final_message,
-                );
-                symphony::auto_constraint(
-                    parser,
-                    &names,
-                    &chat_request,
-                    &chat_request.callable_tools(),
-                    reasoning,
-                    symphony::grammar_start_from(decoding.start),
-                    &ctx.components.templates,
-                )
+                ),
+                templates: Arc::clone(&ctx.components.templates),
             },
         )
         .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
         if decided.by_policy {
             ctx.state.constraint_decided_on = Some(decoding);
         }
+        let auto_tag = decided.auto.map(|auto| -> Arc<dyn TagForStart> { auto });
         let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
         let assignment = symphony::assign(
             parser,
@@ -393,6 +401,7 @@ impl BuildStage for ChatRequestBuildingStage {
             continued_final_message,
             token_ids,
             tool_constraints,
+            auto_tag,
             "chatcmpl-",
             self.inject_pd_metadata,
             self.plan_kind,

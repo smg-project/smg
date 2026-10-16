@@ -17,6 +17,9 @@ pub struct ScriptedTokenizer {
     response_template: Option<serde_json::Value>,
     /// Appended to the rendered prompt.
     prompt_tail: String,
+    /// The rendered prompt ends inside a `<think>` block the model closes, as the gateway reads
+    /// it from a tokenizer ([`Tokenizer::think_in_prefill`]).
+    think_in_prefill: bool,
 }
 
 impl ScriptedTokenizer {
@@ -35,6 +38,7 @@ impl ScriptedTokenizer {
             eos_ids: Vec::new(),
             response_template: None,
             prompt_tail: String::new(),
+            think_in_prefill: false,
         }
     }
 
@@ -68,6 +72,13 @@ impl ScriptedTokenizer {
     /// End every rendered prompt with `tail`.
     pub fn with_prompt_tail(mut self, tail: &str) -> Self {
         self.prompt_tail = tail.to_string();
+        self
+    }
+
+    /// Report the rendered prompt as ending inside a `<think>` block the model closes, as the
+    /// gateway reads it from a tokenizer whose template opens one.
+    pub fn with_think_in_prefill(mut self) -> Self {
+        self.think_in_prefill = true;
         self
     }
 
@@ -112,6 +123,10 @@ impl Decoder for ScriptedTokenizer {
 }
 
 impl Tokenizer for ScriptedTokenizer {
+    fn think_in_prefill(&self) -> bool {
+        self.think_in_prefill
+    }
+
     fn vocab_size(&self) -> usize {
         self.base.vocab_size() + self.chunks.len()
     }

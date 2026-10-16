@@ -421,9 +421,11 @@ pub(crate) struct AttemptStamp {
     /// Pre-default values of the masked fields, so re-application never
     /// carries a previous attempt's worker defaults forward.
     pub sampling_baseline: Option<SamplingBaseline>,
-    /// A forced tool call's constraint before any worker shaped it, with
-    /// the tool parser that shapes it; retry attempts re-shape it for the
-    /// newly selected worker's engine, as the build did for the first.
+    /// The tool constraint as each attempt's worker must take it: a forced
+    /// call's before any worker shaped it, with the tool parser that shapes
+    /// it, or what derives the table's `auto` tag for a worker's grammar
+    /// start; retry attempts re-shape it for the newly selected worker's
+    /// engine, as the build did for the first.
     pub tool_constraint: Option<ToolConstraintStamp>,
     /// Mode::PrefillDecode only (mirrors the build stage's flag).
     pub inject_pd_metadata: bool,

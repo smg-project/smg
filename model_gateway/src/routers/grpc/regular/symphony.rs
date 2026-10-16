@@ -41,7 +41,7 @@
 
 pub(crate) mod template;
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 use axum::http::HeaderMap;
 use llm_tokenizer::{
@@ -68,6 +68,7 @@ use self::template::Templates;
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
     routers::grpc::{
+        common::stages::helpers::TagForStart,
         spec::scans_for_tool_calls,
         utils::{Names, WorkerDecoding},
     },
@@ -644,6 +645,128 @@ pub(crate) struct WorkerConstraint {
     /// The worker's policy chose the constraint (the whole turn's grammar or the `auto` tag), not
     /// the request: a worker of another policy would not send it.
     pub by_policy: bool,
+    /// The `auto` tag the policy chose, as it derives for a worker's grammar start: the attempt
+    /// stamp gives the worker a retry takes the shape its own start needs ([`AutoTag::for_start`],
+    /// `helpers::ToolConstraintStamp`).
+    pub auto: Option<Arc<AutoTag>>,
+}
+
+/// The table's `auto` tag for a request, derived for where a worker's engine starts the grammar on
+/// a prompt that leaves the thought open: request building shapes it for the worker it selected,
+/// and the attempt stamp for the worker each retry takes, whose start may differ (the retry filter
+/// compares the policy, not the start: [`WorkerDecoding::decides_alike`]). It owns what
+/// [`auto_constraint`] and [`auto_constraint_messages`] read, since the request is gone from the
+/// pipeline once the plan is built.
+pub(crate) enum AutoTag {
+    /// A chat request's, over the tools its `tool_choice` leaves callable.
+    Chat {
+        parser: ParserChoice,
+        names: Names,
+        request: Arc<ChatCompletionRequest>,
+        /// The prompt leaves the model inside its thought.
+        reasoning_open: bool,
+        templates: Arc<Templates>,
+    },
+    /// A Messages request's, over `tools` as the template declares them.
+    Messages {
+        parser: ParserChoice,
+        names: Names,
+        request: Arc<CreateMessageRequest>,
+        tools: Vec<Tool>,
+        /// The prompt leaves the model inside its thought.
+        reasoning_open: bool,
+        /// The prompt continues the assistant's message.
+        continues: bool,
+        templates: Arc<Templates>,
+    },
+}
+
+impl AutoTag {
+    /// The tag for an engine whose grammar starts at `start`; `None` where the table gives that
+    /// engine none.
+    pub(crate) fn for_start(&self, start: GrammarStart) -> Result<Option<ToolConstraint>, String> {
+        match self {
+            Self::Chat {
+                parser,
+                names,
+                request,
+                reasoning_open,
+                templates,
+            } => auto_constraint(
+                *parser,
+                names,
+                request,
+                &request.callable_tools(),
+                *reasoning_open,
+                start,
+                templates,
+            ),
+            Self::Messages {
+                parser,
+                names,
+                request,
+                tools,
+                reasoning_open,
+                continues,
+                templates,
+            } => auto_constraint_messages(
+                *parser,
+                names,
+                request,
+                tools,
+                *reasoning_open,
+                start,
+                *continues,
+                templates,
+            ),
+        }
+    }
+}
+
+impl TagForStart for AutoTag {
+    fn tag_for(&self, start: WorkerGrammarStart) -> Result<Option<String>, String> {
+        // The table's `auto` tag is a structural tag ([`auto_tag`]); the schema kind is not built
+        // here.
+        Ok(self
+            .for_start(grammar_start_from(start))?
+            .and_then(|constraint| match constraint {
+                ToolConstraint::StructuralTag(tag) => Some(tag),
+                ToolConstraint::JsonSchema(_) => None,
+            }))
+    }
+}
+
+impl fmt::Debug for AutoTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Chat {
+                parser,
+                request,
+                reasoning_open,
+                ..
+            } => f
+                .debug_struct("AutoTag::Chat")
+                .field("parser", parser)
+                .field("model", &request.model)
+                .field("reasoning_open", reasoning_open)
+                .finish_non_exhaustive(),
+            Self::Messages {
+                parser,
+                request,
+                tools,
+                reasoning_open,
+                continues,
+                ..
+            } => f
+                .debug_struct("AutoTag::Messages")
+                .field("parser", parser)
+                .field("model", &request.model)
+                .field("tools", &tools.len())
+                .field("reasoning_open", reasoning_open)
+                .field("continues", continues)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// What constrains a request's output on the worker selected for it, whose engine takes a grammar
@@ -654,16 +777,17 @@ pub(crate) struct WorkerConstraint {
 /// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
 ///   (`turn`, [`turn_constraint`]) where it starts; its refusal refuses the request.
 /// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
-///   and when that is nothing, the table's tag for the calls `auto` allows (`auto`,
-///   [`auto_constraint`]).
+///   and when that is nothing, the table's tag for the calls `auto` allows (`auto`, the request's
+///   [`AutoTag`], derived for the worker's start).
 ///
 /// When the policy chose the constraint, a retry re-selects only workers that decide alike
-/// ([`WorkerDecoding::decides_alike`]).
+/// ([`WorkerDecoding::decides_alike`]); the `auto` tag goes with the plan as it derives, for the
+/// retry's worker to take in the shape its own start needs.
 pub(crate) fn worker_constraint(
     decoding: WorkerDecoding,
     prepared: PreparedConstraint,
     turn: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
-    auto: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
+    auto: impl FnOnce() -> AutoTag,
 ) -> Result<WorkerConstraint, String> {
     let always = decoding.policy == ConstrainedDecoding::Always;
     if decoding.takes_the_whole_turn() {
@@ -672,21 +796,24 @@ pub(crate) fn worker_constraint(
                 constraint: Some(constraint),
                 whole_turn: true,
                 by_policy: true,
+                auto: None,
             });
         }
     }
-    let (constraint, by_policy) = match prepared? {
+    let (constraint, by_policy, auto) = match prepared? {
         None if always => {
-            let tag = auto()?;
+            let auto = auto();
+            let tag = auto.for_start(grammar_start_from(decoding.start))?;
             let by_policy = tag.is_some();
-            (tag, by_policy)
+            (tag, by_policy, by_policy.then(|| Arc::new(auto)))
         }
-        prepared => (prepared, false),
+        prepared => (prepared, false, None),
     };
     Ok(WorkerConstraint {
         constraint,
         whole_turn: false,
         by_policy,
+        auto,
     })
 }
 
@@ -2832,8 +2959,19 @@ mod tests {
 
         let tag = |text: &str| ToolConstraint::StructuralTag(text.to_string());
         let refused = |why: &str| Err::<Option<ToolConstraint>, String>(why.to_string());
-        // What one decision gives (the tag's text, and whether it is the whole turn's), and which
-        // of the whole turn's grammar and the `auto` tag it built.
+        // The request's `auto` tag: DeepSeek V4's table over one tool, the thought left open, so
+        // the tag takes a shape for each start.
+        let templates = Arc::new(templates());
+        let auto_tag = || AutoTag::Chat {
+            parser: ParserChoice::Symphony,
+            names: names(Some("deepseek_v4"), Some("deepseek_v4")),
+            request: Arc::new(request(json!({"tools": tools()}))),
+            reasoning_open: true,
+            templates: Arc::clone(&templates),
+        };
+        // What one decision gives (the tag's text, whether it is the whole turn's, whether the
+        // policy chose it, and whether the `auto` tag goes with the plan), and which of the whole
+        // turn's grammar and the `auto` tag it built.
         let decide = |policy, start, prepared: PreparedConstraint, turn: PreparedConstraint| {
             let built = std::cell::RefCell::new(Vec::new());
             let decided = worker_constraint(
@@ -2845,17 +2983,32 @@ mod tests {
                 },
                 || {
                     built.borrow_mut().push("auto");
-                    Ok(Some(tag("auto")))
+                    auto_tag()
                 },
             )
             .map(|decided| {
                 let text = decided.constraint.map(|constraint| constraint.to_tuple().1);
-                (text, decided.whole_turn, decided.by_policy)
+                (
+                    text,
+                    decided.whole_turn,
+                    decided.by_policy,
+                    decided.auto.is_some(),
+                )
             });
             (decided, built.into_inner())
         };
-        // The `auto` tag is the policy's choice; what preparation found is the request's.
-        let found = |text: &str| Ok((Some(text.to_string()), false, text == "auto"));
+        // What preparation found is the request's choice.
+        let found = |text: &str| Ok((Some(text.to_string()), false, false, false));
+        // The `auto` tag is the policy's, in the shape the worker's start takes, and goes with the
+        // plan for a retry's worker.
+        let auto = |start| {
+            let text = auto_tag()
+                .for_start(grammar_start_from(start))
+                .expect("a table")
+                .map(|constraint| constraint.to_tuple().1);
+            assert!(text.is_some(), "{start:?}");
+            Ok((text, false, true, true))
+        };
 
         // `requested`: what preparation found, its refusal included; nothing else is built.
         for start in [FirstToken, AfterReasoning, Unknown] {
@@ -2874,14 +3027,17 @@ mod tests {
             );
             assert_eq!(
                 decide(Requested, start, Ok(None), Ok(Some(tag("turn")))),
-                (Ok((None, false, false)), vec![])
+                (Ok((None, false, false, false)), vec![])
             );
         }
         // `always` from the first token: the whole turn's grammar stands over what preparation
         // found or refused, and its refusal refuses the request.
         assert_eq!(
             decide(Always, FirstToken, refused("no tag"), Ok(Some(tag("turn")))),
-            (Ok((Some("turn".to_string()), true, true)), vec!["turn"])
+            (
+                Ok((Some("turn".to_string()), true, true, false)),
+                vec!["turn"]
+            )
         );
         assert_eq!(
             decide(Always, FirstToken, Ok(None), refused("cannot hold")),
@@ -2899,7 +3055,7 @@ mod tests {
         );
         assert_eq!(
             decide(Always, FirstToken, Ok(None), Ok(None)),
-            (found("auto"), vec!["turn", "auto"])
+            (auto(FirstToken), vec!["turn", "auto"])
         );
         for start in [AfterReasoning, Unknown] {
             assert_eq!(
@@ -2917,10 +3073,10 @@ mod tests {
             );
             assert_eq!(
                 decide(Always, start, Ok(None), Ok(Some(tag("turn")))),
-                (found("auto"), vec!["auto"])
+                (auto(start), vec!["auto"])
             );
         }
-        // Where the table gives no `auto` tag, the policy chose nothing.
+        // Where the table gives no `auto` tag (no tool to call), the policy chose nothing.
         let nothing = worker_constraint(
             WorkerDecoding {
                 policy: Always,
@@ -2928,10 +3084,112 @@ mod tests {
             },
             Ok(None),
             || Ok(None),
-            || Ok(None),
+            || AutoTag::Chat {
+                parser: ParserChoice::Symphony,
+                names: names(Some("deepseek_v4"), Some("deepseek_v4")),
+                request: Arc::new(request(json!({}))),
+                reasoning_open: true,
+                templates: Arc::clone(&templates),
+            },
         )
         .unwrap();
-        assert!(nothing.constraint.is_none() && !nothing.by_policy);
+        assert!(nothing.constraint.is_none() && !nothing.by_policy && nothing.auto.is_none());
+        assert_eq!(
+            decide(Requested, Unknown, Ok(None), Ok(None)).0,
+            Ok((None, false, false, false))
+        );
+    }
+
+    /// The request's `auto` tag derives again for where another worker's engine starts the
+    /// grammar, as a retry needs it: the free-text prefix before the calls for an engine that does
+    /// not say, the bare block for one that starts after its reasoning parser's gate, the closed
+    /// thought then the block for one that starts at the first token; each the tag request
+    /// building gives a worker of that start. For a chat and a Messages request alike.
+    #[test]
+    fn the_auto_tag_derives_again_for_the_start_of_the_worker_a_retry_takes() {
+        use WorkerGrammarStart::{AfterReasoning, FirstToken, Unknown};
+        let templates = Arc::new(templates());
+        let names = names(Some("deepseek_v4"), Some("deepseek_v4"));
+        let chat = request(json!({"tools": tools()}));
+        let messages = message_request(json!({
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}]
+        }));
+        let tags = [
+            AutoTag::Chat {
+                parser: ParserChoice::Symphony,
+                names: names.clone(),
+                request: Arc::new(chat.clone()),
+                reasoning_open: true,
+                templates: Arc::clone(&templates),
+            },
+            AutoTag::Messages {
+                parser: ParserChoice::Symphony,
+                names: names.clone(),
+                request: Arc::new(messages.clone()),
+                tools: tools(),
+                reasoning_open: true,
+                continues: false,
+                templates: Arc::clone(&templates),
+            },
+        ];
+        for auto_tag in &tags {
+            let built = |start| {
+                let constraint = match auto_tag {
+                    AutoTag::Chat { .. } => auto_constraint(
+                        ParserChoice::Symphony,
+                        &names,
+                        &chat,
+                        &chat.callable_tools(),
+                        true,
+                        start,
+                        &templates,
+                    ),
+                    AutoTag::Messages { .. } => auto_constraint_messages(
+                        ParserChoice::Symphony,
+                        &names,
+                        &messages,
+                        &tools(),
+                        true,
+                        start,
+                        false,
+                        &templates,
+                    ),
+                };
+                tag_of(constraint)
+            };
+            let derived = |start| {
+                let tag = TagForStart::tag_for(auto_tag, start)
+                    .expect("a table")
+                    .expect("a tag");
+                serde_json::from_str::<Value>(&tag).expect("a tag as JSON")
+            };
+            let unknown = derived(Unknown);
+            assert_eq!(
+                unknown,
+                built(symphony::GrammarStart::Unknown),
+                "{auto_tag:?}"
+            );
+            assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
+            let bare = derived(AfterReasoning);
+            assert_eq!(bare, built(symphony::GrammarStart::AfterReasoning));
+            assert_ne!(bare["format"]["elements"][0]["type"], "any_text", "{bare}");
+            let first = derived(FirstToken);
+            assert_eq!(first, built(symphony::GrammarStart::FirstToken));
+            assert_eq!(first["format"]["elements"][0]["end"], "</think>", "{first}");
+            assert_eq!(first["format"]["elements"][1], bare["format"]);
+        }
+        // A tag the table gives no engine (no tool to call) derives as none for every start.
+        let none = AutoTag::Chat {
+            parser: ParserChoice::Symphony,
+            names,
+            request: Arc::new(request(json!({}))),
+            reasoning_open: true,
+            templates,
+        };
+        for start in [Unknown, AfterReasoning, FirstToken] {
+            assert_eq!(TagForStart::tag_for(&none, start), Ok(None));
+        }
+        assert!(format!("{none:?}").contains("Qwen/Qwen3-8B"));
     }
 
     /// A table whose calls spell a whole turn: a call's header names the tool, its parameters

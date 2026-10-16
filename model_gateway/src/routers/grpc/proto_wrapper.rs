@@ -1838,6 +1838,98 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Set `tag` as the request's constraint where the request carries a
+    /// structural tag or none (the tag it was built with, which a retry
+    /// cleared: [`Self::clear_structural_tag`]); a request whose constraint
+    /// is anything else is left as it is, like one without sampling params.
+    pub fn restore_structural_tag(&mut self, tag: String) {
+        match self {
+            Self::Sglang(req) => {
+                use sglang::sampling_params::Constraint;
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if matches!(params.constraint, None | Some(Constraint::StructuralTag(_))) {
+                        params.constraint = Some(Constraint::StructuralTag(tag));
+                    }
+                }
+            }
+            Self::Vllm(req) => {
+                use vllm::sampling_params::Constraint;
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if matches!(params.constraint, None | Some(Constraint::StructuralTag(_))) {
+                        params.constraint = Some(Constraint::StructuralTag(tag));
+                    }
+                }
+            }
+            Self::TokenSpeed(req) => {
+                use tokenspeed::sampling_params::Constraint;
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if matches!(params.constraint, None | Some(Constraint::StructuralTag(_))) {
+                        params.constraint = Some(Constraint::StructuralTag(tag));
+                    }
+                }
+            }
+            Self::Trtllm(req) => {
+                let structural_tag =
+                    trtllm::guided_decoding_params::GuideType::StructuralTag as i32;
+                match req.guided_decoding.as_mut() {
+                    None => {
+                        req.guided_decoding = Some(trtllm::GuidedDecodingParams {
+                            guide_type: structural_tag,
+                            guide: tag,
+                        });
+                    }
+                    Some(guided) if guided.guide_type == structural_tag => guided.guide = tag,
+                    Some(_) => {}
+                }
+            }
+            Self::Mlx(_) => {}
+        }
+    }
+
+    /// Drop the structural tag the request's constraint carries, leaving the
+    /// request unconstrained; a request whose constraint is anything else, or
+    /// none, is left as it is.
+    pub fn clear_structural_tag(&mut self) {
+        match self {
+            Self::Sglang(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if let Some(sglang::sampling_params::Constraint::StructuralTag(_)) =
+                        params.constraint
+                    {
+                        params.constraint = None;
+                    }
+                }
+            }
+            Self::Vllm(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if let Some(vllm::sampling_params::Constraint::StructuralTag(_)) =
+                        params.constraint
+                    {
+                        params.constraint = None;
+                    }
+                }
+            }
+            Self::TokenSpeed(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if let Some(tokenspeed::sampling_params::Constraint::StructuralTag(_)) =
+                        params.constraint
+                    {
+                        params.constraint = None;
+                    }
+                }
+            }
+            Self::Trtllm(req) => {
+                if req.guided_decoding.as_ref().is_some_and(|guided| {
+                    guided.guide_type
+                        == trtllm::guided_decoding_params::GuideType::StructuralTag as i32
+                }) {
+                    req.guided_decoding = None;
+                }
+            }
+            Self::Mlx(_) => {}
+        }
+    }
+
     /// Offset an explicit sampling seed so fanned-out samples stay distinct
     /// yet deterministic; an unset seed stays unset (the engine then seeds
     /// each request on its own). Engines without a seed field ignore it.

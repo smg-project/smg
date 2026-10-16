@@ -1,6 +1,6 @@
 //! Common helper functions shared across stages
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use axum::response::Response;
 use engine_zmq_adapter::stops::encode_single_token_stops;
@@ -11,7 +11,7 @@ use smg_grpc_client::{
     sglang_proto::{self, DisaggregatedParams},
     tokenspeed_proto, vllm_proto,
 };
-use tool_parser::ParserFactory as ToolParserFactory;
+use tool_parser::{GrammarStart, ParserFactory as ToolParserFactory};
 use tracing::{debug, error, warn};
 
 use super::pd_protocol::{DpPlacement, PdProtocol, PdRendezvous};
@@ -390,18 +390,36 @@ impl SamplingBaseline {
     }
 }
 
-/// A forced tool call's constraint as preparation built it, with the name of
-/// the tool parser that shapes it. Request building gives the first attempt's
-/// worker the shape its engine needs (`utils::tool_constraints_for_worker`);
-/// a retry gives the worker it selects the same treatment from this unshaped
-/// form, since a tag already shaped for one engine cannot be shaped for
-/// another.
+/// A structural tag the table derives for where a worker's engine starts the
+/// grammar (`regular::symphony::AutoTag`): the attempt stamp asks it for the
+/// worker each retry takes, as request building asked it for the first.
+pub(crate) trait TagForStart: fmt::Debug + Send + Sync {
+    /// The tag for an engine whose grammar starts at `start`, or `None` where
+    /// the table gives that engine no tag.
+    fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String>;
+}
+
+/// A request's tool constraint as each attempt's worker must take it. Request
+/// building gives the first attempt's worker the shape its engine needs; a
+/// retry gives the worker it selects the same treatment, since a tag already
+/// shaped for one engine cannot be shaped for another: the registry's tags
+/// from the unshaped form preparation produced, the table's from what derives
+/// them for a start.
 #[derive(Clone, Debug)]
-pub(crate) struct ToolConstraintStamp {
-    /// The `(kind, value)` pair preparation produced, before any worker shaped it.
-    constraint: (String, String),
-    /// The configured tool parser the shaping reads its reasoning prefix from.
-    parser: Option<String>,
+pub(crate) enum ToolConstraintStamp {
+    /// A forced tool call's constraint as preparation built it, with the name
+    /// of the tool parser that shapes it (`utils::tool_constraints_for_worker`).
+    Registry {
+        /// The `(kind, value)` pair preparation produced, before any worker shaped it.
+        constraint: (String, String),
+        /// The configured tool parser the shaping reads its reasoning prefix from.
+        parser: Option<String>,
+    },
+    /// The table's `auto` tag the selected worker's policy chose, shaped for
+    /// where that worker's engine starts the grammar; the retry's worker gets
+    /// it derived again for its own start, or no tag where the table gives
+    /// its engine none.
+    Table(Arc<dyn TagForStart>),
 }
 
 impl ToolConstraintStamp {
@@ -417,27 +435,34 @@ impl ToolConstraintStamp {
     ) -> Option<Self> {
         let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
         request.structural_tag()?;
-        Some(Self {
+        Some(Self::Registry {
             constraint,
             parser: parser.map(str::to_string),
         })
     }
 
+    /// Capture the stamp for a built request that carries the table's `auto`
+    /// tag, with what derives the tag for a worker's start. Nothing is
+    /// captured when the backend's builder let the request's `response_format`
+    /// outrank the tag, as for [`Self::capture`].
+    pub(crate) fn capture_table(
+        tag: Arc<dyn TagForStart>,
+        request: &ProtoGenerateRequest,
+    ) -> Option<Self> {
+        request.structural_tag()?;
+        Some(Self::Table(tag))
+    }
+
     /// Write the constraint, shaped for `workers`, over the request's
-    /// structural tag.
+    /// structural tag; a table's tag the retry's worker gets none of leaves
+    /// the request unconstrained, as a first attempt on that worker would be.
     fn restamp(
         &self,
         request: &mut ProtoGenerateRequest,
         workers: &WorkerSelection,
         tool_parser_factory: &ToolParserFactory,
     ) -> Result<(), Response> {
-        let shaped = utils::tool_constraints_for_worker(
-            tool_parser_factory,
-            self.parser.as_deref(),
-            Some(self.constraint.clone()),
-            Some(workers),
-        )
-        .map_err(|e| {
+        let failed = |e: String| {
             error!(
                 function = "restamp_plan_for_attempt",
                 error = %e,
@@ -447,9 +472,27 @@ impl ToolConstraintStamp {
                 "invalid_tool_constraint",
                 format!("Invalid tool constraint: {e}"),
             )
-        })?;
-        if let Some((_, tag)) = shaped {
-            request.set_structural_tag(tag);
+        };
+        match self {
+            Self::Registry { constraint, parser } => {
+                let shaped = utils::tool_constraints_for_worker(
+                    tool_parser_factory,
+                    parser.as_deref(),
+                    Some(constraint.clone()),
+                    Some(workers),
+                )
+                .map_err(failed)?;
+                if let Some((_, tag)) = shaped {
+                    request.set_structural_tag(tag);
+                }
+            }
+            Self::Table(tag) => {
+                let start = utils::WorkerDecoding::of(Some(workers)).start;
+                match tag.tag_for(start).map_err(failed)? {
+                    Some(tag) => request.restore_structural_tag(tag),
+                    None => request.clear_structural_tag(),
+                }
+            }
         }
         Ok(())
     }
@@ -457,9 +500,9 @@ impl ToolConstraintStamp {
 
 /// Re-stamp the retained plan for a retry attempt's newly selected workers:
 /// fresh engine ids per [`IdStamp`], the new worker's sampling defaults
-/// (re-applied over the build-time baseline), a forced tool call's
-/// constraint in the shape the new worker's engine needs
-/// ([`ToolConstraintStamp`]), and fresh PD bootstrap/rendezvous rooms. EPD
+/// (re-applied over the build-time baseline), the tool constraint in the
+/// shape the new worker's engine needs ([`ToolConstraintStamp`]), and fresh
+/// PD bootstrap/rendezvous rooms. EPD
 /// encode bootstrap info is deliberately untouched — those rooms are the
 /// rendezvous with encode jobs the first dispatch already launched.
 pub(crate) fn restamp_plan_for_attempt(
@@ -1684,6 +1727,7 @@ mod tool_constraint_restamp_tests {
 
         request.set_structural_tag("{}".to_string());
         assert_eq!(request.structural_tag(), None);
+        request.clear_structural_tag();
         let ProtoGenerateRequest::Sglang(req) = &request else {
             panic!("the request was built for SGLang");
         };
@@ -1693,6 +1737,100 @@ mod tool_constraint_restamp_tests {
                 schema
             ))
         );
+    }
+
+    /// A table's `auto` tag as a test derives it per start: the shape for an
+    /// engine starting after its reasoning parser, another for one starting
+    /// at the first token, and none for an engine that does not say.
+    #[derive(Debug)]
+    struct TableTag;
+
+    impl TagForStart for TableTag {
+        fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String> {
+            Ok(match start {
+                GrammarStart::AfterReasoning => Some(BARE_TABLE_TAG.to_string()),
+                GrammarStart::FirstToken => Some(THOUGHT_TABLE_TAG.to_string()),
+                GrammarStart::Unknown => None,
+            })
+        }
+    }
+
+    const BARE_TABLE_TAG: &str = r#"{"format":{"type":"const_string","value":"<call>"}}"#;
+    const THOUGHT_TABLE_TAG: &str = r#"{"format":{"type":"sequence","elements":[{"type":"tag","begin":"","content":{"type":"any_text","excludes":[]},"end":"</think>"},{"type":"const_string","value":"<call>"}]}}"#;
+
+    /// The table's `auto` tag, shaped at build for the selected worker's
+    /// start, reaches a retry's worker derived again for that worker's own
+    /// start: the other shape on an engine that starts the grammar elsewhere,
+    /// and no tag at all, the request left unconstrained, on a worker whose
+    /// engine the table gives none. On every backend that carries a
+    /// structural tag; a backend whose builder let the request's
+    /// `response_format` outrank the tag captures nothing.
+    #[test]
+    fn retry_derives_the_tables_auto_tag_for_its_own_workers_start() {
+        let factory = ToolParserFactory::new();
+        let after_reasoning = worker(&[("constrained_decoding_start", "after_reasoning")]);
+        let first_token = worker(&[("constrained_decoding_start", "first_token")]);
+        let silent = worker(&[]);
+        let tag: Arc<dyn TagForStart> = Arc::new(TableTag);
+
+        for (backend, request) in requests_with_tag(BARE_TABLE_TAG) {
+            let stamp = AttemptStamp {
+                id: IdStamp::Exact,
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: false,
+                tool_constraint: ToolConstraintStamp::capture_table(Arc::clone(&tag), &request),
+            };
+            assert!(
+                matches!(stamp.tool_constraint, Some(ToolConstraintStamp::Table(_))),
+                "{backend}: the built request carries the table's tag"
+            );
+            let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &first_token, &factory).unwrap();
+            assert_eq!(
+                plan_tag(&plan),
+                THOUGHT_TABLE_TAG,
+                "{backend}: a retry on an engine that starts the grammar at the first token"
+            );
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &after_reasoning, &factory).unwrap();
+            assert_eq!(
+                plan_tag(&plan),
+                BARE_TABLE_TAG,
+                "{backend}: a retry back on an engine that starts it after the reasoning"
+            );
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &silent, &factory).unwrap();
+            let ExecutionPlan::Single(ProtoRequest::Generate(request)) = &plan else {
+                panic!("expected a single generate plan");
+            };
+            assert_eq!(
+                request.structural_tag(),
+                None,
+                "{backend}: a worker the table gives no tag goes unconstrained"
+            );
+
+            // And back: the tag returns on the next worker the table shapes one for.
+            restamp_plan_for_attempt(&mut plan, &stamp, &after_reasoning, &factory).unwrap();
+            assert_eq!(
+                plan_tag(&plan),
+                BARE_TABLE_TAG,
+                "{backend}: a retry after an unconstrained attempt takes the tag again"
+            );
+        }
+
+        let schema = r#"{"type":"object"}"#.to_string();
+        let outranked = ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+            sampling_params: Some(sglang_proto::SamplingParams {
+                constraint: Some(sglang_proto::sampling_params::Constraint::JsonSchema(
+                    schema,
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert!(ToolConstraintStamp::capture_table(tag, &outranked).is_none());
     }
 }
 
