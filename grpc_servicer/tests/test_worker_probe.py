@@ -108,6 +108,32 @@ def test_split_host_port_takes_brackets_schemes_and_missing_ports():
     assert worker_probe.split_host_port("") == (None, None)
 
 
+def test_a_host_port_flag_rendezvous_reads_the_leader_from_its_one_flag():
+    """The constructor the SGLang and TokenSpeed probes are built from: one
+    flag carries ``host:port``, in every spelling the command line may use."""
+
+    def cmdline(*words: str) -> bytes:
+        return b"\0".join(word.encode() for word in words) + b"\0"
+
+    rendezvous = worker_probe.Rendezvous.from_host_port_flag(module="m", flag="--dist-init-addr")
+    assert (rendezvous.module, rendezvous.leader_flag, rendezvous.port_flag) == (
+        "m",
+        "--dist-init-addr",
+        "--dist-init-addr",
+    )
+    assert rendezvous.default_port is None
+    read = rendezvous.leader_from_cmdline
+    assert read(cmdline("engine", "--dist-init-addr", "10.0.0.7:5000")) == ("10.0.0.7", 5000)
+    assert read(cmdline("engine", "--dist_init_addr=leader.svc:5000")) == ("leader.svc", 5000)
+    assert read(cmdline("engine", "--dist-init-addr", "[fd00::1]:5000")) == ("fd00::1", 5000)
+    assert read(cmdline("sh", "-c", "engine --dist-init-addr leader:5000")) == ("leader", 5000)
+    assert read(cmdline("engine", "--dist-init-addr", "leader")) == ("leader", None)
+    assert read(cmdline("engine", "--model", "m")) == (None, None)
+    for probe in (sglang_probe, tokenspeed_probe):
+        assert probe.leader_from_cmdline is probe.RENDEZVOUS.leader_from_cmdline
+        assert probe.RENDEZVOUS.leader_flag == probe.RENDEZVOUS.port_flag == "--dist-init-addr"
+
+
 def test_check_passes_only_with_an_established_connection_to_the_leader_store():
     leader = {ipaddress.ip_address("fd00::1")}
     alive = worker_probe.check(leader, PORT, _connections(("fd00::1", PORT, "01")))

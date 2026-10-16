@@ -114,6 +114,31 @@ class Rendezvous:
     #: The engine's own default for the store port, if it has one.
     default_port: int | None = None
 
+    @classmethod
+    def from_host_port_flag(cls, module: str, flag: str) -> Rendezvous:
+        """The rendezvous of an engine whose one ``flag host:port`` names the
+        leader's store, host and port together, as SGLang's and TokenSpeed's
+        ``--dist-init-addr`` does."""
+        return cls(
+            module=module,
+            leader_flag=flag,
+            port_flag=flag,
+            leader_from_cmdline=host_port_from_cmdline(flag),
+        )
+
+
+def host_port_from_cmdline(flag: str) -> Callable[[bytes], tuple[str | None, int | None]]:
+    """A reader of the leader's host and store port as ``flag host:port`` on
+    the engine's command line carries them (an IPv6 literal in brackets, the
+    ``=`` and ``_`` spellings, inside a shell wrapper's one argument too);
+    ``None`` for a part that is absent or unreadable."""
+
+    def leader_from_cmdline(cmdline: bytes) -> tuple[str | None, int | None]:
+        value = flag_values(cmdline, flag).get(flag)
+        return split_host_port(value) if value else (None, None)
+
+    return leader_from_cmdline
+
 
 def _parse_address(hex_address: str) -> Address:
     """An address as ``/proc/net/tcp*`` prints it: the in-memory words in

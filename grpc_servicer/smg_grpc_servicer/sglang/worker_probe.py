@@ -27,21 +27,15 @@ from smg_grpc_servicer import worker_probe
 DIST_INIT_ADDR = "--dist-init-addr"
 
 
-def leader_from_cmdline(cmdline: bytes) -> tuple[str | None, int | None]:
-    """The leader's host and store port as ``--dist-init-addr host:port`` on
-    the engine's command line carries them (an IPv6 literal in brackets, the
-    ``=`` and ``_`` spellings, inside a shell wrapper's one argument too);
-    ``None`` for a part that is absent or unreadable."""
-    value = worker_probe.flag_values(cmdline, DIST_INIT_ADDR).get(DIST_INIT_ADDR)
-    return worker_probe.split_host_port(value) if value else (None, None)
-
-
-RENDEZVOUS = worker_probe.Rendezvous(
+RENDEZVOUS = worker_probe.Rendezvous.from_host_port_flag(
     module="smg_grpc_servicer.sglang.worker_probe",
-    leader_flag=DIST_INIT_ADDR,
-    port_flag=DIST_INIT_ADDR,
-    leader_from_cmdline=leader_from_cmdline,
+    flag=DIST_INIT_ADDR,
 )
+
+#: The leader's host and store port as ``--dist-init-addr host:port`` on the
+#: engine's command line carries them; ``None`` for a part that is absent or
+#: unreadable.
+leader_from_cmdline = RENDEZVOUS.leader_from_cmdline
 
 
 def main(argv: Sequence[str] | None = None) -> int:
