@@ -22,8 +22,8 @@ use crate::{
     },
 };
 
-/// The unique `(worker type, connection mode, model id)` groups of `workers`:
-/// the key the pool-size gauge is kept by.
+/// A set of unique `(worker type, connection mode, model id)` groups: the key
+/// the pool-size gauge is kept by.
 pub(crate) type PoolGroups = HashSet<(WorkerType, ConnectionMode, String)>;
 
 /// Set the worker pool-size gauge of each group in `groups` to the registry's
