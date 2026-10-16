@@ -159,6 +159,18 @@ pub(crate) fn default_max_concurrent_requests() -> usize {
     (cores * DEFAULT_INFLIGHT_PER_CORE).max(DEFAULT_INFLIGHT_FLOOR)
 }
 
+/// The admission bound `max_concurrent_requests` resolves to: none when
+/// admission control is off (0), the host-derived default when unset (-1),
+/// the value otherwise. The one place the sentinels are read, for the
+/// admission bucket and for the start-up checks that compare with it.
+pub(crate) fn effective_max_concurrent_requests(configured: i32) -> Option<usize> {
+    match configured {
+        0 => None,
+        n if n < 0 => Some(default_max_concurrent_requests()),
+        n => usize::try_from(n).ok(),
+    }
+}
+
 pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
@@ -695,23 +707,21 @@ impl AppContextBuilder {
     /// and the unset value (-1) takes the host-derived default so an
     /// overloaded router sheds instead of queueing without bound.
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
-        let capacity = match config.max_concurrent_requests {
-            0 => {
+        let capacity = match effective_max_concurrent_requests(config.max_concurrent_requests) {
+            None => {
                 info!(
                     "Admission bound disabled (max_concurrent_requests = 0): in-flight requests are unbounded"
                 );
                 self.rate_limiter = None;
                 return self;
             }
-            n if n < 0 => {
-                let bound = default_max_concurrent_requests();
+            Some(bound) if config.max_concurrent_requests < 0 => {
                 info!(
                     "Admission bound: at most {bound} in-flight requests (default: {DEFAULT_INFLIGHT_PER_CORE} per available core, at least {DEFAULT_INFLIGHT_FLOOR}; --max-concurrent-requests overrides it, 0 disables it)"
                 );
                 bound
             }
-            n => {
-                let bound = n as usize;
+            Some(bound) => {
                 info!(
                     "Admission bound: at most {bound} in-flight requests (max_concurrent_requests)"
                 );
@@ -1524,5 +1534,22 @@ policy:
         assert_eq!(selected.selected.url(), second.url());
         drop(selected);
         drop(occupied);
+    }
+}
+
+#[cfg(test)]
+mod effective_max_concurrent_requests_tests {
+    use super::{default_max_concurrent_requests, effective_max_concurrent_requests};
+
+    /// The three readings of `max_concurrent_requests`, pinned in one place
+    /// for the admission bucket and the start-up checks alike.
+    #[test]
+    fn the_sentinels_resolve_to_off_the_default_and_the_value() {
+        assert_eq!(effective_max_concurrent_requests(0), None);
+        assert_eq!(
+            effective_max_concurrent_requests(-1),
+            Some(default_max_concurrent_requests())
+        );
+        assert_eq!(effective_max_concurrent_requests(7), Some(7));
     }
 }
