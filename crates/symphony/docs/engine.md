@@ -23,7 +23,10 @@ What the engine decides for every format, and what it leaves open:
   has its own rule; a shown marker (the variants that do not separate a channel) is text, so a
   lead held before it is content, and whitespace after it is content as after any text. A kept
   state (the kept row: a response template's `strip: false` field) holds nothing: whitespace
-  alone there is content, as the template's reader gives it.
+  alone there is content, as the template's reader gives it. The whole answer's message still
+  shows no content for whitespace alone, so for such a table a stream can carry content deltas,
+  and their logprobs, that the whole answer does not; the template's reader, which keeps the
+  whitespace, is the reference there.
 - A terminal with no transition from the current state is text, as the model wrote it:
   `</think>` in content is content. A terminal inside a code fence, or inside a string in a
   call's arguments, is a terminal, as for every parser that reads markers: `</tool_call>` in an
