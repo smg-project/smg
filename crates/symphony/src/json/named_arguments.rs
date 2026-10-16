@@ -21,7 +21,8 @@
 //! What the syntax does not check: the name before the marker is taken as written, spaces
 //! included, since the template writes it without any; and a value that is not an object is
 //! streamed for as long as it is a JSON prefix and ends with the region, since the outline finds
-//! no close for it. The template writes neither.
+//! no close for it, a word among them held until it is spelled or refused, so that the pieces say
+//! of it what the whole says. The template writes neither.
 //!
 //! [`formats::mistral_v13`]: crate::formats::mistral_v13()
 
@@ -174,7 +175,7 @@ impl Arguments {
             }
             None => bytes.len(),
         };
-        self.emit_new_bytes(out);
+        self.emit_new_bytes(close.is_none(), out);
         if close.is_some() {
             out.push(Event::ToolCallEnd {
                 index: self.index,
@@ -186,10 +187,20 @@ impl Arguments {
     }
 
     /// No more bytes will come: a closed object has said everything; one that never closed ends
-    /// with what arrived, every byte of it already a fragment or malformed text.
-    fn finish(self, out: &mut Events) {
+    /// with what arrived, every byte of it already a fragment or malformed text but for a word it
+    /// still held, which goes first, as the prefix it is.
+    fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
+        }
+        if self.invalid_from.is_none() && self.emitted < self.text.len() {
+            let held = &self.text[self.emitted..];
+            out.push(Event::ToolCallArguments {
+                index: self.index,
+                json: held.to_string(),
+                source: Text::uncounted(held),
+            });
+            self.emitted = self.text.len();
         }
         out.push(Event::ToolCallEnd {
             index: self.index,
@@ -199,7 +210,12 @@ impl Arguments {
 
     /// The bytes that arrived since the last call: a fragment for the part that keeps the
     /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken.
-    fn emit_new_bytes(&mut self, out: &mut Events) {
+    /// While the object is `open`, a word under way at the end of the bytes (`nu`, so far a
+    /// prefix of `null`) is held: the judge refuses a word that turns out to be no literal from
+    /// its first letter, and a fragment passed on cannot be taken back, so the pieces would say
+    /// `n` where the whole says nothing. It is sent once the next bytes spell it on or end it,
+    /// with the object's close, or when no more bytes can come ([`Self::finish`]).
+    fn emit_new_bytes(&mut self, open: bool, out: &mut Events) {
         if self.text.len() <= self.emitted {
             return;
         }
@@ -213,6 +229,12 @@ impl Arguments {
                 Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
             },
         };
+        let valid_end = match self.prefix.word_start() {
+            Some(start) if open && self.invalid_from.is_none() => {
+                valid_end.min(start).max(self.emitted)
+            }
+            _ => valid_end,
+        };
         if self.emitted < valid_end {
             let fresh = &self.text[self.emitted..valid_end];
             out.push(Event::ToolCallArguments {
@@ -222,7 +244,8 @@ impl Arguments {
             });
             self.emitted = valid_end;
         }
-        if self.emitted < self.text.len() {
+        // Past the break the rest is malformed; before any break what is not sent is held.
+        if self.invalid_from.is_some() && self.emitted < self.text.len() {
             out.push(Event::Malformed {
                 text: Text::uncounted(&self.text[self.emitted..]),
                 why: MalformedReason::InvalidArguments,
@@ -293,6 +316,58 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The malformed text of the events, joined.
+    fn malformed(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_word_under_way_is_held_so_the_pieces_say_of_it_what_the_whole_says() {
+        // A word that is no literal is refused from its first letter and nothing of it is sent
+        // as arguments however the bytes were cut; a literal, whole or cut short at the end, is
+        // sent once it is spelled or once nothing more can come; a number streams as far as it
+        // is one. The region ends with the stream (cut) or at the next opener (closed).
+        let cases = [
+            ("nosuch", "", "nosuch"),
+            ("trash", "", "trash"),
+            ("nul", "nul", ""),
+            ("null", "null", ""),
+            ("1x", "1", "x"),
+            ("{\"a\": nosuch}", "{\"a\": ", "nosuch}"),
+            ("{\"a\": null}", "{\"a\": null}", ""),
+        ];
+        for (value, expected_arguments, expected_malformed) in cases {
+            for cut in [true, false] {
+                let call = format!("f[ARGS]{value}");
+                let (whole, _) = run(&[&call], cut);
+                let per_char: Vec<&str> = call
+                    .char_indices()
+                    .map(|(i, c)| &call[i..i + c.len_utf8()])
+                    .collect();
+                let (streamed, _) = run(&per_char, cut);
+                for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+                    assert_eq!(
+                        arguments(events),
+                        expected_arguments,
+                        "{call:?} cut={cut} {how}: arguments"
+                    );
+                    assert_eq!(
+                        malformed(events),
+                        expected_malformed,
+                        "{call:?} cut={cut} {how}: malformed"
+                    );
+                    assert_eq!(bytes(events), call, "{call:?} cut={cut} {how}: every byte");
+                }
+            }
+        }
     }
 
     #[test]
