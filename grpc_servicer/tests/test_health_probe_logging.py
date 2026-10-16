@@ -141,7 +141,7 @@ async def _watch(servicer, service, context):
 
 @pytest.mark.parametrize("make", BACKENDS)
 def test_watch_answers_an_unknown_service_without_failing_the_stream(make):
-    servicer, _engine, service = make()
+    servicer, engine, service = make()
     context = _Context()
     (response,) = asyncio.run(_watch(servicer, "no.such.Service", context))
     assert response.status == health_pb2.HealthCheckResponse.SERVICE_UNKNOWN
@@ -152,3 +152,10 @@ def test_watch_answers_an_unknown_service_without_failing_the_stream(make):
     assert response.status == SERVING
     (response,) = asyncio.run(_watch(servicer, "", context))
     assert response.status == SERVING
+    # Shutting down answers NOT_SERVING for every service, as Check does, the
+    # unknown ones included, and still without a code on the stream.
+    engine.gracefully_exit = True
+    for name in ("no.such.Service", service, ""):
+        (response,) = asyncio.run(_watch(servicer, name, context))
+        assert response.status == NOT_SERVING, name
+    assert context.code is None

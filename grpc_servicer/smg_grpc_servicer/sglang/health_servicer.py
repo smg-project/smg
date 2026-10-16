@@ -151,11 +151,15 @@ class SGLangHealthServicer(health_pb2_grpc.HealthServicer):
         service_name = request.service
         logger.debug(f"Health watch request for service: '{service_name}'")
 
-        # The current status once, computed as Check computes it but without
+        # The current status once, computed as Check computes it (a server
+        # shutting down answers NOT_SERVING for every service) but without
         # Check's refusal on the context: a NOT_FOUND code set on a streaming
         # call fails the stream, while the protocol answers an unknown service
         # with a SERVICE_UNKNOWN status.
-        if service_name in (self.OVERALL_SERVER, self.SGLANG_SERVICE):
+        if self.request_manager.gracefully_exit or service_name in (
+            self.OVERALL_SERVER,
+            self.SGLANG_SERVICE,
+        ):
             response = await self.Check(request, context)
         else:
             response = health_pb2.HealthCheckResponse(

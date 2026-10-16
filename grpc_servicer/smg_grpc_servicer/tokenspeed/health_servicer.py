@@ -109,10 +109,14 @@ class TokenSpeedHealthServicer(health_pb2_grpc.HealthServicer):
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[health_pb2.HealthCheckResponse]:
         # K8s probes use Check, not Watch — we emit the current status once,
-        # computed as Check computes it but without Check's refusal on the
+        # computed as Check computes it (a server shutting down answers
+        # NOT_SERVING for every service) but without Check's refusal on the
         # context: a NOT_FOUND code set on a streaming call fails the stream,
         # while the protocol answers an unknown service with SERVICE_UNKNOWN.
-        if request.service in (self.OVERALL_SERVER, self.TOKENSPEED_SERVICE):
+        if self.async_llm.gracefully_exit or request.service in (
+            self.OVERALL_SERVER,
+            self.TOKENSPEED_SERVICE,
+        ):
             yield await self.Check(request, context)
         else:
             yield health_pb2.HealthCheckResponse(
