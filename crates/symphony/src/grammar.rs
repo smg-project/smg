@@ -27,6 +27,7 @@ use crate::{
 };
 
 mod attributed;
+mod calls;
 mod gemma;
 mod keyed;
 mod output;
