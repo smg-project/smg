@@ -80,10 +80,10 @@ static HARMONY_ENCODING_INIT: Mutex<()> = Mutex::new(());
 /// (`EnsureHarmonyEncodingStep`), so request paths hit the loaded fast path.
 /// A request path can still reach a cold load (a request name-matched to the
 /// Harmony pipeline before any of its workers registered, or after that step
-/// failed them all): it then loads here, on the request task's thread, under
-/// the init lock, as it did before, and the load runs on a thread of its own
-/// (see [`on_its_own_thread`]) so that a caller inside a runtime gets the
-/// loader's result (or its error) instead of a panic.
+/// failed them all). The load then runs here, under the init lock, on a thread
+/// of its own (see [`on_its_own_thread`]), so a caller inside a runtime gets
+/// the loader's result (or its error) instead of a panic. The caller's thread
+/// (a runtime worker, on a request path) blocks until the load finishes.
 pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String> {
     if let Some(encoding) = HARMONY_ENCODING.get() {
         return Ok(encoding);
