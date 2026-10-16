@@ -423,6 +423,25 @@ mod usage_tests {
     }
 
     #[test]
+    fn dispatch_arguments_merge_the_requests_hosted_tool_config_and_user_into_a_coerced_payload() {
+        // The reason for the coercion: a scalar payload under a hosted format
+        // still takes the caller-declared config and the request's user.
+        let request = ResponsesRequest {
+            tools: Some(vec![responses::ResponseTool::WebSearchPreview(
+                responses::WebSearchPreviewTool {
+                    search_context_size: Some("low".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            user: Some("u-1".to_string()),
+            ..Default::default()
+        };
+        let merged = dispatch_arguments(ResponseFormat::WebSearchCall, &request, "\"text\"");
+        assert_eq!(merged["search_context_size"], json!("low"));
+        assert_eq!(merged["user"], json!("u-1"));
+    }
+
+    #[test]
     fn mcp_usage_accumulates_reasoning_and_cache_and_survives_missing_usage() {
         let mut state = ToolLoopState::new(&ResponsesRequest::default());
         state.record_usage(None);
