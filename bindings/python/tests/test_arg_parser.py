@@ -745,7 +745,14 @@ class TestParseRouterArgs:
             ]
         )
         assert router_args.worker_overload_shed is True
+        # Deprecated: chain is the only value, read in any case as the Rust CLI
+        # reads it; the removed positional index and any other spelling are
+        # refused by the parser.
         assert router_args.kv_index == "chain"
+        assert parse_router_args(["--kv-index", " Chain "]).kv_index == "chain"
+        for value in ("positional", "Positional", "run", "tree"):
+            with pytest.raises(SystemExit):
+                parse_router_args(["--kv-index", value])
         assert router_args.worker_stall_secs == 5
         assert router_args.worker_wedge_secs == 7
         assert router_args.worker_stale_secs == 9
@@ -759,7 +766,7 @@ class TestParseRouterArgs:
 
         defaults = parse_router_args([])
         assert defaults.worker_overload_shed is False
-        assert defaults.kv_index == "positional"
+        assert defaults.kv_index is None
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
         assert defaults.worker_stale_secs == 15

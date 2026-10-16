@@ -593,7 +593,7 @@ struct Router {
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
     worker_overload_shed: bool,
-    kv_index: String,
+    kv_index: Option<String>,
     worker_stall_secs: u64,
     worker_wedge_secs: u64,
     worker_stale_secs: u64,
@@ -777,14 +777,6 @@ impl Router {
                 })
             })
             .transpose()?;
-
-        let kv_index = config::KvIndexKind::parse(&self.kv_index).ok_or_else(|| {
-            config::ConfigError::InvalidValue {
-                field: "kv_index".to_string(),
-                value: self.kv_index.clone(),
-                reason: "expected 'positional' or 'chain'".to_string(),
-            }
-        })?;
 
         let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
             &self.power_of_two_load_metric,
@@ -1050,7 +1042,8 @@ impl Router {
                 self.worker_warmup_thin_ratio,
                 self.worker_warmup_divert_every,
             )
-            .kv_index(kv_index)
+            // Deprecated: unset by default; `chain` is the only value, `positional` fails validation.
+            .kv_index(self.kv_index.clone())
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1368,7 +1361,7 @@ impl Router {
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
         worker_overload_shed = false,
-        kv_index = String::from("positional"),
+        kv_index = None,
         worker_stall_secs = 2,
         worker_wedge_secs = 3,
         worker_stale_secs = 15,
@@ -1571,7 +1564,7 @@ impl Router {
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
         worker_overload_shed: bool,
-        kv_index: String,
+        kv_index: Option<String>,
         worker_stall_secs: u64,
         worker_wedge_secs: u64,
         worker_stale_secs: u64,

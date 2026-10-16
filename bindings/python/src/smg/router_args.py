@@ -42,6 +42,19 @@ ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file"]
 
 
+def _parse_kv_index(value: str) -> str:
+    """The deprecated --kv-index value, as the Rust CLI reads it: any case, trimmed;
+    the removed positional index is refused with the reason (the choices refuse
+    the rest)."""
+    normalized = value.strip().lower()
+    if normalized == "positional":
+        raise argparse.ArgumentTypeError(
+            "the positional KV index was removed (kv-index 2.0.0): the chain index is the"
+            " only KV index, drop --kv-index"
+        )
+    return normalized
+
+
 def _parse_int_csv(value: str) -> list[int]:
     """Parse a comma-separated integer list (mirrors the CLI value_delimiter)."""
     return [int(item) for item in value.split(",") if item]
@@ -314,9 +327,10 @@ class RouterArgs:
     # Refuse with a 503 when every worker a request could use is overloaded,
     # instead of routing it to the least-loaded one
     worker_overload_shed: bool = False
-    # The event-driven KV index behind cache-aware routing: "positional"
-    # (one entry per block position) or "chain" (chains as runs)
-    kv_index: str = "positional"
+    # Deprecated: the chain index is the only KV index behind cache-aware
+    # routing, so "chain" is the one value and changes nothing; unset by
+    # default so that only a launch line that still passes it is warned
+    kv_index: str | None = None
     # Liveness: seconds without contact after a transport failure before a
     # worker is vetoed; seconds without progress before a loaded one is wedged
     worker_stall_secs: int = 2
@@ -804,12 +818,14 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}kv-index",
-            type=str,
+            type=_parse_kv_index,
+            choices=["chain"],
             default=RouterArgs.kv_index,
             help=(
-                "The event-driven KV index behind cache-aware routing: 'positional'"
-                " (one entry per block position, the default) or 'chain' (chains as"
-                " runs with per-run worker coverage; lock-free, store-free lookups)."
+                "Deprecated: the chain index is the only KV index behind cache-aware"
+                " routing, so 'chain' is the one value and changes nothing; the flag"
+                " goes in a later release. 'positional' names the index that was"
+                " removed and is refused."
             ),
         )
         routing_group.add_argument(
