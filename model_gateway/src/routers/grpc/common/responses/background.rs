@@ -61,7 +61,7 @@ use tracing::{debug, info, warn};
 use super::ResponsesContext;
 use crate::routers::{
     common::{
-        persistence_utils::{build_stored_response, extract_input_items},
+        persistence_utils::{self, build_stored_response, extract_input_items},
         sse::{sse_channel, SseSender},
     },
     error,
@@ -104,9 +104,10 @@ pub(crate) fn is_terminal(status: &str) -> bool {
 /// Whether `status` is a result only the work itself stores (a run that
 /// reached its end, whole or truncated): a record read in one of these while
 /// the work runs is the work's own terminal write, not a close from
-/// elsewhere.
+/// elsewhere. The persist's check for its own earlier write reads the same
+/// list ([`persistence_utils::is_result_status`]).
 fn is_result(status: &str) -> bool {
-    matches!(status, "completed" | "incomplete")
+    persistence_utils::is_result_status(status)
 }
 
 /// The in-flight background responses of this gateway.

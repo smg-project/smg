@@ -597,13 +597,15 @@ fn not_stored(error: &PersistError) -> NotStored {
 }
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use axum::http::StatusCode;
     use openai_protocol::{
         model_card::ModelCard, responses::ResponseStatus, worker::HealthCheckConfig,
     };
     use serde_json::json;
     use smg_data_connector::{
-        ListParams, MemoryConversationItemStorage, MemoryConversationStorage,
+        ConditionalStore, ListParams, MemoryConversationItemStorage, MemoryConversationStorage,
         MemoryResponseStorage, NewConversation, ResponseId, ResponseStorageError, SortOrder,
         StoredResponse,
     };
@@ -945,6 +947,164 @@ mod tests {
         assert!(
             items.is_empty(),
             "nothing is linked to the conversation: {items:?}"
+        );
+    }
+
+    /// A store that takes the write and then answers a timeout: the call's
+    /// bound ran out after the store had accepted the write.
+    struct TimingOutAfterWriteStorage {
+        inner: MemoryResponseStorage,
+        timeouts_left: AtomicUsize,
+        conditional_stores: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ResponseStorage for TimingOutAfterWriteStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.inner.store_response(response).await
+        }
+
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            let outcome = self.inner.store_response_if_open(response).await?;
+            self.conditional_stores.fetch_add(1, Ordering::SeqCst);
+            let left = self.timeouts_left.load(Ordering::SeqCst);
+            if left > 0 {
+                self.timeouts_left.store(left - 1, Ordering::SeqCst);
+                return Err(ResponseStorageError::Timeout(
+                    "store_response_if_open exceeded its bound".to_string(),
+                ));
+            }
+            Ok(outcome)
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.inner
+                .update_response_object_if_open(id, raw_response)
+                .await
+        }
+
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.inner.get_response(response_id).await
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.inner.delete_response(response_id).await
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.inner
+                .list_identifier_responses(identifier, tenant, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+        ) -> Result<usize, ResponseStorageError> {
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
+        }
+    }
+
+    /// A background response's terminal persist retried after a timeout
+    /// whose write had landed: the retry finds the record closed with this
+    /// run's own result and links the items into the conversation, as the
+    /// first attempt would have had its answer arrived.
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_terminal_persist_whose_first_write_landed_links_its_items() {
+        let conversation_storage: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let item_storage: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let timing_out = Arc::new(TimingOutAfterWriteStorage {
+            inner: MemoryResponseStorage::new(),
+            timeouts_left: AtomicUsize::new(1),
+            conditional_stores: AtomicUsize::new(0),
+        });
+        let response_storage: Arc<dyn ResponseStorage> = timing_out.clone();
+        let conversation = conversation_storage
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "background": true,
+            "conversation": conversation.id.0,
+            "max_output_tokens": 64
+        }))
+        .unwrap();
+        background::store_record(
+            &response_storage,
+            &background::queued_response("resp_r", &request),
+            &request,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        persist_response_if_needed(
+            conversation_storage,
+            item_storage.clone(),
+            response_storage.clone(),
+            &completed_response("resp_r", &request),
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("nothing is reported to the caller here");
+
+        assert_eq!(
+            timing_out.conditional_stores.load(Ordering::SeqCst),
+            2,
+            "the write whose answer was lost was retried once"
+        );
+        let stored = response_storage
+            .get_response(&ResponseId::from("resp_r"))
+            .await
+            .unwrap()
+            .expect("the record");
+        assert_eq!(stored.raw_response["status"], "completed");
+        let items = item_storage
+            .list_items(
+                &conversation.id,
+                ListParams {
+                    limit: 10,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            items.len(),
+            2,
+            "the input and the output are linked into the conversation: {items:?}"
         );
     }
 
