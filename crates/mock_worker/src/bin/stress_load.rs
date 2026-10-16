@@ -581,6 +581,38 @@ fn frame_has_token(frame: &[u8]) -> bool {
     false
 }
 
+/// The payload of an SSE frame's `data:` line, its leading space dropped;
+/// `None` for a frame without one (a comment, or a bare `event:` line).
+fn frame_data(frame: &[u8]) -> Option<&[u8]> {
+    frame.split(|&c| c == b'\n').find_map(|line| {
+        let data = line.strip_prefix(b"data:")?;
+        Some(data.strip_prefix(b" ").unwrap_or(data))
+    })
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Whether an SSE frame reports a failure after the head already said 200:
+/// the router's `data: {"error":{...}}` frame, or a Responses
+/// `response.failed` event.
+fn frame_is_error(frame: &[u8]) -> bool {
+    frame_data(frame).is_some_and(|data| {
+        data.starts_with(b"{\"error\"") || contains(data, b"\"type\":\"response.failed\"")
+    })
+}
+
+/// Whether an SSE frame ends its stream in order: `data: [DONE]`, or a
+/// Responses `response.completed` / `response.incomplete` event.
+fn frame_is_last(frame: &[u8]) -> bool {
+    frame_data(frame).is_some_and(|data| {
+        data == b"[DONE]"
+            || contains(data, b"\"type\":\"response.completed\"")
+            || contains(data, b"\"type\":\"response.incomplete\"")
+    })
+}
+
 /// The `id` of a Responses answer: the JSON body's, or the first streamed
 /// `response.*` event's.
 fn response_id(bytes: &[u8]) -> Option<String> {
@@ -667,6 +699,8 @@ async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
             let mut first_token: Option<Instant> = None;
             let mut last_frame: Option<Instant> = None;
             let mut frames: u32 = 0;
+            let mut sse_error = false;
+            let mut sse_last = false;
             while let Some(chunk) = stream.next().await {
                 let chunk = match chunk {
                     Ok(c) => c,
@@ -691,6 +725,8 @@ async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
                 while let Some(pos) = find_frame_end(&pending[start..]) {
                     let frame = &pending[start..start + pos];
                     frames += 1;
+                    sse_error |= frame_is_error(frame);
+                    sse_last |= frame_is_last(frame);
                     if first_token.is_none() && frame_has_token(frame) {
                         first_token = Some(now);
                     }
@@ -718,6 +754,13 @@ async fn one(shared: Arc<Shared>, i: u64, sampled: bool) {
             if outcome.is_ok() {
                 if !(200..300).contains(&status) {
                     outcome = Err(format!("http-{status}"));
+                } else if args.stream && sse_error {
+                    // A failure after the head (an engine error, a stall bound, shedding) is an
+                    // error frame on a stream that already said 200: not an ok request.
+                    outcome = Err("sse-error".into());
+                } else if args.stream && !sse_last {
+                    // The stream closed before its terminator.
+                    outcome = Err("sse-truncated".into());
                 } else if args.mode == Mode::Responses {
                     outcome = Ok(response_id(&body_head));
                 }
@@ -1078,7 +1121,7 @@ mod tests {
     fn base64_matches_the_standard_alphabet_and_padding() {
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"fo"), "Zm8="); // codespell:ignore fo
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
     }
@@ -1102,6 +1145,28 @@ mod tests {
         assert!(frame_has_token(
             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}"
         ));
+    }
+
+    #[test]
+    fn error_frames_and_last_frames_are_told_apart() {
+        assert!(frame_is_error(
+            b"data: {\"error\":{\"message\":\"boom\",\"type\":\"internal_error\"}}"
+        ));
+        assert!(frame_is_error(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{}}"
+        ));
+        assert!(!frame_is_error(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"error\"}}]}"
+        ));
+        assert!(frame_is_last(b"data: [DONE]"));
+        assert!(frame_is_last(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_c\"}}"
+        ));
+        assert!(!frame_is_last(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"[DONE]\"}}]}"
+        ));
+        assert!(!frame_is_last(b": keep-alive"));
+        assert!(!frame_is_error(b": keep-alive"));
     }
 
     #[test]

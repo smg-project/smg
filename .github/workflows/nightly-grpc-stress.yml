@@ -28,6 +28,10 @@ jobs:
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
+        with:
+          # A release build with frame pointers and line tables: a key of its own, so the
+          # rust-cache entry the PR jobs restore is never saved from this target dir.
+          cache-key: grpc-stress
 
       - name: Build the bed (frame pointers and line tables for perf)
         env:

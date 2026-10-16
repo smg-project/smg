@@ -89,8 +89,11 @@ case "$cmd" in
     done
 
     stamp=$(date +%s)
-    read -r -a fleet_scope <<< "$(scope_prefix "grpc-stress-fleet-$MOCK_BASE-$stamp")"
-    read -r -a gw_scope <<< "$(scope_prefix "grpc-stress-gw-$GW_PORT-$stamp")"
+    # The prefix is taken outside the read's substitution, so SCOPE=1 without a usable systemd-run stops here.
+    fleet_prefix=$(scope_prefix "grpc-stress-fleet-$MOCK_BASE-$stamp") || exit 1
+    gw_prefix=$(scope_prefix "grpc-stress-gw-$GW_PORT-$stamp") || exit 1
+    read -r -a fleet_scope <<< "$fleet_prefix"
+    read -r -a gw_scope <<< "$gw_prefix"
     # shellcheck disable=SC2206
     mock_cmd=("${fleet_scope[@]}" ${MOCK_CORES:+taskset -c $MOCK_CORES} "$MOCK_BIN" --grpc-base-port "$MOCK_BASE" --grpc-count "$WORKERS" \
       --model "$MODEL" --tokenizer "$TOKENIZER" --block-size "$BLOCK" --admin-port "$ADMIN_PORT" $ENGINE_ARGS)

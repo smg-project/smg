@@ -38,8 +38,8 @@ allocate and copy" for eight traffic shapes.
 
 Each cell is 120 s after a 10 s warm-up, repeated 3 times, interleaved with
 its family's other cells; the second repeat carries a 30 s `perf record -g`
-of the gateway. With `HEAP_LG_SAMPLE=<n>` every family runs once more on a
-gateway built with `--features jemalloc-profiling` and started with
+of the gateway. With `HEAP_LG_SAMPLE=<n>` every family runs once more (60 s cells; the idle
+cells keep their 20 s opening window) on a gateway built with `--features jemalloc-profiling` and started with
 profiling on, and `heap_sites.py` turns the two dumps into allocation sites.
 
 ## Running it

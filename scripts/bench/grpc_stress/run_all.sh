@@ -13,7 +13,9 @@
 # it, 0 = never wait) [0]; HEAP_LG_SAMPLE (when set: one extra 60 s repeat per cell on a bed whose gateway runs
 # with jemalloc profiling at that lg_prof_sample, heap profiles at the window's start and end; needs a gateway
 # built with --features jemalloc-profiling) [unset]; HEAP_ONLY=1 runs only that pass.
-set -u
+#
+# Exits non-zero when a bed did not come up, a cell failed or the report could not be written.
+set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../../.." && pwd)
 export GS_DIR=${GS_DIR:-$ROOT/target/grpc-stress}
@@ -26,6 +28,7 @@ PERF_ON=${PERF_SECS:-30}; LOAD_MAX=${LOAD_MAX:-0}; HEAP_LG_SAMPLE=${HEAP_LG_SAMP
 LLAVA_TOKENIZER=${LLAVA_TOKENIZER:-}
 families=("$@"); [ ${#families[@]} -gt 0 ] || families=(unary stream idle idle-default long image tenants tools responses)
 mkdir -p "$GS_DIR"
+failed=0
 ts() { date -u +%FT%TZ; }
 log() { echo "$(ts) run_all: $*" | tee -a "$GS_DIR/run_all.log"; }
 wait_for_load() {
@@ -49,7 +52,8 @@ cell() {
     curl -s -X POST "$ADMIN/admin/fault/all/pause" > /dev/null
     ( sleep 50; curl -s -X POST "$ADMIN/admin/fault/all/resume" > /dev/null ) &
   fi
-  PERF_SECS=$perf HEAP=$heap "$HERE/cell.sh" "$fam-$var-r$rep" -- "$@" 2>&1 | tee -a "$GS_DIR/run_all.log"
+  PERF_SECS=$perf HEAP=$heap "$HERE/cell.sh" "$fam-$var-r$rep" -- "$@" 2>&1 | tee -a "$GS_DIR/run_all.log" \
+    || { log "cell $fam-$var-r$rep failed"; failed=$((failed + 1)); }
   wait
 }
 
@@ -62,7 +66,7 @@ run_family() {
   variants=("$@")
   if [ "${HEAP_ONLY:-0}" != 1 ]; then
     log "family $fam: bed up (${env_pairs[*]})"
-    env "${env_pairs[@]}" "$HERE/bed.sh" up 2>&1 | tee -a "$GS_DIR/run_all.log" || { log "family $fam: bed failed"; "$HERE/bed.sh" down; return 1; }
+    env "${env_pairs[@]}" "$HERE/bed.sh" up 2>&1 | tee -a "$GS_DIR/run_all.log" || { log "family $fam: bed failed"; "$HERE/bed.sh" down; failed=$((failed + 1)); return 1; }
     for rep in $(seq 1 "$REPEATS"); do
       for v in "${variants[@]}"; do
         local name=${v%%=*} args=${v#*=}
@@ -80,11 +84,19 @@ run_family() {
     for p in "${env_pairs[@]}"; do case "$p" in GW_ARGS=*) gw_args=${p#GW_ARGS=} ;; esac; done
     env "${env_pairs[@]}" GW_ARGS="$gw_args --jemalloc-prof-dir $GS_DIR/heap" \
       GW_ENV="_RJEM_MALLOC_CONF=prof:true,prof_active:true,prof_accum:true,lg_prof_sample:$HEAP_LG_SAMPLE" \
-      "$HERE/bed.sh" up 2>&1 | tee -a "$GS_DIR/run_all.log" || { "$HERE/bed.sh" down; return 1; }
+      "$HERE/bed.sh" up 2>&1 | tee -a "$GS_DIR/run_all.log" \
+      || { log "family $fam: heap-profile bed failed"; "$HERE/bed.sh" down; failed=$((failed + 1)); return 1; }
     for v in "${variants[@]}"; do
-      local name=${v%%=*} args=${v#*=}
-      # shellcheck disable=SC2086,SC2046
-      cell "$fam" "$name" heap 0 1 -- $(printf '%s' "$args" | sed -E "s/--duration [0-9]+/--duration 60/")
+      local name=${v%%=*} args=${v#*=} heap_args
+      # A 60 s cell, except for the idle families: their 20 s opening window is the load the
+      # profile is of (10k open streams, dumped at the window's end while the engines are still
+      # paused), and a longer window would open more streams than the bed admits.
+      case "$fam" in
+        idle|idle-default) heap_args=$args ;;
+        *) heap_args=$(printf '%s' "$args" | sed -E "s/--duration [0-9]+/--duration 60/") ;;
+      esac
+      # shellcheck disable=SC2086
+      cell "$fam" "$name" heap 0 1 -- $heap_args
     done
     "$HERE/bed.sh" down 2>&1 | tee -a "$GS_DIR/run_all.log"
   fi
@@ -135,4 +147,6 @@ for fam in "${families[@]}"; do
   esac
 done
 log "report"
-python3 "$HERE/report.py" "$GS_DIR" --md "$GS_DIR/report.md" --json "$GS_DIR/report.json" | tee -a "$GS_DIR/run_all.log"
+python3 "$HERE/report.py" "$GS_DIR" --md "$GS_DIR/report.md" --json "$GS_DIR/report.json" | tee -a "$GS_DIR/run_all.log" \
+  || { log "report failed"; failed=$((failed + 1)); }
+[ "$failed" -eq 0 ] || { log "$failed failure(s), see $GS_DIR/run_all.log"; exit 1; }

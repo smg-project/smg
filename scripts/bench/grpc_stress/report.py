@@ -147,8 +147,8 @@ def analyze(cell_dir):
         out["router_errors"] = prom_sum(after, "smg_router_request_errors_total") - prom_sum(
             before, "smg_router_request_errors_total"
         )
-        _, sb = prom_sum(before, "smg_http_requests_total", "status")
-        _, sa = prom_sum(after, "smg_http_requests_total", "status")
+        _, sb = prom_sum(before, "smg_http_responses_total", "status_code")
+        _, sa = prom_sum(after, "smg_http_responses_total", "status_code")
         out["http_status_delta"] = {
             k: sa.get(k, 0) - sb.get(k, 0) for k in set(sa) | set(sb) if sa.get(k, 0) - sb.get(k, 0)
         }
