@@ -7,7 +7,7 @@ import re
 
 import requests
 
-from .constants import MM_PROCESSING_WORKER, get_mm_processing, is_vllm
+from .constants import MM_PROCESSING_WORKER, get_mm_processing, get_vllm_mm_processor, is_vllm
 
 MM_PROCESSING_METRIC = "smg_mm_processing_total"
 
@@ -30,12 +30,15 @@ def expected_mm_processing(*, worker_expandable: bool) -> tuple[str, str | None]
     """The (mode, reason) the gateway must record for this lane and model.
 
     Only vLLM gRPC workers advertise worker-side processing, and only models
-    whose placeholder anchor a vLLM worker can expand take the worker path;
-    every other combination stays on the router path.
+    whose placeholder anchor a vLLM worker can expand take the worker path,
+    unless the workers run the gateway's own pipeline (``smg``), which expands
+    any spec's anchor; every other combination stays on the router path.
     """
     if get_mm_processing() == MM_PROCESSING_WORKER and is_vllm():
         if worker_expandable:
             return "worker", "auto_uniform"
+        if get_vllm_mm_processor() == "smg":
+            return "worker", "auto_pipeline"
         return "router", "model_not_opted_in"
     return "router", None
 

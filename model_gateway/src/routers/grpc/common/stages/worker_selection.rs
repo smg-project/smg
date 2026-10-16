@@ -390,6 +390,7 @@ impl WorkerSelectionStage {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                requires_gateway_pipeline: false,
             });
         // The single worker takes the whole request, so it must meet every
         // demand of the request's media. The disaggregated legs take the
@@ -399,6 +400,7 @@ impl WorkerSelectionStage {
         let media = MediaDemands {
             media_refs,
             vision: needs_vision,
+            pipeline_only: media_refs && ctx.state.media_refs_pipeline_only,
         };
         let accepts_media = |worker: &dyn Worker| {
             media.accepts(worker) && context_requirements.admits(worker, model_id)
@@ -503,7 +505,11 @@ impl WorkerSelectionStage {
         }
 
         if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
-            if let Err(err) = multimodal::ensure_selection_supports_media_refs(&workers, plan) {
+            if let Err(err) = multimodal::ensure_selection_supports_media_refs(
+                &workers,
+                plan,
+                ctx.state.media_refs_pipeline_only,
+            ) {
                 return Err(error::bad_request(err.code(), err.to_string()));
             }
         }
@@ -557,6 +563,7 @@ impl WorkerSelectionStage {
         let media = MediaDemands {
             media_refs: false,
             vision: ctx.routing.needs_vision,
+            pipeline_only: false,
         };
         // A retry skips the workers that already answered this request
         // definitively (see `routers::common::attempt_ledger`), and stays on
@@ -875,6 +882,10 @@ struct MediaDemands {
     /// Pixel media is carried: only a worker with a vision encoder
     /// ([`vision_capable`]).
     vision: bool,
+    /// The forwarded references are of a family only the gateway's own
+    /// pipeline expands: only a worker running it
+    /// ([`multimodal::worker_runs_gateway_pipeline`]).
+    pipeline_only: bool,
 }
 
 impl MediaDemands {
@@ -882,6 +893,7 @@ impl MediaDemands {
     const NONE: Self = Self {
         media_refs: false,
         vision: false,
+        pipeline_only: false,
     };
 
     /// These demands plus the retained plan's media-refs pin on a retry.
@@ -889,6 +901,7 @@ impl MediaDemands {
         Self {
             media_refs: self.media_refs || wire.is_some_and(|w| w.requires_media_refs),
             vision: self.vision,
+            pipeline_only: self.pipeline_only || wire.is_some_and(|w| w.requires_gateway_pipeline),
         }
     }
 
@@ -898,7 +911,9 @@ impl MediaDemands {
 
     /// Whether `worker` meets every demand.
     fn accepts(self, worker: &dyn Worker) -> bool {
-        (!self.media_refs || accepts_media_refs(worker)) && (!self.vision || vision_capable(worker))
+        (!self.media_refs || accepts_media_refs(worker))
+            && (!self.pipeline_only || multimodal::worker_runs_gateway_pipeline(worker))
+            && (!self.vision || vision_capable(worker))
     }
 }
 
@@ -1120,6 +1135,15 @@ impl WorkerSelectionStage {
             if capable.is_empty() {
                 return self.media_refs_shed(model_id);
             }
+            let capable: Vec<Arc<dyn Worker>> = capable
+                .into_iter()
+                .filter(|w| {
+                    !media.pipeline_only || multimodal::worker_runs_gateway_pipeline(w.as_ref())
+                })
+                .collect();
+            if capable.is_empty() {
+                return Self::pipeline_worker_required(model_id);
+            }
             match placement::failure_from(
                 &capable,
                 model_id,
@@ -1137,6 +1161,26 @@ impl WorkerSelectionStage {
             return Self::workers_unavailable(model_id);
         }
         error::model_not_found(model_id)
+    }
+
+    /// Workers process the model's media references, but none runs the
+    /// gateway's own pipeline, the only processor that expands this model's
+    /// placeholders. The request's own 400, as the preparation refusal for
+    /// the same model is; terminal.
+    fn pipeline_worker_required(model_id: &str) -> Response {
+        let mut response = error::bad_request(
+            "multimodal_worker_processing_unsupported_model",
+            format!(
+                "model {model_id} has workers processing media references, but none runs the \
+                 gateway's own pipeline (mm_processor={}), the only processor that expands this \
+                 model's placeholders; start the workers with --mm-processor {} or the router \
+                 with --mm-processing router",
+                multimodal::GATEWAY_PIPELINE_PROCESSOR,
+                multimodal::GATEWAY_PIPELINE_PROCESSOR
+            ),
+        );
+        mark_non_retryable(&mut response);
+        response
     }
 
     /// Workers serve the model but none advertises worker-side multimodal
@@ -2851,6 +2895,8 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+
+                requires_gateway_pipeline: false,
             },
         );
         for _ in 0..8 {
@@ -3171,6 +3217,8 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+
+                requires_gateway_pipeline: false,
             },
         );
         let mut headers = HeaderMap::new();
@@ -3267,6 +3315,8 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+
+                requires_gateway_pipeline: false,
             },
         );
         for _ in 0..8 {
@@ -3330,6 +3380,8 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+
+                requires_gateway_pipeline: false,
             },
         );
 
@@ -3396,6 +3448,8 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+
+            requires_gateway_pipeline: false,
         };
         let namespace = |salt: &str| {
             CacheNamespace::derive(&CachePartition {
@@ -3500,6 +3554,8 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
+
+            requires_gateway_pipeline: false,
         };
         let worker = stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -3563,6 +3619,8 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
+
+            requires_gateway_pipeline: false,
         };
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -3584,10 +3642,18 @@ mod tests {
     const REFS: MediaDemands = MediaDemands {
         media_refs: true,
         vision: false,
+        pipeline_only: false,
     };
     const VISION: MediaDemands = MediaDemands {
         media_refs: false,
         vision: true,
+        pipeline_only: false,
+    };
+    /// References of a family only the gateway's own pipeline expands.
+    const PIPELINE_REFS: MediaDemands = MediaDemands {
+        media_refs: true,
+        vision: false,
+        pipeline_only: true,
     };
 
     /// A regular worker with `labels`, built as [`labeled_worker`] builds every
@@ -3609,6 +3675,58 @@ mod tests {
         let mut urls: Vec<String> = seen.into_keys().collect();
         urls.sort();
         urls
+    }
+
+    /// References of a family only the gateway's own pipeline expands land
+    /// only on workers running it; references of an opted-in family use every
+    /// worker that processes references, and a pool whose
+    /// reference-processing workers all run the engine's processor is the
+    /// request's own 400 for the pinned family.
+    #[test]
+    fn pinned_references_select_only_pipeline_workers() {
+        let model_id = "test-model-pipeline-pinned";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = [
+            ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        let engine = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        for (url, labels) in [
+            ("grpc://127.0.0.1:8770", &pipeline[..]),
+            ("grpc://127.0.0.1:8771", &engine[..]),
+            ("grpc://127.0.0.1:8772", UNLABELED),
+        ] {
+            worker_registry
+                .register(regular_worker(url, model_id, labels))
+                .unwrap();
+        }
+        let stage = regular_stage(Arc::clone(&worker_registry));
+
+        assert_eq!(
+            urls_seen(&stage, model_id, PIPELINE_REFS),
+            ["grpc://127.0.0.1:8770"],
+            "a pinned family goes to the pipeline worker only"
+        );
+        assert_eq!(
+            urls_seen(&stage, model_id, REFS),
+            ["grpc://127.0.0.1:8770", "grpc://127.0.0.1:8771"],
+            "an opted-in family goes to every worker that processes references"
+        );
+
+        let engine_only = "test-model-pipeline-pinned-engine-only";
+        worker_registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:8773",
+                engine_only,
+                &engine,
+            ))
+            .unwrap();
+        let response =
+            stage.selection_failure(engine_only, &[WorkerType::Regular], None, PIPELINE_REFS);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Pixel media never reaches a worker labeled without a vision encoder:
@@ -3747,6 +3865,7 @@ mod tests {
         let both = MediaDemands {
             media_refs: true,
             vision: true,
+            pipeline_only: false,
         };
         let refs_with_vision = [
             ("mm_processor", "inprocess"),
@@ -3830,6 +3949,8 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+
+            requires_gateway_pipeline: false,
         };
 
         let stage = &stage;
@@ -4587,6 +4708,8 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+
+            requires_gateway_pipeline: false,
         };
 
         let stage = &stage;
@@ -5187,6 +5310,8 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+
+            requires_gateway_pipeline: false,
         };
 
         let stage = &stage;

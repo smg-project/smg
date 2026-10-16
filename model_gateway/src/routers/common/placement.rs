@@ -53,6 +53,10 @@ pub(crate) struct WireConstraint {
     /// runtime and transport; the gRPC selection helpers derive their
     /// candidate predicate from this flag.
     pub requires_media_refs: bool,
+    /// With `requires_media_refs`: the references go only to workers running
+    /// the gateway's own pipeline (the model's family is not opted in for the
+    /// engine's prompt updates); derived into the predicate the same way.
+    pub requires_gateway_pipeline: bool,
 }
 
 impl WireConstraint {
@@ -1459,6 +1463,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+            requires_gateway_pipeline: false,
         });
 
         assert_eq!(
@@ -1575,6 +1580,7 @@ mod tests {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                requires_gateway_pipeline: false,
             }),
             false,
             None,
@@ -1739,6 +1745,7 @@ mod tests {
             runtime: RuntimeType::Sglang,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+            requires_gateway_pipeline: false,
         });
         let only_p1 = |w: &dyn Worker| w.url() == "grpc://p:1";
         let failure = select_pair(

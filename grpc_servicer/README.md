@@ -103,10 +103,16 @@ that flag is the one to raise; the router's `--max-payload-size` (default
 512 MiB) must also hold the whole request body.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
-the model's spec opts in and every registered worker of the model advertises
-`mm_processor`), `router` (always preprocess) or `worker` (strict: 400 when a
-request cannot be forwarded); the outcome is counted in
-`smg_mm_processing_total{model,mode,reason}`, and the startup line
+every registered worker of the model advertises `mm_processor` and the model's
+spec opts in, or every one of those workers runs the router's own pipeline,
+`mm_processor=smg`, which expands any spec's anchor itself), `router` (always
+preprocess) or `worker` (strict: 400 when a request cannot be forwarded; a
+family without the opt-in forwards when every media-processing worker of the
+model runs `smg`, and its requests are placed on `smg` workers only, so a
+worker on the engine's own processor never receives an anchor it cannot
+expand); the outcome is counted in
+`smg_mm_processing_total{model,mode,reason}` (`pipeline_workers` and
+`auto_pipeline` name the forwarded-by-the-pipeline case), and the startup line
 `multimodal processing mode` names the value and its source (`flag`, `env` or
 `default`). `SMG_MM_PROCESSING` is the deprecated env fallback: it applies only
 when the flag is absent, logs a deprecation line, and goes away in the next

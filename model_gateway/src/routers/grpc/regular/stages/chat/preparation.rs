@@ -297,6 +297,10 @@ pub(crate) async fn prepare_chat_like(
                     media_items = media_plan.parts().len(),
                     "Forwarding media references for worker-side processing"
                 );
+                // A family only the gateway's own pipeline expands is placed
+                // on the workers that run it (see `resolve_mm_processing`).
+                ctx.state.media_refs_pipeline_only =
+                    multimodal::plan_needs_gateway_pipeline(&media_plan, placeholders);
                 multimodal_refs = Some(media_plan);
             } else {
                 // The dtype every worker the selection can pick reads image

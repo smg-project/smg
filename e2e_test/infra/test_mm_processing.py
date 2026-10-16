@@ -24,17 +24,20 @@ def test_unknown_value_raises(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("lane", "vllm", "expandable", "expected"),
+    ("lane", "vllm", "processor", "expandable", "expected"),
     [
-        ("worker", True, True, ("worker", "auto_uniform")),
-        ("worker", True, False, ("router", "model_not_opted_in")),
-        ("worker", False, True, ("router", None)),
-        (None, True, True, ("router", None)),
+        ("worker", True, "inprocess", True, ("worker", "auto_uniform")),
+        ("worker", True, "inprocess", False, ("router", "model_not_opted_in")),
+        ("worker", True, "smg", True, ("worker", "auto_uniform")),
+        ("worker", True, "smg", False, ("worker", "auto_pipeline")),
+        ("worker", False, "inprocess", True, ("router", None)),
+        (None, True, "inprocess", True, ("router", None)),
     ],
 )
-def test_expected_path_matrix(monkeypatch, lane, vllm, expandable, expected):
+def test_expected_path_matrix(monkeypatch, lane, vllm, processor, expandable, expected):
     monkeypatch.setattr(mm_processing, "get_mm_processing", lambda: lane)
     monkeypatch.setattr(mm_processing, "is_vllm", lambda: vllm)
+    monkeypatch.setattr(mm_processing, "get_vllm_mm_processor", lambda: processor)
     assert mm_processing.expected_mm_processing(worker_expandable=expandable) == expected
 
 
