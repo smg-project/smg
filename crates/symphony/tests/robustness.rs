@@ -15,10 +15,11 @@
 //! a string-valued arguments streams as written, and the JSON prefix judge refuses such a string
 //! whole, so there the pieces say the string's bytes before the break where the whole says
 //! nothing; the one stated exception to the chunking rule, held by the assemblers' own tests.
-//! No piece holds a broken escape, and an output in which a concatenation (a lone `\` before an
-//! escape) or a corruption (a cut inside an escape) built one anyway is skipped under its seed (a
-//! few per cent of the outputs; the count is on the diagnostic line), so a long audit never
-//! reports the known exception as a failure.
+//! No piece holds a broken escape, but a concatenation (a lone `\` before an escape) or a
+//! corruption (a cut inside an escape) builds one in a few per cent of the outputs. Those are
+//! checked like every other (a panic is never forgiven, and a break inside an object must keep
+//! the contract), and a contract breach on one of them is forgiven as the stated exception and
+//! counted on the diagnostic line, so a long audit never reports it as a failure.
 //!
 //! `SYMPHONY_SCRAMBLE_CASES=n` sets the outputs per table, variant and declaration (one hundred
 //! by default; a longer run for an audit), `SYMPHONY_SCRAMBLE_SEED=n` the first seed, so a run can
@@ -741,17 +742,24 @@ fn subjects() -> Vec<(Table, Variant, bool)> {
     subjects
 }
 
-/// The scrambles of one subject, each in its own seed: the failures, each naming what replays it.
-/// Outputs skipped for holding a broken surrogate escape (the stated exception), for the
-/// diagnostic line.
-static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+/// Outputs whose contract breach was forgiven for holding a broken surrogate escape (the stated
+/// exception), for the diagnostic line.
+static FORGIVEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether `text` holds a JSON surrogate escape that is broken: a high surrogate (`\ud800` to
 /// `\udbff`) not followed by a low one (`\udc00` to `\udfff`), or a low one not preceded by a
-/// high one. An escape begins at a backslash that is not itself escaped; an escape cut short
-/// (the tail cut mid-escape) is not a broken one, as whole and pieces hold it alike.
+/// high one. An escape begins at a backslash that is not itself escaped. An escape the text ends
+/// in the middle of (the tail cut after `\ud83c\`, or inside `\ude0`) is not a broken one: the
+/// parser reads it as a valid prefix, whole and pieces alike.
 fn holds_a_broken_surrogate_escape(text: &str) -> bool {
     let bytes = text.as_bytes();
+    // `\`, `\u`, `\u` + up to three hex digits, ending the text: an escape cut short.
+    let cut_short_at = |at: usize| -> bool {
+        let rest = &bytes[at..];
+        rest.first() == Some(&b'\\')
+            && rest.len() <= 5
+            && (rest.len() == 1 || (rest[1] == b'u' && rest[2..].iter().all(u8::is_ascii_hexdigit)))
+    };
     let escape_at = |at: usize| -> Option<u32> {
         // `\uXXXX` at `at`, the backslash unescaped: its code unit.
         if bytes.get(at) != Some(&b'\\') || bytes.get(at + 1) != Some(&b'u') {
@@ -795,7 +803,7 @@ fn holds_a_broken_surrogate_escape(text: &str) -> bool {
             }
             None => {
                 if after_high {
-                    return true;
+                    return !cut_short_at(at);
                 }
                 at += 1;
             }
@@ -814,8 +822,13 @@ fn a_broken_surrogate_escape_is_told_from_a_whole_one() {
         r"\u00e9 \n \\",
         r"\ud83",
         r"ab\udc0",
-        // A high escape the text ends on: cut short, held alike by whole and pieces.
+        // A high escape the text ends on, or an escape the text ends in the middle of: cut
+        // short, read as a valid prefix by whole and pieces alike.
         r"\ud83c",
+        r"\ud83c\",
+        r"\ud83c\u",
+        r"\ud83c\ude0",
+        r#"{"e": "\ud83c\"#,
     ] {
         assert!(!holds_a_broken_surrogate_escape(whole), "{whole:?}");
     }
@@ -832,6 +845,7 @@ fn a_broken_surrogate_escape_is_told_from_a_whole_one() {
     }
 }
 
+/// The scrambles of one subject, each in its own seed: the failures, each naming what replays it.
 fn scramble(
     table: Table,
     variant: Variant,
@@ -855,11 +869,6 @@ fn scramble(
         );
         let prompt_text = prompt(&mut random, &format);
         let text = output(&mut random, &vocabulary);
-        // The stated exception (see the module doc) stays out of the outputs.
-        if holds_a_broken_surrogate_escape(&text) {
-            SKIPPED.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
         let finish = finish(&mut random);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             check(
@@ -873,6 +882,12 @@ fn scramble(
         }));
         let failure = match outcome {
             Ok(Ok(())) => continue,
+            // The stated exception (see the module doc): a contract breach on an output that
+            // holds a broken surrogate escape is forgiven; a panic never is.
+            Ok(Err(_)) if holds_a_broken_surrogate_escape(&text) => {
+                FORGIVEN.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             Ok(Err(breach)) => breach,
             Err(payload) => format!("PANIC: {}", panic_message(payload)),
         };
@@ -928,11 +943,12 @@ fn every_table_reads_every_scramble_without_a_panic_and_keeps_the_contract() {
             })
             .collect()
     });
-    let skipped = SKIPPED.load(Ordering::Relaxed) as u64;
+    let forgiven = FORGIVEN.load(Ordering::Relaxed);
     println!(
-        "{} scrambles read: {} tables x {} variants x 2 declarations x {cases} seeds from {first}, \
-         {skipped} skipped for a broken surrogate escape (the stated exception)",
-        subjects.len() as u64 * cases - skipped,
+        "{} scrambles read: {} tables x {} variants x 2 declarations x {cases} seeds from {first}; \
+         {forgiven} contract breaches forgiven on outputs holding a broken surrogate escape (the \
+         stated exception)",
+        subjects.len() as u64 * cases,
         Table::ALL.len(),
         Variant::ALL.len()
     );
