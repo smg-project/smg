@@ -46,7 +46,7 @@ use llm_tokenizer::traits::Tokenizer;
 use media::MediaGate;
 pub use media::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest,
-    ProcessedMedia,
+    ProcessedMedia, ALL_MODALITIES, PIXEL_MODALITIES,
 };
 use service::VllmEngineService;
 use smg_grpc_client::vllm_proto::vllm_engine_server::VllmEngineServer;

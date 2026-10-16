@@ -2357,6 +2357,7 @@ struct MockMediaProcessor {
     delay: Duration,
     probe_ok: AtomicBool,
     max_inflight: usize,
+    modalities: &'static [&'static str],
 }
 
 impl MockMediaProcessor {
@@ -2364,10 +2365,25 @@ impl MockMediaProcessor {
         Self::slow(outcome, Duration::ZERO, 4)
     }
 
+    /// A processor that takes audio references as well, as the engine's own
+    /// processors do behind the Python bridge.
+    fn taking_audio(outcome: Result<ProcessedMedia, MediaError>) -> Arc<Self> {
+        Self::build(outcome, Duration::ZERO, 4, ALL_MODALITIES)
+    }
+
     fn slow(
         outcome: Result<ProcessedMedia, MediaError>,
         delay: Duration,
         max_inflight: usize,
+    ) -> Arc<Self> {
+        Self::build(outcome, delay, max_inflight, PIXEL_MODALITIES)
+    }
+
+    fn build(
+        outcome: Result<ProcessedMedia, MediaError>,
+        delay: Duration,
+        max_inflight: usize,
+        modalities: &'static [&'static str],
     ) -> Arc<Self> {
         Arc::new(Self {
             outcome: Mutex::new(outcome),
@@ -2376,6 +2392,7 @@ impl MockMediaProcessor {
             delay,
             probe_ok: AtomicBool::new(true),
             max_inflight,
+            modalities,
         })
     }
 
@@ -2403,6 +2420,10 @@ impl MediaProcessor for MockMediaProcessor {
 
     fn max_inflight(&self) -> usize {
         self.max_inflight
+    }
+
+    fn modalities(&self) -> &'static [&'static str] {
+        self.modalities
     }
 
     fn probe(&self) -> BoxFuture<bool> {
@@ -2534,9 +2555,57 @@ async fn media_refs_are_processed_worker_side_and_relayed_as_encoded() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// An audio reference is the processor's to take: the engine's own
+/// processors behind the Python bridge take it as the Python servicer does,
+/// and the item reaches them under the `audio` name, with the request served
+/// as any other; a processor of pixels refuses it before any work, naming
+/// the modes that take it (the refusal case sits with the malformed ones
+/// below).
+#[tokio::test]
+async fn audio_refs_reach_a_processor_that_takes_them() {
+    let processor = MockMediaProcessor::taking_audio(Ok(processed_media()));
+    let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+    let mut request = generate_request("mr6", true, Vec::new());
+    request.input = Some(vllm::generate_request::Input::Tokenized(
+        vllm::TokenizedInput {
+            original_text: "transcribe".to_string(),
+            input_ids: vec![1, 2, 3],
+        },
+    ));
+    request.media_refs = Some(vllm::MediaRefs {
+        items: vec![vllm::MediaRef {
+            modality: common::Modality::Audio as i32,
+            url: "https://example.com/x.wav".to_string(),
+        }],
+    });
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+
+    let frames = h.engine_in.recv_frames().await.expect("add frames");
+    let engine_request: EngineCoreRequest = decode_msgpack(&frames[1]).expect("add payload");
+    assert_eq!(engine_request.request_id, "mr6");
+    assert_eq!(engine_request.prompt_token_ids, Some(vec![7, 8, 9, 10]));
+    assert!(engine_request.mm_features.is_some());
+
+    let seen = processor.requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].items,
+        vec![MediaRefItem {
+            modality: "audio".to_string(),
+            url: "https://example.com/x.wav".to_string(),
+        }]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The Python servicer's own refusals, before the processor runs: references
-/// next to preprocessed batches or without tokenized input, an unsupported
-/// modality, an empty reference.
+/// next to preprocessed batches or without tokenized input, a modality the
+/// configured processor does not take, an empty reference.
 #[tokio::test]
 async fn malformed_media_refs_are_refused_before_processing() {
     let processor = MockMediaProcessor::answering(Ok(processed_media()));
@@ -2562,7 +2631,7 @@ async fn malformed_media_refs_are_refused_before_processing() {
     for (request, needle) in [
         (twice, "cannot be combined"),
         (text, "requires tokenized input"),
-        (audio, "unsupported modality"),
+        (audio, "takes image and video references, not audio"),
         (empty, "empty url"),
     ] {
         let status = h.client.generate(request).await.expect_err("refused");

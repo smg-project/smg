@@ -49,7 +49,8 @@ pub use tokenspeed::{TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedSe
 use tonic::Status;
 pub use vllm::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest,
-    ProcessedMedia, VllmModelInfo, VllmServicerConfig, VllmServicerServer,
+    ProcessedMedia, VllmModelInfo, VllmServicerConfig, VllmServicerServer, ALL_MODALITIES,
+    PIXEL_MODALITIES,
 };
 
 /// A boxed response stream, the shape tonic's generated traits take.

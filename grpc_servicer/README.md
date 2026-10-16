@@ -309,6 +309,11 @@ Worker-side media processing uses the same `--mm-processor` /
   the launcher's switch refuses it before the engine is built and the model
   loaded (one configuration-error line, exit code 2), not after.
 
+An audio reference (a family whose audio the engine's own processor takes)
+reaches `inprocess` and `redis` on the Rust servicer as it does on the Python
+servicer; the `smg` pipeline takes image and video references and refuses an
+audio one before any work, naming the modes that take it.
+
 The in-flight cap, the saturation refusal, the advertised `mm_processor` /
 `mm_media_ref_schemes` / `mm_processor_source` and the PD prefill leg's
 `media_identity` behave as on the Python servicer whichever processor runs;
