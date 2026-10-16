@@ -157,10 +157,11 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize;
 
     /// The table's ignored terminal arrived inside the call. Its bytes are the engine's to place
-    /// ([`Region`]): dropped where it stands when the assembler holds nothing, carried into the
-    /// source of the event that carries the bytes after it otherwise. A syntax that reads the
-    /// terminal as its own separator does what it must here (MiniMax M3's XML releases a tag it
-    /// holds at it) and pushes nothing for its bytes.
+    /// ([`Region`]): dropped where it stands when the assembler holds nothing, else placed where
+    /// it arrived once the bytes around it leave, spliced into a call event's source or split out
+    /// of a text event as a `Dropped` event of its own. A syntax that reads the terminal as its
+    /// own separator does what it must here (MiniMax M3's XML releases a tag it holds at it) and
+    /// pushes nothing for its bytes.
     fn ignored(&mut self, _text: &str, _declared: &Declared, _out: &mut Events) {}
 
     /// The call the engine entered through a matched header starts: the events of its start, and
