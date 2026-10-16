@@ -590,14 +590,14 @@ mod tests {
             let events = run(&prompt, &[turn.output]);
             assert_eq!(bytes(&events), turn.output, "{:?}", turn.output);
             assert_eq!(reasoning_of(&events), turn.reasoning, "{:?}", turn.output);
-            // The two newlines the template writes before a block are the model's content here;
-            // the encoder's parser skips them (bellwether #17).
-            assert_eq!(
-                content_of(&events).trim_matches('\n'),
-                turn.content,
-                "{:?}",
-                turn.output
-            );
+            // The two newlines the template writes before a block are the model's content here,
+            // exactly two of them; the encoder's parser skips them (bellwether #17).
+            let content = if turn.calls.is_empty() {
+                turn.content.to_string()
+            } else {
+                format!("{}\n\n", turn.content)
+            };
+            assert_eq!(content_of(&events), content, "{:?}", turn.output);
             let read: Vec<(String, serde_json::Value)> = calls_of(&events)
                 .into_iter()
                 .map(|(index, name)| {
