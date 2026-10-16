@@ -180,6 +180,24 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   it first: that grace arms no veto and lifts none), re-admits a worker on its first contact with a closed
   circuit breaker, and never touches the health status. A veto steers, it never refuses: when every
   candidate is vetoed, the request goes to the least-loaded ready worker among them.
+- **Wedge drain (opt-in).** The wedged veto steers, so a worker whose engine completes nothing is
+  re-admitted as soon as its pile empties by the requests' budgets (or a load record without a
+  silence figure arrives) and vetoed again within the bound: new requests keep landing on it for
+  the whole stall. `--worker-wedge-drain-secs N` (0 = off) escalates instead: while the drain is on,
+  neither an emptied pile nor a load record re-admits a wedged worker (a token or a completion
+  does), and a veto that has stood for `N` seconds takes the worker out of selection for good
+  until it proves itself: *draining* while its in-flight requests finish or hit their budgets (a
+  completion re-admits it, a token alone no longer does), *held* for
+  `--worker-wedge-drain-hold-secs` (30) once nothing of the gateway's is in flight on it, then
+  *probing*: routable one tracked request at a time until one completes; a probe that makes no
+  progress wedges the worker back into the drain, and one that ends without completing (its
+  budget, an error, an abort) holds it again for the hold. A connection failure meanwhile turns the veto
+  `unreachable` as usual, and the contact that clears it returns the worker to its drain. The
+  state is the worker's `wedge_drain` field (`draining`, `held`, `probing`) in `GET /workers`,
+  the `smg_worker_wedge_drain{worker,state}` gauge and the `smg_worker_wedge_drains_total`
+  counter; `PATCH /workers/{id}` with `{"readmit": true}` ends a veto and a drain by hand. The
+  pile is the streaming gRPC generations in flight, as for the veto, and the completion that
+  counts is the engine's own last message for a request (a `Complete` that is not an error).
 - **Warm-up slice.** A worker that just became routable, or whose index is thin against the
   fleet's (`--worker-warmup-thin-ratio`), receives a share of cache-miss traffic until its index has
   grown, so an empty index does not starve it while every prompt has a holder elsewhere.
@@ -198,7 +216,9 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
 Gateway: `--kv-index chain` (deprecated: the chain index is the only KV index, so the flag takes
 `chain` only and goes in a later release; `positional` is refused), `--kv-indexer-ttl-secs`,
 `--kv-indexer-max-entries` (deprecated, accepted and ignored: the chain index has no prune);
-`--worker-stall-secs` (2), `--worker-wedge-secs` (3); `--worker-warmup-secs` (60),
+`--worker-stall-secs` (2), `--worker-wedge-secs` (3), `--worker-stale-secs` (15),
+`--worker-wedge-drain-secs` (0, off; needs `--worker-wedge-secs` above 0),
+`--worker-wedge-drain-hold-secs` (30); `--worker-warmup-secs` (60),
 `--worker-warmup-share` (0.25), `--worker-warmup-blocks` (1024), `--worker-warmup-thin-ratio`
 (0.5); `--worker-overload-protection` (on), `--disable-worker-overload-protection`,
 `--worker-overload-waiting-requests` (8), `--worker-overload-token-usage` (0.8),
@@ -218,7 +238,8 @@ Metrics added: `smg_kv_index_lookup_seconds{index}`, `smg_kv_event_apply_seconds
 `smg_kv_index_arena_free_bytes`, `smg_kv_index_slab_bytes`, `smg_kv_index_moved_hashes`, `smg_kv_index_engine_conflicts`;
 `smg_kv_event_batches_total{disposition}`, `smg_kv_event_gaps_total{outcome}`,
 `smg_kv_event_resyncs_total{reason}`, `smg_kv_event_lag_seconds`, `smg_kv_event_degraded_ranks`,
-`smg_kv_event_subscriptions_total`; `smg_worker_stalled{reason}`,
+`smg_kv_event_subscriptions_total`; `smg_worker_stalled{reason}`, `smg_worker_wedge_drain{worker,state}`,
+`smg_worker_wedge_drains_total{worker}`,
 `smg_worker_stall_transitions_total`, `smg_worker_overload_fallback_total`,
 `smg_policy_inflight_reconciled_total{policy}`, `smg_cache_aware_policy_branch_total{branch}`.
 

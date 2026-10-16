@@ -645,6 +645,11 @@ class RouterArgs:
     worker_warmup_share: float = 0.25
     worker_warmup_thin_ratio: float = 0.5
     # Liveness: seconds without progress before a loaded worker is wedged
+    # Opt-in wedge drain: seconds a worker may stand vetoed as wedged before it
+    # drains (0 = off), and how long a drained worker with nothing in flight is
+    # held before it may take a probe request
+    worker_wedge_drain_hold_secs: int = 30
+    worker_wedge_drain_secs: int = 0
     worker_wedge_secs: int = 3
     # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
     zmq_engine_count: int | None = None
@@ -1124,6 +1129,30 @@ class RouterArgs:
                 " until it makes progress; the bound stretches to the time its"
                 " in-flight prompts may still need in prefill, up to 120 seconds."
                 " Defaults to 3."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-wedge-drain-secs",
+            type=int,
+            default=RouterArgs.worker_wedge_drain_secs,
+            help=(
+                "Opt-in wedge drain: seconds a worker may stand vetoed as wedged (see"
+                " --worker-wedge-secs) before it drains instead of steering: it leaves"
+                " selection while its in-flight requests finish or hit their budgets,"
+                " is held out for --worker-wedge-drain-hold-secs once nothing is in"
+                " flight on it, then takes one request per hold until one completes."
+                " While the drain is on, neither an emptied pile nor a load record"
+                " re-admits a wedged worker. Needs --worker-wedge-secs above 0."
+                " Defaults to 0 (off)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}worker-wedge-drain-hold-secs",
+            type=int,
+            default=RouterArgs.worker_wedge_drain_hold_secs,
+            help=(
+                "How long a drained worker with nothing in flight is held out of"
+                " routing before it may take a probe request. Defaults to 30."
             ),
         )
         routing_group.add_argument(

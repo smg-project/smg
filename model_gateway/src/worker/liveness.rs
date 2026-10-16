@@ -101,6 +101,33 @@
 //!   so a worker that still streams is never stale. A zero threshold turns
 //!   the rule off.
 //!
+//! - **wedge drain** (opt-in, `--worker-wedge-drain-secs`): the wedged veto
+//!   above steers, and a worker whose pile empties by its requests' budgets
+//!   is re-admitted and vetoed again within the bound for as long as its
+//!   engine completes nothing, a flap in which every re-admission lands new
+//!   requests on a worker that finishes none. With the drain on, a wedged
+//!   veto is not ended by its pile emptying or by a load record alone
+//!   (progress, a token or a completion, still ends it), and one that has
+//!   stood for the drain bound escalates: the worker is *draining*, out of
+//!   selection while its in-flight requests finish or hit their budgets (a
+//!   token is no longer proof; a completion is), then *held* out for the
+//!   hold (`--worker-wedge-drain-hold-secs`) once nothing of this gateway's
+//!   is in flight on it, then *probing*: routable for one tracked request at
+//!   a time, until one of them completes (a completed request, from any
+//!   state of the drain, is what re-admits the worker). A probe that makes
+//!   no progress wedges the worker again, back into the drain; one that ends
+//!   without completing (its budget, an error, an abort) holds the worker
+//!   again for the hold (the worker reads as vetoed from the probe's
+//!   dispatch on, so nothing lands between the probe's end and the sweep;
+//!   selection and dispatch being two steps, requests selected in the same
+//!   instant can still land together), and a worker that completes nothing
+//!   takes one request per hold, not one after another. A connection
+//!   failure meanwhile turns the veto unreachable as usual, and the contact
+//!   that clears that returns the worker to its drain, not to routing. An
+//!   operator ends a drain through the worker update route (`readmit`). The
+//!   state is in the worker's `wedge_drain` field and the
+//!   `smg_worker_wedge_drain` gauge.
+//!
 //! No veto touches the worker's health status: the health checker keeps
 //! its own state machine, and the veto is simply gone once the worker talks.
 
@@ -112,7 +139,10 @@ use std::{
 use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
-use super::{worker::StallReason, Worker};
+use super::{
+    worker::{StallReason, WedgeDrain},
+    Worker,
+};
 use crate::observability::metrics::Metrics;
 
 const DEFAULT_STALL: Duration = Duration::from_secs(2);
@@ -274,8 +304,40 @@ fn reprieve(answered_ago: Option<Duration>, bound: Duration) -> Option<Duration>
 }
 
 static THRESHOLDS: OnceLock<(Duration, Duration, Duration)> = OnceLock::new();
+static DRAIN: OnceLock<Drain> = OnceLock::new();
 static WARMUP: OnceLock<Warmup> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// The wedge drain's settings (see the module docs): how long a wedged veto
+/// stands before the worker drains, and how long a drained worker is held
+/// once nothing is in flight on it before it may take a probe. A zero
+/// `secs` keeps the drain off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Drain {
+    pub secs: Duration,
+    pub hold: Duration,
+}
+
+impl Drain {
+    /// The default: off.
+    pub(crate) const OFF: Self = Self {
+        secs: Duration::ZERO,
+        hold: Duration::from_secs(30),
+    };
+
+    pub(crate) const fn enabled(self) -> bool {
+        !self.secs.is_zero()
+    }
+}
+
+/// Set the wedge drain from the gateway configuration; the first call wins.
+pub(crate) fn configure_drain(drain: Drain) {
+    let _ = DRAIN.set(drain);
+}
+
+fn drain() -> Drain {
+    DRAIN.get().copied().unwrap_or(Drain::OFF)
+}
 
 /// The warm-up slice: one cache miss in `1 / share` is routed to a warming
 /// worker (the least-loaded one) so it builds a cache instead of idling behind
@@ -419,7 +481,7 @@ pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
     if worker.stall_reason() != Some(StallReason::Unreachable) {
         return;
     }
-    set(worker, None, "contact");
+    clear_unreachable(worker, "contact");
     if matches!(
         worker.status(),
         WorkerStatus::NotReady | WorkerStatus::Failed
@@ -435,7 +497,25 @@ pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
 pub(crate) fn on_probe_passed(worker: &Arc<dyn Worker>) {
     worker.note_contact();
     if worker.stall_reason() == Some(StallReason::Unreachable) {
-        set(worker, None, "probe");
+        clear_unreachable(worker, "probe");
+    }
+}
+
+/// The end of an unreachable veto by `cause`: re-admission, unless the
+/// worker was in the wedge drain when its connection went, in which case
+/// the drain goes on (the worker is wedged again, as it was) and only a
+/// completed request ends it; the breaker's failures belong to the outage
+/// either way.
+fn clear_unreachable(worker: &Arc<dyn Worker>, cause: &'static str) {
+    if worker.wedge_drain().is_active() {
+        set(
+            worker,
+            Some(StallReason::Wedged),
+            "contact: the wedge drain holds",
+        );
+        worker.reset_circuit_breaker();
+    } else {
+        set(worker, None, cause);
     }
 }
 
@@ -474,8 +554,19 @@ pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
     sweep_with(worker, stall, wedge, stale);
 }
 
-/// [`sweep`] at the given thresholds.
+/// [`sweep`] at the given thresholds and the configured drain.
 fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale: Duration) {
+    sweep_full(worker, stall, wedge, stale, drain());
+}
+
+/// [`sweep`] at the given thresholds and drain.
+fn sweep_full(
+    worker: &Arc<dyn Worker>,
+    stall: Duration,
+    wedge: Duration,
+    stale: Duration,
+    drain: Drain,
+) {
     let load = worker.tracked_load();
     let previous_load = worker.swap_load_sample(load);
     let contact_age = worker.contact_age();
@@ -483,16 +574,29 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
     // The stream that pushed this worker's load records has gone quiet, and
     // so has everything else: unreachability the transport has not reported.
     let records_stopped = records_stopped(worker.pushes_load_records(), contact_age, stale);
+    let drain_state = worker.wedge_drain();
+    // The probe ended (its budget, an error, an abort) and no completion
+    // ended the drain: held again, for the hold, before the next probe. (The
+    // worker has read as vetoed since the probe's dispatch, so no request
+    // landed between its end and this sweep.)
+    if drain_state == WedgeDrain::Probing && drain.enabled() && worker.probe_taken() && load == 0 {
+        hold(worker, drain, "the probe ended without completing");
+        set(
+            worker,
+            Some(StallReason::Wedged),
+            "the probe ended without completing",
+        );
+        return;
+    }
     match worker.stall_reason() {
         Some(StallReason::Unreachable) => return,
-        Some(StallReason::Wedged) => {
+        // (A probing worker with its probe in flight reads as wedged to
+        // routing, but it is the rules below that judge the probe.)
+        Some(StallReason::Wedged) if drain_state != WedgeDrain::Probing => {
             // A wedged veto ends with its connection or with its pile. The
             // connection failed and the worker has been silent since: the
             // streams that were to show progress are gone, so the veto is
-            // unreachable, which the first contact clears. Nothing in flight:
-            // the pile that was the evidence is gone, and if the engine is
-            // still stuck the next requests re-arm the veto within the wedge
-            // bound; that is steering.
+            // unreachable, which the first contact clears.
             if silent_after_failure {
                 set(
                     worker,
@@ -505,14 +609,12 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
                     Some(StallReason::Unreachable),
                     "load records stopped",
                 );
-            } else if load == 0 && !worker.engine_stalled() {
-                // (Unless the engine's own record still says it is stuck:
-                // then the evidence is the engine's, not this pile's.)
-                set(worker, None, "drained");
+            } else {
+                sweep_wedged(worker, load, drain, drain_state);
             }
             return;
         }
-        None => {}
+        _ => {}
     }
     if silent_after_failure {
         set(
@@ -549,11 +651,119 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
     }
 }
 
-/// A token or a completion from the worker: progress clears any veto.
+/// A token (or a chunk) from the worker: progress clears any veto, except
+/// a wedge drain's, which waits for a completion ([`on_completion`]): an
+/// engine that produced one token and froze again is what the drain is for.
 pub(crate) fn on_token_progress(worker: &Arc<dyn Worker>) {
     worker.note_token_progress();
-    if worker.stall_reason().is_some() {
+    if worker.stall_reason().is_some() && !worker.wedge_drain().is_active() {
         set(worker, None, "progress");
+    }
+}
+
+/// A request completed on the worker (the engine's own last message for it,
+/// not an error): progress, and the proof the wedge drain waits for, from
+/// any of its states. The probe that completes ends the drain; so does an
+/// in-flight request that finishes while the worker drains.
+pub(crate) fn on_completion(worker: &Arc<dyn Worker>) {
+    worker.note_token_progress();
+    if worker.wedge_drain() != WedgeDrain::Off {
+        drain_set(worker, WedgeDrain::Off, "a request completed");
+    }
+    if worker.stall_reason().is_some() {
+        set(worker, None, "completion");
+    }
+}
+
+/// An operator re-admits the worker through the update route: the drain
+/// and the veto end now; the rules re-arm on fresh evidence. `true` when
+/// there was anything to end.
+pub(crate) fn readmit(worker: &Arc<dyn Worker>) -> bool {
+    let drained = worker.wedge_drain() != WedgeDrain::Off;
+    if drained {
+        drain_set(worker, WedgeDrain::Off, "operator");
+    }
+    let vetoed = worker.stall_reason().is_some();
+    if vetoed {
+        set(worker, None, "operator");
+    }
+    drained || vetoed
+}
+
+/// The wedged branch of the sweep: how a standing wedged veto ends, or
+/// escalates. Without the drain it ends with its pile: nothing in flight,
+/// the pile that was the evidence is gone, and if the engine is still stuck
+/// the next requests re-arm the veto within the wedge bound (steering; and
+/// not while the engine's own record still says it is stuck, that evidence
+/// being the engine's, not this pile's). With the drain, an empty pile is
+/// no evidence, and the veto runs the drain: draining once it has stood for
+/// the drain bound, held once nothing is in flight, probing once the hold
+/// is over.
+fn sweep_wedged(worker: &Arc<dyn Worker>, load: usize, drain: Drain, state: WedgeDrain) {
+    if !drain.enabled() {
+        if load == 0 && !worker.engine_stalled() {
+            set(worker, None, "drained");
+        }
+        return;
+    }
+    match state {
+        WedgeDrain::Off => {
+            if worker.stall_age() >= drain.secs {
+                drain_set(worker, WedgeDrain::Draining, "wedged for the drain bound");
+            }
+        }
+        WedgeDrain::Draining => {
+            if load == 0 {
+                hold(worker, drain, "nothing left in flight");
+            }
+        }
+        WedgeDrain::Held => {
+            if now_ms() >= worker.wedge_drain_until_ms() {
+                drain_set(worker, WedgeDrain::Probing, "the hold is over");
+                set(worker, None, "probing: one request at a time");
+            }
+        }
+        WedgeDrain::Probing => {}
+    }
+}
+
+/// Hold `worker` out for the drain's hold from now, for `cause`.
+fn hold(worker: &Arc<dyn Worker>, drain: Drain, cause: &'static str) {
+    worker.set_wedge_drain_until_ms(
+        now_ms().saturating_add(u64::try_from(drain.hold.as_millis()).unwrap_or(u64::MAX)),
+    );
+    drain_set(worker, WedgeDrain::Held, cause);
+}
+
+/// Move `worker` to `state` of the wedge drain for `cause`, logging and
+/// counting the transition; nothing when it is there already.
+fn drain_set(worker: &Arc<dyn Worker>, state: WedgeDrain, cause: &'static str) {
+    let previous = worker.wedge_drain();
+    if !worker.set_wedge_drain(state) {
+        return;
+    }
+    match state {
+        WedgeDrain::Draining => {
+            warn!(
+                worker_url = %worker.url(),
+                cause,
+                in_flight = worker.tracked_load(),
+                "Worker enters the wedge drain"
+            );
+            Metrics::record_worker_wedge_drain(worker.url());
+        }
+        WedgeDrain::Held | WedgeDrain::Probing => {
+            info!(worker_url = %worker.url(), state = state.as_str(), cause, "Wedge drain advances");
+        }
+        WedgeDrain::Off => {
+            info!(worker_url = %worker.url(), from = previous.as_str(), cause, "Worker leaves the wedge drain");
+        }
+    }
+    if previous != WedgeDrain::Off {
+        Metrics::set_worker_wedge_drain(worker.url(), previous.as_str(), false);
+    }
+    if state != WedgeDrain::Off {
+        Metrics::set_worker_wedge_drain(worker.url(), state.as_str(), true);
     }
 }
 
@@ -584,7 +794,7 @@ pub(crate) fn on_load_report(
     );
 }
 
-/// [`on_load_report`] at the given wedge threshold.
+/// [`on_load_report`] at the given wedge threshold and the configured drain.
 fn on_load_report_with(
     worker: &Arc<dyn Worker>,
     waiting: i64,
@@ -592,6 +802,27 @@ fn on_load_report_with(
     engine_reports_steps: bool,
     engine_prefill_pending: Option<u64>,
     wedge: Duration,
+) {
+    on_load_report_full(
+        worker,
+        waiting,
+        engine_silence,
+        engine_reports_steps,
+        engine_prefill_pending,
+        wedge,
+        drain(),
+    );
+}
+
+/// [`on_load_report`] at the given wedge threshold and drain.
+fn on_load_report_full(
+    worker: &Arc<dyn Worker>,
+    waiting: i64,
+    engine_silence: Option<Duration>,
+    engine_reports_steps: bool,
+    engine_prefill_pending: Option<u64>,
+    wedge: Duration,
+    drain: Drain,
 ) {
     let previous = worker.swap_waiting_reqs(waiting);
     // The grace of a cold shape arms no veto and lifts none: a worker vetoed
@@ -612,6 +843,11 @@ fn on_load_report_with(
     );
     worker.note_engine_stall(engine_stalled);
     match worker.stall_reason() {
+        // With the drain on, a record ends no wedged veto: it is the flap
+        // the drain exists to stop (a poll carries no silence figure, so
+        // every poll would read as the engine producing again). A token or
+        // a completion ends it, through their own hooks.
+        Some(StallReason::Wedged) if drain.enabled() => {}
         Some(StallReason::Wedged) => {
             // A clock that restarted with this gateway's first dispatch is
             // not progress while the engine still reports silence: a token
@@ -767,6 +1003,11 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
                 worker.note_engine_stall(false);
             }
             Metrics::set_worker_stalled(worker.url(), reason.as_str(), true);
+            // The probe made no progress: back into the drain, to be held
+            // again once the probe is over.
+            if reason == StallReason::Wedged && worker.wedge_drain() == WedgeDrain::Probing {
+                drain_set(worker, WedgeDrain::Draining, "the probe made no progress");
+            }
         }
         None => {
             info!(worker_url = %worker.url(), cause, "Worker re-admitted by liveness");
@@ -2125,5 +2366,386 @@ mod tests {
         assert!(w.engine_stalled());
         set(&w, Some(StallReason::Unreachable), "test");
         assert!(!w.engine_stalled());
+    }
+
+    // ── The wedge drain ────────────────────────────────────────────
+
+    /// A drain for tests: a veto that has stood for 60 ms drains, a drained
+    /// worker is held for 150 ms.
+    const DRAIN: Drain = Drain {
+        secs: Duration::from_millis(60),
+        hold: Duration::from_millis(150),
+    };
+    const WEDGE: Duration = Duration::from_millis(1);
+
+    fn sweep_drain(w: &Arc<dyn Worker>, drain: Drain) {
+        sweep_full(w, DEFAULT_STALL, WEDGE, DEFAULT_STALE, drain);
+    }
+
+    /// A worker wedged by its pile of `n` silent tracked requests (a sweep
+    /// first, so the pile is growth over the sample it leaves).
+    fn wedged_by_a_pile(w: &Arc<dyn Worker>, n: usize, drain: Drain) {
+        sweep_drain(w, drain);
+        tracked_pile(w, n);
+        thread::sleep(Duration::from_millis(5));
+        sweep_drain(w, drain);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "the pile wedges it"
+        );
+    }
+
+    fn end_pile(w: &Arc<dyn Worker>, n: usize) {
+        for _ in 0..n {
+            w.note_tracked_ended();
+            w.decrement_load();
+        }
+    }
+
+    /// Every transition of the drain, in order, on one worker: the table
+    /// the module docs describe.
+    #[test]
+    fn the_wedge_drain_table_of_transitions() {
+        let w = worker();
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+
+        // 1. Wedged with the drain on: the veto stands, the drain is not
+        //    entered before its bound.
+        wedged_by_a_pile(&w, 4, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+        // 2. The pile empties by its budgets: no re-admission (the steering
+        //    rule is off while the drain is on) ...
+        end_pile(&w, 4);
+        sweep_drain(&w, DRAIN);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "an empty pile is no evidence"
+        );
+        // 3. ... and neither is a load record without the engine's silence.
+        on_load_report_full(&w, 0, None, true, None, WEDGE, DRAIN);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "a poll is no evidence"
+        );
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+        // 4. A token before the drain re-admits, as it always did.
+        on_token_progress(&w);
+        assert!(w.stall_reason().is_none());
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+
+        // 5. Wedged again and silent for the drain bound: draining.
+        wedged_by_a_pile(&w, 2, DRAIN);
+        thread::sleep(DRAIN.secs + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Draining);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        assert!(!w.routing_state().eligible());
+        // 6. A token is no longer proof ...
+        on_token_progress(&w);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "a token is not a completion"
+        );
+        assert_eq!(w.wedge_drain(), WedgeDrain::Draining);
+        // 7. ... nor a record that shows the engine producing again.
+        on_load_report_full(&w, 0, Some(Duration::ZERO), true, None, WEDGE, DRAIN);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        assert_eq!(w.wedge_drain(), WedgeDrain::Draining);
+        // 8. The in-flight requests hit their budgets: held.
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Draining, "two still in flight");
+        end_pile(&w, 2);
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Held);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "held out");
+        // 9. Held until the hold is over ...
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Held);
+        // 10. ... then probing: routable while nothing is in flight.
+        thread::sleep(DRAIN.hold + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Probing);
+        assert!(w.stall_reason().is_none(), "routable for a probe");
+        assert!(!w.routing_state().stalled);
+        // 11. One probe at a time: with one in flight the worker is vetoed.
+        tracked_pile(&w, 1);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "the probe is in flight"
+        );
+        assert!(!w.routing_state().eligible());
+        assert!(!w.is_healthy_and_eligible());
+        // 12. The probe makes no progress: back to draining, and held again
+        //     once the probe is over.
+        thread::sleep(Duration::from_millis(5));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Draining, "the probe wedged");
+        end_pile(&w, 1);
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Held);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        thread::sleep(DRAIN.hold + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Probing);
+        // 13. The next probe completes: re-admitted for good.
+        tracked_pile(&w, 1);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        on_completion(&w);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+        assert!(w.stall_reason().is_none(), "a completed probe re-admits");
+        assert!(!w.routing_state().stalled);
+        end_pile(&w, 1);
+        assert!(w.stall_reason().is_none());
+        assert_eq!(w.tracked_load(), 0);
+        assert_eq!(w.stall_age(), Duration::ZERO);
+    }
+
+    /// A probe that ends with no completion (its budget, an error, the
+    /// client's abort) holds the worker again: one request per hold, not one
+    /// after another, for a worker that completes nothing.
+    #[test]
+    fn a_probe_that_ends_without_completing_restarts_the_hold() {
+        // A wedge threshold the probe cannot reach, so the pile rule stays
+        // out of it: this is the probe's end, not its silence.
+        let long = Duration::from_secs(5);
+        let w = worker();
+        wedged_by_a_pile(&w, 2, DRAIN);
+        thread::sleep(DRAIN.secs + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        end_pile(&w, 2);
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Held);
+        thread::sleep(DRAIN.hold + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Probing);
+        // The probe is dispatched and ends; the worker reads as vetoed from
+        // the dispatch to the sweep that holds it, so no second request
+        // slips in between.
+        assert!(!w.probe_taken());
+        tracked_pile(&w, 1);
+        assert!(w.probe_taken());
+        sweep_full(&w, DEFAULT_STALL, long, DEFAULT_STALE, DRAIN);
+        assert_eq!(
+            w.wedge_drain(),
+            WedgeDrain::Probing,
+            "a quiet probe is not a wedge"
+        );
+        end_pile(&w, 1);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "the probe slot is spent"
+        );
+        sweep_full(&w, DEFAULT_STALL, long, DEFAULT_STALE, DRAIN);
+        assert_eq!(
+            w.wedge_drain(),
+            WedgeDrain::Held,
+            "no completion: held again"
+        );
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "and out of routing"
+        );
+        sweep_full(&w, DEFAULT_STALL, long, DEFAULT_STALE, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Held, "for the hold");
+        thread::sleep(DRAIN.hold + Duration::from_millis(10));
+        sweep_full(&w, DEFAULT_STALL, long, DEFAULT_STALE, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Probing, "the next probe");
+        assert!(!w.probe_taken(), "a fresh probe");
+        assert!(w.stall_reason().is_none());
+        // The next probe completes: out of the drain.
+        tracked_pile(&w, 1);
+        on_completion(&w);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+        end_pile(&w, 1);
+    }
+
+    /// A completion ends the drain from any of its states; an operator does
+    /// too, through `readmit`.
+    #[test]
+    fn a_completion_or_an_operator_ends_the_drain_from_any_state() {
+        // Draining.
+        let w = worker();
+        wedged_by_a_pile(&w, 2, DRAIN);
+        thread::sleep(DRAIN.secs + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Draining);
+        on_completion(&w);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+        assert!(w.stall_reason().is_none());
+        end_pile(&w, 2);
+        // Held.
+        wedged_by_a_pile(&w, 2, DRAIN);
+        thread::sleep(DRAIN.secs + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        end_pile(&w, 2);
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Held);
+        on_completion(&w);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+        assert!(w.stall_reason().is_none());
+        // The operator, while draining; nothing to end afterwards.
+        wedged_by_a_pile(&w, 2, DRAIN);
+        thread::sleep(DRAIN.secs + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Draining);
+        assert!(readmit(&w));
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+        assert!(w.stall_reason().is_none());
+        assert!(!readmit(&w), "nothing left to end");
+        // The operator ends a plain veto as well (the pile grows by two
+        // more silent requests: growth over the last sample re-arms it).
+        tracked_pile(&w, 2);
+        thread::sleep(Duration::from_millis(5));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "the pile re-arms the veto"
+        );
+        assert!(readmit(&w));
+        assert!(w.stall_reason().is_none());
+        end_pile(&w, 4);
+    }
+
+    /// The drain survives an unreachable spell: the connection failing turns
+    /// the veto unreachable as usual, and the contact that clears that
+    /// returns the worker to its drain, not to routing.
+    #[test]
+    fn the_drain_survives_an_unreachable_spell() {
+        let stall = Duration::from_millis(10);
+        for probe in [false, true] {
+            let w = worker();
+            wedged_by_a_pile(&w, 2, DRAIN);
+            thread::sleep(DRAIN.secs + Duration::from_millis(10));
+            sweep_drain(&w, DRAIN);
+            assert_eq!(w.wedge_drain(), WedgeDrain::Draining);
+            on_contact_failed_with(&w, "load poll", stall);
+            thread::sleep(stall + Duration::from_millis(5));
+            sweep_full(&w, stall, WEDGE, DEFAULT_STALE, DRAIN);
+            assert_eq!(w.stall_reason(), Some(StallReason::Unreachable));
+            assert_eq!(
+                w.wedge_drain(),
+                WedgeDrain::Draining,
+                "the drain is remembered"
+            );
+            if probe {
+                on_probe_passed(&w);
+            } else {
+                on_contact(&w);
+            }
+            assert_eq!(
+                w.stall_reason(),
+                Some(StallReason::Wedged),
+                "back in the drain, not in routing"
+            );
+            assert_eq!(w.wedge_drain(), WedgeDrain::Draining);
+            assert!(!w.routing_state().eligible());
+            on_completion(&w);
+            assert!(w.stall_reason().is_none());
+            assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+            end_pile(&w, 2);
+        }
+    }
+
+    /// An engine-reported wedge (nothing of this gateway's in flight) drains
+    /// without a pile, and a record that still reports the engine stuck
+    /// sends a probing worker back into the drain without a probe.
+    #[test]
+    fn an_engine_reported_wedge_drains_without_a_pile() {
+        let w = worker();
+        on_load_report_full(
+            &w,
+            0,
+            Some(Duration::from_secs(4)),
+            true,
+            None,
+            WEDGE,
+            DRAIN,
+        );
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        on_load_report_full(&w, 0, Some(Duration::ZERO), true, None, WEDGE, DRAIN);
+        assert_eq!(
+            w.stall_reason(),
+            Some(StallReason::Wedged),
+            "with the drain on, no record ends a wedged veto"
+        );
+        thread::sleep(DRAIN.secs + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Draining);
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Held, "nothing was in flight");
+        thread::sleep(DRAIN.hold + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Probing);
+        assert!(w.stall_reason().is_none());
+        on_load_report_full(
+            &w,
+            0,
+            Some(Duration::from_secs(4)),
+            true,
+            None,
+            WEDGE,
+            DRAIN,
+        );
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        assert_eq!(
+            w.wedge_drain(),
+            WedgeDrain::Draining,
+            "the engine says it is still stuck"
+        );
+    }
+
+    /// With the drain off (the default) nothing changes: the veto ends with
+    /// its pile however long it stood, and no drain state is ever entered.
+    #[test]
+    fn with_the_drain_off_the_veto_steers_as_before() {
+        assert!(!Drain::OFF.enabled());
+        let w = worker();
+        wedged_by_a_pile(&w, 4, Drain::OFF);
+        thread::sleep(DRAIN.secs + Duration::from_millis(5));
+        sweep_drain(&w, Drain::OFF);
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged), "still piled");
+        end_pile(&w, 4);
+        sweep_drain(&w, Drain::OFF);
+        assert!(w.stall_reason().is_none(), "drained: the steering rule");
+        on_load_report_full(
+            &w,
+            0,
+            Some(Duration::from_secs(4)),
+            true,
+            None,
+            WEDGE,
+            Drain::OFF,
+        );
+        assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
+        on_load_report_full(&w, 0, Some(Duration::ZERO), true, None, WEDGE, Drain::OFF);
+        assert!(w.stall_reason().is_none(), "the record ends it, as before");
+        assert_eq!(w.wedge_drain(), WedgeDrain::Off);
+    }
+
+    /// The worker's administrative view carries the drain state beside the
+    /// veto, and nothing while the worker is not in it.
+    #[test]
+    fn the_worker_info_shows_the_drain() {
+        use crate::worker::worker::worker_to_info;
+        let w = worker();
+        assert_eq!(worker_to_info(&w).wedge_drain, None);
+        wedged_by_a_pile(&w, 2, DRAIN);
+        thread::sleep(DRAIN.secs + Duration::from_millis(10));
+        sweep_drain(&w, DRAIN);
+        let info = worker_to_info(&w);
+        assert_eq!(info.stalled.as_deref(), Some("wedged"));
+        assert_eq!(info.wedge_drain.as_deref(), Some("draining"));
+        on_completion(&w);
+        assert_eq!(worker_to_info(&w).wedge_drain, None);
+        end_pile(&w, 2);
     }
 }

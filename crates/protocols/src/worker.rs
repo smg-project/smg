@@ -1018,6 +1018,12 @@ pub struct WorkerInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled: Option<String>,
 
+    /// Where the gateway's opt-in wedge drain holds the worker (`draining`,
+    /// `held` or `probing`, see the gateway's `--worker-wedge-drain-secs`);
+    /// absent when the worker is not in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wedge_drain: Option<String>,
+
     /// The worker's last polled engine load, as published by the load
     /// monitor. `None` when load monitoring has produced nothing for this
     /// worker yet. Unrelated to `load` above, which counts in-flight
@@ -1042,6 +1048,7 @@ impl WorkerInfo {
             http2: false,
             pd_pairing: None,
             stalled: None,
+            wedge_drain: None,
             engine_load: None,
             job_status,
         }
@@ -1315,6 +1322,26 @@ pub struct WorkerUpdateRequest {
 
     /// Update health check configuration (partial — only specified fields change)
     pub health: Option<HealthCheckUpdate>,
+
+    /// Re-admit the worker to routing now: clears the gateway's liveness
+    /// veto and the wedge drain's hold on it (an operator override; the
+    /// rules re-arm on fresh evidence). Applied as the request is handled,
+    /// not through the job queue; a request that updates nothing else
+    /// queues no job.
+    #[serde(default)]
+    pub readmit: Option<bool>,
+}
+
+impl WorkerUpdateRequest {
+    /// Whether the request changes a property of the worker (anything but
+    /// `readmit`), and so goes through the job queue.
+    pub fn updates_properties(&self) -> bool {
+        self.priority.is_some()
+            || self.cost.is_some()
+            || self.labels.is_some()
+            || self.api_key.is_some()
+            || self.health.is_some()
+    }
 }
 
 // ── Request types ───────────────────────────────────────────────────

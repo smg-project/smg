@@ -317,6 +317,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_wedge_drain(mut self, secs: u64, hold_secs: u64) -> Self {
+        self.config.worker_wedge_drain_secs = secs;
+        self.config.worker_wedge_drain_hold_secs = hold_secs;
+        self
+    }
+
     pub fn worker_warmup(
         mut self,
         secs: u64,

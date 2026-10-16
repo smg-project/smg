@@ -2155,6 +2155,33 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// Whether this is a `Complete`: the engine's last message for a
+    /// request, with or without an error.
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::Sglang(resp) => matches!(
+                &resp.response,
+                Some(sglang::generate_response::Response::Complete(_))
+            ),
+            Self::Vllm(resp) => matches!(
+                &resp.response,
+                Some(vllm::generate_response::Response::Complete(_))
+            ),
+            Self::Trtllm(resp) => matches!(
+                &resp.response,
+                Some(trtllm::generate_response::Response::Complete(_))
+            ),
+            Self::Mlx(resp) => matches!(
+                &resp.response,
+                Some(mlx::generate_response::Response::Complete(_))
+            ),
+            Self::TokenSpeed(resp) => matches!(
+                &resp.response,
+                Some(tokenspeed::generate_response::Response::Complete(_))
+            ),
+        }
+    }
+
     /// Whether this is a `Complete` the engine finished with reason `"error"`.
     pub fn engine_error(&self) -> bool {
         match self {
@@ -3124,6 +3151,39 @@ mod tracked_tests {
     }
 
     #[test]
+    fn a_complete_is_the_engines_last_message_an_error_included() {
+        // The drain's proof is a `Complete` that is not an engine error; a
+        // chunk is progress only (see `ProtoStream::next`).
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            )),
+        }));
+        assert!(!chunk.is_complete());
+        let complete = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Complete(
+                sglang::GenerateComplete {
+                    finish_reason: "stop".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }));
+        assert!(complete.is_complete() && !complete.engine_error());
+        let failed = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Complete(
+                sglang::GenerateComplete {
+                    finish_reason: "error".to_string(),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }));
+        assert!(failed.is_complete() && failed.engine_error());
+        assert!(!ProtoGenerateResponse::Vllm(Box::default()).is_complete());
+    }
+
+    #[test]
     fn a_tracked_stream_is_one_of_its_workers_pile_for_its_life() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).tracked(
@@ -3558,7 +3618,14 @@ impl ProtoStream {
         };
         match &item {
             Some(Ok(response)) => {
-                liveness::on_token_progress(&tracked.worker);
+                // A completion the engine finished on its own terms is the
+                // proof the wedge drain waits for; a chunk, or a completion
+                // that reports an engine error, is progress only.
+                if response.is_complete() && !response.engine_error() {
+                    liveness::on_completion(&tracked.worker);
+                } else {
+                    liveness::on_token_progress(&tracked.worker);
+                }
                 if std::mem::take(&mut tracked.samples_success) {
                     tracked.worker.record_outcome(200);
                 }

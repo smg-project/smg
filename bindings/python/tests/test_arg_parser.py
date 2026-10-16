@@ -754,6 +754,10 @@ class TestParseRouterArgs:
                 "7",
                 "--worker-stale-secs",
                 "9",
+                "--worker-wedge-drain-secs",
+                "12",
+                "--worker-wedge-drain-hold-secs",
+                "45",
                 "--worker-warmup-secs",
                 "30",
                 "--worker-warmup-share",
@@ -782,6 +786,8 @@ class TestParseRouterArgs:
         assert router_args.worker_stall_secs == 5
         assert router_args.worker_wedge_secs == 7
         assert router_args.worker_stale_secs == 9
+        assert router_args.worker_wedge_drain_secs == 12
+        assert router_args.worker_wedge_drain_hold_secs == 45
         assert router_args.worker_warmup_secs == 30
         assert router_args.worker_warmup_share == pytest.approx(0.5)
         assert router_args.worker_warmup_blocks == 256
@@ -796,6 +802,8 @@ class TestParseRouterArgs:
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
         assert defaults.worker_stale_secs == 15
+        assert defaults.worker_wedge_drain_secs == 0, "the wedge drain is opt-in"
+        assert defaults.worker_wedge_drain_hold_secs == 30
         assert defaults.worker_warmup_secs == 60
         assert defaults.worker_warmup_share == pytest.approx(0.25)
         assert defaults.worker_warmup_blocks == 1024
