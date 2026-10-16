@@ -23,7 +23,7 @@ process manager's inputs, on a config missing any one of them.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import cached_property
 from typing import Any
 
@@ -55,6 +55,42 @@ def hf_eos_token_ids(model_config: Any) -> list[int]:
 def uses_mrope(model_config: Any) -> bool:
     """Whether the model positions tokens with M-RoPE (its media carry grids)."""
     return bool(getattr(model_config, "uses_mrope", False))
+
+
+def multimodal_config(model_config: Any) -> Any | None:
+    """``ModelConfig.multimodal_config`` as given, else what the accessor
+    ``get_multimodal_config()`` answers (a config that keeps the section behind
+    the accessor alone); ``None`` on a text model, where the engine's accessor
+    raises. The one lookup of the section: :class:`MultimodalSection` and the
+    Rust launcher's readers of it resolve the section here."""
+    mm_config = getattr(model_config, "multimodal_config", None)
+    if mm_config is not None:
+        return mm_config
+    accessor = getattr(model_config, "get_multimodal_config", None)
+    if not callable(accessor):
+        return None
+    try:
+        return accessor()
+    except ValueError:  # the engine's answer on a text model
+        return None
+
+
+def mm_processor_kwargs(model_config: Any) -> dict[str, Any]:
+    """The engine's ``--mm-processor-kwargs`` as its config carries them once
+    built: ``multimodal_config.mm_processor_kwargs``, a copy; ``{}`` when there
+    are none (a text model, a section without the field, a value that is not a
+    mapping).
+
+    ``ModelConfig`` declares ``mm_processor_kwargs`` init-only (a dataclass
+    ``InitVar``): ``__post_init__`` moves the value into the multimodal section
+    and the attribute on the instance reads as the class default, ``None``,
+    whatever the launcher was given. So the section is the one place to read
+    them; a reader of the instance attribute saw no kwargs on any engine, and a
+    stub that set the attribute hid that. Every reader of the kwargs (the
+    worker-side pipeline's options, the sidecar fingerprint) goes through here.
+    """
+    kwargs = getattr(multimodal_config(model_config), "mm_processor_kwargs", None)
+    return dict(kwargs) if isinstance(kwargs, Mapping) else {}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,10 +138,10 @@ class ModelSection:
 
 @dataclasses.dataclass(frozen=True)
 class MultimodalSection:
-    """``ModelConfig.multimodal_config``, for a multimodal model: whether the
-    engine normalizes pixels on device, and its per-prompt limit accessor
-    (``get_limit_per_prompt``), ``None`` on a text model or a config without
-    the accessor."""
+    """``ModelConfig.multimodal_config`` (resolved by :func:`multimodal_config`),
+    for a multimodal model: whether the engine normalizes pixels on device, and
+    its per-prompt limit accessor (``get_limit_per_prompt``), ``None`` on a text
+    model or a config without the accessor."""
 
     is_multimodal: bool
     device_do_normalize: bool
@@ -115,7 +151,7 @@ class MultimodalSection:
     def read(cls, model_config: Any) -> MultimodalSection:
         if not getattr(model_config, "is_multimodal_model", False):
             return cls(is_multimodal=False, device_do_normalize=False, limit_per_prompt=None)
-        mm_config = getattr(model_config, "multimodal_config", None)
+        mm_config = multimodal_config(model_config)
         get_limit = getattr(mm_config, "get_limit_per_prompt", None)
         return cls(
             is_multimodal=True,

@@ -3,6 +3,7 @@ with the defaults it reads when a version does not carry it."""
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -319,3 +320,100 @@ def test_a_section_is_read_once_per_view():
     view = EngineConfigView(SimpleNamespace(scheduler_config=Scheduler()))
     assert view.max_num_seqs == 8 and view.max_num_seqs == 8
     assert reads == [1]
+
+
+@dataclasses.dataclass
+class _EngineModelConfig:
+    """The engine's layout of the processor kwargs: ``mm_processor_kwargs``
+    is an init-only field whose value ``__post_init__`` moves into the
+    multimodal section (built for a multimodal model only); the attribute
+    on the instance reads as the class default afterwards, and the accessor
+    raises on a text model, as the engine's does."""
+
+    model: str = "org/m"
+    is_multimodal_model: bool = True
+    mm_processor_kwargs: dataclasses.InitVar[dict | None] = None
+    multimodal_config: SimpleNamespace | None = None
+
+    def __post_init__(self, mm_processor_kwargs):
+        if self.is_multimodal_model:
+            self.multimodal_config = SimpleNamespace(
+                mm_device_do_normalize=True, mm_processor_kwargs=mm_processor_kwargs
+            )
+
+    def get_multimodal_config(self):
+        if self.multimodal_config is None:
+            raise ValueError("The model is not multimodal.")
+        return self.multimodal_config
+
+
+def test_the_processor_kwargs_are_read_from_the_section_the_engine_moves_them_to():
+    kwargs = {"max_pixels": 100_000, "do_resize": False}
+    config = _EngineModelConfig(mm_processor_kwargs=kwargs)
+    # What a reader of the model config's own attribute sees on every engine.
+    assert config.mm_processor_kwargs is None
+    assert getattr(config, "mm_processor_kwargs", None) is None
+    assert config_view.multimodal_config(config) is config.multimodal_config
+    assert config_view.mm_processor_kwargs(config) == kwargs
+    # A copy: the pipeline's own filtering never edits the engine's config.
+    read = config_view.mm_processor_kwargs(config)
+    read.pop("do_resize")
+    assert config.multimodal_config.mm_processor_kwargs == kwargs
+
+
+def test_the_processor_kwargs_read_the_same_where_the_field_is_a_plain_attribute():
+    # A config that keeps the field as a plain attribute carries the same value
+    # in its multimodal section; the section is what is read either way.
+    kwargs = {"min_pixels": 784}
+    both = SimpleNamespace(
+        mm_processor_kwargs=kwargs, multimodal_config=SimpleNamespace(mm_processor_kwargs=kwargs)
+    )
+    assert config_view.mm_processor_kwargs(both) == kwargs
+    # The attribute alone is no source: on the engine it is the init-only
+    # field, always None, so a stub that sets it describes no engine.
+    attribute_only = SimpleNamespace(
+        mm_processor_kwargs=kwargs, multimodal_config=SimpleNamespace(mm_device_do_normalize=True)
+    )
+    assert config_view.mm_processor_kwargs(attribute_only) == {}
+
+
+def test_the_processor_kwargs_follow_the_accessor_when_the_section_is_behind_it():
+    section = SimpleNamespace(mm_processor_kwargs={"max_pixels": 1})
+    behind_the_accessor = SimpleNamespace(get_multimodal_config=lambda: section)
+    assert config_view.multimodal_config(behind_the_accessor) is section
+    assert config_view.mm_processor_kwargs(behind_the_accessor) == {"max_pixels": 1}
+    # The attribute wins over the accessor when both are there (one object on the engine).
+    config = _EngineModelConfig(mm_processor_kwargs={"max_pixels": 2})
+    config.get_multimodal_config = lambda: section
+    assert config_view.mm_processor_kwargs(config) == {"max_pixels": 2}
+    # The section itself resolves the same way: one lookup for every reader.
+    section = SimpleNamespace(
+        mm_device_do_normalize=True,
+        get_limit_per_prompt={"image": 4}.__getitem__,
+        mm_processor_kwargs={"max_pixels": 1},
+    )
+    view = EngineConfigView(
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                is_multimodal_model=True, get_multimodal_config=lambda: section
+            )
+        )
+    )
+    assert view.multimodal.device_do_normalize is True
+    assert view.multimodal.limit_per_prompt("image") == 4
+
+
+def test_no_processor_kwargs_read_as_an_empty_mapping():
+    text = _EngineModelConfig(is_multimodal_model=False)
+    assert config_view.multimodal_config(text) is None
+    assert config_view.mm_processor_kwargs(text) == {}
+    for config in (
+        SimpleNamespace(),
+        SimpleNamespace(multimodal_config=None),
+        SimpleNamespace(multimodal_config=SimpleNamespace()),
+        _EngineModelConfig(),
+        _EngineModelConfig(mm_processor_kwargs={}),
+        _EngineModelConfig(mm_processor_kwargs="max_pixels=1"),
+        _EngineModelConfig(mm_processor_kwargs=["max_pixels"]),
+    ):
+        assert config_view.mm_processor_kwargs(config) == {}, config

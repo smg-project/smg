@@ -7,7 +7,7 @@ import asyncio
 import sys
 import time
 import types
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 
 import pytest
 
@@ -173,6 +173,41 @@ class TestFingerprintDerivation:
         ):
             fp = mm_processor.fingerprint_from_model_config(_ModelConfig(skewed))
             assert fp.namespace() != implicit.namespace(), skewed
+
+    def test_the_fingerprint_reads_the_processor_kwargs_where_the_engine_keeps_them(
+        self, monkeypatch
+    ):
+        _fake_vllm(monkeypatch)
+        plain = _ModelConfig({})
+        assert mm_processor.fingerprint_from_model_config(plain).mm_processor_kwargs == "{}"
+        # The section behind the engine's accessor carries the kwargs.
+        with_kwargs = _ModelConfig({})
+        with_kwargs._mm.mm_processor_kwargs = {"max_pixels": 100_000, "do_resize": False}
+        fp = mm_processor.fingerprint_from_model_config(with_kwargs)
+        assert fp.mm_processor_kwargs == '{"do_resize": false, "max_pixels": 100000}'
+        assert fp.namespace() != mm_processor.fingerprint_from_model_config(plain).namespace()
+        # The engine's own layout: an init-only field moved into the section,
+        # the attribute on the instance reading None.
+
+        @dataclass
+        class _EngineModelConfig:
+            model: str = "m"
+            dtype: str = "torch.bfloat16"
+            mm_processor_kwargs: InitVar[dict | None] = None
+            multimodal_config: _MmConfig | None = None
+
+            def __post_init__(self, mm_processor_kwargs):
+                self.multimodal_config = _MmConfig({})
+                self.multimodal_config.mm_processor_kwargs = mm_processor_kwargs
+
+            def get_multimodal_config(self):
+                return self.multimodal_config
+
+        engine_shaped = _EngineModelConfig(
+            mm_processor_kwargs={"max_pixels": 100_000, "do_resize": False}
+        )
+        assert engine_shaped.mm_processor_kwargs is None
+        assert mm_processor.fingerprint_from_model_config(engine_shaped) == fp
 
     def test_sibling_options_and_extra_modalities_stay_in_the_fingerprint(self):
         limits = {

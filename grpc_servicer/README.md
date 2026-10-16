@@ -284,9 +284,13 @@ Worker-side media processing uses the same `--mm-processor` /
   the same way. It serves the model families that pipeline supports
   (`crates/multimodal`), takes `http`, `https` and `data` references, reads
   the model's `config.json` and preprocessor configs from the tokenizer
-  directory the launcher resolved, refuses a request above the engine's own
-  `--limit-mm-per-prompt` as the engine's server does (`--mm-max-items` and
-  `SMG_*_MAX_COUNT` tighten those limits, never loosen them), and samples a
+  directory the launcher resolved, lays the engine's `--mm-processor-kwargs`
+  over those preprocessor configs as the engine's own processor would take
+  them (less `device`, which only says where that processor would run; a key
+  the pipeline has no field for is refused at launch), refuses a request
+  above the engine's own `--limit-mm-per-prompt` as the engine's server does
+  (`--mm-max-items` and `SMG_*_MAX_COUNT` tighten those limits, never loosen
+  them), and samples a
   video to the engine's own frame budget (`--media-io-kwargs`
   `video.num_frames`, else its loader's default) where the family's processor
   takes the loader's frames, so a clip costs the same tokens as on the engine's

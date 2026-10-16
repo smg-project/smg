@@ -46,6 +46,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     hello_schemes,
     resolve_namespace,
 )
+from smg_grpc_servicer.vllm import config_view
 from smg_grpc_servicer.vllm.media_refs import (
     BASE_SCHEMES,
     FETCHABLE_MODALITIES,
@@ -448,7 +449,9 @@ def resolved_mm_limits(mm_config) -> dict[str, dict[str, Any]]:
 
 
 def fingerprint_from_model_config(model_config) -> Fingerprint:
-    """The one derivation the worker and the sidecar share."""
+    """The one derivation the worker and the sidecar share. The processor
+    kwargs are read where the engine keeps them (:func:`.config_view.mm_processor_kwargs`),
+    as the Rust launcher reads them for the worker-side pipeline."""
     import vllm
     from vllm import envs
 
@@ -460,7 +463,7 @@ def fingerprint_from_model_config(model_config) -> Fingerprint:
         video_backend=envs.VLLM_VIDEO_LOADER_BACKEND,
         media_io_kwargs=json.dumps(mm_config.media_io_kwargs or {}, sort_keys=True, default=str),
         mm_processor_kwargs=json.dumps(
-            mm_config.mm_processor_kwargs or {}, sort_keys=True, default=str
+            config_view.mm_processor_kwargs(model_config), sort_keys=True, default=str
         ),
         limit_per_prompt=json.dumps(resolved_mm_limits(mm_config), sort_keys=True, default=str),
     )

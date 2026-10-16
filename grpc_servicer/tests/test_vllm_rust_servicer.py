@@ -526,14 +526,113 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
     # An engine that normalizes on the CPU takes normalized pixels in its dtype.
     config.model_config.multimodal_config = SimpleNamespace(mm_device_do_normalize=False)
     assert rust.smg_media_options(config, settings, None)["raw_pixels"] is False
-    # The engine's processor kwargs ride along, less where its own processor runs.
-    config.model_config.mm_processor_kwargs = {"max_pixels": 1000, "device": "cuda"}
+    # The engine's processor kwargs ride along from its multimodal section,
+    # where the engine keeps them, less where its own processor runs.
+    config.model_config.multimodal_config.mm_processor_kwargs = {
+        "max_pixels": 1000,
+        "device": "cuda",
+    }
     assert (
         rust.smg_media_options(config, settings, None)["processor_kwargs_json"]
         == '{"max_pixels": 1000}'
     )
     # A text model takes no media: the mode is ignored, as the Python processors ignore it.
     assert rust.smg_media_options(_config(), settings, None) is None
+
+
+@dataclasses.dataclass
+class _EngineModelConfig:
+    """The engine's layout of the processor kwargs: ``mm_processor_kwargs`` is
+    an init-only field whose value ``__post_init__`` moves into the multimodal
+    section; the attribute on the instance reads as the class default, None,
+    whatever the launcher was given."""
+
+    model: str = "org/m"
+    dtype: str = "torch.bfloat16"
+    is_multimodal_model: bool = True
+    mm_processor_kwargs: dataclasses.InitVar[dict | None] = None
+    multimodal_config: SimpleNamespace | None = None
+
+    def __post_init__(self, mm_processor_kwargs):
+        self.multimodal_config = SimpleNamespace(
+            mm_device_do_normalize=True, mm_processor_kwargs=mm_processor_kwargs
+        )
+
+    def get_multimodal_config(self):
+        return self.multimodal_config
+
+
+def _engine_config(**kwargs):
+    return SimpleNamespace(
+        model_config=_EngineModelConfig(**kwargs),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+
+
+def test_smg_media_options_carry_the_processor_kwargs_from_where_the_engine_keeps_them(
+    tmp_path, monkeypatch
+):
+    """The pipeline's options are built from an engine-shaped config: the
+    kwargs the launcher was given (`--mm-processor-kwargs`) are in the
+    multimodal section, the model config's own attribute reads None, and the
+    options object the binding builds the pipeline from carries them."""
+    from smg_grpc_servicer.vllm import mm_processor
+    from smg_grpc_servicer.vllm.mm_processor import MmSettings
+
+    monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: None)
+    monkeypatch.delenv("VLLM_VIDEO_LOADER_BACKEND", raising=False)
+    monkeypatch.delenv(mm_processor.ENV_MAX_VIDEO_FRAMES, raising=False)
+    settings = MmSettings(processor="smg", max_inflight=3, max_items=2, max_item_bytes=10).resolve(
+        env={}
+    )
+    given = {"max_pixels": 100_000, "do_resize": False, "device": "cuda"}
+    config = _engine_config(mm_processor_kwargs=given)
+    assert config.model_config.mm_processor_kwargs is None, "the init-only field reads None"
+    options = rust.smg_media_options(config, settings, str(tmp_path))
+    assert options == {
+        "model_dir": str(tmp_path),
+        "model_id": "org/m",
+        "raw_pixels": True,
+        "encoder_dtype": "bfloat16",
+        "processor_kwargs_json": '{"do_resize": false, "max_pixels": 100000}',
+        "max_inflight": 3,
+        "max_items": 2,
+        "engine_item_limits": None,
+        "max_item_bytes": 10,
+        "video_frame_budget": None,
+        "video_loader_rule": None,
+        "source": "flag",
+    }
+    assert json.loads(options["processor_kwargs_json"]) == {
+        "do_resize": False,
+        "max_pixels": 100000,
+    }
+    assert config.model_config.multimodal_config.mm_processor_kwargs == given, "read, not edited"
+    # A launch without the flag sends none: the pipeline runs the family's defaults.
+    bare = rust.smg_media_options(_engine_config(), settings, str(tmp_path))
+    assert bare["processor_kwargs_json"] is None
+    # The engine's processor device alone is no override of the pipeline.
+    device_only = rust.smg_media_options(
+        _engine_config(mm_processor_kwargs={"device": "cuda"}), settings, str(tmp_path)
+    )
+    assert device_only["processor_kwargs_json"] is None
+
+
+def test_server_extras_hand_the_binding_the_engines_processor_kwargs(tmp_path, monkeypatch):
+    """From the launcher's namespace to the keyword the Rust server takes: the
+    `smg` processor's options carry the engine's kwargs for the binding to lay
+    over the preprocessor configs."""
+    from smg_grpc_servicer.vllm import mm_processor
+
+    monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: None)
+    for name in ("PROCESSOR", "MAX_INFLIGHT", "MAX_ITEM_BYTES", "MAX_ITEMS"):
+        monkeypatch.delenv(f"SMG_VLLM_MM_{name}", raising=False)
+    launcher = rust.VllmLauncher()
+    launcher.vllm_config = _engine_config(mm_processor_kwargs={"max_pixels": 100_000})
+    extras = launcher.server_extras(argparse.Namespace(mm_processor="smg"), str(tmp_path))
+    assert extras["media_processor"] is None
+    assert extras["smg_media_processor"]["processor_kwargs_json"] == '{"max_pixels": 100000}'
+    assert extras["smg_media_processor"]["source"] == "flag"
 
 
 def test_model_info_advertises_device_side_normalization():
