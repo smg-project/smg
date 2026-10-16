@@ -2,7 +2,7 @@
 //! caller's request read, rendered and tokenized, then sent to one engine
 //! with the converter that turns its stream into the client's chunks. The
 //! entry points keep what differs around it: which engine takes the request,
-//! and the load a stream holds on the worker a policy selected.
+//! and the load a request holds on the worker a policy selected.
 
 use std::{os::raw::c_char, sync::Arc};
 
@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::{
     error::{set_error_message, SglErrorCode},
     grpc_converter::GrpcResponseConverterHandle,
-    policy::GrpcWorker,
+    policy::HeldLoad,
     runtime::RUNTIME,
     stream::SglangStreamHandle,
     tool_constraint::{tool_constraint_for, tools_keep_special_tokens},
@@ -70,9 +70,11 @@ pub(crate) fn prepare_chat(
 /// read through: the tool constraint and the special-token decision, the
 /// generate request, the stream opened on the runtime, and the converter
 /// over the request's tools, tool choice and stops, seeded with the prompt's
-/// token count. `worker` is the selected worker whose load the stream holds
-/// (the policy client); the single client passes none. A failure leaves the
-/// entry point's message in `error_out` and returns its code.
+/// token count. `load` is the load the request holds on the worker a policy
+/// selected (the policy client; the single client holds none): the stream
+/// carries it until the caller frees the handle, and a failure here drops
+/// it, which gives it back. A failure leaves the entry point's message in
+/// `error_out` and returns its code.
 ///
 /// # Safety
 /// - `error_out` may be null; if non-null, must point to writable memory
@@ -80,7 +82,7 @@ pub(crate) unsafe fn start_chat_stream(
     client: &Arc<SglangSchedulerClient>,
     tokenizer: &Arc<dyn Tokenizer>,
     prepared: PreparedChat,
-    worker: Option<Arc<GrpcWorker>>,
+    load: Option<HeldLoad>,
     error_out: *mut *mut c_char,
 ) -> Result<SglangStreamHandle, SglErrorCode> {
     let PreparedChat {
@@ -141,7 +143,7 @@ pub(crate) unsafe fn start_chat_stream(
         converter: Arc::new(tokio::sync::Mutex::new(converter)),
         client: Arc::clone(client),
         prompt_tokens,
-        worker,
+        load,
     })
 }
 

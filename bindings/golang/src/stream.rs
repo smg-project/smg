@@ -17,7 +17,7 @@ use smg_grpc_client::{
 use super::{
     error::{set_error_message, SglErrorCode},
     grpc_converter::{convert_proto_chunk_to_openai, GrpcResponseConverterHandle},
-    policy::GrpcWorker,
+    policy::HeldLoad,
     runtime::RUNTIME,
 };
 
@@ -39,8 +39,9 @@ pub struct SglangStreamHandle {
     pub(crate) client: Arc<SglangSchedulerClient>,
     #[expect(dead_code)]
     pub(crate) prompt_tokens: u32, // Number of prompt tokens for this request
-    /// Worker that owns this stream (for load tracking). None for single-client streams.
-    pub(crate) worker: Option<Arc<GrpcWorker>>,
+    /// The load this stream holds on the worker a policy selected, given
+    /// back when the handle is freed. None for single-client streams.
+    pub(crate) load: Option<HeldLoad>,
 }
 
 /// Read next chunk from stream and convert to OpenAI format.
@@ -224,12 +225,12 @@ pub unsafe extern "C" fn sgl_stream_read_next(
 #[no_mangle]
 pub unsafe extern "C" fn sgl_stream_free(handle: *mut SglangStreamHandle) {
     if !handle.is_null() {
-        let handle_ref = Box::from_raw(handle);
+        let mut handle_ref = Box::from_raw(handle);
 
-        // Decrement worker load (multi-worker load tracking)
-        if let Some(ref worker) = handle_ref.worker {
-            worker.decrement_load();
-            worker.increment_processed();
+        // The worker's bookkeeping for a stream the caller is done with:
+        // its load given back, the request counted as processed.
+        if let Some(load) = handle_ref.load.take() {
+            load.release().increment_processed();
         }
 
         // Mark stream as completed to prevent abort on drop
