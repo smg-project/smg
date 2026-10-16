@@ -53,6 +53,7 @@ use axum::{
     Json, Router,
 };
 use llm_tokenizer::TokenizerRegistry;
+use openai_protocol::worker::MmProcessingMode;
 use serde_json::json;
 use tokio::{
     sync::broadcast::{
@@ -67,6 +68,7 @@ use crate::{
     config::{RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
+    routers::grpc::multimodal::{mm_settings, models_without_media_processing},
     worker::{event::WorkerEvent, WorkerRegistry, WorkerType},
 };
 
@@ -77,6 +79,11 @@ use crate::{
 /// collectors' 3s checkpoint: readiness gates traffic, so a flip should
 /// land within one probe interval.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The `/readiness` reason while worker-side media placement has a model it
+/// cannot serve media for (see [`ReadinessSnapshot::models_without_media_processing`]).
+const MEDIA_PROCESSING_HELD_REASON: &str =
+    "no worker processes media references for a multimodal model (--mm-processing worker)";
 
 /// Result of one readiness evaluation. Field semantics are identical to the
 /// values the `/readiness` handler used to compute inline per probe.
@@ -94,6 +101,15 @@ pub struct ReadinessSnapshot {
     /// Total number of registered workers (reported in the ready response
     /// body).
     pub total_workers: usize,
+    /// Models whose multimodal requests worker-side media placement
+    /// (`--mm-processing worker`) cannot serve: a worker of the model reports
+    /// a vision encoder and no worker of it processes media references
+    /// (`multimodal::models_without_media_processing`, over every registered
+    /// worker: the capability is configuration, not health). Every such
+    /// request is refused `no_media_ref_capable_worker`, so readiness is
+    /// held, naming the models, until a capable worker registers; the same
+    /// reasoning as the tokenizer gate. Empty under the other placements.
+    pub models_without_media_processing: Vec<String>,
 }
 
 /// Shared O(1) probe state: the cached readiness snapshot plus the drain
@@ -140,18 +156,23 @@ impl ProbeState {
         tokenizer_registry: &TokenizerRegistry,
         router_config: &RouterConfig,
     ) {
-        self.recompute_with(worker_registry, router_config, |model_id| {
-            tokenizer_registry.get(model_id).is_some()
-        });
+        self.recompute_with(
+            worker_registry,
+            router_config,
+            |model_id| tokenizer_registry.get(model_id).is_some(),
+            mm_settings().processing.value,
+        );
     }
 
-    /// Core of [`Self::recompute`] with the tokenizer lookup injected, so
-    /// tests can exercise the gating logic without loading real tokenizers.
+    /// Core of [`Self::recompute`] with the tokenizer lookup and the media
+    /// placement injected, so tests can exercise the gating logic without
+    /// loading real tokenizers or seeding the process-wide settings.
     fn recompute_with(
         &self,
         worker_registry: &WorkerRegistry,
         router_config: &RouterConfig,
         tokenizer_registered: impl Fn(&str) -> bool,
+        mm_processing: MmProcessingMode,
     ) {
         let workers = worker_registry.get_all();
         let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
@@ -210,11 +231,39 @@ impl ProbeState {
                 .filter(|w| w.connection_mode().uses_grpc_pipeline())
                 .all(|w| tokenizer_registered(w.model_id()));
 
+        // Under worker-side media placement, a model whose workers report a
+        // vision encoder and none of which processes media references would
+        // refuse every multimodal request (`no_media_ref_capable_worker`),
+        // so `/readiness` must not report ready for it either. The hold is
+        // said once per change, here, not per probe.
+        let media_held = models_without_media_processing(mm_processing, &workers);
+        {
+            let previous = self.readiness.load();
+            if media_held != previous.models_without_media_processing {
+                if media_held.is_empty() {
+                    info!(
+                        models = ?previous.models_without_media_processing,
+                        "every multimodal model has a worker that processes media references \
+                         again; readiness is no longer held for it"
+                    );
+                } else {
+                    warn!(
+                        models = ?media_held,
+                        "no worker processes media references for a model whose workers report \
+                         a vision encoder: under --mm-processing worker its multimodal requests \
+                         are refused (no_media_ref_capable_worker) and /readiness reports not \
+                         ready until such a worker registers"
+                    );
+                }
+            }
+        }
+
         self.readiness.store(Arc::new(ReadinessSnapshot {
             workers_ready,
             tokenizers_ready,
             healthy_workers: healthy_workers.len(),
             total_workers: workers.len(),
+            models_without_media_processing: media_held,
         }));
     }
 
@@ -222,9 +271,12 @@ impl ProbeState {
     /// flag load plus one snapshot pointer load — no registry access.
     ///
     /// Response bodies are byte-identical to the previous inline handler,
-    /// with one addition: while draining, readiness reports not-ready with
+    /// with two additions: while draining, readiness reports not-ready with
     /// reason `"draining"` so load balancers stop routing new connections
-    /// during shutdown (liveness intentionally stays OK — see module docs).
+    /// during shutdown (liveness intentionally stays OK — see module docs);
+    /// and while worker-side media placement has a model no worker processes
+    /// media for, it reports not-ready with that reason and the `models`
+    /// held on.
     pub fn readiness_response(&self) -> Response {
         if self.inflight_tracker.is_draining() {
             return mark_probe(
@@ -240,7 +292,10 @@ impl ProbeState {
         }
 
         let snapshot = self.readiness.load();
-        if snapshot.workers_ready && snapshot.tokenizers_ready {
+        if snapshot.workers_ready
+            && snapshot.tokenizers_ready
+            && snapshot.models_without_media_processing.is_empty()
+        {
             mark_probe(
                 (
                     StatusCode::OK,
@@ -253,21 +308,26 @@ impl ProbeState {
                     .into_response(),
             )
         } else {
-            let reason = if snapshot.workers_ready {
-                "tokenizer not yet registered"
+            // The pool's own holds come first: a fleet with no healthy worker
+            // or no tokenizer is not ready whatever its media placement.
+            let body = if !snapshot.workers_ready {
+                json!({
+                    "status": "not ready",
+                    "reason": "insufficient healthy workers"
+                })
+            } else if !snapshot.tokenizers_ready {
+                json!({
+                    "status": "not ready",
+                    "reason": "tokenizer not yet registered"
+                })
             } else {
-                "insufficient healthy workers"
+                json!({
+                    "status": "not ready",
+                    "reason": MEDIA_PROCESSING_HELD_REASON,
+                    "models": snapshot.models_without_media_processing
+                })
             };
-            mark_probe(
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({
-                        "status": "not ready",
-                        "reason": reason
-                    })),
-                )
-                    .into_response(),
-            )
+            mark_probe((StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response())
         }
     }
 }
@@ -538,7 +598,7 @@ mod tests {
 
     /// Recompute against `registry` with every tokenizer reported present.
     fn recompute(state: &ProbeState, registry: &WorkerRegistry, router_config: &RouterConfig) {
-        state.recompute_with(registry, router_config, |_| true);
+        state.recompute_with(registry, router_config, |_| true, MmProcessingMode::Auto);
     }
 
     #[test]
@@ -673,7 +733,7 @@ mod tests {
             .unwrap();
 
         // Tokenizer missing: workers ready, tokenizers not.
-        state.recompute_with(&registry, &router_config, |_| false);
+        state.recompute_with(&registry, &router_config, |_| false, MmProcessingMode::Auto);
         let snapshot = state.readiness();
         assert!(snapshot.workers_ready);
         assert!(!snapshot.tokenizers_ready);
@@ -681,7 +741,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         // Tokenizer registered: ready.
-        state.recompute_with(&registry, &router_config, |model_id| model_id == "llama-3");
+        state.recompute_with(
+            &registry,
+            &router_config,
+            |model_id| model_id == "llama-3",
+            MmProcessingMode::Auto,
+        );
         assert!(state.readiness().tokenizers_ready);
         assert_eq!(state.readiness_response().status(), StatusCode::OK);
 
@@ -690,7 +755,7 @@ mod tests {
             disable_tokenizer_autoload: true,
             ..regular_config()
         };
-        state.recompute_with(&registry, &no_autoload, |_| false);
+        state.recompute_with(&registry, &no_autoload, |_| false, MmProcessingMode::Auto);
         assert!(state.readiness().tokenizers_ready);
     }
 
@@ -713,7 +778,7 @@ mod tests {
             ))
             .unwrap();
 
-        state.recompute_with(&registry, &router_config, |_| false);
+        state.recompute_with(&registry, &router_config, |_| false, MmProcessingMode::Auto);
         let snapshot = state.readiness();
         assert!(snapshot.workers_ready);
         assert!(!snapshot.tokenizers_ready);
@@ -722,7 +787,12 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
 
-        state.recompute_with(&registry, &router_config, |model_id| model_id == "llama-3");
+        state.recompute_with(
+            &registry,
+            &router_config,
+            |model_id| model_id == "llama-3",
+            MmProcessingMode::Auto,
+        );
         assert!(state.readiness().tokenizers_ready);
         assert_eq!(state.readiness_response().status(), StatusCode::OK);
     }
@@ -739,7 +809,7 @@ mod tests {
 
         // No tokenizer registered anywhere, but the only healthy worker is
         // HTTP, so the gate passes.
-        state.recompute_with(&registry, &router_config, |_| false);
+        state.recompute_with(&registry, &router_config, |_| false, MmProcessingMode::Auto);
         let snapshot = state.readiness();
         assert!(snapshot.workers_ready);
         assert!(snapshot.tokenizers_ready);
@@ -767,6 +837,101 @@ mod tests {
         let snapshot = state.readiness();
         assert!(snapshot.workers_ready);
         assert!(!snapshot.tokenizers_ready);
+    }
+
+    /// Under worker-side media placement, a model whose workers report a
+    /// vision encoder and none of which processes media references holds
+    /// readiness, with its own reason and the models named, until a capable
+    /// worker registers; the other placements, and pools that say nothing
+    /// about vision, never hold it. Every multimodal request of such a model
+    /// would be refused, so reporting ready would be wrong the same way an
+    /// unregistered tokenizer's would. The pool's own holds come first.
+    #[tokio::test]
+    async fn worker_media_placement_holds_readiness_while_no_worker_processes_media() {
+        use crate::{routers::grpc::multimodal::SUPPORTS_VISION_LABEL, worker::RuntimeType};
+
+        fn vision_worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("qwen-vl"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .status(WorkerStatus::Ready)
+                .label(SUPPORTS_VISION_LABEL, "true");
+            for (key, value) in labels {
+                builder = builder.label(*key, *value);
+            }
+            Arc::new(builder.build())
+        }
+        async fn body_of(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = regular_config();
+        registry
+            .register(vision_worker("grpc://v1:9000", &[]))
+            .unwrap();
+
+        state.recompute_with(
+            &registry,
+            &router_config,
+            |_| true,
+            MmProcessingMode::Worker,
+        );
+        let snapshot = state.readiness();
+        assert!(snapshot.workers_ready && snapshot.tokenizers_ready);
+        assert_eq!(
+            snapshot.models_without_media_processing,
+            vec!["qwen-vl".to_string()]
+        );
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.extensions().get::<ProbeResponse>().is_some());
+        let body = body_of(response).await;
+        assert_eq!(body["status"], "not ready");
+        assert_eq!(body["reason"], MEDIA_PROCESSING_HELD_REASON);
+        assert_eq!(body["models"], json!(["qwen-vl"]));
+
+        // The other placements serve such a model's media on the router.
+        for placement in [MmProcessingMode::Auto, MmProcessingMode::Router] {
+            state.recompute_with(&registry, &router_config, |_| true, placement);
+            assert!(state.readiness().models_without_media_processing.is_empty());
+            assert_eq!(state.readiness_response().status(), StatusCode::OK);
+        }
+
+        // A worker that processes media references lifts the hold.
+        registry
+            .register(vision_worker(
+                "grpc://v2:9000",
+                &[("mm_processor", "inprocess")],
+            ))
+            .unwrap();
+        state.recompute_with(
+            &registry,
+            &router_config,
+            |_| true,
+            MmProcessingMode::Worker,
+        );
+        assert!(state.readiness().models_without_media_processing.is_empty());
+        let response = state.readiness_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response).await["healthy_workers"], 2);
+
+        // The pool's own hold comes first in the reason.
+        let empty = WorkerRegistry::new();
+        state.recompute_with(&empty, &router_config, |_| true, MmProcessingMode::Worker);
+        let body = body_of(state.readiness_response()).await;
+        assert_eq!(body["reason"], "insufficient healthy workers");
+        assert!(body.get("models").is_none());
     }
 
     #[test]

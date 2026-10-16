@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use openai_protocol::{
     model_card::ModelCard,
     model_type::ModelType,
-    worker::{ConstrainedDecoding, HealthCheckConfig, WorkerSpec, WorkerType},
+    worker::{ConstrainedDecoding, HealthCheckConfig, MmProcessingMode, WorkerSpec, WorkerType},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -15,7 +15,7 @@ use super::discover_dp::DpInfo;
 use crate::{
     config::ParserChoice,
     routers::grpc::{
-        multimodal::SUPPORTS_VISION_LABEL,
+        multimodal::{mm_settings, vision_worker_without_media_processing, SUPPORTS_VISION_LABEL},
         regular::symphony::{check_names, labels_select_nothing, set_aside_by_the_registry},
         utils::Names,
         zmq_client::zmq_handshake_address,
@@ -314,6 +314,29 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 Arc::new(builder.build()) as Arc<dyn Worker>
             })
             .collect();
+
+        // A registration that worker-side media placement cannot use is said
+        // once, here, with the worker's address: an engine with a vision
+        // encoder that does not process media references never receives an
+        // image under `--mm-processing worker`. Its model's multimodal
+        // requests are refused (`no_media_ref_capable_worker`) and readiness
+        // is held while no worker of the model processes references; a
+        // capable worker beside it lifts both, so this warns and does not
+        // refuse the registration.
+        if mm_settings().processing.value == MmProcessingMode::Worker {
+            for worker in workers
+                .iter()
+                .filter(|worker| vision_worker_without_media_processing(worker.as_ref()))
+            {
+                warn!(
+                    url = %worker.url(),
+                    model = %worker.model_id(),
+                    "worker reports a vision encoder but no worker-side media processor (no \
+                     mm_processor label): under --mm-processing worker its multimodal requests \
+                     are refused until a worker of the model processes media references"
+                );
+            }
+        }
 
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",

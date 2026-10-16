@@ -2,20 +2,28 @@
 //! preprocesses media itself or forwards references to a vLLM gRPC worker that
 //! advertises worker-side processing, and build the wire payload.
 
-use std::collections::HashSet;
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
+use axum::response::Response;
 use llm_multimodal::{data_url::data_url_payload_bytes, media, MediaContentPart, Modality};
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
 
 use super::{
-    capability::runtime_supports_modality,
+    capability::{runtime_supports_modality, SUPPORTS_VISION_LABEL},
     config::MultimodalComponents,
     plan::{MediaPlan, PlaceholderTokens},
 };
 use crate::{
     observability::metrics::Metrics,
-    routers::{common::placement::PipelinePin, grpc::context::WorkerSelection},
+    routers::{
+        common::placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+        error,
+        grpc::context::WorkerSelection,
+    },
     worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry},
 };
 
@@ -81,6 +89,11 @@ pub(crate) enum MmRefsError {
     /// The model has no registry spec, so the router cannot process its media
     /// itself, and the placement did not give it a worker that does.
     RouterSpecMissing,
+    /// The model has registered workers and none of them processes media
+    /// references, under the placement that forwards every request's media
+    /// to the worker (`--mm-processing worker`). A verdict over the fleet,
+    /// not a fault of the request: a terminal 503 ([`Self::into_response`]).
+    NoCapableWorker { model: String, workers: usize },
 }
 
 impl MmRefsError {
@@ -99,6 +112,21 @@ impl MmRefsError {
             Self::EncodeNotSupported | Self::WorkerNotCapable | Self::RouterSpecMissing => {
                 "multimodal_not_supported"
             }
+            Self::NoCapableWorker { .. } => NO_MEDIA_REF_CAPABLE_WORKER_CODE,
+        }
+    }
+
+    /// The client's response: a fault of the request is a 400 under the
+    /// variant's code; the fleet verdict ([`Self::NoCapableWorker`]) is the
+    /// 503 worker selection has always answered that condition with
+    /// ([`placement::no_media_ref_capable_worker`]), terminal for the retry
+    /// layer and reported once, rate-limited, like the pool's other refusals.
+    pub(crate) fn into_response(self) -> Response {
+        let code = self.code();
+        let message = self.to_string();
+        match self {
+            Self::NoCapableWorker { .. } => placement::no_media_ref_capable_worker(message),
+            _ => error::bad_request(code, message),
         }
     }
 }
@@ -161,6 +189,14 @@ impl std::fmt::Display for MmRefsError {
                  media itself; a vLLM worker with --mm-processor inprocess|redis processes it \
                  under --mm-processing worker (or auto, when every worker of the model does)",
             ),
+            Self::NoCapableWorker { model, workers } => write!(
+                f,
+                "model '{model}' has {workers} registered worker(s) and none processes media \
+                 references (no worker advertises an mm_processor), so under --mm-processing \
+                 worker its multimodal requests cannot be served: start the workers with \
+                 worker-side media processing, or run the router with --mm-processing auto or \
+                 router"
+            ),
         }
     }
 }
@@ -218,6 +254,51 @@ fn fleet_runs_gateway_pipeline(registry: &WorkerRegistry, model_id: &str) -> boo
         .filter(|worker| worker_accepts_media_refs(worker.as_ref()))
         .peekable();
     capable.peek().is_some() && capable.all(|worker| worker_runs_gateway_pipeline(worker.as_ref()))
+}
+
+/// Whether `worker` runs an engine with a vision encoder (`supports_vision`
+/// `"true"`, see [`SUPPORTS_VISION_LABEL`]) on the gRPC pipeline and does not
+/// process media references: under worker-side placement no image or video
+/// ever reaches it. A worker without the label is unknown, never this.
+pub(crate) fn vision_worker_without_media_processing(worker: &dyn Worker) -> bool {
+    worker.connection_mode().uses_grpc_pipeline()
+        && worker
+            .metadata()
+            .spec
+            .labels
+            .get(SUPPORTS_VISION_LABEL)
+            .is_some_and(|value| value == "true")
+        && !worker_accepts_media_refs(worker)
+}
+
+/// The models among `workers` whose multimodal requests worker-side placement
+/// cannot serve: a model with a worker that reports a vision encoder and no
+/// worker that processes media references, judged over every registered
+/// worker (healthy or not: the capability is configuration). What readiness
+/// is held on, sorted for a stable line and body. Empty under any other
+/// placement: `auto` processes such a model's media on the router, `router`
+/// always does.
+pub(crate) fn models_without_media_processing(
+    processing: MmProcessingMode,
+    workers: &[Arc<dyn Worker>],
+) -> Vec<String> {
+    if processing != MmProcessingMode::Worker {
+        return Vec::new();
+    }
+    let mut vision_only = BTreeSet::new();
+    let mut capable = HashSet::new();
+    for worker in workers {
+        if worker_accepts_media_refs(worker.as_ref()) {
+            capable.insert(worker.model_id());
+        } else if vision_worker_without_media_processing(worker.as_ref()) {
+            vision_only.insert(worker.model_id());
+        }
+    }
+    vision_only
+        .into_iter()
+        .filter(|model| !capable.contains(model))
+        .map(str::to_string)
+        .collect()
 }
 
 /// URL schemes `worker` advertised; empty when it advertised none.
@@ -292,8 +373,37 @@ fn router_serves(plan: &MediaPlan, placeholders: &PlaceholderTokens) -> bool {
             .all(|&modality| runtime_supports_modality(RuntimeType::Vllm, modality))
 }
 
+/// Under worker-side placement, a model whose registered workers include none
+/// that processes media references cannot serve a forwarded request whichever
+/// worker selection would pick: refused here, in preparation, before the
+/// request is weighed against any worker and ahead of the selection stage's
+/// own refusal of the condition (its backstop for a pool that changed in
+/// between). Every registered worker counts, healthy or not, as under `auto`:
+/// the capability is configuration, not health. A model with no worker at all
+/// is left to selection, which answers for it (the 404 of a model nobody
+/// serves, or the disaggregated leg that is missing).
+fn ensure_fleet_processes_media_refs(
+    registry: &WorkerRegistry,
+    model_id: &str,
+) -> Result<(), MmRefsError> {
+    let workers = registry.get_by_model(model_id);
+    if workers.is_empty()
+        || workers
+            .iter()
+            .any(|worker| worker_accepts_media_refs(worker.as_ref()))
+    {
+        return Ok(());
+    }
+    Err(MmRefsError::NoCapableWorker {
+        model: model_id.to_string(),
+        workers: workers.len(),
+    })
+}
+
 /// Decide where this request's media is processed. Runs in preparation, before
-/// worker selection, so `auto` consults every registered worker of the model.
+/// worker selection, so `auto` consults every registered worker of the model,
+/// and `worker` refuses a model none of whose workers can take the request
+/// ([`ensure_fleet_processes_media_refs`]).
 pub(crate) fn resolve_mm_processing(
     components: &MultimodalComponents,
     registry: &WorkerRegistry,
@@ -318,6 +428,7 @@ pub(crate) fn resolve_mm_processing(
                 let pipeline_fleet = plan_needs_gateway_pipeline(plan, placeholders)
                     && fleet_runs_gateway_pipeline(registry, model_id);
                 ensure_worker_expandable(plan, placeholders, pipeline_fleet)?;
+                ensure_fleet_processes_media_refs(registry, model_id)?;
                 (
                     MmProcessing::Worker,
                     if pipeline_fleet {
@@ -834,6 +945,160 @@ mod tests {
             .expect("resolves"),
             MmProcessing::Router
         );
+    }
+
+    /// Under worker-side placement a model with workers and none that
+    /// processes media references is refused in preparation, as the fleet
+    /// verdict it is: a terminal 503 under the code selection has always
+    /// answered the condition with, whose message names the flag and the
+    /// fix. One capable worker lifts it (selection picks it); an empty pool
+    /// is left to selection; a hinted request the router can serve keeps its
+    /// router fallback; a fault of the request keeps its 400.
+    #[test]
+    fn worker_mode_refuses_a_fleet_that_processes_no_media_references() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let components = components(MmProcessingMode::Worker);
+        let plan_ok = plan(vec![image_url("https://a/1.png")]);
+        let placeholders = expandable_placeholders();
+        let plain = |url: &str| worker(url, RuntimeType::Vllm, ConnectionMode::Grpc, &[]);
+
+        let none_capable = registry_with(vec![
+            plain("grpc://127.0.0.1:9800"),
+            plain("grpc://127.0.0.1:9801"),
+        ]);
+        let err = resolve_mm_processing(&components, &none_capable, MODEL, &plan_ok, &placeholders)
+            .expect_err("no worker processes media references");
+        assert_eq!(
+            err,
+            MmRefsError::NoCapableWorker {
+                model: MODEL.to_string(),
+                workers: 2,
+            }
+        );
+        assert_eq!(err.code(), "no_media_ref_capable_worker");
+        let message = err.to_string();
+        assert!(
+            message.contains("--mm-processing worker") && message.contains("2 registered worker"),
+            "{message}"
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "no_media_ref_capable_worker"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "a capability verdict is terminal for the retry layer"
+        );
+        assert!(
+            placement::refusal_reason(&response).is_some(),
+            "the refusal's line names its reason"
+        );
+
+        // An engine of another family never processes references either.
+        let other_engine = registry_with(vec![worker(
+            "grpc://127.0.0.1:9802",
+            RuntimeType::TokenSpeed,
+            ConnectionMode::Grpc,
+            &[],
+        )]);
+        assert!(matches!(
+            resolve_mm_processing(&components, &other_engine, MODEL, &plan_ok, &placeholders),
+            Err(MmRefsError::NoCapableWorker { workers: 1, .. })
+        ));
+
+        let mixed = registry_with(vec![
+            plain("grpc://127.0.0.1:9803"),
+            capable("grpc://127.0.0.1:9804"),
+        ]);
+        assert_eq!(
+            resolve_mm_processing(&components, &mixed, MODEL, &plan_ok, &placeholders)
+                .expect("one capable worker is enough: selection picks it"),
+            MmProcessing::Worker
+        );
+
+        let hinted = plan(vec![MediaContentPart::ImageUrl {
+            url: "https://a/1.png".to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: Some(512),
+        }]);
+        assert_eq!(
+            resolve_mm_processing(&components, &none_capable, MODEL, &hinted, &placeholders)
+                .expect("the router applies the hint itself"),
+            MmProcessing::Router
+        );
+
+        let mut unopted = PlaceholderTokens::default();
+        unopted.insert(Modality::Image, "<|image|>".to_string());
+        let fault = resolve_mm_processing(&components, &mixed, MODEL, &plan_ok, &unopted)
+            .expect_err("an unopted model is the request's fault");
+        assert_eq!(
+            fault.code(),
+            "multimodal_worker_processing_unsupported_model"
+        );
+        assert_eq!(
+            fault.into_response().status(),
+            http::StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// What readiness is held on: under worker-side placement, a model with
+    /// a worker that reports a vision encoder and no worker that processes
+    /// media references. A pool without the label (unknown) or with a
+    /// `false` (a text-only engine) is not it, one capable worker lifts it
+    /// for the model, and the other placements never hold readiness.
+    #[test]
+    fn models_without_media_processing_names_vision_pools_with_no_capable_worker() {
+        fn worker_of(model: &str, url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model))
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                });
+            for (key, value) in labels {
+                builder = builder.label(*key, *value);
+            }
+            Arc::new(builder.build())
+        }
+        let vision = [(SUPPORTS_VISION_LABEL, "true")];
+        let vision_capable = [
+            (SUPPORTS_VISION_LABEL, "true"),
+            (MM_PROCESSOR_LABEL, "inprocess"),
+        ];
+        let text_only = [(SUPPORTS_VISION_LABEL, "false")];
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            // Two vision workers, neither processes references: held.
+            worker_of("vl-b", "grpc://127.0.0.1:9900", &vision),
+            worker_of("vl-b", "grpc://127.0.0.1:9901", &vision),
+            // A vision worker without, beside one with: the model is served.
+            worker_of("vl-a", "grpc://127.0.0.1:9902", &vision),
+            worker_of("vl-a", "grpc://127.0.0.1:9903", &vision_capable),
+            // Text-only and unlabeled pools say nothing about media.
+            worker_of("text", "grpc://127.0.0.1:9904", &text_only),
+            worker_of("legacy", "grpc://127.0.0.1:9905", &[]),
+        ];
+        assert_eq!(
+            models_without_media_processing(MmProcessingMode::Worker, &workers),
+            vec!["vl-b".to_string()]
+        );
+        for placement in [MmProcessingMode::Auto, MmProcessingMode::Router] {
+            assert!(models_without_media_processing(placement, &workers).is_empty());
+        }
+        assert!(models_without_media_processing(MmProcessingMode::Worker, &[]).is_empty());
+
+        // The predicate behind it, per worker.
+        assert!(vision_worker_without_media_processing(workers[0].as_ref()));
+        assert!(!vision_worker_without_media_processing(workers[3].as_ref()));
+        assert!(!vision_worker_without_media_processing(workers[4].as_ref()));
+        assert!(!vision_worker_without_media_processing(workers[5].as_ref()));
     }
 
     #[test]
