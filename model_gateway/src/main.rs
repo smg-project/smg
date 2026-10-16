@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -38,6 +41,7 @@ use smg::{
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
+    posture::{SecretSource, SecretSources},
     server::{self, ServerConfig},
     service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
     version,
@@ -1442,7 +1446,12 @@ struct CliArgs {
     oracle_user: Option<String>,
 
     /// Oracle database password
-    #[arg(long, env = "ATP_PASSWORD", help_heading = "Oracle Database")]
+    #[arg(
+        long,
+        env = "ATP_PASSWORD",
+        hide_env_values = true,
+        help_heading = "Oracle Database"
+    )]
     oracle_password: Option<String>,
 
     /// Enable Oracle external authentication
@@ -1477,9 +1486,17 @@ struct CliArgs {
     oracle_pool_timeout_secs: Option<u64>,
 
     // ==================== PostgreSQL Database ====================
-    /// PostgreSQL database connection URL
+    /// PostgreSQL database connection URL (env: SMG_POSTGRES_DB_URL; or a
+    /// file holding it, --postgres-db-url-file). The flag beats the
+    /// environment; a URL and a URL file together are refused
     #[arg(long, help_heading = "PostgreSQL Database")]
     postgres_db_url: Option<String>,
+
+    /// File holding the PostgreSQL connection URL alone, such as a mounted
+    /// secret; the surrounding whitespace is dropped (env:
+    /// SMG_POSTGRES_DB_URL_FILE). Read when the history backend is postgres
+    #[arg(long, help_heading = "PostgreSQL Database")]
+    postgres_db_url_file: Option<PathBuf>,
 
     /// Maximum PostgreSQL connection pool size
     #[arg(long, help_heading = "PostgreSQL Database")]
@@ -1490,9 +1507,17 @@ struct CliArgs {
     postgres_op_timeout_secs: Option<u64>,
 
     // ==================== Redis Database ====================
-    /// Redis connection URL
+    /// Redis connection URL (env: SMG_REDIS_URL; or a file holding it,
+    /// --redis-url-file). The flag beats the environment; a URL and a URL
+    /// file together are refused
     #[arg(long, help_heading = "Redis Database")]
     redis_url: Option<String>,
+
+    /// File holding the Redis connection URL alone, such as a mounted
+    /// secret; the surrounding whitespace is dropped (env:
+    /// SMG_REDIS_URL_FILE). Read when the history backend is redis
+    #[arg(long, help_heading = "Redis Database")]
+    redis_url_file: Option<PathBuf>,
 
     /// Maximum Redis connection pool size
     #[arg(long, help_heading = "Redis Database")]
@@ -1533,9 +1558,16 @@ struct CliArgs {
     otlp_traces_endpoint: String,
 
     // ==================== Control Plane Authentication ====================
-    /// API key for worker authorization
+    /// Shared API key the serving routes require and the admin routes fall
+    /// back to (env: SMG_API_KEY; or a file holding it, --api-key-file). The
+    /// flag beats the environment; a key and a key file together are refused
     #[arg(long, help_heading = "Control Plane Authentication")]
     api_key: Option<String>,
+
+    /// File holding the shared API key alone, such as a mounted secret; the
+    /// surrounding whitespace is dropped (env: SMG_API_KEY_FILE)
+    #[arg(long, help_heading = "Control Plane Authentication")]
+    api_key_file: Option<PathBuf>,
 
     /// JWT issuer URL for OIDC authentication
     #[arg(
@@ -1575,7 +1607,7 @@ struct CliArgs {
 
     /// API keys for control plane access (format: id:name:role:key; role `admin` reaches every
     /// control plane route, `user` the read-only GET/HEAD routes)
-    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", help_heading = "Control Plane Authentication")]
+    #[arg(long = "control-plane-api-keys", action = ArgAction::Append, env = "CONTROL_PLANE_API_KEYS", hide_env_values = true, help_heading = "Control Plane Authentication")]
     control_plane_api_keys: Vec<String>,
 
     /// Disable audit logging for control plane operations
@@ -1592,8 +1624,23 @@ struct CliArgs {
     /// tenant identity. Stored responses and conversations are scoped to the
     /// tenant that created them: another tenant's id answers 404; records
     /// stored without a tenant identity stay readable by every caller.
+    /// Also read from the environment (SMG_TENANT_API_KEYS, entries
+    /// separated by ',' or a newline) or a file (--tenant-api-keys-file);
+    /// the flag beats the environment, and entries together with a file are
+    /// refused.
     #[arg(long = "tenant-api-key", action = ArgAction::Append, help_heading = "Data Plane Authentication")]
     tenant_api_keys: Vec<String>,
+
+    /// File holding the per-tenant API keys, one tenant_id:key per line
+    /// (blank lines and lines starting with # are skipped), such as a
+    /// mounted secret (env: SMG_TENANT_API_KEYS_FILE)
+    #[arg(long, help_heading = "Data Plane Authentication")]
+    tenant_api_keys_file: Option<PathBuf>,
+
+    /// Where the secrets above were read from, filled by
+    /// `resolve_secret_sources` for the start-up record; not a flag.
+    #[arg(skip)]
+    secret_sources: SecretSources,
 
     // ==================== Mesh Server ====================
     #[arg(long, default_value_t = false)]
@@ -1780,6 +1827,252 @@ fn parse_tenant_api_key(key_str: &str) -> ConfigResult<TenantApiKeyEntry> {
         tenant_id: tenant_id.trim().to_string(),
         key: key.trim().to_string(),
     })
+}
+
+// ==================== Secret sources ====================
+
+/// A secret the command line, the environment or a file can give: the
+/// names of its sources, for the resolution and for the refusals. A
+/// refusal names sources and paths; none carries a value.
+struct SecretSetting {
+    /// What the secret is, for the refusals.
+    what: &'static str,
+    /// The `ConfigError` field a bad file is reported under.
+    file_field: &'static str,
+    /// The flag taking the value.
+    flag: &'static str,
+    /// The environment variable taking the value.
+    env: &'static str,
+    /// The flag naming a file that holds the value.
+    file_flag: &'static str,
+    /// The environment variable naming that file.
+    file_env: &'static str,
+}
+
+const API_KEY_SETTING: SecretSetting = SecretSetting {
+    what: "the shared API key",
+    file_field: "api-key-file",
+    flag: "--api-key",
+    env: "SMG_API_KEY",
+    file_flag: "--api-key-file",
+    file_env: "SMG_API_KEY_FILE",
+};
+
+const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
+    what: "the tenant API keys",
+    file_field: "tenant-api-keys-file",
+    flag: "--tenant-api-key",
+    env: "SMG_TENANT_API_KEYS",
+    file_flag: "--tenant-api-keys-file",
+    file_env: "SMG_TENANT_API_KEYS_FILE",
+};
+
+const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
+    what: "the PostgreSQL connection URL",
+    file_field: "postgres-db-url-file",
+    flag: "--postgres-db-url",
+    env: "SMG_POSTGRES_DB_URL",
+    file_flag: "--postgres-db-url-file",
+    file_env: "SMG_POSTGRES_DB_URL_FILE",
+};
+
+const REDIS_URL_SETTING: SecretSetting = SecretSetting {
+    what: "the Redis connection URL",
+    file_field: "redis-url-file",
+    flag: "--redis-url",
+    env: "SMG_REDIS_URL",
+    file_flag: "--redis-url-file",
+    file_env: "SMG_REDIS_URL_FILE",
+};
+
+/// An environment lookup: the value of a variable, `None` when it is not
+/// set. A parameter rather than `std::env::var` so a test need not touch
+/// the process environment.
+type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+impl SecretSetting {
+    /// The file the flag or, failing that, the environment names.
+    fn file(&self, flag_value: Option<&Path>, env: EnvLookup<'_>) -> Option<PathBuf> {
+        flag_value
+            .map(Path::to_path_buf)
+            .or_else(|| env(self.file_env).map(PathBuf::from))
+    }
+
+    /// The refusal for a value and a file given together: ranking them
+    /// would honour a stale secret in silence.
+    fn given_twice(&self) -> ConfigError {
+        ConfigError::IncompatibleConfig {
+            reason: format!(
+                "{} is given twice, by {} (or {}) and by {} (or {}); give one source",
+                self.what, self.flag, self.env, self.file_flag, self.file_env
+            ),
+        }
+    }
+
+    /// The refusal for a file that cannot be used, naming the path, never
+    /// the content.
+    fn bad_file(&self, path: &Path, reason: &str) -> ConfigError {
+        ConfigError::InvalidValue {
+            field: self.file_field.to_string(),
+            value: path.display().to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    fn read_file(&self, path: &Path) -> ConfigResult<String> {
+        std::fs::read_to_string(path)
+            .map_err(|e| self.bad_file(path, &format!("the file cannot be read: {e}")))
+    }
+
+    /// The value of a single-valued secret and its source: the flag's,
+    /// else the environment's, else the content of the file the flag or the
+    /// environment names, with the surrounding whitespace (a trailing
+    /// newline) dropped. A value and a file together are refused, as is a
+    /// file that is empty or holds more than one line (a tenant key file or
+    /// a concatenated pair in the place of one value is a mistake, not a
+    /// value). An empty value from the flag or the environment passes here
+    /// and is refused where the value is validated.
+    fn resolve_value(
+        &self,
+        flag_value: Option<&str>,
+        file_flag_value: Option<&Path>,
+        env: EnvLookup<'_>,
+    ) -> ConfigResult<Option<(String, SecretSource)>> {
+        let value = match flag_value {
+            Some(value) => Some((value.to_string(), SecretSource::Flag)),
+            None => env(self.env).map(|value| (value, SecretSource::Environment)),
+        };
+        match (value, self.file(file_flag_value, env)) {
+            (Some(_), Some(_)) => Err(self.given_twice()),
+            (Some(value), None) => Ok(Some(value)),
+            (None, None) => Ok(None),
+            (None, Some(path)) => {
+                let content = self.read_file(&path)?;
+                let value = content.trim();
+                if value.is_empty() {
+                    return Err(self.bad_file(&path, "the file is empty"));
+                }
+                if value.lines().count() > 1 {
+                    return Err(self.bad_file(
+                        &path,
+                        "the file holds more than one line; it must hold the value alone",
+                    ));
+                }
+                Ok(Some((value.to_string(), SecretSource::File)))
+            }
+        }
+    }
+
+    /// The entries of a list-valued secret and their source: the flag's
+    /// occurrences, else the environment's value split at ',' and at line
+    /// ends, else the lines of the file the flag or the environment names,
+    /// blank lines and `#` comment lines skipped; the whitespace around an
+    /// entry is dropped. Entries and a file together are refused, and so is
+    /// a source that is set but holds no entry: the source was meant to
+    /// close the serving routes, and an empty one would leave them open.
+    fn resolve_entries(
+        &self,
+        flag_values: &[String],
+        file_flag_value: Option<&Path>,
+        env: EnvLookup<'_>,
+    ) -> ConfigResult<Option<(Vec<String>, SecretSource)>> {
+        let entries_of = |text: &str, separators: &[char]| -> Vec<String> {
+            text.split(separators)
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty() && !entry.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        };
+        let value = if flag_values.is_empty() {
+            match env(self.env) {
+                Some(text) => {
+                    let entries = entries_of(&text, &[',', '\n']);
+                    if entries.is_empty() {
+                        return Err(ConfigError::InvalidValue {
+                            field: self.env.to_string(),
+                            value: "<empty>".to_string(),
+                            reason: format!(
+                                "set but holds no entry; {} are tenant_id:key entries separated by ',' or a newline",
+                                self.what
+                            ),
+                        });
+                    }
+                    Some((entries, SecretSource::Environment))
+                }
+                None => None,
+            }
+        } else {
+            Some((flag_values.to_vec(), SecretSource::Flag))
+        };
+        match (value, self.file(file_flag_value, env)) {
+            (Some(_), Some(_)) => Err(self.given_twice()),
+            (Some(value), None) => Ok(Some(value)),
+            (None, None) => Ok(None),
+            (None, Some(path)) => {
+                let content = self.read_file(&path)?;
+                let entries = entries_of(&content, &['\n']);
+                if entries.is_empty() {
+                    return Err(self.bad_file(
+                        &path,
+                        "the file holds no entry; one tenant_id:key per line, blank and # lines skipped",
+                    ));
+                }
+                Ok(Some((entries, SecretSource::File)))
+            }
+        }
+    }
+}
+
+impl CliArgs {
+    /// Phase 1b, resolve: the secrets the environment or a file may give in
+    /// the command line's place, read into the flag fields so the phases
+    /// after this one read flags alone; where each came from is kept for
+    /// the start-up record. One rule for every secret: the command line
+    /// beats the environment, and a value from either together with a file
+    /// is refused rather than ranked. A store URL is read for the selected
+    /// history backend alone, as its flag is. The environment lookup is a
+    /// parameter so a test need not touch the process environment.
+    fn resolve_secret_sources(&mut self, env: EnvLookup<'_>) -> ConfigResult<()> {
+        let mut sources = SecretSources::default();
+        if let Some((value, source)) = API_KEY_SETTING.resolve_value(
+            self.api_key.as_deref(),
+            self.api_key_file.as_deref(),
+            env,
+        )? {
+            self.api_key = Some(value);
+            sources.api_key = Some(source);
+        }
+        if let Some((entries, source)) = TENANT_API_KEYS_SETTING.resolve_entries(
+            &self.tenant_api_keys,
+            self.tenant_api_keys_file.as_deref(),
+            env,
+        )? {
+            sources.tenant_api_keys = Some((source, entries.len()));
+            self.tenant_api_keys = entries;
+        }
+        if self.history_backend == "postgres" {
+            if let Some((value, source)) = POSTGRES_DB_URL_SETTING.resolve_value(
+                self.postgres_db_url.as_deref(),
+                self.postgres_db_url_file.as_deref(),
+                env,
+            )? {
+                self.postgres_db_url = Some(value);
+                sources.postgres_db_url = Some(source);
+            }
+        }
+        if self.history_backend == "redis" {
+            if let Some((value, source)) = REDIS_URL_SETTING.resolve_value(
+                self.redis_url.as_deref(),
+                self.redis_url_file.as_deref(),
+                env,
+            )? {
+                self.redis_url = Some(value);
+                sources.redis_url = Some(source);
+            }
+        }
+        self.secret_sources = sources;
+        Ok(())
+    }
 }
 
 impl CliArgs {
@@ -2856,6 +3149,7 @@ impl CliArgs {
             mesh_server_config,
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server.clone(),
+            secret_sources: self.secret_sources,
         })
     }
 
@@ -2972,8 +3266,9 @@ fn serve(server_config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> 
     server::run(&runtime, server_config)
 }
 
-/// The start-up sequence: parse, announce, configure, serve. The version
-/// flags are answered first, before clap sees the line.
+/// The start-up sequence: parse, resolve the secrets' sources, announce,
+/// configure, serve. The version flags are answered first, before clap sees
+/// the line.
 #[expect(clippy::print_stdout, reason = "the version flags' answer")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_jemalloc_as_global_allocator();
@@ -2983,7 +3278,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let command_line = CommandLine::split(&args);
-    let (cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
+    let (mut cli_args, igw_enabled_for_discovery) = parse_cli_args(command_line.clap_args);
+    cli_args.resolve_secret_sources(&|name| std::env::var(name).ok())?;
     cli_args.announce(
         igw_enabled_for_discovery,
         &command_line.prefill_urls,
@@ -4909,5 +5205,539 @@ mod tests {
             Err(ConfigError::InvalidValue { field, reason, .. })
                 if field == "model_alias" && reason == "Alias maps to both 'a' and 'b'"
         ));
+    }
+
+    // ==================== Secret sources ====================
+
+    /// An environment lookup over a table: no test here touches the
+    /// process environment.
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(var, _)| *var == name)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    fn resolved(args: &[&str], vars: &[(&str, &str)]) -> ConfigResult<CliArgs> {
+        let mut cli = cli_args_from(args);
+        cli.resolve_secret_sources(&env_of(vars))?;
+        Ok(cli)
+    }
+
+    /// Every secret is read from its environment variable when its flag is
+    /// absent, the tenant entries split at ',' and at line ends with the
+    /// whitespace around them dropped, and the built configuration carries
+    /// the values; the record names the environment as the source.
+    #[test]
+    fn secrets_are_read_from_the_environment_when_the_flags_are_absent() {
+        let vars = [
+            ("SMG_API_KEY", "env-shared-key"),
+            (
+                "SMG_TENANT_API_KEYS",
+                "red:env-red, blue:env-blue\n green:env-green ,",
+            ),
+            (
+                "SMG_POSTGRES_DB_URL",
+                "postgresql://u:env-pg-pass@db.example:5432/smg",
+            ),
+            (
+                "SMG_REDIS_URL",
+                "redis://:env-redis-pass@cache.example:6379/0",
+            ),
+        ];
+
+        let cli = resolved(&["--history-backend", "postgres"], &vars).expect("resolves");
+        assert_eq!(cli.api_key.as_deref(), Some("env-shared-key"));
+        assert_eq!(
+            cli.tenant_api_keys,
+            vec!["red:env-red", "blue:env-blue", "green:env-green"]
+        );
+        assert_eq!(
+            cli.postgres_db_url.as_deref(),
+            Some("postgresql://u:env-pg-pass@db.example:5432/smg")
+        );
+        assert_eq!(
+            cli.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::Environment),
+                tenant_api_keys: Some((SecretSource::Environment, 3)),
+                postgres_db_url: Some(SecretSource::Environment),
+                redis_url: None,
+            }
+        );
+        let config = cli
+            .to_router_config(vec![], vec![])
+            .expect("the resolved secrets build a configuration");
+        assert_eq!(config.api_key.as_deref(), Some("env-shared-key"));
+        assert_eq!(
+            config
+                .tenant_api_keys
+                .iter()
+                .map(|entry| (entry.tenant_id.as_str(), entry.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("red", "env-red"),
+                ("blue", "env-blue"),
+                ("green", "env-green")
+            ]
+        );
+        assert_eq!(
+            config.postgres.expect("a postgres store").db_url,
+            "postgresql://u:env-pg-pass@db.example:5432/smg"
+        );
+
+        let cli = resolved(&["--history-backend", "redis"], &vars).expect("resolves");
+        assert_eq!(
+            cli.redis_url.as_deref(),
+            Some("redis://:env-redis-pass@cache.example:6379/0")
+        );
+        assert_eq!(
+            cli.secret_sources.redis_url,
+            Some(SecretSource::Environment)
+        );
+        assert_eq!(cli.secret_sources.postgres_db_url, None);
+        let config = cli.to_router_config(vec![], vec![]).expect("builds");
+        assert_eq!(
+            config.redis.expect("a redis store").url,
+            "redis://:env-redis-pass@cache.example:6379/0"
+        );
+    }
+
+    /// The command line beats the environment for every secret, and the
+    /// record says so.
+    #[test]
+    fn the_command_line_beats_the_environment() {
+        let vars = [
+            ("SMG_API_KEY", "env-shared-key"),
+            ("SMG_TENANT_API_KEYS", "red:env-red"),
+            (
+                "SMG_POSTGRES_DB_URL",
+                "postgresql://u:env@db.example:5432/smg",
+            ),
+        ];
+        let cli = resolved(
+            &[
+                "--api-key",
+                "flag-shared-key",
+                "--tenant-api-key",
+                "blue:flag-blue",
+                "--history-backend",
+                "postgres",
+                "--postgres-db-url",
+                "postgresql://u:flag@db.example:5432/smg",
+            ],
+            &vars,
+        )
+        .expect("resolves");
+
+        assert_eq!(cli.api_key.as_deref(), Some("flag-shared-key"));
+        assert_eq!(cli.tenant_api_keys, vec!["blue:flag-blue"]);
+        assert_eq!(
+            cli.postgres_db_url.as_deref(),
+            Some("postgresql://u:flag@db.example:5432/smg")
+        );
+        assert_eq!(
+            cli.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::Flag),
+                tenant_api_keys: Some((SecretSource::Flag, 1)),
+                postgres_db_url: Some(SecretSource::Flag),
+                redis_url: None,
+            }
+        );
+    }
+
+    /// Without a source, nothing is set and nothing is recorded.
+    #[test]
+    fn without_a_source_no_secret_is_set() {
+        let cli = resolved(&["--history-backend", "postgres"], &[]).expect("resolves");
+
+        assert_eq!(cli.api_key, None);
+        assert!(cli.tenant_api_keys.is_empty());
+        assert_eq!(cli.postgres_db_url, None);
+        assert_eq!(cli.redis_url, None);
+        assert_eq!(cli.secret_sources, SecretSources::default());
+        assert!(!cli.secret_sources.any());
+    }
+
+    /// A secret file is read whole with its trailing newline dropped, a
+    /// tenant key file one entry per line with blank and comment lines
+    /// skipped; the file is named by its flag or by its environment
+    /// variable, and the record names the file as the source.
+    #[test]
+    fn secrets_are_read_from_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_key = dir.path().join("api-key");
+        let tenants = dir.path().join("tenants");
+        let pg = dir.path().join("pg-url");
+        let redis = dir.path().join("redis-url");
+        std::fs::write(&api_key, "file-shared-key\n").unwrap();
+        std::fs::write(
+            &tenants,
+            "# the tenants\r\n\nred:file-red\r\n  blue : file-blue  \n\n# trailing comment\n",
+        )
+        .unwrap();
+        std::fs::write(&pg, "postgresql://u:file-pg@db.example:5432/smg").unwrap();
+        std::fs::write(&redis, "  redis://:file-redis@cache.example:6379/1\n\n").unwrap();
+        let (api_key, tenants, pg, redis) = (
+            api_key.to_str().unwrap(),
+            tenants.to_str().unwrap(),
+            pg.to_str().unwrap(),
+            redis.to_str().unwrap(),
+        );
+
+        let by_flag = resolved(
+            &[
+                "--api-key-file",
+                api_key,
+                "--tenant-api-keys-file",
+                tenants,
+                "--history-backend",
+                "postgres",
+                "--postgres-db-url-file",
+                pg,
+            ],
+            &[],
+        )
+        .expect("resolves");
+        assert_eq!(by_flag.api_key.as_deref(), Some("file-shared-key"));
+        assert_eq!(
+            by_flag.tenant_api_keys,
+            vec!["red:file-red", "blue : file-blue"]
+        );
+        assert_eq!(
+            by_flag.postgres_db_url.as_deref(),
+            Some("postgresql://u:file-pg@db.example:5432/smg")
+        );
+        assert_eq!(
+            by_flag.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::File),
+                tenant_api_keys: Some((SecretSource::File, 2)),
+                postgres_db_url: Some(SecretSource::File),
+                redis_url: None,
+            }
+        );
+        let config = by_flag.to_router_config(vec![], vec![]).expect("builds");
+        assert_eq!(
+            config
+                .tenant_api_keys
+                .iter()
+                .map(|entry| (entry.tenant_id.as_str(), entry.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("red", "file-red"), ("blue", "file-blue")]
+        );
+
+        let by_env = resolved(
+            &["--history-backend", "redis"],
+            &[
+                ("SMG_API_KEY_FILE", api_key),
+                ("SMG_TENANT_API_KEYS_FILE", tenants),
+                ("SMG_REDIS_URL_FILE", redis),
+            ],
+        )
+        .expect("resolves");
+        assert_eq!(by_env.api_key.as_deref(), Some("file-shared-key"));
+        assert_eq!(by_env.tenant_api_keys.len(), 2);
+        assert_eq!(
+            by_env.redis_url.as_deref(),
+            Some("redis://:file-redis@cache.example:6379/1")
+        );
+        assert_eq!(
+            by_env.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::File),
+                tenant_api_keys: Some((SecretSource::File, 2)),
+                postgres_db_url: None,
+                redis_url: Some(SecretSource::File),
+            }
+        );
+    }
+
+    /// A value (from the flag or the environment) and a file for the same
+    /// secret are refused, whichever way each is given; the refusal names
+    /// the four sources and carries no value.
+    #[test]
+    fn a_value_and_a_file_for_one_secret_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "file-secret").unwrap();
+        let file = file.to_str().unwrap();
+        let backend = ["--history-backend", "redis"];
+        /// The command line, the environment and the flag the refusal names.
+        type Case<'a> = (Vec<&'a str>, Vec<(&'a str, &'a str)>, &'a str);
+        let cases: Vec<Case> = vec![
+            (
+                vec!["--api-key", "flag-secret", "--api-key-file", file],
+                vec![],
+                "--api-key",
+            ),
+            (
+                vec!["--api-key", "flag-secret"],
+                vec![("SMG_API_KEY_FILE", file)],
+                "--api-key",
+            ),
+            (
+                vec![],
+                vec![("SMG_API_KEY", "env-secret"), ("SMG_API_KEY_FILE", file)],
+                "--api-key",
+            ),
+            (
+                vec!["--api-key-file", file],
+                vec![("SMG_API_KEY", "env-secret")],
+                "--api-key",
+            ),
+            (
+                vec![
+                    "--tenant-api-key",
+                    "red:flag-secret",
+                    "--tenant-api-keys-file",
+                    file,
+                ],
+                vec![],
+                "--tenant-api-key",
+            ),
+            (
+                vec!["--tenant-api-keys-file", file],
+                vec![("SMG_TENANT_API_KEYS", "red:env-secret")],
+                "--tenant-api-key",
+            ),
+            (
+                vec![
+                    "--history-backend",
+                    "postgres",
+                    "--postgres-db-url",
+                    "postgresql://u:flag-secret@db.example/smg",
+                    "--postgres-db-url-file",
+                    file,
+                ],
+                vec![],
+                "--postgres-db-url",
+            ),
+            (
+                backend.to_vec(),
+                vec![
+                    ("SMG_REDIS_URL", "redis://:env-secret@cache.example/0"),
+                    ("SMG_REDIS_URL_FILE", file),
+                ],
+                "--redis-url",
+            ),
+        ];
+        for (args, vars, flag) in cases {
+            let err = resolved(&args, &vars).expect_err(&format!("{args:?} {vars:?}"));
+            let text = err.to_string();
+            assert!(
+                matches!(err, ConfigError::IncompatibleConfig { .. }),
+                "{args:?}: {text}"
+            );
+            let file_flag = if flag == "--tenant-api-key" {
+                "--tenant-api-keys-file".to_string()
+            } else {
+                format!("{flag}-file")
+            };
+            for named in [flag, file_flag.as_str()] {
+                assert!(
+                    text.contains(named),
+                    "{args:?}: {named} missing from {text}"
+                );
+            }
+            assert!(text.contains("SMG_"), "{args:?}: {text}");
+            for secret in ["flag-secret", "env-secret", "file-secret"] {
+                assert!(!text.contains(secret), "{args:?}: {text}");
+            }
+        }
+    }
+
+    /// A file that is missing, empty, or holds more than one value where
+    /// one is expected, and a tenant key file without an entry, are
+    /// refused under the file flag's name with the path; the content is
+    /// never in the message.
+    #[test]
+    fn secret_files_that_cannot_be_used_are_refused_by_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing");
+        let empty = dir.path().join("empty");
+        let two_lines = dir.path().join("two-lines");
+        let comments_only = dir.path().join("comments-only");
+        std::fs::write(&empty, "\n").unwrap();
+        std::fs::write(&two_lines, "first-secret\nsecond-secret\n").unwrap();
+        std::fs::write(&comments_only, "# nothing here\n\n").unwrap();
+        let path = |p: &Path| p.to_str().unwrap().to_string();
+        let cases: Vec<(Vec<String>, &str, &str)> = vec![
+            (
+                vec!["--api-key-file".into(), path(&missing)],
+                "api-key-file",
+                "cannot be read",
+            ),
+            (
+                vec!["--api-key-file".into(), path(&empty)],
+                "api-key-file",
+                "is empty",
+            ),
+            (
+                vec!["--api-key-file".into(), path(&two_lines)],
+                "api-key-file",
+                "more than one line",
+            ),
+            (
+                vec!["--tenant-api-keys-file".into(), path(&comments_only)],
+                "tenant-api-keys-file",
+                "holds no entry",
+            ),
+            (
+                vec!["--tenant-api-keys-file".into(), path(&missing)],
+                "tenant-api-keys-file",
+                "cannot be read",
+            ),
+            (
+                vec![
+                    "--history-backend".into(),
+                    "postgres".into(),
+                    "--postgres-db-url-file".into(),
+                    path(&two_lines),
+                ],
+                "postgres-db-url-file",
+                "more than one line",
+            ),
+            (
+                vec![
+                    "--history-backend".into(),
+                    "redis".into(),
+                    "--redis-url-file".into(),
+                    path(&missing),
+                ],
+                "redis-url-file",
+                "cannot be read",
+            ),
+        ];
+        for (args, field, reason) in cases {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let err = resolved(&argv, &[]).expect_err(&args.join(" "));
+            let text = err.to_string();
+            match &err {
+                ConfigError::InvalidValue {
+                    field: named,
+                    value,
+                    reason: why,
+                } => {
+                    assert_eq!(named, field, "{text}");
+                    assert!(value.starts_with(dir.path().to_str().unwrap()), "{text}");
+                    assert!(why.contains(reason), "{text}");
+                }
+                other => panic!("{}: {other}", args.join(" ")),
+            }
+            assert!(!text.contains("first-secret"), "{text}");
+        }
+    }
+
+    /// A tenant source that is set but holds no entry is refused: it was
+    /// meant to close the serving routes. A malformed entry from the
+    /// environment is refused where a flag's is, without an echo.
+    #[test]
+    fn tenant_entries_from_the_environment_are_checked_like_the_flags() {
+        let err = resolved(&[], &[("SMG_TENANT_API_KEYS", " , \n")]).expect_err("no entry");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "SMG_TENANT_API_KEYS"),
+            "{err}"
+        );
+
+        let cli = resolved(&[], &[("SMG_TENANT_API_KEYS", "no-separator-secret")])
+            .expect("the shape is checked by the parser");
+        let err = cli
+            .to_router_config(vec![], vec![])
+            .expect_err("a tenant entry without ':' is refused");
+        let text = err.to_string();
+        assert!(text.contains("tenant-api-key"), "{text}");
+        assert!(!text.contains("no-separator-secret"), "{text}");
+    }
+
+    /// A store URL source is read for the selected history backend alone:
+    /// a PostgreSQL URL file named in the environment of a start on the
+    /// memory backend is not opened, and the record does not name it.
+    #[test]
+    fn store_urls_are_resolved_for_the_selected_backend_alone() {
+        let vars = [
+            ("SMG_POSTGRES_DB_URL_FILE", "/nonexistent/pg-url"),
+            ("SMG_REDIS_URL_FILE", "/nonexistent/redis-url"),
+        ];
+
+        let cli = resolved(&[], &vars).expect("the memory backend reads no store URL");
+        assert_eq!(cli.postgres_db_url, None);
+        assert_eq!(cli.redis_url, None);
+        assert_eq!(cli.secret_sources, SecretSources::default());
+
+        let err = resolved(&["--history-backend", "postgres"], &vars).expect_err("opened");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "postgres-db-url-file"),
+            "{err}"
+        );
+        let err = resolved(&["--history-backend", "redis"], &vars).expect_err("opened");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "redis-url-file"),
+            "{err}"
+        );
+    }
+
+    /// The sources travel into the server configuration, for the start-up
+    /// record.
+    #[test]
+    fn the_secret_sources_reach_the_server_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let api_key = dir.path().join("api-key");
+        std::fs::write(&api_key, "file-shared-key\n").unwrap();
+
+        let cli = resolved(
+            &["--api-key-file", api_key.to_str().unwrap()],
+            &[("SMG_TENANT_API_KEYS", "red:env-red")],
+        )
+        .expect("resolves");
+        let server_config = cli.configure(vec![], vec![]).expect("configures");
+
+        assert_eq!(
+            server_config.secret_sources,
+            SecretSources {
+                api_key: Some(SecretSource::File),
+                tenant_api_keys: Some((SecretSource::Environment, 1)),
+                postgres_db_url: None,
+                redis_url: None,
+            }
+        );
+        assert_eq!(
+            server_config.router_config.api_key.as_deref(),
+            Some("file-shared-key")
+        );
+    }
+
+    /// `--help` names the environment variables and the file flags of the
+    /// secrets, and shows no value of an environment variable clap reads
+    /// itself, set or not.
+    #[test]
+    #[serial_test::serial]
+    fn the_help_names_the_sources_and_hides_the_values() {
+        use clap::CommandFactory;
+
+        std::env::set_var("ATP_PASSWORD", "hunter2-oracle-password");
+        std::env::set_var("CONTROL_PLANE_API_KEYS", "i:n:admin:hunter2-control-plane");
+        let help = Cli::command().render_long_help().to_string();
+        std::env::remove_var("ATP_PASSWORD");
+        std::env::remove_var("CONTROL_PLANE_API_KEYS");
+
+        for named in [
+            "SMG_API_KEY",
+            "--api-key-file",
+            "SMG_API_KEY_FILE",
+            "SMG_TENANT_API_KEYS",
+            "--tenant-api-keys-file",
+            "SMG_POSTGRES_DB_URL",
+            "--postgres-db-url-file",
+            "SMG_REDIS_URL",
+            "--redis-url-file",
+            "[env: ATP_PASSWORD]",
+            "[env: CONTROL_PLANE_API_KEYS]",
+        ] {
+            assert!(help.contains(named), "{named} missing from the help");
+        }
+        assert!(!help.contains("hunter2"), "a value in the help:\n{help}");
     }
 }

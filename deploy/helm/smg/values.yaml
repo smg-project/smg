@@ -232,8 +232,15 @@ huggingface:
 # Auth Configuration
 # =============================================================================
 auth:
-  # -- API key authentication (passed via --api-key CLI flag)
+  # -- Shared API key the serving routes require. Written into a chart-managed
+  #    Secret and mounted into the router pod as a file the gateway reads
+  #    (--api-key-file); it is never put in the pod's arguments. Prefer
+  #    existingSecret for a key managed outside the chart's values.
   apiKey: ""
+  # -- Name of an existing Secret holding the API key, instead of apiKey
+  existingSecret: ""
+  # -- The key within that Secret (and the chart-managed one) holding the API key
+  apiKeySecretKey: "api-key"
 
   # -- Rate limiting
   rateLimitTokensPerSecond: -1  # -1 = disabled

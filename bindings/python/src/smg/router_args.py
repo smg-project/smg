@@ -20,6 +20,8 @@ import dataclasses
 import ipaddress
 import logging
 import os
+import re
+from pathlib import Path
 
 from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_parsers
 
@@ -92,6 +94,127 @@ def _ip_address(value: str) -> str | None:
             f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
         )
     return address
+
+
+@dataclasses.dataclass(frozen=True)
+class _SecretSources:
+    """The names of the sources one secret can come from, for the refusals.
+
+    A refusal names sources and paths; none carries a value.
+    """
+
+    what: str
+    flag: str
+    env: str
+    file_flag: str
+    file_env: str
+    # The history backend a store URL belongs to; None for a key.
+    backend: str | None = None
+
+
+_API_KEY_SOURCES = _SecretSources(
+    "the shared API key", "--api-key", "SMG_API_KEY", "--api-key-file", "SMG_API_KEY_FILE"
+)
+_TENANT_API_KEYS_SOURCES = _SecretSources(
+    "the tenant API keys",
+    "--tenant-api-key",
+    "SMG_TENANT_API_KEYS",
+    "--tenant-api-keys-file",
+    "SMG_TENANT_API_KEYS_FILE",
+)
+_POSTGRES_DB_URL_SOURCES = _SecretSources(
+    "the PostgreSQL connection URL",
+    "--postgres-db-url",
+    "SMG_POSTGRES_DB_URL",
+    "--postgres-db-url-file",
+    "SMG_POSTGRES_DB_URL_FILE",
+    backend="postgres",
+)
+_REDIS_URL_SOURCES = _SecretSources(
+    "the Redis connection URL",
+    "--redis-url",
+    "SMG_REDIS_URL",
+    "--redis-url-file",
+    "SMG_REDIS_URL_FILE",
+    backend="redis",
+)
+
+
+def _given_twice(sources: _SecretSources) -> ValueError:
+    """The refusal for a value and a file given for one secret: ranking them
+    would honour a stale secret in silence."""
+    return ValueError(
+        f"{sources.what} is given twice, by {sources.flag} (or {sources.env}) and by"
+        f" {sources.file_flag} (or {sources.file_env}); give one source"
+    )
+
+
+def _value_from_environment(args_dict: dict, name: str, *env_names: str) -> None:
+    """Sets ``name`` from the first of ``env_names`` that is set, if any; a
+    variable set to the empty string counts as set (the value is refused
+    where it is validated, as an empty flag value is)."""
+    for env_name in env_names:
+        value = os.environ.get(env_name)
+        if value is not None:
+            args_dict[name] = value
+            return
+
+
+def _read_text(path: str, file_flag: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        # The path is named; the content never is.
+        raise ValueError(f"{file_flag} {path!r}: the file cannot be read: {e}") from None
+
+
+def _read_secret_file(path: str, file_flag: str) -> str:
+    """The one value a secret file holds: its content with the surrounding
+    whitespace (a trailing newline) dropped. An empty file, or one with more
+    than one line, is refused: a tenant key file or a concatenated pair in
+    the place of one value is a mistake, not a value."""
+    value = _read_text(path, file_flag).strip()
+    if not value:
+        raise ValueError(f"{file_flag} {path!r}: the file is empty")
+    if len(value.splitlines()) > 1:
+        raise ValueError(
+            f"{file_flag} {path!r}: the file holds more than one line; it must hold the value alone"
+        )
+    return value
+
+
+def _entries_of(text: str, separator: str) -> list[str]:
+    entries = (entry.strip() for entry in re.split(separator, text))
+    return [entry for entry in entries if entry and not entry.startswith("#")]
+
+
+def _entries_from_environment(sources: _SecretSources) -> list[str]:
+    """The entries of a list-valued secret's environment variable, split at
+    ',' and at line ends; a variable set but holding no entry is refused: it
+    was meant to close the serving routes."""
+    text = os.environ.get(sources.env)
+    if text is None:
+        return []
+    entries = _entries_of(text, r"[,\n]")
+    if not entries:
+        raise ValueError(
+            f"{sources.env} is set but holds no entry; {sources.what} are tenant_id:key"
+            " entries separated by ',' or a newline"
+        )
+    return entries
+
+
+def _read_entries_file(path: str, file_flag: str) -> list[str]:
+    """The entries of a list-valued secret's file, one per line; blank lines
+    and lines starting with '#' are skipped. A file without an entry is
+    refused."""
+    entries = _entries_of(_read_text(path, file_flag), r"\n")
+    if not entries:
+        raise ValueError(
+            f"{file_flag} {path!r}: the file holds no entry; one tenant_id:key per line,"
+            " blank and # lines skipped"
+        )
+    return entries
 
 
 @dataclasses.dataclass
@@ -2167,7 +2290,7 @@ class RouterArgs:
         oracle_group.add_argument(
             f"--{prefix}oracle-password",
             type=str,
-            default=os.getenv("ATP_PASSWORD"),
+            default=None,
             help="Oracle database password (env: ATP_PASSWORD)",
         )
         oracle_group.add_argument(
@@ -2199,8 +2322,22 @@ class RouterArgs:
         postgres_group.add_argument(
             f"--{prefix}postgres-db-url",
             type=str,
-            default=os.getenv("POSTGRES_DB_URL"),
-            help="PostgreSQL database connection URL (env: POSTGRES_DB_URL)",
+            default=None,
+            help=(
+                "PostgreSQL database connection URL (env: SMG_POSTGRES_DB_URL, or the"
+                " older POSTGRES_DB_URL; or a file holding it, --postgres-db-url-file)."
+                " The flag beats the environment; a URL and a URL file together are refused."
+            ),
+        )
+        postgres_group.add_argument(
+            f"--{prefix}postgres-db-url-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the PostgreSQL connection URL alone, such as a mounted"
+                " secret; the surrounding whitespace is dropped (env:"
+                " SMG_POSTGRES_DB_URL_FILE). Read when the history backend is postgres."
+            ),
         )
         postgres_group.add_argument(
             f"--{prefix}postgres-pool-max",
@@ -2221,8 +2358,22 @@ class RouterArgs:
         redis_group.add_argument(
             f"--{prefix}redis-url",
             type=str,
-            default=os.getenv("REDIS_URL"),
-            help="Redis connection URL (env: REDIS_URL)",
+            default=None,
+            help=(
+                "Redis connection URL (env: SMG_REDIS_URL, or the older REDIS_URL; or a"
+                " file holding it, --redis-url-file). The flag beats the environment; a"
+                " URL and a URL file together are refused."
+            ),
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-url-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the Redis connection URL alone, such as a mounted secret;"
+                " the surrounding whitespace is dropped (env: SMG_REDIS_URL_FILE). Read"
+                " when the history backend is redis."
+            ),
         )
         redis_group.add_argument(
             f"--{prefix}redis-pool-max",
@@ -2318,8 +2469,19 @@ class RouterArgs:
             type=str,
             default=None,
             help=(
-                "The api key used for the authorization with the worker."
-                " Useful when the dp aware scheduling strategy is enabled."
+                "Shared API key the serving routes require and the admin routes fall"
+                " back to; a worker registered without a key of its own is sent it too"
+                " (env: SMG_API_KEY; or a file holding it, --api-key-file). The flag"
+                " beats the environment; a key and a key file together are refused."
+            ),
+        )
+        auth_group.add_argument(
+            f"--{prefix}api-key-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the shared API key alone, such as a mounted secret; the"
+                " surrounding whitespace is dropped (env: SMG_API_KEY_FILE)."
             ),
         )
         dp_auth_group.add_argument(
@@ -2334,6 +2496,19 @@ class RouterArgs:
                 " tenant identity. Stored responses and conversations are scoped to the"
                 " tenant that created them: another tenant's id answers 404; records"
                 " stored without a tenant identity stay readable by every caller."
+                " Also read from the environment (SMG_TENANT_API_KEYS, entries separated"
+                " by ',' or a newline) or a file (--tenant-api-keys-file); the flag beats"
+                " the environment, and entries together with a file are refused."
+            ),
+        )
+        dp_auth_group.add_argument(
+            f"--{prefix}tenant-api-keys-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the per-tenant API keys, one tenant_id:key per line (blank"
+                " lines and lines starting with # are skipped), such as a mounted secret"
+                " (env: SMG_TENANT_API_KEYS_FILE)."
             ),
         )
         auth_group.add_argument(
@@ -2553,10 +2728,59 @@ class RouterArgs:
             cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
         )
 
-        # Parse per-tenant data-plane API keys
-        args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(
-            cli_args_dict.get(f"{prefix}tenant_api_key", [])
-        )
+        # The secrets the environment or a file may give in a flag's place:
+        # the shared key, the per-tenant keys and the store URLs. They are
+        # resolved here, not as parser defaults, since the launcher's --help
+        # prints every default. The flag beats the environment; a value from
+        # either together with a file is refused rather than ranked, as the
+        # Rust CLI refuses it. A store URL file is read for the selected
+        # history backend alone, as its flag is.
+        def file_option(sources: _SecretSources) -> str | None:
+            name = sources.file_flag.lstrip("-").replace("-", "_")
+            value = cli_args_dict.get(f"{prefix}{name}")
+            if value is None and not disable_arg_fallback:
+                value = cli_args_dict.get(name) or None
+            if value is None:
+                value = os.environ.get(sources.file_env)
+            return value
+
+        if args_dict.get("oracle_password") is None:
+            # Not a parser default either: --help would print it.
+            _value_from_environment(args_dict, "oracle_password", "ATP_PASSWORD")
+
+        if args_dict.get("api_key") is None:
+            _value_from_environment(args_dict, "api_key", _API_KEY_SOURCES.env)
+        api_key_file = file_option(_API_KEY_SOURCES)
+        if api_key_file is not None:
+            if args_dict.get("api_key") is not None:
+                raise _given_twice(_API_KEY_SOURCES)
+            args_dict["api_key"] = _read_secret_file(api_key_file, _API_KEY_SOURCES.file_flag)
+
+        backend = args_dict.get("history_backend", cls.history_backend)
+        for name, sources, older_env in (
+            ("postgres_db_url", _POSTGRES_DB_URL_SOURCES, "POSTGRES_DB_URL"),
+            ("redis_url", _REDIS_URL_SOURCES, "REDIS_URL"),
+        ):
+            if args_dict.get(name) is None:
+                _value_from_environment(args_dict, name, sources.env, older_env)
+            url_file = file_option(sources)
+            if url_file is None or backend != sources.backend:
+                continue
+            if args_dict.get(name) is not None:
+                raise _given_twice(sources)
+            args_dict[name] = _read_secret_file(url_file, sources.file_flag)
+
+        # Parse per-tenant data-plane API keys: the flag's entries, else the
+        # environment's (split at ',' and at line ends), else the file's.
+        tenant_entries = list(cli_args_dict.get(f"{prefix}tenant_api_key") or [])
+        if not tenant_entries:
+            tenant_entries = _entries_from_environment(_TENANT_API_KEYS_SOURCES)
+        tenant_file = file_option(_TENANT_API_KEYS_SOURCES)
+        if tenant_file is not None:
+            if tenant_entries:
+                raise _given_twice(_TENANT_API_KEYS_SOURCES)
+            tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES.file_flag)
+        args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(tenant_entries)
 
         return cls(**args_dict)
 

@@ -6,13 +6,86 @@
 //! one command, but a deployment that reaches it by omission should learn
 //! so from its first log lines, not from an audit. One WARN record names
 //! every open surface and the flag that closes it.
+//!
+//! A keyed start names where its secrets came from instead: the command
+//! line, the environment or a file. One INFO record carries the sources;
+//! no record carries a value.
 
 use std::net::SocketAddr;
 
 use smg_mesh::MeshServerConfig;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{middleware::AuthConfig, observability::metrics::PrometheusConfig};
+
+/// Where a secret (a serving key, a store URL) was read from at start-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretSource {
+    /// Given on the command line.
+    Flag,
+    /// Read from an environment variable.
+    Environment,
+    /// Read from a file the command line or the environment named.
+    File,
+}
+
+impl SecretSource {
+    /// The one word the start-up record uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::Environment => "env",
+            Self::File => "file",
+        }
+    }
+}
+
+/// The sources of the secrets a start was given, for the start-up record;
+/// `None` is a secret that was not given. The values are not here: the
+/// record names sources alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecretSources {
+    /// The shared serving API key.
+    pub api_key: Option<SecretSource>,
+    /// The per-tenant serving keys, with how many entries the source held.
+    pub tenant_api_keys: Option<(SecretSource, usize)>,
+    /// The PostgreSQL connection URL.
+    pub postgres_db_url: Option<SecretSource>,
+    /// The Redis connection URL.
+    pub redis_url: Option<SecretSource>,
+}
+
+impl SecretSources {
+    /// Whether any secret was given.
+    pub fn any(&self) -> bool {
+        self.api_key.is_some()
+            || self.tenant_api_keys.is_some()
+            || self.postgres_db_url.is_some()
+            || self.redis_url.is_some()
+    }
+}
+
+/// The headline of the sources record.
+pub(crate) const SOURCES_HEADLINE: &str =
+    "CREDENTIAL SOURCES: where this start read its secrets (the values are never logged)";
+
+/// Logs the sources record, one INFO, when a secret was given: one field per
+/// secret naming its source, `flag`, `env` or `file`.
+pub(crate) fn log_secret_sources(sources: &SecretSources) {
+    if !sources.any() {
+        return;
+    }
+    let tenant_api_keys = sources
+        .tenant_api_keys
+        .map(|(source, entries)| format!("{} ({entries} entries)", source.as_str()));
+    info!(
+        api_key = sources.api_key.map(SecretSource::as_str),
+        tenant_api_keys = tenant_api_keys.as_deref(),
+        postgres_db_url = sources.postgres_db_url.map(SecretSource::as_str),
+        redis_url = sources.redis_url.map(SecretSource::as_str),
+        "{SOURCES_HEADLINE}"
+    );
+}
 
 /// The planes a start leaves open, judged the way `build_app` guards them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,5 +428,35 @@ mod tests {
         log_open_posture(&keyed(), &keyed(), true, Some(&listener()), None);
 
         assert!(!logs_contain("SECURITY POSTURE"));
+    }
+
+    /// The sources record names where each secret came from and how many
+    /// entries a tenant source held; a secret that was not given has no
+    /// field. The record never sees a value, so it cannot carry one.
+    #[traced_test]
+    #[test]
+    fn the_sources_record_names_sources_alone() {
+        log_secret_sources(&SecretSources {
+            api_key: Some(SecretSource::File),
+            tenant_api_keys: Some((SecretSource::Environment, 3)),
+            postgres_db_url: Some(SecretSource::Flag),
+            redis_url: None,
+        });
+
+        assert!(logs_contain("CREDENTIAL SOURCES"));
+        assert!(logs_contain("api_key=\"file\""));
+        assert!(logs_contain("tenant_api_keys=\"env (3 entries)\""));
+        assert!(logs_contain("postgres_db_url=\"flag\""));
+        assert!(!logs_contain("redis_url="));
+    }
+
+    #[traced_test]
+    #[test]
+    fn a_start_without_secrets_logs_no_sources_record() {
+        assert!(!SecretSources::default().any());
+
+        log_secret_sources(&SecretSources::default());
+
+        assert!(!logs_contain("CREDENTIAL SOURCES"));
     }
 }

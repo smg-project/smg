@@ -107,9 +107,22 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if include "smg.authSecretName" . }}
+            - name: auth
+              mountPath: /etc/smg/auth
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if include "smg.authSecretName" . }}
+        - name: auth
+          secret:
+            secretName: {{ include "smg.authSecretName" . }}
+            items:
+              - key: {{ include "smg.authSecretKey" . }}
+                path: {{ include "smg.authSecretKey" . }}
+        {{- end }}
       {{- with .Values.router.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

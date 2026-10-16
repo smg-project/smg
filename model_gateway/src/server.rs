@@ -1007,6 +1007,11 @@ pub struct ServerConfig {
     /// STUN server for ICE candidate gathering (host:port).
     /// Defaults to `stun.l.google.com:19302`; `"none"` to disable.
     pub webrtc_stun_server: Option<String>,
+    /// Where the serving keys and the store URLs were read from (the
+    /// command line, the environment or a file), for the start-up record;
+    /// a caller that did not track them leaves the default, which logs
+    /// nothing.
+    pub secret_sources: crate::posture::SecretSources,
 }
 
 /// Apply the request-admission layer to a protected route group.
@@ -1965,6 +1970,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.prometheus_config.as_ref(),
         config.mesh_server_config.as_ref(),
     );
+    // And where a keyed start's secrets came from, sources alone.
+    crate::posture::log_secret_sources(&config.secret_sources);
 
     let app = build_app(
         app_state,
@@ -2984,6 +2991,7 @@ mod tests {
             mesh_server_config: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            secret_sources: Default::default(),
         }
     }
 

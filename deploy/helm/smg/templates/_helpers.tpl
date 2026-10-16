@@ -301,13 +301,35 @@ Called from the router Deployment template.
 - "--tool-call-parser"
 - {{ .Values.router.toolCallParser | quote }}
 {{- end }}
-{{- if .Values.auth.apiKey }}
-- "--api-key"
-- {{ .Values.auth.apiKey | quote }}
+{{- if include "smg.authSecretName" . }}
+- "--api-key-file"
+- {{ printf "/etc/smg/auth/%s" (include "smg.authSecretKey" .) | quote }}
 {{- end }}
 {{- range .Values.router.extraArgs }}
 - {{ . | quote }}
 {{- end }}
+{{- end }}
+
+{{/*
+Auth secret -- the Secret holding the shared API key, mounted into the router
+pod as a file the gateway reads with --api-key-file; the key itself is never
+in the pod's arguments. `auth.existingSecret` names a Secret the operator
+manages; otherwise `auth.apiKey`, when set, is written into a chart-managed
+Secret. Empty when no key is configured.
+*/}}
+{{- define "smg.authSecretName" -}}
+{{- if .Values.auth.existingSecret -}}
+{{- .Values.auth.existingSecret -}}
+{{- else if .Values.auth.apiKey -}}
+{{- printf "%s-auth" (include "smg.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Auth secret key -- the key within the auth Secret that holds the API key.
+*/}}
+{{- define "smg.authSecretKey" -}}
+{{- .Values.auth.apiKeySecretKey | default "api-key" -}}
 {{- end }}
 
 {{/*

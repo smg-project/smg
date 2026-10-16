@@ -2130,3 +2130,300 @@ class TestRustCliSecondSpellings:
         namespace = parser.parse_args([f"--router-{cli_spelling[2:]}", value])
         router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
         assert getattr(router_args, field) == expected
+SECRET_ENV_NAMES = (
+    "SMG_API_KEY",
+    "SMG_API_KEY_FILE",
+    "SMG_TENANT_API_KEYS",
+    "SMG_TENANT_API_KEYS_FILE",
+    "SMG_POSTGRES_DB_URL",
+    "SMG_POSTGRES_DB_URL_FILE",
+    "POSTGRES_DB_URL",
+    "SMG_REDIS_URL",
+    "SMG_REDIS_URL_FILE",
+    "REDIS_URL",
+    "ATP_PASSWORD",
+)
+
+
+class TestSecretSources:
+    """The shared key, the tenant keys and the store URLs come from the flag,
+    the environment or a file, under the Rust CLI's rule: the flag beats the
+    environment, a value together with a file is refused, a refusal carries
+    no value, and --help shows none either."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_environment(self, monkeypatch):
+        for name in SECRET_ENV_NAMES:
+            monkeypatch.delenv(name, raising=False)
+
+    def test_secrets_are_read_from_the_environment_when_the_flags_are_absent(self, monkeypatch):
+        monkeypatch.setenv("SMG_API_KEY", "env-shared-key")
+        monkeypatch.setenv("SMG_TENANT_API_KEYS", "red:env-red, blue:env-blue\n green:env-green ,")
+        monkeypatch.setenv("SMG_POSTGRES_DB_URL", "postgresql://u:env-pg@db.example:5432/smg")
+        monkeypatch.setenv("SMG_REDIS_URL", "redis://:env-redis@cache.example:6379/0")
+        monkeypatch.setenv("ATP_PASSWORD", "env-oracle-password")
+
+        args = parse_router_args(["--history-backend", "postgres"])
+
+        assert args.api_key == "env-shared-key"
+        assert args.tenant_api_keys == [
+            ("red", "env-red"),
+            ("blue", "env-blue"),
+            ("green", "env-green"),
+        ]
+        assert args.postgres_db_url == "postgresql://u:env-pg@db.example:5432/smg"
+        assert args.redis_url == "redis://:env-redis@cache.example:6379/0"
+        assert args.oracle_password == "env-oracle-password"
+
+    def test_the_command_line_beats_the_environment(self, monkeypatch):
+        monkeypatch.setenv("SMG_API_KEY", "env-shared-key")
+        monkeypatch.setenv("SMG_TENANT_API_KEYS", "red:env-red")
+        monkeypatch.setenv("SMG_POSTGRES_DB_URL", "postgresql://u:env@db.example:5432/smg")
+        monkeypatch.setenv("ATP_PASSWORD", "env-oracle-password")
+
+        args = parse_router_args(
+            [
+                "--api-key",
+                "flag-shared-key",
+                "--tenant-api-key",
+                "blue:flag-blue",
+                "--postgres-db-url",
+                "postgresql://u:flag@db.example:5432/smg",
+                "--oracle-password",
+                "flag-oracle-password",
+            ]
+        )
+
+        assert args.api_key == "flag-shared-key"
+        assert args.tenant_api_keys == [("blue", "flag-blue")]
+        assert args.postgres_db_url == "postgresql://u:flag@db.example:5432/smg"
+        assert args.oracle_password == "flag-oracle-password"
+
+    def test_without_a_source_no_secret_is_set(self):
+        args = parse_router_args([])
+
+        assert args.api_key is None
+        assert args.tenant_api_keys == []
+        assert args.postgres_db_url is None
+        assert args.redis_url is None
+        assert args.oracle_password is None
+
+    def test_the_older_store_url_variables_still_apply(self, monkeypatch):
+        """POSTGRES_DB_URL and REDIS_URL, the names the launcher read before
+        the SMG_ names, still apply; the SMG_ name wins when both are set."""
+        monkeypatch.setenv("POSTGRES_DB_URL", "postgresql://u:old@db.example:5432/smg")
+        monkeypatch.setenv("REDIS_URL", "redis://old.example:6379")
+        args = parse_router_args([])
+        assert args.postgres_db_url == "postgresql://u:old@db.example:5432/smg"
+        assert args.redis_url == "redis://old.example:6379"
+
+        monkeypatch.setenv("SMG_POSTGRES_DB_URL", "postgresql://u:new@db.example:5432/smg")
+        monkeypatch.setenv("SMG_REDIS_URL", "redis://new.example:6379")
+        args = parse_router_args([])
+        assert args.postgres_db_url == "postgresql://u:new@db.example:5432/smg"
+        assert args.redis_url == "redis://new.example:6379"
+
+    def test_secrets_are_read_from_files(self, tmp_path, monkeypatch):
+        """A secret file is read whole with its trailing newline dropped, a
+        tenant key file one entry per line with blank and comment lines
+        skipped; the file is named by its flag or its environment variable."""
+        api_key = tmp_path / "api-key"
+        api_key.write_text("file-shared-key\n")
+        tenants = tmp_path / "tenants"
+        tenants.write_text(
+            "# the tenants\r\n\nred:file-red\r\n  blue : file-blue  \n\n# trailing\n"
+        )
+        pg = tmp_path / "pg-url"
+        pg.write_text("postgresql://u:file-pg@db.example:5432/smg")
+        redis = tmp_path / "redis-url"
+        redis.write_text("  redis://:file-redis@cache.example:6379/1\n\n")
+
+        by_flag = parse_router_args(
+            [
+                "--api-key-file",
+                str(api_key),
+                "--tenant-api-keys-file",
+                str(tenants),
+                "--history-backend",
+                "postgres",
+                "--postgres-db-url-file",
+                str(pg),
+            ]
+        )
+        assert by_flag.api_key == "file-shared-key"
+        assert by_flag.tenant_api_keys == [("red", "file-red"), ("blue", "file-blue")]
+        assert by_flag.postgres_db_url == "postgresql://u:file-pg@db.example:5432/smg"
+
+        monkeypatch.setenv("SMG_API_KEY_FILE", str(api_key))
+        monkeypatch.setenv("SMG_TENANT_API_KEYS_FILE", str(tenants))
+        monkeypatch.setenv("SMG_REDIS_URL_FILE", str(redis))
+        by_env = parse_router_args(["--history-backend", "redis"])
+        assert by_env.api_key == "file-shared-key"
+        assert by_env.tenant_api_keys == [("red", "file-red"), ("blue", "file-blue")]
+        assert by_env.redis_url == "redis://:file-redis@cache.example:6379/1"
+
+    @pytest.mark.parametrize(
+        ("argv", "env", "flag"),
+        [
+            (["--api-key", "flag-secret", "--api-key-file", "FILE"], {}, "--api-key"),
+            (["--api-key", "flag-secret"], {"SMG_API_KEY_FILE": "FILE"}, "--api-key"),
+            ([], {"SMG_API_KEY": "env-secret", "SMG_API_KEY_FILE": "FILE"}, "--api-key"),
+            (["--api-key-file", "FILE"], {"SMG_API_KEY": "env-secret"}, "--api-key"),
+            (
+                ["--tenant-api-key", "red:flag-secret", "--tenant-api-keys-file", "FILE"],
+                {},
+                "--tenant-api-key",
+            ),
+            (
+                ["--tenant-api-keys-file", "FILE"],
+                {"SMG_TENANT_API_KEYS": "red:env-secret"},
+                "--tenant-api-key",
+            ),
+            (
+                [
+                    "--history-backend",
+                    "postgres",
+                    "--postgres-db-url",
+                    "postgresql://u:flag-secret@db.example/smg",
+                    "--postgres-db-url-file",
+                    "FILE",
+                ],
+                {},
+                "--postgres-db-url",
+            ),
+            (
+                ["--history-backend", "redis"],
+                {
+                    "SMG_REDIS_URL": "redis://:env-secret@cache.example/0",
+                    "SMG_REDIS_URL_FILE": "FILE",
+                },
+                "--redis-url",
+            ),
+        ],
+    )
+    def test_a_value_and_a_file_for_one_secret_are_refused(
+        self, tmp_path, monkeypatch, argv, env, flag
+    ):
+        """A value (from the flag or the environment) and a file for the same
+        secret are refused, whichever way each is given; the refusal names
+        the sources and carries no value."""
+        secret_file = tmp_path / "secret"
+        secret_file.write_text("file-secret")
+        argv = [arg.replace("FILE", str(secret_file)) for arg in argv]
+        for name, value in env.items():
+            monkeypatch.setenv(name, value.replace("FILE", str(secret_file)))
+
+        with pytest.raises(ValueError, match="given twice") as excinfo:
+            parse_router_args(argv)
+
+        text = str(excinfo.value)
+        file_flag = "--tenant-api-keys-file" if flag == "--tenant-api-key" else f"{flag}-file"
+        assert flag in text and file_flag in text and "SMG_" in text, text
+        for secret in ("flag-secret", "env-secret", "file-secret"):
+            assert secret not in text
+
+    def test_secret_files_that_cannot_be_used_are_refused_by_path(self, tmp_path):
+        missing = tmp_path / "missing"
+        empty = tmp_path / "empty"
+        empty.write_text("\n")
+        two_lines = tmp_path / "two-lines"
+        two_lines.write_text("first-secret\nsecond-secret\n")
+        comments_only = tmp_path / "comments-only"
+        comments_only.write_text("# nothing here\n\n")
+
+        for argv, flag, reason in [
+            (["--api-key-file", str(missing)], "--api-key-file", "cannot be read"),
+            (["--api-key-file", str(empty)], "--api-key-file", "is empty"),
+            (["--api-key-file", str(two_lines)], "--api-key-file", "more than one line"),
+            (
+                ["--tenant-api-keys-file", str(comments_only)],
+                "--tenant-api-keys-file",
+                "holds no entry",
+            ),
+            (["--tenant-api-keys-file", str(missing)], "--tenant-api-keys-file", "cannot be read"),
+            (
+                ["--history-backend", "postgres", "--postgres-db-url-file", str(two_lines)],
+                "--postgres-db-url-file",
+                "more than one line",
+            ),
+            (
+                ["--history-backend", "redis", "--redis-url-file", str(missing)],
+                "--redis-url-file",
+                "cannot be read",
+            ),
+        ]:
+            with pytest.raises(ValueError) as excinfo:
+                parse_router_args(argv)
+            text = str(excinfo.value)
+            assert flag in text and str(tmp_path) in text and reason in text, text
+            assert "first-secret" not in text
+
+    def test_tenant_entries_from_the_environment_are_checked_like_the_flags(self, monkeypatch):
+        monkeypatch.setenv("SMG_TENANT_API_KEYS", " , \n")
+        with pytest.raises(ValueError, match="SMG_TENANT_API_KEYS is set but holds no entry"):
+            parse_router_args([])
+
+        monkeypatch.setenv("SMG_TENANT_API_KEYS", "no-separator-secret")
+        with pytest.raises(ValueError, match="missing ':' separator") as excinfo:
+            parse_router_args([])
+        assert "no-separator-secret" not in str(excinfo.value)
+
+    def test_store_url_files_are_read_for_the_selected_backend_alone(self, monkeypatch):
+        monkeypatch.setenv("SMG_POSTGRES_DB_URL_FILE", "/nonexistent/pg-url")
+        monkeypatch.setenv("SMG_REDIS_URL_FILE", "/nonexistent/redis-url")
+
+        args = parse_router_args([])
+        assert args.postgres_db_url is None
+        assert args.redis_url is None
+
+        with pytest.raises(ValueError, match="--postgres-db-url-file"):
+            parse_router_args(["--history-backend", "postgres"])
+        with pytest.raises(ValueError, match="--redis-url-file"):
+            parse_router_args(["--history-backend", "redis"])
+
+    def test_prefixed_secret_file_flags_reach_the_same_fields(self, tmp_path):
+        api_key = tmp_path / "api-key"
+        api_key.write_text("file-shared-key\n")
+        tenants = tmp_path / "tenants"
+        tenants.write_text("red:file-red\n")
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            [
+                "--router-api-key-file",
+                str(api_key),
+                "--router-tenant-api-keys-file",
+                str(tenants),
+            ]
+        )
+
+        args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert args.api_key == "file-shared-key"
+        assert args.tenant_api_keys == [("red", "file-red")]
+
+    def test_the_help_names_the_sources_and_shows_no_value(self, monkeypatch):
+        """The launcher's --help prints every default, so a secret from the
+        environment is never a default: with the variables set, the help
+        names them and shows none of their values."""
+        from smg.launch_router import CustomHelpFormatter
+
+        for name in SECRET_ENV_NAMES:
+            monkeypatch.setenv(name, f"hunter2-{name.lower()}")
+        parser = argparse.ArgumentParser(formatter_class=CustomHelpFormatter)
+        RouterArgs.add_cli_args(parser)
+
+        help_text = parser.format_help()
+
+        for named in (
+            "SMG_API_KEY",
+            "--api-key-file",
+            "SMG_TENANT_API_KEYS",
+            "--tenant-api-keys-file",
+            "SMG_POSTGRES_DB_URL",
+            "--postgres-db-url-file",
+            "SMG_REDIS_URL",
+            "--redis-url-file",
+        ):
+            assert named in help_text, named
+        assert "hunter2" not in help_text

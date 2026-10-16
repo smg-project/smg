@@ -48,6 +48,23 @@ smg serve --backend sglang --model-path /path/to/model --port 8080 --dp-size 4
 
 Backend-specific options (e.g., `--tensor-parallel-size`, `--quantization`) are passed through to the backend.
 
+### Secrets from the environment or files
+
+The serving keys and the store URLs need not be on the command line, where other processes can read them (`/proc/<pid>/cmdline`, process listings, a Deployment's args). Each is also read from an environment variable, or from a file such as a mounted Secret, by the Python launcher (`smg launch`, `smg serve` with the `--router-` prefix) and by the Rust binary alike:
+
+| Setting | Flag | Environment | File flag | File environment |
+|---------|------|-------------|-----------|------------------|
+| Shared API key | `--api-key` | `SMG_API_KEY` | `--api-key-file` | `SMG_API_KEY_FILE` |
+| Per-tenant API keys | `--tenant-api-key` (repeatable) | `SMG_TENANT_API_KEYS` | `--tenant-api-keys-file` | `SMG_TENANT_API_KEYS_FILE` |
+| PostgreSQL URL | `--postgres-db-url` | `SMG_POSTGRES_DB_URL` | `--postgres-db-url-file` | `SMG_POSTGRES_DB_URL_FILE` |
+| Redis URL | `--redis-url` | `SMG_REDIS_URL` | `--redis-url-file` | `SMG_REDIS_URL_FILE` |
+
+- The flag beats the environment. A value (from the flag or the environment) together with a file for the same secret is refused at start-up rather than ranked: the second source of one secret is a stale one about to be honoured.
+- A single-value file holds the value alone; the surrounding whitespace (a trailing newline) is dropped. An empty file, or one with more than one line, is refused.
+- `SMG_TENANT_API_KEYS` holds `tenant_id:key` entries separated by `,` or a newline; the file holds one entry per line, blank lines and lines starting with `#` skipped. A source that is set but holds no entry is refused.
+- A store URL file is read for the selected `--history-backend` alone. The launcher still reads the older `POSTGRES_DB_URL` and `REDIS_URL` names when the `SMG_` names are unset.
+- No value is echoed: a refusal names the sources and the path, `--help` shows no value of a variable, and the gateway's start-up record (`CREDENTIAL SOURCES`) names each secret's source as `flag`, `env` or `file`.
+
 ## Directory Structure
 
 ```

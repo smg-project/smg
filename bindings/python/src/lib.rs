@@ -1950,6 +1950,9 @@ impl Router {
                 },
                 webrtc_bind_addr: None,
                 webrtc_stun_server: None,
+                // The launcher resolved the secrets' sources in Python; the
+                // record is the CLI's.
+                secret_sources: Default::default(),
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
