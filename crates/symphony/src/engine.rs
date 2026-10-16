@@ -429,17 +429,30 @@ impl Engine {
     /// Takes one piece where the turn and the table put it: the turn's first piece decides where
     /// the turn starts, then text is the state's and a terminal moves the engine or is text.
     fn place(&mut self, piece: Piece, out: &mut Events) {
+        self.open_turn(&piece, out);
+        match piece {
+            Piece::Text(text) => self.text(&text, out),
+            Piece::Marker(index) => self.terminal(index, out),
+        }
+    }
+
+    /// Takes a delta that is text whole ([`Scanner::reads_as_text`]) where [`Self::place`] would
+    /// take it as one text piece, without the piece: the common delta of a content or reasoning
+    /// stay, and of a call's arguments, is one.
+    fn place_text(&mut self, text: &str, out: &mut Events) {
+        self.open_turn(&Piece::Text(String::new()), out);
+        self.text(text, out);
+    }
+
+    /// The turn's first piece decides where the turn starts, for a table with a start row.
+    fn open_turn(&mut self, piece: &Piece, out: &mut Events) {
         if self.at_turn_start {
-            if let Some(state) = self.format.opening(self.state, &piece) {
+            if let Some(state) = self.format.opening(self.state, piece) {
                 self.at_turn_start = false;
                 if state != self.state {
                     self.enter(state, out);
                 }
             }
-        }
-        match piece {
-            Piece::Text(text) => self.text(&text, out),
-            Piece::Marker(index) => self.terminal(index, out),
         }
     }
 
@@ -1082,6 +1095,14 @@ impl Parser for Engine {
                 }
                 self.stage = Stage::Streaming;
                 self.tokens.note(text, spans);
+                // A delta that is text whole, with no header pending, is taken as the one piece
+                // the scan would make of it, without the scan and the piece.
+                if self.pending.is_none() && self.scanner.reads_as_text(text) {
+                    if !text.is_empty() {
+                        self.place_text(text, out);
+                    }
+                    return Ok(());
+                }
                 let pieces = self.scanner.feed(text);
                 self.run(pieces, false, out);
                 Ok(())

@@ -24,6 +24,26 @@ pub enum Piece {
 pub struct Scanner {
     markers: Vec<String>,
     held: String,
+    /// The bytes the markers start with: a marker can begin at no other byte, so the scan looks
+    /// for one only there. A multi-byte character's first byte is among them when a marker starts
+    /// with it; its other bytes never are, so the scan never cuts a character.
+    starts: ByteSet,
+    /// The longest marker's length: a tail of that many bytes or more holds no half-arrived marker.
+    longest: usize,
+}
+
+/// A set of bytes.
+#[derive(Clone, Copy, Debug, Default)]
+struct ByteSet([u64; 4]);
+
+impl ByteSet {
+    fn insert(&mut self, byte: u8) {
+        self.0[usize::from(byte >> 6)] |= 1 << (byte & 63);
+    }
+
+    fn contains(self, byte: u8) -> bool {
+        self.0[usize::from(byte >> 6)] & (1 << (byte & 63)) != 0
+    }
 }
 
 impl Scanner {
@@ -31,9 +51,19 @@ impl Scanner {
     /// every byte is text. An empty string never matches, so the scan always moves forward, and of
     /// two equal markers the first in the list is the one reported.
     pub fn new(markers: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let markers: Vec<String> = markers.into_iter().map(Into::into).collect();
+        let mut starts = ByteSet::default();
+        for marker in &markers {
+            if let Some(&first) = marker.as_bytes().first() {
+                starts.insert(first);
+            }
+        }
+        let longest = markers.iter().map(String::len).max().unwrap_or(0);
         Self {
-            markers: markers.into_iter().map(Into::into).collect(),
+            markers,
             held: String::new(),
+            starts,
+            longest,
         }
     }
 
@@ -47,28 +77,44 @@ impl Scanner {
         &self.held
     }
 
+    /// Whether `bytes`, fed now, would be text whole: nothing is held, and no byte of them starts a
+    /// marker, so none can be found in them or held at their end. A caller that knows takes the
+    /// text as one piece without a scan.
+    pub fn reads_as_text(&self, bytes: &str) -> bool {
+        self.held.is_empty() && !bytes.bytes().any(|byte| self.starts.contains(byte))
+    }
+
     /// Append the next bytes and return what is now certain, in order: text that cannot be part of
-    /// a marker, and the markers found. Whatever may still become a marker stays held.
+    /// a marker, and the markers found. Whatever may still become a marker stays held. Bytes that
+    /// arrive while nothing is held are scanned in place, without a copy.
     pub fn feed(&mut self, bytes: &str) -> Vec<Piece> {
+        if self.held.is_empty() {
+            return self.scan(bytes, true);
+        }
         let text = std::mem::take(&mut self.held) + bytes;
-        self.scan(text, true)
+        self.scan(&text, true)
     }
 
     /// No more bytes will come: what was held is a marker if it is one whole, and text otherwise.
     pub fn finish(mut self) -> Vec<Piece> {
         let text = std::mem::take(&mut self.held);
-        self.scan(text, false)
+        self.scan(&text, false)
     }
 
     /// Split `text` into pieces. With `more_may_come`, a tail that could still grow into a marker
-    /// is held instead of released.
-    fn scan(&mut self, text: String, more_may_come: bool) -> Vec<Piece> {
+    /// is held instead of released. Only a position whose byte starts some marker is looked at:
+    /// nowhere else can a marker begin, or a tail be the beginning of one.
+    fn scan(&mut self, text: &str, more_may_come: bool) -> Vec<Piece> {
         let mut pieces = Vec::new();
         let mut released = 0;
         let mut at = 0;
         while at < text.len() {
+            if !self.starts.contains(text.as_bytes()[at]) {
+                at += 1;
+                continue;
+            }
             let rest = &text[at..];
-            if more_may_come && self.could_grow_into_marker(rest) {
+            if more_may_come && rest.len() < self.longest && self.could_grow_into_marker(rest) {
                 Self::release(&mut pieces, &text[released..at]);
                 self.held = rest.to_string();
                 return pieces;
@@ -79,7 +125,7 @@ impl Scanner {
                 at += self.markers[index].len();
                 released = at;
             } else {
-                at += rest.chars().next().map_or(1, char::len_utf8);
+                at += 1;
             }
         }
         Self::release(&mut pieces, &text[released..]);
@@ -257,6 +303,49 @@ mod tests {
             "with no markers everything is text at once"
         );
         assert_eq!(scan(&QWEN, &[""]), vec![]);
+    }
+
+    #[test]
+    fn a_marker_that_starts_with_a_multibyte_character_is_found_at_every_cut() {
+        // "｜x" starts with a three-byte character; "０" shares its first byte and is text.
+        let markers = ["｜x"];
+        let text = "０｜x｜y０";
+        let whole = joined(scan(&markers, &[text]));
+        assert_eq!(
+            whole,
+            vec![
+                Piece::Text("０".into()),
+                Piece::Marker(0),
+                Piece::Text("｜y０".into()),
+            ]
+        );
+        for (cut, _) in text.char_indices().skip(1) {
+            let got = scan(&markers, &[&text[..cut], &text[cut..]]);
+            assert_eq!(rendered(&markers, &got), text, "cut at {cut}");
+            assert_eq!(joined(got), whole, "cut at {cut}");
+        }
+        let mut scanner = Scanner::new(markers);
+        assert_eq!(scanner.feed("０｜"), vec![Piece::Text("０".into())]);
+        assert_eq!(scanner.held(), "｜");
+        assert_eq!(scanner.feed("y"), vec![Piece::Text("｜y".into())]);
+    }
+
+    #[test]
+    fn text_reads_as_text_when_nothing_is_held_and_no_byte_of_it_starts_a_marker() {
+        let mut scanner = Scanner::new(QWEN);
+        assert!(scanner.reads_as_text("Hello, world"));
+        assert!(scanner.reads_as_text(""));
+        // A byte that starts a marker: the scan decides.
+        assert!(!scanner.reads_as_text("Hello <"));
+        assert!(!scanner.reads_as_text("<"));
+        // Something held: the scan decides, whatever the bytes.
+        assert_eq!(
+            scanner.feed("Hello <tool_c"),
+            vec![Piece::Text("Hello ".into())]
+        );
+        assert!(!scanner.reads_as_text("Hello"));
+        assert_eq!(scanner.feed("all>"), vec![Piece::Marker(2)]);
+        assert!(scanner.reads_as_text("Hello"));
     }
 
     #[test]

@@ -907,6 +907,11 @@ pub(crate) struct Reader {
     ended: bool,
     /// Drop the events of every call after the first.
     first_call_only: bool,
+    /// The delta being read: the text the decoder released, each token's span in it, and the
+    /// tokens read; kept between deltas, so a stream fills them once.
+    text: String,
+    spans: Vec<TokenSpan>,
+    tokens: Vec<u32>,
 }
 
 impl Reader {
@@ -920,6 +925,9 @@ impl Reader {
             read: 0,
             ended: false,
             first_call_only: false,
+            text: String::new(),
+            spans: Vec::new(),
+            tokens: Vec::new(),
         };
         reader.feed(Input::Prompt {
             token_ids: &[],
@@ -965,43 +973,47 @@ impl Reader {
         decoder: &mut StopSequenceDecoder,
         token_ids: &[u32],
     ) -> Result<(Vec<Event>, bool), String> {
-        let mut text = String::new();
-        let mut spans = Vec::with_capacity(token_ids.len());
-        let mut read = Vec::with_capacity(token_ids.len());
+        self.text.clear();
+        self.spans.clear();
+        self.tokens.clear();
         let mut stopped = false;
         for &token_id in token_ids {
             let output = decoder
                 .process_token(token_id)
                 .map_err(|e| format!("Stop decoder failed to process token {token_id}: {e}"))?;
-            let start = text.len();
+            let start = self.text.len();
             match output {
-                SequenceDecoderOutput::Text(released) => text.push_str(&released),
+                SequenceDecoderOutput::Text(released) => self.text.push_str(&released),
                 SequenceDecoderOutput::StoppedWithText(released) => {
-                    text.push_str(&released);
+                    self.text.push_str(&released);
                     stopped = true;
                 }
                 SequenceDecoderOutput::Stopped => stopped = true,
                 SequenceDecoderOutput::Held => {}
             }
-            spans.push(TokenSpan {
+            self.spans.push(TokenSpan {
                 token_id,
                 start,
-                end: text.len(),
+                end: self.text.len(),
                 continued: false,
             });
-            self.ends.push(self.read + text.len());
-            read.push(token_id);
+            self.ends.push(self.read + self.text.len());
+            self.tokens.push(token_id);
             self.last_token = Some(token_id);
             if stopped {
                 break;
             }
         }
-        self.read += text.len();
-        self.feed(Input::Delta {
-            token_ids: &read,
-            text: &text,
-            spans: &spans,
-        })?;
+        self.read += self.text.len();
+        feed_engine(
+            &mut self.engine,
+            &mut self.events,
+            Input::Delta {
+                token_ids: &self.tokens,
+                text: &self.text,
+                spans: &self.spans,
+            },
+        )?;
         Ok((self.drained(), stopped))
     }
 
@@ -1056,10 +1068,16 @@ impl Reader {
     }
 
     fn feed(&mut self, input: Input<'_>) -> Result<(), String> {
-        self.engine
-            .feed(input, &mut self.events)
-            .map_err(|e| format!("Symphony failed to read the output: {e}"))
+        feed_engine(&mut self.engine, &mut self.events, input)
     }
+}
+
+/// Feeds `input` to `engine`, its events into `events`: the reader's one way in, over the fields
+/// rather than the reader, so a delta read from the reader's own buffers can be fed too.
+fn feed_engine(engine: &mut Engine, events: &mut Events, input: Input<'_>) -> Result<(), String> {
+    engine
+        .feed(input, events)
+        .map_err(|e| format!("Symphony failed to read the output: {e}"))
 }
 
 #[cfg(test)]
