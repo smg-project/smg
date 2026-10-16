@@ -49,6 +49,13 @@
 //!   held until more text in the stay shows it was inside the text, or the stay ends and drops it.
 //!   Whitespace is what Python's `str.strip` removes: Unicode's white space and the separators
 //!   U+001C to U+001F.
+//! - A **kept row** names a content state whose text stands as written, as Hugging Face's `text`
+//!   parser keeps a field's value under `strip: false`: whitespace alone in a stay is content. A
+//!   content state with neither a trim row nor a kept row holds the whitespace a stay begins with
+//!   until text follows it in the stay, which makes it content, and drops it as
+//!   `Dropped { Whitespace }` when the stay ends without any: a family's template writes that
+//!   spacing (after a thought's close, between two calls), and the whole answer's message shows no
+//!   content for whitespace alone.
 //! - The **stop tokens** are the terminals that are tokens the engine stops on (Harmony's
 //!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
 //!   derived from the table can end a region one of them closes with no text of its own, since
@@ -274,6 +281,8 @@ struct State {
     framing: bool,
     /// The state's text is trimmed stay by stay (the trim row).
     trimmed: bool,
+    /// The state's text stands as written, whitespace alone included (the kept row).
+    kept: bool,
     /// The stream's stop closes the call open in the state (the stop row).
     closes_at_stop: bool,
 }
@@ -385,6 +394,7 @@ impl Format {
             emits,
             framing: false,
             trimmed: false,
+            kept: false,
             closes_at_stop: false,
         });
         self
@@ -440,6 +450,15 @@ impl Format {
     pub fn trims(mut self, state: &str) -> Self {
         let state = self.state_named(state);
         self.states[state].trimmed = true;
+        self
+    }
+
+    /// The text of `state`, a content state, stands as written: whitespace alone in a stay is
+    /// content (see the kept row in [`crate::format`]). The state must already be in the table.
+    #[must_use]
+    pub fn keeps(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.states[state].kept = true;
         self
     }
 
@@ -1023,6 +1042,11 @@ impl Format {
         self.states[index].trimmed
     }
 
+    /// Whether the text of state `index` stands as written, whitespace alone included.
+    pub(crate) fn is_kept(&self, index: usize) -> bool {
+        self.states[index].kept
+    }
+
     /// What every table must hold before an engine runs it: a state to start in, which does not
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay or by
     /// the start row, either of which pushes `ReasoningStart`; an arguments state at the start has
@@ -1030,8 +1054,9 @@ impl Format {
     /// every terminal, a turn opener and turn anchors that are not empty and not both named, a
     /// start row only where a turn's first byte is read from the first state and no opener replays
     /// it, a stop row only for an arguments state, a framing row only for a state of content or
-    /// wrapping, a trim row only for a state of content or reasoning that is not framing,
-    /// a thought when the table thinks first, and, for a shaped call, a shape a stream can run,
+    /// wrapping, a trim row only for a state of content or reasoning that is not framing, a kept
+    /// row only for a content state that is neither framing nor trimmed, a thought when the table
+    /// thinks first, and, for a shaped call, a shape a stream can run,
     /// opened only through its terminal (the turn does not start in its state), no terminal the
     /// table ignores, and, when its header is not empty, no row into its state from a state that
     /// holds a call. The builder keeps a row from naming what the table lacks; this checks the
@@ -1125,6 +1150,33 @@ impl Format {
                 } else if state.framing {
                     Some(format!(
                         "format {}: state {:?} is trimmed, but its text is framing",
+                        self.name, state.name
+                    ))
+                } else {
+                    None
+                }
+            });
+        if let Some(why) = misfit {
+            return Err(why);
+        }
+        let misfit = self
+            .states
+            .iter()
+            .filter(|state| state.kept)
+            .find_map(|state| {
+                if state.emits != Emits::Content {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but it emits {:?}",
+                        self.name, state.name, state.emits
+                    ))
+                } else if state.framing {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but its text is framing",
+                        self.name, state.name
+                    ))
+                } else if state.trimmed {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but it is trimmed",
                         self.name, state.name
                     ))
                 } else {
@@ -1861,6 +1913,43 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"answer\"")]
     fn a_trim_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().trims("answer");
+    }
+
+    #[test]
+    fn a_kept_row_names_a_content_state_that_is_neither_framing_nor_trimmed() {
+        let format = Format::new("kept")
+            .terminal("open", "<c>")
+            .state("content", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("between", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .state("outside", Emits::Content)
+            .state("trimmed", Emits::Content)
+            .transition("content", "open", "call")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .trims("trimmed")
+            .keeps("content");
+        assert!(format.is_kept(0) && !format.is_kept(5));
+        assert!(format.validate().is_ok());
+        for (state, why) in [
+            ("thought", "it emits Reasoning"),
+            ("between", "it emits Wrapper"),
+            ("call", "it emits Arguments"),
+            ("outside", "its text is framing"),
+            ("trimmed", "it is trimmed"),
+        ] {
+            assert_eq!(
+                format.clone().keeps(state).validate(),
+                Err(format!("format kept: state {state:?} is kept, but {why}"))
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"answer\"")]
+    fn a_kept_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().keeps("answer");
     }
 
     #[test]

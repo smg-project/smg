@@ -10,7 +10,8 @@
 //! chunks were cut changes nothing, the whitespace a content stay begins with as
 //! `Dropped { Whitespace }` when no text follows it in the stay (the template's spacing after a
 //! thought's close, between two calls, or after a thought nothing follows, held until what
-//! follows says whose it is), and the rest as content, reasoning, or the call's events.
+//! follows says whose it is) unless the table keeps the state's text as written, and the rest as
+//! content, reasoning, or the call's events.
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
@@ -562,7 +563,9 @@ impl Engine {
             Emits::Content | Emits::Reasoning if self.format.is_trimmed(self.state) => {
                 self.trimmed(text, out);
             }
-            Emits::Content if !self.stay.begun => self.lead(text, out),
+            Emits::Content if !self.stay.begun && !self.format.is_kept(self.state) => {
+                self.lead(text, out);
+            }
             Emits::Content | Emits::Reasoning => self.show(text, out),
             Emits::Arguments => {
                 let Some(call) = &mut self.call else {
@@ -1904,6 +1907,19 @@ mod tests {
         assert_eq!(content, "");
         let [content, ..] = same_at_every_cut(&format, "<|im_start|>assistant\nSure,", &output);
         assert_eq!(content, "\n");
+    }
+
+    #[test]
+    fn a_kept_content_state_shows_whitespace_alone_as_written() {
+        // A response template's `strip: false` field keeps its value as written: the whitespace a
+        // stay holds alone is content, where the held lead drops it as the template's spacing.
+        let output = "<think>\nplan\n</think>\n\n";
+        let kept = qwen3(CallSyntax::Json).keeps("content");
+        let [content, reasoning, ..] = same_at_every_cut(&kept, "", output);
+        assert_eq!([content.as_str(), reasoning.as_str()], ["\n\n", "\nplan\n"]);
+        assert_eq!(trimmed_space(&run(kept, output, EngineFinish::Stop)), "");
+        let [content, ..] = same_at_every_cut(&qwen3(CallSyntax::Json), "", output);
+        assert_eq!(content, "");
     }
 
     #[test]
