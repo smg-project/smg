@@ -4726,6 +4726,59 @@ mod request_release_tests {
         }
     }
 
+    /// Harmony Responses over the gRPC PD path, the client leaving while the
+    /// prefill leg wedged after its first token: the prefill drain is cut by
+    /// the client's leaving, both legs drop unmarked (the prefill engine
+    /// receives the abort at once) and both legs' load returns with the body.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_harmony_responses_pd_stream_during_the_prefill_aborts_both_legs_at_once(
+    ) {
+        let prefill_scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let prefill_port = spawn_stub(prefill_scheduler.clone()).await;
+        let decode_port = spawn_stub(GatedScheduler::default()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let ctx =
+            responses_context_over(Endpoint::Harmony, Mode::PrefillDecode, &worker_registry, 0)
+                .await;
+
+        let response = serve_harmony_responses_stream(
+            &ctx,
+            Arc::unwrap_or_clone(responses_request(false)),
+            anonymous(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&prefill).await;
+        assert!(
+            prefill_scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&prefill_scheduler, deadline).await;
+        while prefill.load() != 0 || decode.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the legs' load stayed at {} and {} after the body was dropped during the prefill",
+                prefill.load(),
+                decode.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Harmony Responses, `background: true`: the generation outlives its
     /// client on purpose. The client leaves the stream once the engine's
     /// first token was read; nothing is aborted, the work runs to the
