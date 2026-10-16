@@ -103,7 +103,7 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
     cli = RustCli(pre_clap=set(re.findall(r'args\[i\] == "(--[a-z-]+)"', text)))
     i = start + 1
     while i < end:
-        flattened = lines[i].strip() == "#[command(flatten)]"
+        flattened = re.match(r"#\[(?:command|clap)\(\s*flatten\b", lines[i].strip()) is not None
         if not flattened and not lines[i].lstrip().startswith("#[arg("):
             i += 1
             continue
@@ -139,9 +139,18 @@ def parse_rust_cli(text: str, struct_name: str = "CliArgs") -> RustCli:
     return cli
 
 
-def test_parse_rust_cli_follows_only_reachable_flattened_groups():
+@pytest.mark.parametrize(
+    "flatten",
+    [
+        "#[command(flatten)]",
+        '#[command(flatten, next_help_heading = "Worker")]',
+        "#[clap(flatten)]",
+        '#[command(flatten,\n        next_help_heading = "Worker"\n    )]',
+    ],
+)
+def test_parse_rust_cli_follows_only_reachable_flattened_groups(flatten):
     """Flattened groups retain flags, defaults and aliases, without unrelated structs."""
-    cli = parse_rust_cli("""
+    source = """
 struct CliArgs {
     #[arg(long, default_value_t = 3)]
     retries: usize,
@@ -164,7 +173,8 @@ struct Unrelated {
     #[arg(long)]
     ignored: String,
 }
-""")
+"""
+    cli = parse_rust_cli(source.replace("#[command(flatten)]", flatten))
     assert cli.flags == {"--retries": 3, "--worker-url": None, "--enabled": False}
     assert cli.aliases == {"--url": "--worker-url"}
 
