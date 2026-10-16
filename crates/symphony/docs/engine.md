@@ -20,10 +20,11 @@ What the engine decides for every format, and what it leaves open:
   argument's text ends the call there. Bellwether #16 is where that policy is judged.
 - A terminal the table ignores (MiniMax M3's separator token, Inkling's end-of-sampling token)
   is `Dropped { Wrapper }` wherever it stands and moves nothing. Inside a call whose assembler
-  holds bytes (a header until its marker, a word until it is spelled) it is carried into the
-  source of the event that carries the bytes after it, so that its bytes keep their place; a
-  syntax that reads it as its own separator (M3's XML) acts on it and leaves the bytes to the
-  engine.
+  holds bytes (a header until its marker, a word until it is spelled) it is placed where it
+  arrived once the bytes around it leave: spliced into a call event's source, which no client
+  reads, or split out of a text event as a `Dropped` event of its own, so that its bytes keep
+  their place and none joins text a client reads; a syntax that reads it as its own separator
+  (M3's XML) acts on it and leaves the bytes to the engine.
 - A call region that never closes is finished at the end of the stream: a call with what
   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A region whose closing terminal
   comes before a complete call gives what is left as `Malformed` with a reason that says so,

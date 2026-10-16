@@ -70,8 +70,10 @@ pub struct Engine {
 /// have carried out, and the table's ignored terminals that arrived while it held bytes, each at
 /// the offset it arrived at. A syntax may hold bytes until it can place them (a header until its
 /// marker, a word until it is spelled), and an ignored terminal pushed at once would leave before
-/// them; so one that arrives while bytes are held is carried into the source of the event that
-/// carries the bytes after it, and the output's bytes leave in their order whatever the syntax
+/// them; so one that arrives while bytes are held is placed where it arrived once the event that
+/// carries the bytes around it comes: spliced into a call event's source, which no client reads,
+/// or split out of a text event as a `Dropped { Wrapper }` event of its own between the text's
+/// pieces ([`Engine::carried_into`]). The output's bytes leave in their order whatever the syntax
 /// holds. When nothing is held it is dropped where it stands.
 #[derive(Debug, Default)]
 struct Region {
@@ -667,8 +669,8 @@ impl Engine {
 
     /// A terminal arrived: move where the table says, or keep it as text where the model put it.
     /// A terminal the table ignores is dropped where it stands, and moves nothing: inside a call
-    /// whose assembler holds bytes it is carried into the source of the event that carries the
-    /// bytes after it ([`Region`]), and in a trimmed stay's held run it keeps its place among them.
+    /// whose assembler holds bytes it is placed where it arrived once the bytes around it leave
+    /// ([`Region`]), and in a trimmed stay's held run it keeps its place among them.
     fn terminal(&mut self, index: usize, out: &mut Events) {
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
