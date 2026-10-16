@@ -1314,29 +1314,27 @@ impl ResponseStreamEventEmitter {
         let emit_added =
             !item.added_emitted && (!item.name.is_empty() || !item.arguments.is_empty());
         item.added_emitted |= emit_added;
-        let (output_index, item_id, call_id, name) = (
-            item.output_index,
-            item.item_id.clone(),
-            item.call_id.clone(),
-            item.name.clone(),
-        );
-        let custom = self.is_custom_tool(&name);
+        let (output_index, item_id) = (item.output_index, item.item_id.clone());
+        // Decided once the `&mut` borrow above is over; the call id and the
+        // name are copied only for the announcement, not on every delta.
+        let custom = self.is_custom_tool(&self.tool_call_items[pos].name);
 
         if emit_added {
+            let announced = &self.tool_call_items[pos];
             let item = if custom {
                 json!({
                     "id": item_id,
                     "type": "custom_tool_call",
-                    "call_id": call_id,
-                    "name": name,
+                    "call_id": announced.call_id,
+                    "name": announced.name,
                     "input": "",
                 })
             } else {
                 json!({
                     "id": item_id,
                     "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
+                    "call_id": announced.call_id,
+                    "name": announced.name,
                     "arguments": "",
                     "status": "in_progress",
                 })
