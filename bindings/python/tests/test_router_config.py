@@ -491,8 +491,8 @@ class TestRouterPositionalSignature:
         import inspect
 
         params = list(inspect.signature(_Router).parameters.values())
-        assert params[-1].name == "discovery"
-        assert params[-1].kind is inspect.Parameter.KEYWORD_ONLY
+        keyword_only = [p.name for p in params if p.kind is inspect.Parameter.KEYWORD_ONLY]
+        assert "discovery" in keyword_only
         return [p.name for p in params if p.kind is not inspect.Parameter.KEYWORD_ONLY]
 
     def test_appended_parameters_follow_prefill_queue_timeout(self):
