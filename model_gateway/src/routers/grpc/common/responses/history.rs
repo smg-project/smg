@@ -6,14 +6,16 @@
 //! stored chain behind `previous_response_id`, then the stored items of
 //! `conversation`, then the request's own input, each stored item converted
 //! back by the one conversion of this module. A stored turn's tool calls and
-//! their outputs come back as they were stored, in the order they were stored.
+//! their outputs come back as they were stored, in the order they were stored;
+//! a conversation longer than [`MAX_CONVERSATION_HISTORY_ITEMS`] replays its
+//! newest items.
 
 use std::sync::Arc;
 
 use axum::response::Response;
 use openai_protocol::responses::{
-    generate_id, normalize_input_item, McpToolCallError, ResponseContentPart, ResponseInput,
-    ResponseInputOutputItem, ResponsesRequest,
+    generate_id, normalize_input_item, without_outputs_of_missing_calls, McpToolCallError,
+    ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,7 +28,10 @@ use tracing::{debug, warn};
 use super::{previous_response_chain, ResponsesContext};
 use crate::routers::{common::persistence_utils::split_stored_message_content, error};
 
-/// How many of a conversation's stored items a request replays.
+/// How many of a conversation's stored items a request replays: its newest
+/// ones, oldest first; what is older is not in the prompt. A window this
+/// limit cuts can begin between a call and its output, so the outputs of the
+/// calls before the window are left out of it.
 const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
 
 /// The stores a request's history is read from.
@@ -284,8 +289,9 @@ fn stored_item_as_input(item: &Value) -> Option<ResponseInputOutputItem> {
         .ok()
 }
 
-/// The replayable items of a conversation, oldest first, as the caller's
-/// `tenant` may see it: a conversation of another tenant is as missing.
+/// The replayable items of a conversation, its newest
+/// [`MAX_CONVERSATION_HISTORY_ITEMS`] oldest first, as the caller's `tenant`
+/// may see it: a conversation of another tenant is as missing.
 async fn conversation_items(
     stores: HistoryStores<'_>,
     conversation_id: &str,
@@ -312,16 +318,18 @@ async fn conversation_items(
         ));
     }
 
+    // The newest items, listed newest first so that the limit cuts the
+    // oldest off, then put back in the order they were stored.
     let params = data_connector::ListParams {
         limit: MAX_CONVERSATION_HISTORY_ITEMS,
-        order: data_connector::SortOrder::Asc,
+        order: data_connector::SortOrder::Desc,
         after: None,
     };
     // A listing the store did not answer (or refused) is not an answer
     // without the conversation's context: the client reads a 503 for a
     // timed-out store and a 500 for any other failure, as every other
     // store-dependent answer of this path does.
-    let stored = stores
+    let mut stored = stores
         .conversation_items
         .list_items(&conv_id, params)
         .await
@@ -332,11 +340,23 @@ async fn conversation_items(
                 &e,
             )
         })?;
-    Ok(stored
+    stored.reverse();
+    let items: Vec<ResponseInputOutputItem> = stored
         .iter()
         .filter_map(conversation_item_as_input)
         .filter(replays)
-        .collect())
+        .collect();
+    if stored.len() < MAX_CONVERSATION_HISTORY_ITEMS {
+        return Ok(items);
+    }
+    // The window is cut at the limit: the items before it are not replayed,
+    // and an output whose call is among them is not either.
+    debug!(
+        conversation_id,
+        limit = MAX_CONVERSATION_HISTORY_ITEMS,
+        "Conversation history cut to its newest items"
+    );
+    Ok(without_outputs_of_missing_calls(items))
 }
 
 /// Replace every `item_reference` input item by the item it points to: an item
@@ -453,8 +473,8 @@ pub(crate) mod tests {
     use openai_protocol::{common::ConversationRef, responses::StringOrContentParts};
     use serde_json::json;
     use smg_data_connector::{
-        ConversationItemId, MemoryConversationItemStorage, MemoryConversationStorage,
-        MemoryResponseStorage, NewConversation, NewConversationItem,
+        AddedAtSequence, ConversationItemId, MemoryConversationItemStorage,
+        MemoryConversationStorage, MemoryResponseStorage, NewConversation, NewConversationItem,
     };
 
     use super::*;
@@ -855,6 +875,161 @@ pub(crate) mod tests {
         };
         assert_eq!(shape(items), ["function_call:call_B", "message:user"]);
         assert_eq!(input_item_id(&items[0]), Some(row.id.0.as_str()));
+    }
+
+    /// Links `rows` to `conv_1` in order, each stamped later than the one
+    /// before, as the conversations API does.
+    async fn link_rows(stores: &Stores, rows: Vec<NewConversationItem>) {
+        let conv_id = ConversationId::from("conv_1");
+        let mut stamps = AddedAtSequence::new();
+        for row in rows {
+            let created = stores
+                .conversation_items
+                .create_item(row)
+                .await
+                .expect("the row is created");
+            stores
+                .conversation_items
+                .link_item(&conv_id, &created.id, stamps.next_added_at())
+                .await
+                .expect("the row is linked");
+        }
+    }
+
+    /// Message `n` of a conversation: a user's for an odd `n`, the
+    /// assistant's for an even one, its text `item n`.
+    fn message_row(n: usize) -> NewConversationItem {
+        let (role, content) = if n % 2 == 1 {
+            (
+                "user",
+                json!([{"type": "input_text", "text": format!("item {n}")}]),
+            )
+        } else {
+            (
+                "assistant",
+                json!([{"type": "output_text", "text": format!("item {n}"), "annotations": []}]),
+            )
+        };
+        NewConversationItem {
+            id: None,
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some(role.to_string()),
+            content,
+            status: Some("completed".to_string()),
+            tenant: None,
+        }
+    }
+
+    fn call_row(call_id: &str) -> NewConversationItem {
+        NewConversationItem {
+            id: None,
+            response_id: None,
+            item_type: "function_call".to_string(),
+            role: None,
+            content: json!({
+                "type": "function_call", "call_id": call_id, "name": "calc",
+                "arguments": "{}", "status": "completed"
+            }),
+            status: Some("completed".to_string()),
+            tenant: None,
+        }
+    }
+
+    fn output_row(call_id: &str) -> NewConversationItem {
+        NewConversationItem {
+            id: None,
+            response_id: None,
+            item_type: "function_call_output".to_string(),
+            role: None,
+            content: json!({"type": "function_call_output", "call_id": call_id, "output": "42"}),
+            status: Some("completed".to_string()),
+            tenant: None,
+        }
+    }
+
+    /// The text of each message item, for the window assertions.
+    fn texts(items: &[ResponseInputOutputItem]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                ResponseInputOutputItem::Message { content, .. } => {
+                    content.iter().find_map(|part| match part {
+                        ResponseContentPart::InputText { text }
+                        | ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A conversation of 120 items replays its newest 100, oldest first,
+    /// then the request's input: the first 20 are not in the prompt.
+    #[tokio::test]
+    async fn a_conversation_longer_than_the_limit_replays_its_newest_items() {
+        let stores = Stores::with_conversation().await;
+        link_rows(&stores, (1..=120).map(message_row).collect()).await;
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("item 121".to_string()),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
+        };
+
+        let loaded = load_history(stores.history(), &request, None)
+            .await
+            .expect("the conversation loads");
+
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded input is an item list");
+        };
+        let expected: Vec<String> = (21..=121).map(|n| format!("item {n}")).collect();
+        assert_eq!(texts(items), expected);
+    }
+
+    /// A conversation one item longer than the limit: its window begins at
+    /// the second item, the output of a call before the window, which is
+    /// left out; the call and the output inside the window stay, in order.
+    #[tokio::test]
+    async fn a_cut_window_leaves_out_the_output_of_a_call_before_it() {
+        let stores = Stores::with_conversation().await;
+        let mut rows = vec![
+            call_row("call_A"),
+            output_row("call_A"),
+            call_row("call_B"),
+            output_row("call_B"),
+        ];
+        rows.extend((5..=101).map(message_row));
+        link_rows(&stores, rows).await;
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("item 102".to_string()),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
+        };
+
+        let loaded = load_history(stores.history(), &request, None)
+            .await
+            .expect("the conversation loads");
+
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded input is an item list");
+        };
+        let kinds = shape(items);
+        assert_eq!(
+            &kinds[..3],
+            [
+                "function_call:call_B",
+                "function_call_output:call_B",
+                "message:user"
+            ],
+            "{kinds:?}"
+        );
+        assert!(!kinds.contains(&"function_call_output:call_A".to_string()));
+        // call_A is before the window, its output left out, the rest replays
+        assert_eq!(items.len(), 101 - 2 + 1);
+        let expected: Vec<String> = (5..=102).map(|n| format!("item {n}")).collect();
+        assert_eq!(texts(items), expected);
     }
 
     /// A message row keeps the phase label it was stored with, and a reasoning

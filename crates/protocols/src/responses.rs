@@ -4015,6 +4015,51 @@ pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutp
     }
 }
 
+/// `items` without the tool outputs whose call is not among them. The newest
+/// items of a long conversation can begin between a call and its output, and
+/// an output of a call the model never made is no history an engine-side
+/// builder renders (one refuses it, a chat template sees a tool result nothing
+/// asked for). Every other item keeps its place.
+pub fn without_outputs_of_missing_calls(
+    items: Vec<ResponseInputOutputItem>,
+) -> Vec<ResponseInputOutputItem> {
+    let calls: HashSet<String> = items
+        .iter()
+        .filter_map(tool_call_id)
+        .map(str::to_string)
+        .collect();
+    items
+        .into_iter()
+        .filter(|item| tool_output_call_id(item).is_none_or(|call_id| calls.contains(call_id)))
+        .collect()
+}
+
+/// The call id of a tool call the model made that a separate output item
+/// answers.
+fn tool_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
+    match item {
+        ResponseInputOutputItem::FunctionToolCall { call_id, .. }
+        | ResponseInputOutputItem::CustomToolCall { call_id, .. }
+        | ResponseInputOutputItem::ComputerCall { call_id, .. }
+        | ResponseInputOutputItem::ShellCall { call_id, .. }
+        | ResponseInputOutputItem::ApplyPatchCall { call_id, .. }
+        | ResponseInputOutputItem::LocalShellCall { call_id, .. } => Some(call_id),
+        _ => None,
+    }
+}
+
+/// The call id a tool output item answers.
+fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
+    match item {
+        ResponseInputOutputItem::FunctionCallOutput { call_id, .. }
+        | ResponseInputOutputItem::CustomToolCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ComputerCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ShellCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ApplyPatchCallOutput { call_id, .. } => Some(call_id),
+        _ => None,
+    }
+}
+
 pub fn generate_id(prefix: &str) -> String {
     use rand::Rng;
     let mut rng = rand::rng();
@@ -4360,6 +4405,49 @@ impl ResponseReasoningContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The outputs of calls not among the items go; every other item keeps
+    /// its place.
+    #[test]
+    fn without_outputs_of_missing_calls_keeps_the_outputs_of_the_calls_present() {
+        let items: Vec<ResponseInputOutputItem> = serde_json::from_value(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+            {"type": "custom_tool_call_output", "call_id": "call_gone_too", "output": "3"},
+            {"type": "message", "id": "msg_2", "role": "assistant",
+             "content": [{"type": "output_text", "text": "ok", "annotations": []}]},
+        ]))
+        .expect("the items deserialize");
+
+        let kept = without_outputs_of_missing_calls(items);
+
+        let kinds: Vec<String> = kept
+            .iter()
+            .map(|item| {
+                serde_json::to_value(item).expect("an item serializes")["type"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "function_call",
+                "function_call_output",
+                "message"
+            ]
+        );
+        assert!(matches!(
+            &kept[2],
+            ResponseInputOutputItem::FunctionCallOutput { call_id, .. } if call_id == "call_kept"
+        ));
+    }
 
     /// The Responses API usage of a chat-style usage: both detail objects
     /// present, zero included, the cached and reasoning counts from the
