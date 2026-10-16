@@ -1769,3 +1769,65 @@ def test_require_python_media_mode_is_the_servicers_refusal_as_a_configuration_e
     )
     # A launcher namespace without the flags (no plugin loaded) reads the environment.
     assert rust.require_python_media_mode(argparse.Namespace(model="org/m"), environ={}) == "off"
+
+
+def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
+    monkeypatch, caplog
+):
+    """A launcher without --kv-events-config left vLLM publishing nothing under
+    the Python servicer, while the Rust path turned the publisher on by itself:
+    the switch applies the same default to the namespace before the launcher's
+    own serve_grpc builds the engine from it, with the same opt-out and the
+    same log line, and hands a Rust-path namespace over as parsed (that path
+    applies its own)."""
+    import logging
+
+    from smg_grpc_servicer.vllm import launcher_switch
+
+    served = []
+
+    async def serve_grpc(args):
+        served.append(args)
+
+    switched = launcher_switch.with_servicer_switch(serve_grpc)
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
+    expected = {"enable_kv_cache_events": True, "publisher": "zmq"}
+    # Nothing given: the launcher builds the engine from a namespace with the
+    # publisher on, and the operator reads why and how to decide otherwise.
+    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(switched(args))
+    assert served == [args] and args.kv_events_config == expected
+    assert (
+        "KV event publishing enabled: no --kv-events-config was given, so vLLM's ZMQ "
+        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+        f"--kv-events-config to configure it, or set {rust.KV_EVENTS_ENV}=0 to leave it off"
+    ) in caplog.text
+    # The opt-out: the namespace reaches the launcher as parsed, and nothing is said.
+    caplog.clear()
+    monkeypatch.setenv(rust.KV_EVENTS_ENV, "off")
+    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(switched(args))
+    assert served[-1] is args and args.kv_events_config is None
+    assert "KV event publishing" not in caplog.text
+    # An explicit configuration is kept as given, off included.
+    monkeypatch.delenv(rust.KV_EVENTS_ENV)
+    given = {"enable_kv_cache_events": False, "publisher": "null"}
+    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=given)
+    asyncio.run(switched(args))
+    assert served[-1] is args and args.kv_events_config is given
+    # The Rust path: its launcher applies the default itself, so the switch
+    # hands the namespace over as parsed.
+    handed = []
+
+    async def serve_rust(args):
+        handed.append(args.kv_events_config)
+        return 0
+
+    monkeypatch.setattr(rust, "serve_rust", serve_rust)
+    args = argparse.Namespace(servicer_impl="rust", model="org/m", kv_events_config=None)
+    with pytest.raises(SystemExit):
+        asyncio.run(switched(args))
+    assert handed == [None] and served[-1] is not args

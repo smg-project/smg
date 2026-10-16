@@ -2,7 +2,8 @@
 launchers: the servicer switch (which implementation serves the process, from
 the launcher's flag or the engine's variable), the launcher's knobs, the
 KV-events default (the engine's publisher on, at a free port, unless the
-launcher or its variable says otherwise), a free port and socket directory
+launcher or its variable says otherwise, and its log line; the Python
+servicer's entry points apply the same rule), a free port and socket directory
 for the handshake,
 the engine as a ``Popen``-shaped handle (one spawned headless engine, the
 engine cores a manager started from this process, or the scheduler processes
@@ -477,6 +478,20 @@ def apply_kv_events_default(
         )
         return None
     return config
+
+
+def announce_kv_events_default(engine: str, env_name: str, log: logging.Logger = logger) -> None:
+    """The line an operator reads once :func:`apply_kv_events_default` turned
+    the publisher on, the same under either servicer implementation: what is
+    on, and the two ways to decide otherwise (``engine`` is the engine's name
+    in the line, ``env_name`` its opt-out variable)."""
+    log.info(
+        "KV event publishing enabled: no --kv-events-config was given, so %s's ZMQ "
+        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+        "--kv-events-config to configure it, or set %s=0 to leave it off",
+        engine,
+        env_name,
+    )
 
 
 # How long a servicer that decided to exit over its engine may spend in the
@@ -1141,13 +1156,7 @@ class RustLauncher:
         self.prepare(args)
         servicer.init_servicer_tracing()
         if self.kv_events_default(args) is not None:
-            logger.info(
-                "KV event publishing enabled: no --kv-events-config was given, so %s's ZMQ "
-                "publisher is on at a port found free on this host and SubscribeKvEvents relays "
-                "it; pass --kv-events-config to name the endpoint, or set %s=0 to leave it off",
-                self.engine,
-                self.kv_events_env,
-            )
+            announce_kv_events_default(self.engine, self.kv_events_env)
         facts = self.facts(args)
         engine_count = facts["data_parallel_size"]
         tokenizer_dir = self.tokenizer_dir(args)

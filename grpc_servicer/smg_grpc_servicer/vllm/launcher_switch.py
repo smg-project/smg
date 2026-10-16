@@ -53,6 +53,7 @@ import functools
 import importlib
 import importlib.abc
 import importlib.metadata
+import logging
 import re
 import sys
 import types
@@ -129,19 +130,29 @@ def supported_launchers() -> str:
     )
 
 
+logger = logging.getLogger(__name__)
+
+
 def with_servicer_switch(
     serve_grpc: Callable[..., Awaitable[Any]],
 ) -> Callable[..., Awaitable[Any]]:
     """``serve_grpc`` behind the flag: Rust takes the process (and its exit
-    code), Python runs the launcher's own coroutine."""
+    code); Python runs the launcher's own coroutine, on a namespace with the
+    KV-events default applied."""
     if getattr(serve_grpc, _SWITCH_MARK, False):
         return serve_grpc
 
     @functools.wraps(serve_grpc)
     async def serve_grpc_with_switch(args: Any, *rest: Any, **kwargs: Any) -> Any:
-        from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
+        from smg_grpc_servicer.rust_lifecycle import (
+            ServicerConfigError,
+            announce_kv_events_default,
+            configuration_exit,
+        )
         from smg_grpc_servicer.vllm.rust import (
+            KV_EVENTS_ENV,
             configure_logging,
+            default_kv_events_config,
             require_python_media_mode,
             resolve_servicer_impl,
             serve_rust,
@@ -160,6 +171,14 @@ def with_servicer_switch(
             # code 2, not the launcher's traceback.
             configure_logging()
             raise configuration_exit(error) from None
+        # The Python servicer gets the Rust path's KV-events default too: a
+        # namespace without --kv-events-config has vLLM's ZMQ publisher on
+        # before the launcher builds the engine from it, so SubscribeKvEvents
+        # relays the events a cache-aware router routes by (the rule, the
+        # opt-out and the log line of `RustLauncher.serve`).
+        if default_kv_events_config(args) is not None:
+            configure_logging()
+            announce_kv_events_default("vLLM", KV_EVENTS_ENV, logger)
         return await serve_grpc(args, *rest, **kwargs)
 
     setattr(serve_grpc_with_switch, _SWITCH_MARK, True)

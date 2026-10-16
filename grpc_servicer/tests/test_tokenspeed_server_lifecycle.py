@@ -352,3 +352,68 @@ def test_an_engine_that_does_not_start_is_a_named_exit(monkeypatch, server_mod, 
     assert "The TokenSpeed engine did not start" in caplog.text
     assert "launch_engine() returned no AsyncLLM" in caplog.text
     assert events == []
+
+
+def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
+    monkeypatch, server_mod, caplog
+):
+    """A launcher without --kv-events-config left TokenSpeed publishing nothing
+    under the Python servicer, while the Rust path turned the publisher on by
+    itself: `serve_grpc` applies the same default to the server args before
+    the engine and the servicer are built from them, with the same opt-out and
+    the same log line; an encode worker, which has no KV cache, is left as
+    given."""
+    from smg_grpc_servicer.tokenspeed import rust as tokenspeed_rust
+
+    monkeypatch.delenv(tokenspeed_rust.KV_EVENTS_ENV, raising=False)
+    servicer_module = sys.modules["smg_grpc_servicer.tokenspeed.servicer"]
+
+    def serve(configure):
+        """One start up to a signal, every collaborator stood in for; what the
+        engine launch and the server args ended up with."""
+        events = []
+        server_args = _wire(monkeypatch, server_mod, events)
+        configure(server_args)
+        seen = {}
+
+        def launch_engine(args):
+            seen["launched_with"] = getattr(args, "kv_events_config", None)
+            return object(), {}
+
+        monkeypatch.setattr(server_mod, "launch_engine", launch_engine)
+
+        async def exercise():
+            task = asyncio.create_task(server_mod.serve_grpc(server_args))
+            while "server-start" not in events:
+                await asyncio.sleep(0)
+            _stop_event_of(task).set()
+            return await task
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert asyncio.run(exercise()) is None
+        servicer = servicer_module.TokenSpeedSchedulerServicer.instances[-1]
+        assert servicer.kwargs["server_args"] is server_args
+        return seen["launched_with"], getattr(server_args, "kv_events_config", None)
+
+    # Nothing given: the engine starts with the publisher on, the servicer
+    # reads the same server args, and the operator reads why.
+    default = '{"enable_kv_cache_events": true, "publisher": "zmq"}'
+    assert tokenspeed_rust.DEFAULT_KV_EVENTS_CONFIG == default
+    assert serve(lambda args: None) == (default, default)
+    assert (
+        "KV event publishing enabled: no --kv-events-config was given, so TokenSpeed's ZMQ "
+        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+        f"--kv-events-config to configure it, or set {tokenspeed_rust.KV_EVENTS_ENV}=0 to leave it off"
+    ) in caplog.text
+    # The opt-out: the server args reach the engine as parsed, and nothing is said.
+    monkeypatch.setenv(tokenspeed_rust.KV_EVENTS_ENV, "false")
+    assert serve(lambda args: None) == (None, None)
+    assert "KV event publishing" not in caplog.text
+    # An explicit configuration is kept as given, off included.
+    monkeypatch.delenv(tokenspeed_rust.KV_EVENTS_ENV)
+    given = '{"enable_kv_cache_events": false}'
+    assert serve(lambda args: setattr(args, "kv_events_config", given)) == (given, given)
+    # An encode worker runs the vision tower only: no KV cache, nothing to turn on.
+    assert serve(lambda args: setattr(args, "disaggregation_mode", "encode")) == (None, None)
+    assert "KV event publishing" not in caplog.text

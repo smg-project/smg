@@ -629,3 +629,57 @@ def test_request_tracing_initializes_after_the_runtime_context_is_published(
     with pytest.raises(RuntimeError, match="stop here"):
         asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="null")))
     assert events == ["publish:tokenizer", "tracing", "launch"]
+
+
+def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
+    monkeypatch, server_mod, caplog
+):
+    """A launcher without --kv-events-config left SGLang publishing nothing
+    under the Python servicer, while the Rust path turned the publisher on by
+    itself: `serve_grpc` applies the same default to the server args before
+    the schedulers and the servicer are built from them, with the same opt-out
+    and the same log line."""
+    from smg_grpc_servicer.sglang import rust as sglang_rust
+
+    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
+
+    def serve(configure):
+        """One start with every collaborator stood in for; what the scheduler
+        launch and the server args ended up with."""
+        events = []
+        server_args = _serving_server(monkeypatch, server_mod, events, scheduler_exited=False)
+        configure(server_args)
+        launch = server_mod._launch_scheduler_with_request_manager
+        seen = {}
+
+        async def recording_launch(**kwargs):
+            seen["launched_with"] = getattr(kwargs["server_args"], "kv_events_config", None)
+            return await launch(**kwargs)
+
+        monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", recording_launch)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert asyncio.run(server_mod.serve_grpc(server_args, model_info={})) is None
+        assert server_mod.SGLangSchedulerServicer.call_args.kwargs["server_args"] is server_args
+        return seen["launched_with"], getattr(server_args, "kv_events_config", None)
+
+    # Nothing given: the schedulers start with the publisher on, the servicer
+    # reads the same server args, and the operator reads why.
+    default = '{"publisher": "zmq"}'
+    assert sglang_rust.DEFAULT_KV_EVENTS_CONFIG == default
+    assert serve(lambda args: None) == (default, default)
+    assert (
+        "KV event publishing enabled: no --kv-events-config was given, so SGLang's ZMQ "
+        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+        f"--kv-events-config to configure it, or set {sglang_rust.KV_EVENTS_ENV}=0 to leave it off"
+    ) in caplog.text
+    # The opt-out: the server args reach the schedulers as parsed, and nothing is said.
+    monkeypatch.setenv(sglang_rust.KV_EVENTS_ENV, "0")
+    assert serve(lambda args: None) == (None, None)
+    assert "KV event publishing" not in caplog.text
+    # An explicit configuration is kept as given, off included.
+    monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV)
+    given = '{"publisher": "null"}'
+    assert serve(lambda args: setattr(args, "kv_events_config", given)) == (given, given)
+    assert "KV event publishing" not in caplog.text

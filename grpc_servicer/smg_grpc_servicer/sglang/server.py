@@ -31,13 +31,20 @@ from smg_grpc_servicer.hostport import host_port, loopback_target
 from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
+    announce_kv_events_default,
     configuration_exit,
     guarded_exit,
 )
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
-from smg_grpc_servicer.sglang.rust import SERVICER_IMPL_ENV, serve_rust, servicer_impl_source
+from smg_grpc_servicer.sglang.rust import (
+    KV_EVENTS_ENV,
+    SERVICER_IMPL_ENV,
+    default_kv_events_config,
+    serve_rust,
+    servicer_impl_source,
+)
 from smg_grpc_servicer.sglang.scheduler_launcher import (
     SchedulerStartError,
     launch_scheduler_process_only,
@@ -136,6 +143,14 @@ async def serve_grpc(
         # A knob the servicer cannot use: one named ERROR line and exit code
         # 2, before any scheduler or engine work, not a traceback.
         raise configuration_exit(error, logger) from None
+
+    # The Python servicer gets the Rust path's KV-events default too: server
+    # args without --kv-events-config have SGLang's ZMQ publisher on before
+    # the schedulers and the servicer are built from them, so SubscribeKvEvents
+    # relays the events a cache-aware router routes by (the rule, the opt-out
+    # and the log line of `RustLauncher.serve`).
+    if default_kv_events_config(server_args) is not None:
+        announce_kv_events_default("SGLang", KV_EVENTS_ENV, logger)
 
     # Install the process-wide runtime context before any sglang machinery
     # runs here. Since 0.5.18 the config is published per process and read

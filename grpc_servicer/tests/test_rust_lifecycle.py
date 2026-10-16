@@ -921,3 +921,20 @@ def test_a_block_with_a_held_port_is_passed_over_for_another(monkeypatch):
     monkeypatch.setattr(rust_lifecycle, "_bindable", lambda port: False)
     with pytest.raises(rust_lifecycle.ServicerConfigError, match="--kv-events-config"):
         rust_lifecycle.free_kv_events_endpoint(ranks=2)
+
+
+def test_the_kv_events_default_announcement_is_one_line_for_both_implementations(caplog):
+    """What the operator reads once the default applied, under either servicer
+    implementation: the engine's name, what is on, and the two ways to decide
+    otherwise; through the caller's own logger when it hands one over."""
+    env = "SMG_TEST_SERVICER_KV_EVENTS"
+    with caplog.at_level("INFO"):
+        rust_lifecycle.announce_kv_events_default("Engine", env)
+        rust_lifecycle.announce_kv_events_default("Engine", env, logging.getLogger("test.entry"))
+    assert [record.name for record in caplog.records] == [rust_lifecycle.logger.name, "test.entry"]
+    line = (
+        "KV event publishing enabled: no --kv-events-config was given, so Engine's ZMQ "
+        "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+        f"--kv-events-config to configure it, or set {env}=0 to leave it off"
+    )
+    assert [record.getMessage() for record in caplog.records] == [line, line]
