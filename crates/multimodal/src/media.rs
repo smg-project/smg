@@ -41,10 +41,16 @@ const MAX_REDIRECTS: usize = 10;
 const DEFAULT_IMAGE_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_VIDEO_MAX_DECODED_BYTES: usize = 1024 * 1024 * 1024;
-/// Source frames one video decode may run through, by default: a dense
-/// sampling of a clip hours long is refused before any decoder starts
-/// (`SMG_VIDEO_MAX_DECODE_FRAMES`).
-const DEFAULT_VIDEO_MAX_DECODE_FRAMES: usize = 262_144;
+/// Pixels one video decode may run through (the source frames it decodes,
+/// each of the clip's width and height), by default: a decode past this is
+/// refused before any decoder starts (`SMG_VIDEO_MAX_DECODE_PIXELS`). Decode
+/// work follows pixels, not frames, so the one cap is ten hours of 1280x720
+/// at 30 fps, forty hours of 640x360, four and a half hours of 1920x1080 and
+/// an hour of 3840x2160: well past what the default process budget fits on
+/// a well-provisioned decoder (about 80 s of decode on sixteen threads at
+/// the measured rate), so that only a decode the budget could not have
+/// fitted anyway is refused outright; the budget bounds the rest.
+const DEFAULT_VIDEO_MAX_DECODE_PIXELS: u64 = 1_000_000_000_000;
 /// A clip is decoded by seeking to its picks only when it is at least this
 /// long, in frames, and holds at least [`SEEK_PLAN_MIN_FRAMES_PER_PICK`]
 /// frames per distinct pick: looking into a plan reads the stream's packet
@@ -61,7 +67,7 @@ static VIDEO_PROCESS_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 static IMAGE_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
-static VIDEO_MAX_DECODE_FRAMES: OnceLock<usize> = OnceLock::new();
+static VIDEO_MAX_DECODE_PIXELS: OnceLock<u64> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static FFMPEG_PASSTHROUGH_FLAG: OnceLock<[&'static str; 2]> = OnceLock::new();
 static ACTIVE_VIDEO_DECODES: AtomicUsize = AtomicUsize::new(0);
@@ -2282,13 +2288,15 @@ fn video_max_decoded_bytes() -> usize {
     )
 }
 
-/// Source frames one video decode may run through (`SMG_VIDEO_MAX_DECODE_FRAMES`).
-fn video_max_decode_frames() -> usize {
-    env_byte_limit(
-        &VIDEO_MAX_DECODE_FRAMES,
-        "SMG_VIDEO_MAX_DECODE_FRAMES",
-        DEFAULT_VIDEO_MAX_DECODE_FRAMES,
-    )
+/// Pixels one video decode may run through (`SMG_VIDEO_MAX_DECODE_PIXELS`).
+fn video_max_decode_pixels() -> u64 {
+    *VIDEO_MAX_DECODE_PIXELS.get_or_init(|| {
+        std::env::var("SMG_VIDEO_MAX_DECODE_PIXELS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|pixels| *pixels > 0)
+            .unwrap_or(DEFAULT_VIDEO_MAX_DECODE_PIXELS)
+    })
 }
 
 /// The clip's length as its errors state it.
@@ -2303,22 +2311,28 @@ fn clip_length(metadata: VideoMetadata) -> String {
 }
 
 /// Refuses, before any decoder starts, a decode that would run through more
-/// source frames than the cap allows: the clip is the client's, and so is the
-/// answer (a shorter clip or a smaller frame budget).
+/// pixels than the cap allows (`frames` source frames, each of the clip's
+/// width and height): the clip is the client's, and so is the answer (a
+/// shorter or smaller clip, or a smaller frame budget).
 fn ensure_decode_work_limit(
     frames: usize,
     selection: &FrameSelection,
     metadata: VideoMetadata,
 ) -> Result<(), MediaConnectorError> {
-    let limit = video_max_decode_frames();
-    if frames <= limit {
+    let limit = video_max_decode_pixels();
+    let pixels = (frames as u64)
+        .saturating_mul(u64::from(metadata.width))
+        .saturating_mul(u64::from(metadata.height));
+    if pixels <= limit {
         return Ok(());
     }
     Err(MediaConnectorError::VideoDecode(format!(
-        "sampling {} frames of {} means decoding {frames} of its {} source frames, over SMG_VIDEO_MAX_DECODE_FRAMES={limit}; a shorter clip or a smaller frame budget fits it",
+        "sampling {} frames of {} means decoding {frames} of its {} source frames of {}x{}, {pixels} pixels, over SMG_VIDEO_MAX_DECODE_PIXELS={limit}; a shorter or smaller clip or a smaller frame budget fits it",
         selection.frame_indices.len(),
         clip_length(metadata),
-        selection.total_frames
+        selection.total_frames,
+        metadata.width,
+        metadata.height
     )))
 }
 
@@ -7339,6 +7353,9 @@ mod seek_decode_tests {
         );
     }
 
+    /// The cap is in pixels, so it follows the clip's size: ten hours at
+    /// 30 fps are 1,080,000 source frames, 3.3 gigapixels at 64x48 and
+    /// 2.2 terapixels at 1920x1080, over the terapixel.
     #[test]
     fn a_decode_past_the_work_cap_is_refused_before_it_starts() {
         let metadata = long_clip_metadata();
@@ -7346,16 +7363,40 @@ mod seek_decode_tests {
             .expect("a selection");
         assert_eq!(selection.frame_indices.len(), 768);
         assert_eq!(selection.sequential_frames(), 1_080_000);
-        let error = ensure_decode_work_limit(selection.sequential_frames(), &selection, metadata)
-            .expect_err("ten hours at 30 fps are over the cap");
+        assert!(
+            ensure_decode_work_limit(selection.sequential_frames(), &selection, metadata).is_ok()
+        );
+        let full_hd = VideoMetadata {
+            width: 1920,
+            height: 1080,
+            ..metadata
+        };
+        let error = ensure_decode_work_limit(selection.sequential_frames(), &selection, full_hd)
+            .expect_err("ten hours of 1920x1080 at 30 fps are over the cap");
         let text = error.to_string();
         assert!(
-            text.contains("decoding 1080000 of its 1080000 source frames")
-                && text.contains("SMG_VIDEO_MAX_DECODE_FRAMES")
+            text.contains(
+                "decoding 1080000 of its 1080000 source frames of 1920x1080, 2239488000000 pixels"
+            ) && text.contains("SMG_VIDEO_MAX_DECODE_PIXELS=1000000000000")
                 && text.contains("a clip of 36000 s"),
             "{text}"
         );
-        assert!(ensure_decode_work_limit(1_000, &selection, metadata).is_ok());
+        // The frames one cap admits scale with the frame: four times as many
+        // at 640x360 as at 1280x720.
+        let hd = VideoMetadata {
+            width: 1280,
+            height: 720,
+            ..metadata
+        };
+        assert!(ensure_decode_work_limit(1_085_069, &selection, hd).is_ok());
+        assert!(ensure_decode_work_limit(1_085_070, &selection, hd).is_err());
+        let sd = VideoMetadata {
+            width: 640,
+            height: 360,
+            ..metadata
+        };
+        assert!(ensure_decode_work_limit(4_340_277, &selection, sd).is_ok());
+        assert!(ensure_decode_work_limit(4_340_278, &selection, sd).is_err());
     }
 
     #[test]
