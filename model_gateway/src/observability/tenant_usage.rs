@@ -22,6 +22,11 @@
 //! request. The scrape walks the table, which is why the families are
 //! rendered here rather than recorded through the exporter.
 //!
+//! A buffered response is booked when it is built. A streamed response is
+//! booked by its [`StreamUsage`] guard: at its normal end with the usage
+//! block's numbers, and when it ends any other way (the client went away,
+//! the engine failed mid-stream) with what was counted up to that point.
+//!
 //! A request is one engine round trip: a Responses call whose tool loop runs
 //! several iterations books each of them, buffered or streamed, so the token
 //! sums match what the engine served and the `requests` count says how many
@@ -34,7 +39,7 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
@@ -95,6 +100,119 @@ pub struct RequestUsage {
     pub completion_tokens: u64,
     /// From the request's dispatch to its last token.
     pub elapsed: Duration,
+}
+
+/// The usage of one streamed response, booked at its end whichever way it
+/// ends.
+///
+/// A stream's completion tokens are counted as they pass
+/// ([`add_completion_tokens`](Self::add_completion_tokens)); its normal end
+/// books the authoritative numbers through [`finish`](Self::finish). A stream
+/// that ends any other way never reaches that point: the client went away and
+/// the next send into the response body failed, the engine's stream ended
+/// with an error, a prefill leg failed before the first token. The guard's
+/// `Drop` books those with what it has: the prompt as the gateway tokenized
+/// it at dispatch, the completion tokens streamed so far, the time since the
+/// stream began. One booking per stream either way: `finish` takes the guard,
+/// and a guard that was finished has nothing left to book when it drops.
+///
+/// With accounting off (no table installed) the guard is inert: `begin`
+/// clones nothing and every method is one branch.
+#[must_use = "a guard dropped at once books an empty stream; keep it to the stream's end"]
+pub struct StreamUsage {
+    /// `None` with accounting off, and once the stream is booked.
+    booking: Option<Booking>,
+}
+
+/// Where and what a stream books.
+struct Booking {
+    table: &'static TenantUsage,
+    tenant: Box<str>,
+    model: Box<str>,
+    /// The prompt's length as tokenized at dispatch.
+    prompt_tokens: u64,
+    /// Completion tokens streamed so far. Atomic so the fan-out of a batched
+    /// request can count into one guard by shared reference; one relaxed add
+    /// per chunk.
+    completion_tokens: AtomicU64,
+    start: Instant,
+}
+
+impl StreamUsage {
+    /// The guard of a stream for `tenant` and `model` whose prompt, as
+    /// tokenized at dispatch, is `prompt_tokens` long. Books to the installed
+    /// table; inert when none is.
+    #[inline]
+    pub fn begin(tenant: &str, model: &str, prompt_tokens: u64) -> Self {
+        Self::begin_on(
+            INSTALLED.get().map(|table| &**table),
+            tenant,
+            model,
+            prompt_tokens,
+        )
+    }
+
+    /// [`begin`](Self::begin) on `table`: the installed one, or a test's or a
+    /// benchmark's own. `None` is accounting off.
+    pub fn begin_on(
+        table: Option<&'static TenantUsage>,
+        tenant: &str,
+        model: &str,
+        prompt_tokens: u64,
+    ) -> Self {
+        Self {
+            booking: table.map(|table| Booking {
+                table,
+                tenant: tenant.into(),
+                model: model.into(),
+                prompt_tokens,
+                completion_tokens: AtomicU64::new(0),
+                start: Instant::now(),
+            }),
+        }
+    }
+
+    /// Count `tokens` completion tokens the stream delivered.
+    #[inline]
+    pub fn add_completion_tokens(&self, tokens: u64) {
+        if let Some(booking) = &self.booking {
+            booking
+                .completion_tokens
+                .fetch_add(tokens, Ordering::Relaxed);
+        }
+    }
+
+    /// Book the stream's normal end: `completion_tokens`, the prompt count
+    /// the end knows (else the one counted at dispatch), and `elapsed`, the
+    /// stream's duration as the metrics measure it.
+    pub fn finish(mut self, prompt_tokens: Option<u64>, completion_tokens: u64, elapsed: Duration) {
+        if let Some(booking) = self.booking.take() {
+            booking.book(RequestUsage {
+                prompt_tokens: prompt_tokens.unwrap_or(booking.prompt_tokens),
+                completion_tokens,
+                elapsed,
+            });
+        }
+    }
+}
+
+impl Booking {
+    fn book(&self, usage: RequestUsage) {
+        self.table.record(&self.tenant, &self.model, usage);
+    }
+}
+
+impl Drop for StreamUsage {
+    /// A stream that ended without its normal end: what was counted so far.
+    fn drop(&mut self) {
+        if let Some(booking) = self.booking.take() {
+            booking.book(RequestUsage {
+                prompt_tokens: booking.prompt_tokens,
+                completion_tokens: booking.completion_tokens.load(Ordering::Relaxed),
+                elapsed: booking.start.elapsed(),
+            });
+        }
+    }
 }
 
 /// The sums of one row: a tenant and model pair, a tenant, or the table.
@@ -631,5 +749,88 @@ mod tests {
         let mut out = String::new();
         render_into(&mut out);
         assert!(out.is_empty() || installed().is_some());
+    }
+
+    /// A table of a test's own with the `'static` lifetime a guard books to.
+    fn leaked_table(max_tenants: usize) -> &'static TenantUsage {
+        Box::leak(Box::new(TenantUsage::new(max_tenants)))
+    }
+
+    #[test]
+    fn a_finished_stream_books_the_end_numbers_once() {
+        let table = leaked_table(4);
+        let stream = StreamUsage::begin_on(Some(table), "auth:a", "m", 100);
+        stream.add_completion_tokens(3);
+        stream.add_completion_tokens(4);
+        stream.finish(Some(120), 9, Duration::from_secs(2));
+
+        let snapshot = table.snapshot();
+        let row = tenant(&snapshot, "auth:a");
+        assert_eq!(row.totals.requests, 1);
+        assert_eq!(row.totals.prompt_tokens, 120, "the end's prompt count");
+        assert_eq!(
+            row.totals.completion_tokens, 9,
+            "the end's completion count"
+        );
+        assert!((row.totals.request_seconds - 2.0).abs() < 1e-9);
+        assert_eq!(row.models[0].model, "m");
+    }
+
+    #[test]
+    fn a_finished_stream_without_an_end_prompt_count_books_the_dispatch_count() {
+        let table = leaked_table(4);
+        let stream = StreamUsage::begin_on(Some(table), "auth:a", "m", 100);
+        stream.finish(None, 5, Duration::from_millis(10));
+
+        let snapshot = table.snapshot();
+        assert_eq!(tenant(&snapshot, "auth:a").totals.prompt_tokens, 100);
+        assert_eq!(tenant(&snapshot, "auth:a").totals.completion_tokens, 5);
+    }
+
+    #[test]
+    fn a_dropped_stream_books_the_dispatch_prompt_and_the_tokens_streamed_once() {
+        let table = leaked_table(4);
+        let stream = StreamUsage::begin_on(Some(table), "auth:a", "m", 100);
+        stream.add_completion_tokens(3);
+        stream.add_completion_tokens(4);
+        thread::sleep(Duration::from_millis(2));
+        drop(stream);
+
+        let snapshot = table.snapshot();
+        let row = tenant(&snapshot, "auth:a");
+        assert_eq!(row.totals.requests, 1);
+        assert_eq!(
+            row.totals.prompt_tokens, 100,
+            "the prompt as tokenized at dispatch"
+        );
+        assert_eq!(
+            row.totals.completion_tokens, 7,
+            "the tokens streamed before the end"
+        );
+        assert!(
+            row.totals.request_seconds >= 0.002,
+            "{}",
+            row.totals.request_seconds
+        );
+    }
+
+    #[test]
+    fn a_stream_dropped_without_a_token_books_one_request_of_the_prompt_alone() {
+        let table = leaked_table(4);
+        drop(StreamUsage::begin_on(Some(table), "auth:a", "m", 42));
+
+        let snapshot = table.snapshot();
+        assert_eq!(tenant(&snapshot, "auth:a").totals.requests, 1);
+        assert_eq!(tenant(&snapshot, "auth:a").totals.prompt_tokens, 42);
+        assert_eq!(tenant(&snapshot, "auth:a").totals.completion_tokens, 0);
+    }
+
+    #[test]
+    fn a_stream_with_accounting_off_holds_nothing() {
+        let stream = StreamUsage::begin_on(None, "auth:a", "m", 100);
+        assert!(stream.booking.is_none());
+        stream.add_completion_tokens(1);
+        stream.finish(Some(1), 1, Duration::ZERO);
+        drop(StreamUsage::begin_on(None, "auth:a", "m", 100));
     }
 }

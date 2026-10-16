@@ -46,7 +46,11 @@ use super::{
 use crate::{
     config::ParserChoice,
     middleware::{TenantKey, TenantRequestMeta},
-    observability::{cache_trace, metrics::Metrics, tenant_usage::UNRESOLVED_TENANT},
+    observability::{
+        cache_trace,
+        metrics::Metrics,
+        tenant_usage::{StreamUsage, UNRESOLVED_TENANT},
+    },
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
@@ -551,6 +555,22 @@ impl ExecutionPlan {
         }
     }
 
+    /// Prompt tokens the plan dispatches: the tokenized input's length, summed
+    /// over a batch's prompts; zero for an input the engine tokenizes itself.
+    /// An embedding request never streams, and its buffered end books the
+    /// response's own count.
+    pub(crate) fn prompt_len(&self) -> usize {
+        match self {
+            Self::Single(ProtoRequest::Generate(request))
+            | Self::PrefillDecode(request)
+            | Self::EncodePrefillDecode { request } => request.prompt_len(),
+            Self::Single(ProtoRequest::Embed(_)) => 0,
+            Self::Batch { requests, .. } => {
+                requests.iter().map(ProtoGenerateRequest::prompt_len).sum()
+            }
+        }
+    }
+
     pub(crate) fn request_type(&self) -> &'static str {
         match self {
             Self::Single(ProtoRequest::Generate(_))
@@ -825,12 +845,26 @@ pub(crate) struct DispatchMetadata {
     /// The caller's tenant key, carried to the end of the response (the last
     /// token of a stream) for the usage row the request is booked to.
     pub tenant_key: Option<TenantKey>,
+    /// The prompt's length as tokenized at dispatch (summed over a batch's
+    /// prompts; zero for an input the engine tokenizes itself): what a stream
+    /// that ends before the engine reports its count is booked with.
+    pub prompt_tokens: u32,
 }
 
 impl DispatchMetadata {
     /// The tenant the request's usage is booked to.
     pub fn usage_tenant(&self) -> &str {
         usage_tenant(self.tenant_key.as_ref())
+    }
+
+    /// The usage guard of a stream of this dispatch: it books the stream at
+    /// its end, whichever way it ends ([`StreamUsage`]).
+    pub fn begin_usage(&self) -> StreamUsage {
+        StreamUsage::begin(
+            self.usage_tenant(),
+            &self.model,
+            u64::from(self.prompt_tokens),
+        )
     }
 }
 
