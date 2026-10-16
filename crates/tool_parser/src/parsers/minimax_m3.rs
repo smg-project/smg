@@ -1080,7 +1080,8 @@ impl<'a> Elements<'a> {
     /// the running count passes it, so a leaf the budget refuses costs the walk up to the budget
     /// and no more. Worked out once per leaf schema per invoke: a leaf refused once is refused
     /// again, the budget only shrinking. The walks, refused ones too, spend [`WALK_BYTES`] at the
-    /// pace of the bytes they size; past it a leaf is refused without a walk.
+    /// pace of the bytes they size; past it a leaf with pointers is refused without a walk, while
+    /// a leaf without pointers, which walks nothing but itself, is neither bound nor charged.
     fn reached_within(&mut self, schema: &'a Value) -> Option<(usize, Vec<Reached<'a>>)> {
         let key = std::ptr::from_ref(schema) as usize;
         if let Some(known) = self.reached_by_leaf.get(&key) {
