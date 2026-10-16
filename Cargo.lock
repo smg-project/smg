@@ -4497,6 +4497,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "clap",
  "engine-servicer",
  "engine-zmq-client",
