@@ -39,6 +39,7 @@ import sys
 from typing import Any
 
 # Loaded in every vLLM process: nothing heavier than the package init here.
+from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV
 from smg_grpc_servicer.vllm.launcher_switch import (
     LAUNCHER_MODULES,
@@ -46,8 +47,8 @@ from smg_grpc_servicer.vllm.launcher_switch import (
     install_launcher_switch,
 )
 
-SERVICER_IMPL_FLAG = "--servicer-impl"
-SERVICER_IMPL_CHOICES = ("python", "rust")
+SERVICER_IMPL_FLAG = rust_lifecycle.SERVICER_IMPL_FLAG
+SERVICER_IMPL_CHOICES = rust_lifecycle.IMPLS
 _FLAG_MARK = "_smg_servicer_impl_flag"
 
 
@@ -55,14 +56,9 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     """Add ``--servicer-impl`` to a parser that serves gRPC (``vllm serve``'s,
     which defines ``--grpc``, or the stock gRPC launcher's own, see
     :func:`serves_grpc`) and lacks it; returns whether it was added."""
-    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
-    if SERVICER_IMPL_FLAG in actions or not serves_grpc(parser):
-        return False
-    parser.add_argument(
-        SERVICER_IMPL_FLAG,
-        dest="servicer_impl",
-        choices=list(SERVICER_IMPL_CHOICES),
-        default=None,
+    return rust_lifecycle.add_servicer_impl_argument(
+        parser,
+        applies=serves_grpc,
         help=(
             "Which implementation serves the gRPC contract under --grpc: the Python "
             "servicer (default) or the Rust one (smg.servicer.VllmGrpcServer, with the "
@@ -73,7 +69,6 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
             "before the engine is built."
         ),
     )
-    return True
 
 
 def serves_grpc(parser: argparse.ArgumentParser) -> bool:

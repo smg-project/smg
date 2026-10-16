@@ -22,10 +22,11 @@ import os
 from typing import Any
 
 # Loaded in every SGLang process: nothing heavier than the package init here.
+from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.sglang import SERVICER_IMPL_ENV
 
-SERVICER_IMPL_FLAG = "--servicer-impl"
-SERVICER_IMPL_CHOICES = ("python", "rust")
+SERVICER_IMPL_FLAG = rust_lifecycle.SERVICER_IMPL_FLAG
+SERVICER_IMPL_CHOICES = rust_lifecycle.IMPLS
 # SGLang's parser builder; the flag joins each parser after it ran.
 ADD_CLI_ARGS = "sglang.srt.server_args.ServerArgs.add_cli_args"
 
@@ -35,6 +36,12 @@ class _State:
 
     def __init__(self) -> None:
         self.parsed: str | None = None
+
+    def forget_parse(self) -> None:
+        """A new parser is a new parse: the choice an earlier parser in this
+        process remembered is dropped, so a parse without the flag falls
+        through to the environment."""
+        self.parsed = None
 
 
 _state = _State()
@@ -71,23 +78,16 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     ``prepare_server_args``): the choice an earlier parser in this process
     remembered is dropped, so a parse without the flag falls through to the
     environment."""
-    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
-    if SERVICER_IMPL_FLAG in actions:
-        return False
-    _state.parsed = None
-    parser.add_argument(
-        SERVICER_IMPL_FLAG,
-        dest="servicer_impl",
+    return rust_lifecycle.add_servicer_impl_argument(
+        parser,
         action=_ServicerImplAction,
-        choices=list(SERVICER_IMPL_CHOICES),
-        default=None,
+        on_add=_state.forget_parse,
         help=(
             "Which implementation serves the gRPC contract under --grpc-mode: the Python "
             "servicer (default) or the Rust one (smg.servicer.SglangGrpcServer, with the "
             f"scheduler headless). Unset falls back to ${SERVICER_IMPL_ENV}."
         ),
     )
-    return True
 
 
 def after_add_cli_args(result: Any, *args: Any, **kwargs: Any) -> None:

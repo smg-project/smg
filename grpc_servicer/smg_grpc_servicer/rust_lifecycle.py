@@ -14,6 +14,7 @@ which engine it supervises.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import dataclasses
@@ -273,6 +274,41 @@ IMPLS = ("python", "rust")
 SOURCE_FLAG = "flag"
 SOURCE_ENV = "env"
 SOURCE_DEFAULT = "default"
+
+
+SERVICER_IMPL_FLAG = "--servicer-impl"
+
+
+def add_servicer_impl_argument(
+    parser: argparse.ArgumentParser,
+    *,
+    help: str,
+    action: type[argparse.Action] | None = None,
+    applies: Callable[[argparse.ArgumentParser], bool] | None = None,
+    on_add: Callable[[], None] | None = None,
+) -> bool:
+    """Add ``--servicer-impl`` (the choices in :data:`IMPLS`, no default) to a
+    launcher's parser that lacks it; returns whether it was added. ``applies``
+    refuses a parser that does not serve gRPC; ``on_add`` runs before the
+    argument goes in (a launcher that remembers an earlier parse drops it);
+    ``action`` replaces argparse's store action when the launcher needs its
+    own. Each engine keeps its help text, which names its server class and
+    the flag the choice rides under."""
+    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
+    if SERVICER_IMPL_FLAG in actions or (applies is not None and not applies(parser)):
+        return False
+    if on_add is not None:
+        on_add()
+    kwargs: dict[str, Any] = {
+        "dest": "servicer_impl",
+        "choices": list(IMPLS),
+        "default": None,
+        "help": help,
+    }
+    if action is not None:
+        kwargs["action"] = action
+    parser.add_argument(SERVICER_IMPL_FLAG, **kwargs)
+    return True
 
 
 def servicer_switch(
