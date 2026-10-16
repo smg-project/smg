@@ -1892,15 +1892,15 @@ class RouterArgs:
             type=_non_negative_int,
             default=RouterArgs.max_connections,
             help=(
-                "Most client connections the HTTP listener holds open at once, counted"
-                " from accept to close (idle keep-alive connections, connections inside"
-                " a TLS handshake and upgraded connections included). A connection beyond"
-                " the bound is closed at once, before any TLS handshake and without a"
-                " response: the client sees its connection end and should retry with"
+                "Most client connections the data listener (--port) holds open at once,"
+                " counted from accept to close (idle keep-alive connections, connections"
+                " inside a TLS handshake and upgraded connections included). A connection"
+                " beyond the bound is closed at once, before any TLS handshake and without"
+                " a response: the client sees its connection end and should retry with"
                 " backoff; each is counted in smg_http_connections_rejected_total."
-                " Readiness is unaffected. Probes on this port are subject to the bound"
-                " like any connection: point them at --health-check-port, which it does"
-                " not cover. 0 = no bound"
+                " Readiness is unaffected. Probes on the data port are subject to the"
+                " bound like any connection: point them at --health-check-port or"
+                " --admin-port, which it does not cover. 0 = no bound"
             ),
         )
         request_group.add_argument(

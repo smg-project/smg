@@ -153,12 +153,15 @@ pub struct RouterConfig {
     /// connections until the client closes them.
     #[serde(default = "default_idle_connection_timeout_secs")]
     pub idle_connection_timeout_secs: u64,
-    /// Most client connections the HTTP listener holds open at once, counted
+    /// Most client connections the data listener holds open at once, counted
     /// from accept to close (idle keep-alive connections, connections inside
     /// a TLS handshake and upgraded connections included). A connection
     /// beyond the bound is closed at once, before any TLS handshake and
     /// without a response, and counted in
-    /// `smg_http_connections_rejected_total`. `0` is no bound.
+    /// `smg_http_connections_rejected_total`. The admin listener
+    /// (`admin_port`) and the probe listener (`health_check_port`) are
+    /// outside the bound, so the control plane and the probes stay reachable
+    /// while the data plane is saturated. `0` is no bound.
     #[serde(default)]
     pub max_connections: usize,
     pub request_timeout_secs: u64,

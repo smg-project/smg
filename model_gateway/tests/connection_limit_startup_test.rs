@@ -90,16 +90,36 @@ fn connect(addr: SocketAddr) -> Option<TcpStream> {
     Some(stream)
 }
 
-/// Sends a keep-alive GET for `path` and reads its response (the head and
-/// the `Content-Length` body): the text, or `None` when the connection
-/// closed, or was reset, before a byte of response arrived.
-fn request(stream: &mut TcpStream, path: &str) -> Option<String> {
+/// What a keep-alive GET for `path` got back: the response (the head and the
+/// `Content-Length` body), the connection closed or reset before a byte of
+/// response arrived, or the read timing out with the connection still open
+/// (which is not a closure, and fails a case that expects one).
+#[derive(Debug)]
+enum Reply {
+    Answered(String),
+    Closed,
+    TimedOut,
+}
+
+fn request(stream: &mut TcpStream, path: &str) -> Reply {
     let _ = stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes());
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
         match stream.read(&mut buf) {
-            Ok(0) | Err(_) if bytes.is_empty() => return None,
+            Ok(0) if bytes.is_empty() => return Reply::Closed,
+            Err(e) if bytes.is_empty() => {
+                return match e.kind() {
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                        Reply::TimedOut
+                    }
+                    std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof => Reply::Closed,
+                    _ => panic!("reading the response: {e}"),
+                };
+            }
             Ok(0) | Err(_) => break,
             Ok(n) => bytes.extend_from_slice(&buf[..n]),
         }
@@ -119,11 +139,11 @@ fn request(stream: &mut TcpStream, path: &str) -> Option<String> {
             }
         }
     }
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Reply::Answered(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn ok(response: Option<String>) -> bool {
-    response.is_some_and(|response| response.starts_with("HTTP/1.1 200"))
+fn ok(reply: Reply) -> bool {
+    matches!(reply, Reply::Answered(response) if response.starts_with("HTTP/1.1 200"))
 }
 
 /// A connection the gateway serves: connected and answered within `within`,
@@ -180,12 +200,15 @@ fn a_connection_beyond_the_bound_is_closed_without_a_response_and_counted() {
     let mut first = served_connection(addr, window);
     let mut second = served_connection(addr, window);
 
-    // The third is closed without a byte of response.
+    // The third is closed without a byte of response: closed or reset, not
+    // left hanging until the read times out.
+    let rejected_before =
+        sample(&scrape(metrics_addr), "smg_http_connections_rejected_total").unwrap_or(0.0);
     let mut third = connect(addr).expect("the kernel accepts the third connection");
-    assert_eq!(
-        request(&mut third, "/health"),
-        None,
-        "the connection beyond the bound was answered"
+    let reply = request(&mut third, "/health");
+    assert!(
+        matches!(reply, Reply::Closed),
+        "the connection beyond the bound was answered or left hanging: {reply:?}"
     );
     // The two within the bound are untouched.
     assert!(ok(request(&mut first, "/health")));
@@ -197,10 +220,14 @@ fn a_connection_beyond_the_bound_is_closed_without_a_response_and_counted() {
     assert!(ok(request(&mut fourth, "/health")));
     assert!(ok(request(&mut second, "/health")));
 
-    // The metrics listener is outside the bound and counts the refusal.
+    // The metrics listener is outside the bound and counts the refusal: the
+    // third connection's, counted since the scrape before it.
     let rejected = sample(&scrape(metrics_addr), "smg_http_connections_rejected_total")
         .expect("the rejected-connections counter is on the scrape");
-    assert!(rejected >= 1.0, "rejected connections: {rejected}");
+    assert!(
+        rejected >= rejected_before + 1.0,
+        "rejected connections: {rejected_before} -> {rejected}"
+    );
 
     let log = gateway.log();
     assert!(

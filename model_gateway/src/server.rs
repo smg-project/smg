@@ -2261,7 +2261,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // The bound on the connections open at once (see [`connection_limit`]):
     // a connection beyond it is closed at accept, unanswered. 0 is no bound.
     let max_connections = config.router_config.max_connections;
-    info!(max_connections, "HTTP connection limit (0 = unlimited)");
+    info!(
+        max_connections,
+        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
+         are outside it)"
+    );
     if max_connections > 0
         && usize::try_from(config.router_config.max_concurrent_requests)
             .is_ok_and(|admission| max_connections < admission)
@@ -2276,8 +2280,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     // The admin listener serves the control plane with the data listener's
-    // TLS material and connection timeouts, and drains with it (the shutdown
-    // above closes both handles together).
+    // TLS material and connection timeouts, but outside its connection limit
+    // (`--max-connections`), so the control plane and the probes it serves
+    // stay reachable while the data plane is saturated; it drains with it
+    // (the shutdown above closes both handles together).
     let admin_serving: Serving = match (admin_listener, admin_app) {
         (Some(admin_listener), Some(admin_app)) => {
             let admin_addr = admin_listener.local_addr()?;

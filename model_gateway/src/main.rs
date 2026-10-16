@@ -1204,16 +1204,18 @@ struct ServingArgs {
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
 
-    /// Most client connections the HTTP listener holds open at once, counted
-    /// from accept to close (idle keep-alive connections, connections inside
-    /// a TLS handshake and upgraded connections included). A connection
-    /// beyond the bound is closed at once, before any TLS handshake and
-    /// without a response: the client sees its connection end (an end of
-    /// stream, or a reset when it had already sent its request) and should
-    /// retry with backoff; each is counted in
+    /// Most client connections the data listener (--port) holds open at
+    /// once, counted from accept to close (idle keep-alive connections,
+    /// connections inside a TLS handshake and upgraded connections included).
+    /// A connection beyond the bound is closed at once, before any TLS
+    /// handshake and without a response: the client sees its connection end
+    /// (an end of stream, or a reset when it had already sent its request)
+    /// and should retry with backoff; each is counted in
     /// smg_http_connections_rejected_total. Readiness is unaffected. Probes
-    /// on this port are subject to the bound like any connection: point them
-    /// at --health-check-port, which it does not cover. 0 = no bound
+    /// on the data port are subject to the bound like any connection: point
+    /// them at --health-check-port or --admin-port, which it does not cover
+    /// (the admin listener stays reachable while the data plane is
+    /// saturated). 0 = no bound
     #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
     max_connections: usize,
 
