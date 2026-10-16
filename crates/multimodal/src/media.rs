@@ -30,7 +30,7 @@ use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
     types::TransparencyPolicy,
-    video_seek::{FrameTable, SeekPlan},
+    video_seek::{FrameTable, SeekPlan, SeekSegment},
     vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
 };
 
@@ -1938,9 +1938,12 @@ async fn decode_video_with_ffmpeg(
             .await;
     };
     // A long clip sampled sparsely is decoded by seeking to its picks where
-    // that is a clear win over running the stream to the last pick. The
-    // sequential decode answers anything that goes wrong with the seeks but
-    // a run past the process budget: it would run past it as well.
+    // that is a clear win over running the stream to the last pick. Each run
+    // ends right after its last pick, so a seek that lands elsewhere costs
+    // its own segment and comes back short at once. The sequential decode
+    // answers that, and anything else that goes wrong with the seeks, but a
+    // run past the process budget: the plan is at most half the sequential
+    // decode's work, so that would run past it as well.
     if let Some(plan) = seek_plan_for(input_path, &selection).await {
         ensure_decode_work_limit(plan.decoded_frames(), &selection, probed)?;
         let started = Instant::now();
@@ -2846,9 +2849,11 @@ async fn seek_plan_for(input_path: &Path, selection: &FrameSelection) -> Option<
 /// The selection's distinct frames decoded by seeking: one decoder run per
 /// segment of the plan, as many at a time as the decode's thread budget
 /// allows and one thread each, their frames in order and then repeated as
-/// the selection repeats them. A run that comes back short (a seek that did
-/// not land where the plan says) or with frames of another size than the
-/// metadata's is an error the caller answers with the sequential decode.
+/// the selection repeats them. Each run ends right after its last pick. A
+/// run that comes back short (a seek that did not land where the plan says)
+/// or with frames of another size than the metadata's ends the decode at
+/// once, the other runs with it: errors the caller answers with the
+/// sequential decode.
 async fn decode_video_with_ffmpeg_seek(
     input_path: &Path,
     metadata: VideoMetadata,
@@ -2872,24 +2877,8 @@ async fn decode_video_with_ffmpeg_seek(
             let picks = segment.pts.len();
             let output_limit = checked_decoded_rgb_bytes(picks, frame_size)?
                 .saturating_add(picks.saturating_mul(64))
-                .min(video_max_decoded_bytes())
-                .to_string();
-            let mut command = ffmpeg_seek_decode_command(1, &segment.seek_seconds);
-            command.arg(input_path);
-            let filter = format!("{},{RGB_CONVERSION}", segment.select_filter());
-            command.args(["-vf", &filter, "-frames:v", &picks.to_string()]);
-            command.args(passthrough);
-            command.args([
-                "-fs",
-                &output_limit,
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "ppm",
-                "-pix_fmt",
-                "rgb24",
-                "pipe:1",
-            ]);
+                .min(video_max_decoded_bytes());
+            let command = ffmpeg_seek_run_command(input_path, segment, output_limit, passthrough);
             let output = run_video_command_output(command, "ffmpeg").await?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2897,7 +2886,34 @@ async fn decode_video_with_ffmpeg_seek(
                     "ffmpeg failed: {stderr}"
                 )));
             }
-            Ok::<_, MediaConnectorError>(output.stdout)
+            // A run that comes back short ends the decode here, before the
+            // other runs finish: its seek did not land where the plan says.
+            let frames = if output.stdout.is_empty() {
+                Vec::new()
+            } else {
+                parse_ppm_frame_layout(&output.stdout)?
+            };
+            if frames.len() != picks {
+                return Err(MediaConnectorError::VideoDecode(format!(
+                    "the seek run from {} s produced {} of its {picks} picks: the seek did not land where the plan says",
+                    segment.seek_seconds,
+                    frames.len()
+                )));
+            }
+            // As the headed sequential runner checks: the decoder's size, or
+            // its transpose for a clip stored with a display rotation.
+            if let Some(frame) = frames.first() {
+                let size = (frame.width, frame.height);
+                if size != (metadata.width, metadata.height)
+                    && size != (metadata.height, metadata.width)
+                {
+                    return Err(MediaConnectorError::VideoDecode(format!(
+                        "{FRAME_SIZE_MISMATCH} {}x{} differs from the stated {}x{} and its transpose",
+                        frame.width, frame.height, metadata.width, metadata.height
+                    )));
+                }
+            }
+            Ok::<_, MediaConnectorError>((output.stdout, frames))
         }
     });
     // The runs together are held to the one process budget a sequential
@@ -2922,9 +2938,9 @@ async fn decode_video_with_ffmpeg_seek(
             ))
         })?;
     let mut frames = Vec::with_capacity(selection.unique_count());
-    for stdout in outputs {
+    for (stdout, run_frames) in outputs {
         let base = data.len();
-        for mut frame in parse_ppm_frame_layout(&stdout)? {
+        for mut frame in run_frames {
             frame.offset = frame.offset.checked_add(base).ok_or_else(|| {
                 MediaConnectorError::VideoDecode("PPM frame offset overflow".to_string())
             })?;
@@ -2938,17 +2954,6 @@ async fn decode_video_with_ffmpeg_seek(
         })
     })?;
     ensure_decoded_byte_limit(decoded_bytes)?;
-    if let Some(frame) = frames.first() {
-        // As the headed sequential runner checks: the decoder's size, or its
-        // transpose for a clip stored with a display rotation.
-        let size = (frame.width, frame.height);
-        if size != (metadata.width, metadata.height) && size != (metadata.height, metadata.width) {
-            return Err(MediaConnectorError::VideoDecode(format!(
-                "{FRAME_SIZE_MISMATCH} {}x{} differs from the stated {}x{} and its transpose",
-                frame.width, frame.height, metadata.width, metadata.height
-            )));
-        }
-    }
     let frames = selection.expand(frames)?;
     Ok(DecodedRgbVideo::new(Bytes::from(data), frames))
 }
@@ -3407,6 +3412,34 @@ fn ffmpeg_decode_command(threads: i32, autorotate: bool) -> Command {
 /// input path.
 fn ffmpeg_seek_decode_command(threads: i32, seek: &str) -> Command {
     ffmpeg_decode_command_from(threads, true, Some(seek))
+}
+
+/// One run of a seek plan: the stream entered at the segment's keyframe,
+/// trimmed right after its last pick and the picks named by timestamp, as
+/// PPM frames on standard output under `output_limit` bytes.
+fn ffmpeg_seek_run_command(
+    input_path: &Path,
+    segment: &SeekSegment,
+    output_limit: usize,
+    passthrough: [&'static str; 2],
+) -> Command {
+    let mut command = ffmpeg_seek_decode_command(1, &segment.seek_seconds);
+    command.arg(input_path);
+    let filter = format!("{},{RGB_CONVERSION}", segment.frame_filter());
+    command.args(["-vf", &filter, "-frames:v", &segment.pts.len().to_string()]);
+    command.args(passthrough);
+    command.args([
+        "-fs",
+        &output_limit.to_string(),
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "ppm",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]);
+    command
 }
 
 fn ffmpeg_decode_command_from(threads: i32, autorotate: bool, seek: Option<&str>) -> Command {
@@ -7033,6 +7066,12 @@ mod seek_decode_tests {
                 .await
                 .expect_err("a missing pick");
             assert!(!is_video_command_timeout(&error), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("produced 0 of its 1 picks: the seek did not land"),
+                "{error}"
+            );
         }
 
         // A container that starts 7 s into its timeline: the seeks are
@@ -7091,6 +7130,52 @@ mod seek_decode_tests {
                 "1791.666667",
                 "-copyts",
                 "-i"
+            ]
+        );
+    }
+
+    /// A run is bounded at its last pick: the trim before the `select` ends
+    /// the filter graph, and the run, as soon as the decoder is past it, so a
+    /// pick the seek missed costs the run its segment (the keyframe to the
+    /// last pick) and not the rest of the stream.
+    #[test]
+    fn a_seek_run_ends_right_after_its_last_pick() {
+        let segment = SeekSegment {
+            seek_seconds: "1.600000".to_string(),
+            pts: vec![24_576, 25_088],
+            decoded_frames: 2,
+        };
+        let command = ffmpeg_seek_run_command(
+            Path::new("clip.mp4"),
+            &segment,
+            18_560,
+            FPS_MODE_PASSTHROUGH,
+        );
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let input = args.iter().position(|arg| arg == "-i").expect("an input");
+        assert_eq!(
+            args[input + 1..].to_vec(),
+            [
+                "clip.mp4",
+                "-vf",
+                r"trim=end_pts=25089,select='eq(pts\,24576)+eq(pts\,25088)',format=rgba,format=rgb24",
+                "-frames:v",
+                "2",
+                "-fps_mode",
+                "passthrough",
+                "-fs",
+                "18560",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "ppm",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1"
             ]
         );
     }

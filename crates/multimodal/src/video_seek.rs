@@ -13,9 +13,10 @@
 //! prints it without decoding anything (presentation timestamps and keyframe
 //! flags), and it is used only where it clearly beats the run through the
 //! stream. The picks are named to the decoder by their exact presentation
-//! timestamps: a seek that lands anywhere but where the plan says leaves a
-//! pick missing, which the caller sees as a short decode and answers with the
-//! sequential decode, never with a wrong frame.
+//! timestamps, and each run ends right after its last pick: a seek that lands
+//! anywhere but where the plan says leaves a pick missing, which costs the run
+//! its own segment and no more, and which the caller sees as a short decode
+//! and answers with the sequential decode, never with a wrong frame.
 
 /// What one decoder run costs besides the frames it decodes (starting the
 /// process, reading the container's tables, seeking), in source frames.
@@ -154,6 +155,22 @@ pub(crate) struct SeekSegment {
 }
 
 impl SeekSegment {
+    /// The run's frame filter: the stream trimmed right after the last pick,
+    /// then the picks named by timestamp. The trim ends the filter graph, and
+    /// with it the run, as soon as the decoder is past the last pick, so a
+    /// pick the seek missed costs the run its segment and no more; the
+    /// `select` alone would have the decoder run to the end of the stream
+    /// looking for it.
+    pub(crate) fn frame_filter(&self) -> String {
+        format!("trim=end_pts={},{}", self.end_pts(), self.select_filter())
+    }
+
+    /// The first timestamp past the last pick, in the stream's ticks: where
+    /// the run ends.
+    pub(crate) fn end_pts(&self) -> i64 {
+        self.pts.last().map_or(0, |pts| pts.saturating_add(1))
+    }
+
     /// The frame filter naming the picks by timestamp; `\,` keeps the
     /// filtergraph parser from splitting the expression.
     pub(crate) fn select_filter(&self) -> String {
@@ -395,6 +412,14 @@ mod tests {
             plan.segments[1].select_filter(),
             r"select='eq(pts\,24576)+eq(pts\,25088)'"
         );
+        // The run ends right after its last pick: a pick the seek missed
+        // costs the run its segment, not the rest of the stream.
+        assert_eq!(plan.segments[1].end_pts(), 25089);
+        assert_eq!(
+            plan.segments[1].frame_filter(),
+            r"trim=end_pts=25089,select='eq(pts\,24576)+eq(pts\,25088)'"
+        );
+        assert_eq!(plan.segments[0].end_pts(), 37 * 512 + 1);
     }
 
     /// Half an hour at 30 fps with a keyframe every 250 frames, sampled by
