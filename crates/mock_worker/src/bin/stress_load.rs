@@ -1022,6 +1022,14 @@ fn main() -> Result<()> {
         std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
     }
     println!("{text}");
+    // A run in which no request succeeded is a failed cell, not a measurement: the exit status
+    // carries that to cell.sh and run_all.sh.
+    if summary.sent > 0 && summary.ok == 0 {
+        anyhow::bail!(
+            "no request succeeded ({} failed): see the errors in the summary",
+            summary.failed
+        );
+    }
     Ok(())
 }
 
