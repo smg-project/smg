@@ -40,7 +40,7 @@ use rustc_hash::FxHashMap;
 use serde::Serialize;
 use serde_json::Value;
 use thread_local::ThreadLocal;
-use tokenizers::{models::ModelWrapper, Model, Tokenizer as HfTokenizer};
+use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
 mod pattern;
@@ -48,7 +48,10 @@ mod unicode;
 
 use pattern::Pattern;
 
-use crate::encode_path::{Declined, Fallback};
+use crate::{
+    encode_path::{Declined, Fallback},
+    word_cache::{ModelView, TokenizerOf},
+};
 
 /// The split the `ByteLevel` pre-tokenizer applies itself when `use_regex`
 /// is on (GPT-2 and its descendants).
@@ -262,14 +265,16 @@ fn type_of<'v>(what: &str, component: &'v Value) -> Result<&'v str, Declined> {
 impl NativeEncoder {
     /// This path's encoder for `tokenizer`, or why it declines: a shape
     /// outside what the module documentation lists.
-    pub(crate) fn from_tokenizer(tokenizer: &HfTokenizer) -> Result<Self, Declined> {
+    pub(crate) fn from_tokenizer<M: Model + ModelView>(
+        tokenizer: &TokenizerOf<M>,
+    ) -> Result<Self, Declined> {
         if tokenizer.get_truncation().is_some() {
             return Err(Declined::from("truncation is configured"));
         }
         if tokenizer.get_padding().is_some() {
             return Err(Declined::from("padding is configured"));
         }
-        if !matches!(tokenizer.get_model(), ModelWrapper::BPE(_)) {
+        if !matches!(tokenizer.get_model().wrapper(), ModelWrapper::BPE(_)) {
             return Err(Declined::from("the model is not BPE"));
         }
         let normalizer =
@@ -335,8 +340,8 @@ impl NativeEncoder {
     /// The added tokens the path cuts out itself, those matched on the raw
     /// text and those matched after normalization (normalized here, once),
     /// each in a stable order so leftmost-longest ties stay deterministic.
-    fn added_tokens_of(
-        tokenizer: &HfTokenizer,
+    fn added_tokens_of<M: Model>(
+        tokenizer: &TokenizerOf<M>,
         normalizer: Normalizer,
     ) -> Result<(AddedTokenList, AddedTokenList), Declined> {
         let added = tokenizer.get_added_vocabulary();
@@ -602,7 +607,7 @@ mod tests {
             PreTokenizerWrapper,
         },
         processors::{byte_level::ByteLevel as ByteLevelProcessor, template::TemplateProcessing},
-        AddedToken, SplitDelimiterBehavior,
+        AddedToken, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
     };
 
     use super::*;

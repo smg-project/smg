@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokenizers::{
     decoders::DecoderWrapper,
     models::{bpe::BPE, ModelWrapper},
@@ -14,7 +14,7 @@ use tokenizers::{
     },
     processors::template::TemplateProcessing,
     tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
-    AddedToken,
+    AddedToken, Model,
 };
 use tracing::debug;
 
@@ -32,6 +32,7 @@ use crate::{
         ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
         PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
+    word_cache::{LateBoundModel, LoadingTokenizer, ModelView, TokenizerOf},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -158,7 +159,7 @@ impl DirectEncoders {
     /// encoder, else none and `tokenizers` encodes. The choice is logged
     /// once, with the reasons the paths before it declined, and counted per
     /// path ([`encode_path::encode_path_loads`]).
-    fn choose(tokenizer: &HfTokenizer) -> Self {
+    fn choose<M: Model + ModelView + Serialize>(tokenizer: &TokenizerOf<M>) -> Self {
         #[cfg(feature = "tokenizers-v1")]
         let v1_declined = match crate::v1::V1Encoder::from_tokenizer(
             tokenizer,
@@ -183,7 +184,7 @@ impl DirectEncoders {
         // is worth a warning (the opt-in did not take where it could have);
         // any other model kind was never its business.
         #[cfg(feature = "tokenizers-v1")]
-        if matches!(tokenizer.get_model(), ModelWrapper::BPE(_)) {
+        if matches!(tokenizer.get_model().wrapper(), ModelWrapper::BPE(_)) {
             tracing::warn!(
                 path = %path,
                 v1_declined = %v1_declined,
@@ -268,7 +269,7 @@ impl HuggingFaceTokenizer {
         file_path: &str,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
-        let tokenizer = HfTokenizer::from_file(file_path)
+        let tokenizer = LoadingTokenizer::from_file(file_path)
             .map_err(|e| Error::msg(format!("Failed to load tokenizer: {e}")))?;
         Self::from_built_tokenizer(tokenizer, Path::new(file_path), chat_template_path)
     }
@@ -294,7 +295,7 @@ impl HuggingFaceTokenizer {
         Self::from_built_tokenizer(tokenizer, &logical_tokenizer_path, chat_template_path)
     }
 
-    fn build_qwen2_bpe_tokenizer(dir: &Path) -> Result<HfTokenizer> {
+    fn build_qwen2_bpe_tokenizer(dir: &Path) -> Result<LoadingTokenizer> {
         let vocab_path = dir.join("vocab.json");
         let merges_path = dir.join("merges.txt");
         let config_path = dir.join("tokenizer_config.json");
@@ -336,7 +337,7 @@ impl HuggingFaceTokenizer {
             .files(vocab_path_str.to_string(), merges_path_str.to_string())
             .build()
             .map_err(|error| Error::msg(format!("Failed to build Qwen2 BPE model: {error}")))?;
-        let mut tokenizer = HfTokenizer::new(bpe);
+        let mut tokenizer = LoadingTokenizer::new(LateBoundModel::from(ModelWrapper::BPE(bpe)));
 
         tokenizer
             .with_normalizer(Some(NFC))
@@ -408,7 +409,7 @@ impl HuggingFaceTokenizer {
     }
 
     fn from_built_tokenizer(
-        mut tokenizer: HfTokenizer,
+        mut tokenizer: LoadingTokenizer,
         tokenizer_path: &Path,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
@@ -472,7 +473,10 @@ impl HuggingFaceTokenizer {
             .unwrap_or(Renderer::Jinja);
 
         let encoders = DirectEncoders::choose(&tokenizer);
-        Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
+        // The bound rides on the file's model into the built tokenizer: no
+        // copy of the model (see `word_cache`).
+        tokenizer.get_model().bound(encoders.bpe_words_cached());
+        let tokenizer = HfTokenizer::from(tokenizer);
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         Ok(HuggingFaceTokenizer {
@@ -541,7 +545,7 @@ impl HuggingFaceTokenizer {
     }
 
     /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
-    fn tokenizer_adds_special_tokens(tokenizer: &HfTokenizer) -> bool {
+    fn tokenizer_adds_special_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> bool {
         tokenizer
             .encode("", true)
             .map(|enc| !enc.get_ids().is_empty())
@@ -596,10 +600,15 @@ impl HuggingFaceTokenizer {
     /// fills first-come and never evicts, so a thread keeps the first
     /// thousand distinct words it sees, which in practice catches the
     /// frequent ones.
-    const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
+    pub(crate) const BPE_WORDS_CACHED_PER_THREAD: usize = 1024;
 
-    /// Sizes the per-thread word cache of a BPE model to `words`
-    /// ([`DirectEncoders::bpe_words_cached`]); other model kinds have none.
+    /// Sizes the per-thread word cache of a built tokenizer's BPE model to
+    /// `words` ([`DirectEncoders::bpe_words_cached`]); other model kinds have
+    /// none. A built tokenizer hands out its model by shared reference only,
+    /// so this installs a copy of the model with the bound: the price of a
+    /// tokenizer handed over built ([`Self::from_tokenizer`]). The loaders
+    /// read a file into a [`LoadingTokenizer`] and bound its model in place
+    /// instead (see `word_cache`).
     fn bound_bpe_cache(tokenizer: &mut HfTokenizer, words: usize) {
         let bounded = match tokenizer.get_model() {
             ModelWrapper::BPE(bpe) => {
@@ -652,8 +661,8 @@ impl HuggingFaceTokenizer {
     /// Prefers explicit values from `tokenizer_config.json` (e.g., `"bos_token": "<|begin_of_text|>"`)
     /// over pattern matching against the vocabulary, since models like Llama 4 use non-standard
     /// token names that aren't in the hardcoded pattern list.
-    fn extract_special_tokens(
-        tokenizer: &HfTokenizer,
+    fn extract_special_tokens<M: Model>(
+        tokenizer: &TokenizerOf<M>,
         config_tokens: &ConfigTokens,
     ) -> SpecialTokens {
         // Get vocab with special tokens included (added_tokens like <|im_start|>)

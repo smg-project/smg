@@ -2,7 +2,8 @@
 //! and streaming in the existing wrapper so there is one source of semantics.
 
 use anyhow::{anyhow, Result};
-use tokenizers::{models::ModelWrapper, Tokenizer};
+use serde::Serialize;
+use tokenizers::{models::ModelWrapper, Model};
 use tokenizers_v1::{
     models::bpe::PipelineBPE,
     pipeline::{
@@ -16,6 +17,7 @@ use tokenizers_v1::{
 use crate::{
     encode_path::Declined,
     traits::{Encoder, Encoding},
+    word_cache::{ModelView, TokenizerOf},
 };
 
 pub(crate) struct V1Encoder {
@@ -64,13 +66,13 @@ fn clone_normalizer(n: &PipelineNormalizer) -> PipelineNormalizer {
 impl V1Encoder {
     /// The pipeline for `tokenizer`, or why it declines: a configuration
     /// outside what the RC is trusted with here.
-    pub(crate) fn from_tokenizer(
-        tokenizer: &Tokenizer,
+    pub(crate) fn from_tokenizer<M: Model + ModelView + Serialize>(
+        tokenizer: &TokenizerOf<M>,
         cache_capacity: usize,
     ) -> Result<Self, Declined> {
         // Limit the RC to deterministic, unpadded/untruncated BPE. Other models
         // keep the established implementation, including its rich Encoding metadata.
-        let ModelWrapper::BPE(bpe) = tokenizer.get_model() else {
+        let ModelWrapper::BPE(bpe) = tokenizer.get_model().wrapper() else {
             return Err(Declined::from("the model is not BPE"));
         };
         if bpe.dropout.is_some_and(|p| p > 0.0) {
