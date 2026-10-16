@@ -282,10 +282,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         no_stop_trim = bool(request.sampling_params.no_stop_trim)
 
         aborted = False
+        # Held so the finally can close it: a return at semantic completion
+        # leaves the engine's iterator suspended at its final yield, and the
+        # close releases what it holds there now, not in asyncio's generator
+        # finalizer later.
+        engine_outputs = self.async_llm.generate_request(req_obj)
+        # Choices that have sent a Chunk; only their empty terminal delta is skipped.
+        indices_with_chunks: set[int] = set()
         try:
             engine_started = time.perf_counter()
             first_output = True
-            async for output in self.async_llm.generate_request(req_obj):
+            async for output in engine_outputs:
                 if LOG_MM_TIMING and first_output:
                     first_output = False
                     logger.info(
@@ -331,8 +338,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     # A matched stop token may be the whole final engine delta;
                     # trimmed, it leaves no client-visible payload, and an empty
                     # Chunk before Complete would hold a streaming client at the
-                    # terminal boundary.
-                    if chunk_response.chunk.token_ids:
+                    # terminal boundary. A choice's first output goes out even
+                    # when empty: the gateway opens the choice (its role delta,
+                    # its first-token time) on the first Chunk, and a Complete
+                    # alone opens nothing.
+                    if chunk_response.chunk.token_ids or choice_index not in indices_with_chunks:
+                        indices_with_chunks.add(choice_index)
                         yield chunk_response
                     if is_finished:
                         yield self._complete_response(
@@ -368,6 +379,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             logger.exception("Generate failed for request %s", rid)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
         finally:
+            # The engine's iterator first: closing it runs the engine's own
+            # exit (the model-update reader lock it holds across yields) now
+            # rather than in asyncio's generator finalizer. Its per-request
+            # cleanup is not part of that close, so the check below is still
+            # what aborts an abandoned request.
+            await engine_outputs.aclose()
             # Defensive cleanup — the scheduler owns rid_to_state, but if the
             # stream was torn down before finish we need to notify it. When
             # n>1 we expanded rid to a list of per-choice ids, so walk them.
