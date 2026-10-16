@@ -81,9 +81,9 @@ MODELS = {
     },
     "deepseek_v41": {
         "model_id": "deepseek-ai/DeepSeek-V4.1-Flash",
-        # Anchor = tokenizer token for the config's image_token_id (the
-        # checkpoint's image placeholder).
-        "anchors": {"image": ("config_id", "image_token_id")},
+        # Anchor = the literal <｜deepseek_image｜> the registry renders; its
+        # tokenizer id must be the config's image_token_id vLLM targets.
+        "anchors": {"image": ("literal", "<｜deepseek_image｜>")},
     },
 }
 
