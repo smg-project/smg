@@ -226,6 +226,18 @@ Called from the router Deployment template.
 - "--health-check-endpoint"
 - {{ .Values.router.healthCheck.endpoint | quote }}
 {{- end }}
+{{- if .Values.router.responseCache.enabled }}
+- "--response-cache"
+- "memory"
+- "--response-cache-ttl-secs"
+- {{ int .Values.router.responseCache.ttlSecs | quote }}
+- "--response-cache-max-entries"
+- {{ int .Values.router.responseCache.maxEntries | quote }}
+- "--response-cache-max-bytes"
+- {{ int .Values.router.responseCache.maxBytes | quote }}
+- "--response-cache-max-entry-bytes"
+- {{ int .Values.router.responseCache.maxEntryBytes | quote }}
+{{- end }}
 - "--prometheus-port"
 - {{ .Values.router.metrics.port | quote }}
 - "--log-level"

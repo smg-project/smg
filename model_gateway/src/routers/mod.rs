@@ -33,6 +33,7 @@ pub mod gateway;
 pub mod grpc;
 pub mod http;
 pub(crate) mod provider_support;
+pub mod response_cache;
 
 pub use common::body_policy::BodyPolicy;
 pub use factory::RouterFactory;

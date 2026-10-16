@@ -66,6 +66,16 @@ router:
   queueSize: 100
   queueTimeoutSecs: 60
 
+  # -- Exact-match response cache: a repeated deterministic request
+  #    (temperature 0 or a seed, not streamed, one choice, no tools) is
+  #    answered from the gateway's memory for the tenant that sent it
+  responseCache:
+    enabled: false
+    ttlSecs: 300
+    maxEntries: 10000
+    maxBytes: 268435456        # 256MB in bytes
+    maxEntryBytes: 1048576     # 1MB in bytes
+
   # -- Resilience: retry
   retry:
     enabled: true

@@ -44,6 +44,7 @@ use crate::{
         error as route_error,
         factory::{router_ids, RouterId},
         grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
+        response_cache::{Cacheable, ResponseCache},
         BodyPolicy, RouterFactory, RouterTrait,
     },
     server::ServerConfig,
@@ -107,6 +108,9 @@ pub struct Gateway {
     routers: ArcSwap<HashMap<RouterId, Arc<dyn RouterTrait>>>,
     default_router: ArcSwapOption<RouterId>,
     enable_igw: bool,
+    /// The exact-match response cache in front of the family routers;
+    /// `None` while it is off (the default).
+    response_cache: Option<Arc<ResponseCache>>,
 }
 
 /// The answer when no router serves a request: the JSON error object, a 404
@@ -122,7 +126,15 @@ impl Gateway {
             routers: ArcSwap::from_pointee(HashMap::new()),
             default_router: ArcSwapOption::empty(),
             enable_igw: false,
+            response_cache: None,
         }
+    }
+
+    /// Put `cache` in front of the routers (`None` takes it away).
+    #[must_use]
+    pub fn with_response_cache(mut self, cache: Option<Arc<ResponseCache>>) -> Self {
+        self.response_cache = cache;
+        self
     }
 
     fn try_register(
@@ -148,6 +160,7 @@ impl Gateway {
     ) -> Result<Arc<Self>, String> {
         let mut gateway = Self::new(app_context.worker_registry.clone());
         gateway.enable_igw = config.router_config.enable_igw;
+        gateway.response_cache = ResponseCache::from_config(&config.router_config.response_cache);
         let gateway = Arc::new(gateway);
 
         if config.router_config.enable_igw {
@@ -472,6 +485,26 @@ impl Gateway {
             None => miss(),
         }
     }
+
+    /// Serve a cacheable request: through the response cache when it is on
+    /// (a hit never reaches `run`; a miss's answer is recorded), straight to
+    /// `run` when it is off.
+    async fn route_cached<R, Fut>(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: R,
+        run: impl FnOnce(R) -> Fut,
+    ) -> Response
+    where
+        R: Cacheable,
+        Fut: Future<Output = Response>,
+    {
+        match &self.response_cache {
+            Some(cache) => cache.serve(headers, tenant_meta, body, run).await,
+            None => run(body).await,
+        }
+    }
 }
 
 #[async_trait]
@@ -551,10 +584,12 @@ impl RouterTrait for Gateway {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_chat(headers, tenant_meta, body, model_id)
-                .await
+        self.route_cached(headers, tenant_meta, body, |body| {
+            self.dispatch(Some(model_id), no_router, |router| async move {
+                router
+                    .route_chat(headers, tenant_meta, body, model_id)
+                    .await
+            })
         })
         .await
     }
@@ -566,10 +601,12 @@ impl RouterTrait for Gateway {
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), no_router, |router| async move {
-            router
-                .route_completion(headers, tenant_meta, body, model_id)
-                .await
+        self.route_cached(headers, tenant_meta, body, |body| {
+            self.dispatch(Some(model_id), no_router, |router| async move {
+                router
+                    .route_completion(headers, tenant_meta, body, model_id)
+                    .await
+            })
         })
         .await
     }
@@ -581,19 +618,22 @@ impl RouterTrait for Gateway {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        let router = if self.enable_igw && body.max_tokens == 0 {
-            self.select_router_for_empty_message(model_id)
-        } else {
-            self.select_router_for_request(Some(model_id))
-        };
-        match router {
-            Some(router) => {
-                router
-                    .route_messages(headers, tenant_meta, body, model_id)
-                    .await
+        self.route_cached(headers, tenant_meta, body, |body| async move {
+            let router = if self.enable_igw && body.max_tokens == 0 {
+                self.select_router_for_empty_message(model_id)
+            } else {
+                self.select_router_for_request(Some(model_id))
+            };
+            match router {
+                Some(router) => {
+                    router
+                        .route_messages(headers, tenant_meta, body, model_id)
+                        .await
+                }
+                None => no_router(),
             }
-            None => no_router(),
-        }
+        })
+        .await
     }
 
     async fn route_messages_count_tokens(
@@ -2146,5 +2186,103 @@ mod tests {
             .select_router_for_request(Some("model-alias"))
             .expect("alias should select the PD router");
         assert_eq!(router.router_type(), "pd");
+    }
+
+    /// With the cache on, the second identical deterministic chat request
+    /// is answered from memory and the router is not asked; a sampled one
+    /// is routed every time; with the cache off no header is added.
+    #[tokio::test]
+    async fn the_response_cache_sits_in_front_of_the_routers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{body::to_bytes, Json};
+        use serde_json::json;
+
+        use crate::routers::response_cache::HEADER_CACHE_STATUS;
+
+        #[derive(Debug, Default)]
+        struct CountingRouter {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl RouterTrait for CountingRouter {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            async fn route_chat(
+                &self,
+                _headers: Option<&HeaderMap>,
+                _tenant_meta: &TenantRequestMeta,
+                _body: ChatCompletionRequest,
+                _model_id: &str,
+            ) -> Response {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Json(json!({"id": format!("chatcmpl-{n}"), "object": "chat.completion"}))
+                    .into_response()
+            }
+
+            fn router_type(&self) -> &'static str {
+                "counting"
+            }
+        }
+
+        async fn status_and_id(response: Response) -> (Option<String>, String) {
+            let status = response
+                .headers()
+                .get(&HEADER_CACHE_STATUS)
+                .map(|value| value.to_str().unwrap().to_string());
+            let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            (status, json["id"].as_str().unwrap().to_string())
+        }
+
+        let request = |temperature: f32| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "temperature": temperature,
+            }))
+            .unwrap()
+        };
+
+        for cached in [true, false] {
+            let router = Arc::new(CountingRouter::default());
+            let cache = cached.then(|| {
+                Arc::new(ResponseCache::new(
+                    std::time::Duration::from_secs(60),
+                    16,
+                    1 << 20,
+                    1 << 16,
+                ))
+            });
+            let gateway =
+                Arc::new(Gateway::new(Arc::new(WorkerRegistry::new())).with_response_cache(cache));
+            gateway.register_router(router_ids::HTTP_REGULAR, router.clone());
+            let tenant = test_tenant_meta();
+
+            // An answer is stored once its body has gone out to the
+            // client, so the first body is read before the second request.
+            let first = gateway.route_chat(None, &tenant, request(0.0), "m").await;
+            let (first_status, first_id) = status_and_id(first).await;
+            let second = gateway.route_chat(None, &tenant, request(0.0), "m").await;
+            let (second_status, second_id) = status_and_id(second).await;
+            let sampled = gateway.route_chat(None, &tenant, request(0.8), "m").await;
+            let (sampled_status, _) = status_and_id(sampled).await;
+            if cached {
+                assert_eq!(first_status.as_deref(), Some("miss"));
+                assert_eq!(second_status.as_deref(), Some("hit"));
+                assert_eq!(first_id, second_id);
+                assert_eq!(sampled_status.as_deref(), Some("bypass"));
+                assert_eq!(router.calls.load(Ordering::SeqCst), 2);
+            } else {
+                assert_eq!(first_status, None);
+                assert_eq!(second_status, None);
+                assert_ne!(first_id, second_id);
+                assert_eq!(sampled_status, None);
+                assert_eq!(router.calls.load(Ordering::SeqCst), 3);
+            }
+        }
     }
 }
