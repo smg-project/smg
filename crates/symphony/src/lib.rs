@@ -47,7 +47,7 @@ pub use formats::{
     llama_nemotron, minimax_m3, mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 pub use grammar::{
-    Bound, Grammar, Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Tag,
+    Bound, Grammar, Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Tag, Turn,
 };
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};

@@ -767,3 +767,57 @@ fn a_strict_tool_whose_schema_the_calls_hold_loosely_is_told() {
     assert!(unenforced(&loose, OutputPosition::InCall, OutputChoice::Auto).is_some());
     assert!(unenforced(&loose, OutputPosition::InThought, OutputChoice::Required).is_some());
 }
+
+/// What a request asks of [`Format::turn_grammar`]: `tools` declared and callable under `choice`,
+/// with `answer`, the prompt ending at `prompt`.
+fn turn<'a>(
+    tools: &'a [Tool],
+    choice: OutputChoice,
+    answer: Option<OutputAnswer<'a>>,
+    prompt: &'a str,
+) -> Turn<'a> {
+    Turn {
+        prompt,
+        continued: false,
+        declared: tools,
+        callable: tools,
+        choice,
+        parallel: true,
+        answer,
+    }
+}
+
+#[test]
+fn the_turns_grammar_is_the_spellings_where_the_prompt_leaves_the_model() {
+    let format = table(true);
+    let tools = [weather()];
+    let start = format!("user{OPENER}");
+    let built = |choice, answer| {
+        json_of(spelling().grammar(&output(OutputPosition::Start, &tools, choice, answer)))
+    };
+    let auto = format.turn_grammar(&turn(&tools, OutputChoice::Auto, None, &start));
+    assert_eq!(json_of(auto.unwrap()), built(OutputChoice::Auto, None));
+    // A forced call writes no answer: it leaves the answer's format out, Lark's included.
+    let lark = OutputAnswer::Ebnf("start: \"y\"");
+    let forced = format.turn_grammar(&turn(&tools, OutputChoice::Required, Some(lark), &start));
+    assert_eq!(
+        json_of(forced.unwrap()),
+        built(OutputChoice::Required, None)
+    );
+    // An answer in Lark's syntax is refused; one in xgrammar's is held.
+    let why = format
+        .turn_grammar(&turn(&[], OutputChoice::Auto, Some(lark), &start))
+        .unwrap_err();
+    assert!(why.contains("Lark"), "{why}");
+    let xgrammar = OutputAnswer::Ebnf("root ::= \"y\"");
+    let held = format.turn_grammar(&turn(&[], OutputChoice::Auto, Some(xgrammar), &start));
+    assert!(held.unwrap().is_some());
+    // Inside an answer a forced call starts no grammar, and the table's tags decide.
+    let answering = format!("user{OPENER}{REPLY}The answer");
+    let inside = format.turn_grammar(&turn(&tools, OutputChoice::Required, None, &answering));
+    assert_eq!(inside, Ok(None));
+    // A table whose calls spell no turn has no grammar for one.
+    let unaddressed = crate::formats::qwen3(CallSyntax::Json);
+    let none = unaddressed.turn_grammar(&turn(&tools, OutputChoice::Auto, None, &start));
+    assert_eq!(none, Ok(None));
+}

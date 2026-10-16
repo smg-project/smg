@@ -106,6 +106,10 @@ struct Setup {
     tool_parser: Option<&'static str>,
     /// The worker's constrained-decoding policy, set on its spec.
     constrained_decoding: Option<ConstrainedDecoding>,
+    /// The worker's labels (where its engine starts a grammar, say).
+    labels: Vec<(&'static str, &'static str)>,
+    /// The text of the vocabulary's end-of-sequence token.
+    eos: &'static str,
 }
 
 impl Default for Setup {
@@ -120,6 +124,8 @@ impl Default for Setup {
             reasoning_parser: Some("hf"),
             tool_parser: Some("hf"),
             constrained_decoding: None,
+            labels: Vec::new(),
+            eos: EOS,
         }
     }
 }
@@ -189,7 +195,7 @@ async fn serve(setup: Setup) -> Gateway {
     config.tool_call_parser = setup.tool_parser.map(str::to_string);
     // The chat template renders the generation prompt itself; the mock's own rendering gets
     // the tail the template would write.
-    let mut tokenizer = ScriptedTokenizer::from_chunks(chunks).with_special_tokens(EOS);
+    let mut tokenizer = ScriptedTokenizer::from_chunks(chunks).with_special_tokens(setup.eos);
     tokenizer = if setup.chat_template {
         tokenizer
             .with_chat_template(&qwen3_5_chat_template())
@@ -218,6 +224,9 @@ async fn serve(setup: Setup) -> Gateway {
         });
     if let Some(policy) = setup.constrained_decoding {
         worker_entry = worker_entry.constrained_decoding(policy);
+    }
+    for (key, value) in setup.labels {
+        worker_entry = worker_entry.label(key, value);
     }
     let worker_entry = worker_entry.build();
     context
@@ -674,4 +683,174 @@ async fn the_legacy_parser_refuses_hf_at_startup() {
         .await
         .expect_err("refused");
     assert!(why.contains("--parser symphony"), "{why}");
+}
+
+/// A response template whose calls spell a whole turn (Beam's shape): a call's header names the
+/// tool, its parameters are tags around raw text, and a row out of a call goes on to the next or
+/// stops; `<|eos|>` is its end-of-sequence token.
+fn turn_template() -> Value {
+    json!({
+      "start_anchor_pattern": "<\\|head\\|>assistant",
+      "fields": {
+        "thinking": {"open": "<|via|>notes<|body|>", "close": "<|stop|><|head|>assistant",
+                     "content": "text"},
+        "content": {"open": "<|via|>reply<|body|>", "close": ["<|done|>", "<|stop|>", "<|eos|>"],
+                    "content": "text"},
+        "tool_calls": {
+          "open_pattern": " to=(?P<name>[^\\s<]+)<\\|via\\|>notes <\\|as\\|>xml<\\|body\\|>",
+          "close": ["<|stop|><|head|>assistant", "<|eos|>"], "repeats": true,
+          "content": "xml-inline",
+          "content_args": {
+            "tag_pattern":
+              "<arg name=\"(?P<key>[^\"]+)\">\\n(?P<value>.*?)\\n(?:</arg>|(?=<arg name=\"))",
+            "value_parser": {"name": "text", "args": {"strip": false}}
+          },
+          "transform": {"type": "function",
+                        "function": {"name": "{name}", "arguments": "{content}"}}
+        }
+      }
+    })
+}
+
+/// What a worker serving [`turn_template`]'s model under `policy`, with `labels`, received for a
+/// chat request: the constraint's kind and the tag's format, or the refusal's status and message.
+#[expect(clippy::expect_used, reason = "test helper")]
+async fn turn_sent(
+    policy: Option<ConstrainedDecoding>,
+    labels: Vec<(&'static str, &'static str)>,
+    extra: Value,
+) -> Result<Option<(String, Value)>, (StatusCode, String)> {
+    let gateway = serve(Setup {
+        template: Some(turn_template()),
+        chat_template: false,
+        prompt_tail: "<|head|>assistant",
+        output: "<|via|>notes<|body|>plan<|stop|><|head|>assistant<|via|>reply<|body|>Hello<|eos|>",
+        eos: "<|eos|>",
+        constrained_decoding: policy,
+        labels,
+        ..Setup::default()
+    })
+    .await;
+    let tenant = tenant();
+    let response = timeout(
+        Duration::from_secs(30),
+        gateway
+            .router
+            .route_chat(None, &tenant, chat_request(extra), MODEL),
+    )
+    .await
+    .expect("request should finish");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+    if status != StatusCode::OK {
+        let body: Value = serde_json::from_slice(&bytes).expect("an error body");
+        let message = body["error"]["message"].as_str().unwrap_or("").to_string();
+        return Err((status, message));
+    }
+    Ok(gateway.last_constraint().map(|(kind, value)| {
+        let format = match kind.as_str() {
+            "structural_tag" => {
+                serde_json::from_str::<Value>(&value).expect("a tag")["format"].clone()
+            }
+            _ => Value::String(value),
+        };
+        (kind, format)
+    }))
+}
+
+/// Whether a tag's format is the whole turn's grammar: it opens with the thought.
+fn is_whole_turn(sent: Option<&(String, Value)>) -> bool {
+    sent.is_some_and(|(kind, format)| {
+        kind == "structural_tag" && format["elements"][0]["begin"] == "<|via|>notes<|body|>"
+    })
+}
+
+#[tokio::test]
+async fn a_worker_on_always_from_the_first_token_takes_the_whole_turns_grammar() {
+    let first = ("constrained_decoding_start", "first_token");
+    let always = Some(ConstrainedDecoding::Always);
+    for extra in [
+        json!({"tools": tools(), "tool_choice": "required"}),
+        json!({"tools": tools()}),
+        json!({"tools": null}),
+        json!({"tools": tools(), "response_format": {"type": "json_object"}}),
+    ] {
+        let sent = turn_sent(always, vec![first], extra.clone()).await;
+        assert!(
+            sent.as_ref().is_ok_and(|sent| is_whole_turn(sent.as_ref())),
+            "{extra}: {sent:?}"
+        );
+    }
+    // An ebnf in xgrammar's syntax is the answer's; the engine's request carries the tag alone.
+    let sent = turn_sent(always, vec![first], json!({"ebnf": "root ::= \"y\""}))
+        .await
+        .expect("served");
+    assert!(is_whole_turn(sent.as_ref()), "{sent:?}");
+    let (_, format) = sent.expect("a tag");
+    assert_eq!(format["elements"][1]["elements"][1]["type"], "grammar");
+}
+
+#[tokio::test]
+async fn the_selected_workers_policy_decides_and_what_no_grammar_holds_is_refused() {
+    let first = ("constrained_decoding_start", "first_token");
+    let after = ("constrained_decoding_start", "after_reasoning");
+    let required = json!({"tools": tools(), "tool_choice": "required"});
+    let no_tag = "no structural tag for a forced tool choice";
+    let mut wrong = Vec::new();
+    for (policy, labels, extra, why) in [
+        // `requested`, set or not, is the behaviour before the policy: the table has no tag
+        // for a forced call.
+        (None, vec![first], required.clone(), no_tag),
+        (
+            Some(ConstrainedDecoding::Requested),
+            vec![first],
+            required.clone(),
+            no_tag,
+        ),
+        (
+            Some(ConstrainedDecoding::Requested),
+            vec![after],
+            required.clone(),
+            no_tag,
+        ),
+        // `always` on an engine that starts the grammar after the reasoning, or does not say,
+        // takes the tags: a forced call is refused, never sent free.
+        (
+            Some(ConstrainedDecoding::Always),
+            vec![after],
+            required.clone(),
+            no_tag,
+        ),
+        (
+            Some(ConstrainedDecoding::Always),
+            vec![],
+            required.clone(),
+            no_tag,
+        ),
+        // What the whole turn's grammar cannot hold.
+        (
+            Some(ConstrainedDecoding::Always),
+            vec![first],
+            json!({"ebnf": "start: \"y\""}),
+            "Lark",
+        ),
+        (
+            Some(ConstrainedDecoding::Always),
+            vec![first],
+            json!({"tools": tools(), "regex": "y+", "parallel_tool_calls": false}),
+            "parallel_tool_calls: false",
+        ),
+        (
+            None,
+            vec![first],
+            json!({"ebnf": "start: \"y\""}),
+            "would apply outside it",
+        ),
+    ] {
+        match turn_sent(policy, labels.clone(), extra.clone()).await {
+            Err((StatusCode::BAD_REQUEST, message)) if message.contains(why) => {}
+            other => wrong.push(format!("{policy:?} {labels:?} {extra}: {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "not refused as expected: {wrong:#?}");
 }

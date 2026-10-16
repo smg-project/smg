@@ -65,13 +65,12 @@ impl ChatPreparationStage {
         let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
             .map_err(|why| error::bad_request("invalid_parser_header", why))?;
         ctx.state.parser = Some(parser);
-        let (token_ids, processed_messages, tool_constraints, output_decided) =
+        let (token_ids, processed_messages, tool_constraints) =
             prepare_chat_like(ctx, request, self.wire_pools).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {
             token_ids,
             processed_messages,
             tool_constraints,
-            output_decided,
         });
         Ok(())
     }
@@ -89,7 +88,7 @@ pub(crate) async fn prepare_chat_like(
     ctx: &mut RequestContext,
     request: &ChatCompletionRequest,
     wire_pools: &'static [RoutingPool],
-) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>, bool), Response> {
+) -> Result<(Vec<u32>, ProcessedMessages, symphony::PreparedConstraint), Response> {
     utils::validate_chat_content_parts(&request.messages)
         .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
@@ -364,45 +363,22 @@ pub(crate) async fn prepare_chat_like(
         // the table parses (see `regular::symphony`, which decides both with one
         // predicate); the older registry decides for every other request. Only
         // the chat stage chooses a parser: transcription, which shares this
-        // preparation, keeps the legacy parsers.
-        // Where the model's workers start a grammar at the first token, the response
-        // template's table constrains the whole turn instead, the answer's format included,
-        // and what it gives stands (see `regular::symphony::output`).
+        // preparation, keeps the legacy parsers. The table's refusal waits for
+        // request building, which decides on the selected worker: one whose
+        // engine takes the whole turn's grammar may serve what the table's
+        // tags cannot (`regular::symphony::worker_constraint`).
         let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
         let names = ctx.components.parser_resolver.names(&request.model);
-        let workers = ctx
-            .components
-            .worker_registry
-            .get_by_model(&ctx.input.model_id);
-        let output_grammar = symphony::output::for_chat(
+        let symphony_constraint = symphony::constraint(
             parser,
             &names,
             request,
-            &workers,
-            &processed_messages.text,
-            request.continues_final_assistant(),
+            &constraint_tools,
+            reasoning,
             &ctx.components.templates,
-        )
-        .transpose()?;
-        let has_output_grammar = output_grammar.is_some();
-        let symphony_constraint = match output_grammar {
-            Some(output_grammar) => output_grammar,
-            None => symphony::constraint(
-                parser,
-                &names,
-                request,
-                &constraint_tools,
-                reasoning,
-                &ctx.components.templates,
-            )
-            .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
-        };
+        );
         let tool_call_constraint = match (symphony_constraint, request.tool_choice.as_ref()) {
-            (Some(constraint), _) => Some(constraint),
-            (None, Some(tool_choice))
-                if !has_output_grammar && !constraint_tools.is_empty() =>
-            {
-                ctx
+            (Ok(None), Some(tool_choice)) if !constraint_tools.is_empty() => Ok(ctx
                 .components
                 .tool_parser_factory
                 .registry()
@@ -418,9 +394,8 @@ pub(crate) async fn prepare_chat_like(
                         "invalid_tool_configuration",
                         format!("Invalid tool configuration: {e}"),
                     )
-                })?
-            }
-            (None, _) => None,
+                })?),
+            (prepared, _) => prepared,
         };
 
         let legacy_parser_needs_special_tokens = request.separate_reasoning
@@ -448,7 +423,7 @@ pub(crate) async fn prepare_chat_like(
             request,
             tool_call_constraint
                 .as_ref()
-                .is_some_and(|constraint| constraint.is_json_schema()),
+                .is_ok_and(|constraint| constraint.as_ref().is_some_and(|c| c.is_json_schema())),
             preserve_reasoning_special_tokens,
         );
 
@@ -470,12 +445,7 @@ pub(crate) async fn prepare_chat_like(
         ctx.state.response.stop_decoder = Some(stop_decoder);
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 
-        Ok((
-            token_ids,
-            processed_messages,
-            tool_call_constraint.map(|c| c.to_tuple()),
-            has_output_grammar,
-        ))
+        Ok((token_ids, processed_messages, tool_call_constraint))
     }
 }
 

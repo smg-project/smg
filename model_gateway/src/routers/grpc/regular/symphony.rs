@@ -30,13 +30,14 @@
 //! structural tag of a forced or required call, or of a JSON `response_format` ([`constraint`],
 //! [`constraint_messages`]) before the older registry. Both decide with one predicate, so the
 //! output a table's tag constrains is read by that table and never by the older parsers, which
-//! expect another syntax. Where the model's workers start a grammar at the first token, the
-//! response template's table constrains the whole turn instead, when its calls spell one
-//! ([`output`]). The streaming and non-streaming drivers run one [`Reader`] per choice
+//! expect another syntax. Request building decides what constrains the output on the worker
+//! selected for the request ([`worker_constraint`]): a worker whose engine takes a grammar on every
+//! turn from its first token gets the whole turn's grammar where the response template's table
+//! spells one ([`turn_constraint`]); a table's refusal in preparation waits for that decision. The
+//! streaming and non-streaming drivers run one [`Reader`] per choice
 //! over the stop decoder's output and render its events with `symphony::adapt::chat` or
 //! `symphony::adapt::messages`, so the client sees the deltas and the message it saw before.
 
-pub(crate) mod output;
 pub(crate) mod template;
 
 use axum::http::HeaderMap;
@@ -48,14 +49,16 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
+    worker::ConstrainedDecoding,
 };
 use serde_json::{json, Value};
 use symphony::{
     formats::{for_model, table_for, Table},
     grammar::Options,
-    Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, Parser as _, TokenSpan,
+    Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, OutputAnswer,
+    OutputChoice, Parser as _, TokenSpan, Turn,
 };
-use tool_parser::ToolConstraint;
+use tool_parser::{GrammarStart, ToolConstraint};
 use tracing::debug;
 
 use self::template::Templates;
@@ -97,7 +100,7 @@ fn is_passthrough(name: Option<&str>) -> bool {
 
 /// Whether the parser names select the response template's table: either name is
 /// [`TEMPLATE_PARSER`]; [`check_names`] binds the other to it or to nothing.
-pub(crate) fn names_template(names: &Names) -> bool {
+fn names_template(names: &Names) -> bool {
     is_named(names.tool.as_deref(), TEMPLATE_PARSER)
         || is_named(names.reasoning.as_deref(), TEMPLATE_PARSER)
 }
@@ -547,6 +550,175 @@ pub(crate) fn auto_constraint_messages(
         None => false,
     };
     Ok(auto_tag(&format, tools, reasoning_open, one_call))
+}
+
+/// The constraint preparation finds for what a request asks, before its worker is known: the
+/// table's tag for a forced call or a JSON answer, else the registry's; or why the table cannot
+/// constrain the request ([`constraint`], [`constraint_messages`]). Request building decides on the
+/// selected worker ([`worker_constraint`]).
+pub(crate) type PreparedConstraint = Result<Option<ToolConstraint>, String>;
+
+/// What constrains a request's output on the worker selected for it.
+pub(crate) struct WorkerConstraint {
+    pub constraint: Option<ToolConstraint>,
+    /// The constraint is the whole turn's grammar, which holds the request's own format: the
+    /// engine's request carries none beside it.
+    pub whole_turn: bool,
+}
+
+/// What constrains a request's output on the worker selected for it, whose engine takes a grammar
+/// on every turn or only when the request asks (`policy`) and starts it where `start` says (under
+/// PD the decode worker's). The one place a worker's policy decides:
+///
+/// - `requested`, the default: what preparation found (`prepared`), its refusal included.
+/// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
+///   (`turn`, [`turn_constraint`]) where it starts; its refusal refuses the request.
+/// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
+///   and when that is nothing, the table's tag for the calls `auto` allows (`auto`,
+///   [`auto_constraint`]).
+pub(crate) fn worker_constraint(
+    policy: ConstrainedDecoding,
+    start: GrammarStart,
+    prepared: PreparedConstraint,
+    turn: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
+    auto: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
+) -> Result<WorkerConstraint, String> {
+    let always = policy == ConstrainedDecoding::Always;
+    if always && start == GrammarStart::FirstToken {
+        if let Some(constraint) = turn()? {
+            return Ok(WorkerConstraint {
+                constraint: Some(constraint),
+                whole_turn: true,
+            });
+        }
+    }
+    let constraint = match prepared? {
+        None if always => auto()?,
+        prepared => prepared,
+    };
+    Ok(WorkerConstraint {
+        constraint,
+        whole_turn: false,
+    })
+}
+
+/// The whole turn's grammar for a chat request ([`Format::turn_grammar`]), where the response
+/// template's table reads the response ([`TEMPLATE_PARSER`]); `prompt` is the rendered prompt.
+/// `Ok(None)` for any other table, and where the turn's grammar does not start; an error refuses
+/// what it cannot hold.
+pub(crate) fn turn_constraint(
+    parser: ParserChoice,
+    names: &Names,
+    request: &ChatCompletionRequest,
+    prompt: &str,
+    templates: &Templates,
+) -> Result<Option<ToolConstraint>, String> {
+    if !names_template(names) {
+        return Ok(None);
+    }
+    match reads(parser, names, &request.model, templates)? {
+        Some(format) => chat_turn(&format, request, prompt),
+        None => Ok(None),
+    }
+}
+
+/// [`turn_constraint`] over `format`: the request's tools and choice, and its `response_format`,
+/// `regex` or `ebnf` as the answer's (the protocol refuses more than one).
+fn chat_turn(
+    format: &Format,
+    request: &ChatCompletionRequest,
+    prompt: &str,
+) -> Result<Option<ToolConstraint>, String> {
+    let declared: Vec<Tool> = request.effective_tools().cloned().collect();
+    let callable = match request.tool_choice {
+        Some(ToolChoice::Value(ToolChoiceValue::None)) => Vec::new(),
+        _ => request.callable_tools(),
+    };
+    let schema = answer_schema(request.response_format.as_ref());
+    let answer = schema
+        .as_ref()
+        .map(OutputAnswer::Json)
+        .or_else(|| request.regex.as_deref().map(OutputAnswer::Regex))
+        .or_else(|| request.ebnf.as_deref().map(OutputAnswer::Ebnf));
+    whole_turn(
+        format,
+        &Turn {
+            prompt,
+            continued: request.continues_final_assistant(),
+            declared: &declared,
+            callable: &callable,
+            choice: output_choice(request.tool_choice.as_ref()),
+            parallel: !request.disables_parallel_tool_calls(),
+            answer,
+        },
+    )
+}
+
+/// [`turn_constraint`] for a Messages request whose tools are `tools` (its chat tools): its
+/// `tool_choice` as a Chat one, one call at most when parallel use is disabled; `continues` says
+/// whether the prompt continues the assistant's message. A Messages request carries no answer
+/// format (an `output_format` is refused before this).
+pub(crate) fn turn_constraint_messages(
+    parser: ParserChoice,
+    names: &Names,
+    request: &CreateMessageRequest,
+    tools: &[Tool],
+    prompt: &str,
+    continues: bool,
+    templates: &Templates,
+) -> Result<Option<ToolConstraint>, String> {
+    if !names_template(names) {
+        return Ok(None);
+    }
+    match reads(parser, names, &request.model, templates)? {
+        Some(format) => messages_turn(&format, request, tools, prompt, continues),
+        None => Ok(None),
+    }
+}
+
+/// [`turn_constraint_messages`] over `format`.
+fn messages_turn(
+    format: &Format,
+    request: &CreateMessageRequest,
+    tools: &[Tool],
+    prompt: &str,
+    continues: bool,
+) -> Result<Option<ToolConstraint>, String> {
+    let choice = request.tool_choice.as_ref().map(ToolChoice::from);
+    let callable = match &choice {
+        Some(ToolChoice::Value(ToolChoiceValue::None)) => Vec::new(),
+        Some(choice) => choice.narrow_tools(tools).unwrap_or_else(|| tools.to_vec()),
+        None => tools.to_vec(),
+    };
+    whole_turn(
+        format,
+        &Turn {
+            prompt,
+            continued: continues,
+            declared: tools,
+            callable: &callable,
+            choice: output_choice(choice.as_ref()),
+            parallel: !request.disables_parallel_tool_use(),
+            answer: None,
+        },
+    )
+}
+
+/// How a tool choice shapes a turn: one call for a named function, one or more where the choice
+/// forces a call, an answer or calls otherwise.
+fn output_choice(choice: Option<&ToolChoice>) -> OutputChoice {
+    match choice {
+        Some(ToolChoice::Function { .. }) => OutputChoice::One,
+        Some(choice) if choice.forces_call() => OutputChoice::Required,
+        _ => OutputChoice::Auto,
+    }
+}
+
+/// `format`'s grammar for `turn` as the engine's structural tag.
+fn whole_turn(format: &Format, turn: &Turn<'_>) -> Result<Option<ToolConstraint>, String> {
+    Ok(format
+        .turn_grammar(turn)?
+        .map(|grammar| ToolConstraint::StructuralTag(grammar.payload_text())))
 }
 
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
@@ -2281,5 +2453,371 @@ mod tests {
             panic!("a finish");
         };
         assert_eq!(*reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn the_selected_workers_policy_decides_once() {
+        use ConstrainedDecoding::{Always, Requested};
+        use GrammarStart::{AfterReasoning, FirstToken, Unknown};
+
+        let tag = |text: &str| ToolConstraint::StructuralTag(text.to_string());
+        let refused = |why: &str| Err::<Option<ToolConstraint>, String>(why.to_string());
+        // What one decision gives (the tag's text, and whether it is the whole turn's), and which
+        // of the whole turn's grammar and the `auto` tag it built.
+        let decide = |policy, start, prepared: PreparedConstraint, turn: PreparedConstraint| {
+            let built = std::cell::RefCell::new(Vec::new());
+            let decided = worker_constraint(
+                policy,
+                start,
+                prepared,
+                || {
+                    built.borrow_mut().push("turn");
+                    turn
+                },
+                || {
+                    built.borrow_mut().push("auto");
+                    Ok(Some(tag("auto")))
+                },
+            )
+            .map(|decided| {
+                let text = decided.constraint.map(|constraint| constraint.to_tuple().1);
+                (text, decided.whole_turn)
+            });
+            (decided, built.into_inner())
+        };
+        let found = |text: &str| Ok((Some(text.to_string()), false));
+
+        // `requested`: what preparation found, its refusal included; nothing else is built.
+        for start in [FirstToken, AfterReasoning, Unknown] {
+            assert_eq!(
+                decide(
+                    Requested,
+                    start,
+                    Ok(Some(tag("prepared"))),
+                    Ok(Some(tag("turn")))
+                ),
+                (found("prepared"), vec![])
+            );
+            assert_eq!(
+                decide(Requested, start, refused("no tag"), Ok(Some(tag("turn")))),
+                (Err("no tag".to_string()), vec![])
+            );
+            assert_eq!(
+                decide(Requested, start, Ok(None), Ok(Some(tag("turn")))),
+                (Ok((None, false)), vec![])
+            );
+        }
+        // `always` from the first token: the whole turn's grammar stands over what preparation
+        // found or refused, and its refusal refuses the request.
+        assert_eq!(
+            decide(Always, FirstToken, refused("no tag"), Ok(Some(tag("turn")))),
+            (Ok((Some("turn".to_string()), true)), vec!["turn"])
+        );
+        assert_eq!(
+            decide(Always, FirstToken, Ok(None), refused("cannot hold")),
+            (Err("cannot hold".to_string()), vec!["turn"])
+        );
+        // Where the whole turn's grammar does not start, and on an engine that starts the grammar
+        // later or does not say: what preparation found or refused, else the `auto` tag.
+        assert_eq!(
+            decide(Always, FirstToken, Ok(Some(tag("prepared"))), Ok(None)),
+            (found("prepared"), vec!["turn"])
+        );
+        assert_eq!(
+            decide(Always, FirstToken, refused("no tag"), Ok(None)),
+            (Err("no tag".to_string()), vec!["turn"])
+        );
+        assert_eq!(
+            decide(Always, FirstToken, Ok(None), Ok(None)),
+            (found("auto"), vec!["turn", "auto"])
+        );
+        for start in [AfterReasoning, Unknown] {
+            assert_eq!(
+                decide(Always, start, refused("no tag"), Ok(Some(tag("turn")))),
+                (Err("no tag".to_string()), vec![])
+            );
+            assert_eq!(
+                decide(
+                    Always,
+                    start,
+                    Ok(Some(tag("prepared"))),
+                    Ok(Some(tag("turn")))
+                ),
+                (found("prepared"), vec![])
+            );
+            assert_eq!(
+                decide(Always, start, Ok(None), Ok(Some(tag("turn")))),
+                (found("auto"), vec!["auto"])
+            );
+        }
+    }
+
+    /// A table whose calls spell a whole turn: a call's header names the tool, its parameters
+    /// are tags around raw text, and a row out of a call goes on to the next or stops.
+    fn turn_table() -> Format {
+        let source = json!({
+          "start_anchor_pattern": "<\\|head\\|>assistant",
+          "fields": {
+            "thinking": {"open": "<|via|>notes<|body|>", "close": "<|stop|><|head|>assistant",
+                         "content": "text"},
+            "content": {"open": "<|via|>reply<|body|>", "close": ["<|done|>", "<|stop|>", "<eos>"],
+                        "content": "text"},
+            "tool_calls": {
+              "open_pattern": " to=(?P<name>[^\\s<]+)<\\|via\\|>notes <\\|as\\|>xml<\\|body\\|>",
+              "close": ["<|stop|><|head|>assistant", "<eos>"], "repeats": true,
+              "content": "xml-inline",
+              "content_args": {
+                "tag_pattern":
+                  "<arg name=\"(?P<key>[^\"]+)\">\\n(?P<value>.*?)\\n(?:</arg>|(?=<arg name=\"))",
+                "value_parser": {"name": "text", "args": {"strip": false}}
+              },
+              "transform": {"type": "function",
+                            "function": {"name": "{name}", "arguments": "{content}"}}
+            }
+          }
+        });
+        let template = smg_response_template::load_response_template(&source).expect("template");
+        smg_response_template::to_symphony::compile(&template, &["<|done|>", "<eos>"])
+            .expect("compiled")
+            .format
+    }
+
+    fn weather() -> Value {
+        json!([{"type": "function", "function": {"name": "get_weather", "parameters": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}])
+    }
+
+    /// The format of the whole turn's grammar a chat request takes over [`turn_table`], the prompt
+    /// ending at the turn's opener, then at `continued` when the request continues an assistant
+    /// message; the error is the refusal.
+    fn turn(mut extra: Value, continued: Option<&str>) -> Result<Option<Value>, String> {
+        if continued.is_some() {
+            extra["continue_final_message"] = json!(true);
+            extra["messages"] = json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "partial"}
+            ]);
+        }
+        let prompt = format!("user<|head|>assistant{}", continued.unwrap_or(""));
+        let constraint = chat_turn(&turn_table(), &request(extra), &prompt)?;
+        Ok(constraint.map(|constraint| tag_of(Ok(Some(constraint)))["format"].clone()))
+    }
+
+    fn whole(extra: Value, continued: Option<&str>) -> Value {
+        turn(extra, continued).expect("held").expect("a grammar")
+    }
+
+    /// The part of a turn's format after its thought: the answer, the calls, or either.
+    fn after_thought(format: &Value) -> &Value {
+        &format["elements"][1]
+    }
+
+    #[test]
+    fn the_whole_turn_holds_the_answer_and_the_calls() {
+        let free = whole(json!({}), None);
+        assert_eq!(
+            after_thought(&free)["elements"][1],
+            json!({"type": "any_text", "excludes": ["<|done|>", "<|stop|>"]})
+        );
+        assert_eq!(
+            after_thought(&whole(json!({"tools": weather()}), None))["type"],
+            "or"
+        );
+        let required = whole(json!({"tools": weather(), "tool_choice": "required"}), None);
+        assert_eq!(after_thought(&required)["type"], "sequence");
+        let json_answer = whole(json!({"response_format": {"type": "json_object"}}), None);
+        assert_eq!(
+            after_thought(&json_answer)["elements"][1],
+            json!({"type": "json_schema", "json_schema": {"type": "object"}})
+        );
+        let regex = whole(json!({"regex": "(yes|no)"}), None);
+        assert_eq!(
+            after_thought(&regex)["elements"][1],
+            json!({"type": "regex", "pattern": "(yes|no)"})
+        );
+        let ebnf = whole(json!({"ebnf": "root ::= \"y\""}), None);
+        assert_eq!(after_thought(&ebnf)["elements"][1]["type"], "grammar");
+        // A forced call writes no answer, so it leaves the answer's format out, Lark's included.
+        assert_eq!(
+            turn(
+                json!({"tools": weather(), "tool_choice": "required", "ebnf": "start: \"y\""}),
+                None
+            ),
+            Ok(Some(required))
+        );
+    }
+
+    #[test]
+    fn the_prompt_says_where_the_turn_starts() {
+        let thinking = whole(json!({}), Some("<|via|>notes<|body|>Let me"));
+        assert_eq!(thinking["elements"][0]["begin"], "");
+        let after = whole(
+            json!({}),
+            Some("<|via|>notes<|body|>Plan.<|stop|><|head|>assistant"),
+        );
+        assert_eq!(after["elements"][0]["value"], "<|via|>reply<|body|>");
+
+        // Inside an answer: the rest of a free one; a forced call or an answer's format starts
+        // no grammar there, and the table's tags decide (`worker_constraint`).
+        let answering = Some("<|via|>reply<|body|>The answer");
+        assert_eq!(
+            whole(json!({}), answering)["elements"][0]["type"],
+            "any_text"
+        );
+        for extra in [
+            json!({"tools": weather(), "tool_choice": "required"}),
+            json!({"tools": weather(), "tool_choice": {"type": "allowed_tools",
+                "mode": "required", "tools": [{"type": "function", "name": "get_weather"}]}}),
+            json!({"response_format": {"type": "json_object"}}),
+        ] {
+            assert_eq!(turn(extra, answering), Ok(None));
+        }
+        // Past text no field holds, no grammar starts.
+        assert_eq!(turn(json!({"tools": weather()}), Some("Hello")), Ok(None));
+        // Inside a call: the rest of it is free.
+        let calling = " to=get_weather<|via|>notes <|as|>xml<|body|><arg name=\"city\">\nPa";
+        assert_eq!(
+            whole(json!({"tools": weather()}), Some(calling))["elements"][0]["type"],
+            "any_text"
+        );
+    }
+
+    #[test]
+    fn the_whole_turn_refuses_what_it_cannot_hold() {
+        let refused = |extra: Value| turn(extra, None).is_err();
+        let served = |extra: Value| turn(extra, None).expect("held").is_some();
+        let named = |name: &str| {
+            json!([{"type": "function", "function": {"name": name, "parameters": {
+                "type": "object", "properties": {"city": {"type": "string"}}}}}])
+        };
+        // A name a call cannot carry, whatever the choice.
+        for choice in [json!("auto"), json!("none"), json!("required")] {
+            assert!(refused(
+                json!({"tools": named("get weather"), "tool_choice": choice})
+            ));
+        }
+        let key = json!([{"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {"say \"hi\"": {"type": "string"}}}}}]);
+        assert!(refused(json!({"tools": key})));
+
+        // A strict tool whose calls the grammar would hold more loosely, while it is callable.
+        let tuple = |strict: bool| {
+            json!([{"type": "function", "function": {"name": "f", "strict": strict,
+                "parameters": {"type": "object", "properties": {"p": {"type": "tuple"}},
+                    "required": ["p"]}}}])
+        };
+        assert!(refused(json!({"tools": tuple(true)})));
+        assert!(served(json!({"tools": tuple(false)})));
+        assert!(served(json!({"tools": tuple(true), "tool_choice": "none"})));
+
+        // Under `auto`, a strict tool or one call at most beside the request's own grammar; and
+        // an ebnf in Lark's syntax.
+        let strict = json!([{"type": "function", "function": {"name": "f", "strict": true,
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]);
+        for extra in [
+            json!({"tools": strict, "regex": "(a|b)"}),
+            json!({"tools": strict, "ebnf": "root ::= \"y\""}),
+            json!({"tools": weather(), "parallel_tool_calls": false, "regex": "(a|b)"}),
+            json!({"ebnf": "start: \"y\""}),
+            json!({"tools": weather(), "ebnf": "start: \"y\""}),
+        ] {
+            assert!(refused(extra.clone()), "{extra}");
+        }
+        for extra in [
+            json!({"tools": strict}),
+            json!({"tools": strict, "response_format": {"type": "json_object"}}),
+            json!({"tools": strict, "tool_choice": "required", "regex": "(a|b)"}),
+            json!({"tools": weather(), "regex": "(a|b)"}),
+            json!({"tools": weather(), "parallel_tool_calls": false}),
+            json!({"regex": "(a|b)", "parallel_tool_calls": false}),
+        ] {
+            assert!(served(extra.clone()), "{extra}");
+        }
+        let why = turn(json!({"ebnf": "start: \"y\""}), None).expect_err("refused");
+        assert!(why.contains("Lark"), "{why}");
+    }
+
+    #[test]
+    fn over_its_limits_the_whole_turn_leaves_the_tags_to_decide() {
+        let properties: serde_json::Map<String, Value> = (0
+            ..=symphony::OutputSpelling::MAX_TOOL_PARAMETERS)
+            .map(|i| (format!("p{i}"), json!({"type": "string"})))
+            .collect();
+        let wide = json!([{"type": "function", "function": {"name": "wide",
+            "parameters": {"type": "object", "properties": properties}}}]);
+        assert_eq!(turn(json!({"tools": wide}), None), Ok(None));
+
+        let huge = "x".repeat(symphony::OutputSpelling::MAX_TAG_BYTES);
+        let large = json!([{"type": "function", "function": {"name": "large",
+        "parameters": {"type": "object", "properties": {
+            "p": {"type": "string", "enum": [huge]}
+        }}}}]);
+        assert_eq!(turn(json!({"tools": large}), None), Ok(None));
+    }
+
+    #[test]
+    fn a_messages_choice_takes_the_turn_its_chat_twin_takes() {
+        let tools = json!([{"name": "get_weather", "input_schema": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]);
+        let prompt = "user<|head|>assistant";
+        for (choice, chat) in [
+            (json!({"type": "auto"}), json!({})),
+            (json!({"type": "any"}), json!({"tool_choice": "required"})),
+            (
+                json!({"type": "any", "disable_parallel_tool_use": true}),
+                json!({"tool_choice": "required", "parallel_tool_calls": false}),
+            ),
+            (
+                json!({"type": "tool", "name": "get_weather"}),
+                json!({"tool_choice": {"type": "function", "function": {"name": "get_weather"}}}),
+            ),
+            (json!({"type": "none"}), json!({"tool_choice": "none"})),
+        ] {
+            let messages = message_request(json!({"tools": tools, "tool_choice": choice}));
+            let mut chat = chat;
+            chat["tools"] = weather();
+            let tag = |constraint: Result<Option<ToolConstraint>, String>| {
+                tag_of(constraint)["format"].clone()
+            };
+            assert_eq!(
+                tag(messages_turn(
+                    &turn_table(),
+                    &messages,
+                    &messages.chat_tools(),
+                    prompt,
+                    false
+                )),
+                tag(chat_turn(&turn_table(), &request(chat), prompt)),
+                "{choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_response_templates_table_spells_a_whole_turn() {
+        // Any other name, and the legacy parsers, leave the turn to the table's tags without
+        // looking for a template.
+        let request = request(json!({"tools": weather(), "tool_choice": "required"}));
+        for (parser, names) in [
+            (ParserChoice::Symphony, names(Some("qwen"), None)),
+            (ParserChoice::Symphony, names(None, None)),
+            (ParserChoice::Legacy, names(Some("hf"), None)),
+        ] {
+            assert!(matches!(
+                turn_constraint(parser, &names, &request, PROMPT, &templates()),
+                Ok(None)
+            ));
+        }
+        // The template's names ask for the model's own template, and a model without one is
+        // refused, as the table's tags refuse it.
+        let why = turn_constraint(
+            ParserChoice::Symphony,
+            &names(Some("hf"), None),
+            &request,
+            PROMPT,
+            &templates(),
+        )
+        .expect_err("refused");
+        assert_eq!(why, "no tokenizer is registered for model 'Qwen/Qwen3-8B'");
     }
 }

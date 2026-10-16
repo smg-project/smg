@@ -1027,10 +1027,6 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     // on a thinking prompt, as for SGLang above; the servicer writes both.
     "engine_reasoning_parser",
     "constrained_decoding_start",
-    // The engine's grammar backend (`none` by default): a model served by an
-    // engine that applies no grammar takes none it did not ask for
-    // (`regular::symphony::output::Engines`).
-    "grammar_backend",
     // RL control plane (crates/rl): where the engine's SGLang-compatible
     // control app listens and what it implements. The engine advertises
     // these; SMG's discovery turns them into the labels the RL crate reads.
@@ -1367,7 +1363,6 @@ mod tests {
                         string_value("true"),
                     ),
                     ("mm_item_limits".to_string(), string_value("image=4")),
-                    ("grammar_backend".to_string(), string_value("none")),
                     // Not in TOKENSPEED_GRPC_KEYS — must not become a label.
                     ("host".to_string(), string_value("127.0.0.1")),
                 ]),
@@ -1465,11 +1460,6 @@ mod tests {
         assert_eq!(
             labels.get("mm_item_limits").map(String::as_str),
             Some("image=4")
-        );
-        // The engine's grammar backend, for the grammars a request did not ask for.
-        assert_eq!(
-            labels.get("grammar_backend").map(String::as_str),
-            Some("none")
         );
         // scheduler_info and transient runtime state never become labels.
         assert!(!labels.contains_key("status"));

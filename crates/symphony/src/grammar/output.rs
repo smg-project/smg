@@ -58,6 +58,9 @@
 //! A tool that asks for its calls to follow its schema (`strict`) may hold parts of it the grammar
 //! takes more loosely ([`OutputSpelling::unenforced`]), and a tool or parameter may have a name the
 //! calls cannot carry ([`OutputSpelling::check_names`]).
+//!
+//! A gateway asks for the grammar with one call, [`Format::turn_grammar`], which applies those
+//! checks and refuses what the grammar cannot hold.
 
 mod build;
 mod strict;
@@ -186,6 +189,98 @@ pub struct Output<'a> {
     /// More than one call may be made (ignored for [`OutputChoice::One`]).
     pub parallel: bool,
     pub answer: Option<OutputAnswer<'a>>,
+}
+
+/// What one request asks of a whole turn's grammar ([`Format::turn_grammar`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Turn<'a> {
+    /// The rendered prompt: where it leaves the model is where the grammar starts
+    /// ([`Format::output_position`]).
+    pub prompt: &'a str,
+    /// The prompt continues the final assistant message.
+    pub continued: bool,
+    /// Every tool the request declares.
+    pub declared: &'a [Tool],
+    /// The tools the choice lets the model call (none under `none`).
+    pub callable: &'a [Tool],
+    pub choice: OutputChoice,
+    /// More than one call may be made (ignored for [`OutputChoice::One`]).
+    pub parallel: bool,
+    /// The request's own constraint on the answer.
+    pub answer: Option<OutputAnswer<'a>>,
+}
+
+impl Format {
+    /// The grammar of a whole turn for `turn`, from the model's first token, where this table's
+    /// calls spell one ([`Format::output_spelling`]): the thought, then the answer (the request's
+    /// format, or free text) or calls to the tools the choice lets the model call. A forced call
+    /// writes no answer, so it leaves the answer's format out.
+    ///
+    /// `Ok(None)` where no grammar of the table's starts: its calls spell no turn; the prompt
+    /// leaves the model past text no field holds, or inside an answer while a call is forced or
+    /// the answer has a format; the tools are over [`OutputSpelling::check_parameter_counts`]'s
+    /// limits, or the grammar over [`OutputSpelling::MAX_TAG_BYTES`] (worked out before it is
+    /// built). The error refuses what the grammar cannot hold:
+    /// - a declared tool or parameter whose name a call cannot carry, whatever the choice
+    ///   ([`OutputSpelling::check_names`]);
+    /// - under `auto`, a strict tool or `parallel: false` with the request's own regex or ebnf,
+    ///   which no grammar of the calls holds;
+    /// - an answer's ebnf in Lark's syntax ([`OutputAnswer::composes`]);
+    /// - a callable strict tool whose calls the grammar would hold to its schema more loosely
+    ///   ([`OutputSpelling::unenforced`]).
+    pub fn turn_grammar(&self, turn: &Turn<'_>) -> Result<Option<Grammar>, String> {
+        let Ok(spelling) = self.output_spelling() else {
+            return Ok(None);
+        };
+        spelling.check_names(turn.declared)?;
+        let forced = turn.choice != OutputChoice::Auto;
+        let own_grammar = matches!(
+            turn.answer,
+            Some(OutputAnswer::Regex(_) | OutputAnswer::Ebnf(_))
+        );
+        let strict = turn
+            .callable
+            .iter()
+            .any(|tool| tool.function.strict == Some(true));
+        if own_grammar && !forced && !turn.callable.is_empty() && (strict || !turn.parallel) {
+            return Err(
+                "a strict tool, or parallel_tool_calls: false, cannot be held under tool_choice \
+                 auto together with the request's own regex or ebnf"
+                    .to_string(),
+            );
+        }
+        let answer = turn.answer.filter(|_| !forced);
+        if answer.is_some_and(|answer| !answer.composes()) {
+            return Err(
+                "the ebnf is in Lark's syntax, which this model's turn grammar cannot hold; \
+                 write it in xgrammar's (root ::= ...)"
+                    .to_string(),
+            );
+        }
+        let position = self.output_position(turn.prompt, turn.continued);
+        if position == OutputPosition::InAnswer && forced {
+            return Ok(None);
+        }
+        let output = Output {
+            position,
+            declared: turn.declared,
+            callable: turn.callable,
+            choice: turn.choice,
+            parallel: turn.parallel,
+            answer,
+        };
+        if let Some(why) = spelling.unenforced(&output) {
+            return Err(why);
+        }
+        if OutputSpelling::check_parameter_counts(turn.callable).is_err() {
+            return Ok(None);
+        }
+        // The grammar's length comes before the grammar: one over the bound is never built.
+        match spelling.payload_len(&output) {
+            Some(len) if len <= OutputSpelling::MAX_TAG_BYTES => Ok(spelling.grammar(&output)),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// How an addressed call is spelled, read off its shape (see the module documentation).

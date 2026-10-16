@@ -19,7 +19,7 @@ use openai_protocol::common::Tool;
 use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
 
-pub use self::output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling};
+pub use self::output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling, Turn};
 use crate::{
     format::{CallSyntax, Emits, Format},
     shape::{Layout, Message},

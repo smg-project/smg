@@ -48,7 +48,7 @@ use crate::{
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
         error::internal_error,
-        grpc::regular::symphony::template::Templates,
+        grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
@@ -567,20 +567,18 @@ pub(crate) enum PreparationOutput {
     Chat {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
-        tool_constraints: Option<(String, String)>,
-        /// The whole-output path made the constraint decision, including a deliberate none.
-        output_decided: bool,
+        /// Request building decides on the selected worker
+        /// (`regular::symphony::worker_constraint`).
+        tool_constraints: PreparedConstraint,
     },
     Messages {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
-        tool_constraints: Option<(String, String)>,
+        tool_constraints: PreparedConstraint,
         /// The response spec, built by preparation: the template rendered
         /// the view of its chat tools that `tool_choice` leaves (see
         /// `MessagesResponseSpec`).
         spec: Box<super::spec::MessagesResponseSpec>,
-        /// The whole-output path made the constraint decision, including a deliberate none.
-        output_decided: bool,
     },
     /// Transcription reuses the chat backend request shape. The chat-shaped
     /// request is synthesized here (inside the pipeline) from the family's

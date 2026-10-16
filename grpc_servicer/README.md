@@ -450,9 +450,12 @@ own, not a `server_args` key): `always` for a model that takes a grammar on
 every turn, `requested` for one only when the request asks. The servicers read
 it as `constrained_decoding` off TokenSpeed's `ServerArgs`, else its
 `ModelConfig`. A router turns the field into the worker's `constrained_decoding`
-label and records the policy there; the request paths that act on `always` are a
-separate change, so until they land every worker is served as `requested`, which
-is what every worker did before the label existed.
+label, and its gRPC request building follows the selected worker's policy (under
+PD the decode worker's). `requested`, the default, constrains what a request asks
+for. `always`, on an engine that starts the grammar at the first token, gives
+every turn the grammar of the model's response template table where that table
+spells whole turns; otherwise it constrains the calls a tool request allows under
+`auto`.
 
 #### Multi-node engines: the worker pod's liveness
 
