@@ -4048,7 +4048,8 @@ fn tool_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
     }
 }
 
-/// The call id a tool output item answers.
+/// The call id a tool output item answers (a local shell output names its
+/// call's id as `id`).
 fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::FunctionCallOutput { call_id, .. }
@@ -4056,6 +4057,7 @@ fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
         | ResponseInputOutputItem::ComputerCallOutput { call_id, .. }
         | ResponseInputOutputItem::ShellCallOutput { call_id, .. }
         | ResponseInputOutputItem::ApplyPatchCallOutput { call_id, .. } => Some(call_id),
+        ResponseInputOutputItem::LocalShellCallOutput { id, .. } => Some(id),
         _ => None,
     }
 }
@@ -4418,6 +4420,7 @@ mod tests {
              "arguments": "{}", "status": "completed"},
             {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
             {"type": "custom_tool_call_output", "call_id": "call_gone_too", "output": "3"},
+            {"type": "local_shell_call_output", "id": "call_gone_shell", "output": "4"},
             {"type": "message", "id": "msg_2", "role": "assistant",
              "content": [{"type": "output_text", "text": "ok", "annotations": []}]},
         ]))

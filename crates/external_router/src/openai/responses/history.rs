@@ -148,9 +148,11 @@ pub(crate) async fn load_input_history(
         }
 
         // The newest items, listed newest first so that the limit cuts the
-        // oldest off, then put back in the order they were stored.
+        // oldest off, then put back in the order they were stored. One more
+        // than the limit is asked for: a conversation of exactly the limit
+        // replays whole, and only one with an item past the window is cut.
         let params = ListParams {
-            limit: MAX_CONVERSATION_HISTORY_ITEMS,
+            limit: MAX_CONVERSATION_HISTORY_ITEMS + 1,
             order: SortOrder::Desc,
             after: None,
         };
@@ -162,7 +164,10 @@ pub(crate) async fn load_input_history(
         {
             Ok(mut stored_items) => {
                 stored_items.reverse();
-                let cut = stored_items.len() >= MAX_CONVERSATION_HISTORY_ITEMS;
+                let cut = stored_items.len() > MAX_CONVERSATION_HISTORY_ITEMS;
+                if cut {
+                    stored_items.drain(..stored_items.len() - MAX_CONVERSATION_HISTORY_ITEMS);
+                }
                 let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                 for item in stored_items {
                     match item.item_type.as_str() {
@@ -533,5 +538,23 @@ mod tests {
         // call_A is before the window, its output left out, the rest replays
         assert_eq!(items.len(), 101 - 2 + 1);
         assert_eq!(kinds.last().map(String::as_str), Some("user:item 102"));
+    }
+
+    /// A conversation of exactly the limit is not cut: every item replays,
+    /// an output whose call is not among them included (the window did not
+    /// begin after its call).
+    #[tokio::test]
+    async fn a_conversation_of_exactly_the_limit_replays_whole() {
+        let components = components().await;
+        let mut rows = vec![output_row("call_A")];
+        rows.extend((2..=100).map(message_row));
+        link_rows(&components, rows).await;
+
+        let items = loaded_input(&components, "item 101").await;
+
+        let kinds = shape(&items);
+        assert_eq!(kinds[0], "function_call_output:call_A", "{kinds:?}");
+        assert_eq!(items.len(), 100 + 1);
+        assert_eq!(kinds.last().map(String::as_str), Some("user:item 101"));
     }
 }

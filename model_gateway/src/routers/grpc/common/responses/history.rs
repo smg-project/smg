@@ -319,9 +319,11 @@ async fn conversation_items(
     }
 
     // The newest items, listed newest first so that the limit cuts the
-    // oldest off, then put back in the order they were stored.
+    // oldest off, then put back in the order they were stored. One more than
+    // the limit is asked for: a conversation of exactly the limit replays
+    // whole, and only one with an item past the window is cut.
     let params = data_connector::ListParams {
-        limit: MAX_CONVERSATION_HISTORY_ITEMS,
+        limit: MAX_CONVERSATION_HISTORY_ITEMS + 1,
         order: data_connector::SortOrder::Desc,
         after: None,
     };
@@ -341,12 +343,16 @@ async fn conversation_items(
             )
         })?;
     stored.reverse();
+    let cut = stored.len() > MAX_CONVERSATION_HISTORY_ITEMS;
+    if cut {
+        stored.drain(..stored.len() - MAX_CONVERSATION_HISTORY_ITEMS);
+    }
     let items: Vec<ResponseInputOutputItem> = stored
         .iter()
         .filter_map(conversation_item_as_input)
         .filter(replays)
         .collect();
-    if stored.len() < MAX_CONVERSATION_HISTORY_ITEMS {
+    if !cut {
         return Ok(items);
     }
     // The window is cut at the limit: the items before it are not replayed,
@@ -1030,6 +1036,34 @@ pub(crate) mod tests {
         assert_eq!(items.len(), 101 - 2 + 1);
         let expected: Vec<String> = (5..=102).map(|n| format!("item {n}")).collect();
         assert_eq!(texts(items), expected);
+    }
+
+    /// A conversation of exactly the limit is not cut: every item replays,
+    /// an output whose call is not among them included (the window did not
+    /// begin after its call; a builder that refuses such an output says so).
+    #[tokio::test]
+    async fn a_conversation_of_exactly_the_limit_replays_whole() {
+        let stores = Stores::with_conversation().await;
+        let mut rows = vec![output_row("call_A")];
+        rows.extend((2..=100).map(message_row));
+        link_rows(&stores, rows).await;
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("item 101".to_string()),
+            conversation: Some(ConversationRef::Id("conv_1".to_string())),
+            ..Default::default()
+        };
+
+        let loaded = load_history(stores.history(), &request, None)
+            .await
+            .expect("the conversation loads");
+
+        let ResponseInput::Items(items) = &loaded.input else {
+            panic!("the loaded input is an item list");
+        };
+        let kinds = shape(items);
+        assert_eq!(kinds[0], "function_call_output:call_A", "{kinds:?}");
+        assert_eq!(items.len(), 100 + 1);
+        assert_eq!(kinds.last().map(String::as_str), Some("message:user"));
     }
 
     /// A message row keeps the phase label it was stored with, and a reasoning
