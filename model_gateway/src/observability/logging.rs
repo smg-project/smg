@@ -211,7 +211,11 @@ impl<W: Write> Write for Batched<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.open = false;
-        self.write_batch()?;
+        // The worker discards a flush error, and an `Err` from the flush that
+        // ends the shutdown drain skips its rendezvous with the guard (which
+        // then waits out its full second): the batch is gone either way, as
+        // a line whose own write failed was before.
+        let _ = self.write_batch();
         self.sink.flush()
     }
 }
@@ -566,7 +570,10 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 mod writer_tests {
     use std::{
         io,
-        sync::{mpsc, Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Mutex,
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -843,6 +850,59 @@ mod writer_tests {
         // The writer is inside its window; the guard's drop waits for the flush.
         drop(guard);
         assert_whole_lines_in_order(&sink.writes(), &lines);
+    }
+
+    /// A sink that fails its writes (a closed stdout pipe, a full disk) does
+    /// not break the shutdown handshake: the writer thread takes the shutdown
+    /// message, meets the guard and ends, instead of blocking on its queue for
+    /// good while the guard waits out its rendezvous timeout; the batch is
+    /// gone, as a line whose own write failed was before.
+    #[test]
+    fn a_failing_sink_does_not_break_the_shutdown_handshake() {
+        /// Refuses every write; sets `ended` when it is dropped, which is when
+        /// the writer thread that owns it has ended.
+        struct FailingSink {
+            ended: Arc<AtomicBool>,
+        }
+
+        impl Write for FailingSink {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Drop for FailingSink {
+            fn drop(&mut self) {
+                self.ended.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let ended = Arc::new(AtomicBool::new(false));
+        let sink = FailingSink {
+            ended: ended.clone(),
+        };
+        let (mut writer, guard) = non_blocking(
+            Batched::with(sink, Duration::ZERO, BATCH_BYTES),
+            "test-log-batched-failing",
+        );
+        writer
+            .write_all(b"a line the sink refuses\n")
+            .expect("a lossy writer reports every line as written");
+        let started = Instant::now();
+        drop(guard);
+        let dropped_in = started.elapsed();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ended.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "the writer thread ended after the guard dropped (the drop took {dropped_in:?})"
+        );
     }
 
     /// Writes per line on a steady stream, with the batching and without: a
