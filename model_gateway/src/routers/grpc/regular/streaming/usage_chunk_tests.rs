@@ -45,6 +45,7 @@ async fn streamed_payloads(spec: ChatResponseSpec) -> Vec<String> {
             Arc::new(CharacterTokenizer::default()),
             false,
             None,
+            None,
             source,
         )
         .await;

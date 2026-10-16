@@ -266,6 +266,7 @@ async fn streamed_completion_usage(
             dispatch,
             tokenizer(),
             reservation,
+            None,
             source,
         )
         .await;

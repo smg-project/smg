@@ -17,14 +17,13 @@ use tracing::{debug, error, warn};
 use super::pd_protocol::{DpPlacement, PdProtocol, PdRendezvous};
 use crate::{
     middleware::{RequestId, TenantRequestMeta},
-    rate_limit::{ReservationAttachment, SharedReservationHandle},
     routers::{
         error,
         grpc::{
             backend_client::BackendClient,
             context::{
-                stage_output, AttemptStamp, ClientSelection, ExecutionPlan, LoadGuards,
-                RequestContext, RequestType, WorkerSelection,
+                stage_output, AttemptStamp, ClientSelection, ExecutionPlan, RequestContext,
+                RequestType, WorkerSelection,
             },
             multimodal::{
                 assemble_media_refs, assemble_multimodal_data,
@@ -36,7 +35,7 @@ use crate::{
         },
     },
     worker::{
-        sampling_defaults::SamplingDefaults, AttachedBody, Worker, DEFAULT_BOOTSTRAP_PORT,
+        sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
         DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
@@ -109,28 +108,6 @@ impl SamplingDefaultsMask {
 
     fn any(self) -> bool {
         self.temperature || self.top_p || self.top_k || self.min_p || self.repetition_penalty
-    }
-}
-
-/// Attach load guards and/or a rate-limit reservation to a streaming
-/// response body so each survives (and, for the reservation, resolves via
-/// `ReservationAttachment`'s `Drop`) exactly as long as the body does,
-/// regardless of how the client disconnects. A no-op returning `response`
-/// unchanged when both are `None`.
-pub(crate) fn attach_response_guards(
-    response: Response,
-    guards: Option<LoadGuards>,
-    reservation: Option<Arc<SharedReservationHandle>>,
-) -> Response {
-    match (guards, reservation) {
-        (Some(guards), Some(handle)) => {
-            AttachedBody::wrap_response(response, (guards, ReservationAttachment::new(handle)))
-        }
-        (Some(guards), None) => AttachedBody::wrap_response(response, guards),
-        (None, Some(handle)) => {
-            AttachedBody::wrap_response(response, ReservationAttachment::new(handle))
-        }
-        (None, None) => response,
     }
 }
 

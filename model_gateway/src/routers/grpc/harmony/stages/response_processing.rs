@@ -12,7 +12,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::stages::{helpers, ProcessStage, RateLimitCell},
+            common::stages::{ProcessStage, RateLimitCell},
             context::{DispatchContext, FinalResponse},
             spec::{HarmonyResponseSpec, ResponseSpec},
             utils::StreamSource,
@@ -97,9 +97,9 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                 if is_streaming {
                     // Reserved (if tenant rate limiting is enabled): settled
                     // with real usage inside the streaming processor on
-                    // success, or abandoned via the attached
-                    // ReservationAttachment's Drop below on early
-                    // disconnect/error.
+                    // success, or abandoned on early disconnect/error by the
+                    // reservation's safety net the processor hands the
+                    // response body (ReservationAttachment's Drop).
                     let reservation = ctx
                         .rate_limit_cell
                         .as_deref()
@@ -118,19 +118,11 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                             chat_request,
                             dispatch,
                             router_stops,
-                            reservation.clone(),
+                            reservation,
+                            ctx.load_guards.take(),
                             source,
                         )
                         .await;
-
-                    // Attach load guards (and the reservation's
-                    // disconnect/error safety net) to the response body for
-                    // proper RAII lifecycle.
-                    let response = helpers::attach_response_guards(
-                        response,
-                        ctx.load_guards.take(),
-                        reservation,
-                    );
 
                     return Ok(Some(response));
                 }

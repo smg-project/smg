@@ -2,16 +2,18 @@ use std::{
     any::Any,
     collections::{BTreeMap, VecDeque},
     fmt,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-use axum::body::Body;
+use futures_util::Stream;
 // Re-export protocol types as the canonical types for the gateway
 pub use openai_protocol::worker::{ConnectionMode, ProfileOptions, RuntimeType, WorkerType};
 use openai_protocol::{
@@ -3236,10 +3238,10 @@ impl Worker for BasicWorker {
 
 /// RAII guard for worker load management
 ///
-/// Automatically decrements worker load when dropped. Can be attached to
-/// an axum Response to tie the guard's lifetime to the response body,
-/// which is essential for streaming responses where the function returns
-/// immediately but the stream continues in the background.
+/// Automatically decrements worker load when dropped. A streaming handler
+/// returns at once and keeps producing from a task, so it hands the guard
+/// to the response body's own stream ([`GuardedStream`]), which drops it
+/// when the body is dropped: at the stream's end or the client's disconnect.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
@@ -3321,52 +3323,38 @@ impl Drop for WorkerLoadGuard {
     }
 }
 
-/// Body wrapper that holds an attached value.
+/// A response body's stream that owns an RAII guard.
 ///
-/// When this body is dropped (stream ends or client disconnects),
-/// the attached value is dropped automatically. This is useful for RAII guards
-/// like WorkerLoadGuard that need to be tied to a response body's lifetime.
-pub struct AttachedBody<T> {
-    inner: Body,
-    _attached: T,
+/// A streaming handler returns at once and keeps producing from a task, so
+/// what it holds for the request (the worker's load guard, a rate-limit
+/// reservation's safety net) must live as long as the response body does,
+/// however the body ends: read to its end, dropped when the client leaves,
+/// or consumed by another handler in-process. The guard rides in the body's
+/// own stream and is dropped with it, after the stream. No wrapper goes
+/// over the body for it: a body wrapper is a boxed `poll_frame` more on
+/// every frame out.
+pub struct GuardedStream<S, G> {
+    inner: S,
+    _guard: G,
 }
 
-impl<T> AttachedBody<T> {
-    pub fn new(inner: Body, attached: T) -> Self {
+impl<S, G> GuardedStream<S, G> {
+    pub fn new(inner: S, guard: G) -> Self {
         Self {
             inner,
-            _attached: attached,
+            _guard: guard,
         }
     }
 }
 
-impl<T: Send + Unpin + 'static> AttachedBody<T> {
-    pub fn wrap_response(
-        response: axum::response::Response,
-        attached: T,
-    ) -> axum::response::Response {
-        let (parts, body) = response.into_parts();
-        axum::response::Response::from_parts(parts, Body::new(Self::new(body, attached)))
-    }
-}
+impl<S: Stream + Unpin, G: Unpin> Stream for GuardedStream<S, G> {
+    type Item = S::Item;
 
-impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
     }
 
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
+    fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
 }

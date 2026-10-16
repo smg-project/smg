@@ -1,7 +1,7 @@
 //! Abort-safe reservation lifecycle: [`SharedReservationHandle`] is held
-//! by whoever owns a reservation, and [`ReservationAttachment`] (paired
-//! with `AttachedBody::wrap_response`) can be attached to a response body
-//! so an aborted/disconnected stream still releases it.
+//! by whoever owns a reservation, and [`ReservationAttachment`] rides in a
+//! streaming response's body (see `worker::GuardedStream`) so an
+//! aborted/disconnected stream still releases it.
 
 use std::sync::{
     atomic::{AtomicU8, Ordering},
@@ -89,9 +89,9 @@ impl SharedReservationHandle {
     }
 }
 
-/// RAII guard: pair with `AttachedBody::wrap_response` on a response so an
-/// aborted/disconnected stream still abandons an open reservation instead
-/// of leaking it as permanently reserved.
+/// RAII guard: held by a streaming response's body (`worker::GuardedStream`)
+/// so an aborted/disconnected stream still abandons an open reservation
+/// instead of leaking it as permanently reserved.
 pub struct ReservationAttachment {
     handle: Arc<SharedReservationHandle>,
 }

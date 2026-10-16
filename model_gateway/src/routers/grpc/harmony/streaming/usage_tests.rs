@@ -137,6 +137,7 @@ async fn streamed_chat_usage(
             dispatch,
             Vec::new(),
             reservation,
+            None,
             source,
         )
         .await;

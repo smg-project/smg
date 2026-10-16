@@ -1,5 +1,7 @@
 //! Streaming infrastructure for /v1/responses endpoint
 
+use std::sync::Arc;
+
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use futures::Stream;
@@ -28,14 +30,16 @@ use super::utils::generation_failure_error;
 use crate::routers::common::sse::sse_channel;
 use crate::{
     observability::metrics::Metrics,
+    rate_limit::{ReservationAttachment, SharedReservationHandle},
     routers::{
         common::{
             openai_bridge::{self, descriptor, ResponseFormat},
             sse::{SseEncodeError, SseEncoder, SseReceiver, SseSender},
         },
         error,
-        grpc::harmony::responses::ToolResult,
+        grpc::{context::LoadGuards, harmony::responses::ToolResult},
     },
+    worker::GuardedStream,
 };
 
 /// Item-id-prefix discriminator for non-format kinds. Format-driven items
@@ -1559,6 +1563,35 @@ where
         .header("Connection", HeaderValue::from_static("keep-alive"))
         .body(Body::from_stream(stream))
         .expect("infallible: static headers and valid status code")
+}
+
+/// What a streaming response's body holds for as long as it lives: the
+/// worker load guards and the rate-limit reservation's safety net (its
+/// `Drop` abandons a reservation the stream did not settle). Both go when
+/// the body is dropped, at the stream's end or the client's disconnect.
+pub(crate) type BodyGuards = (Option<LoadGuards>, Option<ReservationAttachment>);
+
+/// The [`BodyGuards`] of a stream dispatched with `load_guards` under
+/// `reservation`.
+pub(crate) fn body_guards(
+    load_guards: Option<LoadGuards>,
+    reservation: Option<&Arc<SharedReservationHandle>>,
+) -> BodyGuards {
+    (
+        load_guards,
+        reservation.map(|handle| ReservationAttachment::new(Arc::clone(handle))),
+    )
+}
+
+/// [`build_sse_response`] whose body owns `guards` for as long as it lives:
+/// they ride in the body's own stream ([`GuardedStream`]) and are dropped
+/// with it, with no wrapper over the body (a wrapper is a boxed
+/// `poll_frame` more on every frame out).
+pub(crate) fn build_sse_response_guarded<G>(rx: SseReceiver, guards: G) -> Response
+where
+    G: Send + Unpin + 'static,
+{
+    build_sse_response_from_stream(GuardedStream::new(ReceiverStream::new(rx), guards))
 }
 
 /// Attach `server_label` to an MCP tool-call JSON item.

@@ -92,7 +92,7 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        AttachedBody, ConnectionMode, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
+        ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
         WorkerRegistry, WorkerType,
     },
 };
@@ -1238,12 +1238,12 @@ impl Router {
                     );
                 }
             });
-            let stream = ReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            // The load guard rides in the body's own stream: released when
+            // the body is dropped, at its end or when the client leaves.
+            let body = Body::from_stream(GuardedStream::new(ReceiverStream::new(rx), load_guard));
             let mut response = Response::new(body);
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
-            response = AttachedBody::wrap_response(response, load_guard);
             response
         } else {
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1556,8 +1556,9 @@ impl Router {
                 .instrument(span),
             );
 
-            let stream = ReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            // The load guard rides in the body's own stream: released when
+            // the body is dropped, at its end or when the client leaves.
+            let body = Body::from_stream(GuardedStream::new(ReceiverStream::new(rx), load_guard));
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -1566,10 +1567,6 @@ impl Router {
             if head_success_recorded {
                 mark_head_success_recorded(&mut response);
             }
-
-            // Attach load guard to response body for proper RAII lifecycle
-            // Guard is dropped when response body is consumed or client disconnects
-            response = AttachedBody::wrap_response(response, load_guard);
             response
         } else {
             // For non-streaming requests, preserve headers

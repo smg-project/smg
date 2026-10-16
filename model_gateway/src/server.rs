@@ -1424,23 +1424,11 @@ where
 {
     app.fallback(sink_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
-        // Marks every response that came back through the body-limit layer
-        // below, so the envelope pass outside it re-shapes only the limit
-        // layer's own refusal (a 413 minted inside, a handler's or a relayed
-        // upstream's, keeps its body).
-        .layer(axum::middleware::from_fn(
-            middleware::mark_passed_body_limit_middleware,
-        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            max_payload_size,
-        ))
-        // The limit layer refuses a declared over-limit length with a plain
-        // text 413: the gateway's envelope and error code go on here, outside
-        // it, the same as the chunked refusal the extractor builds.
-        .layer(axum::middleware::from_fn(
-            middleware::payload_too_large_envelope_middleware,
-        ))
+        // The payload limit on the request body: a declared over-limit
+        // length is refused here, in the gateway's envelope, before any
+        // layer inside runs; a chunked upload is capped on its way in.
+        .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
         // The Messages envelope once more, outside the body-size limit: a
         // declared over-limit length is refused by the limit layer before any
         // route layer runs, and still leaves in the envelope.
@@ -2922,9 +2910,8 @@ mod tests {
         assert_eq!(json["error"]["type"], "request_too_large", "{json}");
         assert_eq!(json["request_id"], request_id, "{json}");
 
-        // Declared length: refused by the limit layer before the body, and
-        // still the JSON envelope with the same code as the chunked refusal
-        // (the limit layer's own answer is plain text).
+        // Declared length: refused by the limit layer before the body, with
+        // the JSON envelope and the same code as the chunked refusal.
         let response = app
             .oneshot(
                 http::Request::builder()

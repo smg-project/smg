@@ -324,6 +324,7 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
                 dispatch(),
                 tokenizer.clone(),
                 None,
+                None,
                 utils::StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_COMPLETIONS),
             )
             .await;
@@ -3369,6 +3370,7 @@ async fn frames_of_a_chat_stream_cut_with(status: tonic::Status) -> (Vec<String>
             dispatch(),
             Arc::new(CharacterTokenizer::default()),
             false,
+            None,
             None,
             source,
         )
