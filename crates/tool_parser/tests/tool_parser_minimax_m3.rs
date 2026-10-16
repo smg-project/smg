@@ -2418,6 +2418,154 @@ fn m3_every_property_but_a_null_one_has_its_element() {
     assert_eq!(free_text_runs(&tag), 1);
 }
 
+/// The `json_schema` leaves a tag holds, in order.
+fn fragments(value: &serde_json::Value) -> Vec<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("json_schema") {
+                return vec![object["json_schema"].clone()];
+            }
+            object.values().flat_map(fragments).collect()
+        }
+        serde_json::Value::Array(items) => items.iter().flat_map(fragments).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// How many `or` nodes of `width` alternatives a tag holds: the enums spelled out.
+fn enums_spelled(value: &serde_json::Value, width: usize) -> usize {
+    match value {
+        serde_json::Value::Object(object) => {
+            let spelled = object.get("type").and_then(serde_json::Value::as_str) == Some("or")
+                && object
+                    .get("elements")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|elements| elements.len() == width);
+            usize::from(spelled)
+                + object
+                    .values()
+                    .map(|v| enums_spelled(v, width))
+                    .sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(|v| enums_spelled(v, width)).sum(),
+        _ => 0,
+    }
+}
+
+/// A number's fragment carries the definitions its pointers reach, directly or through one
+/// another, and no other: a large definition elsewhere under `$defs` does not travel with it, as
+/// in the symphony crate's writer.
+#[test]
+fn m3_a_fragment_carries_only_the_definitions_it_reaches() {
+    let words: Vec<String> = (0..2000).map(|i| format!("word_{i:04}")).collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {
+            "Count": {"$ref": "#/$defs/Positive"},
+            "Positive": {"type": "integer", "minimum": 1},
+            "Big": {"type": "string", "enum": words},
+        },
+        "properties": {"n": {"type": "integer", "anyOf": [{"$ref": "#/$defs/Count"}, {"type": "integer", "maximum": 0}]}},
+        "required": ["n"],
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let leaves = fragments(&tag);
+    assert_eq!(leaves.len(), 1);
+    let defs = leaves[0]["$defs"]
+        .as_object()
+        .expect("the reached definitions");
+    let mut names: Vec<&str> = defs.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["Count", "Positive"],
+        "reached through one another; Big is not"
+    );
+    assert!(
+        serde_json::to_string(&tag).unwrap().len() < 4_000,
+        "the 2,000 words stay home"
+    );
+}
+
+/// The leaves' byte budget: a 5,000-word enum reached by 32 x 32 number leaves through `not`
+/// travelled with every fragment (about 110 MB of grammar from a 113 KB request); now it travels
+/// while the budget lasts, and the leaves after that are free text, the tag well under a megabyte.
+#[test]
+fn m3_number_fragments_past_the_byte_budget_are_free_text() {
+    let words: Vec<String> = (0..5000).map(|i| format!("option_number_{i:05}")).collect();
+    let row: serde_json::Map<String, serde_json::Value> = (0..32)
+        .map(|i| {
+            (
+                format!("n{i:02}"),
+                json!({"type": "number", "not": {"$ref": "#/$defs/Big"}}),
+            )
+        })
+        .collect();
+    let row_required: Vec<String> = row.keys().cloned().collect();
+    let root: serde_json::Map<String, serde_json::Value> = (0..32)
+        .map(|i| (format!("r{i:02}"), json!({"$ref": "#/$defs/Row"})))
+        .collect();
+    let required: Vec<String> = root.keys().cloned().collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {
+            "Big": {"type": "string", "enum": words},
+            "Row": {"type": "object", "properties": row, "required": row_required},
+        },
+        "properties": root,
+        "required": required,
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let text = serde_json::to_string(&tag).unwrap();
+    assert!(text.len() < 700_000, "{} bytes", text.len());
+    let leaves = fragments(&tag);
+    assert!(
+        (1..=3).contains(&leaves.len()),
+        "the definition travels while the budget lasts: {} fragments",
+        leaves.len()
+    );
+    assert!(leaves.iter().all(|leaf| leaf["$defs"]["Big"]["enum"]
+        .as_array()
+        .is_some_and(|w| w.len() == 5000)));
+    assert_eq!(elements_written(&tag), 1024, "the element budget stands");
+    assert!(
+        free_text_runs(&tag) >= 900,
+        "the number leaves past the budget are free text: {}",
+        free_text_runs(&tag)
+    );
+}
+
+/// An enum reused through a reference is spelled out while the budget lasts; the properties after
+/// that take text as it is, typed as strings still.
+#[test]
+fn m3_an_enum_reused_through_references_stops_at_the_byte_budget() {
+    let words: Vec<String> = (0..2000).map(|i| format!("choice_{i:04}")).collect();
+    let properties: serde_json::Map<String, serde_json::Value> = (0..30)
+        .map(|i| (format!("e{i:02}"), json!({"$ref": "#/$defs/E"})))
+        .collect();
+    let required: Vec<String> = properties.keys().cloned().collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": {"E": {"type": "string", "enum": words}},
+        "properties": properties,
+        "required": required,
+    }));
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let text = serde_json::to_string(&tag).unwrap();
+    // One copy is 2,000 words of 11 bytes plus their framing, about 94 KB: two fit, the third
+    // does not.
+    assert_eq!(enums_spelled(&tag, 2000), 2, "{} bytes", text.len());
+    assert!(text.len() < 400_000, "{} bytes", text.len());
+    let members = first_invoke(&tag)["elements"].clone();
+    assert_eq!(
+        members[2],
+        expected_element("e02", expected_text("e02")),
+        "typed text, no enum"
+    );
+    assert_eq!(members[29], expected_element("e29", expected_text("e29")));
+    assert_eq!(free_text_runs(&tag), 0, "nothing untyped");
+}
+
 /// A list's item element counts against the budget like a property's; a list reached once the
 /// budget is spent is free text.
 #[test]
