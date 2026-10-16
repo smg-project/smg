@@ -17,14 +17,18 @@ use openai_protocol::{
         ResponseOutputItem, ResponseUsage, ResponsesRequest,
     },
 };
-use serde_json::Value;
-use smg_mcp::McpToolSession;
+use serde_json::{json, Value};
+use smg_mcp::{McpToolSession, ToolExecutionOutput};
 use tracing::warn;
 
 use crate::{
     middleware::TenantRequestMeta,
+    observability::metrics::{metrics_labels, Metrics},
     routers::{
-        common::{mcp_utils::DEFAULT_MAX_ITERATIONS, openai_bridge},
+        common::{
+            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
+            openai_bridge::{self, ResponseFormat},
+        },
         grpc::common::responses::{history::current_input_items, utils::resolve_function_identity},
     },
 };
@@ -254,6 +258,58 @@ pub(super) fn extract_all_tool_calls_from_chat(
     }
 }
 
+/// The model's argument payload as the object the hosted-tool merge needs,
+/// with the request's hosted-tool config and user merged in. A scalar, an
+/// array or null becomes an empty object first, so caller-declared config is
+/// applied instead of silently dropped (`apply_hosted_tool_overrides` is a
+/// no-op on anything but an object).
+pub(super) fn dispatch_arguments(
+    response_format: ResponseFormat,
+    original_request: &ResponsesRequest,
+    arguments: &str,
+) -> Value {
+    let mut arguments = match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        _ => json!({}),
+    };
+    prepare_hosted_dispatch_args(
+        &mut arguments,
+        response_format,
+        original_request.tools.as_deref().unwrap_or(&[]),
+        original_request.user.as_deref(),
+    );
+    arguments
+}
+
+/// An executed MCP call's metrics and its place in the loop's history.
+pub(super) fn record_mcp_call(
+    state: &mut ToolLoopState,
+    model: &str,
+    output: ToolExecutionOutput,
+    output_str: String,
+    output_item: ResponseOutputItem,
+) {
+    let success = !output.is_error;
+    Metrics::record_mcp_tool_duration(model, &output.tool_name, output.duration);
+    Metrics::record_mcp_tool_call(
+        model,
+        &output.tool_name,
+        if success {
+            metrics_labels::RESULT_SUCCESS
+        } else {
+            metrics_labels::RESULT_ERROR
+        },
+    );
+    state.record_call(
+        output.call_id,
+        output.tool_name,
+        output.arguments_str,
+        output_str,
+        output_item,
+        success,
+    );
+}
+
 pub(super) fn convert_mcp_tools_to_chat_tools(session: &McpToolSession<'_>) -> Vec<Tool> {
     openai_bridge::chat_function_tools(session)
 }
@@ -349,6 +405,22 @@ mod usage_tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn dispatch_arguments_keep_an_object_and_make_an_empty_one_of_anything_else() {
+        let request = ResponsesRequest::default();
+        assert_eq!(
+            dispatch_arguments(ResponseFormat::Passthrough, &request, r#"{"q": "x"}"#),
+            json!({"q": "x"})
+        );
+        for payload in ["\"text\"", "[1, 2]", "null", "not json"] {
+            assert_eq!(
+                dispatch_arguments(ResponseFormat::Passthrough, &request, payload),
+                json!({}),
+                "{payload}"
+            );
+        }
+    }
 
     #[test]
     fn mcp_usage_accumulates_reasoning_and_cache_and_survives_missing_usage() {
