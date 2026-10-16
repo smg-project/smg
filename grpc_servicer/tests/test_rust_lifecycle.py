@@ -107,16 +107,33 @@ def _alive(pid: int) -> bool:
         return False  # reaped: before the open (ENOENT), or between it and the read (ESRCH)
 
 
-def _worker_pid(pid_file, deadline_secs: float = 10) -> int:
-    deadline = time.monotonic() + deadline_secs
+# Every wait below is a poll that ends at its event; the bound only catches a
+# hang, so it is generous: a spawn or an exit that is slow on a loaded host
+# must not fail a test whose behaviour is unaffected.
+_PATIENCE_SECS = 60.0
+
+
+def _worker_pid(pid_file, launcher: subprocess.Popen) -> int:
+    """The pid the launcher wrote once it spawned its worker; a launcher that
+    exits before that fails the test at once instead of at the bound."""
+    deadline = time.monotonic() + _PATIENCE_SECS
     while not pid_file.exists() or not pid_file.read_text().strip():
+        code = launcher.poll()
+        assert code is None, f"the launcher exited with {code} before it spawned its worker"
         assert time.monotonic() < deadline, "the launcher never spawned its worker"
         time.sleep(0.05)
     return int(pid_file.read_text())
 
 
-def _wait_dead(pid: int, what: str, deadline_secs: float = 10) -> None:
-    deadline = time.monotonic() + deadline_secs
+def _exit_when(go_file, code: int) -> str:
+    """The tail of a launcher's command: it exits with ``code`` once the test
+    creates ``go_file``, so the test says when a core goes, not a timer that a
+    loaded host can outrun."""
+    return f"until [ -e {go_file} ]; do sleep 0.02; done; exit {code}"
+
+
+def _wait_dead(pid: int, what: str) -> None:
+    deadline = time.monotonic() + _PATIENCE_SECS
     while _alive(pid):
         assert time.monotonic() < deadline, f"the {what} outlived the engine cleanup"
         time.sleep(0.05)
@@ -127,28 +144,29 @@ def test_kill_reaches_the_workers_the_engine_spawned(tmp_path):
     everything stays in the launcher's process group."""
     pid_file = tmp_path / "worker.pid"
     launcher = subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"])
-    worker_pid = _worker_pid(pid_file)
+    worker_pid = _worker_pid(pid_file, launcher)
     engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
     assert os.getpgid(launcher.pid) == os.getpgid(0)
     assert engine.poll() is None  # tracks the worker
 
     engine.kill()
 
-    assert engine.wait(timeout=10) == -signal.SIGKILL
+    assert engine.wait(timeout=_PATIENCE_SECS) == -signal.SIGKILL
     _wait_dead(worker_pid, "worker")
 
 
 def test_cleanup_after_the_engine_exited_kills_the_workers_it_left(tmp_path):
     """An engine that crashed leaves re-parented workers; terminate_engine
     kills the ones it had seen while the engine was alive."""
-    pid_file = tmp_path / "worker.pid"
+    pid_file, go = tmp_path / "worker.pid", tmp_path / "go"
     launcher = subprocess.Popen(
-        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; sleep 2; exit 3"]
+        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; {_exit_when(go, 3)}"]
     )
-    worker_pid = _worker_pid(pid_file)
+    worker_pid = _worker_pid(pid_file, launcher)
     engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
     assert engine.poll() is None  # tracks the worker while the launcher lives
-    assert engine.wait(timeout=10) == 3
+    go.touch()
+    assert engine.wait(timeout=_PATIENCE_SECS) == 3
     assert _alive(worker_pid)
 
     rust_lifecycle.terminate_engine(engine)
@@ -190,14 +208,14 @@ def test_group_kill_reaches_the_workers_of_every_core(tmp_path):
         subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"])
         for pid_file in pid_files
     ]
-    workers = [_worker_pid(pid_file) for pid_file in pid_files]
+    workers = [_worker_pid(pid_file, launcher) for pid_file, launcher in zip(pid_files, launchers)]
     engines = rust_lifecycle.EngineProcessGroup(_ManagerOf(launchers))
     assert engines.pids == [launcher.pid for launcher in launchers]
     assert engines.poll() is None  # tracks every core's workers
 
     engines.kill()
 
-    assert engines.wait(timeout=10) == -signal.SIGKILL
+    assert engines.wait(timeout=_PATIENCE_SECS) == -signal.SIGKILL
     for worker in workers:
         _wait_dead(worker, "worker")
 
@@ -205,21 +223,25 @@ def test_group_kill_reaches_the_workers_of_every_core(tmp_path):
 def test_one_cores_exit_ends_the_group_and_the_cleanup_reaps_every_worker(tmp_path):
     """A core that exits takes the engine down: the manager shuts the other
     cores down and `terminate_engine` kills the workers they left."""
-    pid_files = [tmp_path / "a.pid", tmp_path / "b.pid"]
+    pid_files, go = [tmp_path / "a.pid", tmp_path / "b.pid"], tmp_path / "go"
     launchers = [
-        subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; sleep 1; exit 3"]),
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; {_exit_when(go, 3)}"]
+        ),
         subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_files[1]}; wait"]),
     ]
-    workers = [_worker_pid(pid_file) for pid_file in pid_files]
+    workers = [_worker_pid(pid_file, launcher) for pid_file, launcher in zip(pid_files, launchers)]
     manager = _ManagerOf(launchers)
     engines = rust_lifecycle.EngineProcessGroup(manager)
     assert engines.poll() is None
-    deadline = time.monotonic() + 10
+    go.touch()
+    deadline = time.monotonic() + _PATIENCE_SECS
     while engines.poll() is None:
         assert time.monotonic() < deadline, "the first core never exited"
         time.sleep(0.05)
     assert engines.poll() == 3 and manager.shutdowns == [None]
-    assert engines.wait(timeout=10) == 3  # the first exit code; the sibling was terminated
+    # The first exit code; the sibling was terminated.
+    assert engines.wait(timeout=_PATIENCE_SECS) == 3
 
     rust_lifecycle.terminate_engine(engines)
 
