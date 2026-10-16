@@ -36,7 +36,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
 
-use super::symphony::{engine_finish, finished, reasoning_text_tokens, Reader};
+use super::{
+    reasoning_usage::{Counter, VllmReasoningUsage},
+    symphony::{engine_finish, finished, reasoning_text_tokens, Reader},
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
@@ -424,6 +427,7 @@ impl StreamingProcessor {
         // tokens of chunks that decoded to no text yet (counted with the
         // chunk that releases their text).
         let mut parsed_reasoning_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut reasoning_usage = VllmReasoningUsage::default();
         let mut held_tokens: HashMap<u32, u32> = HashMap::new();
         let mut spec_accepted: HashMap<u32, u32> = HashMap::new();
         let mut spec_drafted: HashMap<u32, u32> = HashMap::new();
@@ -576,6 +580,17 @@ impl StreamingProcessor {
                     }
 
                     completion_tokens.record_chunk(&chunk);
+                    if assignment.is_none() {
+                        reasoning_usage.record_chunk(&chunk, || {
+                            Counter::new(
+                                &self.reasoning_parser_factory,
+                                reasoning_parser_name.as_deref(),
+                                model,
+                                &tokenizer,
+                                &original_request,
+                            )
+                        });
+                    }
                     if let Some(usage) = &mut continuous_usage {
                         usage.record_chunk(&chunk);
                     }
@@ -746,6 +761,17 @@ impl StreamingProcessor {
                     prompt_tokens.insert(index, complete.prompt_tokens());
 
                     completion_tokens.record_complete(&complete);
+                    if assignment.is_none() {
+                        reasoning_usage.record(&complete, || {
+                            Counter::new(
+                                &self.reasoning_parser_factory,
+                                reasoning_parser_name.as_deref(),
+                                model,
+                                &tokenizer,
+                                &original_request,
+                            )
+                        });
+                    }
                     if let Some(usage) = &mut continuous_usage {
                         usage.record_complete(&complete);
                     }
@@ -1165,12 +1191,14 @@ impl StreamingProcessor {
                 spec_accepted: spec_accepted.values().sum(),
                 spec_drafted: spec_drafted.values().sum(),
             };
-            chat_usage(
+            let mut usage = chat_usage(
                 counts.usage(),
                 (reasoning_parser_available || assignment.is_some())
                     .then(|| parsed_reasoning_tokens.values().sum()),
                 original_request.unbilled_prompt_tokens,
-            )
+            );
+            reasoning_usage.apply(&mut usage, original_request.expected_choices);
+            usage
         });
 
         // Phase 4: Finish reason chunks. Do not advertise partial counters as

@@ -271,6 +271,10 @@ impl Default for MinimaxM3Parser {
 }
 
 impl ReasoningParser for MinimaxM3Parser {
+    fn token_counting_markers(&self) -> Option<(&str, &str)> {
+        Some((THINK_START, THINK_END))
+    }
+
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
         if text.len() > DEFAULT_MAX_BUFFER_SIZE {
             return Err(ParseError::BufferOverflow(text.len()));
@@ -333,6 +337,16 @@ impl ReasoningParser for MinimaxM3Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exact token accounting is driven by these markers; a parser that forgets
+    /// to declare them falls back to the text-based reasoning estimate.
+    #[test]
+    fn test_declares_token_counting_markers() {
+        assert_eq!(
+            MinimaxM3Parser::new().token_counting_markers(),
+            Some(("<mm:think>", "</mm:think>"))
+        );
+    }
 
     fn collect_stream(parser: &mut MinimaxM3Parser, chunks: &[&str]) -> ParserResult {
         let mut result = ParserResult::default();

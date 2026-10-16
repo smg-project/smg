@@ -1,5 +1,8 @@
 //! Test gateway parsers and SSE events with exact gRPC frames.
 
+#[path = "reasoning_usage_tests.rs"]
+mod reasoning_usage_tests;
+
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,

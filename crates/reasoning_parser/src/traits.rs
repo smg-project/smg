@@ -43,6 +43,14 @@ impl ParserResult {
 
 /// Trait for parsing reasoning content from LLM outputs.
 pub trait ReasoningParser: Send + Sync {
+    /// Delimiters for token counting of a single reasoning prefix. Opt in only
+    /// when the first closing delimiter ends reasoning for the whole output.
+    /// Call on a fresh parser; `is_in_reasoning` supplies its initial state.
+    /// The caller must verify that each delimiter is one tokenizer token.
+    fn token_counting_markers(&self) -> Option<(&str, &str)> {
+        None
+    }
+
     /// Detects and parses reasoning from the input text (one-time parsing).
     ///
     /// This method is used for non-streaming scenarios where the complete
