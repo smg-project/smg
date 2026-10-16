@@ -2566,6 +2566,63 @@ fn m3_an_enum_reused_through_references_stops_at_the_byte_budget() {
     assert_eq!(free_text_runs(&tag), 0, "nothing untyped");
 }
 
+/// A hub definition that reaches thousands of small ones, from a thousand number leaves: the walk
+/// behind each leaf stops at the budget and is remembered per leaf, so the tag stays small and the
+/// build stays quick however many definitions a refused leaf would have reached.
+#[test]
+fn m3_a_hub_of_thousands_of_definitions_is_walked_within_the_budget() {
+    let mut defs = serde_json::Map::new();
+    let branches: Vec<serde_json::Value> = (0..4000)
+        .map(|i| {
+            defs.insert(format!("d{i:05}"), json!({}));
+            json!({"$ref": format!("#/$defs/d{i:05}")})
+        })
+        .collect();
+    defs.insert("Hub".to_string(), json!({"anyOf": branches}));
+    let row: serde_json::Map<String, serde_json::Value> = (0..32)
+        .map(|i| {
+            (
+                format!("n{i:02}"),
+                json!({"type": "number", "not": {"$ref": "#/$defs/Hub"}}),
+            )
+        })
+        .collect();
+    let row_required: Vec<String> = row.keys().cloned().collect();
+    defs.insert(
+        "Row".to_string(),
+        json!({"type": "object", "properties": row, "required": row_required}),
+    );
+    let root: serde_json::Map<String, serde_json::Value> = (0..32)
+        .map(|i| (format!("r{i:02}"), json!({"$ref": "#/$defs/Row"})))
+        .collect();
+    let required: Vec<String> = root.keys().cloned().collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": defs,
+        "properties": root,
+        "required": required,
+    }));
+    let started = std::time::Instant::now();
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let took = started.elapsed();
+    let text = serde_json::to_string(&tag).unwrap();
+    assert!(text.len() < 700_000, "{} bytes", text.len());
+    assert_eq!(elements_written(&tag), 1024);
+    // The hub and its four thousand entries are about 120 KB: they travel with the first leaves
+    // while the budget lasts, and the leaves after that are free text without walking the hub.
+    let leaves = fragments(&tag);
+    assert!(
+        (1..=3).contains(&leaves.len()),
+        "{} fragments",
+        leaves.len()
+    );
+    assert!(leaves.iter().all(|leaf| leaf["$defs"]["Hub"].is_object()));
+    assert!(
+        took.as_secs() < 5,
+        "the walk is bounded by the budget and remembered per leaf: {took:?}"
+    );
+}
+
 /// A list's item element counts against the budget like a property's; a list reached once the
 /// budget is spent is free text.
 #[test]
