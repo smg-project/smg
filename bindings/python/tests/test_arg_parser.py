@@ -1702,7 +1702,6 @@ class TestRouterArgsFieldOrder:
         "log_dir",
         "log_level",
         "log_json",
-        "access_log_fields",
         "service_discovery",
         "selector",
         "service_discovery_port",
@@ -1878,6 +1877,7 @@ class TestRouterArgsFieldOrder:
         "drain_settle_secs",
         "admin_port",
         "admin_host",
+        "access_log_fields",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

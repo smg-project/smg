@@ -1691,6 +1691,54 @@ mod field_tests {
         );
     }
 
+    /// A stream that fails after the head went out: the failure line carries
+    /// the bytes out so far as `response_bytes_sent`, once, and a declared
+    /// length stays on its own key, once, under the text format.
+    #[tokio::test]
+    async fn a_stream_that_fails_keeps_the_length_once_and_adds_the_bytes_sent() {
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(text_subscriber(&capture));
+        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+        let response = app(
+            AccessLogFields::all(),
+            Some(Body::from_stream(ReceiverStream::new(rx))),
+        )
+        .oneshot(request("/v1/sized"))
+        .await
+        .expect("response");
+        tx.send(Ok(Bytes::from_static(FRAME))).await.expect("send");
+        tx.send(Err(io::Error::other("upstream cut")))
+            .await
+            .expect("send the failure");
+        drop(tx);
+        let mut body = response.into_body();
+        let frame = body.frame().await.expect("one frame").expect("frame ok");
+        assert_eq!(frame.data_ref().map(Bytes::len), Some(FRAME.len()));
+        let failure = body.frame().await.expect("the failure");
+        assert!(failure.is_err(), "the body ends in the failure");
+        drop(body);
+
+        let text = capture.text();
+        let failed = text
+            .lines()
+            .find(|line| line.contains("response stream failed after the head was sent"))
+            .expect("the failure line");
+        assert_eq!(
+            failed.matches("response_bytes_sent=").count(),
+            1,
+            "{failed}"
+        );
+        assert!(
+            failed.contains(&format!("response_bytes_sent={}", FRAME.len())),
+            "{failed}"
+        );
+        assert!(failed.matches("response_bytes=").count() <= 1, "{failed}");
+        assert!(
+            failed.contains(&format!("response_bytes={}", 2 * FRAME.len())),
+            "{failed}"
+        );
+    }
+
     /// The text format carries the selected fields on the finish line, and
     /// none of them without a selection.
     #[tokio::test]

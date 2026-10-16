@@ -313,8 +313,6 @@ class RouterArgs:
     log_dir: str | None = None
     log_level: str | None = None
     log_json: bool = False
-    # Optional fields of the access-log record; [] keeps the record's fields as they are
-    access_log_fields: list[str] = dataclasses.field(default_factory=list)
     # Service discovery configuration
     service_discovery: bool = False
     selector: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -605,6 +603,9 @@ class RouterArgs:
     # plane stays on the data listener; appended last for the same reason
     admin_port: int | None = None
     admin_host: str | None = None
+    # Optional fields of the access-log record; [] keeps the record's fields as they are;
+    # appended last for the same reason
+    access_log_fields: list[str] = dataclasses.field(default_factory=list)
 
     @staticmethod
     def add_cli_args(
