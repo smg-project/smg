@@ -33,8 +33,8 @@
 //! written one after another, the layout's text between two, and nothing follows the last but the
 //! stop. A tag the stop ends holds no repetition, which an engine cannot end on its own: a schema
 //! without properties takes at most one parameter there. Where no call is owed and more than one
-//! may come, such a call has no tag: the free text after a tag would be the call's own, and a
-//! parameter written there would count with nothing to constrain it.
+//! may come, each call terminal triggers a tag. This constrains every call the model starts while
+//! still allowing free text instead of a call and allowing another call after the first.
 //!
 //! With the prompt's thought open, a tag that owes a call follows the free prefix every syntax's
 //! tag takes; one that owes none takes no prefix, its own free text writing the thought: an engine
@@ -69,9 +69,10 @@ struct Call {
 
 /// The structural tag of a shaped call to one of `tools`, as `count` asks, written as `layout`
 /// says the template writes one (see the module documentation). `None` when the layout does not
-/// fit the table, the arguments are not tagged parameters, a value's end holds no text, no tool
-/// can be called through the header, or the stream's stop closes the last call while no call is
-/// owed and more than one may come.
+/// fit the table, the arguments are not tagged parameters, a value's end holds no text, or no
+/// tool can be called through the header. When the stream's stop closes the last call, an
+/// optional-call grammar uses the call terminal as a repeatable trigger, so it remains optional
+/// and still permits parallel calls.
 pub(super) fn calls(
     format: &Format,
     shape: &CallShape,
@@ -99,12 +100,6 @@ pub(super) fn calls(
         call.close.as_deref().unwrap_or("")
     );
     let one = count.one || layout.between_calls.is_none();
-    // Where the stop closes the last call, its region stays open after its parameters: with no
-    // call owed and more than one allowed, free text after a tag would be the call's own, where a
-    // parameter no tag constrains would count, so there is no tag.
-    if call.close.is_none() && !one && !count.at_least_one {
-        return None;
-    }
     // Where the stop closes the last call, the calls are written one after another, nothing after
     // the last; otherwise each call is a tag of its own, free text after it outside its region.
     let in_a_row = call.close.is_none() && !one;
@@ -133,7 +128,7 @@ pub(super) fn calls(
     if written.is_empty() {
         return None;
     }
-    if in_a_row {
+    if in_a_row && count.at_least_one {
         let tags = written
             .iter()
             .map(|call| {
@@ -896,9 +891,12 @@ mod tests {
         assert_eq!(free["format"]["type"], "triggered_tags");
         assert_eq!(free["format"]["at_least_one"], false);
         assert_eq!(free["format"]["stop_after_first"], true);
-        // No call owed and more than one allowed: text after a call would be the call's own, where
-        // a parameter no tag constrains would count, so there is no tag.
-        assert_eq!(payload(&format, &[f()], options(false, false)), None);
+        // No call owed and more than one allowed by the request: every call terminal triggers a
+        // tag, leaving free text possible before, after and between calls.
+        let free = payload(&format, &[f()], options(false, false)).expect("a tag");
+        assert_eq!(free["format"]["at_least_one"], false);
+        assert!(free["format"].get("stop_after_first").is_none());
+        assert_eq!(free["format"]["tags"][0]["content"], parameters);
         // The template writes its own name: another tool has no tag.
         assert_eq!(
             payload(

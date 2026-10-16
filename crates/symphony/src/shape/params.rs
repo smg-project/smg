@@ -23,9 +23,10 @@
 //! it wherever the trailer stands: the template's reader closes a region at the end of its text
 //! whether or not the closing pattern matched, and `finditer` passes over a trailer the stream
 //! never finished, or a closing terminal given back to the call, as over any text no parameter
-//! takes. When the stream cuts the region, what is undecided is decided the same way at the end of
-//! what arrived, the object is left open, and the bytes no parameter took come back as `Malformed`
-//! with `UnterminatedRegion`.
+//! takes. When the stream cuts the region, it closes the same way at the end of what arrived, as
+//! the template's reader closes a region at the end of its text: what is undecided is decided,
+//! the bytes no parameter took (a parameter the cut left unfinished) are dropped as wrapping, and
+//! the arguments' object is closed over the parameters that finished.
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
@@ -79,15 +80,6 @@ enum Search {
     Scanning(String),
     /// A parameter from its trigger on, the matcher holding every byte since.
     Matching(Box<Matcher<'static>>),
-}
-
-/// What to do with the text no parameter took.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Skipped {
-    /// Dropped as wrapping, as `finditer` passes over it.
-    Dropped,
-    /// Returned as `Malformed`: the stream cut the region.
-    Cut,
 }
 
 impl Params {
@@ -176,21 +168,29 @@ impl Params {
         // The trailer starts at `at` counted from the floor; the held bytes start at `dropped`.
         let split = at.saturating_sub(self.dropped).min(held.len());
         let (text, trailer) = held.split_at(split);
-        self.settle(text, Skipped::Dropped, declared, out);
+        self.settle(text, declared, out);
+        self.close_object(out);
+        trailer.to_string()
+    }
+
+    /// The stream cut the region: it closes as the template's reader closes a region at the end
+    /// of its text. What is undecided is decided as at the end of the text, the bytes no
+    /// parameter took are dropped as wrapping, and the arguments' object is closed over the
+    /// parameters that finished, `{}` where none did.
+    pub(crate) fn finish(mut self, declared: &Declared, out: &mut Events) {
+        let held = self.take_held();
+        self.settle(&held, declared, out);
+        self.close_object(out);
+    }
+
+    /// Closes the arguments' object: `{}` where no parameter was written.
+    fn close_object(&self, out: &mut Events) {
         let close = if self.written == 0 { "{}" } else { "}" };
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: close.to_string(),
             source: Text::default(),
         });
-        trailer.to_string()
-    }
-
-    /// The stream cut the region: what is undecided is decided as at the end of the text, the
-    /// object is left open, and the bytes no parameter took are malformed.
-    pub(crate) fn finish(mut self, declared: &Declared, out: &mut Events) {
-        let held = self.take_held();
-        self.settle(&held, Skipped::Cut, declared, out);
     }
 
     /// The bytes the search holds, taken.
@@ -213,13 +213,13 @@ impl Params {
                 let keep = longest_start_of(tail, self.trigger);
                 let passed = tail[..tail.len() - keep].to_string();
                 tail.drain(..tail.len() - keep);
-                self.skip(&passed, Skipped::Dropped, out);
+                self.skip(&passed, out);
                 return;
             };
             let passed = tail[..at].to_string();
             let from = tail.split_off(at);
             tail.clear();
-            self.skip(&passed, Skipped::Dropped, out);
+            self.skip(&passed, out);
             let mut matcher =
                 Matcher::new(self.tag, self.ends, &self.shape.word, self.before).hold_cap(None);
             let verdict = matcher.feed(&from);
@@ -254,7 +254,7 @@ impl Params {
             None => {
                 let first = held.chars().next().map_or(0, char::len_utf8);
                 let rest = held.split_off(first);
-                self.skip(&held, Skipped::Dropped, out);
+                self.skip(&held, out);
                 self.search = Search::Scanning(rest);
             }
         }
@@ -262,11 +262,11 @@ impl Params {
     }
 
     /// Decides `text`, the call's last undecided bytes, as `finditer` does at the end of the text:
-    /// each parameter that matches is written, and what lies between is skipped as `skipped` says.
-    fn settle(&mut self, text: &str, skipped: Skipped, declared: &Declared, out: &mut Events) {
+    /// each parameter that matches is written, and what lies between is dropped.
+    fn settle(&mut self, text: &str, declared: &Declared, out: &mut Events) {
         let mut rest = text;
         while let Some(at) = rest.find(self.trigger) {
-            self.skip(&rest[..at], skipped, out);
+            self.skip(&rest[..at], out);
             rest = &rest[at..];
             let mut matcher =
                 Matcher::new(self.tag, self.ends, &self.shape.word, self.before).hold_cap(None);
@@ -280,12 +280,12 @@ impl Params {
                 }
                 Verdict::NoMatch | Verdict::Pending => {
                     let first = rest.chars().next().map_or(0, char::len_utf8);
-                    self.skip(&rest[..first], skipped, out);
+                    self.skip(&rest[..first], out);
                     rest = &rest[first..];
                 }
             }
         }
-        self.skip(rest, skipped, out);
+        self.skip(rest, out);
     }
 
     /// Writes the parameter `found` matched in `parameter`, its bytes: its key and its value as
@@ -321,20 +321,14 @@ impl Params {
         self.written += 1;
     }
 
-    /// The text the search passed over, before the bytes it still holds.
-    fn skip(&mut self, text: &str, skipped: Skipped, out: &mut Events) {
+    /// The text the search passed over, before the bytes it still holds, dropped as wrapping.
+    fn skip(&mut self, text: &str, out: &mut Events) {
         if text.is_empty() {
             return;
         }
-        out.push(match skipped {
-            Skipped::Dropped => Event::Dropped {
-                text: Text::uncounted(text),
-                why: DropReason::Wrapper,
-            },
-            Skipped::Cut => Event::Malformed {
-                text: Text::uncounted(text),
-                why: MalformedReason::UnterminatedRegion,
-            },
+        out.push(Event::Dropped {
+            text: Text::uncounted(text),
+            why: DropReason::Wrapper,
         });
         self.dropped += text.len();
         self.before = text.chars().next_back().or(self.before);

@@ -4,17 +4,12 @@ compiled	hf-pipelines/any_to_any_gemma3_style#prompt-opens-thought-no-close	X3
 compiled	hf-pipelines/text_generation_chatml#no-anchor	X9
 compiled	hf-pipelines/text_generation_chatml#prefill	X2
 compiled	hf-pipelines/text_generation_chatml#prompt-opens-thought-no-close	X3
-compiled	hf-tests/_XML_STRING_ARGS_TEMPLATE#call-cut-in-arguments	X5
-compiled	hf-tests/qwen3_template#call-cut-in-arguments	X5
 compiled	hub/cohere-north#no-anchor	X9
 compiled	hub/cohere-north#prefill	X2
-compiled	hub/muse-glimmer#call-cut-in-arguments	X5
 compiled	hub/muse-glimmer#ends-on-end-of-text	X3
 compiled	hub/muse-glimmer#prefill	X2
 compiled	hub/muse-glimmer#reasoning-only	X3
-compiled	serve/qwen3_5#call-cut-in-arguments	X5
 compiled	serve/qwen3_5#prefill-reasoning	X2
-compiled	trl/qwen3_5#call-cut-in-arguments	X5
 compiled	trl/qwen3_5#prefill-reasoning	X2
 hf	behaviour/bad-value-parser#0	X5
 hf	behaviour/content-args-not-dict#0	X5

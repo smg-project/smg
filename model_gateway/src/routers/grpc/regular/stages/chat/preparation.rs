@@ -65,12 +65,13 @@ impl ChatPreparationStage {
         let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
             .map_err(|why| error::bad_request("invalid_parser_header", why))?;
         ctx.state.parser = Some(parser);
-        let (token_ids, processed_messages, tool_constraints) =
+        let (token_ids, processed_messages, tool_constraints, output_decided) =
             prepare_chat_like(ctx, request, self.wire_pools).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {
             token_ids,
             processed_messages,
             tool_constraints,
+            output_decided,
         });
         Ok(())
     }
@@ -88,7 +89,7 @@ pub(crate) async fn prepare_chat_like(
     ctx: &mut RequestContext,
     request: &ChatCompletionRequest,
     wire_pools: &'static [RoutingPool],
-) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>), Response> {
+) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>, bool), Response> {
     utils::validate_chat_content_parts(&request.messages)
         .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
@@ -364,20 +365,44 @@ pub(crate) async fn prepare_chat_like(
         // predicate); the older registry decides for every other request. Only
         // the chat stage chooses a parser: transcription, which shares this
         // preparation, keeps the legacy parsers.
+        // Where the model's workers start a grammar at the first token, the response
+        // template's table constrains the whole turn instead, the answer's format included,
+        // and what it gives stands (see `regular::symphony::output`).
         let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
         let names = ctx.components.parser_resolver.names(&request.model);
-        let symphony_constraint = symphony::constraint(
+        let workers = ctx
+            .components
+            .worker_registry
+            .get_by_model(&ctx.input.model_id);
+        let output_grammar = symphony::output::for_chat(
             parser,
             &names,
             request,
-            &constraint_tools,
-            reasoning,
+            &workers,
+            &processed_messages.text,
+            request.continues_final_assistant(),
             &ctx.components.templates,
         )
-        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        .transpose()?;
+        let has_output_grammar = output_grammar.is_some();
+        let symphony_constraint = match output_grammar {
+            Some(output_grammar) => output_grammar,
+            None => symphony::constraint(
+                parser,
+                &names,
+                request,
+                &constraint_tools,
+                reasoning,
+                &ctx.components.templates,
+            )
+            .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
+        };
         let tool_call_constraint = match (symphony_constraint, request.tool_choice.as_ref()) {
             (Some(constraint), _) => Some(constraint),
-            (None, Some(tool_choice)) if !constraint_tools.is_empty() => ctx
+            (None, Some(tool_choice))
+                if !has_output_grammar && !constraint_tools.is_empty() =>
+            {
+                ctx
                 .components
                 .tool_parser_factory
                 .registry()
@@ -393,7 +418,8 @@ pub(crate) async fn prepare_chat_like(
                         "invalid_tool_configuration",
                         format!("Invalid tool configuration: {e}"),
                     )
-                })?,
+                })?
+            }
             (None, _) => None,
         };
 
@@ -461,6 +487,7 @@ pub(crate) async fn prepare_chat_like(
             token_ids,
             processed_messages,
             tool_call_constraint.map(|c| c.to_tuple()),
+            has_output_grammar,
         ))
     }
 }

@@ -245,19 +245,42 @@ impl MessagePreparationStage {
             tokenizer.as_ref(),
         );
         let names = ctx.components.parser_resolver.names(&request.model);
-        let symphony_constraint = symphony::constraint_messages(
+        let output_continues = request.continues_final_assistant();
+        // Where the model's workers start a grammar at the first token, the response
+        // template's table constrains the whole turn instead, and what it gives stands (see
+        // `regular::symphony::output`).
+        let workers = ctx
+            .components
+            .worker_registry
+            .get_by_model(&ctx.input.model_id);
+        let output_grammar = symphony::output::for_messages(
             parser,
             &names,
             request,
-            &filtered_tools,
-            reasoning,
-            request.continues_final_assistant(),
+            chat_tool_choice.as_ref(),
+            &workers,
+            &processed_messages.text,
+            output_continues,
             &ctx.components.templates,
         )
-        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        .transpose()?;
+        let has_output_grammar = output_grammar.is_some();
+        let symphony_constraint = match output_grammar {
+            Some(output_grammar) => output_grammar,
+            None => symphony::constraint_messages(
+                parser,
+                &names,
+                request,
+                &filtered_tools,
+                reasoning,
+                request.continues_final_assistant(),
+                &ctx.components.templates,
+            )
+            .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
+        };
         let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {
             (Some(constraint), _) => Some(constraint),
-            (None, Some(tool_choice)) if !filtered_tools.is_empty() => ctx
+            (None, Some(tool_choice)) if !has_output_grammar && !filtered_tools.is_empty() => ctx
                 .components
                 .tool_parser_factory
                 .registry()
@@ -336,6 +359,7 @@ impl MessagePreparationStage {
             processed_messages,
             tool_constraints: tool_call_constraint.map(|c| c.to_tuple()),
             spec,
+            output_decided: has_output_grammar,
         });
 
         // Store stop decoder and derived skip_special_tokens for response processing.

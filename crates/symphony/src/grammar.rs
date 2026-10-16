@@ -4,10 +4,11 @@
 //!
 //! [`Grammar`] is Symphony's own tree, in the shape the engines' structural-tag format takes
 //! (xgrammar's, which the serving engines accept): a `triggered_tags` of per-tool `tag`s, each a
-//! `begin`, a content grammar and an `end`; `sequence`, `or`, `star`, `plus` and `optional` to
-//! compose; `const_string`, `any_text`, `regex`, `json_schema` and `token` as leaves.
-//! [`Grammar::to_json`] writes it as the engine reads it, and [`Grammar::payload`] wraps it as the
-//! request carries it.
+//! `begin`, a content grammar and an `end` (one text, or any of several texts); `sequence`, `or`,
+//! `star`, `plus` and `optional` to compose; `const_string`, `any_text`, `regex`, `json_schema`
+//! (whose strings may leave words out), an EBNF `grammar` and `token` as leaves.
+//! [`Grammar::to_json`] writes it as the engine reads it, [`Grammar::payload`] wraps it as the
+//! request carries it, and [`Grammar::payload_text`] writes that as text.
 //!
 //! [`Format::grammar`] derives the tree from the table's rows and the request's tools, one spelling
 //! per call syntax. Notes on how, and on what it leaves open: `docs/grammar.md`.
@@ -15,8 +16,10 @@
 use std::collections::VecDeque;
 
 use openai_protocol::common::Tool;
+use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
 
+pub use self::output::{Output, OutputAnswer, OutputChoice, OutputPosition, OutputSpelling};
 use crate::{
     format::{CallSyntax, Emits, Format},
     shape::{Layout, Message},
@@ -26,6 +29,7 @@ use crate::{
 mod attributed;
 mod gemma;
 mod keyed;
+mod output;
 mod pythonic;
 mod schema;
 mod shaped;
@@ -43,11 +47,16 @@ pub enum Grammar {
     /// Text the regular expression accepts.
     Regex(String),
     /// A JSON value the schema accepts, written in the engine's `style` when one is named
-    /// (`glm_xml` writes it as `<arg_key>`/`<arg_value>` pairs).
+    /// (`glm_xml` writes it as `<arg_key>`/`<arg_value>` pairs). Its strings and keys hold none of
+    /// `excludes`, a list xgrammar enforces from 0.2.8 on and an older xgrammar ignores; an empty
+    /// list is not written.
     JsonSchema {
         schema: Value,
         style: Option<String>,
+        excludes: Vec<String>,
     },
+    /// Text an EBNF grammar in xgrammar's own syntax (`root ::= ...`) accepts.
+    Ebnf(String),
     /// The elements one after another.
     Sequence(Vec<Grammar>),
     /// One of the elements.
@@ -86,84 +95,69 @@ pub enum Grammar {
 pub struct Tag {
     pub begin: String,
     pub content: Box<Grammar>,
-    pub end: String,
+    pub end: Bound,
+}
+
+/// Where a tag ends: a text, or whichever of several texts comes first.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Bound {
+    Text(String),
+    Texts(Vec<String>),
+}
+
+impl Bound {
+    /// The bound with `f` applied to each of its texts.
+    fn map(self, f: impl Fn(String) -> String) -> Self {
+        match self {
+            Self::Text(text) => Self::Text(f(text)),
+            Self::Texts(texts) => Self::Texts(texts.into_iter().map(f).collect()),
+        }
+    }
+}
+
+impl Serialize for Bound {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(text) => serializer.serialize_str(text),
+            Self::Texts(texts) => texts.serialize(serializer),
+        }
+    }
 }
 
 impl Tag {
     fn new(begin: impl Into<String>, content: Grammar, end: impl Into<String>) -> Self {
+        Self::bounded(begin, content, Bound::Text(end.into()))
+    }
+
+    fn bounded(begin: impl Into<String>, content: Grammar, end: Bound) -> Self {
         Self {
             begin: begin.into(),
             content: Box::new(content),
-            end: end.into(),
+            end,
         }
     }
 
-    fn to_json(&self) -> Value {
-        json!({
-            "type": "tag",
-            "begin": self.begin,
-            "content": self.content.to_json(),
-            "end": self.end,
-        })
+    /// The tag's keys, written into `map`.
+    fn entries<M: SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
+        map.serialize_entry("type", "tag")?;
+        map.serialize_entry("begin", &self.begin)?;
+        map.serialize_entry("content", &self.content)?;
+        map.serialize_entry("end", &self.end)
+    }
+}
+
+impl Serialize for Tag {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(4))?;
+        self.entries(&mut map)?;
+        map.end()
     }
 }
 
 impl Grammar {
     /// The grammar as the engine reads it.
     pub fn to_json(&self) -> Value {
-        match self {
-            Self::ConstString(value) => json!({"type": "const_string", "value": value}),
-            Self::AnyText { excludes } => json!({"type": "any_text", "excludes": excludes}),
-            Self::Regex(pattern) => json!({"type": "regex", "pattern": pattern}),
-            Self::JsonSchema { schema, style } => {
-                let mut written = json!({"type": "json_schema", "json_schema": schema});
-                if let Some(style) = style {
-                    written["style"] = Value::String(style.clone());
-                }
-                written
-            }
-            Self::Sequence(elements) => json!({
-                "type": "sequence",
-                "elements": elements.iter().map(Self::to_json).collect::<Vec<_>>(),
-            }),
-            Self::Or(elements) => json!({
-                "type": "or",
-                "elements": elements.iter().map(Self::to_json).collect::<Vec<_>>(),
-            }),
-            Self::Optional(content) => json!({"type": "optional", "content": content.to_json()}),
-            Self::Star(content) => json!({"type": "star", "content": content.to_json()}),
-            Self::Plus(content) => json!({"type": "plus", "content": content.to_json()}),
-            Self::Tag(tag) => tag.to_json(),
-            Self::Token(token) => json!({"type": "token", "token": token}),
-            Self::TriggeredTags {
-                triggers,
-                tags,
-                at_least_one,
-                stop_after_first,
-            } => stopping(
-                json!({
-                    "type": "triggered_tags",
-                    "triggers": triggers,
-                    "tags": tags.iter().map(Tag::to_json).collect::<Vec<_>>(),
-                    "at_least_one": at_least_one,
-                }),
-                *stop_after_first,
-            ),
-            Self::TagsWithSeparator {
-                tags,
-                separator,
-                at_least_one,
-                stop_after_first,
-            } => stopping(
-                json!({
-                    "type": "tags_with_separator",
-                    "tags": tags.iter().map(Tag::to_json).collect::<Vec<_>>(),
-                    "separator": separator,
-                    "at_least_one": at_least_one,
-                }),
-                *stop_after_first,
-            ),
-        }
+        serde_json::to_value(self).unwrap_or(Value::Null)
     }
 
     /// The grammar as a request carries it to the engine: under `format`.
@@ -171,12 +165,27 @@ impl Grammar {
         json!({"format": self.to_json()})
     }
 
+    /// [`Grammar::payload`] as the text a request carries, written straight from the tree: the
+    /// same bytes as `payload().to_string()`, without building the JSON tree first.
+    pub fn payload_text(&self) -> String {
+        serde_json::to_string(&Payload { format: self }).unwrap_or_default()
+    }
+
+    /// The length of [`Grammar::payload_text`], counted without writing it.
+    pub fn payload_len(&self) -> usize {
+        json_len(&Payload { format: self })
+    }
+
     /// The nodes in the tree, this one included: its size, for a derivation that bounds it. A
     /// JSON schema leaf counts by the size of its schema (a node per four of the schema's own, a
     /// long string weighing its length), since the definitions attached to it are copied with it.
     pub(crate) fn nodes(&self) -> usize {
         1 + match self {
-            Self::ConstString(_) | Self::AnyText { .. } | Self::Regex(_) | Self::Token(_) => 0,
+            Self::ConstString(_)
+            | Self::AnyText { .. }
+            | Self::Regex(_)
+            | Self::Ebnf(_)
+            | Self::Token(_) => 0,
             Self::JsonSchema { schema, .. } => json_nodes(schema) / 4,
             Self::Sequence(elements) | Self::Or(elements) => elements.iter().map(Self::nodes).sum(),
             Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.nodes(),
@@ -185,6 +194,127 @@ impl Grammar {
                 tags.iter().map(|tag| tag.content.nodes()).sum()
             }
         }
+    }
+}
+
+/// A grammar under `format`, as a request carries it.
+#[derive(Serialize)]
+struct Payload<'a> {
+    format: &'a Grammar,
+}
+
+/// The engine's keys of each node, in the order it writes them; `excludes` of a JSON schema only
+/// when there are words to leave out, `style` only when one is named, and `stop_after_first` only
+/// when the tags stop after the first (the engines' default otherwise, so a tag that asks for any
+/// number of calls is written as it was before the key existed).
+impl Serialize for Grammar {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::ConstString(value) => {
+                map.serialize_entry("type", "const_string")?;
+                map.serialize_entry("value", value)?;
+            }
+            Self::AnyText { excludes } => {
+                map.serialize_entry("type", "any_text")?;
+                map.serialize_entry("excludes", excludes)?;
+            }
+            Self::Regex(pattern) => {
+                map.serialize_entry("type", "regex")?;
+                map.serialize_entry("pattern", pattern)?;
+            }
+            Self::JsonSchema {
+                schema,
+                style,
+                excludes,
+            } => {
+                map.serialize_entry("type", "json_schema")?;
+                map.serialize_entry("json_schema", schema)?;
+                if let Some(style) = style {
+                    map.serialize_entry("style", style)?;
+                }
+                if !excludes.is_empty() {
+                    map.serialize_entry("excludes", excludes)?;
+                }
+            }
+            Self::Ebnf(grammar) => {
+                map.serialize_entry("type", "grammar")?;
+                map.serialize_entry("grammar", grammar)?;
+            }
+            Self::Sequence(elements) => {
+                map.serialize_entry("type", "sequence")?;
+                map.serialize_entry("elements", elements)?;
+            }
+            Self::Or(elements) => {
+                map.serialize_entry("type", "or")?;
+                map.serialize_entry("elements", elements)?;
+            }
+            Self::Optional(content) => {
+                map.serialize_entry("type", "optional")?;
+                map.serialize_entry("content", content)?;
+            }
+            Self::Star(content) => {
+                map.serialize_entry("type", "star")?;
+                map.serialize_entry("content", content)?;
+            }
+            Self::Plus(content) => {
+                map.serialize_entry("type", "plus")?;
+                map.serialize_entry("content", content)?;
+            }
+            Self::Tag(tag) => tag.entries(&mut map)?,
+            Self::Token(token) => {
+                map.serialize_entry("type", "token")?;
+                map.serialize_entry("token", token)?;
+            }
+            Self::TriggeredTags {
+                triggers,
+                tags,
+                at_least_one,
+                stop_after_first,
+            } => {
+                map.serialize_entry("type", "triggered_tags")?;
+                map.serialize_entry("triggers", triggers)?;
+                map.serialize_entry("tags", tags)?;
+                map.serialize_entry("at_least_one", at_least_one)?;
+                if *stop_after_first {
+                    map.serialize_entry("stop_after_first", &true)?;
+                }
+            }
+            Self::TagsWithSeparator {
+                tags,
+                separator,
+                at_least_one,
+                stop_after_first,
+            } => {
+                map.serialize_entry("type", "tags_with_separator")?;
+                map.serialize_entry("tags", tags)?;
+                map.serialize_entry("separator", separator)?;
+                map.serialize_entry("at_least_one", at_least_one)?;
+                if *stop_after_first {
+                    map.serialize_entry("stop_after_first", &true)?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+/// The length of `value` as JSON text, counted as it is written out.
+pub(super) fn json_len<T: Serialize + ?Sized>(value: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    match serde_json::to_writer(&mut count, value) {
+        Ok(()) => count.0,
+        Err(_) => usize::MAX,
     }
 }
 
@@ -235,6 +365,7 @@ fn bound(grammar: Grammar, tokens: &[String]) -> Grammar {
         leaf @ (Grammar::AnyText { .. }
         | Grammar::Regex(_)
         | Grammar::JsonSchema { .. }
+        | Grammar::Ebnf(_)
         | Grammar::Token(_)) => leaf,
     }
 }
@@ -269,16 +400,6 @@ fn split_tokens(text: String, tokens: &[String]) -> Grammar {
         }
     }
     Grammar::Sequence(pieces)
-}
-
-/// `written` with `stop_after_first` set when the tags stop after the first: the key is left out
-/// otherwise, the engines' default, so a tag that asks for any number of calls is written as it
-/// was before the key existed.
-fn stopping(mut written: Value, stop_after_first: bool) -> Value {
-    if stop_after_first {
-        written["stop_after_first"] = Value::Bool(true);
-    }
-    written
 }
 
 /// The nodes of a JSON value: one per scalar, one per object or array and one per member, and
@@ -412,7 +533,7 @@ impl Count<'_> {
         let tags = tags
             .into_iter()
             .map(|tag| Tag {
-                end: self.end(tag.end),
+                end: tag.end.map(|end| self.end(end)),
                 ..tag
             })
             .collect();
@@ -586,6 +707,7 @@ impl Format {
         let answer = Grammar::JsonSchema {
             schema: schema.clone(),
             style: None,
+            excludes: Vec::new(),
         };
         let content = self.answer_state()?;
         let (before, after) = self.around(|layout| layout.answer.as_ref());
@@ -845,6 +967,7 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
                     },
                     format!("}}\n{}", markers.call_close),
                 )
@@ -881,6 +1004,7 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
                     },
                     format!("}}{close}"),
                 )
@@ -913,6 +1037,7 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: None,
+                        excludes: Vec::new(),
                     },
                     "",
                 )
@@ -944,6 +1069,7 @@ impl Format {
                         Grammar::JsonSchema {
                             schema: tool.function.parameters.clone(),
                             style: None,
+                            excludes: Vec::new(),
                         },
                         Grammar::ConstString("}".to_string()),
                     ])
@@ -1008,6 +1134,7 @@ impl Format {
                     Grammar::JsonSchema {
                         schema: tool.function.parameters.clone(),
                         style: Some("glm_xml".to_string()),
+                        excludes: Vec::new(),
                     },
                     markers.call_close,
                 )
@@ -3695,5 +3822,93 @@ mod tests {
                 ]},
             ]})
         );
+    }
+
+    #[test]
+    fn an_end_list_json_excludes_and_ebnf_write_the_engines_keys() {
+        // A tag that ends at whichever of several texts comes first, JSON whose strings leave
+        // words out (written only when there are words to leave out), and an EBNF grammar.
+        let excluding = |excludes: &[&str]| Grammar::JsonSchema {
+            schema: value!({"type": "string"}),
+            style: None,
+            excludes: excludes.iter().map(|word| word.to_string()).collect(),
+        };
+        let grammar = Grammar::Sequence(vec![
+            Grammar::Tag(Tag {
+                begin: "<a>".to_string(),
+                content: Box::new(excluding(&["</a>"])),
+                end: Bound::Texts(vec!["</a>".to_string(), "</b>".to_string()]),
+            }),
+            excluding(&[]),
+            Grammar::Ebnf("root ::= \"yes\"".to_string()),
+        ]);
+        assert_eq!(
+            grammar.to_json(),
+            value!({"type": "sequence", "elements": [
+                {"type": "tag", "begin": "<a>",
+                 "content": {"type": "json_schema", "json_schema": {"type": "string"},
+                             "excludes": ["</a>"]},
+                 "end": ["</a>", "</b>"]},
+                {"type": "json_schema", "json_schema": {"type": "string"}},
+                {"type": "grammar", "grammar": "root ::= \"yes\""},
+            ]})
+        );
+    }
+
+    #[test]
+    fn the_payload_text_is_the_payloads_json_written_straight() {
+        // Every node, both kinds of bound, a schema with a style and with words to leave out, tags
+        // that stop after the first and tags that do not: the text written from the tree is the
+        // JSON tree's, and its length is counted alike.
+        let tag = |end: Bound| {
+            Tag::bounded(
+                "<t\"\n>",
+                Grammar::Plus(Box::new(Grammar::Token("<|u|>".to_string()))),
+                end,
+            )
+        };
+        let grammar = Grammar::Sequence(vec![
+            Grammar::TriggeredTags {
+                triggers: vec!["<a\"\n>".to_string()],
+                tags: vec![tag(Bound::Text("</a>".to_string()))],
+                at_least_one: true,
+                stop_after_first: false,
+            },
+            Grammar::TriggeredTags {
+                triggers: vec!["<b>".to_string()],
+                tags: vec![tag(Bound::Text("</b>".to_string()))],
+                at_least_one: false,
+                stop_after_first: true,
+            },
+            Grammar::TagsWithSeparator {
+                tags: vec![tag(Bound::Texts(vec!["x".to_string(), "y".to_string()]))],
+                separator: "\u{1}\u{e9}".to_string(),
+                at_least_one: false,
+                stop_after_first: false,
+            },
+            Grammar::TagsWithSeparator {
+                tags: vec![tag(Bound::Text("z".to_string()))],
+                separator: ",".to_string(),
+                at_least_one: true,
+                stop_after_first: true,
+            },
+            Grammar::Tag(tag(Bound::Text("<|e|>".to_string()))),
+            Grammar::JsonSchema {
+                schema: value!({"z": [1, 2.5, null], "a": {"b": "\t"}}),
+                style: Some("glm_xml".to_string()),
+                excludes: vec!["<|e|>".to_string()],
+            },
+            Grammar::Ebnf("root ::= \"yes\"".to_string()),
+            Grammar::Or(vec![
+                Grammar::Optional(Box::new(Grammar::Regex("[0-9]+".to_string()))),
+                Grammar::Star(Box::new(Grammar::AnyText {
+                    excludes: Vec::new(),
+                })),
+                Grammar::ConstString("c".to_string()),
+            ]),
+        ]);
+        let text = grammar.payload_text();
+        assert_eq!(text, grammar.payload().to_string());
+        assert_eq!(grammar.payload_len(), text.len());
     }
 }

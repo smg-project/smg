@@ -340,7 +340,9 @@ pub(crate) async fn encode_prompt_blocking(
 }
 
 /// Process tool call arguments in messages
-/// Per Transformers docs, tool call arguments in assistant messages should be dicts
+/// Per Transformers docs, tool call arguments in assistant messages should be dicts. An empty
+/// `arguments` string is a call with no arguments, `{}`; any other text that is not JSON is
+/// refused.
 pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
     for msg in messages {
         let role = msg.get("role").and_then(|v| v.as_str());
@@ -362,6 +364,10 @@ pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), 
             let Some(args_str) = args.as_str() else {
                 continue;
             };
+            if args_str.trim().is_empty() {
+                *args = json!({});
+                continue;
+            }
 
             // Parse JSON string to object (like Python json.loads)
             match serde_json::from_str::<Value>(args_str) {
@@ -2434,6 +2440,42 @@ mod tests {
             raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
             json!("{\"city\": \"Hangzhou\"}")
         );
+    }
+
+    /// An empty `arguments` string, which a call cut before it wrote any argument may carry back
+    /// in history, is a call with no arguments; other text that is not JSON keeps the 400.
+    #[test]
+    fn an_empty_arguments_string_in_history_is_no_arguments() {
+        let history = |arguments: &str| {
+            vec![json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "apply_patch", "arguments": arguments}
+                }]
+            })]
+        };
+        for empty in ["", "  \n"] {
+            let mut messages = history(empty);
+            process_tool_call_arguments(&mut messages).expect("an empty string is no arguments");
+            assert_eq!(
+                messages[0]["tool_calls"][0]["function"]["arguments"],
+                json!({}),
+                "{empty:?}"
+            );
+        }
+        let mut messages = history("{\"patch\": \"x\"}");
+        process_tool_call_arguments(&mut messages).expect("JSON arguments");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            json!({"patch": "x"})
+        );
+        for invalid in ["{", "{\"patch\": \"x\""] {
+            let err = process_tool_call_arguments(&mut history(invalid)).unwrap_err();
+            assert!(err.contains("Failed to parse tool call arguments"), "{err}");
+        }
     }
 
     /// A renderer that parses `arguments` itself (K3) gets a malformed history

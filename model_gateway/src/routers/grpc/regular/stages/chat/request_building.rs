@@ -286,6 +286,7 @@ impl BuildStage for ChatRequestBuildingStage {
             token_ids,
             processed_messages,
             tool_constraints,
+            output_decided,
         } = prep
         else {
             debug_assert!(false, "pipeline guarantees Chat variant");
@@ -310,8 +311,9 @@ impl BuildStage for ChatRequestBuildingStage {
         // stamp carries the tag unshaped like a forced call's, so a retry's
         // worker shapes it again but is not asked for its own policy.
         let tool_constraints = match tool_constraints {
-            None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
-                == ConstrainedDecoding::Always =>
+            None if !output_decided
+                && utils::constrained_decoding_for(ctx.state.workers.as_ref())
+                    == ConstrainedDecoding::Always =>
             {
                 let reasoning = reasoning_decision(
                     ctx,
@@ -346,16 +348,26 @@ impl BuildStage for ChatRequestBuildingStage {
             None => ParserChoice::Legacy,
         });
         // The table's structural tag stands in for a JSON response_format (see
-        // `regular::symphony::constraint`): the engine's request carries the tag
-        // alone, so no client reads the two as competing constraints.
-        let answered = assignment.is_some()
-            && chat_request.response_format.is_some()
+        // `regular::symphony::constraint`), and the response template's table's
+        // output grammar for a regex or an ebnf too (`regular::symphony::output`):
+        // the engine's request carries the tag alone, so no client reads the two as
+        // competing constraints.
+        let tagged = assignment.is_some()
             && tool_constraints
                 .as_ref()
                 .is_some_and(|(kind, _)| kind == "structural_tag");
-        let engine_request = answered.then(|| openai_protocol::chat::ChatCompletionRequest {
-            response_format: None,
-            ..chat_request.as_ref().clone()
+        let answered = tagged && chat_request.response_format.is_some();
+        let framed = tagged
+            && symphony::names_template(&names)
+            && (chat_request.regex.is_some() || chat_request.ebnf.is_some());
+        let engine_request = (answered || framed).then(|| {
+            let mut request = chat_request.as_ref().clone();
+            request.response_format = None;
+            if framed {
+                request.regex = None;
+                request.ebnf = None;
+            }
+            request
         });
         let engine_request = match &engine_request {
             Some(request) => request,

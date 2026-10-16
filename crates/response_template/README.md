@@ -220,11 +220,7 @@ session that shows one, and the test checks each listed code by undoing it:
 - X3: a stop text is not fed to the table; a region it closes closes at the
   stream's stop, and a stop text transformers keeps as text is not in the
   message.
-- X5: where transformers raises, the table's events are defined. A call the
-  stream cut short (for length, or with any finish but the model's stop) is
-  reported cut: its arguments' object is left open, and the text of a parameter
-  the cut left unfinished is `Malformed`, where transformers closes the region
-  at the end of the text.
+- X5: where transformers raises, the table's events are defined.
 - X6: fields other than the thought, the content and the calls are dropped.
 - X9: with no anchor in the prompt, reading starts at the output, where
   transformers reads the whole prompt as the message's start.

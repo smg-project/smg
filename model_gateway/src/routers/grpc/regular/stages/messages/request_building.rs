@@ -82,6 +82,7 @@ impl BuildStage for MessageRequestBuildingStage {
             processed_messages,
             tool_constraints,
             mut spec,
+            output_decided,
         } = prep
         else {
             debug_assert!(false, "pipeline guarantees Messages variant");
@@ -178,8 +179,9 @@ impl BuildStage for MessageRequestBuildingStage {
         // stamp carries the tag unshaped like a forced call's, so a retry's
         // worker shapes it again but is not asked for its own policy.
         let tool_constraints = match tool_constraints {
-            None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
-                == ConstrainedDecoding::Always =>
+            None if !output_decided
+                && utils::constrained_decoding_for(ctx.state.workers.as_ref())
+                    == ConstrainedDecoding::Always =>
             {
                 let tools = ctx
                     .tokenizer_arc()

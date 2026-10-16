@@ -33,7 +33,7 @@ use symphony::{
         self, Arguments, Atom, CallLayout, CallShape, Class, Dialect, End, Layout, Message,
         NameSource, Nested, Pattern, Segment, Slot, Spellings, ValueParser, Words, Written,
     },
-    CallSyntax, Declared, Emits, Engine, EngineFinish, Format, Grammar, Parser, Tag,
+    Bound, CallSyntax, Declared, Emits, Engine, EngineFinish, Format, Grammar, Parser, Tag,
 };
 
 /// One output and the message it reads as.
@@ -1300,7 +1300,7 @@ fn ends(grammar: &Grammar, text: &str, at: usize) -> Vec<usize> {
             .collect(),
         Grammar::AnyText { excludes } => free(text, at, excludes),
         Grammar::JsonSchema { schema, .. } => json_ends(schema, text, at),
-        Grammar::Regex(_) => Vec::new(),
+        Grammar::Regex(_) | Grammar::Ebnf(_) => Vec::new(),
         Grammar::Sequence(parts) => parts.iter().fold(vec![at], |starts, part| {
             starts
                 .iter()
@@ -1409,7 +1409,12 @@ fn repeated(inner: &Grammar, text: &str, at: usize, least: usize) -> Vec<usize> 
 
 fn tag_ends(tag: &Tag, text: &str, at: usize) -> Vec<usize> {
     let begin = Grammar::ConstString(tag.begin.clone());
-    let end = Grammar::ConstString(tag.end.clone());
+    let end = match &tag.end {
+        Bound::Text(text) => Grammar::ConstString(text.clone()),
+        Bound::Texts(texts) => {
+            Grammar::Or(texts.iter().cloned().map(Grammar::ConstString).collect())
+        }
+    };
     ends(
         &Grammar::Sequence(vec![begin, (*tag.content).clone(), end]),
         text,

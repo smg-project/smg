@@ -40,9 +40,11 @@
 //! arguments' bytes are their fragments' sources; the trailer and the closing terminal are the
 //! end's source. Whitespace after the arguments that is not the trailer is dropped as wrapping, and
 //! anything else there is `Malformed`, run by run, so that where the chunks were cut changes
-//! nothing. A region the stream cut is ended with what arrived: the call is not closed for the
-//! client, and what was held comes back as `Malformed` with `UnterminatedRegion`, its whitespace
-//! dropped.
+//! nothing. A region the stream cut is ended with what arrived. Tagged parameters close as the
+//! template's reader closes a region at the end of its text: the arguments' object is closed over
+//! the parameters that finished, and the text of one the cut left unfinished is dropped as
+//! wrapping. One JSON value or object is not closed for the client, and what was held after it
+//! comes back as `Malformed` with `UnterminatedRegion`, its whitespace dropped.
 //!
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
 
@@ -374,10 +376,11 @@ impl Assembler {
         true
     }
 
-    /// The stream was cut inside the region: the call ends with what arrived, not closed for the
-    /// client. What was held after a value or an object comes back as `Malformed` with
-    /// `UnterminatedRegion`, its whitespace dropped; parameters still undecided are decided as at
-    /// the end of what arrived, and the bytes no parameter took come back the same way.
+    /// The stream was cut inside the region: the call ends with what arrived. One JSON value or
+    /// object is not closed for the client, and what was held after it comes back as `Malformed`
+    /// with `UnterminatedRegion`, its whitespace dropped. Tagged parameters close as at the end of
+    /// the text: those still undecided are decided there, the bytes no parameter took are dropped
+    /// as wrapping, and the arguments' object is closed.
     pub fn finish(mut self, declared: &Declared, out: &mut Events) {
         let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return;
@@ -1566,9 +1569,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_call_decides_what_it_holds_at_the_end_and_stays_open() {
+    fn a_cut_call_decides_what_it_holds_at_the_end_and_closes() {
         let ends = vec![ends_at([lit("</k>"), spaces()], [])];
         let format = table(tagged(ends, Pattern::default()));
+        let length = Event::Finish {
+            reason: crate::event::FinishReason::Length,
+            tool_calls: 1,
+            reasoning_tokens: 0,
+        };
         let events = run_after(&format, "", "<c><k=a>1</k>  <k=b>2", EngineFinish::Length);
         assert_eq!(
             events,
@@ -1576,18 +1584,25 @@ mod tests {
                 wrapper("<c>"),
                 start("f", ""),
                 member("{\"a\": 1", "<k=a>1</k>  "),
-                Event::Malformed {
-                    text: Text::uncounted("<k=b>2"),
-                    why: MalformedReason::UnterminatedRegion,
-                },
+                wrapper("<k=b>2"),
+                closed(),
                 end(""),
-                Event::Finish {
-                    reason: crate::event::FinishReason::Length,
-                    tool_calls: 1,
-                    reasoning_tokens: 0,
-                },
+                length.clone(),
             ],
-            "the parameter whose end waited for more whitespace is whole at the end"
+            "the parameter whose end waited for more whitespace is whole at the end, the one the \
+             cut left unfinished is dropped, and the object closes"
+        );
+        assert_eq!(
+            run_after(&format, "", "<c><k=b>2", EngineFinish::Length),
+            [
+                wrapper("<c>"),
+                start("f", ""),
+                wrapper("<k=b>2"),
+                member("{}", ""),
+                end(""),
+                length,
+            ],
+            "a call cut before any parameter finished closes with no arguments"
         );
         let stopped = table(tagged(closed_by_tag(), Pattern::default())).closes_at_stop("call");
         assert_eq!(
@@ -1694,6 +1709,7 @@ mod tests {
                 start("f", ""),
                 member("{\"a\": 1", "<k=a>1</k>"),
                 wrapper("\n</c>"),
+                closed(),
                 end(""),
                 Event::Finish {
                     reason,
@@ -1708,12 +1724,13 @@ mod tests {
                 "<c><k=a>1</k>\n</c>"
             ),
             cut(crate::event::FinishReason::Stop),
-            "without the row the stop does not close the call, which is cut"
+            "without the row the stop does not close the region, which is cut and closes as at \
+             the end of the text"
         );
         assert_eq!(
             run_after(&format, "", "<c><k=a>1</k>\n</c>", EngineFinish::Length),
             cut(crate::event::FinishReason::Length),
-            "a stream cut for length leaves the call cut"
+            "a stream cut for length closes the call as at the end of the text"
         );
     }
 
