@@ -14,7 +14,7 @@ use axum::http::HeaderMap;
 use bytes::Bytes;
 use openai_protocol::{
     event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
-    responses::{generate_id, McpToolCallError, ResponseInput, ResponseTool, ResponsesRequest},
+    responses::{generate_id, McpToolCallError, ResponseTool, ResponsesRequest},
 };
 use serde_json::{json, to_value, Value};
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput, ToolExecutionResult};
@@ -41,10 +41,8 @@ pub(crate) struct ToolLoopState {
     pub iteration: usize,
     /// Total number of tool calls executed
     pub total_calls: usize,
-    /// Conversation history (function_call and function_call_output items)
+    /// The calls this loop executed, each with its output, in order
     pub conversation_history: Vec<Value>,
-    /// Original user input (preserved for building resume payloads)
-    pub original_input: ResponseInput,
     /// MCP bindings already represented by historical `mcp_list_tools` items.
     pub existing_mcp_list_tools_labels: HashSet<String>,
     /// Transformed output items (mcp_call, web_search_call, etc.) - stored to avoid reconstruction
@@ -52,7 +50,7 @@ pub(crate) struct ToolLoopState {
 }
 
 impl ToolLoopState {
-    pub fn new(original_input: ResponseInput, prior_mcp_list_tools_labels: Vec<String>) -> Self {
+    pub fn new(prior_mcp_list_tools_labels: Vec<String>) -> Self {
         let known_labels = prior_mcp_list_tools_labels
             .into_iter()
             .collect::<HashSet<_>>();
@@ -61,7 +59,6 @@ impl ToolLoopState {
             iteration: 0,
             total_calls: 0,
             conversation_history: Vec::new(),
-            original_input,
             existing_mcp_list_tools_labels: known_labels,
             mcp_call_items: Vec::new(),
         }
@@ -389,11 +386,12 @@ fn remap_tool_choice_for_functions(tool_choice: Option<&Value>, tools: &[Value])
     }
 }
 
-/// Build a resume payload with conversation history
+/// Build a resume payload: the payload the loop started from, its input (the
+/// request's own, with the history it continues loaded in front) followed by
+/// every call this loop executed with its output.
 pub(crate) fn build_resume_payload(
     base_payload: &Value,
     conversation_history: &[Value],
-    original_input: &ResponseInput,
     tools_json: &Value,
     is_streaming: bool,
 ) -> Result<Value, String> {
@@ -403,25 +401,15 @@ pub(crate) fn build_resume_payload(
         .as_object_mut()
         .ok_or_else(|| "payload not an object".to_string())?;
 
-    let mut input_array = Vec::with_capacity(1 + conversation_history.len());
-
-    match original_input {
-        ResponseInput::Text(text) => {
-            let user_item = json!({
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": text }]
-            });
-            input_array.push(user_item);
-        }
-        ResponseInput::Items(items) => {
-            let items_value =
-                to_value(items).map_err(|e| format!("Failed to serialize input items: {e}"))?;
-            if let Some(items_arr) = items_value.as_array() {
-                input_array.extend_from_slice(items_arr);
-            }
-        }
-    }
+    let mut input_array = match obj.get("input") {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::String(text)) => vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }]
+        })],
+        _ => return Err("payload input is neither a string nor an item list".to_string()),
+    };
 
     input_array.extend_from_slice(conversation_history);
     obj.insert("input".to_string(), Value::Array(input_array));
@@ -852,10 +840,7 @@ pub(crate) async fn execute_tool_loop(
         format_registry,
     } = tool_loop_ctx;
 
-    let mut state = ToolLoopState::new(
-        original_body.input.clone(),
-        existing_mcp_list_tools_labels.to_vec(),
-    );
+    let mut state = ToolLoopState::new(existing_mcp_list_tools_labels.to_vec());
     let max_tool_calls = original_body.max_tool_calls.map(|n| n as usize);
     let base_payload = initial_payload.clone();
     let tools_json = base_payload.get("tools").cloned().unwrap_or(json!([]));
@@ -1071,7 +1056,6 @@ pub(crate) async fn execute_tool_loop(
         current_payload = build_resume_payload(
             &base_payload,
             &state.conversation_history,
-            &state.original_input,
             &tools_json,
             false,
         )?;
@@ -1335,8 +1319,7 @@ mod tests {
 
     use super::{
         build_transformed_mcp_call_item, extract_openai_response_output_items,
-        is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit, ResponseInput,
-        ToolLoopState,
+        is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit, ToolLoopState,
     };
     use crate::openai_bridge::ResponseFormat;
 
@@ -1557,7 +1540,7 @@ mod tests {
 
     #[test]
     fn record_call_appends_openai_response_output_after_tool_item() {
-        let mut state = ToolLoopState::new(ResponseInput::Text("hello".to_string()), Vec::new());
+        let mut state = ToolLoopState::new(Vec::new());
         let transformed = json!({
             "type": "web_search_call",
             "id": "ws_test",
@@ -1606,7 +1589,7 @@ mod tests {
 
     #[test]
     fn record_call_does_not_append_openai_response_output_for_non_builtin_tools() {
-        let mut state = ToolLoopState::new(ResponseInput::Text("hello".to_string()), Vec::new());
+        let mut state = ToolLoopState::new(Vec::new());
         let transformed = json!({
             "type": "web_search_call",
             "id": "ws_test",
@@ -2059,12 +2042,67 @@ mod tests {
         let resumed = super::build_resume_payload(
             &base,
             &[],
-            &ResponseInput::Text("q".to_string()),
             &json!([{"type": "function", "name": "ask_wiki"}]),
             false,
         )
         .expect("resume payload");
 
         assert_eq!(resumed["tool_choice"], json!("auto"));
+        assert_eq!(
+            resumed["input"],
+            json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]}])
+        );
+    }
+
+    /// The payload the loop started from carries the history the request
+    /// continues (a stored turn's function call and the client's answer to
+    /// it); the resume payload keeps it in front of the calls this loop ran.
+    #[test]
+    fn resume_payload_keeps_the_loaded_history_in_front_of_the_loops_calls() {
+        let loaded_input = json!([
+            {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "What is 6*7?"}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_A", "name": "calc", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "42"}
+        ]);
+        let base = json!({
+            "model": "m",
+            "input": loaded_input,
+            "tools": [{"type": "function", "name": "search"}]
+        });
+        let executed = [
+            json!({"type": "function_call", "call_id": "call_B", "name": "search", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "call_B", "output": "found"}),
+        ];
+
+        let resumed = super::build_resume_payload(
+            &base,
+            &executed,
+            &json!([{"type": "function", "name": "search"}]),
+            false,
+        )
+        .expect("resume payload");
+
+        let kinds: Vec<(&str, &str)> = resumed["input"]
+            .as_array()
+            .expect("an item list")
+            .iter()
+            .map(|item| {
+                (
+                    item["type"].as_str().unwrap_or("?"),
+                    item["call_id"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("message", ""),
+                ("function_call", "call_A"),
+                ("function_call_output", "call_A"),
+                ("function_call", "call_B"),
+                ("function_call_output", "call_B"),
+            ]
+        );
+        assert_eq!(resumed["store"], json!(false));
     }
 }

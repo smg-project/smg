@@ -18,9 +18,8 @@ use tracing::{debug, error, trace};
 use super::{
     common::{
         apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, load_conversation_history,
-        prepare_chat_tools_and_choice, ExtractedToolCall, McpToolCallLimit, ResponsesCallContext,
-        ToolLoopState,
+        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, prepare_chat_tools_and_choice,
+        ExtractedToolCall, McpToolCallLimit, ResponsesCallContext, ToolLoopState,
     },
     conversions,
 };
@@ -33,8 +32,8 @@ use crate::{
         },
         error,
         grpc::common::responses::{
-            collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
-            NotStored, ResponsesContext,
+            collect_user_function_names, ensure_mcp_connection, load_history,
+            persist_response_if_needed, NotStored, ResponsesContext,
         },
     },
 };
@@ -54,7 +53,7 @@ pub(super) async fn route_responses_internal(
     // 1. Load conversation history (as the caller's tenant may see it) and
     //    build modified request
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
-    let modified_request = load_conversation_history(ctx, &request, tenant.as_deref()).await?;
+    let modified_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -153,7 +152,9 @@ pub(super) async fn execute_tool_loop(
     params: &ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
 ) -> Result<ResponsesResponse, Response> {
-    let mut state = ToolLoopState::new(original_request);
+    // The loop is rebuilt on the loaded request: a stored turn's tool calls
+    // and outputs stay in front of the calls this loop executes.
+    let mut state = ToolLoopState::new(&current_request);
 
     // Configuration: max iterations as safety limit
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);

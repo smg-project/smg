@@ -662,6 +662,16 @@ impl HarmonyBuilder {
                 let mut prev_outputs: Vec<&ResponseInputOutputItem> = Vec::new();
 
                 for item in items {
+                    // The gateway's own record of a hosted tool session (the
+                    // tools it listed, the approval it asked for): nothing
+                    // the model said or was told.
+                    if matches!(
+                        item,
+                        ResponseInputOutputItem::McpListTools { .. }
+                            | ResponseInputOutputItem::McpApprovalRequest { .. }
+                    ) {
+                        continue;
+                    }
                     let msg = self.parse_response_item_to_harmony_message(item, &prev_outputs)?;
                     all_messages.push(msg);
 
@@ -774,54 +784,21 @@ impl HarmonyBuilder {
                     Some(namespace) => format!("{namespace}.{name}"),
                     None => name.clone(),
                 };
-                // If there's an output, this represents the tool result
-                // Otherwise, it's the tool call itself
-                if let Some(output_str) = output {
-                    // Tool result - use Tool role with "functions.{name}" as author name
-                    // IMPORTANT: Must include recipient="assistant" for parser to recognize it.
-                    // We keep channel=None to minimize what the model might copy.
-                    let author_name = format!("functions.{name}");
-                    debug!(
-                        tool_name = %name,
-                        author_name = %author_name,
-                        output_preview = %output_str.chars().take(100).collect::<String>(),
-                        "Building tool result message with Tool role (recipient=assistant, no channel)"
-                    );
-                    Ok(HarmonyMessage {
-                        author: Author {
-                            role: Role::Tool,
-                            name: Some(author_name),
-                        },
-                        recipient: Some("assistant".to_string()),
-                        content: vec![Content::Text(TextContent {
-                            text: output_str.clone(),
-                        })],
-                        channel: None,
-                        content_type: None,
-                    })
-                } else {
-                    // Tool call - assistant message in commentary channel with recipient
-                    // msg.with_channel("commentary").with_recipient(f"functions.{name}")
-                    let recipient = format!("functions.{name}");
-                    debug!(
-                        tool_name = %name,
-                        recipient = %recipient,
-                        "Building tool call message with recipient"
-                    );
-                    Ok(HarmonyMessage {
-                        author: Author {
-                            role: Role::Assistant,
-                            name: None,
-                        },
-                        recipient: Some(recipient),
-                        content: vec![Content::Text(TextContent {
-                            text: arguments.clone(),
-                        })],
-                        channel: Some("commentary".to_string()),
-                        content_type: Some("json".to_string()),
-                    })
-                }
+                Ok(tool_call_message(name, arguments, output.as_deref()))
             }
+
+            // A hosted tool call of a stored turn replays the same way, under
+            // the name the model called it by.
+            ResponseInputOutputItem::McpCall {
+                name,
+                arguments,
+                output,
+                ..
+            } => Ok(tool_call_message(
+                name.clone(),
+                arguments,
+                output.as_deref(),
+            )),
 
             // Function call output (separate from call) - requires looking up the original call
             ResponseInputOutputItem::FunctionCallOutput {
@@ -906,15 +883,18 @@ impl HarmonyBuilder {
             }
 
             ResponseInputOutputItem::McpApprovalResponse { .. }
-            | ResponseInputOutputItem::McpApprovalRequest { .. }
             | ResponseInputOutputItem::ComputerCall { .. }
-            | ResponseInputOutputItem::ComputerCallOutput { .. }
-            | ResponseInputOutputItem::McpCall { .. }
-            | ResponseInputOutputItem::McpListTools { .. } => {
+            | ResponseInputOutputItem::ComputerCallOutput { .. } => {
                 warn!(
                     function = "parse_response_item_to_harmony_message",
                     "Approval item reached Harmony conversion"
                 );
+                Err("Unsupported input item type".to_string())
+            }
+            // Left out before this conversion (see the item loop of
+            // `construct_input_messages_with_harmony`).
+            ResponseInputOutputItem::McpListTools { .. }
+            | ResponseInputOutputItem::McpApprovalRequest { .. } => {
                 Err("Unsupported input item type".to_string())
             }
 
@@ -1220,6 +1200,58 @@ impl Default for HarmonyBuilder {
     }
 }
 
+/// The harmony message of a tool call the assistant issued, by the name the
+/// model called it by: its result once it ran (a Tool message under
+/// `functions.{name}`, addressed to the assistant), the call itself otherwise
+/// (a commentary message addressed to `functions.{name}`).
+fn tool_call_message(name: String, arguments: &str, output: Option<&str>) -> HarmonyMessage {
+    if let Some(output_str) = output {
+        // Tool result - use Tool role with "functions.{name}" as author name
+        // IMPORTANT: Must include recipient="assistant" for parser to recognize it.
+        // We keep channel=None to minimize what the model might copy.
+        let author_name = format!("functions.{name}");
+        debug!(
+            tool_name = %name,
+            author_name = %author_name,
+            output_preview = %output_str.chars().take(100).collect::<String>(),
+            "Building tool result message with Tool role (recipient=assistant, no channel)"
+        );
+        HarmonyMessage {
+            author: Author {
+                role: Role::Tool,
+                name: Some(author_name),
+            },
+            recipient: Some("assistant".to_string()),
+            content: vec![Content::Text(TextContent {
+                text: output_str.to_string(),
+            })],
+            channel: None,
+            content_type: None,
+        }
+    } else {
+        // Tool call - assistant message in commentary channel with recipient
+        // msg.with_channel("commentary").with_recipient(f"functions.{name}")
+        let recipient = format!("functions.{name}");
+        debug!(
+            tool_name = %name,
+            recipient = %recipient,
+            "Building tool call message with recipient"
+        );
+        HarmonyMessage {
+            author: Author {
+                role: Role::Assistant,
+                name: None,
+            },
+            recipient: Some(recipient),
+            content: vec![Content::Text(TextContent {
+                text: arguments.to_string(),
+            })],
+            channel: Some("commentary".to_string()),
+            content_type: Some("json".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Regression coverage for the `image_generation` → function-tool
@@ -1294,6 +1326,37 @@ mod tests {
         assert_eq!(tool.author.name.as_deref(), Some("functions.weather"));
         assert_eq!(tool.recipient.as_deref(), Some("assistant"));
         assert!(matches!(&tool.content[..], [Content::Text(text)] if text.text == "sunny"));
+    }
+
+    /// A hosted tool call of a stored turn replays as its result under the
+    /// name the model called it by; the tools listing stored next to it is
+    /// left out.
+    #[test]
+    fn stored_hosted_tool_calls_replay_as_their_result() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "search it"},
+                {"type": "mcp_list_tools", "id": "mcpl_1", "server_label": "wiki", "tools": []},
+                {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                 "arguments": "{}", "output": "found", "status": "completed"}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("a stored hosted tool call converts");
+        let user = messages
+            .iter()
+            .position(|message| message.author.role == Role::User)
+            .expect("the user's message");
+        let tool = messages.last().unwrap();
+        assert!(user < messages.len() - 1);
+        assert_eq!(messages.len() - user, 2, "{messages:?}");
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.search"));
+        assert_eq!(tool.recipient.as_deref(), Some("assistant"));
+        assert!(matches!(&tool.content[..], [Content::Text(text)] if text.text == "found"));
     }
 
     #[test]

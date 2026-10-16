@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata, load_previous_messages,
+        build_next_request_with_tools, inject_mcp_metadata,
         strip_image_generation_from_request_tools, McpCallTracking,
     },
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools, ToolResult},
@@ -32,8 +32,9 @@ use crate::{
         error,
         grpc::{
             common::responses::{
-                collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
-                utils::resolve_function_identity, NotStored, ResponsesContext,
+                collect_user_function_names, ensure_mcp_connection, load_history,
+                persist_response_if_needed, utils::resolve_function_identity, NotStored,
+                ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
         },
@@ -59,13 +60,10 @@ pub(crate) async fn serve_harmony_responses(
     tenant_request_meta: TenantRequestMeta,
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
-    // Clone request for persistence
-    let original_request = request.clone();
-
-    // Load previous conversation history if previous_response_id is set, as
-    // the caller's tenant may see it
+    // Load the history the request continues, as the caller's tenant may see
+    // it; `request` itself stays as it came, for the persist.
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
-    let current_request = load_previous_messages(ctx, request, tenant.as_deref()).await?;
+    let current_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
 
     // Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -98,7 +96,7 @@ pub(crate) async fn serve_harmony_responses(
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
         &response,
-        &original_request,
+        &request,
         tenant.as_deref(),
         ctx.request_context.clone(),
     )

@@ -672,7 +672,9 @@ async fn execute_tool_loop_streaming_internal(
     tx: SseSender,
     mut startup: Option<StreamStartupSender>,
 ) -> Result<(), String> {
-    let mut state = ToolLoopState::new(original_request);
+    // The loop is rebuilt on the loaded request: a stored turn's tool calls
+    // and outputs stay in front of the calls this loop executes.
+    let mut state = ToolLoopState::new(&current_request);
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session

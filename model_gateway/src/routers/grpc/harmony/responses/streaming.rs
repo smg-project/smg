@@ -11,8 +11,7 @@ use uuid::Uuid;
 
 use super::{
     common::{
-        build_next_request_with_tools, load_previous_messages,
-        strip_image_generation_from_request_tools, McpCallTracking,
+        build_next_request_with_tools, strip_image_generation_from_request_tools, McpCallTracking,
     },
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools},
 };
@@ -26,8 +25,8 @@ use crate::{
         },
         grpc::{
             common::responses::{
-                await_stream_startup, ensure_mcp_connection, persist_response_if_needed,
-                stream_startup_channel,
+                await_stream_startup, ensure_mcp_connection, load_history,
+                persist_response_if_needed, stream_startup_channel,
                 streaming::{failure_reason, ResponseStreamEventEmitter, StreamStartupSender},
                 BackgroundStream, ResponsesContext,
             },
@@ -50,11 +49,11 @@ pub(crate) async fn serve_harmony_responses_stream(
     tenant_request_meta: TenantRequestMeta,
     background: Option<BackgroundStream>,
 ) -> Response {
-    // Load previous conversation history if previous_response_id is set, as
-    // the caller's tenant may see it
+    // Load the history the request continues, as the caller's tenant may see
+    // it; `request` itself stays as it came, for the persist.
     let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
     let current_request =
-        match load_previous_messages(ctx, request.clone(), tenant.as_deref()).await {
+        match load_history(ctx.history_stores(), &request, tenant.as_deref()).await {
             Ok(req) => req,
             Err(err_response) => return err_response,
         };

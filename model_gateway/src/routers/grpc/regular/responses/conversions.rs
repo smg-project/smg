@@ -152,12 +152,36 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
                             tool_call_id: call_id.clone(),
                         });
                     }
+                    // A hosted tool call of a stored turn replays as the
+                    // assistant's call and, once it ran, its result: the
+                    // model sees what it asked for and what it got, as it
+                    // does for a function call.
+                    ResponseInputOutputItem::McpCall {
+                        id,
+                        name,
+                        arguments,
+                        output,
+                        ..
+                    } => {
+                        push_chat_message(
+                            &mut messages,
+                            assistant_tool_call(id, name, None, arguments.clone()),
+                        );
+                        if let Some(output_text) = output {
+                            messages.push(ChatMessage::Tool {
+                                content: MessageContent::Text(output_text.clone()),
+                                tool_call_id: id.clone(),
+                            });
+                        }
+                    }
+                    // The gateway's own record of a hosted tool session (the
+                    // tools it listed, the approval it asked for): nothing
+                    // the model said or was told.
+                    ResponseInputOutputItem::McpListTools { .. }
+                    | ResponseInputOutputItem::McpApprovalRequest { .. } => {}
                     ResponseInputOutputItem::McpApprovalResponse { .. }
-                    | ResponseInputOutputItem::McpApprovalRequest { .. }
                     | ResponseInputOutputItem::ComputerCall { .. }
-                    | ResponseInputOutputItem::ComputerCallOutput { .. }
-                    | ResponseInputOutputItem::McpCall { .. }
-                    | ResponseInputOutputItem::McpListTools { .. } => {
+                    | ResponseInputOutputItem::ComputerCallOutput { .. } => {
                         warn!(
                             function = "responses_to_chat",
                             "Approval item reached chat conversion"
@@ -273,9 +297,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
     // A tool result under a call id the previous assistant turn did not issue
     // is a malformed history under the contracts that say so (the public
     // API's words for it), answered as a bad request, not sent to the engine.
-    // Only that: a result with no call before it is left to the engine, as a
-    // loaded turn may have lost its calls on the way (the stored
-    // conversation's items, the tool loop's rebuilt input).
+    // Only that: a result with no call before it is left to the engine.
     if let Some(call_id) = ProviderProfile::for_model(&model).unanswerable_tool_result(&messages) {
         return Err(format!(
             "No tool call found for function call output with call_id '{call_id}'"
@@ -1005,6 +1027,52 @@ mod tests {
                 assert_eq!(tool_call_id, "call_tool_id");
             }
             other => panic!("expected tool message, got {other:?}"),
+        }
+    }
+
+    /// A hosted tool call of a stored turn replays as the call and its result;
+    /// the tools listing stored next to it says nothing to the model.
+    #[test]
+    fn stored_hosted_tool_calls_replay_as_a_call_and_its_result() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "search it"},
+                {"type": "mcp_list_tools", "id": "mcpl_1", "server_label": "wiki", "tools": []},
+                {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                 "arguments": "{\"q\":\"rust\"}", "output": "found", "status": "completed"},
+                {"type": "message", "id": "msg_a", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "Found it.", "annotations": []}]}
+            ]
+        }))
+        .unwrap();
+
+        let chat_req = responses_to_chat(&req).unwrap();
+
+        assert_eq!(chat_req.messages.len(), 4, "{:?}", chat_req.messages);
+        match &chat_req.messages[1] {
+            ChatMessage::Assistant {
+                tool_calls: Some(tool_calls),
+                ..
+            } => {
+                assert_eq!(tool_calls[0].id, "mcp_1");
+                assert_eq!(tool_calls[0].function.name, "search");
+                assert_eq!(
+                    tool_calls[0].function.arguments.as_deref(),
+                    Some("{\"q\":\"rust\"}")
+                );
+            }
+            other => panic!("expected the assistant's call, got {other:?}"),
+        }
+        match &chat_req.messages[2] {
+            ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "mcp_1");
+                assert!(matches!(content, MessageContent::Text(text) if text == "found"));
+            }
+            other => panic!("expected the call's result, got {other:?}"),
         }
     }
 
