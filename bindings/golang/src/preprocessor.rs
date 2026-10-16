@@ -18,6 +18,7 @@ use openai_protocol::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::process_chat_messages;
 
 use super::{
+    args::read_json_arg,
     error::{set_error_message, SglErrorCode},
     memory::{sgl_free_string, sgl_free_token_ids},
     tokenizer::TokenizerHandle,
@@ -235,14 +236,6 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
         return SglErrorCode::InvalidArgument;
     }
 
-    let request_str = match CStr::from_ptr(request_json).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            set_error_message(error_out, "Invalid UTF-8 in request_json");
-            return SglErrorCode::InvalidArgument;
-        }
-    };
-
     let tokenizer_path_str = match CStr::from_ptr(tokenizer_path).to_str() {
         Ok(s) => s,
         Err(_) => {
@@ -251,13 +244,11 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request(
         }
     };
 
-    let chat_request: ChatCompletionRequest = match serde_json::from_str(request_str) {
-        Ok(req) => req,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to parse request JSON: {e}"));
-            return SglErrorCode::ParsingError;
-        }
-    };
+    let chat_request: ChatCompletionRequest =
+        match read_json_arg(request_json, "request_json", error_out) {
+            Ok(request) => request,
+            Err(code) => return code,
+        };
 
     let tokenizer = match create_tokenizer_from_file(tokenizer_path_str) {
         Ok(t) => t,
@@ -344,21 +335,11 @@ pub unsafe extern "C" fn sgl_preprocess_chat_request_with_tokenizer(
         return SglErrorCode::InvalidArgument;
     }
 
-    let request_str = match CStr::from_ptr(request_json).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            set_error_message(error_out, "Invalid UTF-8 in request_json");
-            return SglErrorCode::InvalidArgument;
-        }
-    };
-
-    let chat_request: ChatCompletionRequest = match serde_json::from_str(request_str) {
-        Ok(req) => req,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to parse request JSON: {e}"));
-            return SglErrorCode::ParsingError;
-        }
-    };
+    let chat_request: ChatCompletionRequest =
+        match read_json_arg(request_json, "request_json", error_out) {
+            Ok(request) => request,
+            Err(code) => return code,
+        };
 
     let handle_ref = &*tokenizer_handle;
 
@@ -441,21 +422,11 @@ pub unsafe extern "C" fn sgl_chat_requires_reasoning_with_tokenizer(
         return SglErrorCode::InvalidArgument;
     }
 
-    let request_str = match CStr::from_ptr(request_json).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            set_error_message(error_out, "Invalid UTF-8 in request_json");
-            return SglErrorCode::InvalidArgument;
-        }
-    };
-
-    let chat_request: ChatCompletionRequest = match serde_json::from_str(request_str) {
-        Ok(req) => req,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to parse request JSON: {e}"));
-            return SglErrorCode::ParsingError;
-        }
-    };
+    let chat_request: ChatCompletionRequest =
+        match read_json_arg(request_json, "request_json", error_out) {
+            Ok(request) => request,
+            Err(code) => return code,
+        };
 
     let handle_ref = &*tokenizer_handle;
     *require_reasoning_out = i32::from(chat_requires_reasoning(

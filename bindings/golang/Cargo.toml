@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
+serde = { workspace = true }
 serde_json = { version = "1.0", default-features = false, features = [
     "std",
     "preserve_order",

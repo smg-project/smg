@@ -1,19 +1,14 @@
 //! Tool parser FFI functions
 
-use std::{
-    collections::HashMap,
-    ffi::{CStr, CString},
-    os::raw::c_char,
-    ptr,
-    sync::Arc,
-};
+use std::{collections::HashMap, ffi::CStr, os::raw::c_char, ptr, sync::Arc};
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 use tool_parser::ToolParser;
 
 use super::{
-    error::{clear_error_message, set_error_message, SglErrorCode},
+    args::write_json_result,
+    error::{set_error_message, SglErrorCode},
     runtime::{PARSER_FACTORY, RUNTIME},
     utils::generate_tool_call_id,
 };
@@ -152,25 +147,10 @@ pub unsafe extern "C" fn sgl_tool_parser_parse_complete(
                 "tool_calls": openai_tool_calls
             });
 
-            let result_str = match serde_json::to_string(&result_json) {
-                Ok(s) => s,
-                Err(e) => {
-                    set_error_message(error_out, &format!("Failed to serialize JSON: {e}"));
-                    return SglErrorCode::ParsingError;
-                }
-            };
-
-            let result_cstr = match CString::new(result_str) {
-                Ok(s) => s,
-                Err(e) => {
-                    set_error_message(error_out, &format!("Failed to create result string: {e}"));
-                    return SglErrorCode::MemoryError;
-                }
-            };
-
-            *result_json_out = result_cstr.into_raw();
-            clear_error_message(error_out);
-            SglErrorCode::Success
+            match write_json_result(&result_json, result_json_out, error_out) {
+                Ok(()) => SglErrorCode::Success,
+                Err(code) => code,
+            }
         }
         Err(e) => {
             set_error_message(error_out, &format!("Parse error: {e}"));
@@ -288,25 +268,10 @@ pub unsafe extern "C" fn sgl_tool_parser_parse_incremental(
                 "tool_calls": openai_tool_calls
             });
 
-            let result_str = match serde_json::to_string(&result_json) {
-                Ok(s) => s,
-                Err(e) => {
-                    set_error_message(error_out, &format!("Failed to serialize JSON: {e}"));
-                    return SglErrorCode::ParsingError;
-                }
-            };
-
-            let result_cstr = match CString::new(result_str) {
-                Ok(s) => s,
-                Err(e) => {
-                    set_error_message(error_out, &format!("Failed to create result string: {e}"));
-                    return SglErrorCode::MemoryError;
-                }
-            };
-
-            *result_json_out = result_cstr.into_raw();
-            clear_error_message(error_out);
-            SglErrorCode::Success
+            match write_json_result(&result_json, result_json_out, error_out) {
+                Ok(()) => SglErrorCode::Success,
+                Err(code) => code,
+            }
         }
         Err(e) => {
             set_error_message(error_out, &format!("Parse incremental error: {e}"));

@@ -75,6 +75,7 @@ pub use tool_parser::{
 };
 
 // Sub-modules
+mod args;
 mod chat_stream;
 mod client;
 mod error;
