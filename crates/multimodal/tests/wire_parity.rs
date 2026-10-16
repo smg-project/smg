@@ -46,12 +46,38 @@ fn fixture_images() -> Vec<(String, DynamicImage)> {
         .collect()
 }
 
+/// Images above this many pixels are left to the full-corpus run: at the
+/// debug build's optimization level the scalar loops over a twelve-megapixel
+/// image take tens of seconds and hold three wires of it at once.
+const DEFAULT_RUN_MAX_PIXELS: u64 = 2_000_000;
+
+fn pixels(image: &DynamicImage) -> u64 {
+    u64::from(image.width()) * u64::from(image.height())
+}
+
+/// The images of the default run: the fixtures up to [`DEFAULT_RUN_MAX_PIXELS`].
 #[test]
+fn the_one_pass_wire_of_every_small_fixture_image_equals_the_two_pass_bytes() {
+    let images: Vec<_> = fixture_images()
+        .into_iter()
+        .filter(|(_, image)| pixels(image) <= DEFAULT_RUN_MAX_PIXELS)
+        .collect();
+    compare_the_one_pass_wire_with_the_two_pass_bytes(&images);
+}
+
+/// The whole corpus, the large images included: minutes and hundreds of
+/// megabytes at the debug build's optimization level, so by request only.
+#[test]
+#[ignore = "the whole corpus incl. the large images: minutes and hundreds of megabytes in a debug build"]
+fn the_one_pass_wire_of_every_fixture_image_equals_the_two_pass_bytes() {
+    compare_the_one_pass_wire_with_the_two_pass_bytes(&fixture_images());
+}
+
 #[expect(
     clippy::print_stdout,
     reason = "the wires' digests, for a comparison across builds"
 )]
-fn the_one_pass_wire_of_every_fixture_image_equals_the_two_pass_bytes() {
+fn compare_the_one_pass_wire_with_the_two_pass_bytes(images: &[(String, DynamicImage)]) {
     let config = PreProcessorConfig::from_json(
         r#"{"do_resize": true, "size": {"shortest_edge": 3136, "longest_edge": 12845056}}"#,
     )
@@ -60,7 +86,6 @@ fn the_one_pass_wire_of_every_fixture_image_equals_the_two_pass_bytes() {
         ("qwen3_vl", Box::new(Qwen3VLProcessor::new())),
         ("qwen2_vl", Box::new(Qwen2VLProcessor::new())),
     ];
-    let images = fixture_images();
     assert!(
         images.len() >= 10,
         "{} fixture images decoded",
@@ -68,7 +93,7 @@ fn the_one_pass_wire_of_every_fixture_image_equals_the_two_pass_bytes() {
     );
     let mut compared = 0usize;
     for (processor_name, processor) in &processors {
-        for (file, image) in &images {
+        for (file, image) in images {
             let batch = std::slice::from_ref(image);
             let two_pass = match processor.preprocess(batch, &config) {
                 Ok(two_pass) => two_pass,

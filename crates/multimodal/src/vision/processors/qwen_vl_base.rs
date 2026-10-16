@@ -1386,9 +1386,11 @@ impl QwenVLProcessorBase {
 
     /// [`patchify_image_rgb_into`](Self::patchify_image_rgb_into) writing
     /// `writer`'s words instead of the bytes: the same blocks, the same
-    /// order, each source row split into its channel runs once and each run
-    /// converted straight into its place in the patch layout (and its
-    /// temporal copies).
+    /// order. A sub-patch's source rows are split once into its three
+    /// channel planes (the vector loads of the byte layout), each plane is
+    /// converted in one run into its first temporal copy, and the other
+    /// copies repeat the converted words; nothing is converted per row or
+    /// per temporal copy.
     fn patchify_image_rgb_wire_into(
         &self,
         image: &DynamicImage,
