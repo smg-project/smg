@@ -13,10 +13,7 @@ mod service;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
     StructuredOutputBackend, StructuredOutputsBackendConfig, StructuredOutputsSupport,
@@ -27,7 +24,7 @@ use tonic::service::Routes;
 use tracing::info;
 
 use crate::{
-    engine_link::EngineLink,
+    engine_link::{EngineLink, TokenizerSlot},
     kv_events::KvEventRelay,
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
@@ -166,7 +163,7 @@ pub(super) struct State {
     pub(super) shared: Shared,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused).
-    pub(super) tokenizer: OnceLock<Option<Arc<dyn Tokenizer>>>,
+    pub(super) tokenizer: TokenizerSlot,
 }
 
 impl WireState for State {
@@ -234,7 +231,7 @@ impl TokenSpeedServicerServer {
         let state = Arc::new(State {
             model: config.model,
             shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
-            tokenizer: OnceLock::new(),
+            tokenizer: TokenizerSlot::new(),
         });
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));

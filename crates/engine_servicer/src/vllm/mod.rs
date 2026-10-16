@@ -31,10 +31,7 @@ mod service;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use engine::connect_engine;
 use llm_tokenizer::traits::Tokenizer;
@@ -49,7 +46,7 @@ use tonic::service::Routes;
 use tracing::info;
 
 use crate::{
-    engine_link::EngineLink,
+    engine_link::{EngineLink, TokenizerSlot},
     kv_events::KvEventRelay,
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
@@ -231,7 +228,7 @@ pub(super) struct State {
     pub(super) loads: crate::load_tracker::LoadTracker,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused, EOS still comes from config).
-    pub(super) tokenizer: OnceLock<Option<Arc<dyn Tokenizer>>>,
+    pub(super) tokenizer: TokenizerSlot,
     /// The media processor behind its in-flight cap; `None` refuses
     /// `media_refs`.
     pub(super) media: Option<MediaGate>,
@@ -308,7 +305,7 @@ impl VllmServicerServer {
             model: config.model,
             shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
             loads: crate::load_tracker::LoadTracker::default(),
-            tokenizer: OnceLock::new(),
+            tokenizer: TokenizerSlot::new(),
             media: config.media_processor.map(MediaGate::new),
         });
         if let Some(tokenizer) = tokenizer {
