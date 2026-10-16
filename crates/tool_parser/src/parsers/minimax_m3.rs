@@ -55,6 +55,11 @@ const NODES: usize = 1024;
 /// thousand times. The budget is each invoke's own, as [`NODES`] is, and is spent in the schema's
 /// order.
 const LEAF_BYTES: usize = 256 * 1024;
+/// How many bytes the walks behind one invoke's number leaves may size, the refused walks counted
+/// too. A walk stops at what the leaves may still spell, but a leaf that is refused spends none of
+/// that, so a thousand distinct leaves at a definition just past the budget would each walk it to
+/// the end; past this allowance a number leaf with pointers is free text without a walk.
+const WALK_BYTES: usize = 4 * LEAF_BYTES;
 /// What an enum's word costs beyond its length: the alternative that spells it.
 const WORD_FRAMING: usize = 36;
 
@@ -714,6 +719,8 @@ struct Elements<'a> {
     reserved: usize,
     /// The bytes the invoke's leaves may still spell.
     leaf_bytes: usize,
+    /// The bytes the walks behind its number leaves may still size, refused walks counted too.
+    walk_bytes: usize,
     /// The serialized size of each root definition a fragment reached, by the entry's address,
     /// worked out once per invoke.
     entry_bytes: HashMap<usize, usize>,
@@ -756,6 +763,7 @@ impl<'a> Elements<'a> {
             nodes: NODES,
             reserved: 0,
             leaf_bytes: LEAF_BYTES,
+            walk_bytes: WALK_BYTES,
             entry_bytes: HashMap::new(),
             reached_by_leaf: HashMap::new(),
             enum_bytes: HashMap::new(),
@@ -1065,7 +1073,8 @@ impl<'a> Elements<'a> {
     /// entry, and its entry), when that fits what the leaves may still spell; `None` as soon as
     /// the running count passes it, so a leaf the budget refuses costs the walk up to the budget
     /// and no more. Worked out once per leaf schema per invoke: a leaf refused once is refused
-    /// again, the budget only shrinking.
+    /// again, the budget only shrinking. The walks, refused ones too, spend [`WALK_BYTES`] at the
+    /// pace of the bytes they size; past it a leaf is refused without a walk.
     fn reached_within(&mut self, schema: &'a Value) -> Option<(usize, Vec<Reached<'a>>)> {
         let key = std::ptr::from_ref(schema) as usize;
         if let Some(known) = self.reached_by_leaf.get(&key) {
@@ -1074,14 +1083,21 @@ impl<'a> Elements<'a> {
                 _ => None,
             };
         }
-        let found = self.walk_reached(schema);
+        let limit = self.leaf_bytes.min(self.walk_bytes);
+        let found = self.walk_reached(schema, limit);
+        self.walk_bytes = self
+            .walk_bytes
+            .saturating_sub(found.as_ref().map_or(limit, |(cost, _)| *cost));
         self.reached_by_leaf.insert(key, found.clone());
         found
     }
 
-    /// The walk behind [`Self::reached_within`], within what the leaves may still spell.
-    fn walk_reached(&mut self, schema: &'a Value) -> Option<(usize, Vec<Reached<'a>>)> {
-        let limit = self.leaf_bytes;
+    /// The walk behind [`Self::reached_within`], within `limit`.
+    fn walk_reached(
+        &mut self,
+        schema: &'a Value,
+        limit: usize,
+    ) -> Option<(usize, Vec<Reached<'a>>)> {
         let mut cost = json_bytes(schema);
         if cost > limit {
             return None;
