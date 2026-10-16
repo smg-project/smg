@@ -7,7 +7,10 @@
 //! [`adapt::chat::message`], and compares it with the reference: whole, character by character,
 //! on thirty seeded byte plans, and on the token-level chunk plans bellwether recorded with the
 //! case, each delta carrying its tokens' ids and pieces. Every replay also has to conserve the
-//! output's bytes across its events and agree with the whole one. An output of at most 256 bytes
+//! output's bytes across its events and agree with the whole one, and a streamed replay's content
+//! deltas have to carry the whole answer's content and nothing else: the template's spacing
+//! before a call, shown as content before the call arrived, is what a client of the stream would
+//! see and a client of the whole answer would not. An output of at most 256 bytes
 //! also replays at every two-way split; past that the set is linear in the output's length, so
 //! a case of any size replays forty-odd times.
 //!
@@ -1981,7 +1984,7 @@ fn parity(
     let mut shown = Shown::default();
     let (mut bitwise, mut separators_only, mut respelled, mut listed, mut allowed_count) =
         (0, 0, 0, 0, 0);
-    let (mut token_plans_run, mut without_pieces) = (0, 0);
+    let (mut token_plans_run, mut without_pieces, mut content_off_whole) = (0, 0, 0);
     for fixture in fixtures {
         let text = fixture.reference.text.as_str();
         let expected = Said::of_reference(&fixture.reference);
@@ -2006,13 +2009,26 @@ fn parity(
             &replay_text(&plans[0].1, "whole"),
             &mut failures,
         );
-        for (plan, cuts) in plans.iter().skip(1) {
-            if checked(fixture, plan, &replay_text(cuts, plan), &mut failures) != said {
+        // What a client of the stream receives as content is every content delta, one per
+        // content or malformed event; the whole answer's content is the message's, absent when
+        // it is only whitespace. A streamed replay whose deltas carry other content than the
+        // whole answer (the template's spacing before a call, shown before the call arrived)
+        // is counted once per case, with the first plan that showed it.
+        let whole_content = said.content.clone().unwrap_or_default();
+        let mut off_whole: Option<String> = None;
+        let mut streamed = |plan: &str, events: &[Event], failures: &mut Vec<String>| {
+            if checked(fixture, plan, events, failures) != said {
                 failures.push(format!(
                     "{}: the {plan} replay disagrees with the whole one",
                     fixture.id
                 ));
             }
+            if off_whole.is_none() && delivered_content(events) != whole_content {
+                off_whole = Some(plan.to_string());
+            }
+        };
+        for (plan, cuts) in plans.iter().skip(1) {
+            streamed(plan, &replay_text(cuts, plan), &mut failures);
         }
         // The token plans need the pieces bellwether records with the case: one per id, giving
         // back the text. A case that lacks them is counted, and one whose pieces are wrong is a
@@ -2056,13 +2072,15 @@ fn parity(
                     &finish,
                 )
                 .unwrap_or_else(|e| panic!("{}: {plan} replay: {e}", fixture.id));
-                if checked(fixture, &plan, &events, &mut failures) != said {
-                    failures.push(format!(
-                        "{}: the {plan} replay disagrees with the whole one",
-                        fixture.id
-                    ));
-                }
+                streamed(&plan, &events, &mut failures);
             }
+        }
+        if let Some(plan) = off_whole {
+            content_off_whole += 1;
+            failures.push(format!(
+                "{}: the {plan} replay's content deltas differ from the whole answer's content",
+                fixture.id
+            ));
         }
         let verdict = if said == expected {
             bitwise += 1;
@@ -2135,7 +2153,8 @@ fn parity(
     let totals = format!(
         "{} cases{sample}: {bitwise} bitwise, {separators_only} separators only, {respelled} \
          respelled, {listed} listed, {allowed_count} allowed for the corpus; {token_plans_run} \
-         token plans replayed, {without_pieces} cases without output_pieces\n",
+         token plans replayed, {without_pieces} cases without output_pieces, \
+         {content_off_whole} cases whose streamed content differs from the whole answer's\n",
         fixtures.len()
     );
     out.push_str(&totals);
@@ -2559,6 +2578,18 @@ fn checked(fixture: &Fixture, plan: &str, events: &[Event], failures: &mut Vec<S
         }
     }
     Said::of(events)
+}
+
+/// The content a client of the stream receives: the text of every content and malformed event in
+/// order, as the gateway writes one content delta per event.
+fn delivered_content(events: &[Event]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Content(text) | Event::Malformed { text, .. } => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Feed the output token by token as the plan `sizes` groups them, each delta carrying its tokens'

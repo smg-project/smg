@@ -287,7 +287,9 @@ pub(crate) struct Replay {
     pub(crate) state: usize,
     /// Whether the turn's first piece is still to come, for a table with a start row.
     pub(crate) at_turn_start: bool,
-    /// Whether the prompt wrote text other than whitespace in the stay the output continues.
+    /// Whether the prompt wrote text other than whitespace in the stay the output continues: a
+    /// prefill the output goes on with. The turn opener and the table's markers are the
+    /// template's framing, not the stay's text.
     pub(crate) begun: bool,
 }
 
@@ -751,6 +753,14 @@ impl Format {
         }
     }
 
+    /// The bytes a piece of the replay stands for.
+    fn piece_len(&self, piece: &Piece) -> usize {
+        match piece {
+            Piece::Text(text) => text.len(),
+            Piece::Marker(index) => self.terminal_text(*index).len(),
+        }
+    }
+
     /// The text of `prompt` the engine replays, and the state the replay starts in: after the
     /// last turn anchor, in the state it names; otherwise [`Self::replay`]'s part, from the first
     /// state.
@@ -827,10 +837,18 @@ impl Format {
     /// where this leaves it, and [`Self::reasoning_open`] reads the same walk.
     pub(crate) fn replayed(&self, prompt: &str) -> Replay {
         let (turn, start) = self.turn(prompt);
+        // The turn opener's own bytes, where the replay begins with them: the template's framing,
+        // not text of the stay.
+        let framing = self
+            .turn_opener()
+            .filter(|opener| self.anchors.is_empty() && turn.starts_with(opener))
+            .map_or(0, str::len);
         let mut scanner = Scanner::new(self.terminal_texts());
         let (mut state, mut rest) = (start, start);
-        // Whether the prompt wrote text other than whitespace in the stay the output continues.
+        // Whether the prompt wrote text other than whitespace in the stay the output continues;
+        // a marker is the template's, whether or not a row reads it here.
         let mut begun = false;
+        let mut at = 0;
         // An anchor that names its own state leaves no start to choose.
         let mut at_turn_start = self.start.is_some() && start == 0;
         let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
@@ -844,18 +862,20 @@ impl Format {
                     (state, rest) = (opened, opened);
                 }
             }
-            let text = match piece {
-                Piece::Marker(index) if self.ignored(index) => continue,
-                Piece::Marker(index) => match self.next(state, index) {
-                    Some(to) => {
+            let from = at;
+            at += self.piece_len(&piece);
+            match piece {
+                Piece::Marker(index) if self.ignored(index) => {}
+                Piece::Marker(index) => {
+                    if let Some(to) = self.next(state, index) {
                         (state, begun) = (to, false);
-                        continue;
                     }
-                    None => self.terminal_text(index).to_string(),
-                },
-                Piece::Text(text) => text,
-            };
-            begun |= !text.chars().all(is_strip_space);
+                }
+                Piece::Text(text) => {
+                    let written = &text[framing.saturating_sub(from).min(text.len())..];
+                    begun |= !written.chars().all(is_strip_space);
+                }
+            }
         }
         if self.emits(state) == Emits::Arguments {
             (state, begun) = (rest, false);

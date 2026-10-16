@@ -7,7 +7,10 @@
 //! Every byte of the output lands in exactly one event: a terminal that moves the engine as
 //! `Dropped { Wrapper }`, the whitespace between a call and the terminal that closes it as
 //! `Dropped { Wrapper }` too, any other text there as `Malformed`, run by run so that where the
-//! chunks were cut changes nothing, and the rest as content, reasoning, or the call's events.
+//! chunks were cut changes nothing, the whitespace a content stay begins with as
+//! `Dropped { Whitespace }` when no text follows it in the stay (the template's spacing after a
+//! thought's close, between two calls, or after a thought nothing follows, held until what
+//! follows says whose it is), and the rest as content, reasoning, or the call's events.
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
@@ -57,7 +60,7 @@ pub struct Engine {
     stage: Stage,
     /// Whether the turn's first piece is still to come, for a table with a start row.
     at_turn_start: bool,
-    /// The stay in the current state, as far as a trimmed state needs it.
+    /// The stay in the current state, as far as a trimmed state or a held lead needs it.
     stay: Stay,
     /// A shaped call whose terminal arrived and whose header is still being read.
     pending: Option<Pending>,
@@ -97,15 +100,18 @@ struct Pending {
     call: shape::Assembler,
 }
 
-/// The stay in a state, from the row that entered it to the row that leaves it, as trimming reads
-/// it: whether text other than whitespace has arrived, and the run held after the last of it.
+/// The stay in a state, from the row that entered it to the row that leaves it, as trimming and
+/// the held lead read it: whether text other than whitespace has arrived, and the run held. A
+/// trimmed stay holds the run after its last text that is not whitespace; a content stay holds
+/// the run before its first ([`Engine::lead`]).
 #[derive(Debug, Default)]
 struct Stay {
     begun: bool,
     held: Vec<Held>,
 }
 
-/// Bytes a trimmed stay holds after its last text that is not whitespace, in the output's order.
+/// Bytes a stay holds, in the output's order: a trimmed stay's run after its last text that is not
+/// whitespace, or a content stay's lead before its first.
 #[derive(Debug)]
 enum Held {
     /// Whitespace: the state's text if more text follows in the stay, dropped if the stay ends.
@@ -556,6 +562,7 @@ impl Engine {
             Emits::Content | Emits::Reasoning if self.format.is_trimmed(self.state) => {
                 self.trimmed(text, out);
             }
+            Emits::Content if !self.stay.begun => self.lead(text, out),
             Emits::Content | Emits::Reasoning => self.show(text, out),
             Emits::Arguments => {
                 let Some(call) = &mut self.call else {
@@ -606,27 +613,57 @@ impl Engine {
         }
         let body = rest.trim_end_matches(is_strip_space);
         if !body.is_empty() {
-            for held in std::mem::take(&mut self.stay.held) {
-                match held {
-                    Held::Space(space) => self.show(&space, out),
-                    Held::Ignored(terminal) => out.push(Event::Dropped {
-                        text: self.tokens.text(&terminal),
-                        why: DropReason::Wrapper,
-                    }),
-                }
-            }
+            self.release_stay(out);
             self.show(body, out);
         }
-        let tail = &rest[body.len()..];
-        if !tail.is_empty() {
-            match self.stay.held.last_mut() {
-                Some(Held::Space(space)) => space.push_str(tail),
-                _ => self.stay.held.push(Held::Space(tail.to_string())),
+        self.hold(&rest[body.len()..]);
+    }
+
+    /// Text at the start of a content stay, before the stay's first character that is not
+    /// whitespace: the whitespace is held, since what follows says whose it is. Text makes it
+    /// the text's, released as content before it; the stay ending without text makes it the
+    /// template's spacing (between a thought's close and the first call, between two calls,
+    /// after a thought nothing follows), dropped. The whole answer's message shows no content
+    /// for whitespace alone, and a stream that showed it as it arrived carried what the whole
+    /// answer does not.
+    fn lead(&mut self, text: &str, out: &mut Events) {
+        let body = text.trim_start_matches(is_strip_space);
+        self.hold(&text[..text.len() - body.len()]);
+        if body.is_empty() {
+            return;
+        }
+        self.stay.begun = true;
+        self.release_stay(out);
+        self.show(body, out);
+    }
+
+    /// Holds `space`, a run of whitespace, after what the stay holds.
+    fn hold(&mut self, space: &str) {
+        if space.is_empty() {
+            return;
+        }
+        match self.stay.held.last_mut() {
+            Some(Held::Space(held)) => held.push_str(space),
+            _ => self.stay.held.push(Held::Space(space.to_string())),
+        }
+    }
+
+    /// The run the stay held is the state's text: the whitespace is shown, and an ignored
+    /// terminal among it is dropped in its place.
+    fn release_stay(&mut self, out: &mut Events) {
+        for held in std::mem::take(&mut self.stay.held) {
+            match held {
+                Held::Space(space) => self.show(&space, out),
+                Held::Ignored(terminal) => out.push(Event::Dropped {
+                    text: self.tokens.text(&terminal),
+                    why: DropReason::Wrapper,
+                }),
             }
         }
     }
 
-    /// The stay ends: the run it held after its last text is the template's, and is dropped.
+    /// The stay ends: the run it held is the template's and is dropped, a trimmed stay's run
+    /// after its last text as much as a lead no text followed.
     fn end_stay(&mut self, out: &mut Events) {
         for held in std::mem::take(&mut self.stay.held) {
             let (text, why) = match held {
@@ -671,7 +708,8 @@ impl Engine {
     /// A terminal arrived: move where the table says, or keep it as text where the model put it.
     /// A terminal the table ignores is dropped where it stands, and moves nothing: inside a call
     /// whose assembler holds bytes it is placed where it arrived once the bytes around it leave
-    /// ([`Region`]), and in a trimmed stay's held run it keeps its place among them.
+    /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead) it
+    /// keeps its place among them.
     fn terminal(&mut self, index: usize, out: &mut Events) {
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
@@ -691,7 +729,7 @@ impl Engine {
                     return;
                 }
             }
-            // Inside a trimmed stay's held run, the terminal keeps its place among the bytes held.
+            // Inside a stay's held run, the terminal keeps its place among the bytes held.
             if !self.stay.held.is_empty() {
                 self.stay.held.push(Held::Ignored(text));
                 return;
@@ -723,12 +761,19 @@ impl Engine {
         out: &mut Events,
     ) {
         let terminal = self.format.terminal_text(index).to_string();
-        self.end_stay(out);
+        // A shown marker is text the client sees: a lead held before it is the text's. Any other
+        // row ends the stay without text after the held run, which is the template's.
+        if self.format.shown(index) && !self.format.is_trimmed(self.state) {
+            self.release_stay(out);
+        } else {
+            self.end_stay(out);
+        }
         let taken =
             self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
+        let shown = !taken && self.format.shown(index);
         if !taken {
             let text = self.tokens.text(&terminal);
-            if self.format.shown(index) {
+            if shown {
                 // A marker of a channel the request does not separate: the client sees it.
                 out.push_content(text);
             } else {
@@ -739,6 +784,11 @@ impl Engine {
             }
         }
         self.enter_with(next, call, out);
+        // The stay a shown marker begins has its text already: whitespace after it is content as
+        // it would be after any other text.
+        if shown && !self.format.is_trimmed(next) {
+            self.stay.begun = true;
+        }
     }
 
     /// Moves into state `next`, with the reasoning events and the call that come with the move.
@@ -1053,6 +1103,7 @@ mod tests {
     use super::*;
     use crate::{
         formats::{glm, inkling, qwen3, xlam},
+        input::TokenSpan,
         tagged::{Placement, Spelling},
     };
 
@@ -1795,6 +1846,249 @@ mod tests {
             );
             assert_eq!(bytes(&events), output);
         }
+    }
+
+    #[test]
+    fn a_content_stays_lead_is_content_before_text_and_the_templates_spacing_otherwise() {
+        let format = qwen3(CallSyntax::Json);
+        let call = |city: &str| {
+            format!(
+                "<tool_call>\n{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"{city}\"}}}}\n\
+                 </tool_call>"
+            )
+        };
+        // The spacing between the thought's close and the first call, and between two calls,
+        // is the template's: dropped as whitespace, the same whole and at every cut.
+        let output = format!(
+            "<think>\nplan\n</think>\n\n{}\n{}",
+            call("Paris"),
+            call("Rome")
+        );
+        let [content, reasoning, ..] = same_at_every_cut(&format, "", &output);
+        assert_eq!([content.as_str(), reasoning.as_str()], ["", "\nplan\n"]);
+        assert_eq!(
+            trimmed_space(&run(format.clone(), &output, EngineFinish::Stop)),
+            "\n\n\n"
+        );
+        // Before text it is the text's, content with it; after text, whitespace is content as
+        // it arrives, the newline before the call included.
+        let output = format!(
+            "<think>\nplan\n</think>\n\nSure.\n{}\n Done.",
+            call("Paris")
+        );
+        let [content, ..] = same_at_every_cut(&format, "", &output);
+        assert_eq!(content, "\n\nSure.\n\n Done.");
+        assert_eq!(
+            trimmed_space(&run(format.clone(), &output, EngineFinish::Stop)),
+            ""
+        );
+        // A stay no text ends, at the end of the output or at a row that opens no call, showed
+        // nothing: its whitespace is the template's.
+        let output = "<think>\nplan\n</think>\n\n";
+        let [content, ..] = same_at_every_cut(&format, "", output);
+        assert_eq!(content, "");
+        assert_eq!(
+            trimmed_space(&run(format.clone(), output, EngineFinish::Stop)),
+            "\n\n"
+        );
+        let output = "<think>\na\n</think>\n\n<think>\nb\n</think>\n";
+        let [content, reasoning, ..] = same_at_every_cut(&format, "", output);
+        assert_eq!([content.as_str(), reasoning.as_str()], ["", "\na\n\nb\n"]);
+        assert_eq!(
+            trimmed_space(&run(format.clone(), output, EngineFinish::Stop)),
+            "\n\n\n"
+        );
+        // The stay the prompt began: text in the prompt's tail makes the whitespace content.
+        let output = format!("\n{}", call("Paris"));
+        let [content, ..] = same_at_every_cut(&format, "<|im_start|>assistant\n", &output);
+        assert_eq!(content, "");
+        let [content, ..] = same_at_every_cut(&format, "<|im_start|>assistant\nSure,", &output);
+        assert_eq!(content, "\n");
+    }
+
+    #[test]
+    fn a_held_lead_leaves_no_content_delta_before_a_call_and_leaves_with_the_text_after_it() {
+        let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {}}\n</tool_call>";
+        // The content of each feed's events, the end's included, empty ones left out: the
+        // content deltas a client of the stream receives.
+        let deltas = |pieces: &[&str]| -> Vec<String> {
+            let mut engine = Engine::new(qwen3(CallSyntax::Json), declared());
+            let mut out = Events::new();
+            let mut deltas = Vec::new();
+            for piece in pieces {
+                engine
+                    .feed(
+                        Input::Delta {
+                            token_ids: &[],
+                            text: piece,
+                            spans: &[],
+                        },
+                        &mut out,
+                    )
+                    .expect("delta");
+                let [content, ..] = kinds(&out.drain());
+                deltas.push(content);
+            }
+            engine
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            let [content, ..] = kinds(&out.drain());
+            deltas.push(content);
+            deltas.retain(|delta| !delta.is_empty());
+            deltas
+        };
+        // Nothing before the first call, nothing between the calls.
+        assert_eq!(
+            deltas(&["<think>", "\nplan\n", "</think>", "\n", "\n", call, "\n", call]),
+            Vec::<String>::new()
+        );
+        // With text after the thought the spacing leaves with the text; after a call, the same.
+        assert_eq!(
+            deltas(&[
+                "<think>", "\nplan\n", "</think>", "\n\n", "Sure", ".\n", call, "\n", "Done."
+            ]),
+            ["\n\nSure", ".\n", "\nDone."]
+        );
+        // Nothing after a thought nothing follows: the whole answer has no content either.
+        assert_eq!(
+            deltas(&["<think>", "\nplan\n", "</think>", "\n\n"]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_shown_marker_is_text_the_lead_before_it_and_the_whitespace_after_it_belong_to() {
+        let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {}}\n</tool_call>";
+        let output = format!("<think>\nplan\n</think>\n\n{call}");
+        // The variant that does not separate reasoning shows the thought's markers as content:
+        // the spacing after `</think>` follows text the client sees, so it is content, and the
+        // content is the model's bytes up to the call.
+        let format = qwen3(CallSyntax::Json).without_reasoning();
+        let [content, reasoning, ..] = same_at_every_cut(&format, "", &output);
+        assert_eq!(
+            [content.as_str(), reasoning.as_str()],
+            ["<think>\nplan\n</think>\n\n", ""]
+        );
+        assert_eq!(trimmed_space(&run(format, &output, EngineFinish::Stop)), "");
+        // The variant that reads no calls shows a call's markers: the lead held before
+        // `<tool_call>` is released as content with it, and the content is every byte after the
+        // thought.
+        let format = qwen3(CallSyntax::Json).without_calls();
+        let [content, reasoning, ..] = same_at_every_cut(&format, "", &output);
+        assert_eq!(
+            [content.as_str(), reasoning.as_str()],
+            [format!("\n\n{call}").as_str(), "\nplan\n"]
+        );
+        assert_eq!(trimmed_space(&run(format, &output, EngineFinish::Stop)), "");
+    }
+
+    #[test]
+    fn an_ignored_terminal_in_a_held_lead_keeps_its_place_and_the_leads_tokens_are_counted() {
+        let format = || {
+            Format::new("led")
+                .terminal("open", "<a>")
+                .terminal("close", "</a>")
+                .ignores("separator", "|")
+                .state("content", Emits::Content)
+                .state("call", Emits::Arguments)
+                .transition("content", "open", "call")
+                .transition("call", "close", "content")
+                .calls(CallSyntax::Json)
+        };
+        let call = "<a>{\"name\": \"get_weather\", \"arguments\": {}}</a>";
+        for (output, content, dropped) in [
+            (format!("\n|\n{call}"), "", "|<a></a>"),
+            (format!("\n|\nHi{call}"), "\n\nHi", "|<a></a>"),
+        ] {
+            let events = run(format(), &output, EngineFinish::Stop);
+            let [shown, _, wrapping, _] = kinds(&events);
+            assert_eq!(
+                [shown.as_str(), wrapping.as_str()],
+                [content, dropped],
+                "{output:?}"
+            );
+            assert_eq!(bytes(&events), output, "{output:?}");
+        }
+        // Each token of the lead is counted in the event that carries its first byte: the
+        // whitespace events the lead leaves as, the separator's in its own.
+        let tokens = [
+            "\n",
+            "|",
+            "\n",
+            "<a>",
+            "{\"name\": \"get_weather\", ",
+            "\"arguments\": {}}",
+            "</a>",
+        ];
+        let text: String = tokens.concat();
+        let mut at = 0;
+        let spans: Vec<TokenSpan> = tokens
+            .iter()
+            .map(|token| {
+                let span = TokenSpan {
+                    token_id: 0,
+                    start: at,
+                    end: at + token.len(),
+                    continued: false,
+                };
+                at += token.len();
+                span
+            })
+            .collect();
+        let mut engine = Engine::new(format(), declared());
+        let mut out = Events::new();
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: &text,
+                    spans: &spans,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        let lead: Vec<(String, Option<u32>)> = events
+            .iter()
+            .take(3)
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some((text.text.clone(), text.tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lead,
+            [
+                ("\n".to_string(), Some(1)),
+                ("|".to_string(), Some(1)),
+                ("\n".to_string(), Some(1)),
+            ]
+        );
+        let counted: u32 = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) | Event::Reasoning(text) => text.tokens,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.tokens,
+                Event::ToolCallStart { source, .. }
+                | Event::ToolCallArguments { source, .. }
+                | Event::ToolCallEnd { source, .. } => source.tokens,
+                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+            })
+            .sum();
+        assert_eq!(counted, tokens.len() as u32, "{events:?}");
     }
 
     #[test]

@@ -195,7 +195,12 @@ mod tests {
                 )),
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                Event::Content(Text::uncounted("\n\n")),
+                // The template's two newlines before the block: held until the block's opener
+                // said they were its spacing, not content.
+                Event::Dropped {
+                    text: Text::uncounted("\n\n"),
+                    why: DropReason::Whitespace,
+                },
                 dropped("<｜DSML｜tool_calls>"),
             ]
         );
@@ -377,7 +382,110 @@ mod tests {
         let events = run("<think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
-        assert_eq!(content_of(&events), "\n\nThe weather is sunny.");
+        // The newline between `</think>` and the block is the template's spacing, dropped; the
+        // one after the block comes before text, so it is the text's.
+        assert_eq!(content_of(&events), "\nThe weather is sunny.");
+    }
+
+    /// The whitespace the engine dropped as the template's spacing, event by event.
+    fn spacing(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::Whitespace,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The content deltas a client of the stream receives when `pieces` arrive one by one after
+    /// `prompt`: the content of each feed's events, the end's included, empty ones left out.
+    fn content_deltas(prompt: &str, pieces: &[&str]) -> Vec<String> {
+        let mut parser = Engine::new(deepseek_v4(), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        let mut deltas = Vec::new();
+        for piece in pieces {
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: piece,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+            deltas.push(content_of(&out.drain()));
+        }
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        deltas.push(content_of(&out.drain()));
+        deltas.retain(|delta| !delta.is_empty());
+        deltas
+    }
+
+    #[test]
+    fn the_spacing_between_the_thought_and_the_block_is_not_content_whole_or_streamed() {
+        // The encoder's turn has nothing between `</think>` and the block but the template's two
+        // newlines: whole, byte by byte and in a tokenizer's pieces they are dropped as the
+        // spacing they are, and no feed's events carry content, so a client of the stream gets
+        // what the whole answer has: no content.
+        let prompt = "<｜Assistant｜><think>";
+        let whole = run(prompt, &[OUTPUT]);
+        assert_eq!(content_of(&whole), "");
+        assert_eq!(spacing(&whole), ["\n\n"]);
+        let per_char: Vec<&str> = OUTPUT
+            .char_indices()
+            .map(|(i, c)| &OUTPUT[i..i + c.len_utf8()])
+            .collect();
+        let (thought, block) = OUTPUT.split_once("</think>").expect("the thought's close");
+        let mut tokens = vec![thought, "</think>", "\n\n"];
+        tokens.extend(block["\n\n".len()..].split_inclusive('\n'));
+        assert_eq!(tokens.concat(), OUTPUT);
+        for pieces in [per_char, tokens] {
+            let events = run(prompt, &pieces);
+            assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
+            assert_eq!(content_of(&events), "", "{pieces:?}");
+            assert_eq!(spacing(&events), ["\n\n"], "{pieces:?}");
+            assert_eq!(
+                arguments_of(&events, 0),
+                r#"{"location": "Beijing", "unit": "celsius"}"#,
+                "{pieces:?}"
+            );
+            assert_eq!(
+                content_deltas(prompt, &pieces),
+                Vec::<String>::new(),
+                "{pieces:?}"
+            );
+        }
+        // Content before the block keeps its two newlines, whole and streamed: they follow text.
+        let (text, block) = ANSWER.split_once("\n\n").expect("the content's end");
+        let pieces = [text, "\n\n", block];
+        let events = run("<｜Assistant｜></think>", &pieces);
+        assert_eq!(content_of(&events), "Sure, adding them.\n\n");
+        assert_eq!(spacing(&events), Vec::<&str>::new());
+        assert_eq!(
+            content_deltas("<｜Assistant｜></think>", &pieces),
+            ["Sure, adding them.", "\n\n"]
+        );
     }
 
     #[test]
@@ -590,9 +698,11 @@ mod tests {
             let events = run(&prompt, &[turn.output]);
             assert_eq!(bytes(&events), turn.output, "{:?}", turn.output);
             assert_eq!(reasoning_of(&events), turn.reasoning, "{:?}", turn.output);
-            // The two newlines the template writes before a block are the model's content here,
-            // exactly two of them; the encoder's parser skips them (bellwether #17).
-            let content = if turn.calls.is_empty() {
+            // The two newlines the template writes before a block follow the content here,
+            // exactly two of them, where there is content; the encoder's parser skips them
+            // (bellwether #17). Where the thought's close is all that comes before them, they
+            // are the template's spacing, dropped, as the encoder's parser has it.
+            let content = if turn.calls.is_empty() || turn.content.is_empty() {
                 turn.content.to_string()
             } else {
                 format!("{}\n\n", turn.content)

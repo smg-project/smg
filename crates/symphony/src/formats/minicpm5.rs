@@ -192,8 +192,9 @@ mod tests {
         let events = run(PROMPT, &[OUTPUT]);
         assert_eq!(bytes(&events), OUTPUT);
         assert_eq!(reasoning(&events), "\nThe user wants two songs.\n");
-        // The newlines around the thought and the one before the calls are the model's.
-        assert_eq!(content(&events), "\n\nTwo songs, then.\n\n");
+        // The newlines around the thought and the one after the content are the model's; the
+        // one between the calls is the template's spacing, dropped.
+        assert_eq!(content(&events), "\n\nTwo songs, then.\n");
         assert_eq!(
             arguments_of(&events, 0),
             r#"{"artist": "Taylor Swift", "duration": 20}"#
@@ -266,9 +267,10 @@ mod tests {
         ];
         let events = run(PROMPT, &pieces);
         assert_eq!(bytes(&events), pieces.concat());
-        // An empty thought is the newline after `<think>` and the one before `</think>`.
+        // An empty thought is the newline after `<think>` and the one before `</think>`; the two
+        // between the thought and the call are the template's spacing, not content.
         assert_eq!(reasoning(&events), "\n\n");
-        assert_eq!(content(&events), "\n\n");
+        assert_eq!(content(&events), "");
         assert_eq!(arguments_of(&events, 0), r#"{"artist": "Taylor Swift"}"#);
         // The string streams as its pieces arrive: three fragments and the closing quote.
         let fragments: Vec<&str> = events

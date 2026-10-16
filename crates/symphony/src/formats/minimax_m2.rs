@@ -201,9 +201,9 @@ mod tests {
             ]
         );
         assert_eq!(reasoning(&events), "The user asks about Paris.\n");
-        // The newlines between the thought and the block are content; the block's own are
-        // wrapping.
-        assert_eq!(content(&events), "\n\n\n");
+        // The newlines between the thought and the block are the template's spacing, dropped
+        // when the block's opener came; the block's own are wrapping.
+        assert_eq!(content(&events), "");
         assert_eq!(
             events[5..8],
             [

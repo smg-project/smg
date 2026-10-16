@@ -230,8 +230,9 @@ mod tests {
         let events = run(PROMPT, &[OUTPUT]);
         assert_eq!(bytes(&events), OUTPUT);
         assert_eq!(reasoning(&events), "\nThe user wants two songs.\n");
-        // The newlines around the thought and the ones between the blocks are the model's.
-        assert_eq!(content(&events), "\n\nTwo songs, then.\n\n");
+        // The newlines around the thought and after the content are the model's; the one
+        // between the blocks is the template's spacing, dropped.
+        assert_eq!(content(&events), "\n\nTwo songs, then.\n");
         assert_eq!(
             arguments_of(&events, 0),
             r#"{"artist": "Taylor Swift", "duration": 20}"#

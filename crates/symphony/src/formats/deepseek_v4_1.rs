@@ -138,7 +138,11 @@ mod tests {
                 Event::ReasoningStart,
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                Event::Content(Text::uncounted("\n\n")),
+                // The template's spacing before the block, held until the block's opener came.
+                Event::Dropped {
+                    text: Text::uncounted("\n\n"),
+                    why: DropReason::Whitespace,
+                },
                 dropped("<｜DSML｜ calls>"),
             ]
         );
@@ -292,8 +296,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The newline after `</think>` is content too.
-        assert_eq!(content, "\n\nThe weather is sunny.");
+        // The newline after `</think>` is the template's spacing before the block, dropped; the
+        // one after the block comes before text, so it is the text's.
+        assert_eq!(content, "\nThe weather is sunny.");
     }
 
     #[test]

@@ -152,7 +152,12 @@ mod tests {
                 Event::Reasoning(Text::uncounted("\nThe user asks.\n")),
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                Event::Content(Text::uncounted("\n\n")),
+                // The template's two newlines before the call: held until the call's opener
+                // said they were its spacing, not content.
+                Event::Dropped {
+                    text: Text::uncounted("\n\n"),
+                    why: DropReason::Whitespace,
+                },
                 dropped("<tool_call>"),
                 Event::ToolCallStart {
                     index: 0,
@@ -225,10 +230,228 @@ mod tests {
             })
         );
         assert!(
-            events.contains(&Event::Content(Text::uncounted("\n"))),
-            "the newline between the calls is content"
+            events.contains(&Event::Dropped {
+                text: Text::uncounted("\n"),
+                why: DropReason::Whitespace,
+            }),
+            "the newline between the calls is the template's spacing"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Content(_))),
+            "and no content: {events:?}"
         );
         assert_eq!(bytes(&events), output);
+    }
+
+    /// The content text of the events, in order.
+    fn content_of(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The whitespace the engine dropped as the template's spacing, event by event.
+    fn spacing(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::Whitespace,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The content deltas a client of the stream receives when `pieces` arrive one by one after
+    /// `prompt`: the content of each feed's events, the end's included, empty ones left out.
+    fn content_deltas(format: Format, prompt: &str, pieces: &[&str]) -> Vec<String> {
+        let mut parser = Engine::new(format, declared());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        let mut deltas = Vec::new();
+        for piece in pieces {
+            parser.feed(delta(piece), &mut out).expect("delta");
+            deltas.push(content_of(&out.drain()));
+        }
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        deltas.push(content_of(&out.drain()));
+        deltas.retain(|delta| !delta.is_empty());
+        deltas
+    }
+
+    /// `text` cut into the pieces a tokenizer makes of it: at every newline and every marker,
+    /// which the family writes as tokens of their own.
+    fn tokens_of(text: &str) -> Vec<&str> {
+        let mut pieces = Vec::new();
+        let mut rest = text;
+        while !rest.is_empty() {
+            let cut = ["\n", "<think>", "</think>", "<tool_call>", "</tool_call>"]
+                .iter()
+                .filter_map(|marker| rest.find(marker).map(|at| (at, marker.len())))
+                .min()
+                .map_or(rest.len(), |(at, len)| if at == 0 { len } else { at });
+            pieces.push(&rest[..cut]);
+            rest = &rest[cut..];
+        }
+        pieces
+    }
+
+    #[test]
+    fn the_spacing_after_the_thought_and_between_two_calls_is_not_content_whole_or_streamed() {
+        let second = CALL
+            .replace("get_weather", "get_time")
+            .replace("Paris", "CET");
+        let output = format!("<think>\nplan\n</think>\n\n{CALL}\n{second}");
+        let whole = run(&[&output], EngineFinish::Stop);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(content_of(&whole), "");
+        assert_eq!(spacing(&whole), ["\n\n", "\n"]);
+        assert!(matches!(
+            whole.last(),
+            Some(Event::Finish { tool_calls: 2, .. })
+        ));
+        // Byte by byte and token by token the events are the same, and no feed's events carry
+        // content: a client of the stream gets no content delta, as the whole answer has none.
+        let whole = joined(whole);
+        let per_char: Vec<&str> = output
+            .char_indices()
+            .map(|(i, c)| &output[i..i + c.len_utf8()])
+            .collect();
+        for pieces in [per_char, tokens_of(&output)] {
+            assert_eq!(
+                joined(run(&pieces, EngineFinish::Stop)),
+                whole,
+                "{pieces:?}"
+            );
+            assert_eq!(
+                content_deltas(qwen3(CallSyntax::Json), "", &pieces),
+                Vec::<String>::new(),
+                "{pieces:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tagged_syntax_streams_no_content_for_the_spacing_after_the_thought_or_between_calls() {
+        // Qwen 3.5's prompt opens the thought; the model closes it at once and writes two calls.
+        let prompt = "<|im_start|>assistant\n<think>\n";
+        let output = format!("\n</think>\n\n{TAGGED_CALL}\n{TAGGED_CALL}");
+        let whole = after_prompt(prompt, &output);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(content_of(&whole), "");
+        assert_eq!(spacing(&whole), ["\n\n", "\n"]);
+        assert_eq!(arguments_of(&whole, 1), r#"{"city": "Paris", "days": 3}"#);
+        let tagged = || qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine));
+        let per_char: Vec<&str> = output
+            .char_indices()
+            .map(|(i, c)| &output[i..i + c.len_utf8()])
+            .collect();
+        for pieces in [per_char, tokens_of(&output)] {
+            assert_eq!(
+                content_deltas(tagged(), prompt, &pieces),
+                Vec::<String>::new(),
+                "{pieces:?}"
+            );
+        }
+        // Text after the thought keeps the spacing around it as content, whole and streamed:
+        // the stream shows the spacing with the text it belongs to.
+        let output = format!("\n</think>\n\nSure.\n{TAGGED_CALL}");
+        let events = after_prompt(prompt, &output);
+        assert_eq!(content_of(&events), "\n\nSure.\n");
+        assert_eq!(spacing(&events), Vec::<&str>::new());
+        assert_eq!(
+            content_deltas(tagged(), prompt, &tokens_of(&output)),
+            ["\n\nSure.", "\n"]
+        );
+    }
+
+    #[test]
+    fn the_tokens_of_a_held_lead_are_counted_where_the_lead_leaves() {
+        // The spacing's own tokens are counted in the whitespace event that drops it, and the
+        // sum over the events is still the number of tokens.
+        let tokens = [
+            "<think>",
+            "\nplan",
+            "\n</think>",
+            "\n\n",
+            "<tool_call>",
+            "{\"name\": \"f\", ",
+            "\"arguments\": {}}",
+            "</tool_call>",
+            "\n",
+            "<tool_call>",
+            "{\"name\": \"f\", ",
+            "\"arguments\": {}}",
+            "</tool_call>",
+        ];
+        let text: String = tokens.concat();
+        let spans = spans_of(&tokens);
+        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: &text,
+                    spans: &spans,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        let whitespace: Vec<(String, Option<u32>)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::Whitespace,
+                } => Some((text.text.clone(), text.tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            whitespace,
+            [("\n\n".to_string(), Some(1)), ("\n".to_string(), Some(1))]
+        );
+        assert_eq!(
+            counted(&events)
+                .iter()
+                .map(|(_, n)| n.unwrap_or(0))
+                .sum::<u32>(),
+            tokens.len() as u32,
+            "every token exactly once"
+        );
     }
 
     #[test]
@@ -977,7 +1200,10 @@ mod tests {
                 Event::Reasoning(Text::uncounted("\n")),
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                Event::Content(Text::uncounted("\n\n")),
+                Event::Dropped {
+                    text: Text::uncounted("\n\n"),
+                    why: DropReason::Whitespace,
+                },
             ]
         );
         assert_eq!(bytes(&events), output);
