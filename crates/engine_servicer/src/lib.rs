@@ -29,6 +29,7 @@ mod load_tracker;
 mod proto_json;
 mod requests;
 mod server;
+mod servicer_config;
 pub mod sglang;
 mod stop_match;
 #[cfg(test)]
@@ -44,6 +45,7 @@ pub use error::ServicerError;
 use futures::Stream;
 pub use server::init_tracing;
 pub(crate) use server::{lock, record_error, ServerThread, SharedError, Shutdown};
+pub use servicer_config::ServicerConfig;
 pub use sglang::{SglangModelInfo, SglangServicerConfig, SglangServicerServer};
 pub use tokenspeed::{TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer};
 use tonic::Status;

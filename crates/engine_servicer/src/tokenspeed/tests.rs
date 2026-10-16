@@ -37,7 +37,11 @@ use tonic_health::pb::{
 };
 
 use super::*;
-use crate::{kv_events, testing::Bounded, ServicerError};
+use crate::{
+    kv_events,
+    testing::{servicer_config, Bounded},
+    ServicerError,
+};
 
 fn model_info() -> TokenSpeedModelInfo {
     TokenSpeedModelInfo {
@@ -69,14 +73,8 @@ fn config(
     model: TokenSpeedModelInfo,
 ) -> TokenSpeedServicerConfig {
     TokenSpeedServicerConfig {
-        bind_address: "127.0.0.1:0".to_string(),
-        ipc_base_url: format!("ipc://{}", dir.join("engine").display()),
-        handshake_address: handshake.to_string(),
-        engine_count: 1,
-        tokenizer_dir: None,
+        servicer: servicer_config(dir, handshake),
         model,
-        engine_startup_timeout: Duration::from_secs(10),
-        engine_startup_ceiling: None,
     }
 }
 
@@ -272,11 +270,9 @@ async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: silence,
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     // The scheduler dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
@@ -312,11 +308,9 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: silence,
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
@@ -347,12 +341,10 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
     let ceiling = Duration::from_millis(900);
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: silence,
-        engine_startup_ceiling: Some(ceiling),
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    config.servicer.engine_startup_ceiling = Some(ceiling);
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     let started = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
@@ -377,48 +369,34 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
 fn config_is_validated_before_binding() {
     let dir = tempfile::tempdir().unwrap();
     let good = config(dir.path(), "tcp://127.0.0.1:1", model_info());
+    let with = |edit: fn(&mut ServicerConfig)| {
+        let mut config = good.clone();
+        edit(&mut config.servicer);
+        config
+    };
     for (name, bad) in [
         (
             "bind",
-            TokenSpeedServicerConfig {
-                bind_address: "nope".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.bind_address = "nope".into()),
         ),
         (
             "ipc",
-            TokenSpeedServicerConfig {
-                ipc_base_url: "tcp://x".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.ipc_base_url = "tcp://x".into()),
         ),
         (
             "handshake",
-            TokenSpeedServicerConfig {
-                handshake_address: "udp://x".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.handshake_address = "udp://x".into()),
         ),
-        (
-            "engines",
-            TokenSpeedServicerConfig {
-                engine_count: 0,
-                ..good.clone()
-            },
-        ),
+        ("engines", with(|servicer| servicer.engine_count = 0)),
         (
             "timeout",
-            TokenSpeedServicerConfig {
-                engine_startup_timeout: Duration::ZERO,
-                ..good.clone()
-            },
+            with(|servicer| servicer.engine_startup_timeout = Duration::ZERO),
         ),
         (
             "ceiling",
-            TokenSpeedServicerConfig {
-                engine_startup_ceiling: Some(Duration::ZERO),
-                ..good.clone()
-            },
+            with(|servicer| {
+                servicer.engine_startup_ceiling = Some(Duration::ZERO);
+            }),
         ),
         (
             "model",
@@ -429,10 +407,7 @@ fn config_is_validated_before_binding() {
         ),
         (
             "startup timeout",
-            TokenSpeedServicerConfig {
-                engine_startup_timeout: Duration::ZERO,
-                ..good.clone()
-            },
+            with(|servicer| servicer.engine_startup_timeout = Duration::ZERO),
         ),
     ] {
         assert!(
@@ -1254,11 +1229,9 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
 async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: Duration::from_millis(300),
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = Duration::from_millis(300);
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {

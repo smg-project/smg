@@ -45,7 +45,11 @@ use tonic_health::pb::{
 use zip::{CompressionMethod, ZipArchive};
 
 use super::*;
-use crate::{kv_events, testing::Bounded, tokenizer_bundle, ServicerError};
+use crate::{
+    kv_events,
+    testing::{servicer_config, Bounded},
+    tokenizer_bundle, ServicerError,
+};
 
 fn model_info() -> VllmModelInfo {
     VllmModelInfo {
@@ -67,15 +71,9 @@ fn model_info() -> VllmModelInfo {
 
 fn config(dir: &std::path::Path, handshake: &str, model: VllmModelInfo) -> VllmServicerConfig {
     VllmServicerConfig {
-        bind_address: "127.0.0.1:0".to_string(),
-        ipc_base_url: format!("ipc://{}", dir.join("engine").display()),
-        handshake_address: handshake.to_string(),
-        engine_count: 1,
-        tokenizer_dir: None,
+        servicer: servicer_config(dir, handshake),
         model,
         media_processor: None,
-        engine_startup_timeout: Duration::from_secs(10),
-        engine_startup_ceiling: None,
     }
 }
 
@@ -275,26 +273,20 @@ fn complete(response: vllm::GenerateResponse) -> vllm::GenerateComplete {
 fn start_rejects_malformed_config() {
     let dir = tempfile::tempdir().unwrap();
     let good = config(dir.path(), "tcp://127.0.0.1:29999", model_info());
-    let bad_ipc = VllmServicerConfig {
-        ipc_base_url: "/tmp/not-ipc".to_string(),
-        ..good.clone()
+    let with = |edit: fn(&mut ServicerConfig)| {
+        let mut config = good.clone();
+        edit(&mut config.servicer);
+        config
     };
-    let bad_handshake = VllmServicerConfig {
-        handshake_address: "udp://127.0.0.1:1".to_string(),
-        ..good.clone()
-    };
-    let no_engines = VllmServicerConfig {
-        engine_count: 0,
-        ..good.clone()
-    };
-    let zero_timeout = VllmServicerConfig {
-        engine_startup_timeout: Duration::ZERO,
-        ..good.clone()
-    };
-    let zero_ceiling = VllmServicerConfig {
-        engine_startup_ceiling: Some(Duration::ZERO),
-        ..good.clone()
-    };
+    let bad_ipc = with(|servicer| servicer.ipc_base_url = "/tmp/not-ipc".to_string());
+    let bad_handshake = with(|servicer| {
+        servicer.handshake_address = "udp://127.0.0.1:1".to_string();
+    });
+    let no_engines = with(|servicer| servicer.engine_count = 0);
+    let zero_timeout = with(|servicer| servicer.engine_startup_timeout = Duration::ZERO);
+    let zero_ceiling = with(|servicer| {
+        servicer.engine_startup_ceiling = Some(Duration::ZERO);
+    });
     let no_model = VllmServicerConfig {
         model: VllmModelInfo::default(),
         ..good
@@ -1653,7 +1645,7 @@ async fn get_tokenizer_streams_a_bundle_the_router_loader_accepts() {
     fs::create_dir(&tokenizer_dir).unwrap();
     let files = write_tokenizer_dir(&tokenizer_dir);
     let mut config = config(dir.path(), &handshake_address(dir.path()), model_info());
-    config.tokenizer_dir = Some(tokenizer_dir.to_string_lossy().into_owned());
+    config.servicer.tokenizer_dir = Some(tokenizer_dir.to_string_lossy().into_owned());
     // The bundle comes off the configured directory; no engine is needed.
     let server = VllmServicerServer::start(config).expect("servicer starts");
     let mut client = VllmEngineClient::connect(format!("http://{}", server.address()))
@@ -1749,7 +1741,7 @@ async fn get_tokenizer_without_a_tokenizer_dir_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing");
     let mut config = config(dir.path(), &handshake_address(dir.path()), model_info());
-    config.tokenizer_dir = Some(missing.to_string_lossy().into_owned());
+    config.servicer.tokenizer_dir = Some(missing.to_string_lossy().into_owned());
     let server = VllmServicerServer::start(config).expect("servicer starts");
     let mut client = VllmEngineClient::connect(format!("http://{}", server.address()))
         .await
@@ -3084,11 +3076,9 @@ async fn a_caller_leaving_an_admitted_decode_leg_sends_no_notice() {
 async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
-    let server = VllmServicerServer::start(VllmServicerConfig {
-        engine_startup_timeout: Duration::from_millis(300),
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = Duration::from_millis(300);
+    let server = VllmServicerServer::start(config).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
@@ -3117,11 +3107,9 @@ async fn a_slow_engine_stays_linked_while_the_launcher_reports_it_alive() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
-    let server = VllmServicerServer::start(VllmServicerConfig {
-        engine_startup_timeout: silence,
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = VllmServicerServer::start(config).unwrap();
     // The engine dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
@@ -3157,11 +3145,9 @@ async fn an_engine_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
-    let server = VllmServicerServer::start(VllmServicerConfig {
-        engine_startup_timeout: silence,
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = VllmServicerServer::start(config).unwrap();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
@@ -3192,12 +3178,10 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
     let ceiling = Duration::from_millis(900);
-    let server = VllmServicerServer::start(VllmServicerConfig {
-        engine_startup_timeout: silence,
-        engine_startup_ceiling: Some(ceiling),
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    config.servicer.engine_startup_ceiling = Some(ceiling);
+    let server = VllmServicerServer::start(config).unwrap();
     let started = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()

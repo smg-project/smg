@@ -35,7 +35,10 @@ use tonic_health::pb::{
 };
 
 use super::*;
-use crate::{testing::Bounded, ServicerError};
+use crate::{
+    testing::{servicer_config, Bounded},
+    ServicerError,
+};
 
 fn model_info() -> SglangModelInfo {
     SglangModelInfo {
@@ -62,14 +65,8 @@ fn model_info() -> SglangModelInfo {
 
 fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> SglangServicerConfig {
     SglangServicerConfig {
-        bind_address: "127.0.0.1:0".to_string(),
-        ipc_base_url: format!("ipc://{}", dir.join("engine").display()),
-        handshake_address: handshake.to_string(),
-        engine_count: 1,
-        tokenizer_dir: None,
+        servicer: servicer_config(dir, handshake),
         model,
-        engine_startup_timeout: Duration::from_secs(10),
-        engine_startup_ceiling: None,
     }
 }
 
@@ -250,11 +247,9 @@ async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
-    let server = SglangServicerServer::start(SglangServicerConfig {
-        engine_startup_timeout: silence,
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = SglangServicerServer::start(config).unwrap();
     // The scheduler dials in at once, then "loads" for four silences.
     let loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
@@ -290,11 +285,9 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
-    let server = SglangServicerServer::start(SglangServicerConfig {
-        engine_startup_timeout: silence,
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = SglangServicerServer::start(config).unwrap();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
         .await
@@ -325,12 +318,10 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
     let handshake = handshake_address(dir.path());
     let silence = Duration::from_millis(300);
     let ceiling = Duration::from_millis(900);
-    let server = SglangServicerServer::start(SglangServicerConfig {
-        engine_startup_timeout: silence,
-        engine_startup_ceiling: Some(ceiling),
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    config.servicer.engine_startup_ceiling = Some(ceiling);
+    let server = SglangServicerServer::start(config).unwrap();
     let started = Instant::now();
     let _loading = hello(&handshake, EngineId::from_engine_index(0))
         .bounded()
@@ -354,34 +345,29 @@ async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive()
 #[test]
 fn config_is_validated_before_binding() {
     let dir = tempfile::tempdir().unwrap();
-    let bad_bind = SglangServicerConfig {
-        bind_address: "nope".to_string(),
-        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
+    let with = |edit: fn(&mut ServicerConfig)| {
+        let mut config = config(dir.path(), "tcp://127.0.0.1:1", model_info());
+        edit(&mut config.servicer);
+        config
     };
+    let bad_bind = with(|servicer| servicer.bind_address = "nope".to_string());
     assert!(matches!(
         SglangServicerServer::start(bad_bind),
         Err(ServicerError::InvalidConfig(_))
     ));
-    let no_engines = SglangServicerConfig {
-        engine_count: 0,
-        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
-    };
+    let no_engines = with(|servicer| servicer.engine_count = 0);
     assert!(matches!(
         SglangServicerServer::start(no_engines),
         Err(ServicerError::InvalidConfig(_))
     ));
-    let zero_timeout = SglangServicerConfig {
-        engine_startup_timeout: Duration::ZERO,
-        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
-    };
+    let zero_timeout = with(|servicer| servicer.engine_startup_timeout = Duration::ZERO);
     assert!(matches!(
         SglangServicerServer::start(zero_timeout),
         Err(ServicerError::InvalidConfig(_))
     ));
-    let zero_ceiling = SglangServicerConfig {
-        engine_startup_ceiling: Some(Duration::ZERO),
-        ..config(dir.path(), "tcp://127.0.0.1:1", model_info())
-    };
+    let zero_ceiling = with(|servicer| {
+        servicer.engine_startup_ceiling = Some(Duration::ZERO);
+    });
     assert!(matches!(
         SglangServicerServer::start(zero_ceiling),
         Err(ServicerError::InvalidConfig(_))
@@ -1567,7 +1553,7 @@ async fn unserved_rpcs_report_the_gap() {
 async fn startup_timeout_keeps_the_server_up_and_reports_the_error() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = config(dir.path(), &handshake_address(dir.path()), model_info());
-    config.engine_startup_timeout = Duration::from_millis(300);
+    config.servicer.engine_startup_timeout = Duration::from_millis(300);
     let server = SglangServicerServer::start(config).expect("servicer starts");
     wait_until(|| matches!(server.last_error(), Ok(Some(_)))).await;
     assert!(!server.engine_ready());

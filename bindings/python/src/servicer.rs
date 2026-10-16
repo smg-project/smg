@@ -22,7 +22,7 @@ use std::{
 use bytes::Bytes;
 use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
-    ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
+    ServicerConfig, ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
     TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
     VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_STARTUP_CEILING,
     DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
@@ -738,16 +738,19 @@ impl PyVllmGrpcServer {
             constrained_decoding_start,
             log_stats,
         };
-        let mut config = VllmServicerConfig {
+        let servicer = ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             tokenizer_dir,
-            model,
-            media_processor,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+        };
+        let mut config = VllmServicerConfig {
+            servicer,
+            model,
+            media_processor,
         };
         let inner = py.detach(|| -> PyResult<VllmServicerServer> {
             let Some(native) = native else {
@@ -755,7 +758,7 @@ impl PyVllmGrpcServer {
             };
             // The pipeline needs the tokenizer the servicer would load after
             // the engine connects; load it here and hand the same one over.
-            let dir = config.tokenizer_dir.clone().ok_or_else(|| {
+            let dir = config.servicer.tokenizer_dir.clone().ok_or_else(|| {
                 PyValueError::new_err("the smg media processor needs tokenizer_dir")
             })?;
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -968,16 +971,16 @@ impl PyTokenSpeedGrpcServer {
             kv_events_replay_endpoint,
             kv_events_topic,
         };
-        let config = TokenSpeedServicerConfig {
+        let servicer = ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             tokenizer_dir,
-            model,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
+        let config = TokenSpeedServicerConfig { servicer, model };
         let inner = py
             .detach(|| TokenSpeedServicerServer::start(config))
             .map_err(to_py_err)?;
@@ -1150,16 +1153,16 @@ impl PySglangGrpcServer {
             kv_events_replay_endpoint,
             kv_events_topic,
         };
-        let config = SglangServicerConfig {
+        let servicer = ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             tokenizer_dir,
-            model,
             engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
         };
+        let config = SglangServicerConfig { servicer, model };
         let inner = py
             .detach(|| SglangServicerServer::start(config))
             .map_err(to_py_err)?;
