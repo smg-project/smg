@@ -68,6 +68,10 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 
 `cache_aware` (default), `round_robin`, `power_of_two`, `consistent_hashing`, `prefix_hash`, `manual`, `random`, `bucket`
 
+### Output Parser
+
+`router.parser` selects which parser reads a chat completion's reasoning and tool calls: `symphony` (the default) or `legacy`, the per-model parsers. The chart passes it to the gateway as `--parser`; a request's `X-SMG-Parser` header (`legacy` or `symphony`) overrides it for that request, and the response's `x-smg-parser` header names the parser that read it. `router.reasoningParser` and `router.toolCallParser` set the parser names (`--reasoning-parser`, `--tool-call-parser`); under Symphony a table's name selects that table, a legacy parser's name keeps the legacy parsers for every model.
+
 ### Workers
 
 Each entry in `workers[]` creates a Deployment + Service:

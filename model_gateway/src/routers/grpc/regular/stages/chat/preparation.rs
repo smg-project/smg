@@ -380,7 +380,7 @@ pub(crate) async fn prepare_chat_like(
         // request building, which decides on the selected worker: one whose
         // engine takes the whole turn's grammar may serve what the table's
         // tags cannot (`regular::symphony::worker_constraint`).
-        let parser: ParserChoice = ctx.state.parser.unwrap_or_default();
+        let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
         let names = ctx.components.parser_resolver.names(&request.model);
         // The tag takes the start the model's workers name, when they agree; the selected
         // worker's own start decides the `auto` tag at request building.

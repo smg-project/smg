@@ -330,7 +330,7 @@ impl BuildStage for MessageRequestBuildingStage {
             .components
             .parser_resolver
             .names(&messages_request.model);
-        let parser = ctx.state.parser.unwrap_or_default();
+        let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
         let ConstraintForWorker {
             auto_tag,
             tool_constraints,

@@ -1,8 +1,9 @@
-//! Symphony reading a chat response or a message: the opt-in path that parses a model's output
+//! Symphony reading a chat response or a message: the default path that parses a model's output
 //! with one [`Engine`](::symphony::Engine) per choice in place of the tool and reasoning parser crates.
 //!
-//! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `legacy` by default),
-//! which a request's `X-SMG-Parser` header overrides for that one request ([`choice`]). With
+//! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `symphony` by default,
+//! `legacy` the way back to the older parsers), which a request's `X-SMG-Parser` header overrides
+//! for that one request ([`choice`]). With
 //! `symphony` on, one precedence decides what reads a model ([`reads`](names::reads)), among the parser names
 //! set for it (`ParserResolver::names`: the `tool_parser` and `reasoning_parser` of the model's
 //! card, its workers' labels, apart from the gateway's `--tool-call-parser` and
