@@ -570,6 +570,57 @@ mod tests {
         }
     }
 
+    /// A Messages body whose `thinking.display` is outside the documented
+    /// set is refused in place: `code` `invalid_value`, `param` the path
+    /// serde recorded, a message that names the field and lists the set.
+    /// One with a documented value goes through.
+    #[tokio::test]
+    async fn a_thinking_display_outside_its_set_is_refused_by_name() {
+        use crate::messages::{CreateMessageRequest, ThinkingConfig, ThinkingDisplay};
+
+        let extract = |display: &str| {
+            let body = json!({
+                "model": "m", "max_tokens": 64,
+                "thinking": {"type": "adaptive", "display": display},
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap_or_default();
+            ValidatedJson::<CreateMessageRequest>::from_request(request, &())
+        };
+        let Ok(ValidatedJson(accepted)) = extract("updates").await else {
+            panic!("`updates` is refused");
+        };
+        assert!(matches!(
+            accepted.thinking,
+            Some(ThinkingConfig::Adaptive {
+                display: Some(ThinkingDisplay::Updates)
+            })
+        ));
+        let Err(refused) = extract("full").await else {
+            panic!("`full` is accepted");
+        };
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(json["error"]["code"], "invalid_value", "{json}");
+        assert_eq!(json["error"]["param"], "thinking", "{json}");
+        let message = json["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(
+                "thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+            ),
+            "{message}"
+        );
+    }
+
     /// (status, type, code, param) of a rejection; `code` must be a string
     /// and `param` present (a string or null), as in the public API. A
     /// field of the wrong shape is reported in place, so the assertion that
@@ -793,6 +844,12 @@ mod tests {
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: include[0]: unknown variant `bogus.field`, expected one of `code_interpreter_call.outputs` at line 1 column 60",
                 "invalid_value",
             ),
+            // A custom error that opens with serde's words takes their code:
+            // a `thinking.display` outside its set is refused as a value.
+            (
+                "Invalid JSON data: Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
+                "invalid_value",
+            ),
             (
                 "Invalid JSON data: Failed to deserialize the JSON body into the target type: max_output_tokens: invalid value: integer `-1`, expected u32 at line 1 column 49",
                 "integer_below_min_value",
@@ -898,6 +955,12 @@ mod tests {
             (
                 "Failed to deserialize the JSON body into the target type: messages[0].content: data did not match any variant of untagged enum Content at line 1 column 60",
                 Some("messages[0].content"),
+            ),
+            // A field inside a tagged enum keeps the enum's path: the message
+            // names the field, the param is the path serde recorded.
+            (
+                "Failed to deserialize the JSON body into the target type: thinking: unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates` at line 1 column 71",
+                Some("thinking"),
             ),
             (
                 "Failed to deserialize the JSON body into the target type: invalid type: integer `5`, expected a string at line 1 column 10",

@@ -1070,14 +1070,67 @@ impl ThinkingConfig {
     }
 }
 
-/// How thinking content is returned in API responses
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// How thinking content is returned in API responses: the documented set,
+/// `summarized`, `omitted` and `updates` (the beta value that returns the
+/// model's progress notes between tool calls). The gateway keeps the
+/// preference on the request and returns the thinking blocks the engine
+/// produces whatever it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingDisplay {
     /// Thinking blocks contain summarized reasoning text
     Summarized,
     /// Thinking blocks return empty text; signature still carries encrypted content
     Omitted,
+    /// As `omitted`, with the model's progress notes between tool calls as
+    /// short thinking blocks (beta `thinking-display-updates-2026-08-18`)
+    Updates,
+}
+
+impl ThinkingDisplay {
+    /// The documented values by wire name, in the order a refusal lists them.
+    const VALUES: [(&'static str, Self); 3] = [
+        ("summarized", Self::Summarized),
+        ("omitted", Self::Omitted),
+        ("updates", Self::Updates),
+    ];
+
+    /// The set as a refusal lists it.
+    const EXPECTED: &'static str = "one of `summarized`, `omitted`, `updates`";
+}
+
+/// A `display` outside the documented set is refused with the field's name:
+/// serde's words for the derived enum would read `thinking: unknown
+/// variant`, the same as for a `thinking.type` outside its own set. The
+/// refusal still opens with serde's words, so the public `code` follows
+/// them (`invalid_value`, `invalid_type`).
+impl<'de> Deserialize<'de> for ThinkingDisplay {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DisplayVisitor;
+
+        impl serde::de::Visitor<'_> for DisplayVisitor {
+            type Value = ThinkingDisplay;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(ThinkingDisplay::EXPECTED)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                ThinkingDisplay::VALUES
+                    .iter()
+                    .find(|(name, _)| *name == value)
+                    .map(|(_, display)| *display)
+                    .ok_or_else(|| {
+                        E::custom(format!(
+                            "unknown variant `{value}` for `thinking.display`, expected {}",
+                            ThinkingDisplay::EXPECTED
+                        ))
+                    })
+            }
+        }
+
+        deserializer.deserialize_str(DisplayVisitor)
+    }
 }
 
 // ============================================================================
@@ -3023,6 +3076,113 @@ mod tests {
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert_eq!(json, r#"{"type":"enabled","budget_tokens":1024}"#);
+    }
+
+    /// `display` takes every documented value under `adaptive` and
+    /// `enabled` alike, and each comes back out as it went in.
+    #[test]
+    fn thinking_display_takes_every_documented_value() {
+        for (name, display) in ThinkingDisplay::VALUES {
+            for input in [
+                json!({"type": "adaptive", "display": name}),
+                json!({"type": "enabled", "budget_tokens": 1024, "display": name}),
+            ] {
+                let cfg: ThinkingConfig = serde_json::from_value(input.clone()).expect(name);
+                let parsed = match &cfg {
+                    ThinkingConfig::Adaptive { display }
+                    | ThinkingConfig::Enabled { display, .. } => *display,
+                    ThinkingConfig::Disabled => None,
+                };
+                assert_eq!(parsed, Some(display), "{input}");
+                assert_eq!(serde_json::to_value(&cfg).unwrap(), input);
+            }
+        }
+        assert_eq!(
+            ThinkingDisplay::EXPECTED,
+            format!(
+                "one of {}",
+                ThinkingDisplay::VALUES
+                    .iter()
+                    .map(|(name, _)| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        );
+    }
+
+    /// A `display` outside the set is refused with the field's name and the
+    /// set, a wrong type the same way; `null` is no display. The words open
+    /// with serde's own, so the public `code` follows them.
+    #[test]
+    fn thinking_display_outside_the_documented_set_is_refused_by_name() {
+        let refusal = |input: Value| -> String {
+            serde_json::from_value::<ThinkingConfig>(input.clone())
+                .expect_err(&input.to_string())
+                .to_string()
+        };
+        assert_eq!(
+            refusal(json!({"type": "adaptive", "display": "full"})),
+            "unknown variant `full` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        assert_eq!(
+            refusal(json!({"type": "enabled", "budget_tokens": 1024, "display": "Updates"})),
+            "unknown variant `Updates` for `thinking.display`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        assert_eq!(
+            refusal(json!({"type": "adaptive", "display": 1})),
+            "invalid type: integer `1`, expected one of `summarized`, `omitted`, `updates`"
+        );
+        let cfg: ThinkingConfig =
+            serde_json::from_value(json!({"type": "adaptive", "display": null})).unwrap();
+        assert!(matches!(cfg, ThinkingConfig::Adaptive { display: None }));
+    }
+
+    /// The first request of a coding agent: an adaptive thinking with
+    /// `display` `updates`, the effort under `output_config`, a context
+    /// management edit and a safeguards list (beta fields that ride in
+    /// `other`), a JSON string as `metadata.user_id`, a system-role entry in
+    /// `messages`, cache-controlled system blocks and custom tools. Nothing
+    /// in it is refused.
+    #[test]
+    fn a_coding_agents_first_request_deserializes_whole() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "List the files."}]},
+                {"role": "system", "content": [{"type": "text", "text": "Workspace notes."}]}
+            ],
+            "system": [
+                {"type": "text", "text": "You are a coding agent."},
+                {"type": "text", "text": "Tool rules.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "tools": [{
+                "name": "Bash",
+                "description": "Runs a command.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }
+            }],
+            "metadata": {"user_id": "{\"device_id\":\"d\",\"session_id\":\"s\"}"},
+            "max_tokens": 32000,
+            "thinking": {"type": "adaptive", "display": "updates"},
+            "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+            "safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"v": 1}}],
+            "output_config": {"effort": "high"},
+            "stream": true
+        }))
+        .expect("the request deserializes");
+        assert!(matches!(
+            request.thinking,
+            Some(ThinkingConfig::Adaptive {
+                display: Some(ThinkingDisplay::Updates)
+            })
+        ));
+        assert_eq!(request.reasoning_effort(), Some("high"));
+        assert!(request.other.contains_key("context_management"));
+        assert!(request.other.contains_key("safeguards"));
+        request.validate().expect("the request validates");
     }
 
     #[test]
