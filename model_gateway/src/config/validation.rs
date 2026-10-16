@@ -296,6 +296,7 @@ impl ConfigValidator {
         Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
+        Self::validate_kv_index(config)?;
         Self::validate_prefill_admission(config)?;
         Self::validate_priority_scheduler(config)?;
         if let Some(discovery) = &config.discovery {
@@ -1380,6 +1381,33 @@ impl ConfigValidator {
         Ok(ancestor)
     }
 
+    /// The deprecated `kv_index` field: the chain index is the only KV index,
+    /// so `chain` (in any case) is the one value accepted; `positional` names
+    /// the index that was removed and is refused with the reason, as is any
+    /// other value.
+    fn validate_kv_index(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(value) = config.kv_index.as_deref() else {
+            return Ok(());
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chain" => Ok(()),
+            "positional" => Err(ConfigError::InvalidValue {
+                field: "kv_index".to_string(),
+                value: value.to_string(),
+                reason: "the positional KV index was removed (kv-index 2.0.0): the chain index \
+                         is the only KV index, drop kv_index"
+                    .to_string(),
+            }),
+            _ => Err(ConfigError::InvalidValue {
+                field: "kv_index".to_string(),
+                value: value.to_string(),
+                reason: "the chain index is the only KV index, so kv_index takes chain only \
+                         (and is deprecated)"
+                    .to_string(),
+            }),
+        }
+    }
+
     fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
         config
             .rl
@@ -2133,6 +2161,39 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The deprecated `kv_index` field, as a config file or a binding sets
+    /// it: `chain` in any case is accepted, the removed `positional` index
+    /// is refused with the removal in the reason, any other value is refused.
+    #[test]
+    fn kv_index_takes_chain_only() {
+        for value in ["chain", "Chain", " CHAIN "] {
+            let config = RouterConfig {
+                kv_index: Some(value.to_string()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{value:?}");
+        }
+
+        let config = RouterConfig {
+            kv_index: Some("positional".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref reason, .. })
+                if field == "kv_index" && reason.contains("positional KV index was removed")
+        ));
+
+        let config = RouterConfig {
+            kv_index: Some("run".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "kv_index"
+        ));
     }
 
     /// A `RouterConfig` built directly, as a language binding or a library

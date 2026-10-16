@@ -5,10 +5,10 @@ use smg_mcp::McpConfig;
 
 use super::{
     CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind, MemoryConfig,
-    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
-    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
+    OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
+    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
+    TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -353,7 +353,9 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn kv_index(mut self, kind: KvIndexKind) -> Self {
+    /// Deprecated: the chain index is the only KV index; `chain` is accepted
+    /// and changes nothing, `positional` fails validation.
+    pub fn kv_index(mut self, kind: Option<String>) -> Self {
         self.config.kv_index = kind;
         self
     }

@@ -11,7 +11,7 @@ lifecycle operations a long-lived, multi-tenant index service needs
 as first-class API. Zero SMG dependencies; everything it sees is a
 hash.
 
-Built as the ground-up replacement for the gateway's
+Built as the ground-up replacement for the gateway's former
 `kv_index::PositionalIndexer` as a fleet-wide index core; the shared
 radix-index service (`smg-radix-index`, a separate crate) is built on
 it.

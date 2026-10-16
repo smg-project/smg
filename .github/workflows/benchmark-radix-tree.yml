@@ -65,7 +65,6 @@ jobs:
           cargo bench -p kv-index --bench throughput_bench -- \
             --num-sessions 200000 \
             --num-workers 256 \
-            --jump-size 8 \
             --sweep-min-ms 10 \
             --sweep-steps 20 2>&1 | tee throughput_output.txt
 
@@ -90,7 +89,6 @@ jobs:
               --trace-path "$GITHUB_WORKSPACE/traces/${trace}.jsonl" \
               --trace-duplication-factor 20 \
               --num-workers 256 \
-              --jump-size 8 \
               --sweep-min-ms 10 \
               --sweep-steps 20 2>&1 | tee -a mooncake_output.txt
             echo "" >> mooncake_output.txt

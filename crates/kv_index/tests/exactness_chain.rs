@@ -1,7 +1,7 @@
 //! Exactness harness: the run-compressed `ChainIndex` against the `ReferenceIndexer`.
 //!
-//! The same seeded corpus as `exactness_positional.rs` (stores, extensions, divergent siblings,
-//! tail and whole-chain removals, clears, worker removals) plus evictions that leave holes: a
+//! A seeded corpus (stores, extensions, divergent siblings, tail and whole-chain removals,
+//! clears, worker removals) plus evictions that leave holes: a
 //! block in the middle of a chain, or its first block, goes away while the worker keeps the blocks
 //! after it.
 //! An engine with prefix caching produces exactly that when it evicts by block, and it keeps

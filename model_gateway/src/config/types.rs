@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{collections::HashMap, path::PathBuf};
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
@@ -260,23 +256,23 @@ pub struct RouterConfig {
     /// between selection and dispatch is part of the same opt-in.
     #[serde(default)]
     pub worker_overload_shed: bool,
-    /// TTL in seconds for entries in the event-driven cache-aware positional
-    /// indexer: entries neither stored to nor read by a query within this
-    /// window are evicted by a periodic background prune. Bounds index growth
-    /// when a backend stops emitting removal events (crash, stream downgrade).
-    /// `None`/`0` disables the TTL pass (default, preserving unbounded growth).
+    /// Deprecated and ignored: the TTL prune of the positional indexer, which
+    /// the chain index replaced. The chain index holds what the engines report
+    /// and shrinks with their removals, so it has no prune. Still accepted so
+    /// that configurations written for the positional indexer load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_ttl_secs: Option<u64>,
-    /// Capacity ceiling per model for the positional indexer, enforced by the
-    /// same periodic prune: beyond it, oldest-touched entries are evicted down
-    /// to 90% of the ceiling. `None`/`0` disables the ceiling (default).
+    /// Deprecated and ignored: the capacity ceiling of the positional
+    /// indexer's prune; see `kv_indexer_ttl_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_indexer_max_entries: Option<usize>,
-    /// Which event-driven KV index cache-aware routing reads: the positional
-    /// indexer (default) or the chain index. The prune bounds above
-    /// apply to the positional indexer only.
-    #[serde(default)]
-    pub kv_index: KvIndexKind,
+    /// Deprecated: the chain index is the only KV index behind cache-aware
+    /// routing, so the one value accepted is `chain`, which changes nothing;
+    /// `positional` names the index that was removed and is refused by
+    /// validation. Still accepted so that configurations written for the
+    /// switch load; the field goes in a later release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_index: Option<String>,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
     /// load-aware routing policy is active. Successful routing-owned polls are
     /// always re-exported without an additional Engine RPC. A worker whose
@@ -958,55 +954,6 @@ impl Default for RoutingKeyOverrideConfig {
             max_idle_secs: default_manual_max_idle_secs(),
             assignment_mode: default_override_assignment_mode(),
             headers: default_routing_key_headers(),
-        }
-    }
-}
-
-/// The event-driven KV index behind cache-aware routing (`--kv-index`).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum KvIndexKind {
-    /// The positional indexer: one entry per `(position, content hash)`,
-    /// probed per block of a request (default).
-    #[default]
-    Positional,
-    /// The chain index: chains stored as runs with per-run worker coverage;
-    /// lock-free, store-free lookups, memory proportional to the blocks the
-    /// engines report. `run`, its name before 2026-10-06, is accepted as a
-    /// deprecated alias until the positional indexer is removed.
-    #[serde(alias = "run")]
-    Chain,
-}
-
-/// Whether the deprecated `run` spelling of the chain index was given on the
-/// command line; read once at startup to log the deprecation.
-static DEPRECATED_KV_INDEX_ALIAS: AtomicBool = AtomicBool::new(false);
-
-impl KvIndexKind {
-    /// Parse from a case-insensitive string (`positional` | `chain`, with
-    /// `run` as the deprecated spelling of `chain`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "positional" => Some(Self::Positional),
-            "chain" => Some(Self::Chain),
-            "run" => {
-                DEPRECATED_KV_INDEX_ALIAS.store(true, Ordering::Relaxed);
-                Some(Self::Chain)
-            }
-            _ => None,
-        }
-    }
-
-    /// Whether `parse` was given the deprecated `run` spelling.
-    pub fn deprecated_alias_used() -> bool {
-        DEPRECATED_KV_INDEX_ALIAS.load(Ordering::Relaxed)
-    }
-
-    /// Canonical lowercase name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Positional => "positional",
-            Self::Chain => "chain",
         }
     }
 }
@@ -1709,7 +1656,7 @@ impl Default for RouterConfig {
             worker_overload_shed: false,
             kv_indexer_ttl_secs: None,
             kv_indexer_max_entries: None,
-            kv_index: KvIndexKind::default(),
+            kv_index: None,
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,

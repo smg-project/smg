@@ -29,12 +29,11 @@ use smg::{
     config::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, KvIndexKind,
-        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
-        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
-        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
-        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode,
+        MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig,
+        PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
+        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
+        TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
@@ -242,10 +241,22 @@ fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
 }
 
-/// Parse the `--kv-index` value into a `KvIndexKind`.
-fn parse_kv_index_kind(value: &str) -> Result<KvIndexKind, String> {
-    KvIndexKind::parse(value)
-        .ok_or_else(|| format!("invalid value '{value}'; expected positional or chain"))
+/// Parse the deprecated `--kv-index` value. The chain index is the only KV
+/// index, so `chain` is the one value accepted; `positional` names the index
+/// that went with kv-index 2.0.0 and is refused with the reason.
+fn parse_kv_index(value: &str) -> Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "chain" => Ok("chain".to_string()),
+        "positional" => Err(
+            "the positional KV index was removed (kv-index 2.0.0): the chain index is the \
+             only KV index, drop --kv-index"
+                .to_string(),
+        ),
+        _ => Err(format!(
+            "invalid value '{value}'; the chain index is the only KV index, so --kv-index \
+             takes chain only (and is deprecated)"
+        )),
+    }
 }
 
 /// Parse the `--power-of-two-load-metric` value into a `PowerOfTwoLoadMetric`.
@@ -659,27 +670,25 @@ struct CliArgs {
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
 
-    /// TTL in seconds for event-driven cache-aware indexer entries: entries
-    /// neither stored nor read by a query within this window are pruned.
-    /// Bounds index growth when a backend stops emitting removal events.
-    /// Unset or 0 disables the TTL pass.
+    /// Deprecated and ignored: the TTL prune of the positional indexer, which
+    /// the chain index replaced. The chain index holds what the engines report
+    /// and shrinks with their removals, so it has no prune; the flag is still
+    /// accepted so that existing launch lines keep working, and goes in a
+    /// later release.
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_ttl_secs: Option<u64>,
 
-    /// Capacity ceiling per model for the event-driven cache-aware indexer;
-    /// beyond it, oldest-touched entries are pruned down to 90% of the
-    /// ceiling. Unset or 0 disables the ceiling.
+    /// Deprecated and ignored: the capacity ceiling of the positional
+    /// indexer's prune; see --kv-indexer-ttl-secs.
     #[arg(long, help_heading = "Routing Policy")]
     kv_indexer_max_entries: Option<usize>,
 
-    /// The event-driven KV index behind cache-aware routing: `positional`
-    /// (one entry per block position, the default) or `chain` (chains as runs
-    /// with per-run worker coverage; lock-free, store-free lookups; `run` is
-    /// its deprecated spelling). The --kv-indexer-* prune bounds apply to the
-    /// positional index only; the chain index holds what the engines report
-    /// and shrinks with their removals.
-    #[arg(long, default_value = "positional", value_parser = parse_kv_index_kind, help_heading = "Routing Policy")]
-    kv_index: KvIndexKind,
+    /// Deprecated: the chain index is the only KV index behind cache-aware
+    /// routing, so this takes `chain` only and does nothing; the flag goes in
+    /// a later release. `positional` names the index that was removed and is
+    /// refused.
+    #[arg(long, value_parser = parse_kv_index, help_heading = "Routing Policy")]
+    kv_index: Option<String>,
 
     // ==================== RL Control Plane ====================
     /// Mount the RL control plane under /v1/rl (worker discovery,
@@ -2661,7 +2670,7 @@ impl CliArgs {
             .worker_overload_shed(self.worker_overload_shed)
             .kv_indexer_ttl_secs(self.kv_indexer_ttl_secs)
             .kv_indexer_max_entries(self.kv_indexer_max_entries)
-            .kv_index(self.kv_index)
+            .kv_index(self.kv_index.clone())
             .engine_metrics(self.engine_metrics)
             .multimodal_tensor_transport(self.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
@@ -3660,8 +3669,8 @@ mod tests {
         }
     }
 
-    /// The indexer prune flags are router-only settings and must flow into
-    /// `RouterConfig` (unset by default so the indexer stays unbounded).
+    /// The deprecated indexer prune flags are still accepted and flow into
+    /// `RouterConfig`, where nothing reads them but the startup warning.
     #[test]
     fn kv_indexer_prune_flags_flow_into_router_config() {
         let cli = cli_args_from(&[
@@ -3679,31 +3688,35 @@ mod tests {
         assert_eq!(defaults.kv_indexer_max_entries, None);
     }
 
-    /// `--kv-index` selects the event-driven index for cache-aware routing;
-    /// the positional indexer stays the default until the chain index has
-    /// passed a soak in the gateway.
+    /// `--kv-index` is deprecated: the chain index is the only KV index, so
+    /// `chain` is accepted (and flows into `RouterConfig` for the startup
+    /// warning), the removed `positional` index is refused with the reason,
+    /// and any other spelling is an invalid value.
     #[test]
-    fn kv_index_flag_flows_into_router_config() {
+    fn kv_index_flag_takes_chain_only() {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_index, KvIndexKind::Positional);
+        assert_eq!(defaults.kv_index, None);
 
-        let cli = cli_args_from(&["--kv-index", "chain"]);
+        let cli = cli_args_from(&["--kv-index", "Chain"]);
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_index, KvIndexKind::Chain);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.router_config.kv_index, KvIndexKind::Chain);
-        // The spelling before the rename still selects the chain index.
-        assert_eq!(
-            cli_args_from(&["--kv-index", "run"]).kv_index,
-            KvIndexKind::Chain
-        );
-        assert!(KvIndexKind::deprecated_alias_used());
+        assert_eq!(router_config.kv_index.as_deref(), Some("chain"));
+        router_config.validate().unwrap();
 
-        assert_eq!(
-            cli_args_from(&["--kv-index", "Positional"]).kv_index,
-            KvIndexKind::Positional
+        let err = Cli::try_parse_from(["smg", "--kv-index", "positional"])
+            .expect_err("the removed positional index is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("positional KV index was removed") && text.contains("--kv-index"),
+            "the refusal names the removal and the flag: {text}"
         );
-        assert!(parse_kv_index_kind("tree").is_err());
+        for value in ["run", "tree"] {
+            let err = Cli::try_parse_from(["smg", "--kv-index", value])
+                .expect_err("only chain is accepted");
+            assert!(
+                err.to_string().contains("takes chain only"),
+                "{value}: {err}"
+            );
+        }
     }
 
     /// The retry-buffer cap must flow through both conversion paths.
