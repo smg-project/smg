@@ -201,6 +201,12 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
 }
 
 pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    with_feature_extractor_section(load_image_processor_section(base_dir), base_dir)
+}
+
+/// The image processor's config: the flat `preprocessor_config.json`, else
+/// the `image_processor` section of `processor_config.json`.
+fn load_image_processor_section(base_dir: &Path) -> Option<PreProcessorConfig> {
     let image_path = base_dir.join("preprocessor_config.json");
     if let Some(config) = load_preprocessor_config_file(&image_path, "preprocessor_config.json") {
         return Some(config);
@@ -236,6 +242,38 @@ pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProce
             );
         })
         .ok()
+}
+
+/// A `processor_config.json` that nests the audio feature extractor next to
+/// the image and video processors keeps the extractor's parameters
+/// (`sampling_rate`, `samples_per_token`, ...) in its `feature_extractor`
+/// section. Audio processors read them from the preprocessor config's
+/// extras, where a flat `preprocessor_config.json` would have put them, so
+/// the section's entries are merged in under the keys the image config does
+/// not set; a model with the section and no image config gets the defaults
+/// plus the section.
+fn with_feature_extractor_section(
+    config: Option<PreProcessorConfig>,
+    base_dir: &Path,
+) -> Option<PreProcessorConfig> {
+    let processor_path = base_dir.join("processor_config.json");
+    let section = std::fs::read_to_string(&processor_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(
+            |processor_config| match processor_config.get("feature_extractor") {
+                Some(serde_json::Value::Object(section)) => Some(section.clone()),
+                _ => None,
+            },
+        );
+    let Some(section) = section else {
+        return config;
+    };
+    let mut config = config.unwrap_or_default();
+    for (key, value) in section {
+        config.extra.entry(key).or_insert(value);
+    }
+    Some(config)
 }
 
 /// Shared multimodal components injected at router creation time.
@@ -414,6 +452,67 @@ mod tests {
             Some("Qwen3VLVideoProcessor")
         );
         assert_eq!(config.do_resize, Some(true));
+    }
+
+    #[test]
+    fn load_image_preprocessor_config_merges_the_feature_extractor_section() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"feature_extractor":{"feature_extractor_type":"AudioFeatureExtractor","sampling_rate":24000,"samples_per_token":1920,"padding_value":0.0},
+                "image_processor":{"image_processor_type":"NestedImageProcessor","do_resize":true}}"#,
+        )
+        .unwrap();
+
+        let nested = load_image_preprocessor_config(tmp.path())
+            .expect("the image section with the extractor section merged in");
+        assert_eq!(
+            nested.image_processor_type.as_deref(),
+            Some("NestedImageProcessor")
+        );
+        assert_eq!(nested.do_resize, Some(true));
+        assert_eq!(nested.get_extra::<usize>("sampling_rate"), Some(24_000));
+        assert_eq!(nested.get_extra::<usize>("samples_per_token"), Some(1_920));
+        assert_eq!(
+            nested
+                .get_extra::<String>("feature_extractor_type")
+                .as_deref(),
+            Some("AudioFeatureExtractor")
+        );
+
+        // The image config's own keys win over the extractor section's.
+        fs::write(
+            tmp.path().join("preprocessor_config.json"),
+            r#"{"image_processor_type":"LegacyImageProcessor","sampling_rate":16000}"#,
+        )
+        .unwrap();
+        let legacy = load_image_preprocessor_config(tmp.path()).expect("legacy image config");
+        assert_eq!(
+            legacy.image_processor_type.as_deref(),
+            Some("LegacyImageProcessor")
+        );
+        assert_eq!(legacy.get_extra::<usize>("sampling_rate"), Some(16_000));
+        assert_eq!(legacy.get_extra::<usize>("samples_per_token"), Some(1_920));
+
+        // An extractor section without any image config: defaults plus the section.
+        fs::remove_file(tmp.path().join("preprocessor_config.json")).unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"feature_extractor":{"sampling_rate":24000}}"#,
+        )
+        .unwrap();
+        let audio_only = load_image_preprocessor_config(tmp.path())
+            .expect("the extractor section alone is a config");
+        assert_eq!(audio_only.image_processor_type, None);
+        assert_eq!(audio_only.get_extra::<usize>("sampling_rate"), Some(24_000));
+
+        // No section: nothing is merged and a missing image config stays missing.
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"video_processor":{"image_processor_type":"VideoProcessor"}}"#,
+        )
+        .unwrap();
+        assert!(load_image_preprocessor_config(tmp.path()).is_none());
     }
 
     #[test]
