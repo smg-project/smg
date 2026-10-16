@@ -372,18 +372,24 @@ impl Assembler {
             }
             '}' | ']' => self.close_container(&rest[..=space], out),
             _ => {
-                // The template writes a separator or a close here; anything else is reported and
-                // read as the next value's start.
-                out.push(Event::Malformed {
-                    text: Text::uncounted(&rest[..space]),
-                    why: MalformedReason::Other(VALUE_CUT_SHORT.to_string()),
-                });
-                self.stage = if self.in_list() {
-                    Stage::Value
+                // The template writes a separator or a close here; anything else is the next
+                // member's start, read as such from its first byte, with the whitespace before
+                // it reported.
+                if space > 0 {
+                    out.push(Event::Malformed {
+                        text: Text::uncounted(&rest[..space]),
+                        why: MalformedReason::Other(VALUE_CUT_SHORT.to_string()),
+                    });
+                }
+                let next = &rest[space..];
+                let taken = if self.in_list() {
+                    self.stage = Stage::Value;
+                    self.value(next, out)
                 } else {
-                    Stage::Key
+                    self.stage = Stage::Key;
+                    self.key(next, out)
                 };
-                return space.max(1);
+                return space + taken;
             }
         }
         space + 1
@@ -605,6 +611,37 @@ mod tests {
         "call:get_weather{city:<|\"|>Paris, \"la\" ville\n<|\"|>,days:3,metric:true,",
         "options:{tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],none:null,ratio:-0.5},empty:[]}"
     );
+
+    #[test]
+    fn a_member_that_follows_a_value_without_a_separator_keeps_its_first_byte() {
+        // A value followed by the next member where a comma should be: the member is read from
+        // its first byte, so every byte of the output lands in an event, whole and in pieces.
+        for text in [
+            "call:f{a:<|\"|>x<|\"|>coconut<|\"|>,b:1}",
+            "call:f{a:<|\"|>x<|\"|>  coconut}",
+            "call:f{a:[<|\"|>x<|\"|>y]}",
+        ] {
+            let whole = run(&[text], false);
+            assert_eq!(bytes(&whole), format!("{text}{CLOSE}"), "{text:?}: whole");
+            let per_char: Vec<&str> = text
+                .char_indices()
+                .map(|(i, c)| &text[i..i + c.len_utf8()])
+                .collect();
+            let in_pieces = run(&per_char, false);
+            assert_eq!(
+                bytes(&in_pieces),
+                format!("{text}{CLOSE}"),
+                "{text:?}: in pieces"
+            );
+            assert_eq!(arguments(&in_pieces), arguments(&whole), "{text:?}");
+        }
+        let whole = run(&["call:f{a:<|\"|>x<|\"|>coconut<|\"|>,b:1}"], false);
+        assert!(
+            arguments(&whole).contains("coconut"),
+            "the next member starts at its first byte: {}",
+            arguments(&whole)
+        );
+    }
 
     #[test]
     fn function_gemmas_spelling_reads_escape_strings_and_none_as_null() {
