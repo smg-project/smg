@@ -591,6 +591,7 @@ struct Router {
     rdma_listen_ip: Option<String>,
     rdma_slot_ttl_s: Option<u64>,
     log_mm_timing: bool,
+    access_log_fields: Vec<String>,
     prefill_max_inflight_requests_per_worker: i32,
     prefill_queue_size: Option<usize>,
     prefill_queue_timeout_secs: Option<u64>,
@@ -779,6 +780,21 @@ impl Router {
                 })
             })
             .transpose()?;
+
+        // The access-log fields by name, each spelled as the record keys it.
+        let access_log_fields = self
+            .access_log_fields
+            .iter()
+            .map(|name| {
+                name.parse::<config::AccessLogField>().map_err(|reason| {
+                    config::ConfigError::InvalidValue {
+                        field: "access_log_fields".to_string(),
+                        value: name.clone(),
+                        reason,
+                    }
+                })
+            })
+            .collect::<config::ConfigResult<Vec<_>>>()?;
 
         let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
             &self.power_of_two_load_metric,
@@ -1168,6 +1184,7 @@ impl Router {
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
+            .access_log_fields(access_log_fields)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -1364,6 +1381,7 @@ impl Router {
         rdma_listen_ip = None,
         rdma_slot_ttl_s = None,
         log_mm_timing = false,
+        access_log_fields = vec![],
         prefill_max_inflight_requests_per_worker = -1,
         prefill_queue_size = None,
         prefill_queue_timeout_secs = None,
@@ -1569,6 +1587,7 @@ impl Router {
         rdma_listen_ip: Option<String>,
         rdma_slot_ttl_s: Option<u64>,
         log_mm_timing: bool,
+        access_log_fields: Vec<String>,
         prefill_max_inflight_requests_per_worker: i32,
         prefill_queue_size: Option<usize>,
         prefill_queue_timeout_secs: Option<u64>,
@@ -1811,6 +1830,7 @@ impl Router {
             rdma_listen_ip,
             rdma_slot_ttl_s,
             log_mm_timing,
+            access_log_fields,
             prefill_max_inflight_requests_per_worker,
             prefill_queue_size,
             prefill_queue_timeout_secs,

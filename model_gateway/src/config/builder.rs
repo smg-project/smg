@@ -4,11 +4,11 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
-    CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
-    OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
-    TokenizerCacheConfig, TraceConfig,
+    AccessLogField, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
+    DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
+    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
+    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -649,6 +649,12 @@ impl RouterConfigBuilder {
 
     pub fn log_level<S: Into<String>>(mut self, level: S) -> Self {
         self.config.log_level = Some(level.into());
+        self
+    }
+
+    /// The optional fields of the access-log record (none by default).
+    pub fn access_log_fields(mut self, fields: Vec<AccessLogField>) -> Self {
+        self.config.access_log_fields = fields;
         self
     }
 

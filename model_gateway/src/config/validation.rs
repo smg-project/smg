@@ -342,6 +342,7 @@ impl ConfigValidator {
         Self::validate_cors_allowed_origins(config)?;
         Self::validate_value_shapes(config)?;
         Self::validate_log_dir(config)?;
+        Self::validate_access_log_fields(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
@@ -586,6 +587,24 @@ impl ConfigValidator {
             memory
                 .validate()
                 .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+        }
+        Ok(())
+    }
+
+    /// `access_log_fields` names each optional field of the access-log
+    /// record once: a field listed twice is a slip in the configuration, not
+    /// a request for a second column, and is refused by name.
+    fn validate_access_log_fields(config: &RouterConfig) -> ConfigResult<()> {
+        let mut seen: Vec<AccessLogField> = Vec::with_capacity(config.access_log_fields.len());
+        for field in &config.access_log_fields {
+            if seen.contains(field) {
+                return Err(ConfigError::InvalidValue {
+                    field: "access_log_fields".to_string(),
+                    value: field.to_string(),
+                    reason: "listed twice".to_string(),
+                });
+            }
+            seen.push(*field);
         }
         Ok(())
     }
@@ -2695,6 +2714,35 @@ mod tests {
                 }
                 other => panic!("{bad}: expected a refusal, got {other:?}"),
             }
+    /// Each optional field of the access-log record is listed once; a field
+    /// listed twice is refused by name, the rest of the list is accepted.
+    #[test]
+    fn an_access_log_field_listed_twice_is_a_configuration_error() {
+        let accepted = RouterConfig {
+            access_log_fields: AccessLogField::ALL.to_vec(),
+            ..Default::default()
+        };
+        ConfigValidator::validate(&accepted).expect("every field once is accepted");
+
+        let twice = RouterConfig {
+            access_log_fields: vec![
+                AccessLogField::Tenant,
+                AccessLogField::Worker,
+                AccessLogField::Tenant,
+            ],
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&twice) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "access_log_fields");
+                assert_eq!(value, "tenant");
+                assert_eq!(reason, "listed twice");
+            }
+            other => panic!("expected an access_log_fields error, got {other:?}"),
         }
     }
 

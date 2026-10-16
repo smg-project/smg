@@ -1362,6 +1362,9 @@ pub fn build_apps(
 
     // Each listener's router gets the edge layers; their not-found fallback
     // is what answers 404 for a route that lives on the other listener.
+    let access_log_fields = middleware::AccessLogFields::from_fields(
+        &app_state.context.router_config.access_log_fields,
+    );
     let finish = |app: Router<Arc<AppState>>| {
         attach_edge_layers(
             app,
@@ -1369,6 +1372,7 @@ pub fn build_apps(
             app_state.context.inflight_tracker.clone(),
             request_id_headers.clone(),
             cors_allowed_origins.clone(),
+            access_log_fields,
         )
         .with_state(Arc::clone(&app_state))
     };
@@ -1406,6 +1410,7 @@ fn attach_edge_layers<S>(
     inflight_tracker: Arc<InFlightRequestTracker>,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
+    access_log_fields: middleware::AccessLogFields,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -1438,7 +1443,7 @@ where
         .layer(axum::middleware::from_fn(
             middleware::trace_context_response,
         ))
-        .layer(middleware::create_logging_layer())
+        .layer(middleware::create_logging_layer(access_log_fields))
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(tower::util::option_layer(create_cors_layer(
@@ -2660,6 +2665,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         for (path, status) in [("/known", StatusCode::OK), ("/nope", StatusCode::NOT_FOUND)] {
             let response = app
@@ -2695,6 +2701,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         for (method, path, version, status, messages_shape) in [
             (
@@ -2805,6 +2812,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         let oversized = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
@@ -2933,6 +2941,7 @@ mod tests {
             InFlightRequestTracker::new(),
             vec![],
             vec![],
+            middleware::AccessLogFields::NONE,
         );
         let oversized = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
@@ -2987,6 +2996,7 @@ mod tests {
                 InFlightRequestTracker::new(),
                 vec![],
                 origins,
+                middleware::AccessLogFields::NONE,
             );
             let mut request = http::Request::builder()
                 .method(if preflight { "OPTIONS" } else { "GET" })

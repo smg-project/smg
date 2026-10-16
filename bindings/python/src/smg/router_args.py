@@ -278,6 +278,8 @@ class RouterArgs:
     log_dir: str | None = None
     log_level: str | None = None
     log_json: bool = False
+    # Optional fields of the access-log record; [] keeps the record's fields as they are
+    access_log_fields: list[str] = dataclasses.field(default_factory=list)
     # Service discovery configuration
     service_discovery: bool = False
     selector: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -1591,6 +1593,28 @@ class RouterArgs:
             action="store_true",
             default=RouterArgs.log_json,
             help="Output logs in JSON format",
+        )
+        logging_group.add_argument(
+            f"--{prefix}access-log-fields",
+            type=str,
+            nargs="*",
+            action="extend",
+            default=[],
+            choices=[
+                "client_addr",
+                "forwarded_for",
+                "user_agent",
+                "tenant",
+                "key_id",
+                "request_bytes",
+                "response_bytes",
+                "worker",
+            ],
+            help=(
+                "Optional fields of the access-log record, each written once it is listed"
+                " (e.g. client_addr worker response_bytes). Without this flag the record keeps"
+                " the fields it has always had."
+            ),
         )
 
         # Service discovery configuration

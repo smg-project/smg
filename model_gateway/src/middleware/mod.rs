@@ -24,8 +24,8 @@ pub use body_limit::{mark_passed_body_limit_middleware, payload_too_large_envelo
 pub use body_timeout::{request_body_timeout_middleware, RequestBodyTimeouts};
 pub use concurrency::{concurrency_limit_middleware, AdmissionQueue, TokenGuardBody};
 pub use logging::{
-    create_logging_layer, trace_context_response, ProbeResponse, ReportedRefusal, RequestLogger,
-    RequestSpan, ResponseLogger, StreamFailureLogger,
+    create_logging_layer, trace_context_response, AccessLogFields, AccessLogRecord, ProbeResponse,
+    ReportedRefusal, RequestLogger, RequestSpan, ResponseLogger, StreamFailureLogger,
 };
 pub use messages_errors::{
     into_messages_envelope, messages_error_envelope_middleware, messages_error_type, request_id_of,

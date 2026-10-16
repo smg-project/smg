@@ -1,6 +1,7 @@
 //! The access log's cost per request: the `http_request` span and its lines
 //! under the JSON line format, written to a sink, for a unary response and
-//! for a streamed one. The reference case runs the same handlers without the
+//! for a streamed one, with the record's optional fields off (the default)
+//! and all of them on. The reference case runs the same handlers without the
 //! access-log layer, so the difference is the log's own cost.
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "a benchmark")]
 
@@ -20,13 +21,13 @@ use http_body_util::BodyExt;
 use smg::{
     config::{PolicyConfig, RouterConfig, RoutingMode},
     middleware::{
-        auth_middleware, create_logging_layer, route_request_meta_middleware, AuthConfig,
-        TenantResolutionState,
+        auth_middleware, create_logging_layer, route_request_meta_middleware, AccessLogFields,
+        AuthConfig, TenantResolutionState,
     },
     observability::log_format::{JsonLine, SpanFields},
 };
 use tower::ServiceExt;
-use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+use tracing_subscriber::{layer::SubscriberExt, Registry};
 
 const KEY: &str = "sk-bench-0123456789abcdef";
 const PAYLOAD: &[u8] = br#"{"model":"bench-model","messages":[{"role":"system","content":"You are a benchmark."},{"role":"user","content":"Write one line about access logs."}],"max_tokens":16,"stream":false}"#;
@@ -53,9 +54,8 @@ async fn chat(body: Bytes) -> Response {
 /// A streamed answer of [`FRAMES`] SSE frames.
 async fn stream(body: Bytes) -> Response {
     black_box(body.len());
-    let frames = futures::stream::iter(
-        (0..FRAMES).map(|_| Ok::<_, io::Error>(Bytes::from_static(FRAME))),
-    );
+    let frames =
+        futures::stream::iter((0..FRAMES).map(|_| Ok::<_, io::Error>(Bytes::from_static(FRAME))));
     let mut response = (
         [(header::CONTENT_TYPE, "text/event-stream")],
         Body::from_stream(frames),
@@ -69,8 +69,8 @@ async fn stream(body: Bytes) -> Response {
 }
 
 /// The serving path's inner layers (auth, tenant resolution) around the two
-/// handlers, with the access-log layer outside them when `logged`.
-fn app(logged: bool) -> Router {
+/// handlers, with the access-log layer outside them when `fields` is set.
+fn app(fields: Option<AccessLogFields>) -> Router {
     let config = RouterConfig::new(
         RoutingMode::Regular {
             worker_urls: vec!["http://127.0.0.1:8000".to_string()],
@@ -84,10 +84,9 @@ fn app(logged: bool) -> Router {
         .route("/v1/stream", post(stream))
         .route_layer(from_fn_with_state(tenants, route_request_meta_middleware))
         .route_layer(from_fn_with_state(auth, auth_middleware));
-    if logged {
-        routes.layer(create_logging_layer())
-    } else {
-        routes
+    match fields {
+        Some(fields) => routes.layer(create_logging_layer(fields)),
+        None => routes,
     }
 }
 
@@ -124,8 +123,12 @@ fn bench_access_log(c: &mut Criterion) {
     let mut group = c.benchmark_group("access_log");
     group.throughput(Throughput::Elements(1));
     for (path, kind) in [("/v1/chat/completions", "unary"), ("/v1/stream", "stream")] {
-        for (logged, case) in [(false, "no_layer"), (true, "logged")] {
-            let app = app(logged);
+        for (fields, case) in [
+            (None, "no_layer"),
+            (Some(AccessLogFields::NONE), "default_fields"),
+            (Some(AccessLogFields::all()), "all_fields"),
+        ] {
+            let app = app(fields);
             group.bench_with_input(BenchmarkId::new(kind, case), &path, |b, path| {
                 b.iter(|| {
                     runtime.block_on(async {

@@ -19,6 +19,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use smg_auth::bearer_token;
 
+use super::logging::AccessLogRecord;
 use crate::{
     config::TenantApiKeyEntry,
     tenant::{authenticated_tenant_key_from_sha256, DataPlaneCaller, TenantIdentity, TenantKey},
@@ -102,6 +103,15 @@ pub async fn auth_middleware(
         let Some(tenant_key) = tenant_key else {
             return unauthorized(token_hash.is_some());
         };
+
+        // The access log, when it carries the key: by its fingerprint, never
+        // the key.
+        if let (Some(record), Some(hash)) = (
+            request.extensions().get::<AccessLogRecord>(),
+            token_hash.as_ref(),
+        ) {
+            record.key_id(hash);
+        }
 
         request
             .extensions_mut()

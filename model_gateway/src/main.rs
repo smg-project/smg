@@ -30,13 +30,14 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode,
-        MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig,
-        PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, AccessLogField,
+        CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+        FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
+        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
+        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
+        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -264,6 +265,11 @@ fn parse_power_of_two_load_metric(value: &str) -> Result<PowerOfTwoLoadMetric, S
     PowerOfTwoLoadMetric::parse(value).ok_or_else(|| {
         format!("invalid value '{value}'; expected expected_wait, requests, or least_requests")
     })
+}
+
+/// Parse one `--access-log-fields` name into an `AccessLogField`.
+fn parse_access_log_field(value: &str) -> Result<AccessLogField, String> {
+    value.parse()
 }
 
 /// Parse the `--mm-processing` value into an `MmProcessingMode`.
@@ -1071,6 +1077,13 @@ struct ServingArgs {
     /// Output logs as JSON
     #[arg(long, default_value_t = false, help_heading = "Logging")]
     log_json: bool,
+
+    /// Optional fields of the access-log record, comma-separated:
+    /// client_addr, forwarded_for, user_agent, tenant, key_id,
+    /// request_bytes, response_bytes, worker (default: none, the record
+    /// keeps the fields it has always had)
+    #[arg(long, value_delimiter = ',', value_parser = parse_access_log_field, help_heading = "Logging")]
+    access_log_fields: Vec<AccessLogField>,
 
     // ==================== Prometheus Metrics ====================
     /// Port to expose Prometheus metrics (at least 1). Each listener (--port,
@@ -3172,6 +3185,7 @@ impl CliArgs {
                     .then_some(self.model.history_memory_retention_secs),
             })
             .log_level(&self.serving.log_level)
+            .access_log_fields(self.serving.access_log_fields.clone())
             .maybe_api_key(self.integrations.api_key.as_ref())
             .tenant_api_keys(tenant_api_keys)
             .maybe_discovery(discovery)
@@ -5122,6 +5136,40 @@ mod tests {
         assert_eq!(server_config.router_config.mm_processing, None);
         assert!(!server_config.router_config.log_mm_timing);
         assert!(!server_config.router_config.mm_allow_private_media_hosts);
+    }
+
+    /// `--access-log-fields` takes the record's optional fields by name,
+    /// comma-separated or repeated, into both configs; without the flag the
+    /// record keeps its fields; an unknown name is refused with the known
+    /// ones.
+    #[test]
+    fn access_log_fields_flow_into_both_configs() {
+        let cli = cli_args_from(&[
+            "--access-log-fields",
+            "client_addr,worker",
+            "--access-log-fields",
+            "response_bytes",
+        ]);
+        let selected = vec![
+            AccessLogField::ClientAddr,
+            AccessLogField::Worker,
+            AccessLogField::ResponseBytes,
+        ];
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.access_log_fields, selected);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert_eq!(server_config.router_config.access_log_fields, selected);
+
+        let unset = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(unset.access_log_fields.is_empty());
+
+        let err = Cli::try_parse_from(["smg", "--access-log-fields", "client_addr,peer"])
+            .expect_err("an unknown field is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("peer") && text.contains("forwarded_for"),
+            "the refusal names the unknown field and the known ones: {text}"
+        );
     }
 
     #[test]

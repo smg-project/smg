@@ -379,6 +379,11 @@ pub struct RouterConfig {
     /// console only.
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
+    /// The optional fields of the access-log record, each written once it is
+    /// listed here; empty (the default) keeps the record's fields as they
+    /// have always been, so nothing that reads the log changes.
+    #[serde(default)]
+    pub access_log_fields: Vec<AccessLogField>,
     /// Directory for the heap profiles `POST /heap_profile` writes, on a
     /// build with the `jemalloc-profiling` feature; unset, the route
     /// answers 404.
@@ -595,6 +600,94 @@ impl Default for TenantResolutionConfig {
             trust_tenant_header: false,
             tenant_header_name: DEFAULT_TENANT_HEADER_NAME.to_string(),
         }
+    }
+}
+
+/// An optional field of the access-log record (`access_log_fields`). The
+/// record always carries the request's method, path, version, request id,
+/// status and latency; each field here is written once it is selected, under
+/// the name the variant spells in `snake_case`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessLogField {
+    /// The address the request came in from, `ip:port`: the TCP peer, which
+    /// is a proxy's address when one sits in front of the gateway.
+    ClientAddr,
+    /// The `X-Forwarded-For` header as the request carried it, unverified:
+    /// the gateway keeps no list of trusted proxies, so it never folds this
+    /// into `client_addr`; the reader decides which hop to believe.
+    ForwardedFor,
+    /// The `User-Agent` header, its first 256 bytes.
+    UserAgent,
+    /// The caller's tenant as the serving path resolved it: `auth:<tenant>`,
+    /// `header:<tenant>`, `ip:<address>` or `anonymous`.
+    Tenant,
+    /// The key the request authenticated with, by its fingerprint (the first
+    /// 16 hex digits of the key's SHA-256), never the key itself.
+    KeyId,
+    /// The bytes of the request body the handler read.
+    RequestBytes,
+    /// The bytes of the response body: the declared length on the finish
+    /// line, the bytes out on a later line (a streamed body's end, a client
+    /// that left, a stream that failed).
+    ResponseBytes,
+    /// The worker the request was routed to.
+    Worker,
+}
+
+impl AccessLogField {
+    /// Every field, in the order the configuration documents them.
+    pub const ALL: [Self; 8] = [
+        Self::ClientAddr,
+        Self::ForwardedFor,
+        Self::UserAgent,
+        Self::Tenant,
+        Self::KeyId,
+        Self::RequestBytes,
+        Self::ResponseBytes,
+        Self::Worker,
+    ];
+
+    /// The field's name: its key in the record and its spelling in the
+    /// configuration.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientAddr => "client_addr",
+            Self::ForwardedFor => "forwarded_for",
+            Self::UserAgent => "user_agent",
+            Self::Tenant => "tenant",
+            Self::KeyId => "key_id",
+            Self::RequestBytes => "request_bytes",
+            Self::ResponseBytes => "response_bytes",
+            Self::Worker => "worker",
+        }
+    }
+
+    /// The field `name` spells (as [`Self::as_str`] spells it).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|field| field.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for AccessLogField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AccessLogField {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::parse(name.trim()).ok_or_else(|| {
+            let known: Vec<&str> = Self::ALL.iter().map(|field| field.as_str()).collect();
+            format!(
+                "unknown access log field '{name}' (expected one of {})",
+                known.join(", ")
+            )
+        })
     }
 }
 
@@ -1700,6 +1793,7 @@ impl Default for RouterConfig {
             trace_config: None,
             log_dir: None,
             log_level: None,
+            access_log_fields: Vec::new(),
             jemalloc_prof_dir: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),

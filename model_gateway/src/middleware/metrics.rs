@@ -113,6 +113,16 @@ impl BodyProgress {
         }
     }
 
+    /// The length the response declared, when it did.
+    pub(super) fn declared(&self) -> Option<u64> {
+        self.declared
+    }
+
+    /// The data bytes out so far.
+    pub(super) fn sent(&self) -> u64 {
+        self.sent
+    }
+
     /// A frame went out; `at_end` is the body's own word (`is_end_stream`)
     /// after it. Whether the body has now gone out in full.
     pub(super) fn frame_out(&mut self, frame: &http_body::Frame<Bytes>, at_end: bool) -> bool {

@@ -1463,6 +1463,15 @@ class TestParseRouterArgs:
             "https://example.com",
         ]
 
+    def test_parse_access_log_fields(self):
+        """The access-log record's optional fields are listed by name; the
+        default keeps the record's fields; an unknown name is refused."""
+        args = ["--access-log-fields", "client_addr", "worker", "--access-log-fields", "tenant"]
+        assert parse_router_args(args).access_log_fields == ["client_addr", "worker", "tenant"]
+        assert parse_router_args([]).access_log_fields == []
+        with pytest.raises(SystemExit):
+            parse_router_args(["--access-log-fields", "peer"])
+
     def test_parse_tokenizer_args(self):
         """Test parsing tokenizer arguments."""
         # Note: model-path and tokenizer-path arguments are not available in current implementation
@@ -1683,6 +1692,7 @@ class TestRouterArgsFieldOrder:
         "log_dir",
         "log_level",
         "log_json",
+        "access_log_fields",
         "service_discovery",
         "selector",
         "service_discovery_port",
