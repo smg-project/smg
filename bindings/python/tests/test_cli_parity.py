@@ -73,7 +73,9 @@ def literal_default(attribute: str) -> object:
     quoted = re.search(r'\bdefault_value\s*=\s*"([^"]*)"', attribute)
     if quoted:
         return quoted.group(1)
-    typed = re.search(r"\bdefault_value_t\s*=\s*([^,]+)", attribute)
+    # The capture stops at the next argument, or at the attribute's own
+    # closing `)]` when `default_value_t` is its last argument.
+    typed = re.search(r"\bdefault_value_t\s*=\s*([^,)\]]+)", attribute)
     if not typed:
         return None
     raw = typed.group(1).strip().replace("_", "")
