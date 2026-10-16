@@ -199,11 +199,25 @@ pub(super) fn bandlimited_resample_exact(
     let kernel_values = new_freq
         .checked_mul(kernel_len)
         .ok_or_else(|| TransformError::ShapeError("audio resample kernel size overflow".into()))?;
-    // The accumulator holds `kernel_len` products of 2^40 by 2^62 in i128.
-    if kernel_len >= 1 << 24 {
-        return Err(TransformError::ShapeError(
-            "audio resample kernel is too long for exact evaluation".to_string(),
-        ));
+    // Two bounds keep the exact evaluation cheap for every rate audio is
+    // stored at and refuse the rest before anything is built. Each output
+    // costs a `kernel_len` dot product, and the table holds `new_freq` phases
+    // of `kernel_len` coefficients, so a rate that shares little with 24 kHz
+    // is expensive on both counts: 23 999 Hz needs 24 000 phases of 24 013
+    // coefficients (a multi-gigabyte table), and 23 994 Hz still 4 000 phases
+    // of 4 013 (a 122 MiB table, 16 M sin/cos to fill it, 4 k multiply-adds
+    // per output: seconds per clip). The rates in use peak at 237 coefficients
+    // per output (176.4 kHz) and 51 520 in the table (11.025 kHz), so a kernel
+    // of up to 1 024 coefficients and a table of up to 2^20 (8 MiB of i64)
+    // leave 4x and 20x headroom; past either, the rate is refused.
+    const MAX_KERNEL_LEN: usize = 1 << 10;
+    const MAX_KERNEL_VALUES: usize = 1 << 20;
+    if kernel_len > MAX_KERNEL_LEN || kernel_values > MAX_KERNEL_VALUES {
+        return Err(TransformError::ShapeError(format!(
+            "audio sample rate {src_sample_rate} Hz has no exact resampling kernel of a \
+             practical size for {dst_sample_rate} Hz ({kernel_len} coefficients per output, \
+             {kernel_values} in the table)"
+        )));
     }
 
     // Coefficients on the 2^-62 grid, from the filter evaluated in f64 as
@@ -385,6 +399,31 @@ mod tests {
                 Err(TransformError::ShapeError(message))
                     if message == "audio resampling rates must be positive"
             ));
+        }
+    }
+
+    #[test]
+    fn a_rate_with_an_impractical_kernel_is_refused_before_it_is_built() {
+        // 23 999 Hz shares no factor with 24 000 (24 000 phases of 24 013
+        // coefficients, over half a billion in the table); 23 994 Hz reduces
+        // to 3 999 : 4 000 (4 000 phases of 4 013, a 16 M table and 4 k
+        // multiply-adds per output). Both are refused before anything is built.
+        for rate in [23_999, 23_994] {
+            let error = bandlimited_resample_exact(&[0.25; 48], rate, 24_000).unwrap_err();
+            assert!(
+                error.to_string().contains("no exact resampling kernel"),
+                "{rate} Hz: {error}"
+            );
+        }
+        // The rates audio is stored at stay well inside both bounds: the
+        // longest kernel per output is 176.4 kHz's and the largest table is
+        // 11.025 kHz's.
+        for rate in [
+            4_000, 8_000, 11_025, 12_000, 16_000, 22_050, 32_000, 37_800, 44_100, 48_000, 64_000,
+            88_200, 96_000, 176_400, 192_000,
+        ] {
+            bandlimited_resample_exact(&[0.25; 48], rate, 24_000)
+                .unwrap_or_else(|error| panic!("{rate} Hz: {error}"));
         }
     }
 

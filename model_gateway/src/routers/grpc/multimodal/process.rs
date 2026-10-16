@@ -597,12 +597,9 @@ async fn preprocess_modality(
     .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
 }
 
-/// The preprocessor config for one clip: its sampled frame rate; when the
+/// The preprocessor config for one clip: its sampled frame rate and, when the
 /// caller named a `max_long_side_pixel` tier, that tier, so the processor can
-/// size the frames the way the caller asked; and, when the decoder recovered
-/// the source frames, each decoded frame's timestamp in the source
-/// (`frame_timestamps`, seconds, one per frame in order) and the source frame
-/// rate (`source_fps`), for a processor that labels frames with their time.
+/// size the frames the way the caller asked.
 fn video_request_config(mut config: PreProcessorConfig, video: &VideoClip) -> PreProcessorConfig {
     config
         .extra
@@ -611,24 +608,6 @@ fn video_request_config(mut config: PreProcessorConfig, video: &VideoClip) -> Pr
         config
             .extra
             .insert("max_long_side_pixel".to_string(), serde_json::json!(tier));
-    }
-    if let Some(sampling) = video
-        .sampling()
-        .filter(|sampling| sampling.source_fps > 0.0)
-    {
-        let timestamps: Vec<f64> = sampling
-            .frame_indices
-            .iter()
-            .map(|&index| index as f64 / sampling.source_fps)
-            .collect();
-        config.extra.insert(
-            "frame_timestamps".to_string(),
-            serde_json::json!(timestamps),
-        );
-        config.extra.insert(
-            "source_fps".to_string(),
-            serde_json::json!(sampling.source_fps),
-        );
     }
     config
 }
@@ -987,40 +966,6 @@ mod tests {
         let config = video_request_config(PreProcessorConfig::default(), &video);
 
         assert_eq!(config.get_extra::<u32>("max_long_side_pixel"), Some(1008));
-    }
-
-    #[test]
-    fn decoded_video_frame_timestamps_reach_the_processor_config() {
-        let video = VideoClip::new_with_sample_fps(
-            Vec::new(),
-            Bytes::new(),
-            VideoSource::InlineBytes,
-            "video-hash".to_string(),
-            2.0,
-        )
-        .with_sampling(Some(VideoSamplingInfo {
-            source_fps: 30.0,
-            frame_indices: vec![0, 15, 45],
-        }));
-
-        let config = video_request_config(PreProcessorConfig::default(), &video);
-
-        assert_eq!(
-            config.get_extra::<Vec<f64>>("frame_timestamps"),
-            Some(vec![0.0, 0.5, 1.5])
-        );
-        assert_eq!(config.get_extra::<f64>("source_fps"), Some(30.0));
-
-        // A clip whose source frames the decoder could not recover carries none.
-        let unknown = VideoClip::new_with_sample_fps(
-            Vec::new(),
-            Bytes::new(),
-            VideoSource::InlineBytes,
-            "video-hash".to_string(),
-            2.0,
-        );
-        let config = video_request_config(PreProcessorConfig::default(), &unknown);
-        assert!(config.get_extra::<Vec<f64>>("frame_timestamps").is_none());
     }
 
     #[test]

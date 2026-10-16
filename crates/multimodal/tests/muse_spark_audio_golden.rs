@@ -3,10 +3,12 @@
 //! The fixture is produced by
 //! `crates/multimodal/scripts/generate_muse_spark_audio_fingerprints.py`, which
 //! runs `MuseSparkFeatureExtractor` on deterministic integer-formula
-//! waveforms (resampled with `torchaudio.functional.resample` when not at
-//! 24 kHz) and fingerprints its `input_values` rows as float32 and as the
-//! bfloat16 the gateway writes on the wire. The processor must reproduce the
-//! token counts, the padded lengths and both fingerprints bit for bit.
+//! waveforms (resampled, when not at 24 kHz, by `exact_resample`: the numpy
+//! port of `bandlimited_resample_exact`, cross-checked against torchaudio's
+//! float64 resample in the fixture's `torchaudio_f64_*` fields) and
+//! fingerprints its `input_values` rows as float32 and as the bfloat16 the
+//! gateway writes on the wire. The processor must reproduce the token counts,
+//! the padded lengths and both fingerprints bit for bit.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
