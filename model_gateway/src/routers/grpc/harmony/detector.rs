@@ -15,27 +15,21 @@ impl HarmonyDetector {
     /// 2. Check if any model card has hf_model_type equal to "gpt_oss"
     /// 3. Check if model_id contains "gpt-oss" substring (case-insensitive)
     pub fn is_harmony_worker(worker: &dyn Worker) -> bool {
-        for model_card in worker.models() {
+        // The cards are read in place: this runs on every chat request, for
+        // every worker of the model, and `models()` would clone each card.
+        let harmony_card = worker.any_model(&mut |model_card| {
             // 1. Check architectures for GptOssForCausalLM
-            if model_card
+            model_card
                 .architectures
                 .iter()
                 .any(|arch| arch == "GptOssForCausalLM")
-            {
-                return true;
-            }
-
-            // 2. Check hf_model_type for gpt_oss
-            if let Some(ref model_type) = model_card.hf_model_type {
-                if model_type == "gpt_oss" {
-                    return true;
-                }
-            }
-
-            // 3. Check model id for gpt-oss substring
-            if Self::is_harmony_model(&model_card.id) {
-                return true;
-            }
+                // 2. Check hf_model_type for gpt_oss
+                || model_card.hf_model_type.as_deref() == Some("gpt_oss")
+                // 3. Check model id for gpt-oss substring
+                || Self::is_harmony_model(&model_card.id)
+        });
+        if harmony_card {
+            return true;
         }
 
         // Fallback: check worker's model_id directly

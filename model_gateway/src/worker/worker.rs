@@ -1022,6 +1022,14 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().spec.models.all().to_vec()
     }
 
+    /// Whether any model card of this worker satisfies `pred`: the same
+    /// cards [`Self::models`] returns, read in place. For a check on the
+    /// request path, which [`Self::models`] would answer by cloning every
+    /// card.
+    fn any_model(&self, pred: &mut dyn FnMut(&ModelCard) -> bool) -> bool {
+        self.metadata().spec.models.all().iter().any(pred)
+    }
+
     /// Context window (in tokens) this worker advertises for `model_id`, from
     /// the matching model card (falling back to the primary card). `None`
     /// when the worker never advertised one; callers then leave the length
@@ -2952,6 +2960,16 @@ impl Worker for BasicWorker {
             overridden.all()
         };
         source.to_vec()
+    }
+
+    fn any_model(&self, pred: &mut dyn FnMut(&ModelCard) -> bool) -> bool {
+        let overridden = self.models_override.load();
+        let source = if overridden.is_wildcard() {
+            self.metadata.spec.models.all()
+        } else {
+            overridden.all()
+        };
+        source.iter().any(pred)
     }
 
     fn context_length(&self, model_id: &str) -> Option<u32> {
