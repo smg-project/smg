@@ -906,7 +906,7 @@ impl Assembler {
     /// The call ended inside a value: an open string is closed, and a value never written comes
     /// back as `Malformed`, since its member was never written.
     fn cut_value(&mut self, value: &ValueState, out: &mut Events) {
-        self.carried.push_str(&value.held);
+        // The value's held bytes went to `carried` before the scanner's, at the close.
         self.report(TAG_CUT_SHORT, out);
         if matches!(value.mode, Mode::Streaming { opened: true }) {
             self.push_fragment("\"".to_string(), Text::default(), out);
@@ -1491,6 +1491,21 @@ mod tests {
         let cut = run_with(Tags::MINICPM5, &["f\"><param name=\"s\"><![CDATA[x]"], true);
         assert_eq!(bytes(&cut), "f\"><param name=\"s\"><![CDATA[x]");
         assert_eq!(arguments(&cut), r#"{"s": "x"#);
+        // Cut inside a tag behind held `]` bytes: the held bytes leave before the tag's start,
+        // in the output's order, at the stream's end and at the region's close.
+        for text in [
+            "f\"><param name=\"s\"><![CDATA[x]</para",
+            "f\"><param name=\"s\"><![CDATA[x]]</para",
+        ] {
+            let cut = run_with(Tags::MINICPM5, &[text], true);
+            assert_eq!(bytes(&cut), text, "{text:?} cut");
+            let closed = run_with(Tags::MINICPM5, &[text], false);
+            assert_eq!(
+                bytes(&closed),
+                format!("{text}</function>"),
+                "{text:?} closed"
+            );
+        }
     }
 
     /// dots3's spelling: MiniMax M2's tags, every value on a line of its own.
