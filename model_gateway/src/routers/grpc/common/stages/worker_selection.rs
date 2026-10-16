@@ -333,7 +333,7 @@ impl WorkerSelectionStage {
             self.prefill_leg_needs_vision(needs_vision),
             self.decode_leg_needs_vision(&ctx.input.request_type, intermediate, media_refs),
         )
-        .with_media_refs(media_refs)
+        .with_media_refs(media_refs, ctx.state.media_refs_pipeline)
         .with_context(context_requirements);
 
         let text = prep.routing_text();
@@ -638,7 +638,7 @@ impl WorkerSelectionStage {
                             self.prefill_leg_needs_vision(ctx.routing.needs_vision),
                             ctx.routing.decode_needs_vision,
                         )
-                        .with_media_refs(media_refs)
+                        .with_media_refs(media_refs, ctx.wire.pipeline)
                         .with_context(context_requirements),
                     )
                     .await?;
@@ -812,6 +812,10 @@ struct PairDemands {
     /// a worker with the encoder among those, or the request could never
     /// pair and a retryable 503 would send the client back for ever.
     refs: bool,
+    /// With `refs`: which of the workers that process them the plan may use
+    /// ([`pipeline_admits`]); the probes count only the pairs on that side,
+    /// so a pair the pin excludes never stands in for one it admits.
+    pipeline: PipelinePin,
 }
 
 impl PairDemands {
@@ -824,14 +828,20 @@ impl PairDemands {
             prefill: pixel_media || decode,
             decode,
             refs: false,
+            pipeline: PipelinePin::Any,
         }
     }
 
     /// The same demand for a request that forwards media references (`refs`,
-    /// the caller's `ACCEPTS_MEDIA_REFS` filter): the prefill leg's refusal
-    /// is judged among the workers that take them.
-    fn with_media_refs(self, refs: bool) -> Self {
-        Self { refs, ..self }
+    /// the caller's references predicate) on the side of `pipeline`: the
+    /// prefill leg's refusal and the capacity refusal are judged among the
+    /// workers that take them there.
+    fn with_media_refs(self, refs: bool, pipeline: PipelinePin) -> Self {
+        Self {
+            refs,
+            pipeline: if refs { pipeline } else { PipelinePin::Any },
+            ..self
+        }
     }
 
     /// Context bounds shared by both token-processing legs, never the encoder.
@@ -1660,7 +1670,9 @@ impl WorkerSelectionStage {
         // workers. A pool with no pair that takes the references at all is
         // not this refusal: the placement's media-references verdict names
         // that gap, and the fix that applies to it.
-        let takes_refs = |worker: &dyn Worker| !demand.refs || accepts_media_refs(worker);
+        let takes_refs = |worker: &dyn Worker| {
+            !demand.refs || (accepts_media_refs(worker) && pipeline_admits(demand.pipeline, worker))
+        };
         if demand.prefill
             && !pairs.prefill_pool.is_empty()
             && !pairs.decode_pool.is_empty()
@@ -4441,6 +4453,88 @@ mod tests {
         }
     }
 
+    /// The prefill leg's probes count only the pairs on the side of the plan's
+    /// pipeline pin: with the pin on the gateway's own pipeline, a prefill
+    /// worker with the encoder on the engine's processor does not stand in
+    /// for the pipeline worker without one, so the request gets the vision
+    /// refusal rather than a retryable 503; off the pin, or without one, the
+    /// same pool pairs on the engine's side.
+    #[test]
+    fn the_pd_probes_count_only_the_pairs_on_the_pins_side() {
+        let model_id = "test-model-pd-pin-probe";
+        let pipeline_without_vision = [
+            ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+            ("mm_media_ref_schemes", "http,https,data"),
+            (multimodal::SUPPORTS_VISION_LABEL, "false"),
+        ];
+        let engine_with_vision = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+            (multimodal::SUPPORTS_VISION_LABEL, "true"),
+        ];
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, labels) in [
+            (
+                "grpc://127.0.0.1:8780",
+                WorkerType::Prefill,
+                &pipeline_without_vision[..],
+            ),
+            (
+                "grpc://127.0.0.1:8781",
+                WorkerType::Prefill,
+                &engine_with_vision[..],
+            ),
+            (
+                "grpc://127.0.0.1:8782",
+                WorkerType::Decode,
+                &pipeline_without_vision[..],
+            ),
+            (
+                "grpc://127.0.0.1:8783",
+                WorkerType::Decode,
+                &engine_with_vision[..],
+            ),
+        ] {
+            worker_registry
+                .register(labeled_worker(url, model_id, worker_type, labels))
+                .unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+        for (pin, pairs) in [
+            (PipelinePin::Only, false),
+            (PipelinePin::Never, true),
+            (PipelinePin::Any, true),
+        ] {
+            let demands = MediaDemands {
+                media_refs: true,
+                vision: true,
+                pipeline: pin,
+            };
+            let accepts_refs = |worker: &dyn Worker| demands.accepts_refs(worker);
+            let selected = stage.select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(&accepts_refs),
+                    ..Default::default()
+                },
+                None,
+                None,
+                PairDemands::new(true, false).with_media_refs(true, pin),
+            );
+            if pairs {
+                assert!(
+                    selected.is_ok(),
+                    "{pin:?}: the engine's pair has the encoder"
+                );
+            } else {
+                assert!(
+                    matches!(selected, Err(PdSelectionFailure::NoVisionCapablePrefill)),
+                    "{pin:?}: no pipeline prefill worker has the encoder"
+                );
+            }
+        }
+    }
+
     /// With the demand an image reference builds, a pool with no pair that
     /// takes the references keeps the placement's media-references verdict
     /// (its message names the fix that applies), not the vision refusal:
@@ -4479,7 +4573,7 @@ mod tests {
                 },
                 None,
                 None,
-                PairDemands::new(true, true).with_media_refs(true),
+                PairDemands::new(true, true).with_media_refs(true, PipelinePin::Any),
             )
             .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
             .expect_err("no pair takes the references");
@@ -4630,6 +4724,7 @@ mod tests {
                 decode: false,
                 refs: false,
                 context: ContextRequirements::default(),
+                pipeline: PipelinePin::Any,
             },
             "a single-sample image: the prefill leg takes the pixels, the decode leg is stripped"
         );
@@ -4640,6 +4735,7 @@ mod tests {
                 decode: true,
                 refs: false,
                 context: ContextRequirements::default(),
+                pipeline: PipelinePin::Any,
             },
             "what the decode leg cannot run without the encoder, the prefill leg cannot either"
         );
@@ -4886,7 +4982,7 @@ mod tests {
                 },
                 None,
                 None,
-                PairDemands::new(true, true).with_media_refs(true),
+                PairDemands::new(true, true).with_media_refs(true, PipelinePin::Any),
             )
             .expect_err("no prefill worker that takes references has the encoder");
         assert!(
