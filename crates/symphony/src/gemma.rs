@@ -172,7 +172,7 @@ impl Assembler {
         } else if !terminal.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(terminal),
-                why: MalformedReason::Other(NOT_A_CALL.to_string()),
+                why: MalformedReason::Other(NOT_A_CALL.into()),
             });
         }
         self.done = true;
@@ -232,7 +232,7 @@ impl Assembler {
             _ => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(&rest[..=brace]),
-                    why: MalformedReason::Other(NOT_A_CALL.to_string()),
+                    why: MalformedReason::Other(NOT_A_CALL.into()),
                 });
                 self.stage = Stage::Closed;
             }
@@ -259,7 +259,7 @@ impl Assembler {
             // value that follows it stays inside a valid object.
             out.push(Event::Malformed {
                 text: Text::uncounted(&rest[..=colon]),
-                why: MalformedReason::Other(EMPTY_KEY.to_string()),
+                why: MalformedReason::Other(EMPTY_KEY.into()),
             });
             let mut json = self.separator();
             json.push_str("\"\": ");
@@ -389,7 +389,7 @@ impl Assembler {
                 if space > 0 {
                     out.push(Event::Malformed {
                         text: Text::uncounted(&rest[..space]),
-                        why: MalformedReason::Other(VALUE_CUT_SHORT.to_string()),
+                        why: MalformedReason::Other(VALUE_CUT_SHORT.into()),
                     });
                 }
                 let next = &rest[space..];
@@ -458,16 +458,16 @@ impl Assembler {
         match self.stage {
             Stage::Header if !held.is_empty() => out.push(Event::Malformed {
                 text: Text::uncounted(held),
-                why: MalformedReason::Other(NOT_A_CALL.to_string()),
+                why: MalformedReason::Other(NOT_A_CALL.into()),
             }),
             Stage::Key if !held.trim().is_empty() => out.push(Event::Malformed {
                 text: Text::uncounted(held),
-                why: MalformedReason::Other(KEY_CUT_SHORT.to_string()),
+                why: MalformedReason::Other(KEY_CUT_SHORT.into()),
             }),
             Stage::Value if !held.trim().is_empty() || self.value_missing() => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(held),
-                    why: MalformedReason::Other(VALUE_CUT_SHORT.to_string()),
+                    why: MalformedReason::Other(VALUE_CUT_SHORT.into()),
                 });
             }
             Stage::Text => {
@@ -519,7 +519,7 @@ fn after_the_object(text: &str, out: &mut Events) -> usize {
         } else {
             Event::Malformed {
                 text: Text::uncounted(run),
-                why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+                why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.into()),
             }
         });
     }
@@ -614,7 +614,7 @@ mod tests {
                 Event::Malformed {
                     text,
                     why: MalformedReason::Other(why),
-                } => Some((text.text.clone(), why.clone())),
+                } => Some((text.text.clone(), why.to_string())),
                 _ => None,
             })
             .collect()

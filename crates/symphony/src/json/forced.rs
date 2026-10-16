@@ -114,7 +114,7 @@ impl Assembler {
 fn unnamed(bytes: &str, out: &mut Events) {
     out.push(Event::Malformed {
         text: Text::uncounted(bytes),
-        why: MalformedReason::Other(NO_FORCED_FUNCTION.to_string()),
+        why: MalformedReason::Other(NO_FORCED_FUNCTION.into()),
     });
 }
 

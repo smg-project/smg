@@ -109,7 +109,7 @@ impl Assembler {
         match self.arguments {
             Some(arguments) => arguments.finish(out),
             None => self.header.ended(
-                || MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.to_string()),
+                || MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.into()),
                 out,
             ),
         }
@@ -424,7 +424,7 @@ mod tests {
             events,
             vec![Event::Malformed {
                 text: Text::uncounted("get_weather"),
-                why: MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.to_string()),
+                why: MalformedReason::Other(NAME_WITHOUT_ARGUMENTS.into()),
             }]
         );
         let (events, _) = run(&["get_wea"], true);

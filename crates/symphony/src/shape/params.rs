@@ -299,7 +299,7 @@ impl Params {
         if again && self.values.reader().duplicates() == Duplicates::First {
             out.push(Event::Malformed {
                 text: Text::uncounted(parameter),
-                why: MalformedReason::Other(KEY_WRITTEN_TWICE.to_string()),
+                why: MalformedReason::Other(KEY_WRITTEN_TWICE.into()),
             });
             return;
         }

@@ -73,13 +73,13 @@ impl Object {
     }
 
     /// The carried bytes as `Malformed` with `why`, whitespace included; nothing when none.
-    pub(super) fn report(&mut self, why: &str, out: &mut Events) {
+    pub(super) fn report(&mut self, why: &'static str, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
         out.push(Event::Malformed {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: MalformedReason::Other(why.to_string()),
+            why: MalformedReason::Other(why.into()),
         });
     }
 

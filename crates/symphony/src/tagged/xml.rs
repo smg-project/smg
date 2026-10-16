@@ -295,7 +295,7 @@ impl Assembler {
         if !tail_bytes.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(tail_bytes),
-                why: MalformedReason::Other(TAG_TAIL.to_string()),
+                why: MalformedReason::Other(TAG_TAIL.into()),
             });
         }
         self.carried.push('>');
@@ -366,7 +366,7 @@ impl Assembler {
             self.drop_carried(out);
             out.push(Event::Malformed {
                 text: Text::uncounted(bytes),
-                why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
+                why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
             });
             return;
         }
@@ -426,7 +426,7 @@ impl Assembler {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(bytes),
-                    why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
+                    why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
                 });
             }
         }
@@ -507,7 +507,7 @@ impl Assembler {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(run),
-                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.to_string()),
+                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
                 });
             }
         }
@@ -658,13 +658,13 @@ impl Assembler {
     }
 
     /// Reports the carried bytes as `Malformed` with `why`, whitespace included.
-    fn report(&mut self, why: &str, out: &mut Events) {
+    fn report(&mut self, why: &'static str, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
         out.push(Event::Malformed {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: MalformedReason::Other(why.to_string()),
+            why: MalformedReason::Other(why.into()),
         });
     }
 

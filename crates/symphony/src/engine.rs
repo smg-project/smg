@@ -684,7 +684,7 @@ impl Engine {
     /// between a block's calls. Each run of whitespace is the template's and is dropped, each run
     /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
     /// wherever the chunks were cut.
-    fn wrapping(&mut self, surplus: &str, why: &str, out: &mut Events) {
+    fn wrapping(&mut self, surplus: &str, why: &'static str, out: &mut Events) {
         for (run, space) in runs(surplus) {
             let run = self.tokens.text(run);
             out.push(if space {
@@ -695,7 +695,7 @@ impl Engine {
             } else {
                 Event::Malformed {
                     text: run,
-                    why: MalformedReason::Other(why.to_string()),
+                    why: MalformedReason::Other(why.into()),
                 }
             });
         }
@@ -861,7 +861,7 @@ impl Engine {
                         why: MalformedReason::UnterminatedRegion,
                     } => Event::Malformed {
                         text,
-                        why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
+                        why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.into()),
                     },
                     event => event,
                 });

@@ -190,7 +190,7 @@ impl Assembler {
             Stage::Malformed => {
                 out.push(Event::Malformed {
                     text: Text::uncounted(text),
-                    why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.to_string()),
+                    why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.into()),
                 });
                 ""
             }
@@ -235,7 +235,7 @@ impl Assembler {
                         self.drop_carried(out);
                         out.push(Event::Malformed {
                             text: Text::uncounted(&text[at..end]),
-                            why: MalformedReason::Other(TEXT_BETWEEN_OBJECTS.to_string()),
+                            why: MalformedReason::Other(TEXT_BETWEEN_OBJECTS.into()),
                         });
                         &text[end..]
                     }
@@ -273,7 +273,7 @@ impl Assembler {
                                 } else {
                                     TEXT_AFTER_THE_OBJECT
                                 }
-                                .to_string(),
+                                .into(),
                             ),
                         }
                     });
@@ -292,7 +292,7 @@ impl Assembler {
             self.stage = Stage::Malformed;
             out.push(Event::Malformed {
                 text,
-                why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.to_string()),
+                why: MalformedReason::Other(TEXT_IN_PLACE_OF_THE_LIST.into()),
             });
         } else {
             self.stage = Stage::Content;

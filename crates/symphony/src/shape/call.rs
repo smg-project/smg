@@ -173,7 +173,7 @@ impl JsonReader {
                 Self::Json(_) => TEXT_AFTER_THE_ARGUMENTS,
                 Self::Envelope(_) => TEXT_AFTER_THE_OBJECT,
             }
-            .to_string(),
+            .into(),
         )
     }
 }
@@ -1064,7 +1064,7 @@ mod tests {
                 arguments("{\"a\": 1}"),
                 Event::Malformed {
                     text: Text::uncounted("</c>x"),
-                    why: MalformedReason::Other(TEXT_AFTER_THE_ARGUMENTS.to_string()),
+                    why: MalformedReason::Other(TEXT_AFTER_THE_ARGUMENTS.into()),
                 },
                 end("</f></c>"),
                 finish(1),
@@ -1235,7 +1235,7 @@ mod tests {
                 end(", "),
                 Event::Malformed {
                     text: Text::uncounted("junk"),
-                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.into()),
                 },
                 wrapper("</f>\n</c>"),
                 content("Done."),
@@ -1984,9 +1984,7 @@ mod tests {
                 member("{\"n\": 7, \"s\": \"x\"", "<k=n> 7 </k><k=s> x </k>"),
                 Event::Malformed {
                     text: Text::uncounted("<k=n>8</k>"),
-                    why: MalformedReason::Other(
-                        super::super::params::KEY_WRITTEN_TWICE.to_string()
-                    ),
+                    why: MalformedReason::Other(super::super::params::KEY_WRITTEN_TWICE.into()),
                 },
                 closed(),
                 end("</c>"),

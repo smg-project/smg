@@ -1,5 +1,7 @@
 //! Typed events. Every byte of model output appears in exactly one event.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// A run of text and, when the parser saw token ids, the number of engine tokens it came from.
@@ -82,8 +84,9 @@ pub enum MalformedReason {
     InvalidArguments,
     /// A tool call named a function the request did not declare.
     UnknownTool,
-    /// Anything else, described.
-    Other(String),
+    /// Anything else, described. The crate's own reasons are fixed texts and borrow; a reason
+    /// built for the occasion is owned. On the wire both are the string, as before.
+    Other(Cow<'static, str>),
 }
 
 /// The finish reason the parser reports after refining the engine's.

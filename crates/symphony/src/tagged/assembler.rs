@@ -191,7 +191,7 @@ impl Assembler {
         if !self.started() {
             self.carried.push_str(&held);
             if matches!(self.stage, Stage::Opening) {
-                self.leftover(MalformedReason::Other(WITHOUT_A_FUNCTION.to_string()), out);
+                self.leftover(MalformedReason::Other(WITHOUT_A_FUNCTION.into()), out);
             } else {
                 self.report_tag(CLOSED_EARLY, out);
             }
@@ -201,7 +201,7 @@ impl Assembler {
             let source = Text::uncounted(std::mem::take(&mut self.carried));
             self.close_object(source, out);
             self.carried = held;
-            self.leftover(MalformedReason::Other(CLOSED_EARLY.to_string()), out);
+            self.leftover(MalformedReason::Other(CLOSED_EARLY.into()), out);
         } else {
             let open_string = self.open_string();
             self.carried.push_str(&held);
@@ -265,7 +265,7 @@ impl Assembler {
 
     /// A tag that is reported, with the carried bytes: the whitespace before it is the template's
     /// and is dropped, the tag's own bytes come back as `Malformed`.
-    fn report_tag(&mut self, why: &str, out: &mut Events) {
+    fn report_tag(&mut self, why: &'static str, out: &mut Events) {
         let text = std::mem::take(&mut self.carried);
         let tag_at = text
             .char_indices()
@@ -280,7 +280,7 @@ impl Assembler {
         if tag_at < text.len() {
             out.push(Event::Malformed {
                 text: Text::uncounted(&text[tag_at..]),
-                why: MalformedReason::Other(why.to_string()),
+                why: MalformedReason::Other(why.into()),
             });
         }
     }
@@ -358,14 +358,14 @@ impl Assembler {
             }
             FUNCTION_CLOSE => {
                 self.carried.push_str(bytes);
-                self.leftover(MalformedReason::Other(WITHOUT_A_FUNCTION.to_string()), out);
+                self.leftover(MalformedReason::Other(WITHOUT_A_FUNCTION.into()), out);
                 self.done = true;
             }
             _ => {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(bytes),
-                    why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
+                    why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
                 });
             }
         }
@@ -407,7 +407,7 @@ impl Assembler {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(run),
-                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.to_string()),
+                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
                 });
             }
         }
@@ -791,8 +791,8 @@ mod tests {
             .count()
     }
 
-    fn other(reason: &str) -> MalformedReason {
-        MalformedReason::Other(reason.to_string())
+    fn other(reason: &'static str) -> MalformedReason {
+        MalformedReason::Other(reason.into())
     }
 
     fn fragment(json: &str, source: &str) -> Event {

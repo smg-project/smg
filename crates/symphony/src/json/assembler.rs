@@ -22,6 +22,8 @@ use crate::{
     },
 };
 
+const WITHOUT_A_NAME: &str = "a tool call without a name";
+
 /// The events of one tool call, from the bytes of its object.
 #[derive(Clone, Debug)]
 pub struct Assembler {
@@ -149,7 +151,7 @@ impl Assembler {
                     if end > 0 {
                         out.push(Event::Malformed {
                             text: Text::uncounted(&self.text[..end]),
-                            why: MalformedReason::Other("a tool call without a name".to_string()),
+                            why: MalformedReason::Other(WITHOUT_A_NAME.into()),
                         });
                     }
                     if close.is_none() {
@@ -704,7 +706,7 @@ mod tests {
             out.drain(),
             vec![Event::Malformed {
                 text: Text::uncounted(r#"{"foo": 1}"#),
-                why: MalformedReason::Other("a tool call without a name".into()),
+                why: MalformedReason::Other(WITHOUT_A_NAME.into()),
             }]
         );
         assembler.finish(&mut out);
@@ -1079,7 +1081,7 @@ mod tests {
             events,
             vec![Event::Malformed {
                 text: Text::uncounted(r#"{"arguments": {"a": 1}, "#),
-                why: MalformedReason::Other("a tool call without a name".into()),
+                why: MalformedReason::Other(WITHOUT_A_NAME.into()),
             }],
             "stopped before its name: no call"
         );

@@ -542,7 +542,7 @@ mod tests {
                 &dropped("\n "),
                 &Event::Malformed {
                     text: Text::uncounted("x"),
-                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.into()),
                 },
                 &dropped("\n"),
                 &dropped("</tool_call>"),
@@ -586,7 +586,7 @@ mod tests {
                 },
                 Event::Malformed {
                     text: Text::uncounted(","),
-                    why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
+                    why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.into()),
                 },
                 Event::ToolCallEnd {
                     index: 0,
@@ -611,7 +611,7 @@ mod tests {
             events[1],
             Event::Malformed {
                 text: Text::uncounted("junk"),
-                why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
+                why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.into()),
             },
             "the block closed at its marker, so the stream did not end inside it"
         );

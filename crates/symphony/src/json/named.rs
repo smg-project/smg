@@ -87,10 +87,9 @@ impl Assembler {
     pub fn close(self, out: &mut Events) {
         match self.object {
             Some(object) => object.finish(out),
-            None => self.header.ended(
-                || MalformedReason::Other(NAME_WITHOUT_A_CALL.to_string()),
-                out,
-            ),
+            None => self
+                .header
+                .ended(|| MalformedReason::Other(NAME_WITHOUT_A_CALL.into()), out),
         }
     }
 
@@ -271,7 +270,7 @@ mod tests {
             events,
             [Event::Malformed {
                 text: Text::uncounted("get_weather"),
-                why: MalformedReason::Other(NAME_WITHOUT_A_CALL.to_string()),
+                why: MalformedReason::Other(NAME_WITHOUT_A_CALL.into()),
             }]
         );
     }

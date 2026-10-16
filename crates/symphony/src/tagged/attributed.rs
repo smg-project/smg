@@ -459,7 +459,7 @@ impl Assembler {
                 } else {
                     out.push(Event::Malformed {
                         text: Text::uncounted(bytes),
-                        why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
+                        why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
                     });
                 }
             }
@@ -479,7 +479,7 @@ impl Assembler {
             self.object.drop_carried(out);
             out.push(Event::Malformed {
                 text: Text::uncounted(bytes),
-                why: MalformedReason::Other(TAG_OUT_OF_PLACE.to_string()),
+                why: MalformedReason::Other(TAG_OUT_OF_PLACE.into()),
             });
         }
     }
@@ -590,7 +590,7 @@ impl Assembler {
                 self.object.drop_carried(out);
                 out.push(Event::Malformed {
                     text: Text::uncounted(run),
-                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.to_string()),
+                    why: MalformedReason::Other(TEXT_BETWEEN_TAGS.into()),
                 });
             }
         }
@@ -622,7 +622,7 @@ impl Assembler {
             });
             out.push(Event::Malformed {
                 text: Text::uncounted(after),
-                why: MalformedReason::Other(TAG_TAIL.to_string()),
+                why: MalformedReason::Other(TAG_TAIL.into()),
             });
             self.object.carried.push_str(&close);
         }
@@ -945,7 +945,7 @@ mod tests {
                 Event::Malformed {
                     text,
                     why: MalformedReason::Other(why),
-                } => Some((text.text.clone(), why.clone())),
+                } => Some((text.text.clone(), why.to_string())),
                 _ => None,
             })
             .collect()

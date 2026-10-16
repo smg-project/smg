@@ -216,7 +216,7 @@ impl Assembler {
                     self.drop_carried(out);
                     out.push(Event::Malformed {
                         text: Text::uncounted(c.to_string()),
-                        why: MalformedReason::Other(TEXT_BETWEEN_CALLS.to_string()),
+                        why: MalformedReason::Other(TEXT_BETWEEN_CALLS.into()),
                     });
                 }
             },
@@ -271,9 +271,7 @@ impl Assembler {
                     self.drop_carried(out);
                     out.push(Event::Malformed {
                         text: Text::uncounted(c.to_string()),
-                        why: MalformedReason::Other(
-                            TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN.to_string(),
-                        ),
+                        why: MalformedReason::Other(TEXT_WHERE_AN_ARGUMENT_SHOULD_BEGIN.into()),
                     });
                 }
             },
@@ -351,13 +349,13 @@ impl Assembler {
         });
     }
 
-    fn report(&mut self, why: &str, out: &mut Events) {
+    fn report(&mut self, why: &'static str, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
         out.push(Event::Malformed {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: MalformedReason::Other(why.to_string()),
+            why: MalformedReason::Other(why.into()),
         });
     }
 
