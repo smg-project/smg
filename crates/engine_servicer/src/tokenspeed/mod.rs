@@ -61,6 +61,12 @@ pub struct TokenSpeedModelInfo {
     pub supports_multimodal: bool,
     /// `smg.grpc.common.Modality` values.
     pub supported_modalities: Vec<i32>,
+    /// Whether the language model's rotary positions are MRoPE (the text rope
+    /// config carries an `mrope_section`), which the launcher reads off the
+    /// checkpoint: a multimodal item's grid tensors then feed positions this
+    /// wire cannot derive and are refused; `Some(false)` lets a patch-layout
+    /// grid through; `None` (a launcher that does not say) refuses as before.
+    pub mrope_positions: Option<bool>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,
     /// TokenSpeed's `ServerArgs` as a JSON object, reported as

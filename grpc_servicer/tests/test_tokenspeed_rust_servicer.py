@@ -299,6 +299,7 @@ def test_model_facts_mirror_the_python_servicer(monkeypatch):
         "supports_vision": True,
         "supports_multimodal": True,
         "supported_modalities": [1, 3],
+        "mrope_positions": None,
         "model_dtype": "bfloat16",
         "multimodal_encoder_dtype": "bfloat16",
         "constrained_decoding": "",
@@ -1127,3 +1128,22 @@ def test_model_facts_carry_the_engines_constrained_decoding_policy(monkeypatch):
     args = SimpleNamespace(model="org/m", constrained_decoding="requested")
     assert rust.model_facts(args, model_config=declared)["constrained_decoding"] == "requested"
     assert "constrained_decoding" not in rust.server_facts(FakeServerArgs())
+
+
+def test_mrope_positions_are_read_off_the_text_rope_config():
+    # Qwen-VL style: the rope scaling carries an mrope_section.
+    qwen_vl = SimpleNamespace(
+        rope_scaling={"rope_type": "default", "mrope_section": [24, 20, 20]},
+    )
+    assert rust.mrope_positions(qwen_vl) is True
+    # Qwen2-VL style: the rope type itself says mrope.
+    assert rust.mrope_positions(SimpleNamespace(rope_scaling={"type": "mrope"})) is True
+    # A nested text config with a plain rope: 1-D positions.
+    plain = SimpleNamespace(
+        text_config={"rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"}},
+    )
+    assert rust.mrope_positions(plain) is False
+    # Dict-shaped configs read the same way; no rope section at all says nothing.
+    assert rust.mrope_positions({"text_config": {"rope_scaling": {"mrope_section": [1]}}}) is True
+    assert rust.mrope_positions(SimpleNamespace(model_type="x")) is None
+    assert rust.mrope_positions(None) is None

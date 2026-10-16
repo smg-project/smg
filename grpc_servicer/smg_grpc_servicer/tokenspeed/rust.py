@@ -147,6 +147,38 @@ def _dtype_name(dtype: Any) -> str:
     return text.removeprefix("torch.")
 
 
+def _config_section(config: Any, name: str) -> Any:
+    """``config[name]`` or ``config.name``, ``None`` when absent."""
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def mrope_positions(hf_config: Any) -> bool | None:
+    """Whether the language model's rotary positions are MRoPE, read off the
+    checkpoint's text rope config: ``rope_scaling`` / ``rope_parameters`` (on the
+    text config when the checkpoint nests one, else the top level) with an
+    ``mrope_section``, or a rope type named ``mrope``. A checkpoint whose rope
+    config is plain (``rope_type: default`` with no section) uses 1-D positions,
+    so its vision grid tensors only lay out the patches. ``None`` when the
+    config carries no rope section at all."""
+    if hf_config is None:
+        return None
+    text = _config_section(hf_config, "text_config") or hf_config
+    found = False
+    for key in ("rope_scaling", "rope_parameters"):
+        rope = _config_section(text, key)
+        if rope is None:
+            continue
+        found = True
+        if _config_section(rope, "mrope_section") is not None:
+            return True
+        kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
+        if isinstance(kind, str) and "mrope" in kind:
+            return True
+    return False if found else None
+
+
 def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, Any]:
     """``TokenSpeedGrpcServer`` keyword arguments for ``GetModelInfo``: the
     Python servicer's ``GetModelInfo`` fields, computed up front."""
@@ -177,6 +209,7 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
         "supports_vision": any(modality in (1, 3) for modality in supported_modalities),
         "supports_multimodal": bool(supported_modalities),
         "supported_modalities": [int(modality) for modality in supported_modalities],
+        "mrope_positions": mrope_positions(model.hf_config),
         "model_dtype": dtype,
         "multimodal_encoder_dtype": dtype,
     }

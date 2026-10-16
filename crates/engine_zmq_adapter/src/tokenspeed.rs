@@ -265,11 +265,44 @@ pub(crate) fn fan_out_tokenspeed_requests(
     })
 }
 
+/// What a multimodal item's `image_grid_thw` / `video_grid_thw` tensors are
+/// for the model served: the inputs of MRoPE position tensors, which nothing
+/// on this wire derives, or the layout of the patches a vision tower reads
+/// while the language model keeps 1-D positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridTensors {
+    /// The grid feeds MRoPE positions (the Qwen-VL families: a rope config
+    /// with an `mrope_section`), or the model is not known either way: an
+    /// item that carries one is refused, since a 1-D fallback would silently
+    /// degrade grounding.
+    Positions,
+    /// The grid only describes the patch layout: the language model's rotary
+    /// positions are 1-D (Muse Spark's `rope_type: default`), so the item
+    /// passes through as the engine expects it.
+    PatchLayout,
+}
+
+impl GridTensors {
+    /// From the model facts' `mrope_positions`, which the launcher derives from
+    /// the checkpoint's text rope config (an `mrope_section` means MRoPE):
+    /// `Some(false)` is a patch layout; `Some(true)`, and `None` for a launcher
+    /// that does not say, keep the conservative reading.
+    pub fn for_model(mrope_positions: Option<bool>) -> Self {
+        match mrope_positions {
+            Some(false) => Self::PatchLayout,
+            Some(true) | None => Self::Positions,
+        }
+    }
+}
+
 /// Translate a TokenSpeed proto `GenerateRequest` into the wire
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
-/// tokenizes upstream).
-pub(crate) fn translate_request_tokenspeed(
+/// tokenizes upstream). `grid_tensors` says whether a multimodal item's grid
+/// tensors are MRoPE positions, refused on this wire, or a patch layout that
+/// passes ([`GridTensors`]).
+pub(crate) fn translate_request_tokenspeed_for(
     req: tokenspeed_proto::GenerateRequest,
+    grid_tensors: GridTensors,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let mut input_ids = match req.tokenized {
         Some(tokenized) => tokenized.input_ids,
@@ -279,7 +312,8 @@ pub(crate) fn translate_request_tokenspeed(
     };
     let (input_ids_unpadded, multimodal_inputs) = match req.mm_inputs {
         Some(mm) => {
-            let (unpadded, inputs) = translate_tokenspeed_multimodal(mm, &mut input_ids)?;
+            let (unpadded, inputs) =
+                translate_tokenspeed_multimodal(mm, &mut input_ids, grid_tensors)?;
             (Some(unpadded), Some(inputs))
         }
         None => (None, None),
@@ -328,6 +362,7 @@ pub(crate) fn translate_request_tokenspeed(
 pub(crate) fn translate_tokenspeed_multimodal(
     mm: tokenspeed_proto::MultimodalInputs,
     input_ids: &mut [u32],
+    grid_tensors: GridTensors,
 ) -> Result<(Vec<u32>, TokenSpeedWireMmInputs), String> {
     if mm.items.is_empty() {
         return Err("multimodal payload carried no items".to_string());
@@ -407,9 +442,11 @@ pub(crate) fn translate_tokenspeed_multimodal(
         // Nothing on the msgpack path computes `mrope_positions` (the engine's
         // InputProcessor is bypassed), and shipping nil silently degrades
         // image grounding to 1-D positions. For the known MRoPE families the
-        // grid tensors are the tell: fail loudly rather than succeed wrong.
+        // grid tensors are the tell: fail loudly rather than succeed wrong. A
+        // model whose grid only lays out the patches (`GridTensors::PatchLayout`)
+        // keeps 1-D positions, and its items pass.
         for key in ["image_grid_thw", "video_grid_thw"] {
-            if model_specific_data.contains_key(key) {
+            if grid_tensors == GridTensors::Positions && model_specific_data.contains_key(key) {
                 return Err(format!(
                     "multimodal item carries {key:?}: MRoPE position tensors are not \
                      derivable over the TokenSpeed ZMQ wire yet; use the gRPC transport \
@@ -803,13 +840,15 @@ mod tests {
         // logprob (count 0/1 in `top_logprobs_num` is the same case).
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.return_logprob = true;
-        let wire = translate_request_tokenspeed(req).expect("return_logprob accepted");
+        let wire = translate_request_tokenspeed_for(req, GridTensors::Positions)
+            .expect("return_logprob accepted");
         assert!(wire.return_logprob);
 
         // Unset -> the flag stays false.
-        let wire = translate_request_tokenspeed(ts_tokenized_req(
-            tokenspeed_proto::SamplingParams::default(),
-        ))
+        let wire = translate_request_tokenspeed_for(
+            ts_tokenized_req(tokenspeed_proto::SamplingParams::default()),
+            GridTensors::Positions,
+        )
         .expect("no logprobs accepted");
         assert!(!wire.return_logprob);
     }
@@ -819,18 +858,18 @@ mod tests {
         // Top-k logprobs (count > 1) cannot be honored over the wire.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.top_logprobs_num = 5;
-        assert!(translate_request_tokenspeed(req).is_err());
+        assert!(translate_request_tokenspeed_for(req, GridTensors::Positions).is_err());
 
         // Prompt (input) logprobs cannot be produced.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.token_ids_logprob = vec![1, 2];
-        assert!(translate_request_tokenspeed(req).is_err());
+        assert!(translate_request_tokenspeed_for(req, GridTensors::Positions).is_err());
 
         // A bare count of 0/1 is the plain sampled-token case: accepted.
         for count in [0, 1] {
             let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
             req.top_logprobs_num = count;
-            assert!(translate_request_tokenspeed(req).is_ok());
+            assert!(translate_request_tokenspeed_for(req, GridTensors::Positions).is_ok());
         }
     }
 
@@ -881,13 +920,15 @@ mod tests {
         // String stops are resolved upstream; any that reach here are dropped
         // (the token-only engine cannot match them) while stop token ids ride
         // through and the router-side decoder trims residual text.
-        let req =
-            translate_request_tokenspeed(ts_tokenized_req(tokenspeed_proto::SamplingParams {
+        let req = translate_request_tokenspeed_for(
+            ts_tokenized_req(tokenspeed_proto::SamplingParams {
                 stop: vec!["</s>".to_string()],
                 stop_token_ids: vec![13],
                 ..Default::default()
-            }))
-            .expect("residual stop strings must not be rejected");
+            }),
+            GridTensors::Positions,
+        )
+        .expect("residual stop strings must not be rejected");
         assert_eq!(req.sampling_params.stop_token_ids, Some(vec![13]));
         assert_eq!(req.sampling_params.stop, None);
     }
@@ -929,7 +970,8 @@ mod tests {
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(&0xDEAD_BEEFu64.to_le_bytes(), 1, 3)],
         });
-        let wire = translate_request_tokenspeed(req).expect("translated");
+        let wire =
+            translate_request_tokenspeed_for(req, GridTensors::Positions).expect("translated");
 
         let expected_pad = mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF);
         assert_eq!(
@@ -957,18 +999,22 @@ mod tests {
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(b"12345678", 1, 3)],
         });
-        assert!(translate_request_tokenspeed(req)
-            .unwrap_err()
-            .contains("exceeds"));
+        assert!(
+            translate_request_tokenspeed_for(req, GridTensors::Positions)
+                .unwrap_err()
+                .contains("exceeds")
+        );
 
         // Missing content hash: pad value cannot be derived.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(b"", 0, 1)],
         });
-        assert!(translate_request_tokenspeed(req)
-            .unwrap_err()
-            .contains("content hash"));
+        assert!(
+            translate_request_tokenspeed_for(req, GridTensors::Positions)
+                .unwrap_err()
+                .contains("content hash")
+        );
 
         // Byte-length mismatch would be silently dropped engine-side; the
         // translate must catch it while the client can still see an error.
@@ -976,18 +1022,22 @@ mod tests {
         let mut item = ts_mm_item(b"12345678", 0, 1);
         item.encoder_input.as_mut().unwrap().shape = vec![3, 4];
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(translate_request_tokenspeed(req)
-            .unwrap_err()
-            .contains("byte length"));
+        assert!(
+            translate_request_tokenspeed_for(req, GridTensors::Positions)
+                .unwrap_err()
+                .contains("byte length")
+        );
 
         // Unspecified modality is rejected, mirroring the gRPC servicer.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         let mut item = ts_mm_item(b"12345678", 0, 1);
         item.modality = common::Modality::Unspecified as i32;
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(translate_request_tokenspeed(req)
-            .unwrap_err()
-            .contains("modality"));
+        assert!(
+            translate_request_tokenspeed_for(req, GridTensors::Positions)
+                .unwrap_err()
+                .contains("modality")
+        );
 
         // Known MRoPE families fail loudly: nothing derives mrope_positions
         // on this wire, and 1-D fallback would silently degrade grounding.
@@ -1004,9 +1054,52 @@ mod tests {
             },
         );
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(translate_request_tokenspeed(req)
-            .unwrap_err()
-            .contains("MRoPE"));
+        assert!(
+            translate_request_tokenspeed_for(req, GridTensors::Positions)
+                .unwrap_err()
+                .contains("MRoPE")
+        );
+    }
+
+    #[test]
+    fn a_patch_layout_grid_passes_for_a_model_whose_positions_are_one_dimensional() {
+        let grid = tokenspeed_proto::TensorData {
+            shape: vec![1, 3],
+            dtype: "uint32".to_string(),
+            payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                vec![0u8; 12].into(),
+            )),
+        };
+        let with_grid = || {
+            let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+            let mut item = ts_mm_item(b"12345678", 0, 1);
+            item.model_specific_tensors
+                .insert("image_grid_thw".to_string(), grid.clone());
+            req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+            req
+        };
+        // The model's rope facts decide: a model whose grid only lays out the
+        // patches (1-D positions) keeps the tensor on the wire; one that
+        // needs MRoPE positions, or a launcher that does not say, is refused
+        // as before.
+        assert_eq!(
+            GridTensors::for_model(Some(false)),
+            GridTensors::PatchLayout
+        );
+        assert_eq!(GridTensors::for_model(Some(true)), GridTensors::Positions);
+        assert_eq!(GridTensors::for_model(None), GridTensors::Positions);
+        let wire = translate_request_tokenspeed_for(with_grid(), GridTensors::PatchLayout)
+            .expect("a patch-layout grid passes");
+        let items = &wire
+            .multimodal_inputs
+            .expect("multimodal inputs on the wire")
+            .mm_items;
+        assert!(items[0].model_specific_data.contains_key("image_grid_thw"));
+        assert!(
+            translate_request_tokenspeed_for(with_grid(), GridTensors::Positions)
+                .unwrap_err()
+                .contains("MRoPE")
+        );
     }
 
     #[test]

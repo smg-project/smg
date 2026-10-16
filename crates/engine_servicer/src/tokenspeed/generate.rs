@@ -12,7 +12,8 @@ use std::{
 };
 
 use engine_zmq_adapter::{
-    stops::take_tokenspeed_string_stops, to_tokenspeed_response, TokenSpeedGenerateStream,
+    stops::take_tokenspeed_string_stops, to_tokenspeed_response, GridTensors,
+    TokenSpeedGenerateStream,
 };
 use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
@@ -64,7 +65,12 @@ pub(super) async fn generate(
         .map(|params| take_tokenspeed_string_stops(params, tokenizer))
         .unwrap_or_default();
     let decoder = stop_decoder(tokenizer, &stops, skip_special_tokens)?;
-    let subs = client.generate_tokenspeed_streams(req).await?;
+    let subs = client
+        .generate_tokenspeed_streams_for_model(
+            req,
+            GridTensors::for_model(state.model.mrope_positions),
+        )
+        .await?;
     let mut choices = SelectAll::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
