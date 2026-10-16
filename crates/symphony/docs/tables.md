@@ -62,7 +62,11 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   content, the model's own (the legacy parser trims them; bellwether #17's question, as for Qwen3).
   The family's reference parser is the one that looks for the block after the two newlines. The prompt ends with `<think>` in thinking mode and with `</think>` right after
   `<｜Assistant｜>` in chat mode, so the replay starts the output inside the thought or in the content;
-  bellwether has not recorded the group's set yet.
+  bellwether has not recorded the group's set yet. The table is pinned against the turns the
+  family's reference encoder (the model repository's `encoding` module) renders for a tool-calling
+  conversation, each read as the encoder's own parser reads it: every kind of value, two invokes in
+  one block, a call after content, and an invoke with no parameters, which the encoder writes with
+  an empty line inside and the table reads as `{}`.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 
