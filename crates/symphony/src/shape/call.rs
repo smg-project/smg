@@ -591,6 +591,7 @@ mod tests {
     use crate::{
         engine::Engine,
         format::{CallSyntax, Emits, Format},
+        ids::CallIds,
         input::{EngineFinish, Input, TokenSpan},
         parser::Parser,
         shape::{
@@ -739,7 +740,8 @@ mod tests {
         let mut plans: Vec<Vec<usize>> = vec![vec![], starts.clone()];
         plans.extend(starts.iter().map(|&cut| vec![cut]));
         let mut runs = plans.iter().map(|cuts| {
-            let mut engine = Engine::new(format.clone(), declared.clone());
+            let mut engine =
+                Engine::with_call_ids(Arc::new(format.clone()), declared.clone(), ids());
             let mut out = Events::new();
             engine
                 .feed(
@@ -797,10 +799,14 @@ mod tests {
         }
     }
 
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+
     fn start(name: &str, source: &str) -> Event {
         Event::ToolCallStart {
             index: 0,
-            id: "call_0".to_string(),
+            id: ids().id(0),
             name: name.to_string(),
             source: Text::uncounted(source),
         }

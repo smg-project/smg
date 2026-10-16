@@ -38,7 +38,14 @@ pub fn deepseek_v4_1() -> Format {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::ids::CallIds;
+
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Events, Text},
@@ -61,7 +68,8 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(deepseek_v4_1(), Declared::default());
+        let mut parser =
+            Engine::with_call_ids(Arc::new(deepseek_v4_1()), Declared::default(), ids());
         let mut out = Events::new();
         parser
             .feed(
@@ -156,7 +164,7 @@ mod tests {
             events[7],
             Event::ToolCallStart {
                 index: 0,
-                id: "call_0".into(),
+                id: ids().id(0),
                 name: "ChaDri_change_drink".into(),
                 source: Text::uncounted("ChaDri_change_drink\">"),
             }

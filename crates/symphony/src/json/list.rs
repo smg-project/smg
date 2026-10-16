@@ -39,6 +39,7 @@
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
+    ids::CallIds,
     json,
 };
 
@@ -47,10 +48,13 @@ const TEXT_AFTER_THE_LIST: &str = "text after the list's end";
 const TEXT_AFTER_THE_OBJECT: &str = "text after the call's object";
 const TEXT_IN_PLACE_OF_THE_LIST: &str = "text where the list of calls should be";
 
-/// The events of a JSON list of calls, each call with its own index from `first`.
+/// The events of a JSON list of calls, each call with its own index from `first` and its id from
+/// the engine's [`CallIds`].
 #[derive(Debug)]
 pub struct Assembler {
     next_index: u32,
+    /// Where the calls' ids count from.
+    ids: CallIds,
     stage: Stage,
     /// Bytes no event has accounted for yet; the next event takes them as its source.
     carried: String,
@@ -88,11 +92,12 @@ enum Stage {
 }
 
 impl Assembler {
-    /// An assembler positioned at the output's start, the first call taking index `first`: the
-    /// bare list, where anything but a list is prose.
-    pub fn new(first: u32) -> Self {
+    /// An assembler positioned at the output's start, the first call taking index `first` and the
+    /// ids counting from `ids`: the bare list, where anything but a list is prose.
+    pub fn new(first: u32, ids: CallIds) -> Self {
         Self {
             next_index: first,
+            ids,
             stage: Stage::Deciding,
             carried: String::new(),
             objects: 0,
@@ -104,19 +109,19 @@ impl Assembler {
     }
 
     /// [`Self::new`], also reading a `{` at the first byte as one call alone.
-    pub fn object_or_list(first: u32) -> Self {
+    pub fn object_or_list(first: u32, ids: CallIds) -> Self {
         Self {
             lone_object: true,
-            ..Self::new(first)
+            ..Self::new(first, ids)
         }
     }
 
     /// An assembler positioned after the marker that opens the list's region, the first call
     /// taking index `first`: anything but a list is malformed.
-    pub fn framed(first: u32) -> Self {
+    pub fn framed(first: u32, ids: CallIds) -> Self {
         Self {
             framed: true,
-            ..Self::new(first)
+            ..Self::new(first, ids)
         }
     }
 
@@ -185,10 +190,8 @@ impl Assembler {
                     self.drop_carried(out);
                     let index = self.next_index;
                     self.objects += 1;
-                    self.stage = Stage::Object(Box::new(json::Assembler::new(
-                        index,
-                        format!("call_{index}"),
-                    )));
+                    self.stage =
+                        Stage::Object(Box::new(json::Assembler::new(index, self.ids.id(index))));
                     &text[at..]
                 } else {
                     self.not_a_list(&text[at..], out);
@@ -222,7 +225,7 @@ impl Assembler {
                         self.objects += 1;
                         self.stage = Stage::Object(Box::new(json::Assembler::new(
                             index,
-                            format!("call_{index}"),
+                            self.ids.id(index),
                         )));
                         &text[at..]
                     }
@@ -345,13 +348,17 @@ impl crate::engine::CallAssembler for Assembler {
 mod tests {
     use super::*;
 
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+
     const LIST: &str = concat!(
         "[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}, ",
         "{\"name\": \"get_stock_price\", \"arguments\": {}}]"
     );
 
     fn run(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::new(0);
+        let mut assembler = Assembler::new(0, ids());
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -518,7 +525,7 @@ mod tests {
     }
 
     fn run_alone(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::object_or_list(0);
+        let mut assembler = Assembler::object_or_list(0, ids());
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -651,7 +658,7 @@ mod tests {
             "  [Note: draft] ok",
             "{\"name\": \"f\", \"arguments\": {}}",
         ] {
-            let mut assembler = Assembler::framed(0);
+            let mut assembler = Assembler::framed(0, ids());
             let mut out = Events::new();
             assembler.feed(output, &mut out);
             assembler.close(&mut out);
@@ -666,7 +673,7 @@ mod tests {
             );
         }
         // The list itself reads the same between markers.
-        let mut assembler = Assembler::framed(0);
+        let mut assembler = Assembler::framed(0, ids());
         let mut out = Events::new();
         assembler.feed(LIST, &mut out);
         assembler.close(&mut out);

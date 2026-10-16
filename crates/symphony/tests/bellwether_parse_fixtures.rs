@@ -71,6 +71,10 @@
 //! not set, and the run says where. `BELLWETHER_VERBOSE=1` prints the per-case report on stdout
 //! too, as the run did before it went to a file.
 
+#[expect(
+    dead_code,
+    reason = "the integration tests share these helpers, and this one keeps an id by its number, not its shape"
+)]
 mod common;
 
 use std::{
@@ -2595,9 +2599,13 @@ fn checked(fixture: &Fixture, plan: &str, events: &[Event], failures: &mut Vec<S
         ));
     }
     let mut index = 0;
+    let mut first = None;
     for event in events {
         if let Event::ToolCallStart { index: i, id, .. } = event {
-            if *i != index || *id != format!("call_{index}") {
+            // The ids count from a nonce of the engine's own, `call_` and 24 hex characters.
+            let number = common::minted_id(id);
+            let origin = *first.get_or_insert(number);
+            if *i != index || number.is_none() || number != origin.map(|f| f + u128::from(index)) {
                 failures.push(format!(
                     "{}: call index {i} / id {id} on the {plan} replay",
                     fixture.id

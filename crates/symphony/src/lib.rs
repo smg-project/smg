@@ -30,6 +30,7 @@ pub mod format;
 pub mod formats;
 pub mod gemma;
 pub mod grammar;
+pub mod ids;
 pub mod input;
 pub mod json;
 pub mod markers;
@@ -50,6 +51,7 @@ pub use grammar::{
     Bound, Grammar, GrammarStart, Output, OutputAnswer, OutputChoice, OutputPosition,
     OutputSpelling, Tag, Turn,
 };
+pub use ids::CallIds;
 pub use input::{EngineFinish, Input, TokenSpan};
 pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};

@@ -33,7 +33,19 @@ pub fn qwen3(syntax: CallSyntax) -> Format {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::ids::CallIds;
+
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+
+    /// An engine whose ids count from the one nonce, so that the events of two engines compare.
+    fn engine(format: Format, declared: Declared) -> Engine {
+        Engine::with_call_ids(Arc::new(format), declared, ids())
+    }
     use crate::{
         engine::{Engine, BLOCK_WITHOUT_A_COMPLETE_CALL, TEXT_AFTER_THE_OBJECT},
         event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
@@ -53,7 +65,7 @@ mod tests {
     }
 
     fn run(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         for piece in pieces {
             parser.feed(delta(piece), &mut out).expect("delta");
@@ -161,7 +173,7 @@ mod tests {
                 dropped("<tool_call>"),
                 Event::ToolCallStart {
                     index: 0,
-                    id: "call_0".into(),
+                    id: ids().id(0),
                     name: "get_weather".into(),
                     source: Text::uncounted("\n{\"name\": \"get_weather\", \"arguments\": "),
                 },
@@ -217,8 +229,8 @@ mod tests {
         assert_eq!(
             starts,
             vec![
-                (0, "call_0".into(), "get_weather".into()),
-                (1, "call_1".into(), "get_time".into()),
+                (0, ids().id(0), "get_weather".into()),
+                (1, ids().id(1), "get_time".into()),
             ]
         );
         assert_eq!(
@@ -575,7 +587,7 @@ mod tests {
                 dropped("<tool_call>"),
                 Event::ToolCallStart {
                     index: 0,
-                    id: "call_0".into(),
+                    id: ids().id(0),
                     name: "f".into(),
                     source: Text::uncounted("\n{\"name\": \"f\", \"arguments\": "),
                 },
@@ -624,7 +636,7 @@ mod tests {
             .collect();
         assert_eq!(
             starts,
-            vec![(0, "call_0".into())],
+            vec![(0, ids().id(0))],
             "the real call takes the first index"
         );
         assert_eq!(
@@ -705,7 +717,7 @@ mod tests {
         ];
         let text: String = tokens.concat();
         let spans = spans_of(&tokens);
-        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         parser
             .feed(
@@ -771,7 +783,7 @@ mod tests {
             ("</think>", &[(0, 8)]),
             ("", &[(0, 0)]),
         ];
-        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         for (text, ranges) in pieces {
             let spans: Vec<TokenSpan> = ranges
@@ -833,7 +845,7 @@ mod tests {
     #[test]
     fn a_token_cut_by_a_delta_boundary_is_counted_once_and_a_special_token_counts_into_what_follows(
     ) {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         let first = [TokenSpan {
             token_id: 1,
@@ -900,7 +912,7 @@ mod tests {
 
     #[test]
     fn a_stream_that_turns_uncounted_reports_no_reasoning_count() {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         let spans = [TokenSpan {
             token_id: 0,
@@ -988,7 +1000,7 @@ mod tests {
     );
 
     fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
-        let mut parser = Engine::new(
+        let mut parser = engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
             declared(),
         );
@@ -1022,7 +1034,7 @@ mod tests {
                 dropped("<tool_call>"),
                 Event::ToolCallStart {
                     index: 0,
-                    id: "call_0".into(),
+                    id: ids().id(0),
                     name: "get_weather".into(),
                     source: Text::uncounted("\n<function=get_weather>"),
                 },
@@ -1088,8 +1100,8 @@ mod tests {
         assert_eq!(
             starts,
             vec![
-                (0, "call_0".to_string(), "get_weather".to_string()),
-                (1, "call_1".to_string(), "lookup".to_string()),
+                (0, ids().id(0), "get_weather".to_string()),
+                (1, ids().id(1), "lookup".to_string()),
             ]
         );
         assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris", "days": 3}"#);
@@ -1161,7 +1173,7 @@ mod tests {
 
     /// The prompt, then the whole output in one delta, then the engine's stop.
     fn after_prompt(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(
+        let mut parser = engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
             declared(),
         );
@@ -1242,7 +1254,7 @@ mod tests {
     /// The prompt, then the whole output in one delta, then the engine's stop, under the JSON
     /// syntax.
     fn after_prompt_json(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         parser
             .feed(
@@ -1317,7 +1329,7 @@ mod tests {
         let bare = Format::new("bare")
             .state("call", Emits::Arguments)
             .calls(CallSyntax::Json);
-        let mut parser = Engine::new(bare, Declared::default());
+        let mut parser = engine(bare, Declared::default());
         let mut out = Events::new();
         parser
             .feed(
@@ -1357,7 +1369,7 @@ mod tests {
         let prompt = "<|user|>\nWhy did you print <tool_call> there?<|endofturn|>\n\
                       <|assistant|>\n<think>\n";
         let output = "The user asks about the marker.\n</think>\n\nIt opens a tool call.";
-        let mut parser = Engine::new(
+        let mut parser = engine(
             qwen3(CallSyntax::Json).opens_turn("<|assistant|>"),
             Declared::default(),
         );
@@ -1391,7 +1403,7 @@ mod tests {
     fn submit_patch(placement: Placement) -> Engine {
         use openai_protocol::common::{Function, Tool};
         use serde_json::json as value;
-        Engine::new(
+        engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, placement)),
             Declared::of(&[Tool {
                 tool_type: "function".to_string(),
@@ -1494,7 +1506,7 @@ mod tests {
 
     #[test]
     fn inputs_out_of_order_are_lifecycle_errors() {
-        let mut parser = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut parser = engine(qwen3(CallSyntax::Json), Declared::default());
         let mut out = Events::new();
         parser
             .feed(

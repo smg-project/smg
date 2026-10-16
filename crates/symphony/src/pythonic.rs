@@ -21,6 +21,7 @@
 
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
+    ids::CallIds,
     tagged::value::{json, python_literal},
 };
 
@@ -73,11 +74,14 @@ const NAME_WITHOUT_A_CALL: &str = "a name without a call";
 const ARGUMENT_CUT_SHORT: &str = "an argument the call's end cut short";
 const KEY_WITHOUT_A_VALUE: &str = "a key without a value";
 
-/// The events of the pythonic calls in one region, each call with its own index from `first`.
+/// The events of the pythonic calls in one region, each call with its own index from `first` and
+/// its id from the engine's [`CallIds`].
 #[derive(Clone, Debug)]
 pub struct Assembler {
     /// The index of the next call to start.
     next_index: u32,
+    /// Where the calls' ids count from.
+    ids: CallIds,
     /// The current call's index, once it started.
     index: u32,
     /// Bytes no event has accounted for yet, in order; the next event takes them as its source.
@@ -140,10 +144,12 @@ impl Extent {
 }
 
 impl Assembler {
-    /// An assembler for the calls of one region, the first taking index `first`.
-    pub fn new(first: u32) -> Self {
+    /// An assembler for the calls of one region, the first taking index `first`, their ids
+    /// counting from `ids`.
+    pub fn new(first: u32, ids: CallIds) -> Self {
         Self {
             next_index: first,
+            ids,
             index: first,
             carried: String::new(),
             stage: Stage::Between,
@@ -237,7 +243,7 @@ impl Assembler {
                     self.written = 0;
                     out.push(Event::ToolCallStart {
                         index: self.index,
-                        id: format!("call_{}", self.index),
+                        id: self.ids.id(self.index),
                         name,
                         source: Text::uncounted(format!("{source}(")),
                     });
@@ -391,8 +397,12 @@ impl crate::engine::CallAssembler for Assembler {
 mod tests {
     use super::*;
 
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+
     fn run(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::new(0);
+        let mut assembler = Assembler::new(0, ids());
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -459,7 +469,7 @@ mod tests {
             events[0],
             Event::ToolCallStart {
                 index: 0,
-                id: "call_0".into(),
+                id: ids().id(0),
                 name: "get_weather".into(),
                 source: Text::uncounted("get_weather("),
             }
@@ -518,7 +528,7 @@ mod tests {
             .any(|event| matches!(event, Event::ToolCallEnd { .. })));
         assert_eq!(bytes(&events), "get_weather(city=\"Par");
 
-        let mut assembler = Assembler::new(3);
+        let mut assembler = Assembler::new(3, ids());
         let mut out = Events::new();
         assembler.feed("get_weather(city=\"Par", &mut out);
         assembler.finish(&mut out);

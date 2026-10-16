@@ -112,7 +112,8 @@ what a turn contains.
 Ids: a call id of the form `call_<suffix>` becomes `toolu_<suffix>`, the prefix Anthropic SDKs and
 tooling pattern-match; any other shape passes through unchanged, since a model family whose id
 format is load-bearing in the prompt must keep it. The rule is deterministic, so a client echoing
-the id back names the same call.
+the id back names the same call, and the engine's ids (`call_` and 24 hex characters counting from
+a nonce of the request's own, `docs/engine.md`) give `toolu_` ids that repeat in no other request.
 
 Stop reason, from the `Finish` event: `length` is `max_tokens`, and parsed calls do not override a
 truncation; `tool_calls`, and any other reason after at least one tool call, are `tool_use`, since a

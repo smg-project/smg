@@ -51,8 +51,14 @@ What the engine decides for every format, and what it leaves open:
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
   request did not declare has every value inferred.
-- Call ids are `call_<index>` for now; the id scheme is the maintainer's decision
-  (deterministic or carrying the conversation's history) and changes only this one line.
+- Call ids are `call_` and 24 lowercase hex characters, the shape the gateway's older parsers
+  mint, so a client tells no difference. The engine draws a nonce at random when it is made
+  (`CallIds::fresh`: 96 random bits; not a UUIDv7, whose in-process counter steps consecutive
+  values by one) and the output's call `index` is the nonce `index` steps on: an id repeats in
+  no other request, since a client pairs its tool results with its calls by id across a
+  conversation, and is the same for one output however its stream is cut.
+  `Engine::with_call_ids` names the nonce for a replay that wants the ids reproducible. No table
+  or assembler chooses an id (`ids.rs`).
 - Every text event says how many tokens it carries, counted by the `Ledger` from the deltas'
   spans: a token in the event that carries its first byte, a byte-less span (a held half of a
   character, or a hidden special token) into the run that carries the next byte, and the tokens

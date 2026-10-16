@@ -230,7 +230,12 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::event::{DropReason, MalformedReason, Text};
+    use crate::{
+        event::{DropReason, MalformedReason, Text},
+        formats::qwen3,
+        ids::is_minted,
+        CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
+    };
 
     fn wire(choice: Option<ChatStreamChoice>) -> Value {
         serde_json::to_value(choice.expect("a choice")).expect("serializable")
@@ -646,5 +651,70 @@ mod tests {
         assert_eq!(kinds, ["reasoning", "tool_call", "tool_call", "finish"]);
         assert!(choices.iter().all(|c| c.index == 2));
         assert_eq!(choices[3].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    /// The events of `output` read by the Qwen3 table through an engine of its own, as the gateway
+    /// reads each request.
+    fn parsed(output: &str) -> Vec<Event> {
+        let mut engine = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("a delta");
+        engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("the end");
+        out.drain()
+    }
+
+    /// Two calls of Qwen3's syntax in one output.
+    const TWO_CALLS: &str = concat!(
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n",
+        "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"zone\": \"CET\"}}\n</tool_call>"
+    );
+
+    #[test]
+    fn two_turns_of_two_calls_carry_four_distinct_ids_the_deltas_and_the_message_agree_on() {
+        // A client pairs its tool results with its calls by id across the conversation: no id
+        // of one turn may come back in the next, and the stream must name the call as the
+        // message does.
+        let mut seen: Vec<String> = Vec::new();
+        for turn in 0..2 {
+            let events = parsed(TWO_CALLS);
+            let in_message: Vec<String> = message(0, &events)
+                .message
+                .tool_calls
+                .unwrap_or_default()
+                .into_iter()
+                .map(|call| call.id)
+                .collect();
+            let in_deltas: Vec<String> = deltas(0, &events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.tool_calls)
+                .flatten()
+                .filter_map(|call| call.id)
+                .collect();
+            assert_eq!(in_message.len(), 2, "turn {turn}: {in_message:?}");
+            assert_eq!(in_deltas, in_message, "turn {turn}");
+            for id in &in_message {
+                assert!(is_minted(id), "turn {turn}: {id}");
+            }
+            seen.extend(in_message);
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "{seen:?}");
     }
 }

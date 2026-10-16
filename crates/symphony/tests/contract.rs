@@ -1768,7 +1768,8 @@ impl Said {
                 Event::ToolCallStart {
                     index, id, name, ..
                 } => {
-                    said.calls.push((*index, id.clone(), name.clone()));
+                    said.calls
+                        .push((*index, common::id_shape(id), name.clone()));
                     said.arguments.push((*index, String::new()));
                 }
                 Event::ToolCallArguments { index, json, .. } => {
@@ -2004,14 +2005,42 @@ fn the_event_stream_is_well_formed_under_every_chunking() {
 }
 
 #[test]
-fn calls_are_numbered_from_zero_in_order_with_ids_that_follow_the_index() {
+fn calls_are_numbered_from_zero_in_order_with_ids_that_count_from_a_nonce_of_the_engines_own() {
     // The whole output is enough: chunking invariance above makes every other cut say the same.
+    fn starts(events: &[Event]) -> Vec<(u32, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { index, id, .. } => Some((*index, id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
     for (subject, text) in corpus() {
         let events = replay(subject, text, &[], false)
             .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
-        for (position, (index, id, _)) in Said::of(&events).calls.iter().enumerate() {
+        let calls = starts(&events);
+        let first = calls.first().and_then(|(_, id)| common::minted_id(id));
+        for (position, (index, id)) in calls.iter().enumerate() {
             assert_eq!(*index as usize, position, "{}: {text:?}", subject.name);
-            assert_eq!(id, &format!("call_{index}"), "{}: {text:?}", subject.name);
+            let number = common::minted_id(id).unwrap_or_else(|| {
+                panic!(
+                    "{}: {text:?}: id {id:?} is not call_ and 24 hex",
+                    subject.name
+                )
+            });
+            assert_eq!(
+                Some(number),
+                first.map(|first| first + position as u128),
+                "{}: {text:?}: {id} does not count from the first id",
+                subject.name
+            );
+        }
+        // Another engine over the same output is another request: it repeats none of the ids.
+        let again = replay(subject, text, &[], false)
+            .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
+        for ((_, id), (_, other)) in calls.iter().zip(starts(&again)) {
+            assert_ne!(id, &other, "{}: {text:?}", subject.name);
         }
     }
 }

@@ -596,6 +596,47 @@ async fn symphony_streams_a_message_as_thinking_text_and_tool_use_blocks() {
     assert!(!text.contains("<tool_call>"), "{text:?}");
 }
 
+/// The `tool_use` ids a streamed message opened, in order.
+fn tool_use_ids(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "tool_use"
+        })
+        .map(|event| {
+            event["content_block"]["id"]
+                .as_str()
+                .expect("a tool_use id")
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn two_symphony_messages_never_share_a_tool_use_id() {
+    // A client keeps its tool_use blocks and tool_results by id across a conversation: a second
+    // turn's call must not come back under the first turn's id, and the id has the shape the
+    // older parsers mint (`toolu_` and 24 hex characters).
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let spec = assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+        let responses = vec![chunk(0, QWEN3_OUTPUT), complete(0, "stop")];
+        let (result, events) = message_events(responses, spec, None).await;
+        assert!(result.is_ok(), "{result:?}");
+        let turn = tool_use_ids(&events);
+        assert_eq!(turn.len(), 1, "{turn:?}");
+        ids.extend(turn);
+    }
+    assert_ne!(ids[0], ids[1], "{ids:?}");
+    for id in &ids {
+        let hex = id.strip_prefix("toolu_").unwrap_or_else(|| panic!("{id}"));
+        assert!(
+            hex.len() == 24 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{id}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn symphony_message_stop_reasons_follow_the_finish_and_the_matched_stop() {
     // The token limit.

@@ -509,7 +509,8 @@ impl Said {
                 Event::ToolCallStart {
                     index, id, name, ..
                 } => {
-                    said.calls.push((*index, id.clone(), name.clone()));
+                    said.calls
+                        .push((*index, common::id_shape(id), name.clone()));
                     said.arguments.push((*index, String::new()));
                 }
                 Event::ToolCallArguments { index, json, .. } => {

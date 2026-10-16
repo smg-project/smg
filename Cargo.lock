@@ -8157,6 +8157,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "openai-protocol",
+ "rand 0.10.2",
  "regex",
  "serde",
  "serde_json",
