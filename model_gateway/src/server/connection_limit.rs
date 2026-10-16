@@ -18,7 +18,9 @@
 //! connection end without a response (an end of stream, or a reset when it
 //! had already sent its request), as it does when a listener's backlog
 //! overflows, and should retry with backoff. Each refusal is counted in
-//! `smg_http_connections_rejected_total`. Readiness is unaffected: the bound
+//! `smg_http_connections_rejected_total`; the log carries one WARN per
+//! minute while refusals happen, with the running count, so an episode shows
+//! in the logs as well as on the counter. Readiness is unaffected: the bound
 //! protects the process, which is not the orchestrator's cue to restart it.
 //! Probes that reach the gateway through the bounded listener are subject to
 //! the bound like every other connection; the dedicated probe listener
@@ -37,6 +39,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use axum_server::accept::Accept;
@@ -55,13 +58,28 @@ struct Bound {
     permits: Arc<Semaphore>,
 }
 
+/// How often refusals reach the log at WARN while they go on: the first at
+/// once, then at most one per interval, with the running count.
+const WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The bound and what became of the connections it saw, readable in
 /// process: how many are open under it now, how many it refused. The
 /// counter `smg_http_connections_rejected_total` carries the refusals.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConnectionLimitStats {
     bound: Option<Bound>,
     rejected: AtomicU64,
+    /// When the stats were made: the clock of `warned_at`.
+    started: Instant,
+    /// Milliseconds after `started` of the last WARN, plus one; 0 is none
+    /// yet.
+    warned_at: AtomicU64,
+}
+
+impl Default for ConnectionLimitStats {
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl ConnectionLimitStats {
@@ -75,7 +93,24 @@ impl ConnectionLimitStats {
                 permits: Arc::new(Semaphore::new(max_connections.min(Semaphore::MAX_PERMITS))),
             }),
             rejected: AtomicU64::new(0),
+            started: Instant::now(),
+            warned_at: AtomicU64::new(0),
         }
+    }
+
+    /// Whether a refusal `elapsed` after the start is the one to log at
+    /// WARN: the first, or the first after [`WARN_INTERVAL`] of the last one.
+    /// Claims the slot, so concurrent refusals log it once.
+    fn warn_due(&self, elapsed: Duration) -> bool {
+        let now = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX - 1) + 1;
+        let last = self.warned_at.load(Ordering::Relaxed);
+        let due = last == 0
+            || now.saturating_sub(last)
+                >= u64::try_from(WARN_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+        due && self
+            .warned_at
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// The bound; `None` without one.
@@ -108,16 +143,20 @@ impl ConnectionLimitStats {
             Ok(permit) => Ok(Some(permit)),
             Err(_) => {
                 let max_connections = bound.max_connections;
-                if self.rejected.fetch_add(1, Ordering::Relaxed) == 0 {
+                let rejected = self.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+                if self.warn_due(self.started.elapsed()) {
                     warn!(
                         max_connections,
-                        "The HTTP connection limit was reached: a connection beyond it is closed \
-                         at once without a response; further refusals are counted in \
-                         smg_http_connections_rejected_total"
+                        rejected,
+                        "The HTTP connection limit is reached: a connection beyond it is closed \
+                         at once without a response; refusals are counted in \
+                         smg_http_connections_rejected_total and logged here at most once a \
+                         minute"
                     );
                 } else {
                     debug!(
                         max_connections,
+                        rejected,
                         "Connection closed at accept: the HTTP connection limit is reached"
                     );
                 }
@@ -401,6 +440,22 @@ mod tests {
         })
         .await;
         assert_eq!(stats.max_connections(), Some(2));
+    }
+
+    /// The WARN is due for the first refusal and then once per interval;
+    /// the refusals in between are not its business.
+    #[test]
+    fn a_refusal_is_logged_at_warn_once_per_interval() {
+        let stats = ConnectionLimitStats::new(1);
+        assert!(stats.warn_due(Duration::ZERO), "the first refusal");
+        assert!(!stats.warn_due(Duration::from_secs(1)));
+        assert!(!stats.warn_due(WARN_INTERVAL - Duration::from_millis(1)));
+        assert!(
+            stats.warn_due(WARN_INTERVAL),
+            "the first after the interval"
+        );
+        assert!(!stats.warn_due(WARN_INTERVAL + Duration::from_secs(1)));
+        assert!(stats.warn_due(WARN_INTERVAL * 2 + Duration::from_secs(1)));
     }
 
     #[tokio::test]
