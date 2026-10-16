@@ -289,26 +289,42 @@ pub(crate) fn parse_listen_ip(value: &str) -> Result<IpAddr, String> {
     })
 }
 
-/// Worker threads of the async runtime allowed per CPU available to the
-/// process: the bound on an explicit `runtime_worker_threads`. A worker
-/// thread beyond the CPUs only waits for one, so a small multiple leaves room
-/// for a deliberately oversubscribed runtime and refuses the counts that are
-/// a typo or a misread unit, each of which is a stack and a thread the
-/// scheduler wakes for nothing.
+/// The most worker threads an explicit `runtime_worker_threads` may ask
+/// for, on every host alike: the counts that are a typo or a misread unit
+/// (10,000; 100,000), each of which is a stack and a thread the scheduler
+/// wakes for nothing, are refused without reading the host, so a
+/// configuration that validates on one host validates on another (a pod
+/// under a cgroup CPU quota included). A few times the CPUs of the largest
+/// hosts, not a budget.
+pub const RUNTIME_WORKER_THREADS_CEILING: usize = 4096;
+
+/// Worker threads per CPU available to the process above which an explicit
+/// count is an oversubscription worth a warning: a worker thread beyond the
+/// CPUs only waits for one. Advice at start-up, not a refusal: a runtime
+/// deliberately oversubscribed (handlers that block a worker) is the
+/// operator's choice, which the host's quota must not veto.
 pub const RUNTIME_WORKER_THREADS_PER_CPU: usize = 4;
 
-/// The most worker threads an explicit `runtime_worker_threads` may ask for
-/// on a host with `cpus` CPUs available to the process:
-/// [`RUNTIME_WORKER_THREADS_PER_CPU`] per CPU, and never under one CPU's
-/// worth (a parallelism that cannot be read counts as one CPU).
-pub fn runtime_worker_threads_bound(cpus: usize) -> usize {
-    cpus.max(1).saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU)
+/// The warning for an explicit `runtime_worker_threads` above
+/// [`RUNTIME_WORKER_THREADS_PER_CPU`] x the `cpus` available to the process
+/// (never under one CPU's worth: a parallelism that cannot be read counts as
+/// one), `None` within it. Pure over the CPU count so the rule is testable;
+/// start-up logs it where it logs the runtime's size.
+pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> Option<String> {
+    let advised = cpus.max(1).saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU);
+    (threads > advised).then(|| {
+        format!(
+            "runtime_worker_threads {threads} is above {advised}, \
+             {RUNTIME_WORKER_THREADS_PER_CPU} x the {cpus} CPUs available to this process: a \
+             worker thread beyond the CPUs only waits for one and costs its stack"
+        )
+    })
 }
 
 /// The CPUs available to this process, as the runtime's own default reads
 /// them (the affinity mask and the cgroup quota included); 1 when the count
 /// cannot be read.
-pub(crate) fn available_cpus() -> usize {
+pub fn available_cpus() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
 }
 
@@ -1191,12 +1207,14 @@ impl ConfigValidator {
         }
 
         // The async runtime builder panics on zero worker threads; refuse it
-        // here like every other count that must be positive. Above the host's
-        // bound every worker thread is one more stack and one more thread the
-        // scheduler wakes for nothing: a count of 100,000 used to pass, build
-        // its threads for over a minute and hold gigabytes before the first
-        // bind. Both are refused here, before the command line builds the
-        // runtime, so a refused count costs no thread.
+        // here like every other count that must be positive. Above the
+        // ceiling every worker thread is one more stack and one more thread
+        // the scheduler wakes for nothing: a count of 100,000 used to pass,
+        // build its threads for over a minute and hold gigabytes before the
+        // first bind. Both are refused here, before the command line builds
+        // the runtime, so a refused count costs no thread. The ceiling reads
+        // nothing of the host, so the verdict is the same on every host; an
+        // oversubscription of the host's CPUs is a warning at start-up.
         match config.runtime_worker_threads {
             Some(0) => {
                 return Err(ConfigError::InvalidValue {
@@ -1205,22 +1223,18 @@ impl ConfigValidator {
                     reason: "Must be >= 1".to_string(),
                 });
             }
-            Some(threads) => {
-                let cpus = available_cpus();
-                let most = runtime_worker_threads_bound(cpus);
-                if threads > most {
-                    return Err(ConfigError::InvalidValue {
-                        field: "runtime_worker_threads".to_string(),
-                        value: threads.to_string(),
-                        reason: format!(
-                            "Must be at most {most}, {RUNTIME_WORKER_THREADS_PER_CPU} x the {cpus} \
-                             CPUs available to this process (a worker thread beyond the CPUs \
-                             only waits for one and costs its stack)"
-                        ),
-                    });
-                }
+            Some(threads) if threads > RUNTIME_WORKER_THREADS_CEILING => {
+                return Err(ConfigError::InvalidValue {
+                    field: "runtime_worker_threads".to_string(),
+                    value: threads.to_string(),
+                    reason: format!(
+                        "Must be at most {RUNTIME_WORKER_THREADS_CEILING} (a worker thread is a \
+                         stack and a thread the scheduler wakes; a count this size is a typo or \
+                         a misread unit)"
+                    ),
+                });
             }
-            None => {}
+            Some(_) | None => {}
         }
 
         // A zero-capacity job channel panics at construction and a
@@ -2526,41 +2540,30 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
-    /// The bound on the count is a small multiple of the CPUs available to
-    /// the process: the pure rule over a CPU count, then the validator around
-    /// the host's own bound (1, the CPU count and the bound pass; one more is
-    /// refused naming the bound and the CPUs, and so is the 100,000 that a
-    /// typo once got through with).
+    /// The ceiling on the count reads nothing of the host: 1, the host's CPU
+    /// count, a deliberate oversubscription of it and the ceiling itself pass
+    /// on every host, while one more and the 100,000 that a typo once got
+    /// through with are refused naming the ceiling.
     #[test]
-    fn runtime_worker_threads_above_the_host_bound_are_rejected_naming_the_bound() {
-        assert_eq!(
-            runtime_worker_threads_bound(1),
-            RUNTIME_WORKER_THREADS_PER_CPU
-        );
-        assert_eq!(
-            runtime_worker_threads_bound(0),
-            RUNTIME_WORKER_THREADS_PER_CPU
-        );
-        assert_eq!(
-            runtime_worker_threads_bound(16),
-            16 * RUNTIME_WORKER_THREADS_PER_CPU
-        );
-        assert_eq!(runtime_worker_threads_bound(usize::MAX), usize::MAX);
-
+    fn runtime_worker_threads_above_the_ceiling_are_rejected_on_every_host_alike() {
         let cpus = available_cpus();
-        let most = runtime_worker_threads_bound(cpus);
-        assert!(cpus >= 1 && most >= RUNTIME_WORKER_THREADS_PER_CPU);
+        assert!(cpus >= 1);
         let with = |threads: usize| RouterConfig {
             runtime_worker_threads: Some(threads),
             ..Default::default()
         };
-        for ok in [1, cpus, most] {
+        for ok in [
+            1,
+            cpus,
+            cpus.saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU + 4),
+            RUNTIME_WORKER_THREADS_CEILING,
+        ] {
             assert!(
                 ConfigValidator::validate(&with(ok)).is_ok(),
-                "{ok} worker threads, at most {most}"
+                "{ok} worker threads, at most {RUNTIME_WORKER_THREADS_CEILING}"
             );
         }
-        for bad in [most + 1, (most + 1).max(100_000)] {
+        for bad in [RUNTIME_WORKER_THREADS_CEILING + 1, 100_000] {
             match ConfigValidator::validate(&with(bad)) {
                 Err(ConfigError::InvalidValue {
                     field,
@@ -2570,14 +2573,41 @@ mod tests {
                     assert_eq!(field, "runtime_worker_threads", "{bad}");
                     assert_eq!(value, bad.to_string());
                     assert!(
-                        reason.contains(&format!("at most {most}"))
-                            && reason.contains(&format!("{cpus} CPUs")),
+                        reason.contains(&format!("at most {RUNTIME_WORKER_THREADS_CEILING}")),
                         "{bad}: {reason}"
                     );
                 }
                 other => panic!("{bad} worker threads: expected a refusal, got {other:?}"),
             }
         }
+    }
+
+    /// A count above a small multiple of the CPUs available to the process
+    /// is a warning, not a refusal: the pure rule names the advised count
+    /// and the CPUs, says nothing within it, counts an unreadable
+    /// parallelism as one CPU, and the validator passes such a count.
+    #[test]
+    fn runtime_worker_threads_above_four_per_cpu_warn_without_a_refusal() {
+        assert_eq!(runtime_worker_threads_oversubscription(8, 2), None);
+        assert_eq!(runtime_worker_threads_oversubscription(1, 0), None);
+        let warning = runtime_worker_threads_oversubscription(16, 2).expect("a warning");
+        assert!(
+            warning.contains("runtime_worker_threads 16 is above 8")
+                && warning.contains("2 CPUs available"),
+            "{warning}"
+        );
+        let warning = runtime_worker_threads_oversubscription(5, 0).expect("a warning");
+        assert!(warning.contains("is above 4"), "{warning}");
+
+        let config = RouterConfig {
+            runtime_worker_threads: Some(
+                available_cpus()
+                    .saturating_mul(16)
+                    .min(RUNTIME_WORKER_THREADS_CEILING),
+            ),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     /// The RDMA lane's listener address is an IP address or nothing: a plain

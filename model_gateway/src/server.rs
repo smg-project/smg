@@ -1495,6 +1495,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         pinned = config.runtime_worker_threads.is_some(),
         "Tokio runtime sized"
     );
+    // A pinned count well above the CPUs available to the process is the
+    // operator's choice, served with a warning: a worker thread beyond the
+    // CPUs only waits for one. The ceiling on the count is the validator's,
+    // and reads nothing of the host.
+    if let Some(warning) = config.runtime_worker_threads.and_then(|threads| {
+        crate::config::runtime_worker_threads_oversubscription(
+            threads,
+            crate::config::available_cpus(),
+        )
+    }) {
+        tracing::warn!("{warning}");
+    }
 
     // Who else can read the private key files: checked here, once the
     // subscriber exists, so the line reaches the log (the configuration is

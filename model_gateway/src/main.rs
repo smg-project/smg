@@ -1653,10 +1653,12 @@ struct CliArgs {
     webrtc_stun_server: Option<String>,
 
     // ==================== Runtime ====================
-    /// Explicit async runtime worker-thread count, from 1 to 4 x the CPUs
-    /// available to the process (a refusal names the bound). Leave unset to
-    /// use tokio's default (`available_parallelism()`), which already honors the
-    /// cgroup CPU quota on Rust 1.95+ and is therefore container-aware.
+    /// Explicit async runtime worker-thread count, from 1 to 4096 on every
+    /// host (a refusal names the ceiling); a count above 4 x the CPUs
+    /// available to the process starts with a warning, since a worker thread
+    /// beyond the CPUs only waits for one. Leave unset to use tokio's default
+    /// (`available_parallelism()`), which already honors the cgroup CPU quota
+    /// on Rust 1.95+ and is therefore container-aware.
     #[arg(long, help_heading = "Runtime")]
     runtime_worker_threads: Option<usize>,
 }
@@ -4730,8 +4732,8 @@ mod tests {
 
     /// Both values the validator bounds are checked on the command line's own
     /// path, after the flags are parsed and before the runtime is built: a
-    /// count above the host's bound is refused naming the field and the
-    /// bound, a listener address that is not an IP address naming its field
+    /// count above the ceiling is refused naming the field and the
+    /// ceiling, a listener address that is not an IP address naming its field
     /// and the value; the smallest count and a plain address pass.
     #[test]
     fn runtime_worker_threads_and_rdma_listen_ip_are_validated_on_the_cli_path() {
@@ -4767,17 +4769,23 @@ mod tests {
         .unwrap();
     }
 
-    /// The flag's help states the bound as the validator computes it.
+    /// The flag's help states the ceiling the validator refuses above and
+    /// the multiple of the CPUs the start-up warns above, as the constants
+    /// hold them.
     #[test]
     fn the_runtime_flag_help_names_the_bound() {
         use clap::CommandFactory;
         let help = Cli::command().render_long_help().to_string();
         let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
-        let bound = format!(
-            "from 1 to {} x the CPUs available to the process",
+        let ceiling = format!(
+            "from 1 to {} on every host",
+            smg::config::RUNTIME_WORKER_THREADS_CEILING
+        );
+        let advised = format!(
+            "above {} x the CPUs available to the process starts with a warning",
             smg::config::RUNTIME_WORKER_THREADS_PER_CPU
         );
-        assert!(help.contains(&bound), "{help}");
+        assert!(help.contains(&ceiling) && help.contains(&advised), "{help}");
     }
 
     /// Over ZMQ, `--backend` pins the startup workers' runtime (the shared

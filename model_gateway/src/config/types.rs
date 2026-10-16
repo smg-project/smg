@@ -101,10 +101,14 @@ pub struct RouterConfig {
     /// Explicit async runtime worker-thread count. `None` uses tokio's default
     /// (`available_parallelism()`), which already honors the cgroup CPU quota on
     /// Rust 1.95+ and is therefore container-aware. `Some` pins a count from 1
-    /// to [`RUNTIME_WORKER_THREADS_PER_CPU`](crate::config::RUNTIME_WORKER_THREADS_PER_CPU)
-    /// x the CPUs available to the process: the runtime builder panics on 0,
-    /// and every thread above the bound is a stack and a wake-up for nothing,
-    /// so `ConfigValidator` refuses both, naming the bound.
+    /// to [`RUNTIME_WORKER_THREADS_CEILING`](crate::config::RUNTIME_WORKER_THREADS_CEILING),
+    /// the same on every host: the runtime builder panics on 0, and a count
+    /// above the ceiling is a typo or a misread unit, each thread a stack and
+    /// a wake-up for nothing, so `ConfigValidator` refuses both, naming the
+    /// ceiling. A count above
+    /// [`RUNTIME_WORKER_THREADS_PER_CPU`](crate::config::RUNTIME_WORKER_THREADS_PER_CPU)
+    /// x the CPUs available to the process is served with a warning at
+    /// start-up (a worker thread beyond the CPUs only waits for one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,

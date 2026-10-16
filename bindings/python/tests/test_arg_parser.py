@@ -634,7 +634,14 @@ class TestParseRouterArgs:
             ("   ", None),
         ]:
             assert parse_router_args(["--rdma-listen-ip", value]).rdma_listen_ip == parsed
-        for value in ["999.1.1.1", "10.0.0", "gateway.example", "10.0.0.7:18515", "[fd00::1]"]:
+        for value in [
+            "999.1.1.1",
+            "10.0.0",
+            "gateway.example",
+            "10.0.0.7:18515",
+            "[fd00::1]",
+            "fd00::1%eth0",
+        ]:
             with pytest.raises(SystemExit):
                 parse_router_args(["--rdma-listen-ip", value])
 

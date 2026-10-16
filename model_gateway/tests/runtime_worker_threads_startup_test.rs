@@ -1,4 +1,4 @@
-//! `--runtime-worker-threads 0`, and a count above the host's bound, are
+//! `--runtime-worker-threads 0`, and a count above the ceiling, are
 //! configuration errors: the gateway exits non-zero with the field in the
 //! error, without the async runtime builder's panic and without building a
 //! thread, and its port is never bound; a count of 1 serves its health route,
@@ -44,12 +44,12 @@ fn a_zero_runtime_worker_thread_count_refuses_to_start() {
     );
 }
 
-/// A count above the host's bound (a small multiple of the CPUs available to
-/// the process) is refused before anything listens, with the field and the
-/// bound in the error, and at once: 100,000 used to pass, build its threads
-/// for over a minute and hold gigabytes before the first bind.
+/// A count above the ceiling (the same on every host) is refused before
+/// anything listens, with the field and the ceiling in the error, and at
+/// once: 100,000 used to pass, build its threads for over a minute and hold
+/// gigabytes before the first bind.
 #[test]
-fn a_runtime_worker_thread_count_above_the_bound_refuses_to_start() {
+fn a_runtime_worker_thread_count_above_the_ceiling_refuses_to_start() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let started = Instant::now();
     let launch = launch(
@@ -82,6 +82,52 @@ fn a_runtime_worker_thread_count_above_the_bound_refuses_to_start() {
     assert!(
         elapsed < Duration::from_secs(20),
         "the refusal took {elapsed:?}\n{log}"
+    );
+}
+
+/// A count above four per CPU available to the process serves, with a
+/// warning in the log that names the count and the advised one: the ceiling
+/// is the refusal, the host's CPUs are advice (a runtime deliberately
+/// oversubscribed is the operator's choice, which the host's quota must not
+/// veto). The child reads the same CPUs as this process: it inherits the
+/// affinity mask and the cgroup.
+#[test]
+fn a_runtime_worker_thread_count_above_four_per_cpu_serves_with_a_warning() {
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let advised = cpus * 4;
+    let threads = advised + 1;
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let launch = launch(
+        &[
+            "--runtime-worker-threads",
+            &threads.to_string(),
+            "--log-json",
+        ],
+        Until::Served,
+        &dir.path().join("over.log"),
+    );
+    assert!(
+        launch.served,
+        "the gateway did not serve its health route with {threads} worker threads (exit {:?})\n{}",
+        launch.status, launch.log
+    );
+    let expected = format!("runtime_worker_threads {threads} is above {advised}");
+    let warned = launch
+        .log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| {
+            line["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with(&expected))
+        })
+        .unwrap_or_else(|| panic!("the warning did not reach the log\n{}", launch.log));
+    assert_eq!(warned["level"], "WARN", "{warned}");
+    assert!(
+        warned["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(&format!("{cpus} CPUs available"))),
+        "{warned}"
     );
 }
 

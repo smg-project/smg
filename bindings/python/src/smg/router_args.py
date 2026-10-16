@@ -79,11 +79,17 @@ def _ip_address(value: str) -> str | None:
     if not address:
         return None
     try:
-        ipaddress.ip_address(address)
+        ip = ipaddress.ip_address(address)
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
         ) from None
+    if getattr(ip, "scope_id", None):
+        # A scoped IPv6 literal (fd00::1%eth0) parses here and not in the
+        # router; the two refuse the same.
+        raise argparse.ArgumentTypeError(
+            f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
+        )
     return address
 
 
