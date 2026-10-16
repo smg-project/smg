@@ -78,6 +78,8 @@ static HARMONY_ENCODING_INIT: Mutex<()> = Mutex::new(());
 /// The vocab may come from disk (`TIKTOKEN_ENCODINGS_BASE`) or a cached
 /// download; loading is triggered at gpt-oss worker registration
 /// (`EnsureHarmonyEncodingStep`), so request paths hit the loaded fast path.
+/// The load runs on a thread of its own, whatever the caller's thread drives
+/// (see [`on_its_own_thread`]).
 pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String> {
     if let Some(encoding) = HARMONY_ENCODING.get() {
         return Ok(encoding);
@@ -88,9 +90,52 @@ pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String>
     if let Some(encoding) = HARMONY_ENCODING.get() {
         return Ok(encoding);
     }
-    let encoding = openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
-        .map_err(|e| format!("Failed to load Harmony encoding: {e:#}"))?;
+    let encoding = on_its_own_thread(|| {
+        openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
+    })
+    .map_err(|e| format!("Failed to load Harmony encoding: {e:#}"))?;
     Ok(HARMONY_ENCODING.get_or_init(|| encoding))
+}
+
+/// Runs `load` on a thread of its own and returns what it returns.
+///
+/// The vocab loader is synchronous and, on a cache miss, downloads with a
+/// blocking HTTP client that builds and drops an async runtime of its own.
+/// Dropped on a thread that drives a current-thread runtime, as a
+/// `#[tokio::test]` body does, that runtime is a panic ("Cannot drop a
+/// runtime in a context where blocking is not allowed"), so a test that
+/// encodes a Harmony turn passed only once the sync builder tests of the same
+/// binary had filled the cell: test order, not a guarantee, and a failure by
+/// name on a cold machine. A thread of its own drives no runtime, so the load
+/// is the same from any caller.
+fn on_its_own_thread<T: Send>(load: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(load)
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+#[cfg(test)]
+mod own_thread_tests {
+    use super::on_its_own_thread;
+
+    /// What the loader's own thread is for: a runtime dropped on a thread that
+    /// drives one (this test's) is a panic; dropped on the loader's thread it
+    /// is nothing, and the load's result comes back.
+    #[tokio::test]
+    async fn a_load_may_build_and_drop_a_runtime() {
+        let answer = on_its_own_thread(|| {
+            drop(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("a runtime"),
+            );
+            42
+        });
+        assert_eq!(answer, 42);
+    }
 }
 
 /// Convert ProtoOutputLogProbs to OpenAI ChatLogProbs format using Harmony's tokenizer
