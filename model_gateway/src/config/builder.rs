@@ -543,6 +543,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn tenant_model_policy_config(mut self, path: Option<String>) -> Self {
+        self.config.tenant_model_policy_config = path;
+        self
+    }
+
     // ==================== Security & CORS ====================
 
     pub fn api_key<S: Into<String>>(mut self, key: S) -> Self {

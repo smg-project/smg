@@ -1296,6 +1296,18 @@ struct ServingArgs {
     #[arg(long, help_heading = "Tenant Rate Limit")]
     tenant_rate_limit_config: Option<String>,
 
+    // ==================== Tenant Model Policy ====================
+    /// Path to the per-tenant model allow-list YAML: a default policy and
+    /// per-tenant lists of model patterns (exact ids, `prefix*`, or `*`),
+    /// keyed by canonical tenant key (`auth:<tenant_id>` of a tenant API key,
+    /// `header:<id>` of the trusted tenant header). A request for a model
+    /// outside its tenant's list answers the 404 of an unknown model, and
+    /// `/v1/models` lists the allowed subset. A file that cannot be read,
+    /// parsed or validated is a start-up error. Unset (default): every
+    /// tenant may name every model.
+    #[arg(long, help_heading = "Tenant Model Policy")]
+    tenant_model_policy_config: Option<String>,
+
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
     #[arg(long, default_value_t = 5, help_heading = "Retry Configuration")]
@@ -3185,6 +3197,7 @@ impl CliArgs {
             )
             .tenant_rate_limit_enabled(self.serving.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.serving.tenant_rate_limit_config.clone())
+            .tenant_model_policy_config(self.serving.tenant_model_policy_config.clone())
             .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.serving.retry_max_retries,

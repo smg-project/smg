@@ -10,11 +10,18 @@
 //! caller speaks: a request carrying the `anthropic-version` header gets the
 //! Anthropic objects (`type`, `display_name`, `created_at`, page markers),
 //! every other request the OpenAI ones (`object`, `created`, `owned_by`).
+//!
+//! Under the tenant model policy (`tenant_model_policy_config`) the caller
+//! sees its allowed subset: the list is filtered to it and a model outside
+//! it is the 404 of an unknown model, as on every serving route. The caller
+//! is the tenant of the gateway credential it presents, else the identity
+//! its request resolves to without one (a trusted tenant header, its
+//! address, anonymous), as the serving routes would resolve it.
 
 use std::collections::HashSet;
 
 use axum::{
-    http::{header, HeaderMap, HeaderValue},
+    http::{header, Extensions, HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
     Json,
 };
@@ -25,8 +32,13 @@ use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
-    middleware::{into_messages_envelope, AuthConfig},
+    middleware::{
+        into_messages_envelope,
+        tenant_resolution::{resolve_tenant_key, TenantResolutionState},
+        AuthConfig,
+    },
     routers::{common::header_utils::apply_provider_headers, error},
+    tenant_model_policy::{ModelAllowList, TenantModelPolicy},
     worker::{ProviderType, RuntimeType, WorkerRegistry},
 };
 
@@ -95,21 +107,88 @@ impl ModelShape {
     }
 }
 
-/// Answer `GET /v1/models` for the caller identified by `headers`
-/// (`request_id` names the request in the Messages envelope of a refusal).
+/// Answer `GET /v1/models` for the caller a request's `headers` and
+/// `extensions` identify (`request_id` names the request in the Messages
+/// envelope of a refusal).
 pub async fn list_models(
     context: &AppContext,
     headers: &HeaderMap,
+    extensions: &Extensions,
     request_id: String,
 ) -> Response {
+    let allow = match caller_allow_list(context, headers, extensions) {
+        Ok(allow) => allow,
+        Err(refused) => return refused,
+    };
     list_models_with(
         &context.worker_registry,
         &context.client,
         &context.gateway_auth,
         headers,
+        allow,
         request_id,
     )
     .await
+}
+
+/// The allow-list of the caller of a models route under the tenant model
+/// policy, `None` without a policy (see the module docs for who the caller
+/// is), or the refusal the request earns on its way to an identity (an
+/// unusable trusted tenant header).
+fn caller_allow_list<'a>(
+    context: &'a AppContext,
+    headers: &HeaderMap,
+    extensions: &Extensions,
+) -> Result<Option<&'a ModelAllowList>, Response> {
+    let Some(policy) = context.tenant_model_policy.as_deref() else {
+        return Ok(None);
+    };
+    // The header name was validated with the configuration; a resolution
+    // state that cannot be built would already have refused start-up.
+    let resolution = TenantResolutionState::new(&context.router_config)
+        .map_err(|e| error::internal_error("tenant_resolution", e.to_string()))?;
+    caller_allow_list_with(
+        policy,
+        &context.gateway_auth,
+        &resolution,
+        headers,
+        extensions,
+    )
+    .map(Some)
+}
+
+/// [`caller_allow_list`] over explicit collaborators.
+fn caller_allow_list_with<'a>(
+    policy: &'a TenantModelPolicy,
+    gateway_auth: &AuthConfig,
+    resolution: &TenantResolutionState,
+    headers: &HeaderMap,
+    extensions: &Extensions,
+) -> Result<&'a ModelAllowList, Response> {
+    let by_credential =
+        bearer_token(headers).and_then(|token| gateway_auth.tenant_key_for(&token).cloned());
+    let tenant = match by_credential {
+        Some(tenant) => tenant,
+        None => resolve_tenant_key(resolution, headers, extensions)?,
+    };
+    Ok(policy.allow_list_for(&tenant))
+}
+
+/// The cards of `cards` that `allow` names, by id or by an alias; all of
+/// them without a list.
+fn admitted_cards(cards: Vec<ModelCard>, allow: Option<&ModelAllowList>) -> Vec<ModelCard> {
+    match allow {
+        Some(allow) => cards
+            .into_iter()
+            .filter(|card| {
+                allow.admits_any(
+                    std::iter::once(card.id.as_str())
+                        .chain(card.aliases.iter().map(String::as_str)),
+                )
+            })
+            .collect(),
+        None => cards,
+    }
 }
 
 /// [`list_models`] over explicit collaborators.
@@ -118,6 +197,7 @@ pub(crate) async fn list_models_with(
     client: &reqwest::Client,
     gateway_auth: &AuthConfig,
     headers: &HeaderMap,
+    allow: Option<&ModelAllowList>,
     request_id: String,
 ) -> Response {
     let bearer_token = bearer_token(headers);
@@ -128,7 +208,7 @@ pub(crate) async fn list_models_with(
     // below, which would forward it externally.
     if let Some(ref token) = bearer_token {
         if gateway_auth.contains_token(token) {
-            return registry_models_response(registry, shape, request_id).await;
+            return registry_models_response(registry, shape, allow, request_id).await;
         }
     }
 
@@ -137,25 +217,38 @@ pub(crate) async fn list_models_with(
     if let Some(ref token) = bearer_token {
         let upstream_cards = fetch_upstream_models(registry, client, token).await;
         if !upstream_cards.is_empty() {
-            return shape.list(upstream_cards);
+            return shape.list(admitted_cards(upstream_cards, allow));
         }
     }
 
-    registry_models_response(registry, shape, request_id).await
+    registry_models_response(registry, shape, allow, request_id).await
 }
 
 /// Answer `GET /v1/models/{id}` from the self-hosted inventory: the card of
 /// the model `model_id` names (its id, or an alias the registry resolves),
 /// in the caller's API shape, or the 404 an unknown model gets on every other
 /// route, in the caller's error envelope (`request_id` names the request in
-/// the Messages envelope).
+/// the Messages envelope). A model outside the caller's allow-list is that
+/// 404 as well.
 pub async fn retrieve_model(
     context: &AppContext,
     headers: &HeaderMap,
+    extensions: &Extensions,
     model_id: &str,
     request_id: String,
 ) -> Response {
-    retrieve_model_with(&context.worker_registry, headers, model_id, request_id).await
+    let allow = match caller_allow_list(context, headers, extensions) {
+        Ok(allow) => allow,
+        Err(refused) => return refused,
+    };
+    retrieve_model_with(
+        &context.worker_registry,
+        headers,
+        model_id,
+        allow,
+        request_id,
+    )
+    .await
 }
 
 /// [`retrieve_model`] over an explicit registry. The lookup is by the
@@ -165,14 +258,18 @@ pub(crate) async fn retrieve_model_with(
     registry: &WorkerRegistry,
     headers: &HeaderMap,
     model_id: &str,
+    allow: Option<&ModelAllowList>,
     request_id: String,
 ) -> Response {
     let canonical = registry.resolve_model_alias(model_id);
     let wanted = canonical.as_deref().unwrap_or(model_id);
+    let shape = ModelShape::from_headers(headers);
+    if allow.is_some_and(|allow| !allow.admits_any([model_id, wanted])) {
+        return shape.not_found(model_id, request_id).await;
+    }
     let card = self_hosted_cards(registry)
         .into_iter()
         .find(|card| card.id == wanted);
-    let shape = ModelShape::from_headers(headers);
     match card {
         Some(card) => shape.single(card),
         None => shape.not_found(model_id, request_id).await,
@@ -208,17 +305,20 @@ fn self_hosted_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
 }
 
 /// The self-hosted inventory as a list in the caller's shape, or the 503 of
-/// an empty one in the caller's error envelope.
+/// an empty one in the caller's error envelope. The caller's allowed subset
+/// of an inventory that is not empty may itself be empty: that is an empty
+/// list, not the 503 (the inventory is there; the caller may use none of it).
 async fn registry_models_response(
     registry: &WorkerRegistry,
     shape: ModelShape,
+    allow: Option<&ModelAllowList>,
     request_id: String,
 ) -> Response {
     let cards = self_hosted_cards(registry);
     if cards.is_empty() {
         shape.no_models(request_id).await
     } else {
-        shape.list(cards)
+        shape.list(admitted_cards(cards, allow))
     }
 }
 
@@ -331,7 +431,8 @@ mod tests {
         let registry = WorkerRegistry::new();
 
         let response =
-            registry_models_response(&registry, ModelShape::OpenAi, "req_1".to_string()).await;
+            registry_models_response(&registry, ModelShape::OpenAi, None, "req_1".to_string())
+                .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response
@@ -346,7 +447,8 @@ mod tests {
         assert!(body["error"]["type"].is_string(), "{body}");
 
         let response =
-            registry_models_response(&registry, ModelShape::Anthropic, "req_2".to_string()).await;
+            registry_models_response(&registry, ModelShape::Anthropic, None, "req_2".to_string())
+                .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = json_body(response).await;
         assert_eq!(body["type"], "error", "{body}");
@@ -425,6 +527,7 @@ mod tests {
             &client,
             &gateway_auth,
             req.headers(),
+            None,
             "req_test".to_string(),
         )
         .await;
@@ -447,6 +550,7 @@ mod tests {
             &client,
             &gateway_auth,
             req.headers(),
+            None,
             "req_test".to_string(),
         )
         .await;
@@ -503,6 +607,7 @@ mod tests {
                 &client,
                 &gateway_auth,
                 &HeaderMap::new(),
+                None,
                 "req_test".to_string(),
             )
             .await,
@@ -521,6 +626,7 @@ mod tests {
                 &client,
                 &gateway_auth,
                 &headers,
+                None,
                 "req_test".to_string(),
             )
             .await,
@@ -548,7 +654,7 @@ mod tests {
         card.aliases = vec!["alias-1".to_owned()];
         let registry = registry_with(vec![card]);
 
-        let by_id = retrieve_model_with(&registry, &HeaderMap::new(), "m1", rid()).await;
+        let by_id = retrieve_model_with(&registry, &HeaderMap::new(), "m1", None, rid()).await;
         assert_eq!(by_id.status(), StatusCode::OK);
         let body = json_body(by_id).await;
         assert_eq!(body["object"], "model");
@@ -556,13 +662,13 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        let by_alias = retrieve_model_with(&registry, &headers, "alias-1", rid()).await;
+        let by_alias = retrieve_model_with(&registry, &headers, "alias-1", None, rid()).await;
         assert_eq!(by_alias.status(), StatusCode::OK);
         let body = json_body(by_alias).await;
         assert_eq!(body["type"], "model");
         assert_eq!(body["id"], "m1");
 
-        let unknown = retrieve_model_with(&registry, &headers, "nope", rid()).await;
+        let unknown = retrieve_model_with(&registry, &headers, "nope", None, rid()).await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
@@ -574,7 +680,7 @@ mod tests {
     async fn an_unknown_model_is_refused_in_the_callers_envelope() {
         let registry = registry_with(vec![ModelCard::new("m1")]);
 
-        let openai = retrieve_model_with(&registry, &HeaderMap::new(), "nope", rid()).await;
+        let openai = retrieve_model_with(&registry, &HeaderMap::new(), "nope", None, rid()).await;
         assert_eq!(openai.status(), StatusCode::NOT_FOUND);
         let body = json_body(openai).await;
         assert_eq!(body["error"]["code"], "model_not_found", "{body}");
@@ -584,7 +690,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         let messages =
-            retrieve_model_with(&registry, &headers, "nope", "req_models_1".to_owned()).await;
+            retrieve_model_with(&registry, &headers, "nope", None, "req_models_1".to_owned()).await;
         assert_eq!(messages.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             messages.headers()["content-type"],
@@ -612,9 +718,221 @@ mod tests {
         aliased.aliases = vec!["org/second".to_owned()];
         let registry = registry_with(vec![aliased, ModelCard::new("org/second")]);
 
-        let response = retrieve_model_with(&registry, &HeaderMap::new(), "org/second", rid()).await;
+        let response =
+            retrieve_model_with(&registry, &HeaderMap::new(), "org/second", None, rid()).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["id"], "org/second");
+    }
+
+    /// The policy and its collaborators for the models tests: `team-red`
+    /// may use `org/a` and the `org/small-` models, everyone else everything.
+    fn policy_for_models_tests() -> (TenantModelPolicy, AuthConfig, TenantResolutionState) {
+        use crate::tenant_model_policy::{ModelPolicySpec, TenantModelPolicyYaml};
+
+        let config = crate::config::RouterConfig {
+            tenant_api_keys: vec![TenantApiKeyEntry {
+                tenant_id: "team-red".to_string(),
+                key: "team-red-secret".to_string(),
+            }],
+            tenant_resolution: crate::config::TenantResolutionConfig {
+                trust_tenant_header: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let yaml = TenantModelPolicyYaml {
+            default_policy: ModelPolicySpec {
+                tenant_key: None,
+                models: vec!["*".to_owned()],
+            },
+            tenants: vec![
+                ModelPolicySpec {
+                    tenant_key: Some("auth:team-red".to_owned()),
+                    models: vec!["org/a".to_owned(), "org/small-*".to_owned()],
+                },
+                ModelPolicySpec {
+                    tenant_key: Some("header:team-none".to_owned()),
+                    models: vec![],
+                },
+            ],
+        };
+        let policy = TenantModelPolicy::compile(&yaml, &config).unwrap();
+        let gateway_auth =
+            AuthConfig::with_tenant_keys(config.api_key.clone(), &config.tenant_api_keys);
+        let resolution = TenantResolutionState::new(&config).unwrap();
+        (policy, gateway_auth, resolution)
+    }
+
+    fn ids(list: &Value) -> Vec<String> {
+        list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|card| card["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Under the policy the list is the caller's allowed subset, a card
+    /// qualifying by its id or by an alias; without a list the inventory is
+    /// listed whole; a subset with nothing in it is an empty list, not the
+    /// 503 of an empty inventory.
+    #[tokio::test]
+    async fn the_list_is_filtered_to_the_callers_allow_list() {
+        let mut aliased = ModelCard::new("org/served");
+        aliased.aliases = vec!["org/small-alias".to_owned()];
+        let registry = registry_with(vec![
+            ModelCard::new("org/a"),
+            ModelCard::new("org/b"),
+            aliased,
+        ]);
+        let (policy, gateway_auth, _) = policy_for_models_tests();
+        let client = crate::http_client::client();
+        let headers = HeaderMap::new();
+
+        let whole =
+            list_models_with(&registry, &client, &gateway_auth, &headers, None, rid()).await;
+        assert_eq!(whole.status(), StatusCode::OK);
+        let mut all = ids(&json_body(whole).await);
+        all.sort();
+        assert_eq!(all, ["org/a", "org/b", "org/served"]);
+
+        let red = policy.allow_list_for(&crate::tenant::TenantKey::from("auth:team-red"));
+        let filtered = list_models_with(
+            &registry,
+            &client,
+            &gateway_auth,
+            &headers,
+            Some(red),
+            rid(),
+        )
+        .await;
+        assert_eq!(filtered.status(), StatusCode::OK);
+        let mut red_ids = ids(&json_body(filtered).await);
+        red_ids.sort();
+        assert_eq!(red_ids, ["org/a", "org/served"], "by id, and by alias");
+
+        let none = policy.allow_list_for(&crate::tenant::TenantKey::from("header:team-none"));
+        let empty = list_models_with(
+            &registry,
+            &client,
+            &gateway_auth,
+            &headers,
+            Some(none),
+            rid(),
+        )
+        .await;
+        assert_eq!(empty.status(), StatusCode::OK, "an empty subset is a list");
+        assert!(ids(&json_body(empty).await).is_empty());
+
+        let other = policy.allow_list_for(&crate::tenant::TenantKey::from("anonymous"));
+        let everything = list_models_with(
+            &registry,
+            &client,
+            &gateway_auth,
+            &headers,
+            Some(other),
+            rid(),
+        )
+        .await;
+        assert_eq!(ids(&json_body(everything).await).len(), 3);
+    }
+
+    /// A model outside the caller's list is the 404 of an unknown model, in
+    /// the caller's envelope, whether named by its id or by an alias; a
+    /// model in the list is served, by its id or by an alias.
+    #[tokio::test]
+    async fn a_model_outside_the_allow_list_is_not_found() {
+        let mut card = ModelCard::new("org/a");
+        card.aliases = vec!["a-alias".to_owned()];
+        let registry = registry_with(vec![card, ModelCard::new("org/b")]);
+        let (policy, _, _) = policy_for_models_tests();
+        let red = policy.allow_list_for(&crate::tenant::TenantKey::from("auth:team-red"));
+
+        for name in ["org/a", "a-alias"] {
+            let response =
+                retrieve_model_with(&registry, &HeaderMap::new(), name, Some(red), rid()).await;
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+        }
+        let refused =
+            retrieve_model_with(&registry, &HeaderMap::new(), "org/b", Some(red), rid()).await;
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        let body = json_body(refused).await;
+        assert_eq!(body["error"]["code"], "model_not_found", "{body}");
+        // The refusal is the one a model nobody serves gets, name for name.
+        let absent = json_body(
+            retrieve_model_with(&registry, &HeaderMap::new(), "org/zzz", None, rid()).await,
+        )
+        .await;
+        assert_eq!(
+            body.to_string(),
+            absent.to_string().replace("org/zzz", "org/b"),
+            "{body} vs {absent}"
+        );
+        let served = retrieve_model_with(&registry, &HeaderMap::new(), "org/b", None, rid()).await;
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "without a list the model is served"
+        );
+    }
+
+    /// The caller of a models route is the tenant of the gateway credential
+    /// it presents (by `Authorization` or `x-api-key`), else the identity
+    /// its request resolves to without one: the trusted tenant header, then
+    /// anonymous; a foreign token is no gateway identity.
+    #[test]
+    fn the_caller_of_a_models_route_is_resolved_as_the_serving_routes_would() {
+        let (policy, gateway_auth, resolution) = policy_for_models_tests();
+        let list_for = |request: Request<()>| {
+            caller_allow_list_with(
+                &policy,
+                &gateway_auth,
+                &resolution,
+                request.headers(),
+                request.extensions(),
+            )
+            .expect("resolved")
+            .clone()
+        };
+        let red = policy
+            .allow_list_for(&crate::tenant::TenantKey::from("auth:team-red"))
+            .clone();
+        let none = policy
+            .allow_list_for(&crate::tenant::TenantKey::from("header:team-none"))
+            .clone();
+        let default = policy
+            .allow_list_for(&crate::tenant::TenantKey::from("anonymous"))
+            .clone();
+        assert_ne!(red, default);
+
+        let bearer = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer team-red-secret")
+            .body(())
+            .unwrap();
+        assert_eq!(list_for(bearer), red);
+        let x_api_key = Request::builder()
+            .header("x-api-key", "team-red-secret")
+            .body(())
+            .unwrap();
+        assert_eq!(list_for(x_api_key), red);
+        let by_header = Request::builder()
+            .header(crate::tenant::DEFAULT_TENANT_HEADER_NAME, "team-none")
+            .body(())
+            .unwrap();
+        assert_eq!(list_for(by_header), none);
+        let credential_over_header = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer team-red-secret")
+            .header(crate::tenant::DEFAULT_TENANT_HEADER_NAME, "team-none")
+            .body(())
+            .unwrap();
+        assert_eq!(list_for(credential_over_header), red);
+        let foreign = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer not-a-gateway-key")
+            .body(())
+            .unwrap();
+        assert_eq!(list_for(foreign), default);
+        let nobody = Request::builder().body(()).unwrap();
+        assert_eq!(list_for(nobody), default);
     }
 }

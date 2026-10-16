@@ -608,6 +608,7 @@ struct Router {
     /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
     tenant_api_keys: Vec<(String, String)>,
     tenant_header_name: String,
+    tenant_model_policy_config: Option<String>,
     tenant_rate_limit_config: Option<String>,
     tenant_rate_limit_enabled: bool,
     tokenizer_cache_enable_l0: bool,
@@ -1109,6 +1110,7 @@ impl Router {
             .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
             .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
             .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
+            .tenant_model_policy_config(self.tenant_model_policy_config.clone())
             .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
             .prefill_queue_size(self.prefill_queue_size)
             .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
@@ -1428,6 +1430,7 @@ impl Router {
         stream_body_stall_timeout_secs = 300,
         tenant_api_keys = vec![],
         tenant_header_name = String::from("x-smg-tenant-id"),
+        tenant_model_policy_config = None,
         tenant_rate_limit_config = None,
         tenant_rate_limit_enabled = false,
         tokenizer_cache_enable_l0 = false,
@@ -1635,6 +1638,7 @@ impl Router {
         stream_body_stall_timeout_secs: u64,
         tenant_api_keys: Vec<(String, String)>,
         tenant_header_name: String,
+        tenant_model_policy_config: Option<String>,
         tenant_rate_limit_config: Option<String>,
         tenant_rate_limit_enabled: bool,
         tokenizer_cache_enable_l0: bool,
@@ -1872,6 +1876,7 @@ impl Router {
             stream_body_stall_timeout_secs,
             tenant_api_keys,
             tenant_header_name,
+            tenant_model_policy_config,
             tenant_rate_limit_config,
             tenant_rate_limit_enabled,
             tokenizer_cache_enable_l0,

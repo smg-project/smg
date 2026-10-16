@@ -8,7 +8,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{middleware::scheduler, policies::cost as selection_cost};
+use crate::{
+    middleware::scheduler, policies::cost as selection_cost, tenant_model_policy::TenantModelPolicy,
+};
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -348,6 +350,7 @@ impl ConfigValidator {
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
+        Self::validate_tenant_model_policy(config)?;
         Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
@@ -601,6 +604,30 @@ impl ConfigValidator {
             seen.push(*field);
         }
         Ok(())
+    }
+
+    /// With a tenant model policy configured, its YAML must be readable,
+    /// parsable (no key the policy does not know) and compiled against the
+    /// rest of the configuration (every tenant key reachable, see
+    /// [`TenantModelPolicy::compile`]): an operator who asked for model
+    /// allow-lists gets a start-up error naming the field, never a gateway
+    /// that serves every model to every tenant. Without the key nothing is
+    /// read.
+    fn validate_tenant_model_policy(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(path) = config.tenant_model_policy_config.as_deref() else {
+            return Ok(());
+        };
+        let refused = |reason: String| ConfigError::InvalidValue {
+            field: "tenant_model_policy_config".to_string(),
+            value: path.to_string(),
+            reason,
+        };
+        if path.trim().is_empty() {
+            return Err(refused("the path must not be empty".to_string()));
+        }
+        TenantModelPolicy::from_config(config)
+            .map(drop)
+            .map_err(refused)
     }
 
     fn validate_tenant_resolution(config: &RouterConfig) -> ConfigResult<()> {
@@ -4796,5 +4823,81 @@ mod tests {
             matches!(built, Err(ConfigError::InvalidValue { ref field, .. }) if field == "cors_allowed_origins"),
             "{built:?}"
         );
+    }
+
+    fn model_policy_config(path: Option<&str>) -> RouterConfig {
+        let mut config = RouterConfig {
+            tenant_model_policy_config: path.map(str::to_owned),
+            ..Default::default()
+        };
+        config.tenant_api_keys = vec![TenantApiKeyEntry {
+            tenant_id: "team-red".to_owned(),
+            key: "red-secret".to_owned(),
+        }];
+        config
+    }
+
+    /// The `(value, reason)` of the `tenant_model_policy_config` error a
+    /// configuration is refused with.
+    fn refused_model_policy_config(config: &RouterConfig) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == "tenant_model_policy_config" => (value, reason),
+            other => panic!("expected a tenant_model_policy_config error, got {other:?}"),
+        }
+    }
+
+    /// With a tenant model policy configured, a file that cannot be read,
+    /// parsed or compiled against the configuration is refused under the
+    /// field's name; a valid file and an absent key are accepted, and an
+    /// unknown key in the file is a refusal rather than a silently ignored
+    /// typo.
+    #[test]
+    fn a_tenant_model_policy_config_is_validated_at_start_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.yaml");
+        let missing = missing.to_str().unwrap();
+        let (value, reason) = refused_model_policy_config(&model_policy_config(Some(missing)));
+        assert_eq!(value, missing);
+        assert!(reason.starts_with("reading "), "{reason}");
+
+        let path = dir.path().join("models.yaml");
+        let path_str = path.to_str().unwrap();
+        std::fs::write(
+            &path,
+            "default_policy:\n  models: [\"*\"]\n  routes: [serving]\n",
+        )
+        .unwrap();
+        let (_, reason) = refused_model_policy_config(&model_policy_config(Some(path_str)));
+        assert!(
+            reason.starts_with("parsing ") && reason.contains("routes"),
+            "{reason}"
+        );
+
+        std::fs::write(
+            &path,
+            "default_policy:\n  models: [\"*\"]\ntenants:\n  - tenant_key: auth:team-rde\n    models: [\"org/a\"]\n",
+        )
+        .unwrap();
+        let (_, reason) = refused_model_policy_config(&model_policy_config(Some(path_str)));
+        assert!(
+            reason.contains("auth:team-rde") && reason.contains("tenant_api_keys"),
+            "{reason}"
+        );
+
+        std::fs::write(
+            &path,
+            "default_policy:\n  models: [\"*\"]\ntenants:\n  - tenant_key: auth:team-red\n    models: [\"org/a\", \"org/small-*\"]\n",
+        )
+        .unwrap();
+        ConfigValidator::validate(&model_policy_config(Some(path_str))).expect("a valid policy");
+        ConfigValidator::validate(&model_policy_config(None)).expect("no policy");
+
+        let (value, reason) = refused_model_policy_config(&model_policy_config(Some(" ")));
+        assert_eq!(value, " ");
+        assert!(reason.contains("empty"), "{reason}");
     }
 }

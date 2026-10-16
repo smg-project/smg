@@ -75,6 +75,14 @@ impl AuthConfig {
     pub fn contains_token(&self, token: &str) -> bool {
         self.keys.contains_key(&hash_key(token))
     }
+
+    /// The tenant `token` authenticates as, `None` for a token that is no
+    /// configured key: for a route outside the auth layer that wants the
+    /// caller's identity when it presents one of the gateway's own
+    /// credentials (`/v1/models` under the tenant model policy).
+    pub fn tenant_key_for(&self, token: &str) -> Option<&TenantKey> {
+        self.keys.get(&hash_key(token))
+    }
 }
 
 fn hash_key(key: &str) -> [u8; 32] {
