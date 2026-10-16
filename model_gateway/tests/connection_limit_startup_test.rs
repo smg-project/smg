@@ -210,6 +210,16 @@ fn a_connection_beyond_the_bound_is_closed_without_a_response_and_counted() {
         matches!(reply, Reply::Closed),
         "the connection beyond the bound was answered or left hanging: {reply:?}"
     );
+    // The refusal is on the counter before the refused stream is dropped,
+    // and nothing else has connected to the data port since the scrape
+    // before: exactly one more, the third connection's.
+    let rejected = sample(&scrape(metrics_addr), "smg_http_connections_rejected_total")
+        .expect("the rejected-connections counter is on the scrape");
+    assert_eq!(
+        rejected,
+        rejected_before + 1.0,
+        "the third connection's refusal: {rejected_before} -> {rejected}"
+    );
     // The two within the bound are untouched.
     assert!(ok(request(&mut first, "/health")));
     assert!(ok(request(&mut second, "/health")));
@@ -219,15 +229,6 @@ fn a_connection_beyond_the_bound_is_closed_without_a_response_and_counted() {
     let mut fourth = served_connection(addr, window);
     assert!(ok(request(&mut fourth, "/health")));
     assert!(ok(request(&mut second, "/health")));
-
-    // The metrics listener is outside the bound and counts the refusal: the
-    // third connection's, counted since the scrape before it.
-    let rejected = sample(&scrape(metrics_addr), "smg_http_connections_rejected_total")
-        .expect("the rejected-connections counter is on the scrape");
-    assert!(
-        rejected >= rejected_before + 1.0,
-        "rejected connections: {rejected_before} -> {rejected}"
-    );
 
     let log = gateway.log();
     assert!(

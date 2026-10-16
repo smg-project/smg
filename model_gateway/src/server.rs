@@ -2266,13 +2266,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
          are outside it)"
     );
-    if max_connections > 0
-        && usize::try_from(config.router_config.max_concurrent_requests)
-            .is_ok_and(|admission| max_connections < admission)
+    // The admission limit the bound is compared with is the effective one:
+    // the derived default when `max_concurrent_requests` is unset (-1), none
+    // when admission control is off (0), the value otherwise.
+    let admission_limit = match config.router_config.max_concurrent_requests {
+        0 => None,
+        n if n < 0 => Some(crate::app_context::default_max_concurrent_requests()),
+        n => usize::try_from(n).ok(),
+    };
+    if let Some(admission_limit) =
+        admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
     {
         warn!(
             max_connections,
-            max_concurrent_requests = config.router_config.max_concurrent_requests,
+            admission_limit,
             "The connection limit is below the admission limit: clients on HTTP/1, one request \
              per connection, are refused at the listener (a closed connection, no response) \
              before admission can queue or answer them"
